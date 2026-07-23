@@ -270,3 +270,43 @@ class TestDashboard:
         assert "task.end" in line
         assert "[t1]" in line
         assert "done" in line
+
+
+class TestDoctorRendering:
+    def test_multiline_error_detail_is_flattened(self) -> None:
+        from sdxloop.cli.doctor import _clean
+
+        messy = "sbx ls failed | rc=1 | stderr=line one\nline two\n\n   line three"
+        cleaned = _clean(messy)
+        assert "\n" not in cleaned
+        assert "line one line two line three" in cleaned
+
+    def test_overlong_detail_is_elided(self) -> None:
+        from sdxloop.cli.doctor import _clean
+
+        cleaned = _clean("x" * 1000)
+        assert len(cleaned) == 300
+        assert cleaned.endswith("…")
+
+    def test_doctor_emits_progress_lines(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "checking sbx binary" in result.output
+        assert "browser window" in result.output  # auth heads-up is visible
+
+    def test_doctor_login_hint_names_app_name_when_configured(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.setenv("SDXLOOP_APP_NAME", "sdxloop-iso")
+        fake_sbx.script("ls", returncode=1, stderr="not logged in", once=True)
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        # the table may fold the hint across lines; assert on whole words
+        assert "--app-name" in result.output
+        assert "sdxloop-iso" in result.output

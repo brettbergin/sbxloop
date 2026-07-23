@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from rich.console import Console
@@ -28,12 +29,23 @@ class Check:
     hard: bool = True
 
 
-def collect_checks(env: dict[str, str], cli: SbxCLI | None = None) -> list[Check]:
+ProgressFn = Callable[[str], None]
+
+
+def collect_checks(
+    env: dict[str, str],
+    cli: SbxCLI | None = None,
+    progress: ProgressFn | None = None,
+) -> list[Check]:
     config = load_config(env=env)
     cli = cli or SbxCLI(app_name=config.app_name or None)
     checks: list[Check] = []
+    report = progress or (lambda _message: None)
 
-    # sbx binary + version
+    # sbx binary + version. The very first sbx invocation may trigger
+    # Docker's interactive browser login if this sbx application state has
+    # never authenticated - say so instead of appearing hung.
+    report("checking sbx binary (Docker may open a browser window for authentication on first use)")
     try:
         version = cli.version()
     except SbxNotFoundError:
@@ -54,14 +66,19 @@ def collect_checks(env: dict[str, str], cli: SbxCLI | None = None) -> list[Check
 
     if version is not None:
         # login / daemon reachable
+        report("checking sbx login")
         try:
             cli.ls()
             checks.append(Check("sbx login", True, "sbx ls succeeded"))
         except SbxError as exc:
-            checks.append(Check("sbx login", False, f"sbx ls failed ({exc}); run `sbx login`"))
+            login_cmd = (
+                f"sbx --app-name {config.app_name} login" if config.app_name else "sbx login"
+            )
+            checks.append(Check("sbx login", False, f"sbx ls failed ({exc}); run `{login_cmd}`"))
 
         # network policy reachable for the copilot hosts
         for host in AGENT_TOKEN_HOSTS:
+            report(f"checking network policy for {host}")
             allowed = False
             try:
                 allowed = cli.policy_check(host)
@@ -128,18 +145,28 @@ def collect_checks(env: dict[str, str], cli: SbxCLI | None = None) -> list[Check
     return checks
 
 
+def _clean(detail: str, limit: int = 300) -> str:
+    """Collapse whitespace/newlines so multi-line sbx stderr can't shatter
+    the table layout; long tails are elided."""
+    flat = " ".join(detail.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "\u2026"
+
+
 def run_doctor(console: Console, env: dict[str, str] | None = None) -> bool:
     import os
 
-    checks = collect_checks(dict(os.environ) if env is None else env)
+    checks = collect_checks(
+        dict(os.environ) if env is None else env,
+        progress=lambda message: console.print(f"[dim]\u2026 {message}[/dim]", highlight=False),
+    )
     table = Table(title="sdxloop doctor")
-    table.add_column("check")
-    table.add_column("status")
-    table.add_column("detail", max_width=80)
+    table.add_column("check", no_wrap=True)
+    table.add_column("status", no_wrap=True)
+    table.add_column("detail", overflow="fold")
     for check in checks:
         status = (
             "[green]ok[/]" if check.ok else ("[red]FAIL[/]" if check.hard else "[yellow]warn[/]")
         )
-        table.add_row(check.name, status, check.detail)
+        table.add_row(check.name, status, _clean(check.detail))
     console.print(table)
     return all(check.ok or not check.hard for check in checks)

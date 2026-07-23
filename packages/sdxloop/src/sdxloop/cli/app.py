@@ -324,8 +324,11 @@ DEFAULT_CONFIG_TOML = """\
 
 # Copilot model for agent sessions ("auto" lets the SDK choose).
 model = "auto"
-# sbx --app-name isolating sdxloop's sandboxes/policies/secrets.
-app_name = "sdxloop"
+# Optional sbx --app-name isolating sdxloop's sandboxes/policies/secrets.
+# Empty shares your normal sbx state (your login + balanced policy apply).
+# If set, that isolated state needs its own `sbx --app-name <name> login`
+# and `sbx --app-name <name> policy init balanced`.
+app_name = ""
 # Where run state (SQLite) and per-run workspaces live.
 state_dir = ".sdxloop"
 # Keep sandboxes around after a run (for debugging).

@@ -6,6 +6,16 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+- `app_name` now defaults to empty: sdxloop shares the user's normal sbx
+  application state, so `sbx login` and `sbx policy init balanced` apply
+  directly. Isolation via `--app-name` is opt-in (and documented to need
+  its own login/policy init). Previously the default isolated state
+  silently triggered Docker's browser login on first `sdxloop doctor`.
+- `sdxloop doctor` prints progress lines for slow checks (including a
+  heads-up that Docker may open a browser for auth) and sanitizes
+  multi-line sbx error output so the results table renders cleanly.
+
 ### Added
 - `.env` support: the CLI and `LoopEngine` automatically load `./.env`
   (via python-dotenv) for the two PATs and `SDXLOOP_*` settings. Real

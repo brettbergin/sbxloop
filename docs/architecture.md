@@ -55,8 +55,10 @@ and the GitHub layer can never spend Copilot quota.
 
 Both sandboxes run under sbx's **balanced** network policy (default-deny plus
 a curated allowlist), with per-sandbox allow rules added for exactly the
-hosts each role needs. `--app-name sdxloop` isolates all sdxloop state from
-the user's interactive sbx usage. The `plain-env` fallback strategy (tokens
+hosts each role needs. By default sdxloop shares the user's normal sbx
+application state (so `sbx login` and `sbx policy init balanced` apply
+directly); setting `app_name` in config opts into isolated sbx state, which
+then needs its own `sbx --app-name <name> login` and policy init. The `plain-env` fallback strategy (tokens
 written to `~/.sdxloop/env.sh` in-VM) exists for hosts where the experimental
 `set-custom` proxying is unavailable, and is documented as weaker.
 
