@@ -143,12 +143,33 @@ def _flatten(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return flat
 
 
+def load_dotenv_file(cwd: Path | None = None) -> Path | None:
+    """Load ``<cwd>/.env`` into the process environment, if present.
+
+    Real environment variables always win (``override=False``), so a ``.env``
+    file is a convenience layer for the two PATs and ``SDXLOOP_*`` settings —
+    never a way to silently shadow explicit exports. Returns the loaded path,
+    or None when there is no file.
+    """
+    from dotenv import load_dotenv
+
+    path = (cwd or Path.cwd()) / ".env"
+    if not path.is_file():
+        return None
+    load_dotenv(path, override=False)
+    return path
+
+
 def load_config_with_sources(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> tuple[Config, dict[str, str]]:
     """Load config and report, per dotted key, which layer supplied it."""
     cwd = cwd or Path.cwd()
+    if env is None:
+        # Only consult .env when reading the real environment; explicit env
+        # mappings (tests, embedders) stay hermetic.
+        load_dotenv_file(cwd)
     env = os.environ if env is None else env
 
     layers: list[tuple[str, dict[str, Any]]] = [
