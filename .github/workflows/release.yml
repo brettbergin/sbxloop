@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Check tag matches package versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for pkg in packages/sdxloop packages/sdxloop-worker; do
+            version=$(uv run --no-project python -c "import tomllib,sys; print(tomllib.load(open('$pkg/pyproject.toml','rb'))['project']['version'])")
+            if [ "$version" != "$tag" ]; then
+              echo "::error::$pkg version $version does not match tag $tag"
+              exit 1
+            fi
+          done
+      - run: uv build --package sdxloop-worker -o dist
+      - run: uv build --package sdxloop -o dist
+      - name: Assert worker wheel is vendored inside the host wheel
+        run: |
+          unzip -l dist/sdxloop-*.whl | grep 'sdxloop/_vendor/sdxloop_worker-.*\.whl'
+      - name: Run the full check suite against the release tree
+        run: |
+          uv sync --all-packages
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+          uv run pytest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC): configure this repo + workflow + environment
+    # as a Trusted Publisher on pypi.org for BOTH projects (sdxloop and
+    # sdxloop-worker). No API token secrets are used.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
