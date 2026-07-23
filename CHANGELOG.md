@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-23
+
 ### Fixed
 - Provisioning no longer fails with "secret exists" on re-runs and resumes:
   sbx refuses to overwrite existing secrets, so the provisioner now removes
