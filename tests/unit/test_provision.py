@@ -213,3 +213,68 @@ class TestEnsurePair:
             assert fake_sbx.meta(pair.agent.name)["workspace"] == str(workspace.resolve())
         finally:
             pair.cleanup()
+
+
+class TestSecretIdempotency:
+    def secret_state(self, fake_sbx: FakeSbx) -> dict[str, dict[str, str]]:
+        import json
+
+        path = fake_sbx.state / "secrets-state.json"
+        return json.loads(path.read_text()) if path.is_file() else {"service": {}, "custom": {}}
+
+    def test_reprovision_replaces_existing_secrets(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        """Second run: custom secrets are keyed globally by host+env, so a
+        naive set fails with 'secret exists' — the provisioner must remove
+        and re-set instead of dying (the field-reported bug)."""
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1").cleanup()
+        pair = provisioner.ensure_pair("r2")  # must not raise
+        try:
+            state = self.secret_state(fake_sbx)
+            # replaced, not duplicated: still one entry per host+env
+            assert set(state["custom"]) == {
+                "api.githubcopilot.com|COPILOT_GITHUB_TOKEN",
+                "api.github.com|COPILOT_GITHUB_TOKEN",
+            }
+            # rm invocations happened for the collisions
+            rms = [s["args"] for s in fake_sbx.secrets() if s["args"][0] == "rm"]
+            assert any("--host" in a for a in rms)
+        finally:
+            pair.cleanup()
+
+    def test_resume_same_run_id_replaces_service_secret(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """resume() reuses run ids -> same sandbox names -> the github
+        service secret collides too; it must be replaced with the current
+        token value."""
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1").cleanup()
+        rotated = dict(TOKENS, GH_TOKEN="github_pat_rotated")
+        provisioner2 = make_provisioner(fake_sbx, tmp_path, env=rotated)
+        pair = provisioner2.ensure_pair("r1")
+        try:
+            state = self.secret_state(fake_sbx)
+            assert state["service"]["sdxloop-r1-github|github"] == "github_pat_rotated"
+        finally:
+            pair.cleanup()
+
+    def test_unremovable_secret_keeps_existing_value_with_warning(
+        self, fake_sbx: FakeSbx, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1").cleanup()
+        # every rm is rejected (simulating an sbx build without custom rm)
+        fake_sbx.script("secret rm", returncode=1, stderr="unknown command")
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            pair = provisioner.ensure_pair("r2")  # still must not raise
+        pair.cleanup()
+        assert any("could not be removed" in r.message for r in caplog.records)
+
+    def test_non_exists_secret_error_still_raises(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        fake_sbx.script("secret set-custom", returncode=1, stderr="keychain locked")
+        with pytest.raises(ProvisionError):
+            provisioner.ensure_pair("r1")

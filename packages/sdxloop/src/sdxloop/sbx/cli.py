@@ -208,3 +208,27 @@ class SbxCLI:
             "--value",
             value,
         )
+
+    def secret_rm(
+        self,
+        *,
+        service: str | None = None,
+        host: str | None = None,
+        env: str | None = None,
+        sandbox: str | None = None,
+    ) -> bool:
+        """Best-effort secret removal; returns whether sbx accepted it.
+
+        Used by the replace-on-exists flow: sbx refuses to overwrite an
+        existing secret, so provisioning removes and re-sets. Removal syntax
+        for custom secrets is not a stable documented API, hence best-effort
+        (callers keep the existing value when removal is rejected).
+        """
+        scope = [sandbox] if sandbox else ["-g"]
+        args = ["secret", "rm", *scope]
+        if service:
+            args.append(service)
+        else:
+            assert host is not None and env is not None
+            args += ["--host", host, "--env", env]
+        return self.run(*args, check=False).ok
