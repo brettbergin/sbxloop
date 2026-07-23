@@ -83,9 +83,15 @@ dispatched workflow.
 ## Setup
 
 1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then `sbx login` and `sbx policy init balanced`.
-2. Create two fine-grained GitHub PATs and export them:
+2. Create two fine-grained GitHub PATs:
    - `COPILOT_GITHUB_TOKEN` — personal account, **Copilot Requests** permission. Used *only* by the agent sandbox.
    - `GH_TOKEN` — repository permissions you want sdxloop to act with (e.g. issues: write, contents: read). Used *only* by the github-ops sandbox.
+
+   Export them, or put them in a `.env` file (loaded automatically from the working directory; real environment variables always win):
+
+   ```bash
+   cp .env.example .env   # then fill in the two tokens
+   ```
 3. `sdxloop doctor` verifies all of it and prints remediation for anything missing.
 
 Configuration lives in `sdxloop.toml` / `pyproject.toml [tool.sdxloop]` / `SDXLOOP_*` env vars (`sdxloop init` writes a commented starter file; `sdxloop config show` shows the resolved values and their sources).

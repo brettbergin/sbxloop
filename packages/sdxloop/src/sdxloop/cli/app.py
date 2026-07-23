@@ -15,7 +15,7 @@ from rich.table import Table
 import sdxloop
 from sdxloop.cli.doctor import run_doctor
 from sdxloop.cli.tui import Dashboard, format_event, plain_printer
-from sdxloop.config import Config, load_config, load_config_with_sources
+from sdxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sdxloop.engine.engine import LoopEngine
 from sdxloop.engine.model import RunResult
 from sdxloop.engine.store import StateStore
@@ -50,6 +50,9 @@ def _main_callback(
     ] = False,
 ) -> None:
     """sdxloop — agentic loops on Docker Sandboxes."""
+    # Every command sees ./.env (tokens + SDXLOOP_* settings); real
+    # environment variables always take precedence.
+    load_dotenv_file()
 
 
 def _config_with_overrides(**overrides: Any) -> Config:

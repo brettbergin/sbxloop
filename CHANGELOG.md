@@ -6,6 +6,13 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+- `.env` support: the CLI and `LoopEngine` automatically load `./.env`
+  (via python-dotenv) for the two PATs and `SDXLOOP_*` settings. Real
+  environment variables always take precedence, and explicit `env=`
+  mappings passed to `load_config` stay hermetic. A documented
+  `.env.example` ships in the repo.
+
 ## [0.1.0] — 2026-07-22
 
 Initial release.

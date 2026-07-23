@@ -18,7 +18,7 @@ import json
 import time
 from collections.abc import Callable, Sequence
 
-from sdxloop.config import Config, load_config
+from sdxloop.config import Config, load_config, load_dotenv_file
 from sdxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     RunResult,
@@ -51,6 +51,9 @@ class LoopEngine:
         install_workers: bool | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # Library parity with the CLI: a ./.env supplies tokens/settings even
+        # when the caller passes a prebuilt Config (real env vars still win).
+        load_dotenv_file()
         self.config = config or load_config()
         self.store = store or StateStore(self.config.state_dir / "state.db")
         self.bus = bus or EventBus()
