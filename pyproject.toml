@@ -60,6 +60,11 @@ addopts = [
 
 [tool.coverage.run]
 branch = true
+omit = [
+    # Exercised only by the real-sbx e2e workflow: requires the Copilot SDK
+    # runtime and a Copilot subscription.
+    "*/sdxloop_worker/backends/copilot.py",
+]
 
 [tool.coverage.report]
 exclude_also = [
