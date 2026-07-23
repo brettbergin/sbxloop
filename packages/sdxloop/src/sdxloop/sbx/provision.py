@@ -20,6 +20,7 @@ import logging
 import os
 import shlex
 from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
 
 from sdxloop.config import Config
@@ -183,15 +184,68 @@ class Provisioner:
         for secret in spec.secrets:
             if secret.kind == "service":
                 assert secret.service is not None
-                self.cli.secret_set(secret.service, sandbox=spec.name, token=token)
+                self._set_secret_replacing(
+                    f"service {secret.service} ({spec.name})",
+                    set_fn=partial(
+                        self.cli.secret_set, secret.service, sandbox=spec.name, token=token
+                    ),
+                    rm_fn=partial(self.cli.secret_rm, service=secret.service, sandbox=spec.name),
+                )
             else:
                 assert secret.host is not None and secret.env is not None
-                self.cli.secret_set_custom(
-                    host=secret.host,
-                    env=secret.env,
-                    value=token,
-                    sandbox=spec.name,
+                self._set_secret_replacing(
+                    f"custom {secret.env}@{secret.host} ({spec.name})",
+                    set_fn=partial(
+                        self.cli.secret_set_custom,
+                        host=secret.host,
+                        env=secret.env,
+                        value=token,
+                        sandbox=spec.name,
+                    ),
+                    rm_fn=partial(
+                        self.cli.secret_rm,
+                        host=secret.host,
+                        env=secret.env,
+                        sandbox=spec.name,
+                    ),
                 )
+
+    _SECRET_EXISTS_MARKERS = ("exist", "already")
+
+    def _set_secret_replacing(
+        self,
+        describe: str,
+        *,
+        set_fn: Callable[[], None],
+        rm_fn: Callable[[], bool],
+    ) -> None:
+        """Set a secret, replacing a leftover one from a previous run.
+
+        sbx refuses to overwrite an existing secret ("secret exists"), which
+        would otherwise fail every re-run and every resume (same sandbox
+        names). On an exists-error we remove and re-set so rotated tokens
+        take effect. If removal is rejected (rm syntax for custom secrets is
+        not a stable API), the existing value is kept with a warning rather
+        than failing the run.
+        """
+        try:
+            set_fn()
+            return
+        except SbxError as exc:
+            # Match only sbx's own stderr: the full exception string embeds
+            # argv, and arbitrary paths in argv can contain words like
+            # "exists" (a pytest tmp dir did exactly that).
+            text = exc.stderr.lower()
+            if not any(marker in text for marker in self._SECRET_EXISTS_MARKERS):
+                raise
+        if rm_fn():
+            set_fn()
+        else:
+            logger.warning(
+                "secret %s already exists and could not be removed; keeping the "
+                "existing value (it may be stale if the token was rotated)",
+                describe,
+            )
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sdxloop/env.sh in the VM."""

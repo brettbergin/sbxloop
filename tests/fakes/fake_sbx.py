@@ -271,9 +271,66 @@ def cmd_policy(root: Path, args: list[str]) -> int:
     return 0
 
 
+def _parse_flags(args: list[str]) -> tuple[list[str], dict[str, str]]:
+    positional: list[str] = []
+    flags: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("--"):
+            flags[args[i][2:]] = args[i + 1] if i + 1 < len(args) else ""
+            i += 2
+        else:
+            positional.append(args[i])
+            i += 1
+    return positional, flags
+
+
 def cmd_secret(root: Path, args: list[str], stdin: str) -> int:
+    """Stateful secrets, mimicking real sbx: refuses to overwrite an existing
+    secret ("secret exists"), supports rm. Custom secrets are keyed globally
+    by host+env (matching observed sbx behavior); service secrets per scope."""
     append_jsonl(root / "secrets.jsonl", {"args": args, "stdin": stdin, "ts": time.time()})
-    return 0
+    state_path = root / "secrets-state.json"
+    state: dict[str, dict[str, str]] = (
+        json.loads(state_path.read_text())
+        if state_path.is_file()
+        else {"service": {}, "custom": {}}
+    )
+    sub, *rest = args
+    positional, flags = _parse_flags(rest)
+    code = 0
+    if sub == "set":
+        scope, service = positional[0], positional[1]
+        key = f"{scope}|{service}"
+        if key in state["service"]:
+            print(f'Error: cannot set secret in "{scope}": secret exists', file=sys.stderr)
+            code = 1
+        else:
+            state["service"][key] = stdin
+    elif sub == "set-custom":
+        key = f"{flags['host']}|{flags['env']}"
+        if key in state["custom"]:
+            print(
+                f"Error: cannot set secret in secret store: secret for "
+                f"{flags['host']}/{flags['env']} already exists",
+                file=sys.stderr,
+            )
+            code = 1
+        else:
+            state["custom"][key] = flags.get("value", "")
+    elif sub == "rm":
+        if "host" in flags:
+            key = f"{flags['host']}|{flags['env']}"
+            if state["custom"].pop(key, None) is None:
+                print("Error: secret not found", file=sys.stderr)
+                code = 1
+        else:
+            key = f"{positional[0]}|{positional[1]}"
+            if state["service"].pop(key, None) is None:
+                print("Error: secret not found", file=sys.stderr)
+                code = 1
+    state_path.write_text(json.dumps(state))
+    return code
 
 
 def main() -> int:
