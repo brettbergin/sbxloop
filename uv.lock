@@ -668,7 +668,7 @@ wheels = [
 
 [[package]]
 name = "sdxloop"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/sdxloop" }
 dependencies = [
     { name = "pydantic" },
@@ -689,7 +689,7 @@ requires-dist = [
 
 [[package]]
 name = "sdxloop-worker"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/sdxloop-worker" }
 dependencies = [
     { name = "pydantic" },

@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-23
+
 ### Changed
 - `app_name` now defaults to empty: sdxloop shares the user's normal sbx
   application state, so `sbx login` and `sbx policy init balanced` apply
