@@ -1,0 +1,69 @@
+[tool.uv.workspace]
+members = ["packages/sdxloop", "packages/sdxloop-worker"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12",
+    "mypy>=1.16",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["packages/sdxloop/src", "packages/sdxloop-worker/src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # bugbear
+    "SIM",    # simplify
+    "C4",     # comprehensions
+    "RET",    # return
+    "RUF",    # ruff-specific
+    "PTH",    # pathlib
+    "T20",    # no stray prints in library code
+]
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]
+"packages/*/tests/**" = ["T20"]
+# The worker communicates over stdout by design.
+"packages/sdxloop-worker/src/sdxloop_worker/**" = ["T20"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+mypy_path = ["packages/sdxloop/src", "packages/sdxloop-worker/src"]
+files = ["packages/sdxloop/src", "packages/sdxloop-worker/src"]
+explicit_package_bases = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = ["copilot", "copilot.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "packages/sdxloop-worker/tests"]
+addopts = [
+    "--cov=sdxloop",
+    "--cov=sdxloop_worker",
+    "--cov-report=term-missing",
+    "--cov-fail-under=85",
+    "-ra",
+]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]

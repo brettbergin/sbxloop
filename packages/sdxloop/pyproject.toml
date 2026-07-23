@@ -1,0 +1,39 @@
+[project]
+name = "sdxloop"
+version = "0.1.0"
+description = "Agentic loop orchestration on Docker Sandboxes (sbx) with isolated credential domains"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Brett Bergin" }]
+keywords = ["agents", "sandbox", "docker", "copilot", "orchestration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.7",
+    "typer>=0.12",
+    "rich>=13.7",
+    "sdxloop-worker==0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/brettbergin/sdxloop"
+Repository = "https://github.com/brettbergin/sdxloop"
+Issues = "https://github.com/brettbergin/sdxloop/issues"
+
+[tool.uv.sources]
+sdxloop-worker = { workspace = true }
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sdxloop"]
