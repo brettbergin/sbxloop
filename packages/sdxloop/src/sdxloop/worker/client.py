@@ -18,6 +18,7 @@ WorkerTimeoutError is raised.
 from __future__ import annotations
 
 import contextlib
+import logging
 import queue
 import threading
 import time
@@ -34,6 +35,15 @@ from sdxloop.worker.wheel import resolve_worker_wheel
 from sdxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult
 
 STAGED_WHEEL = "/tmp/sdxloop_worker.whl"
+
+logger = logging.getLogger(__name__)
+
+
+def _output_tail(result: ExecResult, limit: int = 2000) -> str:
+    """Combined stderr+stdout tail: sbx exec surfaces some in-sandbox errors
+    on stdout, so stderr alone can be empty exactly when it matters."""
+    combined = "\n".join(part.strip() for part in (result.stderr, result.stdout) if part.strip())
+    return combined[-limit:] if combined else "(no output)"
 
 
 class WorkerClient:
@@ -65,31 +75,45 @@ class WorkerClient:
         no_deps: bool = False,
         system_site_packages: bool = False,
     ) -> None:
-        """Create the worker venv in the sandbox and install sdxloop-worker.
+        """Install sdxloop-worker into the sandbox, venv-first with fallbacks.
+
+        Sandbox templates ship python3 but often lack python3-venv
+        (Debian/Ubuntu split ensurepip out). The ladder:
+
+        1. ``python3 -m venv`` — the clean path.
+        2. On a venv/ensurepip failure: ``sudo -n apt-get install
+           python3-venv python3-pip`` (the template's agent user has sudo;
+           apt hosts are on the balanced allowlist), then retry the venv.
+        3. Still no venv: **user-site fallback** — ``python3 -m pip install
+           --user`` (adding ``--break-system-packages`` when pip reports an
+           externally-managed environment), and the worker runs under the
+           system ``python3``. ``self.python`` is updated so submit() uses
+           the right interpreter either way.
 
         ``no_deps``/``system_site_packages`` are test seams for hermetic
         installs; production uses full dependency resolution (PyPI is
         reachable under the balanced network policy).
         """
         wheel = wheel if wheel is not None else resolve_worker_wheel()
-        venv_cmd = ["python3", "-m", "venv"]
-        if system_site_packages:
-            venv_cmd.append("--system-site-packages")
-        self._check(self.sandbox.exec([*venv_cmd, VENV_DIR], timeout=timeout), "venv creation")
-
-        pip = [f"{VENV_DIR}/bin/pip", "install", "--quiet"]
-        if no_deps:
-            pip.append("--no-deps")
         if wheel is not None:
             self.sandbox.cp_in(wheel, STAGED_WHEEL)
-            target = f"{STAGED_WHEEL}[{extras}]" if extras else STAGED_WHEEL
+            base_target = STAGED_WHEEL
         else:
-            spec = f"sdxloop-worker=={sdxloop.__version__}"
-            target = f"sdxloop-worker[{extras}]=={sdxloop.__version__}" if extras else spec
-        self._check(self.sandbox.exec([*pip, target], timeout=timeout), "worker install")
+            base_target = f"sdxloop-worker=={sdxloop.__version__}"
+        target = f"{base_target}[{extras}]" if extras else base_target
+
+        if self._create_venv(timeout, system_site_packages):
+            self.python = DEFAULT_PYTHON
+            pip = [f"{VENV_DIR}/bin/pip", "install", "--quiet"]
+            if no_deps:
+                pip.append("--no-deps")
+            self._check(self.sandbox.exec([*pip, target], timeout=timeout), "worker install")
+        else:
+            self.python = "python3"
+            self._pip_user_install(target, timeout=timeout, no_deps=no_deps)
 
         verify = self.sandbox.exec(
-            [DEFAULT_PYTHON, "-c", "import sdxloop_worker; print(sdxloop_worker.__version__)"]
+            [self.python, "-c", "import sdxloop_worker; print(sdxloop_worker.__version__)"]
         )
         self._check(verify, "worker import check")
         installed = verify.stdout.strip()
@@ -98,12 +122,54 @@ class WorkerClient:
                 f"worker version {installed!r} does not match host {sdxloop.__version__!r}"
             )
 
+    def _create_venv(self, timeout: float, system_site_packages: bool) -> bool:
+        venv_cmd = ["python3", "-m", "venv"]
+        if system_site_packages:
+            venv_cmd.append("--system-site-packages")
+        venv_cmd.append(VENV_DIR)
+
+        result = self.sandbox.exec(venv_cmd, timeout=timeout)
+        if result.ok:
+            return True
+        output = f"{result.stdout} {result.stderr}".lower()
+        if "ensurepip" in output or "venv" in output:
+            # Self-heal: the official templates run Ubuntu with a sudo-capable
+            # agent user, and apt hosts are on the balanced allowlist.
+            self.sandbox.exec(
+                [
+                    "sh",
+                    "-c",
+                    "sudo -n apt-get update -q && "
+                    "sudo -n apt-get install -y -q python3-venv python3-pip",
+                ],
+                timeout=timeout,
+            )
+            result = self.sandbox.exec(venv_cmd, timeout=timeout)
+            if result.ok:
+                return True
+        logger.warning(
+            "venv creation failed (rc=%s): %s — falling back to a user-site install "
+            "with the system python3",
+            result.returncode,
+            _output_tail(result),
+        )
+        return False
+
+    def _pip_user_install(self, target: str, *, timeout: float, no_deps: bool) -> None:
+        pip = ["python3", "-m", "pip", "install", "--quiet", "--user"]
+        if no_deps:
+            pip.append("--no-deps")
+        result = self.sandbox.exec([*pip, target], timeout=timeout)
+        if not result.ok and "externally-managed" in f"{result.stdout} {result.stderr}".lower():
+            # PEP 668 (Ubuntu 24.04+): system pip refuses --user without an
+            # explicit opt-out.
+            result = self.sandbox.exec([*pip, "--break-system-packages", target], timeout=timeout)
+        self._check(result, "worker install (user-site fallback)")
+
     @staticmethod
     def _check(result: ExecResult, step: str) -> None:
         if not result.ok:
-            raise WorkerError(
-                f"{step} failed (rc={result.returncode}): {result.stderr.strip()[:2000]}"
-            )
+            raise WorkerError(f"{step} failed (rc={result.returncode}): {_output_tail(result)}")
 
     # -- submit ------------------------------------------------------------
 
