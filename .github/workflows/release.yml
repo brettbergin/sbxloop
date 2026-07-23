@@ -55,3 +55,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          # Both dists publish from one job; if one project's upload fails
+          # (e.g. missing Trusted Publisher) the re-run must not trip over
+          # the files that already made it to PyPI.
+          skip-existing: true
