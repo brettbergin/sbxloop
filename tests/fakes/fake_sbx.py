@@ -308,24 +308,34 @@ def cmd_secret(root: Path, args: list[str], stdin: str) -> int:
         else:
             state["service"][key] = stdin
     elif sub == "set-custom":
-        key = f"{flags['host']}|{flags['env']}"
-        if key in state["custom"]:
+        scope = positional[0]
+        env = flags["env"]
+        if env in state["custom"]:
+            owner = state["custom"][env]["scope"]
             print(
-                f"Error: cannot set secret in secret store: secret for "
-                f"{flags['host']}/{flags['env']} already exists",
+                f'ERROR: custom secret env "{env}" already exists in scope '
+                f"{owner} with placeholder sbx-cs-abc123.",
                 file=sys.stderr,
             )
             code = 1
         else:
-            state["custom"][key] = flags.get("value", "")
+            state["custom"][env] = {
+                "scope": scope,
+                "host": flags.get("host", ""),
+                "value": flags.get("value", ""),
+            }
     elif sub == "rm":
-        if "host" in flags:
-            key = f"{flags['host']}|{flags['env']}"
-            if state["custom"].pop(key, None) is None:
+        scope = positional[0]
+        if "env" in flags:
+            env = flags["env"]
+            entry = state["custom"].get(env)
+            if entry is None or entry["scope"] != scope:
                 print("Error: secret not found", file=sys.stderr)
                 code = 1
+            else:
+                del state["custom"][env]
         else:
-            key = f"{positional[0]}|{positional[1]}"
+            key = f"{scope}|{positional[1]}"
             if state["service"].pop(key, None) is None:
                 print("Error: secret not found", file=sys.stderr)
                 code = 1
