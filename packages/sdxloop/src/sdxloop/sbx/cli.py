@@ -229,6 +229,8 @@ class SbxCLI:
         if service:
             args.append(service)
         else:
-            assert host is not None and env is not None
-            args += ["--host", host, "--env", env]
+            assert env is not None
+            if host:
+                args += ["--host", host]
+            args += ["--env", env]
         return self.run(*args, check=False).ok

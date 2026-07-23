@@ -41,10 +41,13 @@ class TestSpecs:
         assert "uploads.github.com" in github.policy_allows
         assert {s.kind for s in agent.secrets} == {"custom"}
         assert [s.service for s in github.secrets] == ["github"]
-        # the copilot token must be bound to both the copilot API and the
-        # token-exchange host
-        assert {s.host for s in agent.secrets} == {"api.githubcopilot.com", "api.github.com"}
-        assert all(s.env == "COPILOT_GITHUB_TOKEN" for s in agent.secrets)
+        # ONE custom secret, bound to the token-exchange host only: sbx keys
+        # custom secrets by env name, so the same env cannot bind two hosts;
+        # the exchanged Copilot token lives in SDK memory, so the copilot API
+        # hosts need network allows but no env rewrite
+        assert [(s.host, s.env) for s in agent.secrets] == [
+            ("api.github.com", "COPILOT_GITHUB_TOKEN")
+        ]
 
     def test_extra_allow_domains_added(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         config = Config.model_validate(
@@ -120,11 +123,8 @@ class TestEnsurePair:
             secrets = fake_sbx.secrets()
             custom = [s for s in secrets if s["args"][0] == "set-custom"]
             service = [s for s in secrets if s["args"][0] == "set"]
-            assert {s["args"][1] for s in custom} == {pair.agent.name}
-            assert {s["args"][s["args"].index("--host") + 1] for s in custom} == {
-                "api.githubcopilot.com",
-                "api.github.com",
-            }
+            assert [s["args"][1] for s in custom] == [pair.agent.name]
+            assert [s["args"][s["args"].index("--host") + 1] for s in custom] == ["api.github.com"]
             assert all("github_pat_copilot" in s["args"] for s in custom)
             assert service == [
                 {
@@ -222,23 +222,25 @@ class TestSecretIdempotency:
         path = fake_sbx.state / "secrets-state.json"
         return json.loads(path.read_text()) if path.is_file() else {"service": {}, "custom": {}}
 
-    def test_reprovision_replaces_existing_secrets(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        """Second run: custom secrets are keyed globally by host+env, so a
-        naive set fails with 'secret exists' — the provisioner must remove
-        and re-set instead of dying (the field-reported bug)."""
+    def test_reprovision_replaces_secret_owned_by_old_scope(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Second run, field-reported shape: sbx keys custom secrets by env
+        name and the conflicting entry is owned by the PREVIOUS run's scope
+        ('already exists in scope <old> with placeholder ...'). The
+        provisioner must parse that scope out of the error, remove the old
+        entry there, and re-set — never die."""
         provisioner = make_provisioner(fake_sbx, tmp_path)
         provisioner.ensure_pair("r1").cleanup()
         pair = provisioner.ensure_pair("r2")  # must not raise
         try:
             state = self.secret_state(fake_sbx)
-            # replaced, not duplicated: still one entry per host+env
-            assert set(state["custom"]) == {
-                "api.githubcopilot.com|COPILOT_GITHUB_TOKEN",
-                "api.github.com|COPILOT_GITHUB_TOKEN",
-            }
-            # rm invocations happened for the collisions
+            entry = state["custom"]["COPILOT_GITHUB_TOKEN"]
+            assert entry["scope"] == "sdxloop-r2-agent"  # replaced, new owner
+            assert entry["value"] == "github_pat_copilot"
+            # the rm targeted the OLD run's scope, parsed from the error
             rms = [s["args"] for s in fake_sbx.secrets() if s["args"][0] == "rm"]
-            assert any("--host" in a for a in rms)
+            assert any(a[1] == "sdxloop-r1-agent" for a in rms)
         finally:
             pair.cleanup()
 
@@ -271,7 +273,7 @@ class TestSecretIdempotency:
         with caplog.at_level(logging.WARNING):
             pair = provisioner.ensure_pair("r2")  # still must not raise
         pair.cleanup()
-        assert any("could not be removed" in r.message for r in caplog.records)
+        assert any("could not be replaced" in r.message for r in caplog.records)
 
     def test_non_exists_secret_error_still_raises(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)

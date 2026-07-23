@@ -6,6 +6,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Secret provisioning now survives sbx's real conflict semantics: custom
+  secrets are keyed by env name (one host per env), so the Copilot token
+  binds to `api.github.com` only (the token-exchange host; the exchanged
+  Copilot token lives in SDK memory). Exists-conflicts parse the owning
+  scope out of sbx's error, try removal candidates from most to least
+  specific, and NEVER fail provisioning — worst case the existing value
+  is kept with a warning.
+
 ## [0.1.2] — 2026-07-23
 
 ### Fixed

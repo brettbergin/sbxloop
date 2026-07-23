@@ -43,7 +43,7 @@ Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pai
 |---|---|---|
 | name | `sdxloop-<run>-agent` | `sdxloop-<run>-github` |
 | credential | `COPILOT_GITHUB_TOKEN` only | `GH_TOKEN` only |
-| injection | `sbx secret set-custom`, bound to `api.githubcopilot.com` + `api.github.com` | built-in `github` secret service |
+| injection | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` secret service |
 | network | balanced policy + copilot hosts | balanced policy + github hosts |
 | runs | Copilot SDK agent sessions, shell checks | `github.op` jobs (gh CLI or REST) |
 
