@@ -70,10 +70,11 @@ class TestRunnerInProcess:
         assert result.status == "timeout"  # type: ignore[attr-defined]
         assert EventTypes.WORKER_ERROR in [e.type for e in events]
 
-    def test_github_op_module_missing(self, tmp_path: Path) -> None:
+    def test_github_op_bad_params(self, tmp_path: Path) -> None:
         job = JobRequest(job_id="j3", run_id="r1", kind="github.op", op="issue.create")
         result, _ = run_job(tmp_path, job)
         assert result.status == "error"  # type: ignore[attr-defined]
+        assert result.error.type == "GithubOpError"  # type: ignore[attr-defined]
 
     def test_heartbeat_thread(self, tmp_path: Path) -> None:
         script = tmp_path / "script.json"
