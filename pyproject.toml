@@ -50,6 +50,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/sdxloop-worker/tests"]
+markers = ["slow: long-running packaging/build tests"]
 addopts = [
     "--cov=sdxloop",
     "--cov=sdxloop_worker",
