@@ -146,15 +146,17 @@ class TestShellCheck:
         assert "marker.txt" in result.output_text
 
 
-class TestGithubOpPlaceholder:
-    def test_github_op_unavailable_yet(self, harness: WorkerHarness) -> None:
+class TestGithubOpErrors:
+    def test_github_op_bad_params_is_error_result(self, harness: WorkerHarness) -> None:
+        # Missing params fail validation before any transport/network use.
         job = JobRequest(job_id="j3", run_id="r1", kind="github.op", op="issue.create", params={})
         proc = harness.run(job)
         assert proc.returncode == 0
         result = harness.result()
         assert result.status == "error"
         assert result.error is not None
-        assert result.error.type == "ModuleNotFoundError"
+        assert result.error.type == "GithubOpError"
+        assert "missing required params" in result.error.message
 
 
 class TestEntrypoint:

@@ -117,9 +117,7 @@ class JobRunner:
         )
 
     def _run_github_op(self, writer: EventWriter) -> JobResult:
-        # Lands in the github-ops PR; until then this raises
-        # ModuleNotFoundError, which run() converts into an error result.
-        from sdxloop_worker.githubops import execute_op  # type: ignore[import-not-found]
+        from sdxloop_worker.githubops import execute_op
 
         assert self.job.op is not None
         writer.emit(EventTypes.GH_OP_START, op=self.job.op)

@@ -68,4 +68,20 @@ class EventBus:
         return event
 
 
-__all__ = ["Event", "EventBus", "Hook", "Subscriber"]
+class HostEventTypes:
+    """Host-emitted event types (the worker's live in protocol.EventTypes)."""
+
+    RUN_START = "run.start"
+    RUN_STATE = "run.state"
+    RUN_END = "run.end"
+    TASK_START = "task.start"
+    TASK_STATE = "task.state"
+    TASK_END = "task.end"
+    PHASE_START = "phase.start"
+    PHASE_END = "phase.end"
+    SANDBOX_PROVISION_START = "sandbox.provision_start"
+    SANDBOX_READY = "sandbox.ready"
+    SANDBOX_CLEANUP = "sandbox.cleanup"
+
+
+__all__ = ["Event", "EventBus", "Hook", "HostEventTypes", "Subscriber"]
