@@ -6,6 +6,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Worker installation no longer dies when the sandbox template lacks
+  python3-venv: it self-heals via `sudo apt-get install python3-venv
+  python3-pip` and, failing that, falls back to a user-site pip install
+  under the system python3 (handling PEP 668 externally-managed
+  environments). Install/exec errors now include stdout as well as
+  stderr — sbx exec surfaces some errors on stdout, which previously
+  produced blank "rc=1" messages.
+
 ## [0.1.3] — 2026-07-23
 
 ### Fixed

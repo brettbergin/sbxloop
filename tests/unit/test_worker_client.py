@@ -199,9 +199,14 @@ class TestInstall:
         pip_calls = [c for c in fake_sbx.invocations("exec") if any("pip" in a for a in c)]
         assert any("/tmp/sdxloop_worker.whl[copilot]" in a for c in pip_calls for a in c)
 
-    def test_install_pypi_fallback(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+    def test_install_pypi_fallback(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import sdxloop
+        from sdxloop.worker import client as client_mod
 
+        # no local wheel available -> install pinned from PyPI
+        monkeypatch.setattr(client_mod, "resolve_worker_wheel", lambda: None)
         client = make_client(sandbox, EventBus())
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
@@ -224,7 +229,89 @@ class TestInstall:
             client.install(wheel=None, extras="")
 
     def test_install_step_failure(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        # venv fails, apt can't heal it, and the user-site fallback fails
+        # too -> the error names the fallback step with the pip output
         client = make_client(sandbox, EventBus())
-        fake_sbx.script("exec boxa python3 -m venv", returncode=1, stderr="no python3 in template")
-        with pytest.raises(WorkerError, match="venv creation failed"):
+        fake_sbx.script("exec boxa python3 -m venv", returncode=1, stderr="no venv here")
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=1, stderr="no sudo")
+        fake_sbx.script("exec boxa python3 -m pip install", returncode=1, stderr="pip is broken")
+        with pytest.raises(WorkerError, match=r"user-site fallback.*pip is broken"):
             client.install(wheel=None)
+
+
+class TestInstallFallbacks:
+    def test_venv_failure_self_heals_via_apt(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        import sdxloop
+
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        # first venv attempt fails the Debian way; after apt, retry succeeds
+        fake_sbx.script(
+            "exec boxa python3 -m venv",
+            returncode=1,
+            stderr="The virtual environment was not created: ensurepip is not available.",
+            once=True,
+        )
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0, once=True)
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0, once=True)
+        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script(
+            "exec boxa /home/agent/.sdxloop/venv/bin/python",
+            stdout=f"{sdxloop.__version__}\n",
+        )
+        client.install(wheel=wheel)
+        assert client.python == "/home/agent/.sdxloop/venv/bin/python"
+        apt_calls = [c for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)]
+        assert apt_calls, "expected an apt-get self-heal attempt"
+
+    def test_user_site_fallback_when_venv_impossible(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        import sdxloop
+
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script("exec boxa python3 -m venv", returncode=1, stderr="venv: not supported")
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=1, stderr="no sudo")
+        # PEP 668: plain --user refused, --break-system-packages accepted
+        fake_sbx.script(
+            "exec boxa python3 -m pip install --quiet --user --break-system-packages",
+            returncode=0,
+            once=True,
+        )
+        fake_sbx.script(
+            "exec boxa python3 -m pip install --quiet --user",
+            returncode=1,
+            stderr="error: externally-managed-environment",
+            once=True,
+        )
+        fake_sbx.script("exec boxa python3 -c", stdout=f"{sdxloop.__version__}\n")
+        client.install(wheel=wheel)
+        assert client.python == "python3"
+        pip_calls = [c for c in fake_sbx.invocations("exec") if any("pip" in a for a in c)]
+        assert any("--break-system-packages" in a for c in pip_calls for a in c)
+
+    def test_install_error_includes_stdout_when_stderr_empty(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        # sbx exec surfaced the real error on stdout; stderr empty
+        fake_sbx.script(
+            "exec boxa python3 -m venv",
+            returncode=1,
+            stdout="Error: no python3-venv on this template\n",
+        )
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=1)
+        fake_sbx.script(
+            "exec boxa python3 -m pip install",
+            returncode=1,
+            stdout="pip exploded on stdout only\n",
+        )
+        with pytest.raises(WorkerError, match="pip exploded on stdout only"):
+            client.install(wheel=wheel)
