@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-23
+
 ### Fixed
 - Secret provisioning now survives sbx's real conflict semantics: custom
   secrets are keyed by env name (one host per env), so the Copilot token
