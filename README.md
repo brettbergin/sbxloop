@@ -1,5 +1,10 @@
 # sdxloop
 
+[![CI](https://github.com/brettbergin/sdxloop/actions/workflows/ci.yml/badge.svg)](https://github.com/brettbergin/sdxloop/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/sdxloop)](https://pypi.org/project/sdxloop/)
+[![Python](https://img.shields.io/pypi/pyversions/sdxloop)](https://pypi.org/project/sdxloop/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Agentic loop orchestration on [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`), with hard credential isolation.**
 
 sdxloop turns a large outcome ("migrate this service to async", "add coverage to every untested module") into a supervised agentic loop: it **decomposes** the outcome into a task graph, then for each task **plans → executes → scrutinizes → verifies → validates**, with revision/replan budgets, checkpointing, and resume.
@@ -75,11 +80,31 @@ Unit and contract tests run against a **fake sbx CLI** — no Docker Sandboxes i
 is required for development. The real-sbx end-to-end suite runs in CI via a manually
 dispatched workflow.
 
+## Setup
+
+1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then `sbx login` and `sbx policy init balanced`.
+2. Create two fine-grained GitHub PATs and export them:
+   - `COPILOT_GITHUB_TOKEN` — personal account, **Copilot Requests** permission. Used *only* by the agent sandbox.
+   - `GH_TOKEN` — repository permissions you want sdxloop to act with (e.g. issues: write, contents: read). Used *only* by the github-ops sandbox.
+3. `sdxloop doctor` verifies all of it and prints remediation for anything missing.
+
+Configuration lives in `sdxloop.toml` / `pyproject.toml [tool.sdxloop]` / `SDXLOOP_*` env vars (`sdxloop init` writes a commented starter file; `sdxloop config show` shows the resolved values and their sources).
+
+## Documentation
+
+- [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume
+- [Worker protocol](docs/worker-protocol.md) — the host↔worker contract: job kinds, events, transports
+- [Changelog](CHANGELOG.md)
+
 ## Requirements
 
 - Python ≥ 3.11
 - [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/) on the host (macOS Apple silicon, Windows 11, or Ubuntu 24.04+/KVM)
 - A GitHub Copilot subscription (any plan) + two fine-grained PATs (see above)
+
+## Releasing
+
+Tag `vX.Y.Z` (matching both package versions) and push: `release.yml` rebuilds, re-runs the full check suite, and publishes both distributions to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — configure the publisher for repo `brettbergin/sdxloop`, workflow `release.yml`, environment `pypi` on both PyPI projects; no token secrets). The manually-dispatched `e2e.yml` workflow installs real sbx on a GitHub runner for end-to-end validation.
 
 ## License
 
