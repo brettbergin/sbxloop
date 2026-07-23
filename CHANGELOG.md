@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-07-23
+
 ### Fixed
 - Worker installation no longer dies when the sandbox template lacks
   python3-venv: it self-heals via `sudo apt-get install python3-venv
