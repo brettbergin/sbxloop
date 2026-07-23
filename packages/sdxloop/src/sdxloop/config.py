@@ -55,7 +55,11 @@ class Budgets(_ConfigModel):
 
 class Config(_ConfigModel):
     model: str = "auto"
-    app_name: str = "sdxloop"
+    # sbx --app-name. Empty (the default) shares the user's normal sbx
+    # application state, so their `sbx login` and `sbx policy init balanced`
+    # apply directly. Setting a name isolates sdxloop state, but the isolated
+    # app-state needs its own `sbx --app-name <name> login` and policy init.
+    app_name: str = ""
     state_dir: Path = Path(".sdxloop")
     keep_sandboxes: bool = False
     worker_transport: WorkerTransport = "stream"

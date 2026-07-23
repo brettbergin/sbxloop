@@ -24,7 +24,7 @@ class SbxCLI:
     def __init__(
         self,
         binary: str = "sbx",
-        app_name: str | None = "sdxloop",
+        app_name: str | None = None,
         default_timeout: float = 120.0,
     ) -> None:
         self.binary = binary

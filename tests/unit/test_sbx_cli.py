@@ -20,15 +20,19 @@ def spec(name: str = "sdxloop-r1-agent", tmp: Path = Path("/tmp")) -> SandboxSpe
 
 
 class TestAppName:
-    def test_app_name_injected(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
+    def test_no_app_name_by_default(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
+        # Default shares the user's normal sbx state so their login and
+        # policy init apply; isolation is opt-in.
         cli.run("version", check=False)
-        raw = fake_sbx.raw_invocations()
-        assert raw[0]["args"] == ["version"]  # app-name stripped by fake, so recorded clean
-        assert cli.argv("version")[:3] == [str(fake_sbx.binary), "--app-name", "sdxloop"]
-
-    def test_app_name_disabled(self, fake_sbx: FakeSbx) -> None:
-        cli = SbxCLI(binary=str(fake_sbx.binary), app_name=None)
+        assert fake_sbx.raw_invocations()[0]["args"] == ["version"]
         assert cli.argv("ls") == [str(fake_sbx.binary), "ls"]
+
+    def test_app_name_opt_in_injected(self, fake_sbx: FakeSbx) -> None:
+        cli = SbxCLI(binary=str(fake_sbx.binary), app_name="sdxloop")
+        assert cli.argv("version")[:3] == [str(fake_sbx.binary), "--app-name", "sdxloop"]
+        cli.run("version", check=False)
+        # the fake strips --app-name before recording, proving it was passed
+        assert fake_sbx.raw_invocations()[0]["args"] == ["version"]
 
 
 class TestLifecycle:
