@@ -54,6 +54,9 @@ jobs:
           enable-cache: true
       - run: uv build --package sdxloop-worker -o dist
       - run: uv build --package sdxloop -o dist
+      - name: Assert worker wheel is vendored inside the host wheel
+        run: |
+          unzip -l dist/sdxloop-*.whl | grep 'sdxloop/_vendor/sdxloop_worker-.*\.whl'
       - name: List artifacts
         run: ls -l dist
       - uses: actions/upload-artifact@v4
