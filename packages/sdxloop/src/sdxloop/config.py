@@ -23,6 +23,10 @@ from sdxloop.errors import ConfigError
 
 ENV_PREFIX = "SDXLOOP_"
 
+# SDXLOOP_-prefixed variables consumed by the *worker process* rather than
+# host configuration; the env config layer must not treat them as settings.
+RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
+
 WorkerTransport = Literal["stream", "poll"]
 SecretStrategy = Literal["proxy", "plain-env"]
 
@@ -56,6 +60,11 @@ class Config(_ConfigModel):
     keep_sandboxes: bool = False
     worker_transport: WorkerTransport = "stream"
     secret_strategy: SecretStrategy = "proxy"
+    # Advanced: in-sandbox interpreter for the worker, and whether to run the
+    # install flow. Overridden in tests/e2e via SDXLOOP_WORKER_PYTHON /
+    # SDXLOOP_INSTALL_WORKERS.
+    worker_python: str = "/home/agent/.sdxloop/venv/bin/python"
+    install_workers: bool = True
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
     budgets: Budgets = Field(default_factory=Budgets)
@@ -102,7 +111,7 @@ def _env_layer(env: Mapping[str, str]) -> dict[str, Any]:
         if not key.startswith(ENV_PREFIX):
             continue
         path = key[len(ENV_PREFIX) :].lower().split("__")
-        if not all(path):
+        if not all(path) or path[0] in RESERVED_ENV_KEYS:
             continue
         node = layer
         for part in path[:-1]:
