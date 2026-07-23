@@ -23,6 +23,9 @@ dependencies = [
     "sdxloop-worker==0.1.0",
 ]
 
+[project.scripts]
+sdxloop = "sdxloop.cli.app:main"
+
 [project.urls]
 Homepage = "https://github.com/brettbergin/sdxloop"
 Repository = "https://github.com/brettbergin/sdxloop"

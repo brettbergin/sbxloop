@@ -35,7 +35,6 @@ from sdxloop.gh.reporter import GithubReporterHook
 from sdxloop.ids import new_run_id
 from sdxloop.sbx.cli import SbxCLI
 from sdxloop.sbx.provision import Provisioner
-from sdxloop.sbx.sandbox import VENV_PYTHON
 from sdxloop.worker.client import WorkerClient
 
 
@@ -48,16 +47,20 @@ class LoopEngine:
         bus: EventBus | None = None,
         hooks: Sequence[Hook] = (),
         sbx: SbxCLI | None = None,
-        worker_python: str = VENV_PYTHON,
-        install_workers: bool = True,
+        worker_python: str | None = None,
+        install_workers: bool | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config or load_config()
         self.store = store or StateStore(self.config.state_dir / "state.db")
         self.bus = bus or EventBus()
         self.sbx = sbx or SbxCLI(app_name=self.config.app_name or None)
-        self.worker_python = worker_python
-        self.install_workers = install_workers
+        self.worker_python = (
+            worker_python if worker_python is not None else (self.config.worker_python)
+        )
+        self.install_workers = (
+            install_workers if install_workers is not None else self.config.install_workers
+        )
         self.clock = clock
         for hook in hooks:
             self.bus.attach_hook(hook)
