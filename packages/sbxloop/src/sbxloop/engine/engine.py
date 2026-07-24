@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Sequence
 
 from sbxloop.config import Config, load_config, load_dotenv_file
+from sbxloop.deliver import deliver_workspace
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     RunResult,
@@ -29,7 +30,14 @@ from sbxloop.engine.model import (
 )
 from sbxloop.engine.phases import PhaseRunner, clip
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import BudgetExceededError, SbxError, SdxloopError, StateError
+from sbxloop.errors import (
+    BudgetExceededError,
+    DeliveryError,
+    GithubOpsError,
+    SbxError,
+    SdxloopError,
+    StateError,
+)
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.reporter import GithubReporterHook
@@ -136,6 +144,8 @@ class LoopEngine:
                     # alive here, and partial artifacts beat none.
                     self._harvest(run_id, pair)
                     self._report_artifacts(run_id, pair)
+                if state == "completed":
+                    self._deliver(run_id, outcome, pair, github)
         except SdxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
@@ -189,6 +199,40 @@ class LoopEngine:
             files=count,
             mounted=pair.mounted,
         )
+
+    def _deliver(self, run_id: str, outcome: str, pair: SandboxPair, github: WorkerClient) -> None:
+        """Publish the completed run's artifacts as a GitHub PR when
+        configured. The run has already succeeded — delivery failure is loud
+        (run.deliver event with the error) but never changes the run state.
+        """
+        repo = self.config.deliver.repo
+        if not repo:
+            return
+        source = (
+            pair.workspace
+            if pair.mounted
+            else self.config.state_dir / "runs" / run_id / "artifacts"
+        )
+        if source is None or not source.is_dir():
+            self.bus.emit(
+                HostEventTypes.RUN_DELIVER, run_id, repo=repo, error="no artifacts directory"
+            )
+            return
+        try:
+            pr = deliver_workspace(
+                GithubOps(github, run_id),
+                repo,
+                run_id=run_id,
+                outcome=outcome,
+                source_dir=source,
+                base=self.config.deliver.base,
+                draft=self.config.deliver.draft,
+            )
+        except (DeliveryError, GithubOpsError) as exc:
+            logger.warning("delivery to %s failed for run %s", repo, run_id, exc_info=True)
+            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
+            return
+        self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, pr=pr.number, url=pr.url)
 
     def _run_phases(
         self, run_id: str, phases: PhaseRunner, deadline: float, pair: SandboxPair

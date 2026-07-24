@@ -347,6 +347,49 @@ class TestRunCommand:
         bare = runner.invoke(app, ["artifacts", run_id, "--path"])
         assert bare.output.strip() == str(runs[0] / "workspace")
 
+    def test_run_deliver_flag_triggers_delivery(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import PrRef
+
+        delivered: list[str] = []
+
+        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
+            delivered.append(repo)
+            return PrRef(number=8, url="https://github.com/o/r/pull/8")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Only task",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+                {"text": "did it", "files": {"hello.txt": "hi"}},
+                {"json": {"verdict": "pass"}},
+                {"json": {"verdict": "accept"}},
+            ],
+        )
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver", "o/r"])
+        assert result.exit_code == 0, result.output
+        assert delivered == ["o/r"]
+        assert "run.deliver" in result.output
+        assert "pull/8" in result.output
+
     def test_run_failure_exit_code(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -362,7 +405,8 @@ class TestArtifactsTree:
     def test_tree_caps_and_hides_dotfiles(self, tmp_path: Path) -> None:
         from rich.console import Console
 
-        from sbxloop.cli.app import _artifact_files, _artifacts_tree
+        from sbxloop.cli.app import _artifacts_tree
+        from sbxloop.engine.model import artifact_files
 
         root = tmp_path / "ws"
         (root / "sub").mkdir(parents=True)
@@ -373,7 +417,7 @@ class TestArtifactsTree:
             (root / f"f{i}.txt").write_text("x" * 2048)
         (root / "sub" / "nested.txt").write_text("y")
 
-        files = _artifact_files(root)
+        files = artifact_files(root)
         assert [p.name for p in files if p.name.startswith(".")] == []
         assert len(files) == 6
 

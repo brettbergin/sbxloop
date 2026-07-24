@@ -187,7 +187,8 @@ def format_event(event: Event) -> str:
     parts = [_stamp(event), event.type]
     if event.data.get("task_id"):
         parts.append(f"[{event.data['task_id']}]")
-    for key in ("state", "content", "tool", "op", "line", "message", "outcome", "path"):
+    keys = ("state", "content", "tool", "op", "line", "message", "outcome", "error", "url", "path")
+    for key in keys:
         if event.data.get(key):
             value = str(event.data[key]).replace("\n", " ")
             parts.append(value[:160])
