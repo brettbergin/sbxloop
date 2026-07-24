@@ -18,6 +18,9 @@ from sdxloop_worker.protocol import JobRequest
 from sdxloop_worker.runner import JobRunner
 
 DEFAULT_ENV_FILE = Path.home() / ".sdxloop" / "env.sh"
+# sbx documents this file as the place persistent sandbox env lives; load
+# it too so secrets reach the worker even outside login-shell contexts.
+PERSISTENT_ENV_FILE = Path("/etc/sandbox-persistent.sh")
 
 _EXPORT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
@@ -65,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     apply_env_file(args.env_file)
+    apply_env_file(PERSISTENT_ENV_FILE)
 
     try:
         job = JobRequest.model_validate_json(args.job.read_text())

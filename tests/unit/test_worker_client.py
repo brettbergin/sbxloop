@@ -415,3 +415,21 @@ class TestEntrypointSmoke:
         )
         with pytest.raises(WorkerError, match=r"entrypoint check failed.*entrypoint exploded"):
             client.install(wheel=wheel)
+
+
+class TestLoginShellWrapping:
+    def test_worker_runs_under_login_shell(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        """sbx injects secrets via the session/profile machinery, so the
+        worker must run under `sh -lc` to see them (field: SDK 'Session was
+        not created with authentication info')."""
+        make_client(sandbox, EventBus()).submit(agent_job())
+        worker_execs = [
+            c
+            for c in fake_sbx.invocations("exec")
+            if any("sdxloop_worker" in a for a in c) and "pkill" not in c
+        ]
+        assert worker_execs, "no worker exec recorded"
+        head = worker_execs[0][:4]
+        assert head[0] == "exec"
+        assert head[2] == "sh"
+        assert head[3] == "-lc"

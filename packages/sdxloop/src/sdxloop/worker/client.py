@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import queue
+import shlex
 import threading
 import time
 from collections import deque
@@ -223,12 +224,16 @@ class WorkerClient:
             "--env-file",
             ENV_FILE,
         ]
+        # sbx injects secrets through the sandbox session/profile machinery;
+        # a bare exec'd process may not see them. Run the worker under a
+        # login shell so the sandbox environment is fully loaded.
+        wrapped = ["sh", "-lc", shlex.join(argv)]
         deadline = time.monotonic() + job.timeout_s + self.grace_s
         if self.transport == "poll":
-            self._run_poll(job, argv, events_path, result_path, deadline)
+            self._run_poll(job, wrapped, events_path, result_path, deadline)
             diagnostics = ""
         else:
-            diagnostics = self._run_stream(job, argv, deadline)
+            diagnostics = self._run_stream(job, wrapped, deadline)
         return self._fetch_result(job, result_path, events_path, diagnostics)
 
     # -- stream transport --------------------------------------------------
@@ -303,7 +308,7 @@ class WorkerClient:
         result_path: str,
         deadline: float,
     ) -> None:
-        quoted = " ".join(argv)
+        quoted = shlex.join(argv)
         launch = self.sandbox.exec(["sh", "-c", f"nohup {quoted} >/dev/null 2>&1 & echo $!"])
         if not launch.ok:
             raise WorkerError(f"failed to launch worker: {launch.stderr.strip()[:2000]}")

@@ -156,6 +156,7 @@ class Provisioner:
                 created.append(sandbox)
                 self._apply_policy(spec)
                 self._apply_secrets(spec, sandbox, tokens[spec.role])
+                self._verify_secret_env(run_id, spec, sandbox)
                 sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
                 if self.post_create is not None:
                     self.post_create(sandbox, spec.role)
@@ -304,6 +305,34 @@ class Provisioner:
             "secret %s already exists and could not be replaced; keeping the "
             "existing value (it may be stale if the token was rotated)",
             describe,
+        )
+
+    def _verify_secret_env(self, run_id: str, spec: SandboxSpec, sandbox: Sandbox) -> None:
+        """Warn early when the injected secret env var is not visible.
+
+        Non-fatal: the SDK may have other auth paths, and the worker also
+        loads /etc/sandbox-persistent.sh itself. But an invisible token is
+        the leading cause of "Session was not created with authentication
+        info" deep inside the first agent job - surface it here instead.
+        """
+        env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
+        result = sandbox.exec(["sh", "-lc", f'test -n "${{{env_name}}}"'])
+        if result.ok:
+            return
+        message = (
+            f"{env_name} is not visible in {spec.name}'s shell environment after "
+            f"secret injection ({self.config.secret_strategy!r} strategy). Agent "
+            'auth will likely fail; consider `secret_strategy = "plain-env"` '
+            "in sdxloop.toml (or SDXLOOP_SECRET_STRATEGY=plain-env)."
+        )
+        logger.warning(message)
+        self.bus.emit(
+            "sandbox.secret_env_missing",
+            run_id,
+            name=spec.name,
+            env=env_name,
+            strategy=self.config.secret_strategy,
+            message=message,
         )
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:

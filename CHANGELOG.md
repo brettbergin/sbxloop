@@ -6,6 +6,17 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Copilot session auth: the worker now runs under a login shell
+  (`sh -lc`) so sbx-injected secret env vars reach it, and it also loads
+  `/etc/sandbox-persistent.sh`. Provisioning verifies the secret env is
+  visible in each sandbox and emits a `sandbox.secret_env_missing`
+  warning (with a plain-env remediation hint) when it is not. Copilot
+  session failures now append an auth diagnostic stating whether
+  COPILOT_GITHUB_TOKEN is missing, well-formed, or looks like the sbx
+  proxy sentinel (which the SDK's client-side token validation cannot
+  use - switch to `secret_strategy = "plain-env"` in that case).
+
 ## [0.1.7] — 2026-07-23
 
 ### Fixed
