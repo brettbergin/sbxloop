@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-07-23
+
 ### Changed
 - The live run view is now a chat-style transcript: agent messages render
   as markdown panels (fenced ```json blocks syntax-highlighted and
