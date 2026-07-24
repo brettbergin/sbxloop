@@ -34,7 +34,10 @@ from sdxloop.sbx.sandbox import VENV_PYTHON as DEFAULT_PYTHON
 from sdxloop.worker.wheel import resolve_worker_wheel
 from sdxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult
 
-STAGED_WHEEL = "/tmp/sdxloop_worker.whl"
+# Wheels must keep their canonical filename when staged: pip validates the
+# name-version-python-abi-platform structure of the FILENAME itself and
+# refuses to install a renamed wheel ("Invalid wheel filename").
+STAGED_WHEEL_DIR = "/tmp"
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +99,9 @@ class WorkerClient:
         """
         wheel = wheel if wheel is not None else resolve_worker_wheel()
         if wheel is not None:
-            self.sandbox.cp_in(wheel, STAGED_WHEEL)
-            base_target = STAGED_WHEEL
+            staged = f"{STAGED_WHEEL_DIR}/{wheel.name}"
+            self.sandbox.cp_in(wheel, staged)
+            base_target = staged
         else:
             base_target = f"sdxloop-worker=={sdxloop.__version__}"
         target = f"{base_target}[{extras}]" if extras else base_target
