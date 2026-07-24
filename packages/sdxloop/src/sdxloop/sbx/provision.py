@@ -156,7 +156,7 @@ class Provisioner:
                 created.append(sandbox)
                 self._apply_policy(spec)
                 self._apply_secrets(spec, sandbox, tokens[spec.role])
-                self._verify_secret_env(run_id, spec, sandbox)
+                self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
                 sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
                 if self.post_create is not None:
                     self.post_create(sandbox, spec.role)
@@ -307,13 +307,18 @@ class Provisioner:
             describe,
         )
 
-    def _verify_secret_env(self, run_id: str, spec: SandboxSpec, sandbox: Sandbox) -> None:
-        """Warn early when the injected secret env var is not visible.
+    def _verify_secret_env(
+        self, run_id: str, spec: SandboxSpec, sandbox: Sandbox, token: str
+    ) -> None:
+        """Verify the secret env is visible; auto-heal with plain-env if not.
 
-        Non-fatal: the SDK may have other auth paths, and the worker also
-        loads /etc/sandbox-persistent.sh itself. But an invisible token is
-        the leading cause of "Session was not created with authentication
-        info" deep inside the first agent job - surface it here instead.
+        Field-confirmed (2026-07-23): sbx's proxy secret injection feeds the
+        interactive agent sessions sbx launches, but NOT `sbx exec`
+        processes - not even login shells. When the proxy strategy leaves
+        the env invisible, provisioning falls back to writing the in-VM env
+        file for that sandbox so runs work, with a loud event about the
+        security tradeoff. If sbx later injects secrets into exec sessions,
+        this check passes and the token stays out of the VM.
         """
         env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
         result = sandbox.exec(["sh", "-lc", f'test -n "${{{env_name}}}"'])
@@ -321,9 +326,7 @@ class Provisioner:
             return
         message = (
             f"{env_name} is not visible in {spec.name}'s shell environment after "
-            f"secret injection ({self.config.secret_strategy!r} strategy). Agent "
-            'auth will likely fail; consider `secret_strategy = "plain-env"` '
-            "in sdxloop.toml (or SDXLOOP_SECRET_STRATEGY=plain-env)."
+            f"secret injection ({self.config.secret_strategy!r} strategy)."
         )
         logger.warning(message)
         self.bus.emit(
@@ -333,6 +336,26 @@ class Provisioner:
             env=env_name,
             strategy=self.config.secret_strategy,
             message=message,
+        )
+        if self.config.secret_strategy != "proxy":
+            return
+        # Auto-heal: fall back to the plain-env file for this sandbox. The
+        # token value becomes visible inside the microVM (which the agent
+        # already controls); egress remains bounded by the network policy.
+        fallback_message = (
+            f"falling back to the in-VM env file for {spec.name}: the sbx secret "
+            "proxy does not expose env vars to exec'd processes. Set "
+            '`secret_strategy = "plain-env"` to make this explicit and silence '
+            "the warning."
+        )
+        logger.warning(fallback_message)
+        self._apply_plain_env(spec, sandbox, token)
+        self.bus.emit(
+            "sandbox.secret_env_fallback",
+            run_id,
+            name=spec.name,
+            env=env_name,
+            message=fallback_message,
         )
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:

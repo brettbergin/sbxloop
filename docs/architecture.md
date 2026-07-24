@@ -47,11 +47,16 @@ Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pai
 | network | balanced policy + copilot hosts | balanced policy + github hosts |
 | runs | Copilot SDK agent sessions, shell checks | `github.op` jobs (gh CLI or REST) |
 
-Under the default `proxy` secret strategy, **token values never enter either
-VM**: sbx stores them in the host keychain and its egress proxy substitutes
-them only on requests to the declared hosts. The agent layer can therefore
-never exfiltrate the user PAT (it never sees any PAT but its own sentinel),
-and the GitHub layer can never spend Copilot quota.
+Under the default `proxy` secret strategy, sdxloop first attempts sbx's
+keychain-backed injection, where **token values never enter the VM**.
+Field reality (sbx 0.35): that injection feeds only the interactive agent
+sessions sbx launches — never `sbx exec` processes — so provisioning
+verifies visibility and **auto-falls-back to an in-VM env file**
+(`~/.sdxloop/env.sh`, chmod 600) when the env is invisible, emitting a
+`sandbox.secret_env_fallback` event. In fallback mode the token value is
+visible inside its own microVM, but the credential *split* still holds
+(each sandbox only ever receives its own token) and egress remains bounded
+by the balanced network policy.
 
 Both sandboxes run under sbx's **balanced** network policy (default-deny plus
 a curated allowlist), with per-sandbox allow rules added for exactly the
