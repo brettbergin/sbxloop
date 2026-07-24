@@ -379,7 +379,7 @@ class TestDeliverHook:
     test_deliver.py. deliver_workspace is patched — no GitHub, no network."""
 
     def deliver_engine(self, harness: Harness) -> LoopEngine:
-        return harness.engine(deliver={"repo": "o/r"})
+        return harness.engine(github={"repo": "o/r", "deliver": True})
 
     def test_completed_run_delivers_and_emits_pr(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch

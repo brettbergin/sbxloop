@@ -206,13 +206,17 @@ class LoopEngine:
             mounted=pair.mounted,
         )
 
-    def _deliver(self, run_id: str, outcome: str, pair: SandboxPair, github: WorkerClient) -> None:
-        """Publish the completed run's artifacts as a GitHub PR when
-        configured. The run has already succeeded — delivery failure is loud
-        (run.deliver event with the error) but never changes the run state.
+    def _deliver(
+        self, run_id: str, outcome: str, pair: SandboxPair, github: WorkerClient | None
+    ) -> None:
+        """Publish the completed run's artifacts as a PR to the configured
+        [github].repo when delivery is enabled. The run has already
+        succeeded — delivery failure is loud (run.deliver event with the
+        error) but never changes the run state.
         """
-        repo = self.config.deliver.repo
-        if not repo:
+        gh = self.config.github
+        repo = gh.repo
+        if not gh.deliver or not repo or github is None:
             return
         source = (
             pair.workspace
@@ -231,8 +235,8 @@ class LoopEngine:
                 run_id=run_id,
                 outcome=outcome,
                 source_dir=source,
-                base=self.config.deliver.base,
-                draft=self.config.deliver.draft,
+                base=gh.deliver_base,
+                draft=gh.deliver_draft,
             )
         except (DeliveryError, GithubOpsError) as exc:
             logger.warning("delivery to %s failed for run %s", repo, run_id, exc_info=True)

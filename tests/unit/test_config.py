@@ -100,13 +100,16 @@ def test_env_string_fallback(tmp_path: Path) -> None:
 
 
 def test_deliver_config_layers(tmp_path: Path) -> None:
-    (tmp_path / "sbxloop.toml").write_text('[deliver]\nrepo = "file/repo"\ndraft = true\n')
+    (tmp_path / "sbxloop.toml").write_text(
+        '[github]\nrepo = "file/repo"\ndeliver = true\ndeliver_draft = true\n'
+    )
     config = load_config(cwd=tmp_path, env={})
-    assert config.deliver.repo == "file/repo"
-    assert config.deliver.draft is True
-    assert config.deliver.base is None
+    assert config.github.repo == "file/repo"
+    assert config.github.deliver is True
+    assert config.github.deliver_draft is True
+    assert config.github.deliver_base is None
 
-    config = load_config(cwd=tmp_path, env={"SBXLOOP_DELIVER__REPO": "env/repo"})
-    assert config.deliver.repo == "env/repo"
+    config = load_config(cwd=tmp_path, env={"SBXLOOP_GITHUB__DELIVER_BASE": "develop"})
+    assert config.github.deliver_base == "develop"
 
-    assert Config().deliver.repo is None  # delivery is opt-in
+    assert Config().github.deliver is False  # delivery is opt-in

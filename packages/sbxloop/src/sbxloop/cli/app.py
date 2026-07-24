@@ -496,14 +496,11 @@ extra_allow_domains = []
 # repo = "you/your-repo"
 # Post run progress (issues/comments) to the configured repo.
 # report = false
-
-[deliver]
-# Open a PR with the run's artifacts when a run completes ("owner/repo";
-# empty disables). GH_TOKEN needs contents:write + pull_requests:write on
-# the target. base defaults to the repo's default branch.
-# repo = "you/your-repo"
-# base = "main"
-# draft = false
+# Open a PR with the run's artifacts when a run completes (or `--deliver`).
+# GH_TOKEN needs contents:write + pull_requests:write on the repo.
+# deliver = false
+# deliver_base = "main"   # base branch; unset uses the repo's default
+# deliver_draft = false
 
 [budgets]
 max_revisions_per_task = 2

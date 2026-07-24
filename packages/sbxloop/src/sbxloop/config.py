@@ -51,6 +51,10 @@ class GithubConfig(_ConfigModel):
 
     repo: str | None = None
     report: bool = False
+    # Publish a completed run's artifacts as a PR to `repo`.
+    deliver: bool = False
+    deliver_base: str | None = None  # base branch; None → the repo's default
+    deliver_draft: bool = False
 
     @field_validator("repo")
     @classmethod
@@ -62,14 +66,6 @@ class GithubConfig(_ConfigModel):
     @property
     def enabled(self) -> bool:
         return self.repo is not None
-
-
-class DeliverConfig(_ConfigModel):
-    """Publish a completed run's artifacts as a GitHub PR (empty disables)."""
-
-    repo: str | None = None
-    base: str | None = None  # defaults to the repo's default branch
-    draft: bool = False
 
 
 class Budgets(_ConfigModel):
@@ -98,7 +94,6 @@ class Config(_ConfigModel):
     install_workers: bool = True
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
-    deliver: DeliverConfig = Field(default_factory=DeliverConfig)
     budgets: Budgets = Field(default_factory=Budgets)
 
 

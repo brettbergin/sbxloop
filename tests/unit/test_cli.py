@@ -496,11 +496,21 @@ class TestRunCommand:
                 {"json": {"verdict": "accept"}},
             ],
         )
-        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver", "o/r"])
+        monkeypatch.setenv("SBXLOOP_GITHUB__REPO", "o/r")
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver"])
         assert result.exit_code == 0, result.output
         assert delivered == ["o/r"]
         assert "run.deliver" in result.output
         assert "pull/8" in result.output
+
+    def test_run_deliver_refused_without_github_config(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, [])
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver"])
+        assert result.exit_code == 2
+        assert "GitHub integration is not configured" in result.output
+        assert fake_sbx.invocations("create") == []
 
     def test_run_failure_exit_code(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
