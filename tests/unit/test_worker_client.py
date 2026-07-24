@@ -326,9 +326,11 @@ class TestRealPipInstall:
         pip validates the staged FILENAME itself, so nothing short of
         actually running pip exercises that contract."""
         import sdxloop
-        from sdxloop.worker.wheel import resolve_worker_wheel
+        from sdxloop.worker import wheel as wheel_mod
 
-        wheel = resolve_worker_wheel()
+        # another test file may have poisoned the build cache with None
+        wheel_mod._workspace_build.cache_clear()
+        wheel = wheel_mod.resolve_worker_wheel()
         if wheel is None:
             pytest.skip("no worker wheel available (uv not on PATH)")
         client = make_client(sandbox, EventBus())
