@@ -6,6 +6,17 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- "produced no result file" failures are now diagnosable: the worker's
+  stderr is drained (also fixing a potential pipe-deadlock for chatty
+  workers) and the error carries the exec exit code, stderr tail, and
+  the last lines of the in-sandbox events file.
+- Worker installation now ends with an entrypoint smoke check:
+  `python -m sdxloop_worker run` against a missing job must exit 64.
+  Importing the package proves nothing about the entrypoint executing —
+  broken entrypoints now fail at install time with a full traceback
+  instead of as silent no-result jobs.
+
 ## [0.1.5] — 2026-07-23
 
 ### Fixed

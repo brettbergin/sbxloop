@@ -22,6 +22,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import sdxloop
@@ -126,6 +127,31 @@ class WorkerClient:
                 f"worker version {installed!r} does not match host {sdxloop.__version__!r}"
             )
 
+        # Entrypoint smoke check: importing the package proves nothing about
+        # `python -m sdxloop_worker` actually executing under sbx exec. A run
+        # against a missing job file must exit 64 (the worker's usage-error
+        # code) — anything else means jobs would die with no result file,
+        # so fail HERE with full output instead of at the first real job.
+        smoke = self.sandbox.exec(
+            [
+                self.python,
+                "-m",
+                "sdxloop_worker",
+                "run",
+                "--job",
+                "/tmp/sdxloop-smoke-missing.json",
+                "--events",
+                "/tmp/sdxloop-smoke.events.jsonl",
+                "--result",
+                "/tmp/sdxloop-smoke.result.json",
+            ]
+        )
+        if smoke.returncode != 64:
+            raise WorkerError(
+                "worker entrypoint check failed "
+                f"(rc={smoke.returncode}, expected 64): {_output_tail(smoke)}"
+            )
+
     def _create_venv(self, timeout: float, system_site_packages: bool) -> bool:
         venv_cmd = ["python3", "-m", "venv"]
         if system_site_packages:
@@ -200,15 +226,19 @@ class WorkerClient:
         deadline = time.monotonic() + job.timeout_s + self.grace_s
         if self.transport == "poll":
             self._run_poll(job, argv, events_path, result_path, deadline)
+            diagnostics = ""
         else:
-            self._run_stream(job, argv, deadline)
-        return self._fetch_result(job, result_path)
+            diagnostics = self._run_stream(job, argv, deadline)
+        return self._fetch_result(job, result_path, events_path, diagnostics)
 
     # -- stream transport --------------------------------------------------
 
-    def _run_stream(self, job: JobRequest, argv: list[str], deadline: float) -> None:
+    def _run_stream(self, job: JobRequest, argv: list[str], deadline: float) -> str:
+        """Run the worker via a blocking exec; returns diagnostics (exit code
+        + stderr tail) for the no-result failure path."""
         proc = self.sandbox.exec_stream(argv)
         lines: queue.Queue[str | None] = queue.Queue()
+        stderr_tail: deque[str] = deque(maxlen=50)
 
         def reader() -> None:
             assert proc.stdout is not None
@@ -216,8 +246,16 @@ class WorkerClient:
                 lines.put(line)
             lines.put(None)
 
-        thread = threading.Thread(target=reader, name="sdxloop-stream-reader", daemon=True)
-        thread.start()
+        def err_reader() -> None:
+            # stderr must be drained: an unread PIPE deadlocks a chatty
+            # worker once the 64KB buffer fills — and its content is the
+            # only clue when the process dies before writing a result.
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_tail.append(line.rstrip())
+
+        threading.Thread(target=reader, name="sdxloop-stream-reader", daemon=True).start()
+        threading.Thread(target=err_reader, name="sdxloop-stderr-reader", daemon=True).start()
 
         try:
             while True:
@@ -237,6 +275,10 @@ class WorkerClient:
         finally:
             with contextlib.suppress(Exception):
                 proc.wait(timeout=self.grace_s)
+        parts = [f"exec rc={proc.returncode}"]
+        if stderr_tail:
+            parts.append("stderr: " + " | ".join(stderr_tail)[-1500:])
+        return "; ".join(parts)
 
     def _handle_line(self, job: JobRequest, line: str) -> None:
         line = line.strip()
@@ -314,13 +356,33 @@ class WorkerClient:
             with contextlib.suppress(Exception):
                 proc.kill()  # type: ignore[attr-defined]
 
-    def _fetch_result(self, job: JobRequest, result_path: str) -> JobResult:
+    def _events_tail(self, events_path: str, lines: int = 5) -> str:
+        if not events_path:
+            return ""
+        with contextlib.suppress(Exception):
+            result = self.sandbox.exec(
+                ["sh", "-c", f"tail -n {lines} {events_path} 2>/dev/null || true"]
+            )
+            return result.stdout.strip().replace("\n", " | ")[-1500:]
+        return ""
+
+    def _fetch_result(
+        self,
+        job: JobRequest,
+        result_path: str,
+        events_path: str = "",
+        diagnostics: str = "",
+    ) -> JobResult:
         try:
             raw = self.sandbox.read_text(result_path)
         except SbxError as exc:
-            raise WorkerError(
-                f"worker for job {job.job_id} produced no result file ({result_path})"
-            ) from exc
+            detail = [f"worker for job {job.job_id} produced no result file ({result_path})"]
+            if diagnostics:
+                detail.append(diagnostics)
+            tail = self._events_tail(events_path)
+            if tail:
+                detail.append(f"last events: {tail}")
+            raise WorkerError("; ".join(detail)) from exc
         try:
             result = JobResult.model_validate_json(raw)
         except ValueError as exc:
