@@ -1,4 +1,4 @@
-from sdxloop import ids
+from sbxloop import ids
 
 
 def test_run_id_shape_and_uniqueness() -> None:

@@ -1,13 +1,13 @@
-# sdxloop
+# sbxloop
 
-[![CI](https://github.com/brettbergin/sdxloop/actions/workflows/ci.yml/badge.svg)](https://github.com/brettbergin/sdxloop/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/sdxloop)](https://pypi.org/project/sdxloop/)
-[![Python](https://img.shields.io/pypi/pyversions/sdxloop)](https://pypi.org/project/sdxloop/)
+[![CI](https://github.com/brettbergin/sbxloop/actions/workflows/ci.yml/badge.svg)](https://github.com/brettbergin/sbxloop/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/sbxloop)](https://pypi.org/project/sbxloop/)
+[![Python](https://img.shields.io/pypi/pyversions/sbxloop)](https://pypi.org/project/sbxloop/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Agentic loop orchestration on [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`), with hard credential isolation.**
 
-sdxloop turns a large outcome ("migrate this service to async", "add coverage to every untested module") into a supervised agentic loop: it **decomposes** the outcome into a task graph, then for each task **plans → executes → scrutinizes → verifies → validates**, with revision/replan budgets, checkpointing, and resume.
+sbxloop turns a large outcome ("migrate this service to async", "add coverage to every untested module") into a supervised agentic loop: it **decomposes** the outcome into a task graph, then for each task **plans → executes → scrutinizes → verifies → validates**, with revision/replan budgets, checkpointing, and resume.
 
 ## The primitive: a sandbox pair
 
@@ -15,29 +15,29 @@ Every run gets **two isolated microVM sandboxes**, so no single environment ever
 
 | Sandbox | Credential | Purpose |
 |---|---|---|
-| `sdxloop-<run>-agent` | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM. |
-| `sdxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: issues write, contents read, …) | Performs user-facing GitHub operations (issues, PRs, statuses) on your behalf. |
+| `sbxloop-<run>-agent` | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM. |
+| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: issues write, contents read, …) | Performs user-facing GitHub operations (issues, PRs, statuses) on your behalf. |
 
 Both sandboxes run under sbx's **balanced network policy** (default-deny egress plus a curated allowlist), and tokens are injected through sbx's secret proxy — **credential values never enter the VM**; the host proxy substitutes them only on egress to their declared domains.
 
 ## Quickstart
 
 ```bash
-pip install sdxloop
+pip install sbxloop
 
 # one-time host setup
 sbx login
 sbx policy init balanced
-sdxloop doctor          # verifies sbx, policy, tokens, worker wheel
+sbxloop doctor          # verifies sbx, policy, tokens, worker wheel
 
 # go
-sdxloop run "Add mypy strict typing to every module in ./src and fix all findings"
+sbxloop run "Add mypy strict typing to every module in ./src and fix all findings"
 ```
 
 Or as a library:
 
 ```python
-from sdxloop import LoopEngine, load_config
+from sbxloop import LoopEngine, load_config
 
 engine = LoopEngine(config=load_config())
 result = engine.start(outcome="Add mypy strict typing to ./src and fix all findings")
@@ -58,15 +58,15 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
 - **Verify** — mechanical: the task's `verify_commands` must exit 0. No LLM.
 - **Validate** — a fresh read-only session judges the acceptance criteria.
 - Budgets bound revisions, replans, tasks, and wall clock. State is checkpointed to
-  SQLite after every transition; `sdxloop resume <run>` re-provisions sandboxes
+  SQLite after every transition; `sbxloop resume <run>` re-provisions sandboxes
   (they're cattle) and continues where it left off.
 
 ## Repository layout
 
 This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with two distributions:
 
-- [`packages/sdxloop`](packages/sdxloop) — the host orchestrator: sbx CLI wrapper, sandbox pair provisioning, worker transport, loop engine, typer CLI + rich TUI.
-- [`packages/sdxloop-worker`](packages/sdxloop-worker) — the in-sandbox runtime: shared protocol models, job runner, Copilot backend. Installed into sandboxes automatically (the host package embeds the worker wheel, so this works before anything is on PyPI).
+- [`packages/sbxloop`](packages/sbxloop) — the host orchestrator: sbx CLI wrapper, sandbox pair provisioning, worker transport, loop engine, typer CLI + rich TUI.
+- [`packages/sbxloop-worker`](packages/sbxloop-worker) — the in-sandbox runtime: shared protocol models, job runner, Copilot backend. Installed into sandboxes automatically (the host package embeds the worker wheel, so this works before anything is on PyPI).
 
 ## Development
 
@@ -85,16 +85,16 @@ dispatched workflow.
 1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then `sbx login` and `sbx policy init balanced`.
 2. Create two fine-grained GitHub PATs:
    - `COPILOT_GITHUB_TOKEN` — personal account, **Copilot Requests** permission. Used *only* by the agent sandbox.
-   - `GH_TOKEN` — repository permissions you want sdxloop to act with (e.g. issues: write, contents: read). Used *only* by the github-ops sandbox.
+   - `GH_TOKEN` — repository permissions you want sbxloop to act with (e.g. issues: write, contents: read). Used *only* by the github-ops sandbox.
 
    Export them, or put them in a `.env` file (loaded automatically from the working directory; real environment variables always win):
 
    ```bash
    cp .env.example .env   # then fill in the two tokens
    ```
-3. `sdxloop doctor` verifies all of it and prints remediation for anything missing.
+3. `sbxloop doctor` verifies all of it and prints remediation for anything missing.
 
-Configuration lives in `sdxloop.toml` / `pyproject.toml [tool.sdxloop]` / `SDXLOOP_*` env vars (`sdxloop init` writes a commented starter file; `sdxloop config show` shows the resolved values and their sources).
+Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLOOP_*` env vars (`sbxloop init` writes a commented starter file; `sbxloop config show` shows the resolved values and their sources).
 
 ## Documentation
 
@@ -110,7 +110,7 @@ Configuration lives in `sdxloop.toml` / `pyproject.toml [tool.sdxloop]` / `SDXLO
 
 ## Releasing
 
-Tag `vX.Y.Z` (matching both package versions) and push: `release.yml` rebuilds, re-runs the full check suite, and publishes both distributions to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — configure the publisher for repo `brettbergin/sdxloop`, workflow `release.yml`, environment `pypi` on both PyPI projects; no token secrets). The manually-dispatched `e2e.yml` workflow installs real sbx on a GitHub runner for end-to-end validation.
+Tag `vX.Y.Z` (matching both package versions) and push: `release.yml` rebuilds, re-runs the full check suite, and publishes both distributions to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — configure the publisher for repo `brettbergin/sbxloop`, workflow `release.yml`, environment `pypi` on both PyPI projects; no token secrets). The manually-dispatched `e2e.yml` workflow installs real sbx on a GitHub runner for end-to-end validation.
 
 ## License
 

@@ -1,7 +1,7 @@
 name: E2E (real sbx)
 
 # Manually dispatched: installs real Docker Sandboxes on the runner and runs
-# sdxloop against it. Requires repository secrets:
+# sbxloop against it. Requires repository secrets:
 #   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  - for `sbx login`
 # and, to run the full smoke loop (skipped when absent):
 #   E2E_COPILOT_GITHUB_TOKEN  - fine-grained PAT w/ "Copilot Requests"
@@ -12,7 +12,7 @@ on:
     inputs:
       smoke_outcome:
         description: Outcome for the smoke run
-        default: "Create a file named hello.txt containing exactly 'hello sdxloop'"
+        default: "Create a file named hello.txt containing exactly 'hello sbxloop'"
         required: false
 
 env:
@@ -54,34 +54,34 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           echo -n "" | gnome-keyring-daemon --unlock --components=secrets || true
-          printf '%s' "$DOCKERHUB_TOKEN" | sbx --app-name sdxloop-e2e login --username "$DOCKERHUB_USERNAME" --password-stdin
-          sbx --app-name sdxloop-e2e version
+          printf '%s' "$DOCKERHUB_TOKEN" | sbx --app-name sbxloop-e2e login --username "$DOCKERHUB_USERNAME" --password-stdin
+          sbx --app-name sbxloop-e2e version
 
       - name: sbx policy init balanced
-        run: sbx --app-name sdxloop-e2e policy init balanced
+        run: sbx --app-name sbxloop-e2e policy init balanced
 
-      - name: sdxloop doctor
+      - name: sbxloop doctor
         env:
-          SDXLOOP_APP_NAME: sdxloop-e2e
+          SBXLOOP_APP_NAME: sbxloop-e2e
           COPILOT_GITHUB_TOKEN: ${{ secrets.E2E_COPILOT_GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.E2E_GH_TOKEN }}
         # Doctor exits 1 when tokens are missing; report but don't hide it.
-        run: uv run sdxloop doctor || echo "::warning::doctor reported failures (expected when e2e token secrets are not configured)"
+        run: uv run sbxloop doctor || echo "::warning::doctor reported failures (expected when e2e token secrets are not configured)"
 
       - name: Smoke run
         if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
         env:
-          SDXLOOP_APP_NAME: sdxloop-e2e
+          SBXLOOP_APP_NAME: sbxloop-e2e
           COPILOT_GITHUB_TOKEN: ${{ secrets.E2E_COPILOT_GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.E2E_GH_TOKEN }}
-          SDXLOOP_BUDGETS__MAX_TASKS: "3"
-          SDXLOOP_BUDGETS__MAX_WALL_CLOCK_S: "1800"
+          SBXLOOP_BUDGETS__MAX_TASKS: "3"
+          SBXLOOP_BUDGETS__MAX_WALL_CLOCK_S: "1800"
         run: |
-          uv run sdxloop run "${{ inputs.smoke_outcome }}" --no-tui
-          uv run sdxloop status
+          uv run sbxloop run "${{ inputs.smoke_outcome }}" --no-tui
+          uv run sbxloop status
 
       - name: Cleanup
         if: always()
         run: |
-          uv run sdxloop sandbox rm --all || true
-          sbx --app-name sdxloop-e2e logout --yes || true
+          uv run sbxloop sandbox rm --all || true
+          sbx --app-name sbxloop-e2e logout --yes || true

@@ -95,14 +95,14 @@ def require_sandbox(root: Path, name: str) -> Path:
 # /tmp, so rewriting all of /home and /tmp would clobber legitimate host
 # paths in worker argv (this broke CI once — keep it narrow).
 _SANDBOX_ROOTS = re.compile(
-    r"(^|[\s='\"(:])(/(?:home/agent|etc/sandbox|tmp/sdxloop)(?=[/._\-\s]|$))"
+    r"(^|[\s='\"(:])(/(?:home/agent|etc/sandbox|tmp/sbxloop)(?=[/._\-\s]|$))"
 )
 
 
 def rewrite_abs(fs: Path, arg: str) -> str:
     """Map sandbox-canonical paths onto the fake fs root.
 
-    Rewrites /home/agent, /etc/sandbox*, and /tmp/sdxloop* — as whole args
+    Rewrites /home/agent, /etc/sandbox*, and /tmp/sbxloop* — as whole args
     and embedded in shell strings, so both ``exec box /home/agent/x`` and
     ``exec box sh -c 'cat /home/agent/x'`` hit the fake filesystem. All
     other absolute paths (host binaries, host tmp files) are left alone.

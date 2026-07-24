@@ -6,6 +6,22 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-23
+
+### Changed
+- **Project renamed: sdxloop → sbxloop — hard cutover, no compatibility
+  layer.** The underlying Docker product is the `sbx` CLI; the name now
+  matches. Everything renames with it: the distributions (`sbxloop`,
+  `sbxloop-worker`), import names (`sbxloop`, `sbxloop_worker`), the CLI
+  command (`sbxloop`), the env prefix (`SBXLOOP_*`), the config file
+  (`sbxloop.toml` / `[tool.sbxloop]`), the state dir (`.sbxloop/`), and
+  sandbox name prefixes (`sbxloop-<run>-*`). The old `sdxloop` /
+  `sdxloop-worker` PyPI packages are frozen at 0.1.10 and will receive no
+  further releases. Migration: `pip uninstall sdxloop sdxloop-worker &&
+  pip install sbxloop`, rename `SDXLOOP_*` env vars / `.env` entries and
+  `sdxloop.toml`, and optionally rename `.sdxloop/` state dirs to
+  `.sbxloop/` to keep old run history visible.
+
 ## [0.1.10] — 2026-07-23
 
 ### Changed

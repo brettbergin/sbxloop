@@ -1,4 +1,4 @@
-from sdxloop.events import Event, EventBus, Hook
+from sbxloop.events import Event, EventBus, Hook
 
 
 def test_subscribe_publish_and_unsubscribe() -> None:

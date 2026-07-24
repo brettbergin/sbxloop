@@ -6,11 +6,11 @@ from typing import Any
 
 import pytest
 
-from sdxloop.errors import GithubOpsError
-from sdxloop.events import EventBus, HostEventTypes
-from sdxloop.gh.ops import GithubOps, IssueRef
-from sdxloop.gh.reporter import GithubReporterHook
-from sdxloop_worker.protocol import ErrorInfo, JobRequest, JobResult
+from sbxloop.errors import GithubOpsError
+from sbxloop.events import EventBus, HostEventTypes
+from sbxloop.gh.ops import GithubOps, IssueRef
+from sbxloop.gh.reporter import GithubReporterHook
+from sbxloop_worker.protocol import ErrorInfo, JobRequest, JobResult
 
 
 class StubWorkerClient:
@@ -41,12 +41,12 @@ def make_ops(responses: dict[str, Any]) -> tuple[GithubOps, StubWorkerClient]:
 class TestGithubOpsFacade:
     def test_issue_create_typed(self) -> None:
         ops, client = make_ops({"issue.create": {"number": 5, "url": "https://x/5"}})
-        ref = ops.issue_create("o/r", "Title", body="Body", labels=["sdxloop"])
+        ref = ops.issue_create("o/r", "Title", body="Body", labels=["sbxloop"])
         assert ref == IssueRef(number=5, url="https://x/5")
         job = client.jobs[0]
         assert job.kind == "github.op"
         assert job.run_id == "r1"
-        assert job.params["labels"] == ["sdxloop"]
+        assert job.params["labels"] == ["sbxloop"]
 
     def test_pr_create_and_comment(self) -> None:
         ops, client = make_ops(
@@ -122,7 +122,7 @@ class TestGithubReporterHook:
         bus.emit(HostEventTypes.TASK_END, "r1", task_id="t2", title="second", state="failed")
         bus.emit(HostEventTypes.RUN_END, "r1", state="completed")
 
-        assert ops.created == [("o/r", "sdxloop run r1")]
+        assert ops.created == [("o/r", "sbxloop run r1")]
         assert len(ops.comments) == 3
         assert "✅ `t1`" in ops.comments[0][1]
         assert "❌ `t2`" in ops.comments[1][1]

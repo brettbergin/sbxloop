@@ -1,6 +1,6 @@
-# sdxloop architecture
+# sbxloop architecture
 
-sdxloop orchestrates agentic loops on top of [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)
+sbxloop orchestrates agentic loops on top of [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)
 (the `sbx` CLI). This document describes the system layers, the security
 model, and the run lifecycle.
 
@@ -8,7 +8,7 @@ model, and the run lifecycle.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│ CLI (typer + rich)         sdxloop run/resume/status/logs/doctor  │
+│ CLI (typer + rich)         sbxloop run/resume/status/logs/doctor  │
 ├───────────────────────────────────────────────────────────────────┤
 │ Engine                     LoopEngine + PhaseRunner + StateStore  │
 │                            (state machine, budgets, checkpoints)  │
@@ -22,16 +22,16 @@ model, and the run lifecycle.
 │ Docker Sandboxes (sbx)     microVMs, network policy, secret proxy │
 └───────────────────────────────────────────────────────────────────┘
 
-            inside each sandbox: sdxloop-worker
+            inside each sandbox: sbxloop-worker
             (JobRunner + agent backends + githubops executor)
 ```
 
 Two distributions ship from this repo in lockstep versions:
 
-- **`sdxloop`** — everything above the line: the host orchestrator.
-- **`sdxloop-worker`** — the in-sandbox runtime. The host package embeds the
-  worker wheel (`sdxloop/_vendor/`) at build time so sandboxes can be
-  provisioned with no dependency on PyPI availability of sdxloop itself.
+- **`sbxloop`** — everything above the line: the host orchestrator.
+- **`sbxloop-worker`** — the in-sandbox runtime. The host package embeds the
+  worker wheel (`sbxloop/_vendor/`) at build time so sandboxes can be
+  provisioned with no dependency on PyPI availability of sbxloop itself.
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
   host never installs the Copilot runtime.
 
@@ -41,18 +41,18 @@ Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pai
 
 | | agent sandbox | github sandbox |
 |---|---|---|
-| name | `sdxloop-<run>-agent` | `sdxloop-<run>-github` |
+| name | `sbxloop-<run>-agent` | `sbxloop-<run>-github` |
 | credential | `COPILOT_GITHUB_TOKEN` only | `GH_TOKEN` only |
 | injection | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` secret service |
 | network | balanced policy + copilot hosts | balanced policy + github hosts |
 | runs | Copilot SDK agent sessions, shell checks | `github.op` jobs (gh CLI or REST) |
 
-Under the default `proxy` secret strategy, sdxloop first attempts sbx's
+Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
 Field reality (sbx 0.35): that injection feeds only the interactive agent
 sessions sbx launches — never `sbx exec` processes — so provisioning
 verifies visibility and **auto-falls-back to an in-VM env file**
-(`~/.sdxloop/env.sh`, chmod 600) when the env is invisible, emitting a
+(`~/.sbxloop/env.sh`, chmod 600) when the env is invisible, emitting a
 `sandbox.secret_env_fallback` event. In fallback mode the token value is
 visible inside its own microVM, but the credential *split* still holds
 (each sandbox only ever receives its own token) and egress remains bounded
@@ -60,11 +60,11 @@ by the balanced network policy.
 
 Both sandboxes run under sbx's **balanced** network policy (default-deny plus
 a curated allowlist), with per-sandbox allow rules added for exactly the
-hosts each role needs. By default sdxloop shares the user's normal sbx
+hosts each role needs. By default sbxloop shares the user's normal sbx
 application state (so `sbx login` and `sbx policy init balanced` apply
 directly); setting `app_name` in config opts into isolated sbx state, which
 then needs its own `sbx --app-name <name> login` and policy init. The `plain-env` fallback strategy (tokens
-written to `~/.sdxloop/env.sh` in-VM) exists for hosts where the experimental
+written to `~/.sbxloop/env.sh` in-VM) exists for hosts where the experimental
 `set-custom` proxying is unavailable, and is documented as weaker.
 
 Cleanup is guaranteed by `SandboxPair` (context manager) plus a process-wide
@@ -121,7 +121,7 @@ persisting — a crash and a `kill -9` look identical to the store — and
 ## Events
 
 Everything observable is an `Event` (versioned JSONL envelope, shared model
-in `sdxloop_worker.protocol`). Workers emit `worker.*`, `agent.*`, `gh.*`;
+in `sbxloop_worker.protocol`). Workers emit `worker.*`, `agent.*`, `gh.*`;
 the host adds `run.*`, `task.*`, `phase.*`, `sandbox.*`. All events flow
 through the host `EventBus` (synchronous, subscriber-exception-isolated) and
 are persisted to SQLite — the CLI TUI, `logs --follow`, and hooks like
