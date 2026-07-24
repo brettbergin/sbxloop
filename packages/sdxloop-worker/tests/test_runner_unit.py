@@ -182,3 +182,43 @@ class TestEnvFile:
 
     def test_missing_file(self, tmp_path: Path) -> None:
         assert load_env_file(tmp_path / "nope.sh") == {}
+
+
+class TestPersistentEnvFile:
+    def test_sandbox_persistent_env_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worker loads /etc/sandbox-persistent.sh (where sbx documents
+        persistent sandbox env) in addition to ~/.sdxloop/env.sh."""
+        import os
+
+        import sdxloop_worker.__main__ as main_mod
+
+        persistent = tmp_path / "sandbox-persistent.sh"
+        persistent.write_text("export SDXLOOP_TEST_PERSISTENT_SENTINEL=from-persistent\n")
+        monkeypatch.setattr(main_mod, "PERSISTENT_ENV_FILE", persistent)
+        monkeypatch.delenv("SDXLOOP_TEST_PERSISTENT_SENTINEL", raising=False)
+        monkeypatch.setenv("SDXLOOP_WORKER_BACKEND", "echo")
+
+        job_path = tmp_path / "job.json"
+        job_path.write_text(agent_job().model_dump_json())
+        code = main_mod.main(
+            [
+                "run",
+                "--job",
+                str(job_path),
+                "--events",
+                str(tmp_path / "e.jsonl"),
+                "--result",
+                str(tmp_path / "r.json"),
+                "--heartbeat",
+                "0",
+                "--env-file",
+                str(tmp_path / "none.sh"),
+            ]
+        )
+        try:
+            assert code == 0
+            assert os.environ["SDXLOOP_TEST_PERSISTENT_SENTINEL"] == "from-persistent"
+        finally:
+            os.environ.pop("SDXLOOP_TEST_PERSISTENT_SENTINEL", None)

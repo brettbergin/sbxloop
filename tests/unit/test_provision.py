@@ -280,3 +280,41 @@ class TestSecretIdempotency:
         fake_sbx.script("secret set-custom", returncode=1, stderr="keychain locked")
         with pytest.raises(ProvisionError):
             provisioner.ensure_pair("r1")
+
+
+class TestSecretEnvVerification:
+    def test_missing_env_emits_warning_event(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # the fake exec inherits the test process env; ensure the tokens are
+        # NOT visible inside the sandbox shells
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            missing = [e for e in events if e.type == "sandbox.secret_env_missing"]
+            assert len(missing) == 2  # one per sandbox
+            assert missing[0].data["env"] == "COPILOT_GITHUB_TOKEN"
+            assert "plain-env" in missing[0].data["message"]
+            assert missing[1].data["env"] == "GH_TOKEN"
+        finally:
+            pair.cleanup()
+
+    def test_visible_env_emits_nothing(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_x")
+        monkeypatch.setenv("GH_TOKEN", "github_pat_y")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert not [e for e in events if e.type == "sandbox.secret_env_missing"]
+        finally:
+            pair.cleanup()

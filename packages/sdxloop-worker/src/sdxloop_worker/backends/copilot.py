@@ -17,6 +17,7 @@ from unit coverage accordingly.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from sdxloop_worker._json import extract_json
@@ -24,6 +25,31 @@ from sdxloop_worker.backends import BackendResult, BackendUnavailableError, Emit
 from sdxloop_worker.protocol import EventTypes, JobRequest, Usage
 
 READ_ONLY_DENIED_KINDS = {"shell", "write"}
+
+_TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
+
+
+def _auth_diagnostic() -> str:
+    """Describe the COPILOT_GITHUB_TOKEN this process can actually see."""
+    token = os.environ.get("COPILOT_GITHUB_TOKEN", "")
+    if not token:
+        return (
+            "auth diagnostic: COPILOT_GITHUB_TOKEN is NOT set in the worker "
+            "environment - sbx secret injection did not reach this process; "
+            'try secret_strategy="plain-env"'
+        )
+    if token.startswith(_TOKEN_PREFIXES):
+        return (
+            "auth diagnostic: COPILOT_GITHUB_TOKEN is set with a recognized "
+            "format; the failure is likely subscription/permissions "
+            "(the PAT needs the Copilot Requests permission) or network policy"
+        )
+    return (
+        f"auth diagnostic: COPILOT_GITHUB_TOKEN is set but has an unrecognized "
+        f"format ({token[:6]}...) - likely the sbx secret-proxy sentinel. The "
+        "Copilot SDK validates token format client-side and cannot use proxy "
+        'sentinels; set secret_strategy="plain-env" for the agent sandbox'
+    )
 
 
 class CopilotBackend:
@@ -36,7 +62,13 @@ class CopilotBackend:
             raise BackendUnavailableError(
                 "github-copilot-sdk is not installed; install sdxloop-worker[copilot]"
             ) from exc
-        return asyncio.run(self._run(job, emit))
+        try:
+            return asyncio.run(self._run(job, emit))
+        except Exception as exc:
+            # Auth failures surface as opaque SDK errors ("Session was not
+            # created with authentication info..."); say what the token
+            # environment actually looks like from inside the sandbox.
+            raise RuntimeError(f"{exc} | {_auth_diagnostic()}") from exc
 
     async def _run(self, job: JobRequest, emit: EmitFn) -> BackendResult:
         from copilot import CopilotClient
