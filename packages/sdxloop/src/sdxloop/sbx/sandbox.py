@@ -50,6 +50,11 @@ class Sandbox:
             f.write(text)
             tmp = Path(f.name)
         try:
+            # NamedTemporaryFile creates 0600 files and sbx cp preserves the
+            # mode into the VM, where the in-sandbox `agent` user (not the
+            # owner) must read them — job files were arriving unreadable
+            # (Errno 13). Everything staged in must be world-readable.
+            tmp.chmod(0o644)
             self.cp_in(tmp, sb_path)
         finally:
             tmp.unlink(missing_ok=True)

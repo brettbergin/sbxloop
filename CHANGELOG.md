@@ -6,6 +6,12 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Job files staged into sandboxes are now world-readable: they were
+  created 0600 by the host tempfile machinery and `sbx cp` preserves the
+  mode, so the in-sandbox `agent` user could not read its own job files
+  (Errno 13) and every job died before producing a result.
+
 ## [0.1.6] — 2026-07-23
 
 ### Fixed
