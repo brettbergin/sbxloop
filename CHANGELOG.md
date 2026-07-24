@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-07-23
+
 ### Fixed
 - Job files staged into sandboxes are now world-readable: they were
   created 0600 by the host tempfile machinery and `sbx cp` preserves the
