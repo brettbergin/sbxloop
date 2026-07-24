@@ -17,6 +17,7 @@ from unit coverage accordingly.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Any
 
@@ -52,6 +53,59 @@ def _auth_diagnostic() -> str:
     )
 
 
+# Transcript-facing clips: the event stream is telemetry, not the artifact
+# channel, so payloads are bounded aggressively.
+TOOL_ARGS_CLIP = 400
+TOOL_OUTPUT_CLIP = 1_000
+
+
+def _tool_args(arguments: Any) -> str | None:
+    """The tool's arguments as one displayable string (best-effort).
+
+    ``ToolExecutionStartData.arguments`` is typed ``Any`` by the SDK: shell
+    tools carry ``{"command": ...}``-shaped dicts, others arbitrary JSON.
+    Prefer the human-relevant fields, fall back to compact JSON.
+    """
+    if arguments is None:
+        return None
+    if isinstance(arguments, dict):
+        for key in ("command", "cmd", "input", "query", "path"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return value[:TOOL_ARGS_CLIP]
+        try:
+            return json.dumps(arguments, separators=(",", ":"))[:TOOL_ARGS_CLIP]
+        except (TypeError, ValueError):
+            return str(arguments)[:TOOL_ARGS_CLIP]
+    text = str(arguments)
+    return text[:TOOL_ARGS_CLIP] if text.strip() else None
+
+
+def _tool_exit_code(data: Any) -> int | None:
+    """Shell exit code from a ToolExecutionComplete, when present.
+
+    Shell completions carry a ShellExit entry in ``result.contents``
+    (verified against github-copilot-sdk: ``exit_code: int``).
+    """
+    result = getattr(data, "result", None)
+    for entry in getattr(result, "contents", None) or []:
+        code = getattr(entry, "exit_code", None)
+        if isinstance(code, int):
+            return code
+    return None
+
+
+def _tool_output(data: Any) -> str | None:
+    """A bounded tail of the tool's output, for transcript display."""
+    result = getattr(data, "result", None)
+    content = getattr(result, "content", None)
+    if not content and result is not None:
+        content = getattr(result, "detailed_content", None)
+    if not isinstance(content, str) or not content.strip():
+        return None
+    return content[-TOOL_OUTPUT_CLIP:]
+
+
 class CopilotBackend:
     name = "copilot"
 
@@ -75,6 +129,9 @@ class CopilotBackend:
 
         usage = Usage()
         final_text: list[str] = []
+        # tool_call_id -> tool name, so completion events can name the tool
+        # (the SDK's Complete event carries only the call id).
+        tool_names: dict[str, str] = {}
 
         def on_event(event: Any) -> None:
             nonlocal usage
@@ -91,18 +148,25 @@ class CopilotBackend:
                     final_text.append(content)
                 emit(EventTypes.AGENT_MESSAGE, content=content)
             elif type_name.startswith("ToolExecutionStart"):
+                tool = getattr(data, "tool_name", None) or getattr(data, "toolName", None)
+                call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
+                if tool and call_id:
+                    tool_names[str(call_id)] = str(tool)
                 emit(
                     EventTypes.AGENT_TOOL_START,
-                    tool=getattr(data, "tool_name", None) or getattr(data, "toolName", None),
-                    tool_call_id=getattr(data, "tool_call_id", None)
-                    or getattr(data, "toolCallId", None),
+                    tool=tool,
+                    tool_call_id=call_id,
+                    args=_tool_args(getattr(data, "arguments", None)),
                 )
             elif type_name.startswith("ToolExecutionComplete"):
+                call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
                 emit(
                     EventTypes.AGENT_TOOL_END,
-                    tool_call_id=getattr(data, "tool_call_id", None)
-                    or getattr(data, "toolCallId", None),
+                    tool_call_id=call_id,
+                    tool=tool_names.get(str(call_id)),
                     success=getattr(data, "success", None),
+                    exit_code=_tool_exit_code(data),
+                    output=_tool_output(data),
                 )
             elif type_name == "AssistantUsageData":
                 sample = Usage(

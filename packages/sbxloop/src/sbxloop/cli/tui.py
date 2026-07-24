@@ -50,10 +50,22 @@ _TRANSCRIPT_SKIP = {
 }
 
 AGENT_MESSAGE_CLIP = 4000
+# One-line clip for tool arguments; output tail lines shown on tool failure.
+TOOL_ARGS_LINE_CLIP = 160
+TOOL_FAIL_TAIL_LINES = 6
 
 
 def _stamp(event: Event) -> str:
     return datetime.datetime.fromtimestamp(event.ts).strftime("%H:%M:%S")
+
+
+def _one_line(text: str, limit: int = TOOL_ARGS_LINE_CLIP) -> str:
+    """Collapse to a single display line, eliding the middle beyond limit."""
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    keep = (limit - 1) // 2
+    return f"{flat[:keep]}…{flat[-keep:]}"
 
 
 def render_event(event: Event) -> RenderableType | None:
@@ -88,10 +100,36 @@ def render_event(event: Event) -> RenderableType | None:
 
     if event.type == EventTypes.AGENT_TOOL_START:
         tool = data.get("tool") or "tool"
-        return Text(f"{_stamp(event)}  ⚙ {tool}", style="yellow", overflow="fold")
+        start = Text(f"{_stamp(event)}  ⚙ {tool}", style="yellow")
+        args = _one_line(str(data.get("args") or ""))
+        if args:
+            start.append(" $ ", style="bold yellow")
+            start.append(args, style="yellow dim")
+        start.overflow = "fold"
+        return start
 
     if event.type == EventTypes.AGENT_TOOL_END:
-        return None  # start lines carry enough signal for the transcript
+        tool = data.get("tool") or "tool"
+        success = data.get("success")
+        exit_code = data.get("exit_code")
+        if success is None and exit_code is None:
+            return None  # nothing informative beyond the start line
+        if success or (success is None and exit_code == 0):
+            suffix = " exit 0" if exit_code == 0 else ""
+            return Text(f"{_stamp(event)}  ✓ {tool}{suffix}", style="green dim")
+        suffix = f" exit {exit_code}" if exit_code is not None else ""
+        failure = Text(f"{_stamp(event)}  ✗ {tool}{suffix}", style="red")
+        tail = str(data.get("output") or "").strip()
+        if tail:
+            return Group(
+                failure,
+                Text(
+                    "\n".join(tail.splitlines()[-TOOL_FAIL_TAIL_LINES:]),
+                    style="red dim",
+                    overflow="fold",
+                ),
+            )
+        return failure
 
     if event.type.startswith(_LIFECYCLE_PREFIXES):
         line = format_event(event)
@@ -192,6 +230,8 @@ def format_event(event: Event) -> str:
             value = str(event.data[key]).replace("\n", " ")
             parts.append(value[:160])
             break
+    if event.data.get("args"):
+        parts.append(_one_line(str(event.data["args"]), 120))
     return " ".join(parts)
 
 

@@ -550,6 +550,76 @@ class TestDashboard:
         assert "[t1]" in line
         assert "done" in line
 
+    def test_format_event_includes_tool_args(self) -> None:
+        from sbxloop.cli.tui import format_event
+
+        line = format_event(
+            Event.now("agent.tool_start", "r1", tool="bash", args="pip install -e .")
+        )
+        assert "bash" in line
+        assert "pip install -e ." in line
+
+
+class TestToolTranscript:
+    def render_text(self, event: Event) -> str | None:
+        from rich.console import Console
+
+        from sbxloop.cli.tui import render_event
+
+        rendered = render_event(event)
+        if rendered is None:
+            return None
+        console = Console(record=True, width=100)
+        console.print(rendered)
+        return console.export_text()
+
+    def test_tool_start_shows_command(self) -> None:
+        text = self.render_text(
+            Event.now("agent.tool_start", "r1", tool="bash", args="python -m pytest -q")
+        )
+        assert text is not None
+        assert "⚙ bash" in text
+        assert "python -m pytest -q" in text
+
+    def test_tool_start_without_args_still_renders(self) -> None:
+        text = self.render_text(Event.now("agent.tool_start", "r1", tool="str_replace_editor"))
+        assert text is not None
+        assert "⚙ str_replace_editor" in text
+        assert "$" not in text
+
+    def test_tool_start_long_command_elided_to_one_line(self) -> None:
+        long_cmd = "python -c '" + "x" * 500 + "'"
+        text = self.render_text(Event.now("agent.tool_start", "r1", tool="bash", args=long_cmd))
+        assert text is not None
+        assert "…" in text
+
+    def test_tool_end_success_is_quiet_check(self) -> None:
+        text = self.render_text(
+            Event.now("agent.tool_end", "r1", tool="bash", success=True, exit_code=0)
+        )
+        assert text is not None
+        assert "✓ bash" in text
+        assert "✗" not in text
+
+    def test_tool_end_failure_shows_exit_and_tail(self) -> None:
+        text = self.render_text(
+            Event.now(
+                "agent.tool_end",
+                "r1",
+                tool="bash",
+                success=False,
+                exit_code=2,
+                output="line1\nline2\nE: broken",
+            )
+        )
+        assert text is not None
+        assert "✗ bash exit 2" in text
+        assert "E: broken" in text
+
+    def test_tool_end_without_signal_is_skipped(self) -> None:
+        # Older/other backends may emit bare completions; stay quiet then.
+        assert self.render_text(Event.now("agent.tool_end", "r1", tool_call_id="c1")) is None
+
 
 class TestDoctorRendering:
     def test_multiline_error_detail_is_flattened(self) -> None:
