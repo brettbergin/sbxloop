@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from pathlib import Path
@@ -15,12 +16,13 @@ from rich.tree import Tree
 
 import sbxloop
 from sbxloop.cli.doctor import run_doctor
-from sbxloop.cli.tui import Dashboard, format_event, plain_printer
+from sbxloop.cli.tui import Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RunResult, artifacts_dir
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
+from sbxloop.events import Event
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
 
@@ -67,13 +69,23 @@ def _store(config: Config) -> StateStore:
 
 
 def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
-    """Run start/resume with either the live dashboard or plain event logs."""
+    """Run start/resume with the scrollback transcript + pinned status, or
+    plain event logs (--no-tui).
+
+    Transcript entries print permanently to the terminal's scrollback (via
+    ``live.console.print``, which renders above the live region), so the
+    full conversation history survives; only the compact status panel at
+    the bottom is redrawn in place. Events arrive on the engine thread but
+    every terminal write happens here on the main thread, via a queue —
+    ordering stays deterministic and rich's Live never interleaves.
+    """
     if not tui:
         engine.bus.subscribe(plain_printer(console))
         return action()  # type: ignore[no-any-return]
 
     dashboard = Dashboard()
-    engine.bus.subscribe(dashboard.on_event)
+    pending: queue.SimpleQueue[Event] = queue.SimpleQueue()
+    engine.bus.subscribe(pending.put)
     outcome: dict[str, Any] = {}
 
     def target() -> None:
@@ -84,10 +96,24 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
 
     thread = threading.Thread(target=target, daemon=True)
     with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
+
+        def drain() -> None:
+            while True:
+                try:
+                    event = pending.get_nowait()
+                except queue.Empty:
+                    return
+                dashboard.on_event(event)
+                rendered = render_event(event)
+                if rendered is not None:
+                    live.console.print(rendered)
+
         thread.start()
         while thread.is_alive():
+            drain()
             live.update(dashboard.renderable())
             time.sleep(0.15)
+        drain()
         live.update(dashboard.renderable())
     if "error" in outcome:
         raise outcome["error"]
