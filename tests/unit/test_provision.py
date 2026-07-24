@@ -299,11 +299,12 @@ class TestSecretEnvVerification:
         provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
         pair = provisioner.ensure_pair("r1")
         try:
-            missing = [e for e in events if e.type == "sandbox.secret_env_missing"]
-            assert [e.data["env"] for e in missing] == ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"]
             fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
-            assert len(fallback) == 2
+            assert [e.data["env"] for e in fallback] == ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"]
+            # one concise single-line message, not a paragraph
             assert "plain-env" in fallback[0].data["message"]
+            assert "\n" not in fallback[0].data["message"]
+            assert len(fallback[0].data["message"]) < 160
             # the in-VM env file now carries the tokens the worker will load
             agent_env = (
                 fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sdxloop/env.sh"
@@ -327,6 +328,28 @@ class TestSecretEnvVerification:
         provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
         pair = provisioner.ensure_pair("r1")
         try:
-            assert not [e for e in events if e.type == "sandbox.secret_env_missing"]
+            assert not [e for e in events if "secret_env" in e.type]
+        finally:
+            pair.cleanup()
+
+    def test_plain_env_strategy_skips_verification(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit plain-env: the worker loads the env file itself, so the
+        shell visibility check (which can never pass) must not run or warn."""
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        config = Config.model_validate(
+            {"secret_strategy": "plain-env", "state_dir": str(tmp_path / "state")}
+        )
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert not [e for e in events if "secret_env" in e.type]
+            checks = [c for c in fake_sbx.invocations("exec") if any("test -n" in a for a in c)]
+            assert checks == []
         finally:
             pair.cleanup()

@@ -263,6 +263,56 @@ class TestDashboard:
         assert "executing" in text
         assert "working on it" in text
 
+    def test_agent_messages_render_as_wrapped_markdown_panels(self) -> None:
+        """Field complaint: ```json blocks flew by truncated and unwrapped.
+        Agent messages must render as markdown (code blocks intact, long
+        lines wrapped), not as clipped single lines."""
+        from rich.console import Console
+
+        from sdxloop.cli.tui import Dashboard
+
+        long_value = "x" * 200  # far beyond one terminal row
+        content = (
+            "Here is the plan:\n\n"
+            "```json\n"
+            f'{{"tasks": [{{"id": "t1", "note": "{long_value}"}}]}}\n'
+            "```"
+        )
+        dashboard = Dashboard()
+        dashboard.on_event(Event.now("agent.message", "r1", content=content))
+        console = Console(record=True, width=80)
+        console.print(dashboard.renderable())
+        text = console.export_text()
+        assert "agent" in text  # chat bubble title
+        assert '"tasks"' in text  # code block content survived
+        # the long value wrapped instead of being clipped: all 200 chars
+        # of payload are present in the output across multiple lines
+        assert text.count("x") >= 200
+
+    def test_deltas_and_heartbeats_stay_out_of_transcript(self) -> None:
+        from sdxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        dashboard.on_event(Event.now("agent.message_delta", "r1", delta="chunk"))
+        dashboard.on_event(Event.now("worker.heartbeat", "r1"))
+        dashboard.on_event(Event.now("worker.stdout", "r1", line="noise"))
+        assert len(dashboard.transcript) == 0
+
+    def test_worker_error_renders_red_panel(self) -> None:
+        from rich.console import Console
+
+        from sdxloop.cli.tui import render_event
+
+        rendered = render_event(
+            Event.now("worker.error", "r1", error_type="RuntimeError", message="boom happened")
+        )
+        assert rendered is not None
+        console = Console(record=True, width=80)
+        console.print(rendered)
+        text = console.export_text()
+        assert "error" in text
+        assert "boom happened" in text
+
     def test_format_event_variants(self) -> None:
         from sdxloop.cli.tui import format_event
 
