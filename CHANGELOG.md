@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-07-23
+
 ### Fixed
 - Worker wheels are staged into the sandbox under their canonical
   filename: pip validates the name-version-python-abi-platform structure
