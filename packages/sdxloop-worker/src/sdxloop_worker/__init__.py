@@ -5,6 +5,6 @@ models, the agent backends (GitHub Copilot SDK), and the job runner invoked
 via ``python -m sdxloop_worker``.
 """
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 __all__ = ["__version__"]

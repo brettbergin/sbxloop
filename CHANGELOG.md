@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-07-23
+
 ### Fixed
 - Copilot session auth: the worker now runs under a login shell
   (`sh -lc`) so sbx-injected secret env vars reach it, and it also loads
