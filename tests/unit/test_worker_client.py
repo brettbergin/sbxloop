@@ -187,8 +187,11 @@ class TestInstall:
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python",
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
             stdout=f"{sdxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker", returncode=64
         )
         client.install(wheel=wheel, extras="copilot")
 
@@ -212,8 +215,11 @@ class TestInstall:
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python",
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
             stdout=f"{sdxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker", returncode=64
         )
         client.install(wheel=None, extras="")
 
@@ -225,7 +231,7 @@ class TestInstall:
         client = make_client(sandbox, EventBus())
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
-        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/python", stdout="9.9.9\n")
+        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/python -c", stdout="9.9.9\n")
         with pytest.raises(WorkerError, match="does not match host"):
             client.install(wheel=None, extras="")
 
@@ -260,8 +266,11 @@ class TestInstallFallbacks:
         fake_sbx.script("exec boxa python3 -m venv", returncode=0, once=True)
         fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python",
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
             stdout=f"{sdxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker", returncode=64
         )
         client.install(wheel=wheel)
         assert client.python == "/home/agent/.sdxloop/venv/bin/python"
@@ -334,9 +343,11 @@ class TestRealPipInstall:
         if wheel is None:
             pytest.skip("no worker wheel available (uv not on PATH)")
         client = make_client(sandbox, EventBus())
-        # hermetic: --system-site-packages exposes the test venv's pydantic;
-        # --no-deps keeps pip off the network. Everything else is real.
-        client.install(wheel=wheel, extras="", no_deps=True, system_site_packages=True)
+        # Fully real: pip resolves pydantic from PyPI. --no-deps would pass
+        # the import check but fail the entrypoint smoke check (pydantic is
+        # only needed by __main__) - which is exactly the class of breakage
+        # the smoke check exists to catch at install time.
+        client.install(wheel=wheel, extras="")
         assert client.python == "/home/agent/.sdxloop/venv/bin/python"
         # the worker is genuinely importable from the sandbox venv
         result = sandbox.exec(
@@ -348,3 +359,59 @@ class TestRealPipInstall:
         )
         assert result.ok
         assert result.stdout.strip() == sdxloop.__version__
+
+
+class TestNoResultDiagnostics:
+    def test_missing_result_error_carries_rc_and_stderr(
+        self, sandbox: Sandbox, tmp_path: Path
+    ) -> None:
+        """When the worker process dies without writing a result, the error
+        must carry the exec exit code and the stderr tail — the field
+        alternative is an unactionable 'produced no result file'."""
+        crasher = tmp_path / "crasher.sh"
+        crasher.write_text("#!/bin/sh\necho 'boom from the sandbox' >&2\nexit 7\n")
+        crasher.chmod(0o755)
+        client = make_client(sandbox, EventBus(), python=str(crasher))
+        with pytest.raises(WorkerError) as excinfo:
+            client.submit(agent_job())
+        message = str(excinfo.value)
+        assert "produced no result file" in message
+        assert "exec rc=7" in message
+        assert "boom from the sandbox" in message
+
+    def test_missing_result_error_includes_events_tail(self, sandbox: Sandbox) -> None:
+        """If the worker got far enough to emit events before dying, the
+        last events ride along in the error."""
+        # a fake partial events file left behind by a dying worker
+        partial = Event.now("worker.start", "r1", job_id="j1").to_json_line()
+        sandbox.write_text("/home/agent/.sdxloop/events/j1.jsonl", partial + "\n")
+        client = make_client(sandbox, EventBus(), python="false")  # rc=1, no output
+        with pytest.raises(WorkerError) as excinfo:
+            client.submit(agent_job())
+        message = str(excinfo.value)
+        assert "exec rc=1" in message
+        assert "worker.start" in message
+
+
+class TestEntrypointSmoke:
+    def test_smoke_failure_fails_install_with_output(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        import sdxloop
+
+        wheel = tmp_path / f"sdxloop_worker-{sdxloop.__version__}-py3-none-any.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script(
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
+            stdout=f"{sdxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker",
+            returncode=1,
+            stderr="Traceback: entrypoint exploded under sbx exec",
+        )
+        with pytest.raises(WorkerError, match=r"entrypoint check failed.*entrypoint exploded"):
+            client.install(wheel=wheel)
