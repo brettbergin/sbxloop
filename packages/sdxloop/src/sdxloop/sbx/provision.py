@@ -320,42 +320,29 @@ class Provisioner:
         security tradeoff. If sbx later injects secrets into exec sessions,
         this check passes and the token stays out of the VM.
         """
+        if self.config.secret_strategy != "proxy":
+            # plain-env: the worker loads the env file itself; a shell
+            # visibility check can never pass and would only produce noise.
+            return
         env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
         result = sandbox.exec(["sh", "-lc", f'test -n "${{{env_name}}}"'])
         if result.ok:
             return
-        message = (
-            f"{env_name} is not visible in {spec.name}'s shell environment after "
-            f"secret injection ({self.config.secret_strategy!r} strategy)."
-        )
-        logger.warning(message)
-        self.bus.emit(
-            "sandbox.secret_env_missing",
-            run_id,
-            name=spec.name,
-            env=env_name,
-            strategy=self.config.secret_strategy,
-            message=message,
-        )
-        if self.config.secret_strategy != "proxy":
-            return
         # Auto-heal: fall back to the plain-env file for this sandbox. The
         # token value becomes visible inside the microVM (which the agent
         # already controls); egress remains bounded by the network policy.
-        fallback_message = (
-            f"falling back to the in-VM env file for {spec.name}: the sbx secret "
-            "proxy does not expose env vars to exec'd processes. Set "
-            '`secret_strategy = "plain-env"` to make this explicit and silence '
-            "the warning."
+        message = (
+            f"{env_name}: sbx proxy secret invisible to exec — using in-VM env file "
+            f'(secret_strategy="plain-env" silences this)'
         )
-        logger.warning(fallback_message)
+        logger.info("%s: %s", spec.name, message)
         self._apply_plain_env(spec, sandbox, token)
         self.bus.emit(
             "sandbox.secret_env_fallback",
             run_id,
             name=spec.name,
             env=env_name,
-            message=fallback_message,
+            message=message,
         )
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:

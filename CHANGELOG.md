@@ -6,6 +6,18 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+- The live run view is now a chat-style transcript: agent messages render
+  as markdown panels (fenced ```json blocks syntax-highlighted and
+  word-wrapped instead of truncated), errors as red panels, tool calls as
+  compact colored lines, lifecycle events as dim one-liners. Streaming
+  deltas, heartbeats, and stdout noise no longer flood the feed (they
+  remain available via `sdxloop logs`). `--no-tui` prints the same
+  chat-style entries sequentially.
+- The secret-env fallback is one concise line and a single
+  `sandbox.secret_env_fallback` event; explicit `plain-env` strategy no
+  longer runs (and spuriously fails) the shell visibility check.
+
 ## [0.1.9] — 2026-07-23
 
 ### Fixed
