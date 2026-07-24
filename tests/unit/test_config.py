@@ -97,3 +97,16 @@ def test_env_string_fallback(tmp_path: Path) -> None:
     # Bare strings are not valid TOML scalars; they fall back to raw strings.
     config = load_config(cwd=tmp_path, env={"SBXLOOP_MODEL": "claude-sonnet"})
     assert config.model == "claude-sonnet"
+
+
+def test_deliver_config_layers(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[deliver]\nrepo = "file/repo"\ndraft = true\n')
+    config = load_config(cwd=tmp_path, env={})
+    assert config.deliver.repo == "file/repo"
+    assert config.deliver.draft is True
+    assert config.deliver.base is None
+
+    config = load_config(cwd=tmp_path, env={"SBXLOOP_DELIVER__REPO": "env/repo"})
+    assert config.deliver.repo == "env/repo"
+
+    assert Config().deliver.repo is None  # delivery is opt-in

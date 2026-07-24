@@ -64,6 +64,14 @@ class GithubConfig(_ConfigModel):
         return self.repo is not None
 
 
+class DeliverConfig(_ConfigModel):
+    """Publish a completed run's artifacts as a GitHub PR (empty disables)."""
+
+    repo: str | None = None
+    base: str | None = None  # defaults to the repo's default branch
+    draft: bool = False
+
+
 class Budgets(_ConfigModel):
     max_revisions_per_task: int = 2
     max_replans_per_task: int = 1
@@ -90,6 +98,7 @@ class Config(_ConfigModel):
     install_workers: bool = True
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
+    deliver: DeliverConfig = Field(default_factory=DeliverConfig)
     budgets: Budgets = Field(default_factory=Budgets)
 
 

@@ -372,3 +372,87 @@ class TestWorkspaceExecution:
         assert [e.data["mounted"] for e in reports] == [True]
         assert reports[0].data["files"] == 1
         assert reports[0].data["path"] == str(result.workspace)
+
+
+class TestDeliverHook:
+    """The engine's finalize hook; the git-data flow itself is covered in
+    test_deliver.py. deliver_workspace is patched — no GitHub, no network."""
+
+    def deliver_engine(self, harness: Harness) -> LoopEngine:
+        return harness.engine(deliver={"repo": "o/r"})
+
+    def test_completed_run_delivers_and_emits_pr(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import PrRef
+
+        calls: list[dict[str, Any]] = []
+
+        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
+            calls.append({"repo": repo, **kwargs})
+            return PrRef(number=3, url="https://github.com/o/r/pull/3")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        execute = {"text": "done", "files": {"hello.txt": "hi"}}
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        result = self.deliver_engine(harness).start("ship it")
+
+        assert result.state == "completed"
+        assert len(calls) == 1
+        assert calls[0]["repo"] == "o/r"
+        assert calls[0]["run_id"] == result.run_id
+        assert calls[0]["outcome"] == "ship it"
+        assert calls[0]["source_dir"] == result.workspace
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [
+            {"repo": "o/r", "pr": 3, "url": "https://github.com/o/r/pull/3"}
+        ]
+
+    def test_delivery_failure_is_loud_but_nonfatal(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.errors import DeliveryError
+
+        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
+            raise DeliveryError("boom")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = self.deliver_engine(harness).start("ship it")
+
+        assert result.state == "completed"  # the run itself still succeeded
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
+
+    def test_failed_run_never_delivers(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+
+        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("must not deliver a failed run")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        # execute passes but validate rejects until replan budget exhausts
+        harness.script(
+            [taskgraph(task("t1")), PLAN, EXECUTE, PASS, REJECT, PLAN, EXECUTE, PASS, REJECT]
+        )
+        result = self.deliver_engine(harness).start("doomed")
+        assert result.state == "failed"
+        assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
+
+    def test_no_repo_configured_never_delivers(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+
+        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("must not deliver without a configured repo")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("plain run")
+        assert result.state == "completed"
+        assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []

@@ -158,6 +158,16 @@ class RunResult(_Model):
         return self.state == "completed"
 
 
+def artifact_files(root: Path) -> list[Path]:
+    """Regular files under root, hidden files/dirs excluded (an agent's .git
+    would otherwise swamp listings and deliveries), sorted for stable output."""
+    return sorted(
+        p
+        for p in root.rglob("*")
+        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
+    )
+
+
 def artifacts_dir(run: RunRecord | RunResult, state_dir: Path) -> Path | None:
     """The single host directory holding a run's artifacts.
 

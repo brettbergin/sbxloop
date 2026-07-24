@@ -61,6 +61,28 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
   SQLite after every transition; `sbxloop resume <run>` re-provisions sandboxes
   (they're cattle) and continues where it left off.
 
+## Artifacts
+
+Every job in a run executes in the run's **workspace** — a host directory
+(`.sbxloop/runs/<run>/workspace`) that sbx mounts into the agent microVM.
+Provisioning *discovers* the in-VM mount point (marker file + bounded search) rather
+than assuming one; when the mount can't be found, jobs run in a fallback dir that is
+**harvested** to `.sbxloop/runs/<run>/artifacts` with `sbx cp` at each task end and at
+run finalize. Either way the files an agent produces survive the sandbox:
+
+```bash
+sbxloop run "write a fib.py with tests"   # summary ends with an artifact tree
+sbxloop artifacts <run>                   # list a past run's files (--tree for a tree)
+cat "$(sbxloop artifacts <run> --path)/fib.py"
+```
+
+To publish a completed run's artifacts as a GitHub pull request, pass
+`--deliver owner/repo` (or set `[deliver] repo` in `sbxloop.toml`). Delivery runs
+through the github-ops sandbox — `GH_TOKEN` only, one atomic commit via the git data
+API, branch `sbxloop/<run>` — and needs `contents:write` + `pull_requests:write` on
+the target repo. Delivery failures are reported loudly (`run.deliver` event) but never
+fail a completed run.
+
 ## Repository layout
 
 This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with two distributions:

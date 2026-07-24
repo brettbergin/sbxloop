@@ -80,6 +80,24 @@ jobs:
           uv run sbxloop run "${{ inputs.smoke_outcome }}" --no-tui
           uv run sbxloop status
 
+      # First real-sbx confirmation of workspace mount/harvest mode: the file
+      # the agent writes must land on the HOST and be discoverable. Also the
+      # validation point for Copilot working_directory and sbx cp directory
+      # semantics (see TODO(e2e) markers in provision.py / engine.py /
+      # deliver.py) — the harvest and os.chdir fallbacks stay until this
+      # passes.
+      - name: Assert artifacts landed on the host
+        if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+        run: |
+          set -euo pipefail
+          run_id=$(basename "$(ls -dt .sbxloop/runs/* | head -1)")
+          uv run sbxloop artifacts "$run_id" --tree
+          artifacts_dir=$(uv run sbxloop artifacts "$run_id" --path)
+          test -f "$artifacts_dir/hello.txt"
+          grep -q "hello sbxloop" "$artifacts_dir/hello.txt"
+
       - name: Cleanup
         if: always()
         run: |

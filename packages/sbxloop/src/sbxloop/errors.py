@@ -65,6 +65,10 @@ class GithubOpsError(SdxloopError):
     """A GitHub operation failed in the github-ops sandbox."""
 
 
+class DeliveryError(SdxloopError):
+    """Delivering a run's workspace as a GitHub PR failed."""
+
+
 class BudgetExceededError(SdxloopError):
     """A run or task exhausted one of its budgets."""
 
