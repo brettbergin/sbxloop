@@ -6,7 +6,7 @@ agentic layer, and a GitHub-ops sandbox holding only ``GH_TOKEN`` for
 user-facing GitHub interactions. The balanced network policy is the default.
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 from sdxloop.config import Budgets, Config, load_config
 from sdxloop.engine import LoopEngine, RunResult, run_outcome
