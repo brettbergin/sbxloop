@@ -11,12 +11,12 @@ sbxloop turns a large outcome ("migrate this service to async", "add coverage to
 
 ## The primitive: a sandbox pair
 
-Every run gets **two isolated microVM sandboxes**, so no single environment ever holds both credentials:
+Every run gets an isolated microVM agent sandbox — plus, when the GitHub integration is configured, a second github-ops sandbox, so no single environment ever holds both credentials:
 
 | Sandbox | Credential | Purpose |
 |---|---|---|
 | `sbxloop-<run>-agent` | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM. |
-| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: issues write, contents read, …) | Performs user-facing GitHub operations (issues, PRs, statuses) on your behalf. |
+| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: issues write, contents read, …) | Performs user-facing GitHub operations (issues, PRs, statuses) against the one configured repository. Only provisioned when `[github] repo` is set. |
 
 Both sandboxes run under sbx's **balanced network policy** (default-deny egress plus a curated allowlist), and tokens are injected through sbx's secret proxy — **credential values never enter the VM**; the host proxy substitutes them only on egress to their declared domains.
 
@@ -83,16 +83,25 @@ dispatched workflow.
 ## Setup
 
 1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then `sbx login` and `sbx policy init balanced`.
-2. Create two fine-grained GitHub PATs:
+2. Create a fine-grained GitHub PAT:
    - `COPILOT_GITHUB_TOKEN` — personal account, **Copilot Requests** permission. Used *only* by the agent sandbox.
-   - `GH_TOKEN` — repository permissions you want sbxloop to act with (e.g. issues: write, contents: read). Used *only* by the github-ops sandbox.
 
-   Export them, or put them in a `.env` file (loaded automatically from the working directory; real environment variables always win):
+   Export it, or put it in a `.env` file (loaded automatically from the working directory; real environment variables always win):
 
    ```bash
-   cp .env.example .env   # then fill in the two tokens
+   cp .env.example .env   # then fill in the token(s)
    ```
-3. `sbxloop doctor` verifies all of it and prints remediation for anything missing.
+3. **Optional — the GitHub integration.** sbxloop has no GitHub capability until you configure the one repository it may work with:
+
+   ```toml
+   # sbxloop.toml
+   [github]
+   repo = "you/your-repo"   # the ONE repo sbxloop may act on
+   report = false           # post run progress as a tracking issue (or `--report`)
+   ```
+
+   With `repo` set, runs provision the github-ops sandbox and require a second PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with (e.g. issues: write, contents: read) — used *only* by that sandbox. Without it, no github sandbox exists, `GH_TOKEN` is not needed, and repo-facing features refuse to run.
+4. `sbxloop doctor` verifies all of it and prints remediation for anything missing.
 
 Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLOOP_*` env vars (`sbxloop init` writes a commented starter file; `sbxloop config show` shows the resolved values and their sources).
 
@@ -106,7 +115,7 @@ Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLO
 
 - Python ≥ 3.11
 - [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/) on the host (macOS Apple silicon, Windows 11, or Ubuntu 24.04+/KVM)
-- A GitHub Copilot subscription (any plan) + two fine-grained PATs (see above)
+- A GitHub Copilot subscription (any plan) + a fine-grained PAT (a second one only if the GitHub integration is configured — see above)
 
 ## Releasing
 

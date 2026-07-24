@@ -39,7 +39,7 @@ def test_env_overrides_everything(tmp_path: Path) -> None:
         "SBXLOOP_KEEP_SANDBOXES": "true",
         "SBXLOOP_BUDGETS__MAX_TASKS": "3",
         "SBXLOOP_BUDGETS__MAX_WALL_CLOCK_S": "60.5",
-        "SBXLOOP_GITHUB__REPORT_REPO": "brettbergin/sbxloop",
+        "SBXLOOP_GITHUB__REPO": "brettbergin/sbxloop",
         "UNRELATED": "ignored",
     }
     config = load_config(cwd=tmp_path, env=env)
@@ -47,7 +47,8 @@ def test_env_overrides_everything(tmp_path: Path) -> None:
     assert config.keep_sandboxes is True
     assert config.budgets.max_tasks == 3
     assert config.budgets.max_wall_clock_s == 60.5
-    assert config.github.report_repo == "brettbergin/sbxloop"
+    assert config.github.repo == "brettbergin/sbxloop"
+    assert config.github.enabled
 
 
 def test_sources_tracking(tmp_path: Path) -> None:
@@ -67,6 +68,18 @@ def test_unknown_key_is_config_error(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text("no_such_option = 1\n")
     with pytest.raises(ConfigError, match="invalid sbxloop configuration"):
         load_config(cwd=tmp_path, env={})
+
+
+def test_github_repo_must_be_owner_name(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="owner/name"):
+        load_config(cwd=tmp_path, env={"SBXLOOP_GITHUB__REPO": "https://github.com/o/r"})
+
+
+def test_github_disabled_by_default(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path, env={})
+    assert config.github.repo is None
+    assert not config.github.enabled
+    assert not config.github.report
 
 
 def test_invalid_toml_is_config_error(tmp_path: Path) -> None:

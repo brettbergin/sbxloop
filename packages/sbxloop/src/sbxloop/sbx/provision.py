@@ -7,7 +7,9 @@ The credential split is enforced here:
   token-exchange host — the value never enters the VM under the default
   ``proxy`` strategy.
 - **github sandbox** gets only ``GH_TOKEN`` via sbx's built-in ``github``
-  secret service (scoped to github.com hosts).
+  secret service (scoped to github.com hosts). It is provisioned only when
+  the GitHub integration is configured (``[github].repo``); otherwise runs
+  have no GitHub capability and GH_TOKEN is not required.
 
 The ``plain-env`` fallback strategy writes tokens to ``~/.sbxloop/env.sh``
 inside the sandbox (weaker: the value is visible in the VM) for environments
@@ -145,17 +147,22 @@ class Provisioner:
         workspace = workspace.resolve()
         workspace.mkdir(parents=True, exist_ok=True)
 
+        # The github sandbox (and its token requirement) exists only when the
+        # GitHub integration is configured; without [github].repo a run has
+        # no GitHub capability at all — and one less microVM to boot.
+        github_enabled = self.config.github.enabled
+
         # Fail fast on missing tokens before creating any microVM.
-        tokens: dict[SandboxRole, str] = {
-            "agent": self.copilot_token(),
-            "github": self.gh_token(),
-        }
+        tokens: dict[SandboxRole, str] = {"agent": self.copilot_token()}
+        if github_enabled:
+            tokens["github"] = self.gh_token()
 
         agent_spec, github_spec = self.build_specs(run_id, workspace)
+        specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
         created: list[Sandbox] = []
         try:
             sandboxes: dict[SandboxRole, Sandbox] = {}
-            for spec in (agent_spec, github_spec):
+            for spec in specs:
                 self.bus.emit("sandbox.provision_start", run_id, name=spec.name, role=spec.role)
                 self.cli.create(spec)
                 sandbox = Sandbox(self.cli, spec.name)
@@ -176,7 +183,7 @@ class Provisioner:
             return SandboxPair(
                 run_id,
                 agent=sandboxes["agent"],
-                github=sandboxes["github"],
+                github=sandboxes.get("github"),
                 keep=self.config.keep_sandboxes,
                 workspace=workspace,
                 agent_workdir=agent_workdir,

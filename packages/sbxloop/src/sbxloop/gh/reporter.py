@@ -1,7 +1,8 @@
 """GithubReporterHook: mirrors run progress to a GitHub tracking issue.
 
-The default consumer of the github-ops sandbox. When ``github.report_repo``
-is configured, the hook opens a tracking issue at run start, comments as
+The default consumer of the github-ops sandbox. When the GitHub integration
+is configured (``[github].repo``) and reporting is enabled (``report = true``
+or ``--report``), the hook opens a tracking issue at run start, comments as
 tasks finish, and posts a final summary at run end. It never raises — a
 reporting failure must not fail a run — and the EventBus isolates it anyway.
 """

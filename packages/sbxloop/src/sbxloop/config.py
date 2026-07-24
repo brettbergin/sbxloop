@@ -12,12 +12,13 @@ strings.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from sbxloop.errors import ConfigError
 
@@ -42,7 +43,25 @@ class SandboxConfig(_ConfigModel):
 
 
 class GithubConfig(_ConfigModel):
-    report_repo: str | None = None
+    """The GitHub integration. ``repo`` is the gate: unset (the default)
+    disables GitHub entirely — no github sandbox is provisioned, no GH_TOKEN
+    is required, and repo-facing features (progress reporting, delivery)
+    refuse to run. Setting it makes ``repo`` the one repository sbxloop is
+    allowed to work with; behavior toggles like ``report`` act on it."""
+
+    repo: str | None = None
+    report: bool = False
+
+    @field_validator("repo")
+    @classmethod
+    def _check_repo(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", value):
+            raise ValueError(f"github.repo must be owner/name, got {value!r}")
+        return value
+
+    @property
+    def enabled(self) -> bool:
+        return self.repo is not None
 
 
 class Budgets(_ConfigModel):
