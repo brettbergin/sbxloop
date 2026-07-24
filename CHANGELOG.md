@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-07-23
+
 ### Fixed
 - "produced no result file" failures are now diagnosable: the worker's
   stderr is drained (also fixing a potential pipe-deadlock for chatty
