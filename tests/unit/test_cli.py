@@ -56,7 +56,16 @@ class TestBasics:
     def test_help_lists_commands(self) -> None:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        for command in ("run", "resume", "status", "logs", "doctor", "sandbox", "config"):
+        for command in (
+            "run",
+            "resume",
+            "status",
+            "logs",
+            "artifacts",
+            "doctor",
+            "sandbox",
+            "config",
+        ):
             assert command in result.output
 
 
@@ -95,6 +104,71 @@ class TestStatusAndLogs:
         result = runner.invoke(app, ["logs", "rseeded11", "--follow"])
         assert result.exit_code == 0
         assert "run.end" in result.output
+
+
+class TestArtifactsCommand:
+    def seed_with_workspace(self, workdir: Path, *, mounted: bool) -> Path:
+        store = seed_store(workdir)
+        workspace = workdir / "runs-ws"
+        workspace.mkdir()
+        store.set_run_workspace("rseeded11", workspace, mounted)
+        return workspace
+
+    def test_unknown_run_errors(self, workdir: Path) -> None:
+        seed_store(workdir)
+        result = runner.invoke(app, ["artifacts", "rghost"])
+        assert result.exit_code == 2
+        assert "unknown run" in result.output
+
+    def test_never_provisioned_run_errors_cleanly(self, workdir: Path) -> None:
+        seed_store(workdir)  # run exists but has no workspace recorded
+        result = runner.invoke(app, ["artifacts", "rseeded11"])
+        assert result.exit_code == 2
+        assert "never provisioned a workspace" in result.output
+
+    def test_mounted_run_lists_files_with_sizes(self, workdir: Path) -> None:
+        workspace = self.seed_with_workspace(workdir, mounted=True)
+        (workspace / "hello.txt").write_text("hi")
+        (workspace / "sub").mkdir()
+        (workspace / "sub" / "data.bin").write_bytes(b"x" * 2048)
+        result = runner.invoke(app, ["artifacts", "rseeded11"])
+        assert result.exit_code == 0
+        assert "2 file(s)" in result.output
+        assert "live workspace mount" in result.output
+        assert "hello.txt" in result.output
+        assert "2.0 KB" in result.output
+
+    def test_path_prints_bare_directory(self, workdir: Path) -> None:
+        workspace = self.seed_with_workspace(workdir, mounted=True)
+        result = runner.invoke(app, ["artifacts", "rseeded11", "--path"])
+        assert result.exit_code == 0
+        assert result.output.strip() == str(workspace)
+
+    def test_harvested_run_reads_artifacts_dir(self, workdir: Path) -> None:
+        self.seed_with_workspace(workdir, mounted=False)
+        harvested = workdir / ".sbxloop" / "runs" / "rseeded11" / "artifacts"
+        harvested.mkdir(parents=True)
+        (harvested / "result.md").write_text("# out")
+        result = runner.invoke(app, ["artifacts", "rseeded11"])
+        assert result.exit_code == 0
+        assert "harvested copy" in result.output
+        assert "result.md" in result.output
+
+    def test_tree_renders(self, workdir: Path) -> None:
+        workspace = self.seed_with_workspace(workdir, mounted=True)
+        (workspace / "a").mkdir()
+        (workspace / "a" / "deep.txt").write_text("d")
+        result = runner.invoke(app, ["artifacts", "rseeded11", "--tree"])
+        assert result.exit_code == 0
+        assert "a/" in result.output
+        assert "deep.txt" in result.output
+
+    def test_missing_directory_errors(self, workdir: Path) -> None:
+        workspace = self.seed_with_workspace(workdir, mounted=True)
+        workspace.rmdir()
+        result = runner.invoke(app, ["artifacts", "rseeded11"])
+        assert result.exit_code == 2
+        assert "gone" in result.output
 
 
 class TestConfigAndInit:
@@ -263,6 +337,15 @@ class TestRunCommand:
         runs = list((workdir / ".sbxloop" / "runs").iterdir())
         assert len(runs) == 1
         assert (runs[0] / "workspace" / "hello.txt").read_text() == "hi"
+
+        # ...and the artifacts command finds them after the run (full loop:
+        # executor writes -> mount propagates -> store resolves -> CLI lists)
+        run_id = StateStore(workdir / ".sbxloop" / "state.db").list_runs()[0].run_id
+        listed = runner.invoke(app, ["artifacts", run_id])
+        assert listed.exit_code == 0, listed.output
+        assert "hello.txt" in listed.output
+        bare = runner.invoke(app, ["artifacts", run_id, "--path"])
+        assert bare.output.strip() == str(runs[0] / "workspace")
 
     def test_run_failure_exit_code(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
