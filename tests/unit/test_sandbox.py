@@ -58,3 +58,12 @@ def test_stop_and_rm(sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
 
 def test_repr(sandbox: Sandbox) -> None:
     assert repr(sandbox) == "Sandbox('boxa')"
+
+
+def test_write_text_produces_world_readable_files(sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+    """Regression (field, 0.1.6): NamedTemporaryFile stages 0600 files and
+    sbx cp preserves the mode, so the in-sandbox agent user got Errno 13
+    reading its own job files. Staged files must be world-readable."""
+    sandbox.write_text("/home/agent/.sdxloop/jobs/j1.json", '{"v": 1}')
+    staged = fake_sbx.sandbox_fs("boxa") / "home/agent/.sdxloop/jobs/j1.json"
+    assert staged.stat().st_mode & 0o777 == 0o644
