@@ -7,7 +7,11 @@ multi-job engine tests can script an entire run.
 
 Response object shape (all fields optional):
 ``{"text": str, "json": dict|list, "session_id": str, "sleep_s": float,
-"events": [{"type": str, "data": {...}}], "fail": str}``
+"events": [{"type": str, "data": {...}}], "fail": str,
+"files": {"relative/path": "content"}}``
+
+``files`` are written relative to the worker process cwd — modelling an
+executor that produces artifacts in the run workspace.
 """
 
 from __future__ import annotations
@@ -73,6 +77,10 @@ class EchoBackend:
             raise RuntimeError(str(response["fail"]))
         if sleep_s := float(response.get("sleep_s", 0)):
             time.sleep(sleep_s)
+        for relative, content in response.get("files", {}).items():
+            target = Path.cwd() / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(content))
         for scripted_event in response.get("events", []):
             emit(scripted_event["type"], **scripted_event.get("data", {}))
         text = str(response.get("text", ""))

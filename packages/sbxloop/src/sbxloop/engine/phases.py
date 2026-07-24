@@ -48,11 +48,23 @@ def clip(text: str | None, limit: int = OUTPUT_CLIP) -> str:
 class PhaseRunner:
     """Runs the six phases for one run against the agent sandbox's worker."""
 
-    def __init__(self, agent: WorkerClient, config: Config, run_id: str, outcome: str) -> None:
+    def __init__(
+        self,
+        agent: WorkerClient,
+        config: Config,
+        run_id: str,
+        outcome: str,
+        *,
+        workdir: str | None = None,
+    ) -> None:
         self.agent = agent
         self.config = config
         self.run_id = run_id
         self.outcome = outcome
+        # Canonical in-VM working directory for every job in this run: the
+        # discovered workspace mount, or the harvest dir. Evidence and verify
+        # commands must run where the executor wrote its files.
+        self.workdir = workdir
 
     # -- job plumbing ------------------------------------------------------
 
@@ -71,6 +83,7 @@ class PhaseRunner:
             model=self.config.model,
             permission_mode=permission_mode,
             expect=expect,
+            cwd=self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
         )
         result = self.agent.submit(job)
@@ -110,7 +123,7 @@ class PhaseRunner:
             run_id=self.run_id,
             kind="shell.check",
             argv=["sh", "-c", command],
-            cwd=cwd,
+            cwd=cwd or self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
         )
         result = self.agent.submit(job)

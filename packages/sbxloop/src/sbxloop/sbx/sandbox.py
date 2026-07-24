@@ -13,6 +13,9 @@ from sbxloop.sbx.models import ExecResult
 # Canonical in-sandbox layout. The sandbox user is `agent` in the official
 # Docker sandbox templates.
 SANDBOX_HOME = "/home/agent"
+# Fallback in-VM working directory when the host-workspace mount cannot be
+# discovered (harvest mode copies it out with `sbx cp` instead).
+WORK_DIR = f"{SANDBOX_HOME}/work"
 SBXLOOP_DIR = f"{SANDBOX_HOME}/.sbxloop"
 JOBS_DIR = f"{SBXLOOP_DIR}/jobs"
 RESULTS_DIR = f"{SBXLOOP_DIR}/results"

@@ -101,6 +101,8 @@ class LoopEngine:
         self._set_run_state(run_id, "provisioning")
         provisioner = Provisioner(self.sbx, self.config, self.bus)
         pair = provisioner.ensure_pair(run_id)
+        assert pair.workspace is not None
+        self.store.set_run_workspace(run_id, pair.workspace, pair.mounted)
         try:
             with pair:
                 agent = WorkerClient(
@@ -120,7 +122,9 @@ class LoopEngine:
                     github.install(extras="")
                 detach = self._attach_reporter(github, run_id)
                 try:
-                    phases = PhaseRunner(agent, self.config, run_id, outcome)
+                    phases = PhaseRunner(
+                        agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                    )
                     state = self._run_phases(run_id, phases, deadline)
                 finally:
                     detach()
@@ -130,7 +134,13 @@ class LoopEngine:
         self._set_run_state(run_id, state)
         tasks = self.store.get_tasks(run_id)
         self.bus.emit(HostEventTypes.RUN_END, run_id, state=state)
-        return RunResult(run_id=run_id, state=state, tasks=tasks)
+        return RunResult(
+            run_id=run_id,
+            state=state,
+            tasks=tasks,
+            workspace=pair.workspace,
+            mounted=pair.mounted,
+        )
 
     def _attach_reporter(self, github: WorkerClient, run_id: str) -> Callable[[], None]:
         repo = self.config.github.report_repo

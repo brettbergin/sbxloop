@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import secrets
 import shlex
 from collections.abc import Callable, Mapping
 from functools import partial
@@ -30,7 +31,7 @@ from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
 from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.sandbox import ENV_FILE, EVENTS_DIR, JOBS_DIR, RESULTS_DIR, Sandbox
+from sbxloop.sbx.sandbox import ENV_FILE, EVENTS_DIR, JOBS_DIR, RESULTS_DIR, WORK_DIR, Sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,11 @@ GITHUB_ALLOW_DOMAINS = (
     "uploads.github.com",
     "objects.githubusercontent.com",
 )
+
+# Candidate roots for the in-VM workspace mount search. Where sbx mounts the
+# host workspace inside the microVM is undocumented; probe, never assume.
+MOUNT_SEARCH_ROOTS = ("/workspace", "/home/agent", "/mnt", "/host", "/root")
+MOUNT_SEARCH_MAXDEPTH = 4
 
 PostCreate = Callable[[Sandbox, SandboxRole], None]
 
@@ -162,11 +168,19 @@ class Provisioner:
                     self.post_create(sandbox, spec.role)
                 sandboxes[spec.role] = sandbox
                 self.bus.emit("sandbox.ready", run_id, name=spec.name, role=spec.role)
+            agent_workdir = self._discover_mount(run_id, sandboxes["agent"], workspace)
+            mounted = agent_workdir is not None
+            if agent_workdir is None:
+                agent_workdir = WORK_DIR
+                sandboxes["agent"].mkdirs(agent_workdir)
             return SandboxPair(
                 run_id,
                 agent=sandboxes["agent"],
                 github=sandboxes["github"],
                 keep=self.config.keep_sandboxes,
+                workspace=workspace,
+                agent_workdir=agent_workdir,
+                mounted=mounted,
             )
         except Exception as exc:
             for sandbox in created:
@@ -344,6 +358,53 @@ class Provisioner:
             env=env_name,
             message=message,
         )
+
+    def _discover_mount(self, run_id: str, sandbox: Sandbox, workspace: Path) -> str | None:
+        """Find where sbx mounted the host workspace inside the agent VM.
+
+        Writes a nonce marker file into the host workspace, then runs one
+        bounded in-sandbox search for it over candidate roots. Returns the
+        in-VM directory containing the marker, or None when discovery fails
+        (→ harvest mode; non-fatal, mirroring _verify_secret_env's
+        probe-don't-assume pattern). The marker is always removed.
+        """
+        marker = f".sbxloop-mount-{secrets.token_hex(8)}"
+        try:
+            (workspace / marker).write_text("")
+        except OSError:
+            logger.warning("mount discovery: cannot write marker into %s", workspace)
+            return None
+        try:
+            command = (
+                f"find -L {' '.join(MOUNT_SEARCH_ROOTS)} "
+                f"-maxdepth {MOUNT_SEARCH_MAXDEPTH} -name {marker} -print 2>/dev/null"
+                " | head -1"
+            )
+            result = sandbox.exec(["sh", "-c", command])
+            hit = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        except SbxError:
+            logger.warning("mount discovery failed for %s", sandbox.name, exc_info=True)
+            hit = ""
+        finally:
+            (workspace / marker).unlink(missing_ok=True)
+        if not hit.endswith(f"/{marker}"):
+            self.bus.emit(
+                "sandbox.workspace_mount",
+                run_id,
+                name=sandbox.name,
+                mounted=False,
+                message="workspace mount not found in VM; artifacts will be harvested",
+            )
+            return None
+        mount_dir = hit[: -len(f"/{marker}")] or "/"
+        self.bus.emit(
+            "sandbox.workspace_mount",
+            run_id,
+            name=sandbox.name,
+            mounted=True,
+            path=mount_dir,
+        )
+        return mount_dir
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""
