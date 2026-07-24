@@ -283,9 +283,12 @@ class TestSecretIdempotency:
 
 
 class TestSecretEnvVerification:
-    def test_missing_env_emits_warning_event(
+    def test_missing_env_auto_heals_with_plain_env_fallback(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Field-confirmed: sbx proxy secrets never reach exec'd processes.
+        Under the proxy strategy, an invisible token must trigger the
+        plain-env fallback for that sandbox so the run still works."""
         # the fake exec inherits the test process env; ensure the tokens are
         # NOT visible inside the sandbox shells
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
@@ -297,10 +300,19 @@ class TestSecretEnvVerification:
         pair = provisioner.ensure_pair("r1")
         try:
             missing = [e for e in events if e.type == "sandbox.secret_env_missing"]
-            assert len(missing) == 2  # one per sandbox
-            assert missing[0].data["env"] == "COPILOT_GITHUB_TOKEN"
-            assert "plain-env" in missing[0].data["message"]
-            assert missing[1].data["env"] == "GH_TOKEN"
+            assert [e.data["env"] for e in missing] == ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"]
+            fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+            assert len(fallback) == 2
+            assert "plain-env" in fallback[0].data["message"]
+            # the in-VM env file now carries the tokens the worker will load
+            agent_env = (
+                fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sdxloop/env.sh"
+            ).read_text()
+            github_env = (
+                fake_sbx.sandbox_fs(pair.github.name) / "home/agent/.sdxloop/env.sh"
+            ).read_text()
+            assert "export COPILOT_GITHUB_TOKEN=github_pat_copilot" in agent_env
+            assert "export GH_TOKEN=github_pat_user" in github_env
         finally:
             pair.cleanup()
 

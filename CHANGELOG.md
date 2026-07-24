@@ -6,6 +6,16 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Runs work out of the box on real sbx: field testing confirmed the sbx
+  secret proxy never exposes env vars to `sbx exec` processes (only to
+  the interactive agent sessions sbx launches). Under the default proxy
+  strategy, provisioning now auto-falls-back to the in-VM env file for
+  any sandbox whose secret env is invisible, emitting a
+  `sandbox.secret_env_fallback` warning about the tradeoff. If sbx later
+  injects secrets into exec sessions, the verification passes and tokens
+  stay out of the VM automatically.
+
 ## [0.1.8] — 2026-07-23
 
 ### Fixed
