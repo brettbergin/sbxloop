@@ -11,13 +11,14 @@ import typer
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+from rich.tree import Tree
 
 import sbxloop
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import Dashboard, format_event, plain_printer
 from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import RunResult
+from sbxloop.engine.model import RunResult, artifacts_dir
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
 from sbxloop.sbx.cli import SbxCLI
@@ -93,11 +94,64 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     return outcome["result"]  # type: ignore[no-any-return]
 
 
-def _finish(result: RunResult) -> None:
+_TREE_MAX_FILES = 50
+
+
+def _human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB"):
+        if value < 1024 or unit == "MB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _artifact_files(root: Path) -> list[Path]:
+    """Regular files under root, hidden files/dirs excluded (an agent's .git
+    would otherwise swamp the listing), sorted for stable output."""
+    return sorted(
+        p
+        for p in root.rglob("*")
+        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
+    )
+
+
+def _artifacts_tree(root: Path, files: list[Path], cap: int = _TREE_MAX_FILES) -> Tree:
+    tree = Tree(f"[bold]{root}[/]")
+    nodes: dict[Path, Tree] = {root: tree}
+    for path in files[:cap]:
+        rel = path.relative_to(root)
+        parent = root
+        for part in rel.parts[:-1]:
+            child = parent / part
+            if child not in nodes:
+                nodes[child] = nodes[parent].add(f"{part}/")
+            parent = child
+        nodes[parent].add(f"{rel.name} [dim]({_human_size(path.stat().st_size)})[/]")
+    if len(files) > cap:
+        tree.add(f"[dim]… +{len(files) - cap} more[/]")
+    return tree
+
+
+def _print_artifacts_summary(result: RunResult, config: Config) -> None:
+    target = artifacts_dir(result, config.state_dir)
+    if target is None or not target.is_dir():
+        return
+    files = _artifact_files(target)
+    if not files:
+        console.print(f"\nartifacts: none produced (workspace: {target})")
+        return
+    via = "live workspace mount" if result.mounted else "harvested from the sandbox"
+    console.print(f"\nartifacts: {len(files)} file(s), {via}")
+    console.print(_artifacts_tree(target, files))
+
+
+def _finish(result: RunResult, config: Config) -> None:
     style = "green" if result.succeeded else "red"
     console.print(f"\nrun [bold cyan]{result.run_id}[/] finished: [bold {style}]{result.state}[/]")
     for task in result.tasks:
         console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
+    _print_artifacts_summary(result, config)
     raise typer.Exit(0 if result.succeeded else 1)
 
 
@@ -125,7 +179,7 @@ def run(
     except SdxloopError as exc:
         console.print(f"[bold red]run failed:[/] {exc}")
         raise typer.Exit(2) from exc
-    _finish(result)
+    _finish(result, config)
 
 
 @app.command()
@@ -134,13 +188,14 @@ def resume(
     tui: Annotated[bool, typer.Option("--tui/--no-tui")] = True,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state)."""
-    engine = LoopEngine(load_config())
+    config = load_config()
+    engine = LoopEngine(config)
     try:
         result = _drive_with_ui(engine, tui=tui, action=lambda: engine.resume(run_id))
     except SdxloopError as exc:
         console.print(f"[bold red]resume failed:[/] {exc}")
         raise typer.Exit(2) from exc
-    _finish(result)
+    _finish(result, config)
 
 
 @app.command()

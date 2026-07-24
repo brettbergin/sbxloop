@@ -156,3 +156,18 @@ class RunResult(_Model):
     @property
     def succeeded(self) -> bool:
         return self.state == "completed"
+
+
+def artifacts_dir(run: RunRecord | RunResult, state_dir: Path) -> Path | None:
+    """The single host directory holding a run's artifacts.
+
+    Mounted runs write straight into the workspace; unmounted runs are
+    harvested to ``runs/<run>/artifacts``. Every reader (run summary,
+    ``sbxloop artifacts``, delivery) resolves through here. None means the
+    run never got as far as provisioning a workspace.
+    """
+    if run.workspace is None:
+        return None
+    if run.mounted:
+        return run.workspace
+    return state_dir / "runs" / run.run_id / "artifacts"

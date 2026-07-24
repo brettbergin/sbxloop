@@ -1,9 +1,11 @@
 """TaskGraph and model validation tests."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from sbxloop.engine.model import TaskGraph, TaskSpec, Verdict
+from sbxloop.engine.model import RunRecord, TaskGraph, TaskSpec, Verdict, artifacts_dir
 
 
 def spec(id: str, deps: list[str] | None = None) -> dict[str, object]:
@@ -52,3 +54,35 @@ class TestVerdict:
         t = TaskSpec(id="t1", title="X")
         assert t.acceptance_criteria == []
         assert t.verify_commands == []
+
+
+class TestArtifactsDir:
+    def test_mounted_run_uses_workspace(self) -> None:
+        record = RunRecord(
+            run_id="r1",
+            outcome="x",
+            state="completed",
+            created_at=1.0,
+            updated_at=1.0,
+            workspace=Path("/tmp/ws"),
+            mounted=True,
+        )
+        assert artifacts_dir(record, Path("/state")) == Path("/tmp/ws")
+
+    def test_unmounted_run_uses_harvest_dir(self) -> None:
+        record = RunRecord(
+            run_id="r1",
+            outcome="x",
+            state="completed",
+            created_at=1.0,
+            updated_at=1.0,
+            workspace=Path("/tmp/ws"),
+            mounted=False,
+        )
+        assert artifacts_dir(record, Path("/state")) == Path("/state/runs/r1/artifacts")
+
+    def test_never_provisioned_run_has_none(self) -> None:
+        record = RunRecord(
+            run_id="r1", outcome="x", state="created", created_at=1.0, updated_at=1.0
+        )
+        assert artifacts_dir(record, Path("/state")) is None

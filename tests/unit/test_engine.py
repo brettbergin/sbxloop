@@ -317,11 +317,11 @@ class TestWorkspaceExecution:
         assert len(workdirs) == 1
         assert workdirs != {None}
 
-    def test_unmounted_run_uses_harvest_workdir(
+    def test_unmounted_run_harvests_artifacts(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
-        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n", "sub/deep.txt": "d"}}
         harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
         engine = harness.engine()
         result = engine.start("write hello.txt in harvest mode")
@@ -329,7 +329,27 @@ class TestWorkspaceExecution:
         assert result.state == "completed"
         assert not result.mounted
         assert result.workspace is not None
-        # not mounted: nothing propagated to the host workspace (harvest — the
-        # sbx cp copy-out — arrives in the next PR)
+        # not mounted: nothing lands in the live workspace...
         assert not (result.workspace / "hello.txt").exists()
+        # ...but the sbx cp harvest brought the work dir contents to the host
+        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        assert (harvested / "hello.txt").read_text() == "hi\n"
+        assert (harvested / "sub/deep.txt").read_text() == "d"
         assert not engine.store.get_run(result.run_id).mounted
+        reports = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS]
+        assert reports
+        assert reports[-1].data == {
+            "path": str(harvested),
+            "files": 2,
+            "mounted": False,
+        }
+
+    def test_mounted_run_reports_artifacts_event(self, harness: Harness) -> None:
+        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        result = harness.engine().start("write hello.txt")
+        assert result.state == "completed"
+        reports = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS]
+        assert [e.data["mounted"] for e in reports] == [True]
+        assert reports[0].data["files"] == 1
+        assert reports[0].data["path"] == str(result.workspace)
