@@ -92,6 +92,10 @@ class JobRequest(ProtocolModel):
 
     # kind == "shell.check"
     argv: list[str] | None = None
+
+    # agent.session + shell.check: in-sandbox working directory. The worker
+    # process chdirs here (via --cwd) so agent sessions and shell commands
+    # run in the run's canonical workspace.
     cwd: str | None = None
 
     # kind == "github.op"

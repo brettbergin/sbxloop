@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from graphlib import CycleError, TopologicalSorter
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -137,6 +138,10 @@ class RunRecord(_Model):
     state: RunState
     created_at: float
     updated_at: float
+    # Host workspace directory and whether it was live-mounted into the
+    # agent VM (False → artifacts are harvested to runs/<run>/artifacts).
+    workspace: Path | None = None
+    mounted: bool = False
 
 
 class RunResult(_Model):
@@ -145,6 +150,8 @@ class RunResult(_Model):
     run_id: str
     state: RunState
     tasks: list[TaskRecord] = Field(default_factory=list)
+    workspace: Path | None = None
+    mounted: bool = False
 
     @property
     def succeeded(self) -> bool:

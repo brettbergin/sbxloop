@@ -93,24 +93,28 @@ def require_sandbox(root: Path, name: str) -> Path:
 # Sandbox-canonical path prefixes only. Deliberately narrow: on Linux CI the
 # host checkout, interpreter, and pytest tmp dirs live under /home/runner and
 # /tmp, so rewriting all of /home and /tmp would clobber legitimate host
-# paths in worker argv (this broke CI once — keep it narrow).
+# paths in worker argv (this broke CI once — keep it narrow). /workspace is
+# the fake's model of the sbx workspace mount (a symlink to the real host
+# workspace dir, created by cmd_create).
 _SANDBOX_ROOTS = re.compile(
-    r"(^|[\s='\"(:])(/(?:home/agent|etc/sandbox|tmp/sbxloop)(?=[/._\-\s]|$))"
+    r"(^|[\s='\"(:])(/(?:home/agent|etc/sandbox|tmp/sbxloop|workspace)(?=[/._\-\s]|$))"
 )
 
 
 def rewrite_abs(fs: Path, arg: str) -> str:
     """Map sandbox-canonical paths onto the fake fs root.
 
-    Rewrites /home/agent, /etc/sandbox*, and /tmp/sbxloop* — as whole args
-    and embedded in shell strings, so both ``exec box /home/agent/x`` and
-    ``exec box sh -c 'cat /home/agent/x'`` hit the fake filesystem. All
-    other absolute paths (host binaries, host tmp files) are left alone.
+    Rewrites /home/agent, /etc/sandbox*, /tmp/sbxloop*, and /workspace — as
+    whole args and embedded in shell strings, so both ``exec box
+    /home/agent/x`` and ``exec box sh -c 'cat /home/agent/x'`` hit the fake
+    filesystem. All other absolute paths (host binaries, host tmp files) are
+    left alone. Args may mix already-host fs paths with canonical ones (a
+    ``--cwd <fs>/workspace`` next to ``--job /home/agent/...``): the
+    separator requirement in the regex keeps already-rewritten paths stable,
+    so rewriting is idempotent without a whole-arg guard.
     """
     if arg.startswith("~/"):
         return str(fs / "home/agent" / arg[2:])
-    if str(fs) in arg:
-        return arg
     return _SANDBOX_ROOTS.sub(lambda m: m.group(1) + str(fs) + m.group(2), arg)
 
 
@@ -155,6 +159,12 @@ def cmd_create(root: Path, args: list[str]) -> int:
     fs = path / "fs"
     (fs / "home/agent").mkdir(parents=True, exist_ok=True)
     (fs / "etc").mkdir(parents=True, exist_ok=True)
+    # Model the sbx workspace mount: /workspace inside the sandbox is the
+    # host workspace directory (symlink — writes propagate live, exactly
+    # like a real mount). SBX_FAKE_NO_MOUNT disables it so tests can force
+    # discovery failure / harvest mode.
+    if not os.environ.get("SBX_FAKE_NO_MOUNT") and Path(workspace).is_dir():
+        (fs / "workspace").symlink_to(workspace)
     meta = {"agent": agent, "workspace": workspace, "template": template, "status": "running"}
     (path / "meta.json").write_text(json.dumps(meta))
     return 0

@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS runs (
     state      TEXT NOT NULL,
     config_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    workspace  TEXT,
+    mounted    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -68,6 +70,13 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id, seq);
 """
 
+# Columns added after 0.2.0; applied idempotently so existing state
+# databases upgrade in place on open.
+_RUNS_MIGRATIONS = (
+    ("workspace", "ALTER TABLE runs ADD COLUMN workspace TEXT"),
+    ("mounted", "ALTER TABLE runs ADD COLUMN mounted INTEGER NOT NULL DEFAULT 0"),
+)
+
 
 class StateStore:
     def __init__(self, path: Path) -> None:
@@ -77,6 +86,10 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")}
+        for column, ddl in _RUNS_MIGRATIONS:
+            if column not in existing:
+                self._conn.execute(ddl)
         self._conn.commit()
 
     def close(self) -> None:
@@ -108,30 +121,36 @@ class StateStore:
             raise StateError(f"unknown run {run_id}")
         self._conn.commit()
 
-    def get_run(self, run_id: str) -> RunRecord:
-        row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-        if row is None:
+    def set_run_workspace(self, run_id: str, workspace: Path, mounted: bool) -> None:
+        cursor = self._conn.execute(
+            "UPDATE runs SET workspace = ?, mounted = ?, updated_at = ? WHERE run_id = ?",
+            (str(workspace), int(mounted), time.time(), run_id),
+        )
+        if cursor.rowcount == 0:
             raise StateError(f"unknown run {run_id}")
+        self._conn.commit()
+
+    @staticmethod
+    def _run_record(row: sqlite3.Row) -> RunRecord:
         return RunRecord(
             run_id=row["run_id"],
             outcome=row["outcome"],
             state=row["state"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            workspace=Path(row["workspace"]) if row["workspace"] else None,
+            mounted=bool(row["mounted"]),
         )
+
+    def get_run(self, run_id: str) -> RunRecord:
+        row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise StateError(f"unknown run {run_id}")
+        return self._run_record(row)
 
     def list_runs(self) -> list[RunRecord]:
         rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
-        return [
-            RunRecord(
-                run_id=row["run_id"],
-                outcome=row["outcome"],
-                state=row["state"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            )
-            for row in rows
-        ]
+        return [self._run_record(row) for row in rows]
 
     # -- tasks -------------------------------------------------------------
 

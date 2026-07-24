@@ -9,6 +9,7 @@ from sbxloop.errors import ProvisionError
 from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner, sandbox_name
+from sbxloop.sbx.sandbox import WORK_DIR
 from tests.conftest import FakeSbx
 
 TOKENS = {"COPILOT_GITHUB_TOKEN": "github_pat_copilot", "GH_TOKEN": "github_pat_user"}
@@ -351,5 +352,60 @@ class TestSecretEnvVerification:
             assert not [e for e in events if "secret_env" in e.type]
             checks = [c for c in fake_sbx.invocations("exec") if any("test -n" in a for a in c)]
             assert checks == []
+        finally:
+            pair.cleanup()
+
+
+class TestMountDiscovery:
+    def test_mounted_workspace_discovered(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.mounted
+            assert pair.workspace == (tmp_path / "state/runs/r1/workspace").resolve()
+            # the discovered in-VM dir IS the host workspace (fake models the
+            # mount as a symlink: writes propagate live)
+            assert Path(pair.agent_workdir).resolve() == pair.workspace.resolve()
+            (Path(pair.agent_workdir) / "probe.txt").write_text("via mount")
+            assert (pair.workspace / "probe.txt").read_text() == "via mount"
+            # nonce marker cleaned up
+            assert not list(pair.workspace.glob(".sbxloop-mount-*"))
+            mount_events = [e for e in events if e.type == "sandbox.workspace_mount"]
+            assert [e.data["mounted"] for e in mount_events] == [True]
+            assert mount_events[0].data["path"] == pair.agent_workdir
+        finally:
+            pair.cleanup()
+
+    def test_discovery_failure_falls_back_to_harvest_dir(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert not pair.mounted
+            assert pair.agent_workdir == WORK_DIR
+            # fallback work dir created inside the VM
+            assert (fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/work").is_dir()
+            assert not list(pair.workspace.glob(".sbxloop-mount-*"))
+            mount_events = [e for e in events if e.type == "sandbox.workspace_mount"]
+            assert [e.data["mounted"] for e in mount_events] == [False]
+        finally:
+            pair.cleanup()
+
+    def test_discovery_exec_error_is_non_fatal(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        # sbx-level failure of the find probe must degrade, not abort the run
+        fake_sbx.script("exec sbxloop-r1-agent sh -c find", returncode=1, stderr="not found")
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert not pair.mounted
+            assert pair.agent_workdir == WORK_DIR
         finally:
             pair.cleanup()

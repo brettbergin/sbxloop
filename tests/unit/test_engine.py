@@ -279,3 +279,57 @@ class TestJsonRetry:
         harness.script([{"json": {"tasks": [{"id": "t1"}]}}, {"json": {"tasks": [{"id": "t1"}]}}])
         with pytest.raises(WorkerError, match="invalid output twice"):
             harness.engine().start("never valid")
+
+
+class TestWorkspaceExecution:
+    """The artifacts linchpin: jobs run in the workspace mount, so files the
+    executor writes appear on the host live and survive sandbox teardown."""
+
+    def test_mounted_run_lands_artifacts_on_host(self, harness: Harness) -> None:
+        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        engine = harness.engine()
+        result = engine.start("write hello.txt containing hi")
+
+        assert result.state == "completed"
+        assert result.mounted
+        assert result.workspace is not None
+        # the sandboxes are gone; the artifact is on the host
+        assert harness.sandboxes_left() == []
+        assert (result.workspace / "hello.txt").read_text() == "hi\n"
+
+        # persisted for post-run reads (sbxloop artifacts / resume)
+        record = engine.store.get_run(result.run_id)
+        assert record.workspace == result.workspace
+        assert record.mounted
+
+    def test_every_job_carries_workspace_cwd(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(keep_sandboxes=True)
+        result = engine.start("check job cwd")
+        assert result.state == "completed"
+        fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{result.run_id}-agent")
+        jobs = [json.loads(p.read_text()) for p in (fs / "home/agent/.sbxloop/jobs").iterdir()]
+        assert jobs
+        # every job of every kind — agent phases, evidence, verify — runs in
+        # the workspace, so scrutiny and verification see the produced files
+        workdirs = {j["cwd"] for j in jobs}
+        assert len(workdirs) == 1
+        assert workdirs != {None}
+
+    def test_unmounted_run_uses_harvest_workdir(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        engine = harness.engine()
+        result = engine.start("write hello.txt in harvest mode")
+
+        assert result.state == "completed"
+        assert not result.mounted
+        assert result.workspace is not None
+        # not mounted: nothing propagated to the host workspace (harvest — the
+        # sbx cp copy-out — arrives in the next PR)
+        assert not (result.workspace / "hello.txt").exists()
+        assert not engine.store.get_run(result.run_id).mounted

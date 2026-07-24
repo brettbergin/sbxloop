@@ -224,6 +224,10 @@ class WorkerClient:
             "--env-file",
             ENV_FILE,
         ]
+        # cwd travels on argv (not only in the job JSON) so the worker
+        # process itself chdirs there — agent SDK sessions inherit it.
+        if job.cwd:
+            argv += ["--cwd", job.cwd]
         # sbx injects secrets through the sandbox session/profile machinery;
         # a bare exec'd process may not see them. Run the worker under a
         # login shell so the sandbox environment is fully loaded.

@@ -15,9 +15,10 @@ import logging
 import signal
 import threading
 import types
+from pathlib import Path
 from typing import Any
 
-from sbxloop.sbx.sandbox import Sandbox
+from sbxloop.sbx.sandbox import WORK_DIR, Sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,21 @@ class SandboxPair:
         github: Sandbox,
         *,
         keep: bool = False,
+        workspace: Path | None = None,
+        agent_workdir: str = WORK_DIR,
+        mounted: bool = False,
     ) -> None:
         self.run_id = run_id
         self.agent = agent
         self.github = github
         self.keep = keep
+        # The host directory sbx was given as the run workspace, the in-VM
+        # working directory agent jobs run in, and whether the two are the
+        # same filesystem (mount discovered) — if not, artifacts must be
+        # harvested out with `sbx cp`.
+        self.workspace = workspace
+        self.agent_workdir = agent_workdir
+        self.mounted = mounted
         self._cleaned = False
 
     def __enter__(self) -> SandboxPair:

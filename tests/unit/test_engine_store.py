@@ -109,3 +109,45 @@ class TestPhasesAndEvents:
 
         last_seq = all_events[-1][0]
         assert list(store.events("r1", after_seq=last_seq)) == []
+
+
+class TestWorkspaceColumns:
+    def test_set_and_read_workspace(self, store: StateStore, tmp_path: Path) -> None:
+        store.create_run("r1", "x")
+        record = store.get_run("r1")
+        assert record.workspace is None
+        assert record.mounted is False
+        store.set_run_workspace("r1", tmp_path / "ws", True)
+        record = store.get_run("r1")
+        assert record.workspace == tmp_path / "ws"
+        assert record.mounted is True
+        assert store.list_runs()[0].workspace == tmp_path / "ws"
+
+    def test_set_workspace_unknown_run(self, store: StateStore, tmp_path: Path) -> None:
+        with pytest.raises(StateError, match="unknown run"):
+            store.set_run_workspace("ghost", tmp_path, False)
+
+    def test_pre_0_3_database_migrates_in_place(self, tmp_path: Path) -> None:
+        """A state.db created before the workspace columns opens cleanly and
+        gains them (idempotent ALTERs guarded by PRAGMA table_info)."""
+        import sqlite3
+
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
+            " state TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}',"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+        )
+        conn.execute("INSERT INTO runs VALUES ('r1', 'old', 'completed', '{}', 1.0, 1.0)")
+        conn.commit()
+        conn.close()
+
+        store = StateStore(db)
+        record = store.get_run("r1")
+        assert record.workspace is None
+        assert record.mounted is False
+        store.set_run_workspace("r1", tmp_path / "ws", True)
+        assert store.get_run("r1").mounted is True
+        # reopening does not re-apply the ALTERs
+        StateStore(db).get_run("r1")

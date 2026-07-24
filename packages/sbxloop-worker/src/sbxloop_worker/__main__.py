@@ -65,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--result", required=True, type=Path)
     run.add_argument("--heartbeat", type=float, default=15.0)
     run.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
+    run.add_argument("--cwd", type=Path, default=None)
     args = parser.parse_args(argv)
 
     apply_env_file(args.env_file)
@@ -75,6 +76,18 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"sbxloop_worker: invalid job file {args.job}: {exc}", file=sys.stderr)
         return 64
+
+    if args.cwd is not None:
+        # Run the whole worker in the job's working directory so agent
+        # sessions (which inherit the process cwd) and shell commands both
+        # execute in the run workspace. Overwrite job.cwd with the resolved
+        # value so shell.check keeps its single code path.
+        try:
+            os.chdir(args.cwd)
+        except OSError as exc:
+            print(f"sbxloop_worker: cannot chdir to {args.cwd}: {exc}", file=sys.stderr)
+            return 64
+        job = job.model_copy(update={"cwd": str(Path.cwd())})
 
     try:
         JobRunner(

@@ -433,3 +433,51 @@ class TestLoginShellWrapping:
         assert head[0] == "exec"
         assert head[2] == "sh"
         assert head[3] == "-lc"
+
+
+class TestWorkerCwd:
+    def test_cwd_travels_on_argv_and_worker_chdirs(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """--cwd /workspace → the fake rewrites it onto the mount symlink, the
+        worker chdirs there, and a relative write lands in the HOST workspace
+        (tmp_path is boxa's workspace, mounted by the fake at /workspace)."""
+        job = JobRequest(
+            job_id="j9",
+            run_id="r1",
+            kind="shell.check",
+            argv=["sh", "-c", "printf hi > produced.txt"],
+            cwd="/workspace",
+        )
+        result = make_client(sandbox, EventBus()).submit(job)
+        assert result.status == "ok"
+        assert result.exit_code == 0
+        assert (tmp_path / "produced.txt").read_text() == "hi"
+        # the worker argv carried --cwd (agent sessions inherit process cwd)
+        execs = [c for c in fake_sbx.invocations("exec") if any("--cwd" in a for a in c)]
+        assert execs
+
+    def test_agent_session_cwd_reaches_backend(
+        self, sandbox: Sandbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An agent job with cwd runs the echo backend inside the workspace:
+        scripted 'files' writes propagate to the host through the mount."""
+        script = tmp_path / "script.json"
+        script.write_text(
+            json.dumps([{"text": "done", "files": {"out/hello.txt": "hello sbxloop"}}])
+        )
+        monkeypatch.setenv("SBXLOOP_ECHO_SCRIPT", str(script))
+        result = make_client(sandbox, EventBus()).submit(agent_job(job_id="j10", cwd="/workspace"))
+        assert result.status == "ok"
+        assert (tmp_path / "out/hello.txt").read_text() == "hello sbxloop"
+
+    def test_missing_cwd_fails_job_cleanly(self, sandbox: Sandbox) -> None:
+        job = JobRequest(
+            job_id="j11",
+            run_id="r1",
+            kind="shell.check",
+            argv=["true"],
+            cwd="/workspace/nope/nope",
+        )
+        with pytest.raises(WorkerError, match="produced no result file"):
+            make_client(sandbox, EventBus()).submit(job)

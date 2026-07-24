@@ -142,6 +142,21 @@ class CopilotBackend:
             kwargs["model"] = job.model
         if job.system_message:
             kwargs["system_message"] = {"mode": "append", "content": job.system_message}
+        if job.cwd:
+            # Belt-and-braces alongside the worker-level chdir; the kwarg
+            # name is unverified against the SDK (e2e-validated), so an
+            # unsupported signature must not fail the session.
+            kwargs["working_directory"] = job.cwd
+        try:
+            return await self._open(client, job, kwargs)
+        except TypeError:
+            if "working_directory" not in kwargs:
+                raise
+            del kwargs["working_directory"]
+            return await self._open(client, job, kwargs)
+
+    @staticmethod
+    async def _open(client: Any, job: JobRequest, kwargs: dict[str, Any]) -> Any:
         if job.resume_session_id:
             return await client.resume_session(job.resume_session_id, **kwargs)
         return await client.create_session(**kwargs)
