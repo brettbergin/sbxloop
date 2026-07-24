@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from sdxloop.sbx.cli import SbxCLI
-from sdxloop.sbx.models import SandboxSpec
-from sdxloop.sbx.sandbox import Sandbox
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxSpec
+from sbxloop.sbx.sandbox import Sandbox
 from tests.conftest import FakeSbx
 
 
@@ -18,15 +18,15 @@ def sandbox(fake_sbx: FakeSbx, tmp_path: Path) -> Sandbox:
 
 
 def test_write_and_read_text(sandbox: Sandbox) -> None:
-    sandbox.write_text("/home/agent/.sdxloop/jobs/j1.json", '{"job": 1}')
-    assert sandbox.read_text("/home/agent/.sdxloop/jobs/j1.json") == '{"job": 1}'
+    sandbox.write_text("/home/agent/.sbxloop/jobs/j1.json", '{"job": 1}')
+    assert sandbox.read_text("/home/agent/.sbxloop/jobs/j1.json") == '{"job": 1}'
 
 
 def test_mkdirs_and_exec(sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
-    sandbox.mkdirs("/home/agent/.sdxloop/a", "/home/agent/.sdxloop/b")
+    sandbox.mkdirs("/home/agent/.sbxloop/a", "/home/agent/.sbxloop/b")
     fs = fake_sbx.sandbox_fs("boxa")
-    assert (fs / "home/agent/.sdxloop/a").is_dir()
-    assert (fs / "home/agent/.sdxloop/b").is_dir()
+    assert (fs / "home/agent/.sbxloop/a").is_dir()
+    assert (fs / "home/agent/.sbxloop/b").is_dir()
     result = sandbox.exec(["sh", "-c", "echo -n out"])
     assert result.ok
 
@@ -64,6 +64,6 @@ def test_write_text_produces_world_readable_files(sandbox: Sandbox, fake_sbx: Fa
     """Regression (field, 0.1.6): NamedTemporaryFile stages 0600 files and
     sbx cp preserves the mode, so the in-sandbox agent user got Errno 13
     reading its own job files. Staged files must be world-readable."""
-    sandbox.write_text("/home/agent/.sdxloop/jobs/j1.json", '{"v": 1}')
-    staged = fake_sbx.sandbox_fs("boxa") / "home/agent/.sdxloop/jobs/j1.json"
+    sandbox.write_text("/home/agent/.sbxloop/jobs/j1.json", '{"v": 1}')
+    staged = fake_sbx.sandbox_fs("boxa") / "home/agent/.sbxloop/jobs/j1.json"
     assert staged.stat().st_mode & 0o777 == 0o644

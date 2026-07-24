@@ -13,18 +13,18 @@ jobs:
       - name: Check tag matches package versions
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          for pkg in packages/sdxloop packages/sdxloop-worker; do
+          for pkg in packages/sbxloop packages/sbxloop-worker; do
             version=$(uv run --no-project python -c "import tomllib,sys; print(tomllib.load(open('$pkg/pyproject.toml','rb'))['project']['version'])")
             if [ "$version" != "$tag" ]; then
               echo "::error::$pkg version $version does not match tag $tag"
               exit 1
             fi
           done
-      - run: uv build --package sdxloop-worker -o dist
-      - run: uv build --package sdxloop -o dist
+      - run: uv build --package sbxloop-worker -o dist
+      - run: uv build --package sbxloop -o dist
       - name: Assert worker wheel is vendored inside the host wheel
         run: |
-          unzip -l dist/sdxloop-*.whl | grep 'sdxloop/_vendor/sdxloop_worker-.*\.whl'
+          unzip -l dist/sbxloop-*.whl | grep 'sbxloop/_vendor/sbxloop_worker-.*\.whl'
       - name: Run the full check suite against the release tree
         run: |
           uv sync --all-packages
@@ -42,8 +42,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC): configure this repo + workflow + environment
-    # as a Trusted Publisher on pypi.org for BOTH projects (sdxloop and
-    # sdxloop-worker). No API token secrets are used.
+    # as a Trusted Publisher on pypi.org for BOTH projects (sbxloop and
+    # sbxloop-worker). No API token secrets are used.
     environment: pypi
     permissions:
       id-token: write

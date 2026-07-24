@@ -8,21 +8,21 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
-from sdxloop.config import Config, load_config, load_dotenv_file
+from sbxloop.config import Config, load_config, load_dotenv_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-SENTINEL = "SDXLOOP_TEST_DOTENV_SENTINEL"
+SENTINEL = "SBXLOOP_TEST_DOTENV_SENTINEL"
 
 
 @pytest.fixture(autouse=True)
 def _clean_sentinels(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure vars our .env files set never leak across tests."""
-    for name in (SENTINEL, "SDXLOOP_MODEL", "COPILOT_GITHUB_TOKEN"):
+    for name in (SENTINEL, "SBXLOOP_MODEL", "COPILOT_GITHUB_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     yield  # type: ignore[misc]
     os.environ.pop(SENTINEL, None)
-    os.environ.pop("SDXLOOP_MODEL", None)
+    os.environ.pop("SBXLOOP_MODEL", None)
 
 
 class TestLoadDotenvFile:
@@ -44,15 +44,15 @@ class TestLoadDotenvFile:
 
 class TestConfigIntegration:
     def test_load_config_reads_dotenv_settings(self, tmp_path: Path) -> None:
-        (tmp_path / ".env").write_text("SDXLOOP_MODEL=dotenv-model\n")
+        (tmp_path / ".env").write_text("SBXLOOP_MODEL=dotenv-model\n")
         config = load_config(cwd=tmp_path)  # env=None -> real environ + .env
         assert config.model == "dotenv-model"
 
     def test_explicit_env_mapping_stays_hermetic(self, tmp_path: Path) -> None:
-        (tmp_path / ".env").write_text("SDXLOOP_MODEL=dotenv-model\n")
+        (tmp_path / ".env").write_text("SBXLOOP_MODEL=dotenv-model\n")
         config = load_config(cwd=tmp_path, env={})
         assert config.model == "auto"  # .env not consulted
-        assert "SDXLOOP_MODEL" not in os.environ  # and not loaded at all
+        assert "SBXLOOP_MODEL" not in os.environ  # and not loaded at all
 
 
 class TestEnvExample:
@@ -67,16 +67,16 @@ class TestEnvExample:
         assert all(not v for v in values.values())  # placeholders ship empty
 
     def test_example_commented_settings_are_valid_config(self, tmp_path: Path) -> None:
-        # Every commented-out SDXLOOP_* line must round-trip through the
+        # Every commented-out SBXLOOP_* line must round-trip through the
         # config loader once uncommented, so the example can't rot.
         lines = (REPO_ROOT / ".env.example").read_text().splitlines()
         env: dict[str, str] = {}
         for line in lines:
             stripped = line.lstrip("#").strip()
-            if stripped.startswith("SDXLOOP_") and "=" in stripped:
+            if stripped.startswith("SBXLOOP_") and "=" in stripped:
                 key, _, value = stripped.partition("=")
                 env[key] = value
-        assert env, "expected commented SDXLOOP_ examples"
+        assert env, "expected commented SBXLOOP_ examples"
         config = load_config(cwd=tmp_path, env=env)
         assert isinstance(config, Config)
         assert config.github.report_repo == "owner/repo"

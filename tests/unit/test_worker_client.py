@@ -1,6 +1,6 @@
 """WorkerClient transport tests: the REAL worker process through the fake sbx.
 
-sys.executable (the test venv python, which has sdxloop_worker importable) is
+sys.executable (the test venv python, which has sbxloop_worker importable) is
 used as the in-sandbox interpreter; the fake sbx rewrites the /home/agent
 job/event/result paths into the fake sandbox filesystem, so these tests
 exercise the genuine end-to-end submit path: write job -> exec worker ->
@@ -15,19 +15,19 @@ from pathlib import Path
 
 import pytest
 
-from sdxloop.errors import WorkerError, WorkerTimeoutError
-from sdxloop.events import Event, EventBus
-from sdxloop.sbx.cli import SbxCLI
-from sdxloop.sbx.models import SandboxSpec
-from sdxloop.sbx.sandbox import Sandbox
-from sdxloop.worker.client import WorkerClient
-from sdxloop_worker.protocol import EventTypes, JobRequest
+from sbxloop.errors import WorkerError, WorkerTimeoutError
+from sbxloop.events import Event, EventBus
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxSpec
+from sbxloop.sbx.sandbox import Sandbox
+from sbxloop.worker.client import WorkerClient
+from sbxloop_worker.protocol import EventTypes, JobRequest
 from tests.conftest import FakeSbx
 
 
 @pytest.fixture(autouse=True)
 def echo_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SDXLOOP_WORKER_BACKEND", "echo")
+    monkeypatch.setenv("SBXLOOP_WORKER_BACKEND", "echo")
 
 
 @pytest.fixture
@@ -70,9 +70,9 @@ class TestStreamTransport:
 
         # durable artifacts exist inside the sandbox fs
         fs = fake_sbx.sandbox_fs("boxa")
-        assert (fs / "home/agent/.sdxloop/jobs/j1.json").is_file()
-        assert (fs / "home/agent/.sdxloop/results/j1.json").is_file()
-        assert (fs / "home/agent/.sdxloop/events/j1.jsonl").is_file()
+        assert (fs / "home/agent/.sbxloop/jobs/j1.json").is_file()
+        assert (fs / "home/agent/.sbxloop/results/j1.json").is_file()
+        assert (fs / "home/agent/.sbxloop/events/j1.jsonl").is_file()
 
     def test_shell_check_job(self, sandbox: Sandbox) -> None:
         job = JobRequest(
@@ -111,13 +111,13 @@ class TestStreamTransport:
         script.write_text(json.dumps([{"text": "slow", "sleep_s": 30}]))
         import os
 
-        os.environ["SDXLOOP_ECHO_SCRIPT"] = str(script)
+        os.environ["SBXLOOP_ECHO_SCRIPT"] = str(script)
         try:
             client = make_client(sandbox, EventBus(), grace_s=1.0)
             with pytest.raises(WorkerTimeoutError, match="exceeded"):
                 client.submit(agent_job(timeout_s=0.2))
         finally:
-            del os.environ["SDXLOOP_ECHO_SCRIPT"]
+            del os.environ["SBXLOOP_ECHO_SCRIPT"]
         kills = [c for c in fake_sbx.invocations("exec") if "pkill" in c]
         assert kills, "expected a pkill inside the sandbox"
         assert any("j1" in arg for c in kills for arg in c)
@@ -135,11 +135,11 @@ class TestStreamTransport:
             [
                 "sh",
                 "-c",
-                "cp /home/agent/.sdxloop/results/j1.json /home/agent/.sdxloop/results/jX.json",
+                "cp /home/agent/.sbxloop/results/j1.json /home/agent/.sbxloop/results/jX.json",
             ]
         )
         with pytest.raises(WorkerError, match="mismatch"):
-            client._fetch_result(agent_job(job_id="jX"), "/home/agent/.sdxloop/results/jX.json")
+            client._fetch_result(agent_job(job_id="jX"), "/home/agent/.sbxloop/results/jX.json")
 
 
 class TestPollTransport:
@@ -162,7 +162,7 @@ class TestPollTransport:
         script.write_text(json.dumps([{"text": "slow", "sleep_s": 30}]))
         import os
 
-        os.environ["SDXLOOP_ECHO_SCRIPT"] = str(script)
+        os.environ["SBXLOOP_ECHO_SCRIPT"] = str(script)
         try:
             client = make_client(
                 sandbox, EventBus(), transport="poll", poll_interval=0.1, grace_s=0.5
@@ -170,28 +170,28 @@ class TestPollTransport:
             with pytest.raises(WorkerTimeoutError):
                 client.submit(agent_job(timeout_s=0.2))
         finally:
-            del os.environ["SDXLOOP_ECHO_SCRIPT"]
+            del os.environ["SBXLOOP_ECHO_SCRIPT"]
 
 
 class TestInstall:
     def test_install_flow_with_wheel(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        import sdxloop
+        import sbxloop
 
-        wheel = tmp_path / f"sdxloop_worker-{sdxloop.__version__}-py3-none-any.whl"
+        wheel = tmp_path / f"sbxloop_worker-{sbxloop.__version__}-py3-none-any.whl"
         wheel.write_bytes(b"fake wheel bytes")
         client = make_client(sandbox, EventBus())
         # Scripted execs: venv creation, pip install, and import check all
         # succeed; the import check must print the lockstep version.
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
-        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
-            stdout=f"{sdxloop.__version__}\n",
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
         )
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker", returncode=64
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
         )
         client.install(wheel=wheel, extras="copilot")
 
@@ -206,32 +206,32 @@ class TestInstall:
     def test_install_pypi_fallback(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import sdxloop
-        from sdxloop.worker import client as client_mod
+        import sbxloop
+        from sbxloop.worker import client as client_mod
 
         # no local wheel available -> install pinned from PyPI
         monkeypatch.setattr(client_mod, "resolve_worker_wheel", lambda: None)
         client = make_client(sandbox, EventBus())
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
-        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
-            stdout=f"{sdxloop.__version__}\n",
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
         )
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker", returncode=64
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
         )
         client.install(wheel=None, extras="")
 
         pip_calls = [c for c in fake_sbx.invocations("exec") if any("pip" in a for a in c)]
-        expected = f"sdxloop-worker=={sdxloop.__version__}"
+        expected = f"sbxloop-worker=={sbxloop.__version__}"
         assert any(expected in a for c in pip_calls for a in c)
 
     def test_install_version_mismatch(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
         client = make_client(sandbox, EventBus())
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
-        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
-        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/python -c", stdout="9.9.9\n")
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/python -c", stdout="9.9.9\n")
         with pytest.raises(WorkerError, match="does not match host"):
             client.install(wheel=None, extras="")
 
@@ -250,7 +250,7 @@ class TestInstallFallbacks:
     def test_venv_failure_self_heals_via_apt(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        import sdxloop
+        import sbxloop
 
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
@@ -264,23 +264,23 @@ class TestInstallFallbacks:
         )
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0, once=True)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0, once=True)
-        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
-            stdout=f"{sdxloop.__version__}\n",
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
         )
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker", returncode=64
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
         )
         client.install(wheel=wheel)
-        assert client.python == "/home/agent/.sdxloop/venv/bin/python"
+        assert client.python == "/home/agent/.sbxloop/venv/bin/python"
         apt_calls = [c for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)]
         assert apt_calls, "expected an apt-get self-heal attempt"
 
     def test_user_site_fallback_when_venv_impossible(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        import sdxloop
+        import sbxloop
 
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
@@ -299,7 +299,7 @@ class TestInstallFallbacks:
             stderr="error: externally-managed-environment",
             once=True,
         )
-        fake_sbx.script("exec boxa python3 -c", stdout=f"{sdxloop.__version__}\n")
+        fake_sbx.script("exec boxa python3 -c", stdout=f"{sbxloop.__version__}\n")
         client.install(wheel=wheel)
         assert client.python == "python3"
         pip_calls = [c for c in fake_sbx.invocations("exec") if any("pip" in a for a in c)]
@@ -334,8 +334,8 @@ class TestRealPipInstall:
         would have caught the renamed-wheel bug ('Invalid wheel filename'):
         pip validates the staged FILENAME itself, so nothing short of
         actually running pip exercises that contract."""
-        import sdxloop
-        from sdxloop.worker import wheel as wheel_mod
+        import sbxloop
+        from sbxloop.worker import wheel as wheel_mod
 
         # another test file may have poisoned the build cache with None
         wheel_mod._workspace_build.cache_clear()
@@ -348,17 +348,17 @@ class TestRealPipInstall:
         # only needed by __main__) - which is exactly the class of breakage
         # the smoke check exists to catch at install time.
         client.install(wheel=wheel, extras="")
-        assert client.python == "/home/agent/.sdxloop/venv/bin/python"
+        assert client.python == "/home/agent/.sbxloop/venv/bin/python"
         # the worker is genuinely importable from the sandbox venv
         result = sandbox.exec(
             [
-                "/home/agent/.sdxloop/venv/bin/python",
+                "/home/agent/.sbxloop/venv/bin/python",
                 "-c",
-                "import sdxloop_worker; print(sdxloop_worker.__version__)",
+                "import sbxloop_worker; print(sbxloop_worker.__version__)",
             ]
         )
         assert result.ok
-        assert result.stdout.strip() == sdxloop.__version__
+        assert result.stdout.strip() == sbxloop.__version__
 
 
 class TestNoResultDiagnostics:
@@ -384,7 +384,7 @@ class TestNoResultDiagnostics:
         last events ride along in the error."""
         # a fake partial events file left behind by a dying worker
         partial = Event.now("worker.start", "r1", job_id="j1").to_json_line()
-        sandbox.write_text("/home/agent/.sdxloop/events/j1.jsonl", partial + "\n")
+        sandbox.write_text("/home/agent/.sbxloop/events/j1.jsonl", partial + "\n")
         client = make_client(sandbox, EventBus(), python="false")  # rc=1, no output
         with pytest.raises(WorkerError) as excinfo:
             client.submit(agent_job())
@@ -397,19 +397,19 @@ class TestEntrypointSmoke:
     def test_smoke_failure_fails_install_with_output(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        import sdxloop
+        import sbxloop
 
-        wheel = tmp_path / f"sdxloop_worker-{sdxloop.__version__}-py3-none-any.whl"
+        wheel = tmp_path / f"sbxloop_worker-{sbxloop.__version__}-py3-none-any.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
-        fake_sbx.script("exec boxa /home/agent/.sdxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -c",
-            stdout=f"{sdxloop.__version__}\n",
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
         )
         fake_sbx.script(
-            "exec boxa /home/agent/.sdxloop/venv/bin/python -m sdxloop_worker",
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker",
             returncode=1,
             stderr="Traceback: entrypoint exploded under sbx exec",
         )
@@ -426,7 +426,7 @@ class TestLoginShellWrapping:
         worker_execs = [
             c
             for c in fake_sbx.invocations("exec")
-            if any("sdxloop_worker" in a for a in c) and "pkill" not in c
+            if any("sbxloop_worker" in a for a in c) and "pkill" not in c
         ]
         assert worker_execs, "no worker exec recorded"
         head = worker_execs[0][:4]

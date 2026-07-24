@@ -52,11 +52,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv build --package sdxloop-worker -o dist
-      - run: uv build --package sdxloop -o dist
+      - run: uv build --package sbxloop-worker -o dist
+      - run: uv build --package sbxloop -o dist
       - name: Assert worker wheel is vendored inside the host wheel
         run: |
-          unzip -l dist/sdxloop-*.whl | grep 'sdxloop/_vendor/sdxloop_worker-.*\.whl'
+          unzip -l dist/sbxloop-*.whl | grep 'sbxloop/_vendor/sbxloop_worker-.*\.whl'
       - name: List artifacts
         run: ls -l dist
       - uses: actions/upload-artifact@v4

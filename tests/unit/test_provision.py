@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from sdxloop.config import Config
-from sdxloop.errors import ProvisionError
-from sdxloop.events import Event, EventBus
-from sdxloop.sbx.cli import SbxCLI
-from sdxloop.sbx.provision import Provisioner, sandbox_name
+from sbxloop.config import Config
+from sbxloop.errors import ProvisionError
+from sbxloop.events import Event, EventBus
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.provision import Provisioner, sandbox_name
 from tests.conftest import FakeSbx
 
 TOKENS = {"COPILOT_GITHUB_TOKEN": "github_pat_copilot", "GH_TOKEN": "github_pat_user"}
@@ -35,8 +35,8 @@ class TestSpecs:
     def test_build_specs_roles_and_domains(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         agent, github = provisioner.build_specs("r1", tmp_path)
-        assert agent.name == "sdxloop-r1-agent"
-        assert github.name == "sdxloop-r1-github"
+        assert agent.name == "sbxloop-r1-agent"
+        assert github.name == "sbxloop-r1-github"
         assert "api.githubcopilot.com" in agent.policy_allows
         assert "uploads.github.com" in github.policy_allows
         assert {s.kind for s in agent.secrets} == {"custom"}
@@ -137,9 +137,9 @@ class TestEnsurePair:
             # worker dirs created in both sandboxes
             for name in (pair.agent.name, pair.github.name):
                 fs = fake_sbx.sandbox_fs(name)
-                assert (fs / "home/agent/.sdxloop/jobs").is_dir()
-                assert (fs / "home/agent/.sdxloop/results").is_dir()
-                assert (fs / "home/agent/.sdxloop/events").is_dir()
+                assert (fs / "home/agent/.sbxloop/jobs").is_dir()
+                assert (fs / "home/agent/.sbxloop/results").is_dir()
+                assert (fs / "home/agent/.sbxloop/events").is_dir()
 
             # workspace created under state dir
             assert (tmp_path / "state/runs/r1/workspace").is_dir()
@@ -159,10 +159,10 @@ class TestEnsurePair:
         pair = provisioner.ensure_pair("r1")
         try:
             agent_env = (
-                fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sdxloop/env.sh"
+                fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sbxloop/env.sh"
             ).read_text()
             github_env = (
-                fake_sbx.sandbox_fs(pair.github.name) / "home/agent/.sdxloop/env.sh"
+                fake_sbx.sandbox_fs(pair.github.name) / "home/agent/.sbxloop/env.sh"
             ).read_text()
             assert "export COPILOT_GITHUB_TOKEN=github_pat_copilot" in agent_env
             assert "GH_TOKEN" not in agent_env
@@ -190,19 +190,19 @@ class TestEnsurePair:
         pair = provisioner.ensure_pair("r1")
         pair.cleanup()
         assert seen == [
-            ("sdxloop-r1-agent", "agent"),
-            ("sdxloop-r1-github", "github"),
+            ("sbxloop-r1-agent", "agent"),
+            ("sbxloop-r1-github", "github"),
         ]
 
     def test_rollback_on_secret_failure(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         # the github sandbox's secret application fails after both creates
-        fake_sbx.fail_next("secret set sdxloop-r1-github", returncode=1, stderr="keychain locked")
+        fake_sbx.fail_next("secret set sbxloop-r1-github", returncode=1, stderr="keychain locked")
         with pytest.raises(ProvisionError, match="provisioning run r1 failed"):
             provisioner.ensure_pair("r1")
         # everything created so far was rolled back
-        assert not (fake_sbx.state / "sandboxes" / "sdxloop-r1-agent").exists()
-        assert not (fake_sbx.state / "sandboxes" / "sdxloop-r1-github").exists()
+        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-agent").exists()
+        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-github").exists()
 
     def test_explicit_workspace_wins(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
@@ -236,11 +236,11 @@ class TestSecretIdempotency:
         try:
             state = self.secret_state(fake_sbx)
             entry = state["custom"]["COPILOT_GITHUB_TOKEN"]
-            assert entry["scope"] == "sdxloop-r2-agent"  # replaced, new owner
+            assert entry["scope"] == "sbxloop-r2-agent"  # replaced, new owner
             assert entry["value"] == "github_pat_copilot"
             # the rm targeted the OLD run's scope, parsed from the error
             rms = [s["args"] for s in fake_sbx.secrets() if s["args"][0] == "rm"]
-            assert any(a[1] == "sdxloop-r1-agent" for a in rms)
+            assert any(a[1] == "sbxloop-r1-agent" for a in rms)
         finally:
             pair.cleanup()
 
@@ -257,7 +257,7 @@ class TestSecretIdempotency:
         pair = provisioner2.ensure_pair("r1")
         try:
             state = self.secret_state(fake_sbx)
-            assert state["service"]["sdxloop-r1-github|github"] == "github_pat_rotated"
+            assert state["service"]["sbxloop-r1-github|github"] == "github_pat_rotated"
         finally:
             pair.cleanup()
 
@@ -307,10 +307,10 @@ class TestSecretEnvVerification:
             assert len(fallback[0].data["message"]) < 160
             # the in-VM env file now carries the tokens the worker will load
             agent_env = (
-                fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sdxloop/env.sh"
+                fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sbxloop/env.sh"
             ).read_text()
             github_env = (
-                fake_sbx.sandbox_fs(pair.github.name) / "home/agent/.sdxloop/env.sh"
+                fake_sbx.sandbox_fs(pair.github.name) / "home/agent/.sbxloop/env.sh"
             ).read_text()
             assert "export COPILOT_GITHUB_TOKEN=github_pat_copilot" in agent_env
             assert "export GH_TOKEN=github_pat_user" in github_env

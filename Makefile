@@ -21,8 +21,8 @@ check: lint typecheck test
 
 build:
 	rm -rf dist
-	uv build --package sdxloop-worker -o dist
-	uv build --package sdxloop -o dist
+	uv build --package sbxloop-worker -o dist
+	uv build --package sbxloop -o dist
 
 clean:
 	rm -rf dist .pytest_cache .mypy_cache .ruff_cache .coverage

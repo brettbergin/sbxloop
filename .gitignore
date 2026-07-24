@@ -217,6 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# sdxloop
+# sbxloop
+.sbxloop/
 .sdxloop/
-packages/sdxloop/src/sdxloop/_vendor/
+packages/sbxloop/src/sbxloop/_vendor/

@@ -1,11 +1,11 @@
 """Parser tests pinned against realistic sbx v0.35-style output."""
 
-from sdxloop.sbx.parse import parse_columns, parse_ls, parse_version
+from sbxloop.sbx.parse import parse_columns, parse_ls, parse_version
 
 LS_FIXTURE = """\
 NAME                    AGENT    STATUS    WORKSPACE
-sdxloop-r1a2b3c4d-agent   shell    running   /Users/b/.sdxloop/runs/r1a2b3c4d/workspace
-sdxloop-r1a2b3c4d-github  shell    running   /Users/b/.sdxloop/runs/r1a2b3c4d/workspace
+sbxloop-r1a2b3c4d-agent   shell    running   /Users/b/.sbxloop/runs/r1a2b3c4d/workspace
+sbxloop-r1a2b3c4d-github  shell    running   /Users/b/.sbxloop/runs/r1a2b3c4d/workspace
 quickstart              claude   stopped   /Users/b/proj
 """
 
@@ -13,13 +13,13 @@ quickstart              claude   stopped   /Users/b/proj
 def test_parse_ls_fixture() -> None:
     infos = parse_ls(LS_FIXTURE)
     assert [i.name for i in infos] == [
-        "sdxloop-r1a2b3c4d-agent",
-        "sdxloop-r1a2b3c4d-github",
+        "sbxloop-r1a2b3c4d-agent",
+        "sbxloop-r1a2b3c4d-github",
         "quickstart",
     ]
     assert infos[0].agent == "shell"
     assert infos[2].status == "stopped"
-    assert infos[0].workspace == "/Users/b/.sdxloop/runs/r1a2b3c4d/workspace"
+    assert infos[0].workspace == "/Users/b/.sbxloop/runs/r1a2b3c4d/workspace"
 
 
 def test_parse_ls_empty_and_header_only() -> None:

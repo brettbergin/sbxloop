@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from sdxloop.engine.model import TaskGraph, TaskSpec, Verdict
+from sbxloop.engine.model import TaskGraph, TaskSpec, Verdict
 
 
 def spec(id: str, deps: list[str] | None = None) -> dict[str, object]:

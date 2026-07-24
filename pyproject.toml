@@ -1,5 +1,5 @@
 [tool.uv.workspace]
-members = ["packages/sdxloop", "packages/sdxloop-worker"]
+members = ["packages/sbxloop", "packages/sbxloop-worker"]
 
 [dependency-groups]
 dev = [
@@ -12,7 +12,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["packages/sdxloop/src", "packages/sdxloop-worker/src", "tests"]
+src = ["packages/sbxloop/src", "packages/sbxloop-worker/src", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -33,13 +33,13 @@ select = [
 "tests/**" = ["T20"]
 "packages/*/tests/**" = ["T20"]
 # The worker communicates over stdout by design.
-"packages/sdxloop-worker/src/sdxloop_worker/**" = ["T20"]
+"packages/sbxloop-worker/src/sbxloop_worker/**" = ["T20"]
 
 [tool.mypy]
 strict = true
 python_version = "3.11"
-mypy_path = ["packages/sdxloop/src", "packages/sdxloop-worker/src"]
-files = ["packages/sdxloop/src", "packages/sdxloop-worker/src"]
+mypy_path = ["packages/sbxloop/src", "packages/sbxloop-worker/src"]
+files = ["packages/sbxloop/src", "packages/sbxloop-worker/src"]
 explicit_package_bases = true
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
@@ -49,11 +49,11 @@ module = ["copilot", "copilot.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "packages/sdxloop-worker/tests"]
+testpaths = ["tests", "packages/sbxloop-worker/tests"]
 markers = ["slow: long-running packaging/build tests"]
 addopts = [
-    "--cov=sdxloop",
-    "--cov=sdxloop_worker",
+    "--cov=sbxloop",
+    "--cov=sbxloop_worker",
     "--cov-report=term-missing",
     "--cov-fail-under=85",
     "-ra",
@@ -64,7 +64,7 @@ branch = true
 omit = [
     # Exercised only by the real-sbx e2e workflow: requires the Copilot SDK
     # runtime and a Copilot subscription.
-    "*/sdxloop_worker/backends/copilot.py",
+    "*/sbxloop_worker/backends/copilot.py",
 ]
 
 [tool.coverage.report]

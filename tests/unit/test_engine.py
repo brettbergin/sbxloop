@@ -15,12 +15,12 @@ from typing import Any
 
 import pytest
 
-from sdxloop.config import Config
-from sdxloop.engine.engine import LoopEngine
-from sdxloop.engine.store import StateStore
-from sdxloop.errors import BudgetExceededError, StateError, WorkerError
-from sdxloop.events import Event, EventBus, HostEventTypes
-from sdxloop.sbx.cli import SbxCLI
+from sbxloop.config import Config
+from sbxloop.engine.engine import LoopEngine
+from sbxloop.engine.store import StateStore
+from sbxloop.errors import BudgetExceededError, StateError, WorkerError
+from sbxloop.events import Event, EventBus, HostEventTypes
+from sbxloop.sbx.cli import SbxCLI
 from tests.conftest import FakeSbx
 
 # -- scripted responses ------------------------------------------------------
@@ -64,8 +64,8 @@ class Harness:
         self.script_path = tmp_path / "echo-script.json"
         self.state_dir = tmp_path / "state"
         self.events: list[Event] = []
-        monkeypatch.setenv("SDXLOOP_WORKER_BACKEND", "echo")
-        monkeypatch.setenv("SDXLOOP_ECHO_SCRIPT", str(self.script_path))
+        monkeypatch.setenv("SBXLOOP_WORKER_BACKEND", "echo")
+        monkeypatch.setenv("SBXLOOP_ECHO_SCRIPT", str(self.script_path))
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "copilot_tok")
         monkeypatch.setenv("GH_TOKEN", "gh_tok")
 

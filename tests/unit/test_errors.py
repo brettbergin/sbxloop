@@ -1,4 +1,4 @@
-from sdxloop.errors import (
+from sbxloop.errors import (
     BudgetExceededError,
     SbxError,
     SbxNotFoundError,

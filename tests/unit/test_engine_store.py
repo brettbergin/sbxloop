@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from sdxloop.engine.model import PlanModel, TaskRecord, TaskSpec
-from sdxloop.engine.store import StateStore
-from sdxloop.errors import StateError
-from sdxloop_worker.protocol import Event
+from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
+from sbxloop.engine.store import StateStore
+from sbxloop.errors import StateError
+from sbxloop_worker.protocol import Event
 
 
 @pytest.fixture

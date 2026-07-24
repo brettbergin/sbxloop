@@ -2,7 +2,7 @@
 
 import pytest
 
-from sdxloop.engine.prompts import bullet_list, render
+from sbxloop.engine.prompts import bullet_list, render
 
 
 def test_render_decompose() -> None:

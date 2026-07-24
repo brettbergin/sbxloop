@@ -2,13 +2,13 @@
 
 The host orchestrator and the in-sandbox worker communicate through files and
 process streams — no sockets, no servers. All wire models live in
-`sdxloop_worker.protocol` (pydantic, `extra="forbid"`, versioned `v: 1`);
+`sbxloop_worker.protocol` (pydantic, `extra="forbid"`, versioned `v: 1`);
 the host imports the exact same module, so drift is a validation error.
 
 ## Filesystem layout (inside each sandbox)
 
 ```
-/home/agent/.sdxloop/
+/home/agent/.sbxloop/
   jobs/<job_id>.json      # JobRequest, written by the host (sbx cp)
   events/<job_id>.jsonl   # Event stream, appended by the worker (fsync/line)
   results/<job_id>.json   # JobResult, written by the worker — AUTHORITATIVE
@@ -19,7 +19,7 @@ the host imports the exact same module, so drift is a validation error.
 ## Job lifecycle
 
 1. Host writes `jobs/<id>.json` and runs
-   `venv/bin/python -m sdxloop_worker run --job … --events … --result …`
+   `venv/bin/python -m sbxloop_worker run --job … --events … --result …`
    via `sbx exec`.
 2. Worker emits `worker.start`, dispatches the job, emits events as it goes
    (mirrored to stdout for live streaming), writes `results/<id>.json`,
@@ -77,7 +77,7 @@ pure-stdlib REST client — both produce identical result shapes.
 ## Worker installation
 
 At provision time the host resolves a worker wheel — vendored inside the
-sdxloop package → built from a workspace checkout → PyPI at the exact
-lockstep version — copies it into the sandbox, creates `~/.sdxloop/venv`,
+sbxloop package → built from a workspace checkout → PyPI at the exact
+lockstep version — copies it into the sandbox, creates `~/.sbxloop/venv`,
 installs it (`[copilot]` extra in the agent sandbox only), and verifies the
 imported version matches the host exactly.

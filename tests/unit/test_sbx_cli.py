@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from sdxloop.errors import SbxError, SbxNotFoundError
-from sdxloop.sbx.cli import SbxCLI
-from sdxloop.sbx.models import SandboxSpec, SecretSpec
+from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxSpec, SecretSpec
 from tests.conftest import FakeSbx
 
 
@@ -15,7 +15,7 @@ def cli(fake_sbx: FakeSbx) -> SbxCLI:
     return SbxCLI(binary=str(fake_sbx.binary))
 
 
-def spec(name: str = "sdxloop-r1-agent", tmp: Path = Path("/tmp")) -> SandboxSpec:
+def spec(name: str = "sbxloop-r1-agent", tmp: Path = Path("/tmp")) -> SandboxSpec:
     return SandboxSpec(name=name, role="agent", workspace=tmp)
 
 
@@ -28,8 +28,8 @@ class TestAppName:
         assert cli.argv("ls") == [str(fake_sbx.binary), "ls"]
 
     def test_app_name_opt_in_injected(self, fake_sbx: FakeSbx) -> None:
-        cli = SbxCLI(binary=str(fake_sbx.binary), app_name="sdxloop")
-        assert cli.argv("version")[:3] == [str(fake_sbx.binary), "--app-name", "sdxloop"]
+        cli = SbxCLI(binary=str(fake_sbx.binary), app_name="sbxloop")
+        assert cli.argv("version")[:3] == [str(fake_sbx.binary), "--app-name", "sbxloop"]
         cli.run("version", check=False)
         # the fake strips --app-name before recording, proving it was passed
         assert fake_sbx.raw_invocations()[0]["args"] == ["version"]
@@ -83,9 +83,9 @@ class TestExec:
         cli.create(spec("boxa", tmp_path))
         cli.exec(
             "boxa",
-            ["sh", "-c", "mkdir -p /home/agent/.sdxloop && echo hi > /home/agent/.sdxloop/x"],
+            ["sh", "-c", "mkdir -p /home/agent/.sbxloop && echo hi > /home/agent/.sbxloop/x"],
         )
-        assert (fake_sbx.sandbox_fs("boxa") / "home/agent/.sdxloop/x").read_text() == "hi\n"
+        assert (fake_sbx.sandbox_fs("boxa") / "home/agent/.sbxloop/x").read_text() == "hi\n"
 
 
 class TestCp:
