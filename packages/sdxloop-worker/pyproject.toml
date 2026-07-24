@@ -1,6 +1,6 @@
 [project]
 name = "sdxloop-worker"
-version = "0.1.8"
+version = "0.1.9"
 description = "In-sandbox worker runtime for sdxloop (protocol models, agent backends, job runner)"
 readme = "README.md"
 requires-python = ">=3.11"

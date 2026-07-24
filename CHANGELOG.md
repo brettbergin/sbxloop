@@ -6,6 +6,8 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-07-23
+
 ### Fixed
 - Runs work out of the box on real sbx: field testing confirmed the sbx
   secret proxy never exposes env vars to `sbx exec` processes (only to
