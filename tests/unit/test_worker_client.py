@@ -192,12 +192,13 @@ class TestInstall:
         )
         client.install(wheel=wheel, extras="copilot")
 
-        # wheel staged into the sandbox
-        assert (fake_sbx.sandbox_fs("boxa") / "tmp/sdxloop_worker.whl").read_bytes() == (
+        # wheel staged into the sandbox UNDER ITS CANONICAL FILENAME: pip
+        # validates the filename structure and rejects renamed wheels
+        assert (fake_sbx.sandbox_fs("boxa") / "tmp" / wheel.name).read_bytes() == (
             b"fake wheel bytes"
         )
         pip_calls = [c for c in fake_sbx.invocations("exec") if any("pip" in a for a in c)]
-        assert any("/tmp/sdxloop_worker.whl[copilot]" in a for c in pip_calls for a in c)
+        assert any(f"/tmp/{wheel.name}[copilot]" in a for c in pip_calls for a in c)
 
     def test_install_pypi_fallback(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -315,3 +316,33 @@ class TestInstallFallbacks:
         )
         with pytest.raises(WorkerError, match="pip exploded on stdout only"):
             client.install(wheel=wheel)
+
+
+class TestRealPipInstall:
+    def test_staged_wheel_installs_with_real_pip(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        """End-to-end install regression: REAL venv + REAL pip against the
+        REAL workspace wheel through the fake sbx. This is the test that
+        would have caught the renamed-wheel bug ('Invalid wheel filename'):
+        pip validates the staged FILENAME itself, so nothing short of
+        actually running pip exercises that contract."""
+        import sdxloop
+        from sdxloop.worker.wheel import resolve_worker_wheel
+
+        wheel = resolve_worker_wheel()
+        if wheel is None:
+            pytest.skip("no worker wheel available (uv not on PATH)")
+        client = make_client(sandbox, EventBus())
+        # hermetic: --system-site-packages exposes the test venv's pydantic;
+        # --no-deps keeps pip off the network. Everything else is real.
+        client.install(wheel=wheel, extras="", no_deps=True, system_site_packages=True)
+        assert client.python == "/home/agent/.sdxloop/venv/bin/python"
+        # the worker is genuinely importable from the sandbox venv
+        result = sandbox.exec(
+            [
+                "/home/agent/.sdxloop/venv/bin/python",
+                "-c",
+                "import sdxloop_worker; print(sdxloop_worker.__version__)",
+            ]
+        )
+        assert result.ok
+        assert result.stdout.strip() == sdxloop.__version__

@@ -6,6 +6,13 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Worker wheels are staged into the sandbox under their canonical
+  filename: pip validates the name-version-python-abi-platform structure
+  of the wheel FILENAME and refused the previously renamed
+  `sdxloop_worker.whl` ("Invalid wheel filename"). A new regression test
+  runs real pip against the real wheel through the fake sbx.
+
 ## [0.1.4] — 2026-07-23
 
 ### Fixed
