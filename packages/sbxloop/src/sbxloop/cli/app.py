@@ -284,6 +284,49 @@ def logs(
         time.sleep(0.5)
 
 
+@app.command()
+def artifacts(
+    run_id: Annotated[str, typer.Argument(help="Run id.")],
+    path: Annotated[
+        bool, typer.Option("--path", help="Print only the artifacts directory (for scripting).")
+    ] = False,
+    tree: Annotated[
+        bool, typer.Option("--tree/--list", help="Render a file tree instead of a flat list.")
+    ] = False,
+) -> None:
+    """Show where a run's artifacts live on the host, and what is in there."""
+    config = load_config()
+    store = _store(config)
+    try:
+        record = store.get_run(run_id)
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    target = artifacts_dir(record, config.state_dir)
+    if target is None:
+        console.print(
+            f"[bold red]run {run_id} has no artifacts:[/] it never provisioned a workspace "
+            f"(state: {record.state})"
+        )
+        raise typer.Exit(2)
+    if path:
+        # bare path on stdout, nothing else — `cd $(sbxloop artifacts R --path)`
+        typer.echo(str(target))
+        return
+    if not target.is_dir():
+        console.print(f"[bold red]artifacts directory is gone:[/] {target}")
+        raise typer.Exit(2)
+    files = _artifact_files(target)
+    via = "live workspace mount" if record.mounted else "harvested copy"
+    console.print(f"run [bold cyan]{run_id}[/]: {len(files)} file(s) ({via}) in [bold]{target}[/]")
+    if tree:
+        console.print(_artifacts_tree(target, files))
+        return
+    for file in files:
+        size = _human_size(file.stat().st_size)
+        console.print(f"  {file.relative_to(target)}  [dim]{size}[/]")
+
+
 @sandbox_app.command("ls")
 def sandbox_ls() -> None:
     """List sbxloop-managed sandboxes."""
