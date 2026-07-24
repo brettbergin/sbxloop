@@ -15,6 +15,7 @@ Failure semantics:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable, Sequence
 
@@ -28,14 +29,17 @@ from sbxloop.engine.model import (
 )
 from sbxloop.engine.phases import PhaseRunner, clip
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import BudgetExceededError, SdxloopError, StateError
+from sbxloop.errors import BudgetExceededError, SbxError, SdxloopError, StateError
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.worker.client import WorkerClient
+
+logger = logging.getLogger(__name__)
 
 
 class LoopEngine:
@@ -125,9 +129,13 @@ class LoopEngine:
                     phases = PhaseRunner(
                         agent, self.config, run_id, outcome, workdir=pair.agent_workdir
                     )
-                    state = self._run_phases(run_id, phases, deadline)
+                    state = self._run_phases(run_id, phases, deadline, pair)
                 finally:
                     detach()
+                    # Harvest even when a phase raised: the sandbox is still
+                    # alive here, and partial artifacts beat none.
+                    self._harvest(run_id, pair)
+                    self._report_artifacts(run_id, pair)
         except SdxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
@@ -149,7 +157,42 @@ class LoopEngine:
         hook = GithubReporterHook(GithubOps(github, run_id), repo)
         return self.bus.attach_hook(hook)
 
-    def _run_phases(self, run_id: str, phases: PhaseRunner, deadline: float) -> RunState:
+    def _harvest(self, run_id: str, pair: SandboxPair) -> None:
+        """Copy the in-VM work dir out to the host (unmounted runs only).
+
+        Best-effort by design: a failed copy must never fail the run. The
+        trailing ``/.`` copies directory *contents* (docker-style cp) — real
+        sbx cp directory semantics are e2e-validated.
+        """
+        if pair.mounted:
+            return
+        target = self.config.state_dir / "runs" / run_id / "artifacts"
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            pair.agent.cp_out(f"{pair.agent_workdir}/.", target)
+        except SbxError:
+            logger.warning("artifact harvest failed for run %s", run_id, exc_info=True)
+
+    def _report_artifacts(self, run_id: str, pair: SandboxPair) -> None:
+        target = (
+            pair.workspace
+            if pair.mounted
+            else self.config.state_dir / "runs" / run_id / "artifacts"
+        )
+        if target is None or not target.is_dir():
+            return
+        count = sum(1 for p in target.rglob("*") if p.is_file())
+        self.bus.emit(
+            HostEventTypes.RUN_ARTIFACTS,
+            run_id,
+            path=str(target),
+            files=count,
+            mounted=pair.mounted,
+        )
+
+    def _run_phases(
+        self, run_id: str, phases: PhaseRunner, deadline: float, pair: SandboxPair
+    ) -> RunState:
         tasks = self.store.get_tasks(run_id)
         if not tasks:
             self._set_run_state(run_id, "decomposing")
@@ -187,7 +230,7 @@ class LoopEngine:
                 self.store.update_task(run_id, task)
                 self._emit_task_end(run_id, task)
                 continue
-            self._run_task(run_id, phases, task, deadline)
+            self._run_task(run_id, phases, task, deadline, pair)
             if task.state == "failed":
                 failed_ids.add(task.spec.id)
 
@@ -202,6 +245,7 @@ class LoopEngine:
         phases: PhaseRunner,
         task: TaskRecord,
         deadline: float,
+        pair: SandboxPair,
     ) -> None:
         budgets = self.config.budgets
         if task.state == "pending":
@@ -231,6 +275,9 @@ class LoopEngine:
             else:  # pragma: no cover - defensive
                 raise StateError(f"task {task.spec.id} in unexpected state {task.state}")
 
+        # Task-boundary harvest narrows the loss window on long runs; the
+        # finalize harvest in _drive remains the authoritative sweep.
+        self._harvest(run_id, pair)
         self._emit_task_end(run_id, task)
 
     def _phase_plan(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:

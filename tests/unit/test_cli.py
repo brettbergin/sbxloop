@@ -227,6 +227,43 @@ class TestRunCommand:
         assert "completed" in result.output
         assert "t1: done" in result.output
 
+    def test_run_summary_lists_artifacts(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Write the file",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+                {"text": "did it", "files": {"hello.txt": "hi", "docs/readme.md": "# hi"}},
+                {"json": {"verdict": "pass"}},
+                {"json": {"verdict": "accept"}},
+            ],
+        )
+        result = runner.invoke(app, ["run", "write hello", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        assert "artifacts: 2 file(s)" in result.output
+        assert "hello.txt" in result.output
+        assert "readme.md" in result.output
+        # the files really are on the host, inside the run workspace
+        runs = list((workdir / ".sbxloop" / "runs").iterdir())
+        assert len(runs) == 1
+        assert (runs[0] / "workspace" / "hello.txt").read_text() == "hi"
+
     def test_run_failure_exit_code(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -236,6 +273,42 @@ class TestRunCommand:
         result = runner.invoke(app, ["run", "impossible", "--no-tui"])
         assert result.exit_code == 2
         assert "run failed" in result.output
+
+
+class TestArtifactsTree:
+    def test_tree_caps_and_hides_dotfiles(self, tmp_path: Path) -> None:
+        from rich.console import Console
+
+        from sbxloop.cli.app import _artifact_files, _artifacts_tree
+
+        root = tmp_path / "ws"
+        (root / "sub").mkdir(parents=True)
+        (root / ".git").mkdir()
+        (root / ".git" / "HEAD").write_text("ref")
+        (root / ".hidden").write_text("x")
+        for i in range(5):
+            (root / f"f{i}.txt").write_text("x" * 2048)
+        (root / "sub" / "nested.txt").write_text("y")
+
+        files = _artifact_files(root)
+        assert [p.name for p in files if p.name.startswith(".")] == []
+        assert len(files) == 6
+
+        console = Console(record=True, width=100)
+        console.print(_artifacts_tree(root, files, cap=3))
+        text = console.export_text()
+        assert "f0.txt" in text
+        assert "2.0 KB" in text
+        assert "+3 more" in text
+        assert ".git" not in text
+
+    def test_human_size_units(self) -> None:
+        from sbxloop.cli.app import _human_size
+
+        assert _human_size(3) == "3 B"
+        assert _human_size(2048) == "2.0 KB"
+        assert _human_size(5 * 1024 * 1024) == "5.0 MB"
+        assert _human_size(3 * 1024**3) == "3072.0 MB"
 
 
 class TestDashboard:
