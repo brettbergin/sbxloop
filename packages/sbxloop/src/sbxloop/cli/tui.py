@@ -39,10 +39,12 @@ TASK_STATE_STYLES = {
 }
 
 # Compact one-liner lifecycle events (chat "system" messages).
-_LIFECYCLE_PREFIXES = ("run.", "task.", "phase.", "sandbox.", "gh.")
+_LIFECYCLE_PREFIXES = ("run.", "task.", "phase.", "sandbox.", "gh.", "policy.")
 
 # High-volume noise excluded from the transcript (still queryable via
-# `sbxloop logs`): streaming deltas, raw stdout passthrough, heartbeats.
+# `sbxloop logs`): streaming deltas, raw stdout passthrough, heartbeats,
+# per-beat resource samples (they live in the pinned gauge instead —
+# threshold *crossings* arrive as sandbox.resources_warning and do print).
 _TRANSCRIPT_SKIP = {
     EventTypes.AGENT_MESSAGE_DELTA,
     EventTypes.WORKER_STDOUT,
@@ -51,7 +53,10 @@ _TRANSCRIPT_SKIP = {
     EventTypes.WORKER_RESULT,
     EventTypes.WORKER_END,
     EventTypes.AGENT_USAGE,
+    EventTypes.SANDBOX_RESOURCES,
 }
+
+RESOURCE_LEVEL_STYLES = {"ok": "dim", "warn": "yellow", "abort": "bold red"}
 
 AGENT_MESSAGE_CLIP = 4000
 # One-line clip for tool arguments; output tail lines shown on tool failure.
@@ -148,7 +153,12 @@ def render_event(event: Event) -> RenderableType | None:
         style = "dim"
         if event.type == HostEventTypes.TASK_STATE:
             style = TASK_STATE_STYLES.get(str(data.get("state", "")), "dim")
-        elif "fallback" in event.type or "missing" in event.type:
+        elif (
+            "fallback" in event.type
+            or "missing" in event.type
+            or "warning" in event.type
+            or event.type == HostEventTypes.POLICY_DENY
+        ):
             style = "yellow"
         return Text(line, style=style, overflow="fold")
 
@@ -166,13 +176,18 @@ class Dashboard:
         self.run_state: str = "starting"
         self.outcome: str = ""
         self.tasks: dict[str, dict[str, Any]] = {}
+        # Latest resource sample per sandbox role, rendered as one compact
+        # gauge line each; only escalates visually past warn/abort levels.
+        self.resources: dict[str, dict[str, Any]] = {}
 
     # -- event intake ------------------------------------------------------
 
     def on_event(self, event: Event) -> None:
         self.run_id = self.run_id or event.run_id
         data = event.data
-        if event.type == HostEventTypes.RUN_START:
+        if event.type == EventTypes.SANDBOX_RESOURCES:
+            self.resources[str(data.get("role") or "sandbox")] = dict(data)
+        elif event.type == HostEventTypes.RUN_START:
             self.outcome = str(data.get("outcome", ""))
         elif event.type in (HostEventTypes.RUN_STATE, HostEventTypes.RUN_END):
             self.run_state = str(data.get("state", self.run_state))
@@ -219,10 +234,27 @@ class Dashboard:
         if not self.tasks:
             table.add_row("…", "decomposing outcome", Text("pending", style="dim"), "")
 
+        gauges = [self._gauge_line(role) for role in sorted(self.resources)]
         return Panel(
-            Group(header, outcome, table),
+            Group(header, outcome, table, *gauges),
             border_style="cyan",
             padding=(0, 1),
+        )
+
+    def _gauge_line(self, role: str) -> Text:
+        sample = self.resources[role]
+        level = str(sample.get("level", "ok"))
+        parts = []
+        if sample.get("disk_used_pct") is not None:
+            parts.append(f"disk {sample['disk_used_pct']:.0f}%")
+        if sample.get("mem_used_pct") is not None:
+            parts.append(f"mem {sample['mem_used_pct']:.0f}%")
+        if sample.get("load1") is not None:
+            parts.append(f"load {sample['load1']}")
+        suffix = "  ⚠ " + level if level != "ok" else ""
+        return Text(
+            f"{role}: " + " · ".join(parts) + suffix,
+            style=RESOURCE_LEVEL_STYLES.get(level, "dim"),
         )
 
 
@@ -239,6 +271,17 @@ def format_event(event: Event) -> str:
             value = str(event.data[key]).replace("\n", " ")
             parts.append(value[:160])
             break
+    if event.data.get("disk_used_pct") is not None:
+        # Resource samples: make `sbxloop logs --type-prefix sandbox.resources`
+        # answer "what did disk look like before the failure" at a glance.
+        summary = [f"disk={event.data['disk_used_pct']}%"]
+        if event.data.get("mem_used_pct") is not None:
+            summary.append(f"mem={event.data['mem_used_pct']}%")
+        if event.data.get("load1") is not None:
+            summary.append(f"load={event.data['load1']}")
+        if event.data.get("level"):
+            summary.append(str(event.data["level"]))
+        parts.append(" ".join(summary))
     if event.data.get("args"):
         parts.append(_one_line(str(event.data["args"]), 120))
     if picked != "error" and event.data.get("error"):
