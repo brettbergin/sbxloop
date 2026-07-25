@@ -56,7 +56,10 @@ Field reality (sbx 0.35): that injection feeds only the interactive agent
 sessions sbx launches — never `sbx exec` processes — so provisioning
 verifies visibility and **auto-falls-back to an in-VM env file**
 (`~/.sbxloop/env.sh`, chmod 600) when the env is invisible, emitting a
-`sandbox.secret_env_fallback` event. In fallback mode the token value is
+`sandbox.secret_env_fallback` event. The fallback fires only on a clean
+probe answer: an sbx-level failure during the probe is retried once and
+then fails provisioning loudly (`sandbox.secret_probe_error`) — an infra
+blip must never silently select the weaker strategy. In fallback mode the token value is
 visible inside its own microVM, but the credential *split* still holds
 (each sandbox only ever receives its own token) and egress remains bounded
 by the balanced network policy.

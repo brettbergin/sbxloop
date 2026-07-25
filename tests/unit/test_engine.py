@@ -360,6 +360,67 @@ class TestResume:
         # "uncommitted phases re-run" resume semantic
         assert phases.count("execute") == 1
 
+    def test_resume_into_validating_carries_verify_evidence(self, harness: Harness) -> None:
+        # #61: a task checkpointed 'validating' resumes straight into
+        # VALIDATE in a fresh process. The judge must see the persisted
+        # verify transcript, not a "(verification not run)" placeholder.
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["echo verify-evidence-61"])),
+                PLAN,
+                EXECUTE,
+                PASS,
+                {"fail": "killed before validate"},
+            ]
+        )
+        engine = harness.engine()
+        with pytest.raises(WorkerError, match="killed before validate"):
+            engine.start("die in validate")
+        run_id = engine.store.list_runs()[0].run_id
+        assert engine.store.get_tasks(run_id)[0].state == "validating"
+
+        harness.script([ACCEPT])
+        engine2 = harness.engine(keep_sandboxes=True)
+        result = engine2.resume(run_id)
+        assert result.state == "completed"
+        # evidence came from the stored verify attempt - verify did not re-run
+        phases = [row["phase"] for row in engine2.store.phase_attempts(run_id)]
+        assert phases.count("verify") == 1
+        # the resumed validate job's prompt carried the real transcript
+        fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent")
+        jobs = [json.loads(p.read_text()) for p in (fs / "home/agent/.sbxloop/jobs").iterdir()]
+        (validate_prompt,) = [j["prompt"] for j in jobs if j.get("prompt")]
+        assert "verify-evidence-61" in validate_prompt
+        assert "(verification not run)" not in validate_prompt
+
+    def test_resume_validating_without_verify_row_reruns_verify(self, harness: Harness) -> None:
+        # Defensive path for pre-upgrade checkpoints whose verify rows carry
+        # no transcript: rewind to verifying (mechanical, idempotent) instead
+        # of judging evidence-free.
+        from sbxloop.engine.model import PlanModel, TaskSpec
+
+        engine = harness.engine()
+        engine.store.create_run("r61", "old checkpoint")
+        engine.store.save_tasks("r61", [TaskSpec.model_validate(task("t1"))])
+        record = engine.store.get_tasks("r61")[0]
+        record.plan = PlanModel(steps=["do"], expected_artifacts=[], verify_commands=[])
+        record.state = "validating"
+        engine.store.update_task("r61", record)
+        engine.store.set_run_state("r61", "running")
+
+        harness.script([ACCEPT])
+        result = engine.resume("r61")
+        assert result.state == "completed"
+        phases = [row["phase"] for row in engine.store.phase_attempts("r61")]
+        assert phases == ["verify", "validate"]
+
+    def test_no_class_level_verify_state(self) -> None:
+        # #61: the per-run verify transcript must not live as mutable
+        # class-level state on PhaseRunner.
+        from sbxloop.engine.phases import PhaseRunner
+
+        assert not hasattr(PhaseRunner, "_last_verify_results")
+
     def test_resume_completed_run_refused(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         engine = harness.engine()

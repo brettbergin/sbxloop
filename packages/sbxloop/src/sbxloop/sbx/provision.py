@@ -266,13 +266,45 @@ class Provisioner:
         file for that sandbox so runs work, with a loud event about the
         security tradeoff. If sbx later injects secrets into exec sessions,
         this check passes and the token stays out of the VM.
+
+        The downgrade is a security decision, so it only ever happens on a
+        clean probe answer (`test -n` exiting 0 or 1). An sbx-level failure
+        or any other exit code is retried once and then fails provisioning
+        loudly (#63): a transient infra blip must never silently select the
+        weaker secret strategy.
         """
         if self.config.secret_strategy != "proxy":  # nosec B105 - strategy label
             # plain-env: the worker loads the env file itself; a shell
             # visibility check can never pass and would only produce noise.
             return
         env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
-        result = sandbox.exec(["sh", "-lc", f'test -n "${{{env_name}}}"'])
+        probe = ["sh", "-lc", f'test -n "${{{env_name}}}"']
+        error = ""
+        for _attempt in range(2):
+            try:
+                result = sandbox.exec(probe)
+            except SbxError as exc:
+                error = str(exc)
+                continue
+            if result.returncode in (0, 1):
+                break
+            error = f"probe exited {result.returncode} (expected 0 or 1): {result.stderr.strip()}"
+        else:
+            message = (
+                f"{env_name}: secret visibility probe failed twice without a clean answer — "
+                "refusing to auto-downgrade to plain-env; retry when sbx is healthy, or set "
+                'secret_strategy="plain-env" to choose the in-VM env file explicitly'
+            )
+            self.bus.emit(
+                "sandbox.secret_probe_error",
+                run_id,
+                name=spec.name,
+                env=env_name,
+                message=message,
+            )
+            raise ProvisionError(f"{spec.name}: {message} (last error: {error})")
+        # A transient probe error must not clobber the cached knowledge of
+        # sbx semantics, so only clean answers are recorded.
         self._record_probe(
             PROBE_SECRET_ENV_VISIBILITY,
             "visible-under-exec" if result.ok else "invisible-under-exec",
@@ -305,6 +337,13 @@ class Provisioner:
         in-VM directory containing the marker, or None when discovery fails
         (→ harvest mode; non-fatal, mirroring _verify_secret_env's
         probe-don't-assume pattern). The marker is always removed.
+
+        A failed probe degrades the same way a clean "not mounted" answer
+        does, but the two are kept distinguishable (#63): the
+        ``sandbox.workspace_mount`` event carries ``probe="error"`` vs
+        ``probe="answered"``, and only clean answers refresh the conformance
+        cache — so field debugging of harvest-mode runs chases the right
+        cause.
         """
         marker = f".sbxloop-mount-{secrets.token_hex(8)}"
         try:
@@ -312,6 +351,7 @@ class Provisioner:
         except OSError:
             logger.warning("mount discovery: cannot write marker into %s", workspace)
             return None
+        probe_error = ""
         try:
             command = (
                 f"find -L {' '.join(MOUNT_SEARCH_ROOTS)} "
@@ -320,39 +360,59 @@ class Provisioner:
             )
             result = sandbox.exec(["sh", "-c", command])
             hit = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
-        except SbxError:
+            if not result.ok:
+                # find's own errors are discarded by the pipeline, so a
+                # nonzero exit means the probe itself broke — not "no mount".
+                probe_error = f"probe exited {result.returncode}: {result.stderr.strip()}"
+        except SbxError as exc:
             logger.warning("mount discovery failed for %s", sandbox.name, exc_info=True)
             hit = ""
+            probe_error = str(exc)
         finally:
             (workspace / marker).unlink(missing_ok=True)
-        if not hit.endswith(f"/{marker}"):
+        if hit.endswith(f"/{marker}"):
+            mount_dir = hit[: -len(f"/{marker}")] or "/"
             self._record_probe(
                 PROBE_WORKSPACE_MOUNT,
-                "not-found",
-                f"observed while provisioning {sandbox.name}",
+                "discoverable",
+                f"workspace mounted at {mount_dir} (observed while provisioning {sandbox.name})",
             )
             self.bus.emit(
                 "sandbox.workspace_mount",
                 run_id,
                 name=sandbox.name,
+                mounted=True,
+                probe="answered",
+                path=mount_dir,
+            )
+            return mount_dir
+        if probe_error:
+            # No verdict recorded: an infra failure is not knowledge about
+            # sbx mount semantics and must not clobber the cached answer.
+            self.bus.emit(
+                "sandbox.workspace_mount",
+                run_id,
+                name=sandbox.name,
                 mounted=False,
-                message="workspace mount not found in VM; artifacts will be harvested",
+                probe="error",
+                message=f"mount discovery probe failed ({probe_error}); "
+                "artifacts will be harvested",
             )
             return None
-        mount_dir = hit[: -len(f"/{marker}")] or "/"
         self._record_probe(
             PROBE_WORKSPACE_MOUNT,
-            "discoverable",
-            f"workspace mounted at {mount_dir} (observed while provisioning {sandbox.name})",
+            "not-found",
+            f"observed while provisioning {sandbox.name}",
         )
         self.bus.emit(
             "sandbox.workspace_mount",
             run_id,
             name=sandbox.name,
-            mounted=True,
-            path=mount_dir,
+            mounted=False,
+            probe="answered",
+            message="workspace mount not found in VM; artifacts will be harvested",
         )
-        return mount_dir
+        return None
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""

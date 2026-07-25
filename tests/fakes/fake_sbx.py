@@ -340,10 +340,32 @@ def _parse_flags(args: list[str]) -> tuple[list[str], dict[str, str]]:
     return positional, flags
 
 
+# Mirrors real sbx (docs at v0.37): --value/--token only, deliberately no
+# stdin path — the conformance probe secret-value-stdin alarms if one appears.
+SET_CUSTOM_HELP = """\
+Create or update a custom secret
+
+Usage:  sbx secret set-custom [-g | sandbox] [flags]
+
+Flags:
+      --env string           Set this env var in the sandbox to the placeholder value
+  -g, --global               Use global secret scope
+  -h, --help                 help for set-custom
+      --host stringArray     Host, IP, or wildcard pattern (e.g. *.example.com); repeatable
+      --placeholder string   Placeholder value; use {rand} for a random suffix (e.g. sk-{rand})
+  -t, --token string         Secret value (less secure: visible in shell history)
+      --value string         Secret value (less secure: visible in shell history)
+"""
+
+
 def cmd_secret(root: Path, args: list[str], stdin: str) -> int:
     """Stateful secrets, mimicking real sbx: refuses to overwrite an existing
     secret ("secret exists"), supports rm. Custom secrets are keyed globally
     by host+env (matching observed sbx behavior); service secrets per scope."""
+    if args[:1] == ["set-custom"] and ("--help" in args or "-h" in args):
+        # Help is not a mutation: answer before recording to secrets.jsonl.
+        sys.stdout.write(SET_CUSTOM_HELP)
+        return 0
     append_jsonl(root / "secrets.jsonl", {"args": args, "stdin": stdin, "ts": time.time()})
     state_path = root / "secrets-state.json"
     state: dict[str, dict[str, str]] = (
