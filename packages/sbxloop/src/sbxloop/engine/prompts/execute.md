@@ -24,6 +24,10 @@ destroyed.
   your summary — a re-plan can declare it — instead of retrying forever.
   The allowlist is operator-bounded configuration, not something you can
   change from in here.
+- After you finish, the plan's verify commands run mechanically from the
+  workspace root, exactly as written — you cannot edit them. Create files
+  at the paths those commands check: if verification expects
+  `requirements.txt` at the root, do not bury it in a subdirectory.
 
 ## Overall outcome
 

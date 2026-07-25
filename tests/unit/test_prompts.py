@@ -45,6 +45,13 @@ def test_execute_and_plan_carry_environment_notes() -> None:
     assert "egress" in plan
     assert "egress" in execute
     assert "blocked domain" in execute
+    # Field regression (rv4zfdb1m): the executor nested the project in a
+    # subdirectory while root-relative verify commands failed every revision.
+    # Both sides must be told verify runs from the workspace root.
+    assert "workspace root" in plan
+    assert "workspace root" in execute
+    assert "cannot edit" in plan
+    assert "cannot edit" in execute
     # 0.5.0 regression: environment notes buried the response-format section
     # and JSON compliance dropped. The format instructions must come LAST.
     assert plan.index("Environment facts") < plan.index("Response format")

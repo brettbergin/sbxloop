@@ -5,6 +5,9 @@ Failure semantics:
 
 - Budget exhaustion (revisions/replans) fails the *task*; dependents are
   skipped and the run continues, finishing ``failed`` if any task failed.
+  One exception: revisions exhausted by *verify-command* failures spend a
+  replan first when budget remains — the executor cannot edit verify
+  commands, so only a fresh plan can unstick a broken check.
 - Infrastructure errors (worker/sbx crashes) propagate after state is
   persisted — equivalent to a kill. ``resume()`` re-provisions a fresh
   sandbox pair (sandboxes are cattle; the workspace and SQLite state
@@ -560,8 +563,23 @@ class LoopEngine:
         )
         if passed:
             self._set_task_state(run_id, task, "validating")
-        else:
-            self._register_revision(run_id, task, feedback)
+            return
+        # Put the failing command in the live stream: without this the
+        # transcript jumps verifying -> failed and the reason only exists
+        # in the phase_attempts table.
+        failure_count = feedback.count("verify command failed:")
+        first_line = feedback.splitlines()[0] if feedback else "verify failed"
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="verify",
+            status="failed",
+            message=(
+                first_line if failure_count <= 1 else f"{first_line} (+{failure_count - 1} more)"
+            ),
+        )
+        self._register_revision(run_id, task, feedback, verify_failure=True)
 
     def _phase_validate(
         self,
@@ -594,13 +612,31 @@ class LoopEngine:
         task.revisions = 0
         self._set_task_state(run_id, task, "planning")
 
-    def _register_revision(self, run_id: str, task: TaskRecord, feedback: str) -> None:
+    def _register_revision(
+        self, run_id: str, task: TaskRecord, feedback: str, *, verify_failure: bool = False
+    ) -> None:
         task.revisions += 1
         task.last_feedback = feedback
-        if task.revisions > self.config.budgets.max_revisions_per_task:
-            self._set_task_state(run_id, task, "failed")
-        else:
+        if task.revisions <= self.config.budgets.max_revisions_per_task:
             self._set_task_state(run_id, task, "executing")
+            return
+        if verify_failure and task.replans < self.config.budgets.max_replans_per_task:
+            # Verify commands come from the plan and task spec; the executor
+            # cannot edit them, so no number of revisions can fix a check
+            # that disagrees with where the work landed. A fresh plan
+            # regenerates its verify_commands and can route steps to where
+            # the spec-level commands expect files.
+            task.replans += 1
+            task.plan = None
+            task.revisions = 0
+            task.last_feedback = (
+                "every revision failed the same verify commands; write a plan "
+                "whose steps and verify_commands agree on file locations and "
+                "setup:\n\n" + feedback
+            )
+            self._set_task_state(run_id, task, "planning")
+            return
+        self._set_task_state(run_id, task, "failed")
 
     # -- bookkeeping -------------------------------------------------------
 
