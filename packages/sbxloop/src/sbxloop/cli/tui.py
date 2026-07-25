@@ -116,14 +116,22 @@ def render_event(event: Event) -> RenderableType | None:
         tool = data.get("tool") or "tool"
         success = data.get("success")
         exit_code = data.get("exit_code")
-        if success is None and exit_code is None:
+        error = str(data.get("error") or "").strip()
+        if success is None and exit_code is None and not error:
             return None  # nothing informative beyond the start line
-        if success or (success is None and exit_code == 0):
+        if success or (success is None and exit_code == 0 and not error):
             suffix = " exit 0" if exit_code == 0 else ""
             return Text(f"{_stamp(event)}  ✓ {tool}{suffix}", style="green dim")
         suffix = f" exit {exit_code}" if exit_code is not None else ""
         failure = Text(f"{_stamp(event)}  ✗ {tool}{suffix}", style="red")
-        tail = str(data.get("output") or "").strip()
+        args = _one_line(str(data.get("args") or ""))
+        if args:
+            failure.append(" $ ", style="bold red")
+            failure.append(args, style="red dim")
+        failure.overflow = "fold"
+        # Failed executions carry the reason in `error` (the SDK omits
+        # `output` on failure); prefer real output when both exist.
+        tail = str(data.get("output") or "").strip() or error
         if tail:
             return Group(
                 failure,
@@ -224,13 +232,17 @@ def format_event(event: Event) -> str:
     if event.data.get("task_id"):
         parts.append(f"[{event.data['task_id']}]")
     keys = ("state", "content", "tool", "op", "line", "message", "outcome", "error", "url", "path")
+    picked = ""
     for key in keys:
         if event.data.get(key):
+            picked = key
             value = str(event.data[key]).replace("\n", " ")
             parts.append(value[:160])
             break
     if event.data.get("args"):
         parts.append(_one_line(str(event.data["args"]), 120))
+    if picked != "error" and event.data.get("error"):
+        parts.append(_one_line(str(event.data["error"]), 160))
     return " ".join(parts)
 
 

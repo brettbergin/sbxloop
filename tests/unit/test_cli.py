@@ -663,6 +663,23 @@ class TestDashboard:
         assert "bash" in line
         assert "pip install -e ." in line
 
+    def test_format_event_tool_end_failure_includes_error(self) -> None:
+        from sbxloop.cli.tui import format_event
+
+        line = format_event(
+            Event.now(
+                "agent.tool_end",
+                "r1",
+                tool="bash",
+                args="make lint",
+                success=False,
+                error="command not found: make",
+            )
+        )
+        assert "bash" in line
+        assert "make lint" in line
+        assert "command not found: make" in line
+
 
 class TestToolTranscript:
     def render_text(self, event: Event) -> str | None:
@@ -723,6 +740,47 @@ class TestToolTranscript:
     def test_tool_end_without_signal_is_skipped(self) -> None:
         # Older/other backends may emit bare completions; stay quiet then.
         assert self.render_text(Event.now("agent.tool_end", "r1", tool_call_id="c1")) is None
+
+    def test_tool_end_failure_echoes_what_ran(self) -> None:
+        text = self.render_text(
+            Event.now(
+                "agent.tool_end",
+                "r1",
+                tool="bash",
+                args="pytest -q tests/",
+                success=False,
+                exit_code=1,
+            )
+        )
+        assert text is not None
+        assert "✗ bash exit 1" in text
+        assert "pytest -q tests/" in text
+
+    def test_tool_end_failure_without_output_shows_error(self) -> None:
+        # Failed executions carry only `error` (the SDK omits output/exit
+        # code on failure); the reason must still reach the transcript.
+        text = self.render_text(
+            Event.now(
+                "agent.tool_end",
+                "r1",
+                tool="glob",
+                args="**/*.nope",
+                success=False,
+                error="no files matched pattern",
+            )
+        )
+        assert text is not None
+        assert "✗ glob" in text
+        assert "**/*.nope" in text
+        assert "no files matched pattern" in text
+
+    def test_tool_end_with_only_error_still_renders_failure(self) -> None:
+        text = self.render_text(
+            Event.now("agent.tool_end", "r1", tool="bash", error="rejected by policy")
+        )
+        assert text is not None
+        assert "✗ bash" in text
+        assert "rejected by policy" in text
 
 
 class TestDoctorRendering:
