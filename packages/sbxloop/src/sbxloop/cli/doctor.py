@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -9,6 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sbxloop.config import load_config
+from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import (
@@ -16,6 +18,7 @@ from sbxloop.sbx.provision import (
     COPILOT_TOKEN_ENV,
     GH_TOKEN_ENVS,
 )
+from sbxloop.sbx.prune import count_orphans
 from sbxloop.worker.wheel import resolve_worker_wheel
 
 TESTED_SBX_SERIES = "0.35"
@@ -67,14 +70,35 @@ def collect_checks(
     if version is not None:
         # login / daemon reachable
         report("checking sbx login")
+        logged_in = False
         try:
             cli.ls()
+            logged_in = True
             checks.append(Check("sbx login", True, "sbx ls succeeded"))
         except SbxError as exc:
             login_cmd = (
                 f"sbx --app-name {config.app_name} login" if config.app_name else "sbx login"
             )
             checks.append(Check("sbx login", False, f"sbx ls failed ({exc}); run `{login_cmd}`"))
+
+        # orphaned sandboxes (leaked pairs from crashed/killed runs)
+        if logged_in:
+            report("checking for orphaned sandboxes")
+            try:
+                orphans = count_orphans(cli, StateStore(config.state_dir / "state.db"))
+            except (SbxError, OSError, sqlite3.Error):
+                orphans = None
+            if orphans is not None:
+                checks.append(
+                    Check(
+                        "orphaned sandboxes",
+                        orphans == 0,
+                        "none found"
+                        if orphans == 0
+                        else f"{orphans} orphan candidate(s) — run `sbxloop sandbox prune`",
+                        hard=False,
+                    )
+                )
 
         # network policy reachable for the copilot hosts
         for host in AGENT_TOKEN_HOSTS:
@@ -97,6 +121,29 @@ def collect_checks(
                     hard=False,  # per-sandbox allows are applied at provision time
                 )
             )
+
+        # Host-side resource stats: sbx 0.35.x has no stats command, so
+        # resource telemetry samples in-VM on the worker heartbeat. This is
+        # the field-check for the day sbx grows one (issue #54) — purely
+        # informational either way.
+        report("checking for host-side sandbox stats")
+        stats_available = False
+        try:
+            stats_available = cli.run("stats", "--help", check=False).returncode == 0
+        except SbxError:
+            stats_available = False
+        checks.append(
+            Check(
+                "sandbox stats",
+                True,
+                "host-side `sbx stats` available — sbxloop still samples in-VM; "
+                "consider filing an issue to prefer host-side stats"
+                if stats_available
+                else "no host-side `sbx stats`; resource telemetry samples in-VM "
+                f"on the worker heartbeat (expected on {TESTED_SBX_SERIES}.x)",
+                hard=False,
+            )
+        )
 
     # tokens
     checks.append(

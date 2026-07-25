@@ -17,6 +17,24 @@ from sbxloop.sbx.parse import parse_ls, parse_version
 
 _NOT_FOUND_MARKERS = ("not found", "no such sandbox", "does not exist", "unknown sandbox")
 
+# Flags whose values are secrets. ExecResult/SbxError carry argv into error
+# messages, logs, and events — secret values must never travel with them.
+_SECRET_FLAGS = frozenset({"--value"})
+_REDACTED = "***"
+
+
+def redacted_argv(argv: Sequence[str]) -> list[str]:
+    """A copy of argv safe to embed in errors/logs: secret flag values masked."""
+    safe = list(argv)
+    for i, arg in enumerate(safe):
+        if arg in _SECRET_FLAGS and i + 1 < len(safe):
+            safe[i + 1] = _REDACTED
+        else:
+            flag = arg.split("=", 1)[0]
+            if "=" in arg and flag in _SECRET_FLAGS:
+                safe[i] = f"{flag}={_REDACTED}"
+    return safe
+
 
 class SbxCLI:
     """Blocking, typed access to the sbx CLI."""
@@ -45,6 +63,10 @@ class SbxCLI:
         stdin: str | None = None,
     ) -> ExecResult:
         argv = self.argv(*args)
+        # The real argv reaches the subprocess only; everything observable
+        # (ExecResult, exceptions, and therefore logs/events) gets the
+        # redacted copy so secret values can never leak through error text.
+        safe_argv = redacted_argv(argv)
         started = time.monotonic()
         try:
             proc = subprocess.run(
@@ -59,17 +81,17 @@ class SbxCLI:
             raise SbxNotFoundError(
                 f"sbx binary {self.binary!r} not found on PATH — install Docker Sandboxes "
                 "(https://docs.docker.com/ai/sandboxes/) and run `sbx login`",
-                argv=argv,
+                argv=safe_argv,
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise SbxError(
                 f"sbx invocation timed out after {timeout or self.default_timeout:.0f}s",
-                argv=argv,
+                argv=safe_argv,
                 stderr=(exc.stderr or b"").decode() if isinstance(exc.stderr, bytes) else "",
             ) from exc
 
         result = ExecResult(
-            argv=argv,
+            argv=safe_argv,
             returncode=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
@@ -93,7 +115,7 @@ class SbxCLI:
         except FileNotFoundError as exc:
             raise SbxNotFoundError(
                 f"sbx binary {self.binary!r} not found on PATH",
-                argv=argv,
+                argv=redacted_argv(argv),
             ) from exc
 
     def _error_for(self, result: ExecResult) -> SbxError:
@@ -132,6 +154,22 @@ class SbxCLI:
             if any(m in lowered for m in _NOT_FOUND_MARKERS):
                 raise self._error_for(result)
         return result
+
+    def exec_interactive(self, name: str, cmd: Sequence[str]) -> int:
+        """Run a command in a sandbox with the caller's terminal attached
+        (stdin/stdout/stderr inherited); returns the command's exit code.
+
+        `sbx exec` documents no -it-style flags; terminal attachment is
+        simply inheriting the caller's stdio.
+        """
+        argv = self.argv("exec", name, *cmd)
+        try:
+            return subprocess.run(argv, check=False).returncode
+        except FileNotFoundError as exc:
+            raise SbxNotFoundError(
+                f"sbx binary {self.binary!r} not found on PATH",
+                argv=argv,
+            ) from exc
 
     def cp(self, src: str, dst: str, *, timeout: float | None = None) -> None:
         self.run("cp", src, dst, timeout=timeout)

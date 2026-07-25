@@ -170,6 +170,10 @@ class RunRecord(_Model):
     # agent VM (False → artifacts are harvested to runs/<run>/artifacts).
     workspace: Path | None = None
     mounted: bool = False
+    # Why this run's sandboxes were deliberately left alive ("debug",
+    # "manual"); None means normal teardown applied. `sandbox prune`
+    # excludes kept runs unless asked to include them.
+    kept_reason: str | None = None
 
 
 class RunResult(_Model):
@@ -180,6 +184,9 @@ class RunResult(_Model):
     tasks: list[TaskRecord] = Field(default_factory=list)
     workspace: Path | None = None
     mounted: bool = False
+    # Sandbox names deliberately left alive (keep_sandboxes/keep_on_failure),
+    # so callers can point the user at `sbxloop shell`.
+    kept_sandboxes: list[str] = Field(default_factory=list)
 
     @property
     def succeeded(self) -> bool:

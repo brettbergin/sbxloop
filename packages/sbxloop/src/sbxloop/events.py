@@ -75,6 +75,7 @@ class HostEventTypes:
     RUN_STATE = "run.state"
     RUN_ARTIFACTS = "run.artifacts"
     RUN_DELIVER = "run.deliver"
+    RUN_KEEP = "run.keep"
     RUN_END = "run.end"
     TASK_START = "task.start"
     TASK_STATE = "task.state"

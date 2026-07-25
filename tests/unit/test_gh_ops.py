@@ -94,9 +94,11 @@ class TestGithubOpsFacade:
 class RecordingOps:
     """GithubOps stand-in recording reporter interactions."""
 
-    def __init__(self) -> None:
+    def __init__(self, existing_issues: list[dict[str, Any]] | None = None) -> None:
         self.created: list[tuple[str, str]] = []
         self.comments: list[tuple[int, str]] = []
+        self.searches: list[str] = []
+        self.existing_issues = existing_issues or []
 
     def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> IssueRef:
         self.created.append((repo, title))
@@ -106,21 +108,31 @@ class RecordingOps:
         self.comments.append((number, body))
         return "https://c"
 
+    def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
+        self.searches.append(query)
+        return self.existing_issues
+
 
 class TestGithubReporterHook:
-    def make(self) -> tuple[GithubReporterHook, RecordingOps, EventBus]:
-        ops = RecordingOps()
+    """Run start/end are explicit open_run/close_run calls (the engine emits
+    the bus lifecycle events outside the hook's attach window — #58); only
+    task progress arrives via the bus."""
+
+    def make(
+        self, existing_issues: list[dict[str, Any]] | None = None
+    ) -> tuple[GithubReporterHook, RecordingOps, EventBus]:
+        ops = RecordingOps(existing_issues)
         hook = GithubReporterHook(ops, "o/r")  # type: ignore[arg-type]
         bus = EventBus()
         bus.attach_hook(hook)
         return hook, ops, bus
 
     def test_full_run_reporting(self) -> None:
-        _hook, ops, bus = self.make()
-        bus.emit(HostEventTypes.RUN_START, "r1", outcome="do the thing")
+        hook, ops, bus = self.make()
+        hook.open_run("r1", "do the thing")
         bus.emit(HostEventTypes.TASK_END, "r1", task_id="t1", title="first", state="done")
         bus.emit(HostEventTypes.TASK_END, "r1", task_id="t2", title="second", state="failed")
-        bus.emit(HostEventTypes.RUN_END, "r1", state="completed")
+        hook.close_run("r1", "completed")
 
         assert ops.created == [("o/r", "sbxloop run r1")]
         assert len(ops.comments) == 3
@@ -130,10 +142,18 @@ class TestGithubReporterHook:
         assert "finished: **completed**" in final
         assert "`t1` first" in final
 
-    def test_task_events_before_run_start_are_ignored(self) -> None:
-        _hook, ops, bus = self.make()
+    def test_resume_reuses_existing_tracking_issue(self) -> None:
+        hook, ops, _bus = self.make(
+            existing_issues=[{"number": 7, "title": "sbxloop run r1", "html_url": "https://x/7"}]
+        )
+        hook.open_run("r1", "again")
+        assert ops.created == []  # found, not duplicated
+        assert hook.issue is not None and hook.issue.number == 7
+
+    def test_task_events_without_open_run_are_ignored(self) -> None:
+        hook, ops, bus = self.make()
         bus.emit(HostEventTypes.TASK_END, "r1", task_id="t1", state="done")
-        bus.emit(HostEventTypes.RUN_END, "r1", state="failed")
+        hook.close_run("r1", "failed")
         assert ops.created == []
         assert ops.comments == []
 
@@ -143,10 +163,18 @@ class TestGithubReporterHook:
                 raise RuntimeError("github down")
 
         hook = GithubReporterHook(ExplodingOps(), "o/r")  # type: ignore[arg-type]
-        bus = EventBus()
-        bus.attach_hook(hook)
-        bus.emit(HostEventTypes.RUN_START, "r1", outcome="x")  # must not raise
+        hook.open_run("r1", "x")  # must not raise
         assert hook.issue is None
+        hook.close_run("r1", "completed")  # must not raise either
+
+    def test_close_run_failure_is_swallowed(self) -> None:
+        class ExplodingComment(RecordingOps):
+            def issue_comment(self, *a: Any, **k: Any) -> str:
+                raise RuntimeError("github down")
+
+        hook = GithubReporterHook(ExplodingComment(), "o/r")  # type: ignore[arg-type]
+        hook.open_run("r1", "x")
+        hook.close_run("r1", "completed")  # must not raise
 
     def test_unrelated_events_ignored(self) -> None:
         _hook, ops, bus = self.make()
