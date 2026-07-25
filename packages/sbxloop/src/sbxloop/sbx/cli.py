@@ -17,6 +17,19 @@ from sbxloop.sbx.parse import parse_ls, parse_version
 
 _NOT_FOUND_MARKERS = ("not found", "no such sandbox", "does not exist", "unknown sandbox")
 
+# Stderr shapes meaning sbx itself failed to run the command (daemon
+# unreachable, transport dropped, VM stopped) rather than the command failing
+# inside the sandbox. Field-collected (#63) — grow this list from observed
+# failures, but keep every entry specific enough that stderr from a
+# legitimately-failing inner command (curl to a blocked host, a flaky pip
+# download) cannot plausibly match it.
+_INFRA_MARKERS = (
+    "is not running",  # exec refused: the sandbox exists but is stopped/crashed
+    "cannot connect to the",  # daemon unreachable ("Cannot connect to the ... daemon at ...")
+    "error during connect",  # docker-family transport failure
+    "dial unix",  # daemon socket dial errors
+)
+
 # Flags whose values are secrets. ExecResult/SbxError carry argv into error
 # messages, logs, and events — secret values must never travel with them.
 _SECRET_FLAGS = frozenset({"--value"})
@@ -147,11 +160,15 @@ class SbxCLI:
         timeout: float | None = None,
     ) -> ExecResult:
         """Run a command inside a sandbox; the inner exit code is returned,
-        but sbx-level failures (missing sandbox, daemon down) raise."""
+        but recognizable sbx-level failures (missing sandbox, sandbox not
+        running, daemon down) raise so callers never mistake infra trouble
+        for the command's own answer. Unrecognized sbx failures still come
+        back as a nonzero ExecResult — decision points that act on a nonzero
+        result must stay conservative about that ambiguity (#63)."""
         result = self.run("exec", name, *cmd, timeout=timeout, check=False)
         if not result.ok:
             lowered = result.stderr.lower()
-            if any(m in lowered for m in _NOT_FOUND_MARKERS):
+            if any(m in lowered for m in (*_NOT_FOUND_MARKERS, *_INFRA_MARKERS)):
                 raise self._error_for(result)
         return result
 
@@ -168,7 +185,7 @@ class SbxCLI:
         except FileNotFoundError as exc:
             raise SbxNotFoundError(
                 f"sbx binary {self.binary!r} not found on PATH",
-                argv=argv,
+                argv=redacted_argv(argv),
             ) from exc
 
     def cp(self, src: str, dst: str, *, timeout: float | None = None) -> None:
@@ -207,14 +224,21 @@ class SbxCLI:
         self.run(*args)
 
     def policy_check(self, host: str, *, sandbox: str | None = None) -> bool:
+        """Whether the network policy allows ``host``.
+
+        Returns the policy's answer only: a failed invocation without a
+        deny-shaped answer raises SbxError instead of reading as "blocked",
+        so infra trouble is never reported as a policy verdict (#63).
+        """
         args = ["policy", "check", "network", host]
         if sandbox:
             args += ["--sandbox", sandbox]
         result = self.run(*args, check=False)
-        if not result.ok:
-            return False
-        lowered = result.stdout.lower()
-        return not any(marker in lowered for marker in ("deny", "denied", "block"))
+        text = f"{result.stdout}\n{result.stderr}".lower()
+        denied = any(marker in text for marker in ("deny", "denied", "block"))
+        if not result.ok and not denied:
+            raise self._error_for(result)
+        return result.ok and not denied
 
     def policy_ls(self) -> str:
         return self.run("policy", "ls").stdout

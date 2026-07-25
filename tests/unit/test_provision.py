@@ -388,6 +388,67 @@ class TestSecretEnvVerification:
         finally:
             pair.cleanup()
 
+    def test_probe_infra_failure_never_downgrades_to_plain_env(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #63 acceptance: an exec-level failure during the secret
+        visibility probe must fail provisioning loudly — never silently
+        select the weaker plain-env strategy."""
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        # every probe attempt (including the retry) dies at the sbx level
+        fake_sbx.script(
+            "exec sbxloop-r1-agent sh -lc test -n",
+            returncode=1,
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        )
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        with pytest.raises(ProvisionError, match="refusing to auto-downgrade"):
+            provisioner.ensure_pair("r1")
+        # no plain-env fallback: distinct probe-error event, not the
+        # fallback event a clean "invisible" answer produces
+        assert not [e for e in events if e.type == "sandbox.secret_env_fallback"]
+        errors = [e for e in events if e.type == "sandbox.secret_probe_error"]
+        assert [e.data["env"] for e in errors] == ["COPILOT_GITHUB_TOKEN"]
+        # rollback removed the half-provisioned sandbox
+        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-agent").exists()
+
+    def test_transient_probe_error_retries_to_a_clean_answer(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        # first probe attempt hits a transient sbx failure; the retry gets
+        # the real fake's clean "invisible" answer -> normal fallback
+        fake_sbx.fail_next(
+            "exec sbxloop-r1-agent sh -lc test -n",
+            returncode=1,
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        )
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+            assert [e.data["env"] for e in fallback] == ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"]
+            assert not [e for e in events if e.type == "sandbox.secret_probe_error"]
+        finally:
+            pair.cleanup()
+
+    def test_ambiguous_probe_exit_code_fails_loudly(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # `test -n` answers with 0 or 1; anything else is not an answer
+        fake_sbx.script("exec sbxloop-r1-agent sh -lc test -n", returncode=3)
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        with pytest.raises(ProvisionError, match="without a clean answer"):
+            provisioner.ensure_pair("r1")
+
     def test_plain_env_strategy_skips_verification(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -451,17 +512,33 @@ class TestMountDiscovery:
             assert not list(pair.workspace.glob(".sbxloop-mount-*"))
             mount_events = [e for e in events if e.type == "sandbox.workspace_mount"]
             assert [e.data["mounted"] for e in mount_events] == [False]
+            # a clean negative answer, distinguishable from a broken probe
+            assert mount_events[0].data["probe"] == "answered"
         finally:
             pair.cleanup()
 
-    def test_discovery_exec_error_is_non_fatal(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+    def test_discovery_exec_error_is_non_fatal_but_distinguishable(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        from sbxloop.sbx.conformance import PROBE_WORKSPACE_MOUNT, load_verdicts
+
         # sbx-level failure of the find probe must degrade, not abort the run
         fake_sbx.script("exec sbxloop-r1-agent sh -c find", returncode=1, stderr="not found")
-        provisioner = make_provisioner(fake_sbx, tmp_path)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
         pair = provisioner.ensure_pair("r1")
         try:
             assert not pair.mounted
             assert pair.agent_workdir == WORK_DIR
+            # the event says the probe FAILED — not that sbx answered "no
+            # mount" — so field debugging chases the right cause (#63)
+            mount_events = [e for e in events if e.type == "sandbox.workspace_mount"]
+            assert [e.data["probe"] for e in mount_events] == ["error"]
+            # and the infra failure did not clobber the conformance cache
+            # with a bogus "not-found" verdict
+            assert PROBE_WORKSPACE_MOUNT not in load_verdicts(tmp_path / "state", "0.35.0")
         finally:
             pair.cleanup()
 

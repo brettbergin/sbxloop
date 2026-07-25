@@ -58,6 +58,7 @@ PROBE_WORKSPACE_MOUNT = "workspace-mount"
 PROBE_PYTHON3_VENV = "python3-venv"
 PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"  # nosec B105 - probe name
 PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"  # nosec B105 - probe name
+PROBE_SECRET_VALUE_STDIN = "secret-value-stdin"  # nosec B105 - probe name
 
 VERDICT_ERROR = "error"
 VERDICT_UNPROBED = "unprobed"
@@ -109,6 +110,16 @@ def _probe_cli_surface(ctx: ProbeContext) -> tuple[str, str]:
     if missing:
         return f"missing({','.join(missing)})", "subcommands absent from `sbx --help`"
     return "complete", "all subcommands sbxloop invokes are advertised"
+
+
+def _probe_secret_value_stdin(ctx: ProbeContext) -> tuple[str, str]:
+    result = ctx.cli.run("secret", "set-custom", "--help", check=False)
+    text = f"{result.stdout}\n{result.stderr}"
+    if "stdin" in text.lower():
+        return "stdin-available", "set-custom --help mentions a stdin path — adopt it (#57)"
+    if "--value" not in text:
+        return "help-drifted", "set-custom --help no longer describes --value"
+    return "argv-only", "no stdin path in set-custom --help; --value on argv is the only option"
 
 
 def _probe_version_format(ctx: ProbeContext) -> tuple[str, str]:
@@ -279,6 +290,16 @@ CATALOG: tuple[Probe, ...] = (
         expected="expected-columns",
         depends="parse_ls (sandbox listing, `sandbox rm --all`, pair cleanup)",
         run=_probe_ls_columns,
+    ),
+    Probe(
+        id=PROBE_SECRET_VALUE_STDIN,
+        summary="whether `sbx secret set-custom` can take the secret value via stdin",
+        tier="cheap",
+        expected="argv-only",
+        depends="secret_set_custom passes the Copilot PAT via --value on argv (ps-visible "
+        "for the subprocess lifetime; every observable argv copy is redacted). A stdin "
+        "path appearing means sbxloop should switch to it and close the ps window (#57)",
+        run=_probe_secret_value_stdin,
     ),
     Probe(
         id=PROBE_EXEC_ERROR_CHANNEL,

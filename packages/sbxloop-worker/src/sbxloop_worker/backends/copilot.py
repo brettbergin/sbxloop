@@ -20,15 +20,82 @@ import asyncio
 import contextlib
 import json
 import os
-from typing import Any
+from typing import Any, get_args
 
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, BackendUnavailableError, EmitFn
 from sbxloop_worker.protocol import EventTypes, JobRequest, Usage
 
-READ_ONLY_DENIED_KINDS = {"shell", "write"}
+# The SDK's permission-request ``kind`` vocabulary, field-verified against
+# github-copilot-sdk 1.0.8 (2026-07-25): ``copilot.session.PermissionRequest``
+# is a union of request dataclasses, each carrying its wire discriminator as
+# a ``kind`` ClassVar (the same strings the SDK's ``_load_PermissionRequest``
+# switch matches on). ``sbxloop doctor`` compares the installed SDK against
+# this snapshot so vocabulary drift on an SDK bump is surfaced there instead
+# of as a silently degraded critic in the field.
+SDK_PERMISSION_KINDS = frozenset(
+    {
+        "shell",
+        "write",
+        "read",
+        "mcp",
+        "url",
+        "memory",
+        "custom-tool",
+        "hook",
+        "extension-management",
+        "extension-permission-access",
+    }
+)
+
+# The read-only critic barrier (SCRUTINIZE/VALIDATE sessions) is an allowlist
+# with default-deny: an unknown or novel kind fails closed, so the worst case
+# is the critic losing a read capability and saying so — never the critic
+# silently editing the work under review. Of the verified vocabulary only
+# these are reads: ``read`` (workspace files) and ``url`` (web fetches, which
+# cannot mutate the workspace and stay inside the sandbox network policy).
+# Everything else mutates state (shell, write, memory, extension-management)
+# or has unbounded effect (mcp, custom-tool, hook,
+# extension-permission-access).
+READ_ONLY_ALLOWED_KINDS = frozenset({"read", "url"})
 
 _TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
+
+
+def read_only_denial(request: Any) -> str | None:
+    """Rejection feedback for ``request`` in a read-only session, or None to allow.
+
+    Pure decision logic (no SDK types) so the default-deny polarity is
+    unit-testable with stub request objects.
+    """
+    kind = getattr(request, "kind", None)
+    if isinstance(kind, str) and kind in READ_ONLY_ALLOWED_KINDS:
+        return None
+    return (
+        f"this is a read-only review session; permission kind {kind!r} is not "
+        "in the read allowlist — do not modify anything, report findings instead"
+    )
+
+
+def installed_sdk_permission_kinds() -> frozenset[str] | None:
+    """The installed SDK's permission-request ``kind`` vocabulary, or None.
+
+    Introspects ``copilot.session.PermissionRequest`` — a union of request
+    dataclasses each carrying its wire ``kind`` as a ClassVar. Returns None
+    when github-copilot-sdk is not installed. Doctor compares the result
+    against :data:`SDK_PERMISSION_KINDS` to catch vocabulary drift on SDK
+    bumps before it degrades the read-only critic in the field.
+    """
+    try:
+        from copilot.session import PermissionRequest
+    except ImportError:
+        return None
+    kinds: set[str] = set()
+    for member in get_args(PermissionRequest):
+        kind = getattr(member, "kind", None)
+        if isinstance(kind, str):
+            kinds.add(kind)
+    return frozenset(kinds)
 
 
 def _auth_diagnostic() -> str:
@@ -255,11 +322,9 @@ class CopilotBackend:
         def read_only_handler(request: Any, invocation: Any = None) -> Any:
             from copilot.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 
-            kind = getattr(request, "kind", None)
-            if kind in READ_ONLY_DENIED_KINDS:
-                return PermissionDecisionReject(
-                    feedback="this is a read-only review session; do not modify anything"
-                )
+            feedback = read_only_denial(request)
+            if feedback is not None:
+                return PermissionDecisionReject(feedback=feedback)
             return PermissionDecisionApproveOnce()
 
         return read_only_handler
