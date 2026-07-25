@@ -63,6 +63,7 @@ class TestBasics:
             "logs",
             "artifacts",
             "bake",
+            "list-models",
             "shell",
             "doctor",
             "sandbox",
