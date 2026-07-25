@@ -118,6 +118,61 @@ jobs:
           test -f "$artifacts_dir/hello.txt"
           grep -q "hello sbxloop" "$artifacts_dir/hello.txt"
 
+      # Multi-file delivery smoke (#66): a 50-file workspace must deliver as
+      # O(1) batched blob jobs, visibly (gh.op_progress) and under a time
+      # budget — the per-file-job regression this guards against took minutes.
+      # Needs a scratch repo the E2E_GH_TOKEN can open PRs against.
+      - name: Multi-file delivery smoke
+        if: ${{ vars.E2E_SMOKE_ENABLED == 'true' && vars.E2E_DELIVER_REPO != '' }}
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+          COPILOT_GITHUB_TOKEN: ${{ secrets.E2E_COPILOT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.E2E_GH_TOKEN }}
+          SBXLOOP_BUDGETS__MAX_TASKS: "3"
+          SBXLOOP_BUDGETS__MAX_WALL_CLOCK_S: "1800"
+          SBXLOOP_GITHUB__REPO: ${{ vars.E2E_DELIVER_REPO }}
+          SBXLOOP_GITHUB__DELIVER: "true"
+          SBXLOOP_GITHUB__DELIVER_DRAFT: "true"
+        run: |
+          uv run sbxloop run "Create exactly 50 files named artifact_00.txt through artifact_49.txt, each containing its own filename, using a shell loop" --no-tui
+
+      - name: Assert batched delivery opened a PR within budget
+        if: ${{ vars.E2E_SMOKE_ENABLED == 'true' && vars.E2E_DELIVER_REPO != '' }}
+        run: |
+          set -euo pipefail
+          uv run --no-project python - <<'EOF'
+          import json, sqlite3, sys
+
+          db = sqlite3.connect(".sbxloop/state.db")
+          db.row_factory = sqlite3.Row
+          run_id = db.execute(
+              "SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1"
+          ).fetchone()["run_id"]
+          events = db.execute(
+              "SELECT ts, type, data_json FROM events WHERE run_id = ? ORDER BY seq",
+              (run_id,),
+          ).fetchall()
+
+          deliver = [json.loads(e["data_json"]) for e in events if e["type"] == "run.deliver"]
+          assert deliver, f"no run.deliver event for {run_id}"
+          if "error" in deliver[-1]:
+              sys.exit(f"delivery failed: {deliver[-1]['error']}")
+          print(f"delivered PR: {deliver[-1].get('url')}")
+
+          # Delivery starts at the first gh.op after run.artifacts; the whole
+          # 50-file publish (blobs + tree + commit + ref + PR) must beat the
+          # budget that one-job-per-file delivery could never meet.
+          artifacts_ts = max(e["ts"] for e in events if e["type"] == "run.artifacts")
+          gh_ts = [e["ts"] for e in events if e["type"].startswith("gh.") and e["ts"] >= artifacts_ts]
+          deliver_ts = max(e["ts"] for e in events if e["type"] == "run.deliver")
+          elapsed = deliver_ts - (min(gh_ts) if gh_ts else artifacts_ts)
+          print(f"delivery took {elapsed:.1f}s")
+          assert elapsed < 120, f"50-file delivery took {elapsed:.1f}s (budget 120s)"
+
+          batch_progress = [e for e in events if e["type"] == "gh.op_progress"]
+          assert batch_progress, "no gh.op_progress events — blob batching not exercised"
+          EOF
+
       - name: Cleanup
         if: always()
         run: |

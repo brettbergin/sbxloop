@@ -26,6 +26,11 @@ dependencies = [
     "sbxloop-worker",
 ]
 
+[project.optional-dependencies]
+# Host-side SDK access for `sbxloop list-models` (agent sessions get the SDK
+# inside the sandbox via sbxloop-worker[copilot]; runs never need this extra).
+copilot = ["github-copilot-sdk>=1.0.8"]
+
 [project.scripts]
 sbxloop = "sbxloop.cli.app:main"
 

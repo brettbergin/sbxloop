@@ -182,6 +182,7 @@ class Provisioner:
         agent_spec, github_spec = self.build_specs(run_id, workspace)
         specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
         created: list[Sandbox] = []
+        registered_secret_rms: list[Callable[[], bool]] = []
         try:
             sandboxes: dict[SandboxRole, Sandbox] = {}
             for spec in specs:
@@ -190,7 +191,7 @@ class Provisioner:
                 sandbox = Sandbox(self.cli, spec.name)
                 created.append(sandbox)
                 self._apply_policy(spec)
-                self._apply_secrets(spec, sandbox, tokens[spec.role])
+                registered_secret_rms += self._apply_secrets(spec, sandbox, tokens[spec.role])
                 self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
                 sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
                 if self.post_create is not None:
@@ -217,6 +218,17 @@ class Provisioner:
                     sandbox.rm()
                 except SbxError:
                     logger.warning("rollback: failed to remove %s", sandbox.name, exc_info=True)
+            # Symmetric with sandbox removal: best-effort unregister the
+            # secrets THIS attempt registered. Left behind, they would be
+            # owned by a now-deleted sandbox scope, and the next run's
+            # replace-on-exists recovery would depend on scope-parsing
+            # heuristics instead of starting clean.
+            for rm in registered_secret_rms:
+                try:
+                    if not rm():
+                        logger.warning("rollback: sbx rejected removing a registered secret")
+                except SbxError:
+                    logger.warning("rollback: failed to remove a registered secret", exc_info=True)
             if isinstance(exc, ProvisionError):
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
@@ -225,22 +237,33 @@ class Provisioner:
         for domain in spec.policy_allows:
             self.cli.policy_allow(domain, sandbox=spec.name)
 
-    def _apply_secrets(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
+    def _apply_secrets(
+        self, spec: SandboxSpec, sandbox: Sandbox, token: str
+    ) -> list[Callable[[], bool]]:
+        """Register the spec's secrets, returning one rollback (rm) callable
+        per registration this attempt actually created — so a provisioning
+        failure can unregister them symmetric with sandbox removal, instead
+        of leaving entries owned by a scope that no longer exists."""
         if self.config.secret_strategy == "plain-env":  # nosec B105 - strategy label
             self._apply_plain_env(spec, sandbox, token)
-            return
+            return []
+        rollbacks: list[Callable[[], bool]] = []
         for secret in spec.secrets:
             if secret.kind == "service":
                 assert secret.service is not None
                 service = secret.service
-                set_secret_replacing(
+                registered = set_secret_replacing(
                     f"service {service} ({spec.name})",
                     set_fn=partial(self.cli.secret_set, service, sandbox=spec.name, token=token),
                     rm_candidates=partial(service_rm_candidates, self.cli, service, spec.name),
                 )
+                if registered:
+                    rollbacks.append(
+                        partial(self.cli.secret_rm, service=service, sandbox=spec.name)
+                    )
             else:
                 assert secret.host is not None and secret.env is not None
-                set_secret_replacing(
+                registered = set_secret_replacing(
                     f"custom {secret.env}@{secret.host} ({spec.name})",
                     set_fn=partial(
                         self.cli.secret_set_custom,
@@ -253,6 +276,18 @@ class Provisioner:
                         custom_rm_candidates, self.cli, secret.host, secret.env, spec.name
                     ),
                 )
+                if registered:
+                    rollbacks.append(
+                        partial(self._rm_custom, host=secret.host, env=secret.env, scope=spec.name)
+                    )
+        return rollbacks
+
+    def _rm_custom(self, *, host: str, env: str, scope: str) -> bool:
+        # env+host first, then env-only — same ladder shape as collision
+        # recovery (sbx keys custom secrets by env name).
+        return self.cli.secret_rm(host=host, env=env, sandbox=scope) or self.cli.secret_rm(
+            env=env, sandbox=scope
+        )
 
     def _verify_secret_env(
         self, run_id: str, spec: SandboxSpec, sandbox: Sandbox, token: str

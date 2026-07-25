@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -12,6 +13,7 @@ from typing import Annotated, Any
 import typer
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape as rich_escape
 from rich.table import Table
 from rich.tree import Tree
 
@@ -20,12 +22,14 @@ from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import RunResult, artifact_files, artifacts_dir
+from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifact_files, artifacts_dir
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxRole
+from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
 from sbxloop.sbx.secretstate import (
@@ -85,6 +89,11 @@ def _store(config: Config) -> StateStore:
     return StateStore(config.state_dir / "state.db")
 
 
+# How long a Ctrl-C waits for the engine thread to reach a phase boundary
+# and unwind before sandbox cleanup proceeds regardless.
+_INTERRUPT_JOIN_S = 10.0
+
+
 def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     """Run start/resume with the scrollback transcript + pinned status, or
     plain event logs (--no-tui).
@@ -95,7 +104,17 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     the bottom is redrawn in place. Events arrive on the engine thread but
     every terminal write happens here on the main thread, via a queue —
     ordering stays deterministic and rich's Live never interleaves.
+
+    Ctrl-C/SIGTERM quiesce the engine before sandbox teardown: the
+    registry's signal handler (and, when handlers could not install, the
+    KeyboardInterrupt path here) signals the engine's cancel flag —
+    checked at phase boundaries — and briefly joins the daemon thread, so
+    cleanup doesn't race an engine still mid-``sbx exec``.
     """
+    # The TUI runs the engine on a background thread, where pair
+    # registration cannot install signal handlers — install them here,
+    # on the main thread, so SIGTERM/SIGINT still clean up the sandboxes.
+    cleanup_registry.install_handlers()
     if not tui:
         engine.bus.subscribe(plain_printer(console))
         return action()  # type: ignore[no-any-return]
@@ -112,26 +131,44 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
             outcome["error"] = exc
 
     thread = threading.Thread(target=target, daemon=True)
-    with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
 
-        def drain() -> None:
-            while True:
-                try:
-                    event = pending.get_nowait()
-                except queue.Empty:
-                    return
-                dashboard.on_event(event)
-                rendered = render_event(event)
-                if rendered is not None:
-                    live.console.print(rendered)
+    def quiesce() -> None:
+        # Idempotent: the signal handler runs it before cleanup, and the
+        # KeyboardInterrupt fallback below may run it again after.
+        engine.request_cancel()
+        if thread.is_alive():
+            thread.join(timeout=_INTERRUPT_JOIN_S)
 
-        thread.start()
-        while thread.is_alive():
+    cleanup_registry.set_quiesce(quiesce)
+    try:
+        with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
+
+            def drain() -> None:
+                while True:
+                    try:
+                        event = pending.get_nowait()
+                    except queue.Empty:
+                        return
+                    dashboard.on_event(event)
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        live.console.print(rendered)
+
+            thread.start()
+            try:
+                while thread.is_alive():
+                    drain()
+                    live.update(dashboard.renderable())
+                    time.sleep(0.15)
+            except KeyboardInterrupt:
+                # Fallback for environments where the signal handlers could
+                # not install (no-op re-quiesce when they did).
+                quiesce()
+                raise
             drain()
             live.update(dashboard.renderable())
-            time.sleep(0.15)
-        drain()
-        live.update(dashboard.renderable())
+    finally:
+        cleanup_registry.set_quiesce(None)
     if "error" in outcome:
         raise outcome["error"]
     return outcome["result"]  # type: ignore[no-any-return]
@@ -211,8 +248,12 @@ def run(
     ] = None,
     model: Annotated[str | None, typer.Option("--model", help="Copilot model id.")] = None,
     keep_sandboxes: Annotated[
-        bool, typer.Option("--keep-sandboxes", help="Do not remove sandboxes at the end.")
-    ] = False,
+        bool | None,
+        typer.Option(
+            "--keep-sandboxes/--no-keep-sandboxes",
+            help="Do not remove sandboxes at the end (either flag overrides config).",
+        ),
+    ] = None,
     keep_on_failure: Annotated[
         bool | None,
         typer.Option(
@@ -225,7 +266,7 @@ def run(
     """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
     config = _config_with_overrides(
         model=model,
-        keep_sandboxes=keep_sandboxes or None,
+        keep_sandboxes=keep_sandboxes,
         keep_on_failure=keep_on_failure,
     )
     if report is not None:
@@ -334,6 +375,26 @@ def status(
     console.print(table)
     attempts = store.phase_attempts(run_id)
     console.print(f"{len(attempts)} phase attempts recorded")
+    # The pair names, so debugging a live run needs no by-hand
+    # `sbxloop-<run>-agent` reconstruction.
+    console.print("sandboxes:")
+    roles: tuple[SandboxRole, ...] = ("agent", "github")
+    try:
+        live = {info.name for info in SbxCLI(app_name=config.app_name or None).ls()}
+    except SdxloopError:
+        for role in roles:
+            console.print(
+                f"  {sandbox_name(run_id, role)}  [dim](liveness unknown: sbx ls failed)[/]"
+            )
+        return
+    any_live = False
+    for role in roles:
+        name = sandbox_name(run_id, role)
+        any_live = any_live or name in live
+        state_note = "[green]running[/]" if name in live else "[dim]not running[/]"
+        console.print(f"  {name}  {state_note}")
+    if any_live:
+        console.print(f"  inspect: [cyan]sbxloop shell {run_id}[/] (--role github)")
 
 
 @app.command()
@@ -344,6 +405,15 @@ def logs(
         str | None, typer.Option("--type", help="Filter by event type prefix.")
     ] = None,
     task: Annotated[str | None, typer.Option("--task", help="Filter by task id.")] = None,
+    stale_after: Annotated[
+        float,
+        typer.Option(
+            "--stale-after",
+            help="With --follow: exit once a non-terminal run has shown no "
+            "activity (events or state changes) for this many minutes; "
+            "0 follows forever.",
+        ),
+    ] = 10.0,
 ) -> None:
     """Replay (or tail) a run's event stream from the state store."""
     config = load_config()
@@ -358,7 +428,19 @@ def logs(
             console.print(format_event(event), highlight=False)
         if not follow:
             break
-        if store.get_run(run_id).state in ("completed", "failed", "cancelled"):
+        record = store.get_run(run_id)
+        if record.state in TERMINAL_RUN_STATES:
+            break
+        # A run whose driving process died hard stays non-terminal in the DB
+        # forever; without this, --follow would spin indefinitely.
+        last_activity = max(record.updated_at, store.last_event_ts(run_id) or 0.0)
+        if stale_after > 0 and time.time() - last_activity > stale_after * 60.0:
+            console.print(
+                f"[yellow]run {run_id} is {record.state} but has shown no activity "
+                f"for over {stale_after:g} minutes[/] — its process may be dead. "
+                f"Exiting; resume with [cyan]sbxloop resume {run_id}[/] or keep "
+                "waiting with [cyan]--stale-after 0[/]."
+            )
             break
         time.sleep(0.5)
 
@@ -925,6 +1007,67 @@ def bake(
         console.print(
             f'set [cyan]\\[sandbox] template = "{record.ref}"[/] in sbxloop.toml to use it.'
         )
+
+
+@app.command("list-models")
+def list_models(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Machine-readable JSON on stdout (for scripting).")
+    ] = False,
+    timeout_s: Annotated[
+        float,
+        typer.Option("--timeout", help="Seconds to wait for the Copilot runtime and API."),
+    ] = 60.0,
+) -> None:
+    """List the models the GitHub Copilot SDK gives this host access to.
+
+    Queries the SDK directly on the host (no sandbox) with the same auth
+    chain agent sessions use, so the ids shown here are valid values for
+    `model` in sbxloop.toml and `sbxloop run --model`.
+    """
+    from sbxloop.cli.models import fetch_models, format_context, format_efforts, model_row
+
+    config = load_config()
+    try:
+        rows = [model_row(info) for info in fetch_models(timeout_s=timeout_s)]
+    except SdxloopError as exc:
+        # escape(): the install hint (`sbxloop[copilot]`) and arbitrary SDK
+        # error text must not be parsed as rich markup.
+        console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
+        raise typer.Exit(2) from exc
+    if json_output:
+        # bare JSON on stdout, nothing else — `sbxloop list-models --json | jq`
+        typer.echo(json.dumps([row.raw or {"id": row.id, "name": row.name} for row in rows]))
+        return
+    table = Table(title="copilot models")
+    for column in ("model", "name", "billing", "context", "vision", "reasoning", "policy"):
+        table.add_column(column)
+    for row in rows:
+        configured = row.id == config.model
+        # SDK-provided text is escaped: a model name with brackets must not
+        # be parsed as rich markup.
+        table.add_row(
+            f"[bold cyan]{rich_escape(row.id)}[/] ◀" if configured else rich_escape(row.id),
+            rich_escape(row.name),
+            f"{row.multiplier:g}x" if row.multiplier is not None else "",
+            format_context(row.context_window),
+            "yes" if row.vision else "",
+            format_efforts(row),
+            row.policy_state or "",
+        )
+    console.print(table)
+    if not rows:
+        console.print(
+            "[yellow]the SDK returned no models[/] — the subscription may have "
+            "no model access, or model policy blocks them all"
+        )
+    marker = (
+        f"◀ = configured model ({config.model})"
+        if any(row.id == config.model for row in rows)
+        else f"configured model: {config.model}"
+        + (" (the SDK picks one per session)" if config.model == "auto" else " — not in this list!")
+    )
+    console.print(f"[dim]{marker}; * = default reasoning effort[/]")
 
 
 @app.command()

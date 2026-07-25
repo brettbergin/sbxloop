@@ -17,6 +17,9 @@ WorkerTimeoutError is raised.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import codecs
 import contextlib
 import json
 import logging
@@ -438,17 +441,20 @@ class WorkerClient:
             parts.append("stderr: " + " | ".join(stderr_tail)[-1500:])
         return "; ".join(parts)
 
-    def _handle_line(self, job: JobRequest, line: str) -> None:
+    def _handle_line(self, job: JobRequest, line: str) -> Event | None:
+        """Publish one stdout/events line; returns the parsed Event (None for
+        blank or non-event lines) so callers can act on event types without
+        re-parsing or substring-matching the raw line."""
         line = line.strip()
         if not line:
-            return
+            return None
         try:
             event = Event.from_json_line(line)
         except ValueError:
             self.bus.publish(
                 Event.now(EventTypes.WORKER_STDOUT, job.run_id, job_id=job.job_id, line=line)
             )
-            return
+            return None
         if self.role is not None and event.type in (
             EventTypes.SANDBOX_RESOURCES,
             EventTypes.SANDBOX_RESOURCES_WARNING,
@@ -458,6 +464,7 @@ class WorkerClient:
         if agent is not None and event.type.startswith("agent."):
             event.data.setdefault("agent", agent)
         self.bus.publish(event)
+        return event
 
     # -- poll transport ----------------------------------------------------
 
@@ -475,24 +482,7 @@ class WorkerClient:
             raise WorkerError(f"failed to launch worker: {launch.stderr.strip()[:2000]}")
         pid = launch.stdout.strip().splitlines()[-1] if launch.stdout.strip() else ""
 
-        offset = 0
-        buffer = ""
-
-        def drain() -> bool:
-            """Read new event bytes; return True once worker.end is seen."""
-            nonlocal offset, buffer
-            chunk = self.sandbox.exec(
-                ["sh", "-c", f"tail -c +{offset + 1} {events_path} 2>/dev/null || true"]
-            )
-            finished = False
-            if chunk.stdout:
-                offset += len(chunk.stdout.encode())
-                *complete, buffer = (buffer + chunk.stdout).split("\n")
-                for line in complete:
-                    self._handle_line(job, line)
-                    if '"worker.end"' in line:
-                        finished = True
-            return finished
+        drain = _PollDrain(self, job, events_path).drain
 
         while True:
             if time.monotonic() > deadline:
@@ -556,3 +546,51 @@ class WorkerClient:
         if result.job_id != job.job_id:
             raise WorkerError(f"result job_id mismatch: expected {job.job_id}, got {result.job_id}")
         return result
+
+
+class _PollDrain:
+    """Byte-offset tail reader over the in-sandbox events file.
+
+    ``tail -c`` offsets are raw bytes with no character alignment, so each
+    chunk is fetched base64-encoded — binary-safe through the text-mode exec
+    (no newline translation or decode errors can perturb the byte count) —
+    and the offset advances by decoded byte length. A split multibyte UTF-8
+    character is held by the incremental decoder until the next chunk
+    completes it; a split line is held in the partial-line buffer until its
+    newline arrives.
+
+    Completion is signalled only by a *parsed* event of type worker.end:
+    substring-matching the raw line would false-trigger on an agent message
+    that merely mentions the protocol literal.
+    """
+
+    def __init__(self, client: WorkerClient, job: JobRequest, events_path: str) -> None:
+        self.client = client
+        self.job = job
+        self.events_path = events_path
+        self.offset = 0
+        self.buffer = ""
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def drain(self) -> bool:
+        """Publish any newly completed event lines; True once worker.end is seen."""
+        chunk = self.client.sandbox.exec(
+            ["sh", "-c", f"tail -c +{self.offset + 1} {self.events_path} 2>/dev/null | base64"]
+        )
+        try:
+            raw = base64.b64decode(chunk.stdout) if chunk.stdout else b""
+        except binascii.Error:
+            logger.warning(
+                "poll drain: undecodable chunk from %s; retrying next poll", self.events_path
+            )
+            return False
+        if not raw:
+            return False
+        self.offset += len(raw)
+        finished = False
+        *complete, self.buffer = (self.buffer + self.decoder.decode(raw)).split("\n")
+        for line in complete:
+            event = self.client._handle_line(self.job, line)
+            if event is not None and event.type == EventTypes.WORKER_END:
+                finished = True
+        return finished
