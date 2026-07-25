@@ -18,6 +18,7 @@ WorkerTimeoutError is raised.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import queue
 import shlex
@@ -31,7 +32,15 @@ from sbxloop.config import WorkerTransport
 from sbxloop.errors import SbxError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
 from sbxloop.sbx.models import ExecResult
-from sbxloop.sbx.sandbox import ENV_FILE, EVENTS_DIR, JOBS_DIR, RESULTS_DIR, VENV_DIR, Sandbox
+from sbxloop.sbx.sandbox import (
+    BAKE_MANIFEST,
+    ENV_FILE,
+    EVENTS_DIR,
+    JOBS_DIR,
+    RESULTS_DIR,
+    VENV_DIR,
+    Sandbox,
+)
 from sbxloop.sbx.sandbox import VENV_PYTHON as DEFAULT_PYTHON
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult
@@ -68,6 +77,9 @@ class WorkerClient:
         self.python = python
         self.poll_interval = poll_interval
         self.grace_s = grace_s
+        # Set by install(): True when a prebaked template carried a working
+        # worker and the install ladder was skipped entirely.
+        self.prebaked = False
 
     # -- install -----------------------------------------------------------
 
@@ -80,8 +92,16 @@ class WorkerClient:
         no_deps: bool = False,
         system_site_packages: bool = False,
         ensure_dev_tools: bool = False,
+        expect_prebaked: bool = False,
     ) -> None:
         """Install sbxloop-worker into the sandbox, venv-first with fallbacks.
+
+        ``expect_prebaked`` (set when ``[sandbox].template`` is configured)
+        first probes for a template baked by ``sbxloop bake``: a bake
+        manifest whose worker version matches this host, verified with the
+        same entrypoint smoke check the ladder ends with. On success the
+        whole ladder is skipped; any verification failure degrades to the
+        ladder below, so a stale template costs one probe, never a run.
 
         Sandbox templates ship python3 but often lack python3-venv
         (Debian/Ubuntu split ensurepip out). The ladder:
@@ -104,6 +124,9 @@ class WorkerClient:
         the AGENT's own work (see _ensure_dev_tools) — the engine sets it
         for the agent sandbox only.
         """
+        if expect_prebaked and self._verify_prebaked():
+            self.prebaked = True
+            return
         if ensure_dev_tools:
             self._ensure_dev_tools(timeout)
         wheel = wheel if wheel is not None else resolve_worker_wheel()
@@ -140,9 +163,19 @@ class WorkerClient:
         # against a missing job file must exit 64 (the worker's usage-error
         # code) — anything else means jobs would die with no result file,
         # so fail HERE with full output instead of at the first real job.
-        smoke = self.sandbox.exec(
+        smoke = self._entrypoint_smoke(self.python)
+        if smoke.returncode != 64:
+            raise WorkerError(
+                "worker entrypoint check failed "
+                f"(rc={smoke.returncode}, expected 64): {_output_tail(smoke)}"
+            )
+
+    def _entrypoint_smoke(self, python: str) -> ExecResult:
+        """Run the worker entrypoint against a missing job file; a healthy
+        install exits 64 (the worker's usage-error code)."""
+        return self.sandbox.exec(
             [
-                self.python,
+                python,
                 "-m",
                 "sbxloop_worker",
                 "run",
@@ -154,11 +187,59 @@ class WorkerClient:
                 "/tmp/sbxloop-smoke.result.json",
             ]
         )
-        if smoke.returncode != 64:
-            raise WorkerError(
-                "worker entrypoint check failed "
-                f"(rc={smoke.returncode}, expected 64): {_output_tail(smoke)}"
+
+    def _verify_prebaked(self) -> bool:
+        """Fast prerequisite probes against a prebaked template.
+
+        Reads the bake manifest ``sbxloop bake`` left in the template, then
+        re-runs the two checks the install ladder ends with (version match,
+        entrypoint exits 64) under the interpreter the bake recorded. Any
+        failure returns False — the caller falls back to the install
+        ladder, so a stale or foreign template degrades to today's
+        behavior instead of failing the run.
+        """
+        manifest_read = self.sandbox.exec(["cat", BAKE_MANIFEST])
+        if not manifest_read.ok:
+            logger.info("no bake manifest in template (%s); running install ladder", BAKE_MANIFEST)
+            return False
+        try:
+            manifest = json.loads(manifest_read.stdout)
+            baked_version = str(manifest["worker_version"])
+            python = str(manifest.get("python") or DEFAULT_PYTHON)
+        except (ValueError, KeyError, TypeError):
+            logger.warning("unreadable bake manifest %s; running install ladder", BAKE_MANIFEST)
+            return False
+        if baked_version != sbxloop.__version__:
+            logger.warning(
+                "template worker %s does not match host %s — stale template, running "
+                "install ladder (re-run `sbxloop bake` to refresh)",
+                baked_version,
+                sbxloop.__version__,
             )
+            return False
+        verify = self.sandbox.exec(
+            [python, "-c", "import sbxloop_worker; print(sbxloop_worker.__version__)"]
+        )
+        if not verify.ok or verify.stdout.strip() != sbxloop.__version__:
+            logger.warning(
+                "prebaked worker failed the import/version probe (rc=%s): %s — "
+                "running install ladder",
+                verify.returncode,
+                _output_tail(verify),
+            )
+            return False
+        smoke = self._entrypoint_smoke(python)
+        if smoke.returncode != 64:
+            logger.warning(
+                "prebaked worker failed the entrypoint probe (rc=%s, expected 64): %s — "
+                "running install ladder",
+                smoke.returncode,
+                _output_tail(smoke),
+            )
+            return False
+        self.python = python
+        logger.info("prebaked worker %s verified; install ladder skipped", baked_version)
+        return True
 
     def _ensure_dev_tools(self, timeout: float) -> None:
         """Best-effort: make the sandbox dev-ready for the agent's own work.

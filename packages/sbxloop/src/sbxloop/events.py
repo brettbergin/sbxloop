@@ -83,6 +83,7 @@ class HostEventTypes:
     PHASE_END = "phase.end"
     SANDBOX_PROVISION_START = "sandbox.provision_start"
     SANDBOX_READY = "sandbox.ready"
+    SANDBOX_PREBAKED = "sandbox.prebaked"
     SANDBOX_CLEANUP = "sandbox.cleanup"
 
 

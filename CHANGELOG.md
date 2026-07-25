@@ -6,6 +6,19 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Prebaked sandbox templates + `sbxloop bake` (#48).** `sbxloop bake` runs
+  the worker install ladder once in a scratch sandbox (plus a best-effort
+  Copilot runtime pre-cache) and persists the result with `sbx template
+  save`. With `[sandbox] template` pointing at the baked ref, provisioning
+  verifies the baked worker with fast probes (bake manifest → version match
+  → entrypoint smoke) and skips the per-run install entirely; any probe
+  failure falls back to the existing install ladder, so a stale template
+  degrades to today's behavior instead of failing the run. Runs emit a
+  `sandbox.prebaked` event either way, and `sbxloop doctor` warns when the
+  configured template was baked with an older worker (re-run `sbxloop
+  bake`) or is missing from `sbx template ls`.
+
 ### Changed
 - **Releases are now fully automated** (aligned with the entrygraph release
   strategy): every merge to `main` runs the check suite, auto-bumps the patch

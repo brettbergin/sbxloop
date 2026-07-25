@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from rich.console import Console
 from rich.table import Table
 
+import sbxloop
 from sbxloop.config import load_config
 from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import (
     AGENT_TOKEN_HOSTS,
@@ -95,6 +97,54 @@ def collect_checks(
                         f"`sbx policy allow network {host}`"
                     ),
                     hard=False,  # per-sandbox allows are applied at provision time
+                )
+            )
+
+    # prebaked template freshness: a stale template never breaks a run
+    # (provisioning falls back to the install ladder), so these are warns.
+    template = config.sandbox.template
+    if template:
+        record = load_bake_record(config)
+        if record is not None and record.ref == template:
+            fresh = record.worker_version == sbxloop.__version__
+            checks.append(
+                Check(
+                    "sandbox template",
+                    fresh,
+                    f"{template} baked with worker {record.worker_version}"
+                    if fresh
+                    else f"{template} is stale: baked worker {record.worker_version}, host "
+                    f"is {sbxloop.__version__} — run `sbxloop bake` (runs fall back to "
+                    "the install ladder meanwhile)",
+                    hard=False,
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "sandbox template",
+                    True,
+                    f"{template} was not baked on this host; provisioning verifies it and "
+                    "falls back to the install ladder if needed (`sbxloop bake` builds one)",
+                    hard=False,
+                )
+            )
+        if version is not None:
+            report("checking sbx template list")
+            repo = template.split(":", 1)[0]
+            try:
+                listed = repo in cli.template_ls()
+            except SbxError:
+                listed = False
+            checks.append(
+                Check(
+                    "template available",
+                    listed,
+                    "listed by `sbx template ls`"
+                    if listed
+                    else f"{repo} not in `sbx template ls` — run `sbxloop bake` "
+                    "(or pull/load the template) before running",
+                    hard=False,
                 )
             )
 

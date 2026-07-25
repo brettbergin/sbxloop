@@ -23,6 +23,7 @@ from sbxloop.engine.model import RunResult, artifact_files, artifacts_dir
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
+from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
 
@@ -456,6 +457,62 @@ def init(
 
 
 @app.command()
+def bake(
+    ref: Annotated[
+        str, typer.Option("--ref", help="Template reference to save (name:tag).")
+    ] = DEFAULT_TEMPLATE_REF,
+    base_template: Annotated[
+        str | None,
+        typer.Option("--from", help="Base template to bake from (default: the sbx base)."),
+    ] = None,
+    runtime_cache: Annotated[
+        bool,
+        typer.Option(
+            "--runtime-cache/--no-runtime-cache",
+            help="Pre-cache the Copilot runtime into the template.",
+        ),
+    ] = True,
+    keep: Annotated[
+        bool, typer.Option("--keep", help="Keep the scratch sandbox for debugging.")
+    ] = False,
+) -> None:
+    """Bake a sandbox template with the worker preinstalled.
+
+    Runs the full worker install once in a scratch sandbox and saves it
+    via `sbx template save`. With `[sandbox] template` pointing at the
+    saved ref, runs verify the baked worker with fast probes instead of
+    reinstalling it on every provision (and fall back to the normal
+    install if the template goes stale).
+    """
+    config = load_config()
+    cli = SbxCLI(app_name=config.app_name or None)
+    try:
+        record = bake_template(
+            cli,
+            config,
+            ref=ref,
+            base_template=base_template,
+            cache_runtime=runtime_cache,
+            keep=keep,
+            progress=lambda message: console.print(f"[dim]… {message}[/dim]", highlight=False),
+        )
+    except SdxloopError as exc:
+        console.print(f"[bold red]bake failed:[/] {exc}")
+        raise typer.Exit(2) from exc
+    runtime = "cached" if record.runtime_cached else "[yellow]not cached[/]"
+    console.print(
+        f"baked [bold cyan]{record.ref}[/] "
+        f"(worker {record.worker_version}, copilot runtime {runtime})"
+    )
+    if config.sandbox.template == record.ref:
+        console.print("`[sandbox] template` already points at this ref — runs will use it.")
+    else:
+        console.print(
+            f'set [cyan]\\[sandbox] template = "{record.ref}"[/] in sbxloop.toml to use it.'
+        )
+
+
+@app.command()
 def doctor() -> None:
     """Check that this host is ready to run sbxloop."""
     ok = run_doctor(console)
@@ -484,7 +541,9 @@ secret_strategy = "proxy"
 
 [sandbox]
 # Custom sandbox template reference (defaults to the sbx shell template).
-# template = "docker.io/you/your-template:v1"
+# `sbxloop bake` builds one with the worker preinstalled, cutting the
+# per-run install out of provisioning.
+# template = "sbxloop-baked:latest"
 # Extra network allow rules applied to both sandboxes.
 extra_allow_domains = []
 

@@ -62,6 +62,7 @@ class TestBasics:
             "status",
             "logs",
             "artifacts",
+            "bake",
             "doctor",
             "sandbox",
             "config",
@@ -268,6 +269,82 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "FAIL" in result.output
 
+    def _bake_record(self, workdir: Path, *, worker_version: str, ref: str) -> None:
+        state = workdir / ".sbxloop"
+        state.mkdir(exist_ok=True)
+        (state / "bake.json").write_text(
+            json.dumps(
+                {
+                    "ref": ref,
+                    "worker_version": worker_version,
+                    "python": "/home/agent/.sbxloop/venv/bin/python",
+                    "runtime_cached": True,
+                    "baked_at": 0.0,
+                }
+            )
+        )
+
+    def test_doctor_template_fresh_and_listed(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rendered table wraps long details, so assert on the checks."""
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        self._bake_record(workdir, worker_version=sbxloop.__version__, ref="sbxloop-baked:latest")
+        fake_sbx.script("template ls", stdout="REPOSITORY  TAG\nsbxloop-baked  latest\n")
+        checks = collect_checks(
+            {"COPILOT_GITHUB_TOKEN": "tok", "SBXLOOP_SANDBOX__TEMPLATE": "sbxloop-baked:latest"},
+            cli=SbxCLI(binary=str(fake_sbx.binary)),
+        )
+        by_name = {c.name: c for c in checks}
+        template = by_name["sandbox template"]
+        assert template.ok and "baked with worker" in template.detail
+        available = by_name["template available"]
+        assert available.ok and "listed" in available.detail
+
+    def test_doctor_stale_template_warns_rebake(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("SBXLOOP_SANDBOX__TEMPLATE", "sbxloop-baked:latest")
+        self._bake_record(workdir, worker_version="0.0.0", ref="sbxloop-baked:latest")
+        result = runner.invoke(app, ["doctor"])
+        # stale template is a warning (runs fall back to the ladder), never a FAIL
+        assert result.exit_code == 0, result.output
+        assert "stale" in result.output
+        assert "sbxloop bake" in result.output
+
+    def test_doctor_unbaked_template_is_soft(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        checks = collect_checks(
+            {
+                "COPILOT_GITHUB_TOKEN": "tok",
+                "SBXLOOP_SANDBOX__TEMPLATE": "docker.io/you/custom:v1",
+            },
+            cli=SbxCLI(binary=str(fake_sbx.binary)),
+        )
+        by_name = {c.name: c for c in checks}
+        template = by_name["sandbox template"]
+        assert template.ok and not template.hard
+        assert "not baked on this host" in template.detail
+        # not in `sbx template ls` either -> soft warn with remediation
+        available = by_name["template available"]
+        assert not available.ok and not available.hard
+        assert "sbxloop bake" in available.detail
+
+    def test_doctor_no_template_no_template_checks(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "sandbox template" not in result.output
+
     def test_doctor_without_sbx(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PATH", str(workdir))  # nothing on PATH
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
@@ -275,6 +352,65 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 1
         assert "not found on PATH" in result.output
+
+
+class TestBakeCommand:
+    """CLI wiring only — the bake flow itself is covered in test_bake.py."""
+
+    def _stub_record(self, **overrides: Any) -> Any:
+        from sbxloop.sbx.bake import BakeRecord
+
+        base: dict[str, Any] = {
+            "ref": "sbxloop-baked:latest",
+            "worker_version": sbxloop.__version__,
+            "python": "/home/agent/.sbxloop/venv/bin/python",
+            "runtime_cached": True,
+            "baked_at": 0.0,
+        }
+        base.update(overrides)
+        return BakeRecord.model_validate(base)
+
+    def test_bake_success_prints_config_hint(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.cli.app as app_mod
+
+        captured: dict[str, Any] = {}
+
+        def fake_bake(cli: Any, config: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return self._stub_record()
+
+        monkeypatch.setattr(app_mod, "bake_template", fake_bake)
+        result = runner.invoke(app, ["bake", "--no-runtime-cache", "--keep"])
+        assert result.exit_code == 0, result.output
+        assert captured["cache_runtime"] is False
+        assert captured["keep"] is True
+        assert captured["ref"] == "sbxloop-baked:latest"
+        assert 'template = "sbxloop-baked:latest"' in result.output
+
+    def test_bake_notes_already_configured_template(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.cli.app as app_mod
+
+        monkeypatch.setenv("SBXLOOP_SANDBOX__TEMPLATE", "sbxloop-baked:latest")
+        monkeypatch.setattr(app_mod, "bake_template", lambda *a, **k: self._stub_record())
+        result = runner.invoke(app, ["bake"])
+        assert result.exit_code == 0, result.output
+        assert "already points at this ref" in result.output
+
+    def test_bake_failure_exits_2(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sbxloop.cli.app as app_mod
+        from sbxloop.errors import BakeError
+
+        def fail(*args: Any, **kwargs: Any) -> Any:
+            raise BakeError("bake failed: sandbox exploded")
+
+        monkeypatch.setattr(app_mod, "bake_template", fail)
+        result = runner.invoke(app, ["bake"])
+        assert result.exit_code == 2
+        assert "bake failed" in result.output
 
 
 class TestRunCommand:
