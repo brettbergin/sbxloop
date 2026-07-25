@@ -128,7 +128,9 @@ class JobRunner:
 
     def _run_shell_check(self) -> JobResult:
         assert self.job.argv is not None
-        proc = subprocess.run(
+        # nosec below: executing the job's argv inside the sandbox IS this
+        # worker's contract; list argv, never shell=True.
+        proc = subprocess.run(  # nosec B603
             self.job.argv,
             capture_output=True,
             text=True,

@@ -48,12 +48,13 @@ def _workspace_worker_root() -> Path | None:
 @lru_cache(maxsize=1)
 def _workspace_build() -> Path | None:
     worker_root = _workspace_worker_root()
-    if worker_root is None or shutil.which("uv") is None:
+    uv = shutil.which("uv")
+    if worker_root is None or uv is None:
         return None
     out_dir = Path(tempfile.mkdtemp(prefix="sbxloop-worker-wheel-"))
     try:
-        subprocess.run(
-            ["uv", "build", "--wheel", "-o", str(out_dir), str(worker_root)],
+        subprocess.run(  # nosec B603 - fixed argv, absolute uv path
+            [uv, "build", "--wheel", "-o", str(out_dir), str(worker_root)],
             check=True,
             capture_output=True,
             timeout=300,

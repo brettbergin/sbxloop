@@ -1,4 +1,4 @@
-.PHONY: install fmt lint typecheck test check build clean
+.PHONY: install fmt lint typecheck security test check build clean
 
 install:
 	uv sync --all-packages
@@ -14,10 +14,13 @@ lint:
 typecheck:
 	uv run mypy
 
+security:
+	uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
+
 test:
 	uv run pytest
 
-check: lint typecheck test
+check: lint typecheck security test
 
 build:
 	rm -rf dist

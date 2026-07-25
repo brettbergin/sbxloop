@@ -39,7 +39,7 @@ from sbxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult
 # Wheels must keep their canonical filename when staged: pip validates the
 # name-version-python-abi-platform structure of the FILENAME itself and
 # refuses to install a renamed wheel ("Invalid wheel filename").
-STAGED_WHEEL_DIR = "/tmp"
+STAGED_WHEEL_DIR = "/tmp"  # nosec B108 - path inside the sandbox VM, not host tmp
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,7 @@ class WorkerClient:
         # against a missing job file must exit 64 (the worker's usage-error
         # code) — anything else means jobs would die with no result file,
         # so fail HERE with full output instead of at the first real job.
+        smoke_base = "/tmp/sbxloop-smoke"  # nosec B108 - path inside the sandbox VM, not host tmp
         smoke = self.sandbox.exec(
             [
                 self.python,
@@ -154,11 +155,11 @@ class WorkerClient:
                 "sbxloop_worker",
                 "run",
                 "--job",
-                "/tmp/sbxloop-smoke-missing.json",
+                f"{smoke_base}-missing.json",
                 "--events",
-                "/tmp/sbxloop-smoke.events.jsonl",
+                f"{smoke_base}.events.jsonl",
                 "--result",
-                "/tmp/sbxloop-smoke.result.json",
+                f"{smoke_base}.result.json",
             ]
         )
         if smoke.returncode != 64:

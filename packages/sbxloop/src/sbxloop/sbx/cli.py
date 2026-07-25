@@ -69,7 +69,7 @@ class SbxCLI:
         safe_argv = redacted_argv(argv)
         started = time.monotonic()
         try:
-            proc = subprocess.run(
+            proc = subprocess.run(  # nosec B603 - list argv, sbx CLI, no shell
                 argv,
                 capture_output=True,
                 text=True,
@@ -105,7 +105,7 @@ class SbxCLI:
         """Start a streaming sbx invocation (stdout piped, line-buffered)."""
         argv = self.argv(*args)
         try:
-            return subprocess.Popen(
+            return subprocess.Popen(  # nosec B603 - list argv, sbx CLI, no shell
                 argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -164,7 +164,7 @@ class SbxCLI:
         """
         argv = self.argv("exec", name, *cmd)
         try:
-            return subprocess.run(argv, check=False).returncode
+            return subprocess.run(argv, check=False).returncode  # nosec B603 - list argv, no shell
         except FileNotFoundError as exc:
             raise SbxNotFoundError(
                 f"sbx binary {self.binary!r} not found on PATH",

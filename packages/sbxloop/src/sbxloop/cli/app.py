@@ -670,7 +670,7 @@ def secrets_rotate(
                 f"[yellow]runs read {COPILOT_TOKEN_ENV} from the environment at "
                 "provision time[/] — update your export / ./.env with the new value too"
             )
-        if config.secret_strategy == "plain-env":
+        if config.secret_strategy == "plain-env":  # nosec B105 - strategy label
             console.print(
                 "next run: [bold]plain-env[/] strategy (configured) — the token is "
                 "written to the in-VM env file from your environment"

@@ -46,6 +46,18 @@ jobs:
       - run: uv sync --all-packages
       - run: uv run mypy
 
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs tags to resolve the version
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages
+      - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
+
   test:
     runs-on: ubuntu-latest
     strategy:
