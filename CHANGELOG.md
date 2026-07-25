@@ -126,6 +126,19 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Security
 
+- **The read-only critic barrier is now allowlist + default-deny (#62).**
+  SCRUTINIZE/VALIDATE sessions previously denied only `{"shell", "write"}`
+  permission kinds and approved everything else — an unverified denylist,
+  so an SDK rename or a new mutating kind would have silently handed the
+  critic approve-all over the workspace it reviews. The barrier now allows
+  only known-read kinds (`read`, `url`) and rejects everything else with
+  feedback naming the denied kind, so unknown kinds fail closed (worst
+  case: the critic loses a read capability and says so). The full `kind`
+  vocabulary was field-verified against github-copilot-sdk 1.0.8 (`shell`,
+  `write`, `read`, `mcp`, `url`, `memory`, `custom-tool`, `hook`,
+  `extension-management`, `extension-permission-access`), and
+  `sbxloop doctor` now compares the installed SDK's vocabulary against
+  that snapshot, warning loudly on drift after an SDK bump.
 - Secret values no longer leak through error text or the process-observable
   argv carried on `ExecResult`/`SbxError`: the value passed to
   `sbx secret set-custom --value` is masked (`***`) in every observable copy
