@@ -98,6 +98,17 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- A run resumed while a task was checkpointed `validating` no longer asks
+  the VALIDATE judge to rule without evidence (#61). The verify-command
+  transcript lived only in memory on the `PhaseRunner` (a class-level
+  default of `"(verification not run)"`), so a fresh process entering
+  VALIDATE rendered the prompt with the placeholder instead of the real
+  results. VERIFY now persists its full command transcript on the
+  `phase_attempts` row and VALIDATE reads it from there — the single source
+  of truth for both fresh and resumed runs — and the class-level mutable
+  state is gone. A checkpoint whose verify row predates this change (no
+  stored transcript) rewinds to `verifying` on resume; VERIFY is mechanical
+  and idempotent, so the evidence is cheaply repopulated.
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and
   sbx-level errors raised by the delivery op jobs (`WorkerError`,
@@ -135,6 +146,16 @@ All notable changes to sdxloop are documented here. The project adheres to
   into terminals, logs, or events (#57). The remaining `ps`-visibility of
   the live subprocess argv needs stdin support in sbx itself and stays
   tracked in #57.
+- The `ps`-visibility half of #57 is now a doctor conformance probe
+  (`secret-value-stdin`, cheap tier): desk-verified against the sbx docs and
+  release history through v0.37, `sbx secret set-custom` accepts the secret
+  only via `--token`/`--value` on argv (both documented as "less secure:
+  visible in shell history") — no stdin path exists, so the exposure window
+  cannot be closed from sbxloop's side yet. The probe checks
+  `set-custom --help` on every `sbxloop doctor` run and alarms the moment an
+  sbx upgrade grows a stdin path, naming the switch-over as the fix.
+  `exec_interactive`'s missing-binary error now carries the redacted argv
+  copy like every other observable path.
 
 ## [0.2.0] — 2026-07-23
 

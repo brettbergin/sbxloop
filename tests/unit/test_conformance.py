@@ -17,6 +17,7 @@ from sbxloop.sbx.conformance import (
     PROBE_LS_COLUMNS,
     PROBE_SECRET_ENV_VISIBILITY,
     PROBE_SECRET_EXISTS_ERROR,
+    PROBE_SECRET_VALUE_STDIN,
     PROBE_WORKSPACE_MOUNT,
     ProbeRecord,
     cache_path,
@@ -142,6 +143,38 @@ class TestShallowRun:
         )
         report = run_conformance(make_cli(fake_sbx), state, deep=False)
         assert by_id(report)[PROBE_SECRET_ENV_VISIBILITY].source == "provision"
+
+
+class TestSecretValueStdinProbe:
+    """The #57 ps-visibility watchdog: sbx set-custom offers no stdin path
+    today, so the PAT must ride --value on argv; the probe alarms the moment
+    an sbx upgrade makes stdin passing possible."""
+
+    def test_argv_only_against_fake(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
+        outcome = by_id(report)[PROBE_SECRET_VALUE_STDIN]
+        assert outcome.verdict == "argv-only"
+        assert outcome.drifts == []
+
+    def test_alarms_when_sbx_gains_a_stdin_path(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        fake_sbx.script(
+            "secret set-custom --help",
+            stdout="Flags:\n      --value-stdin   Read the secret value from stdin\n",
+        )
+        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
+        outcome = by_id(report)[PROBE_SECRET_VALUE_STDIN]
+        assert outcome.verdict == "stdin-available"
+        assert outcome.drifts
+        assert any("#57" in drift for drift in outcome.drifts)
+
+    def test_unrecognized_help_is_visible_not_fatal(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        fake_sbx.script("secret set-custom --help", returncode=2, stderr="unknown flag: --help\n")
+        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
+        outcome = by_id(report)[PROBE_SECRET_VALUE_STDIN]
+        assert outcome.verdict == "help-drifted"
+        assert outcome.drifts  # flipped vs expected -> loud
 
 
 class TestDrift:

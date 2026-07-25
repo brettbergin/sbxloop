@@ -242,6 +242,16 @@ class StateStore:
         )
         self._conn.commit()
 
+    def latest_phase_output(self, run_id: str, task_id: str, phase: str) -> str | None:
+        """output_json of the task's most recent attempt of ``phase``."""
+        row = self._conn.execute(
+            "SELECT output_json FROM phase_attempts"
+            " WHERE run_id = ? AND task_id = ? AND phase = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (run_id, task_id, phase),
+        ).fetchone()
+        return row["output_json"] if row is not None else None
+
     def phase_attempts(self, run_id: str, task_id: str | None = None) -> list[sqlite3.Row]:
         if task_id is None:
             return list(

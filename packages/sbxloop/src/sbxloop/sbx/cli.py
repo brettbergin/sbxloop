@@ -168,7 +168,7 @@ class SbxCLI:
         except FileNotFoundError as exc:
             raise SbxNotFoundError(
                 f"sbx binary {self.binary!r} not found on PATH",
-                argv=argv,
+                argv=redacted_argv(argv),
             ) from exc
 
     def cp(self, src: str, dst: str, *, timeout: float | None = None) -> None:
