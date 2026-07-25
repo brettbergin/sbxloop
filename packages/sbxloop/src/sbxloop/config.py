@@ -51,6 +51,10 @@ class GithubConfig(_ConfigModel):
 
     repo: str | None = None
     report: bool = False
+    # Publish a completed run's artifacts as a PR to `repo`.
+    deliver: bool = False
+    deliver_base: str | None = None  # base branch; None → the repo's default
+    deliver_draft: bool = False
 
     @field_validator("repo")
     @classmethod

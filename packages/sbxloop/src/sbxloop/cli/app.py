@@ -19,7 +19,7 @@ from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import RunResult, artifacts_dir
+from sbxloop.engine.model import RunResult, artifact_files, artifacts_dir
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
@@ -132,16 +132,6 @@ def _human_size(size: int) -> str:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def _artifact_files(root: Path) -> list[Path]:
-    """Regular files under root, hidden files/dirs excluded (an agent's .git
-    would otherwise swamp the listing), sorted for stable output."""
-    return sorted(
-        p
-        for p in root.rglob("*")
-        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
-    )
-
-
 def _artifacts_tree(root: Path, files: list[Path], cap: int = _TREE_MAX_FILES) -> Tree:
     tree = Tree(f"[bold]{root}[/]")
     nodes: dict[Path, Tree] = {root: tree}
@@ -163,7 +153,7 @@ def _print_artifacts_summary(result: RunResult, config: Config) -> None:
     target = artifacts_dir(result, config.state_dir)
     if target is None or not target.is_dir():
         return
-    files = _artifact_files(target)
+    files = artifact_files(target)
     if not files:
         console.print(f"\nartifacts: none produced (workspace: {target})")
         return
@@ -191,6 +181,13 @@ def run(
             help="Post run progress to the configured [github].repo.",
         ),
     ] = None,
+    deliver: Annotated[
+        bool | None,
+        typer.Option(
+            "--deliver/--no-deliver",
+            help="Publish the completed run's artifacts as a PR to the configured [github].repo.",
+        ),
+    ] = None,
     model: Annotated[str | None, typer.Option("--model", help="Copilot model id.")] = None,
     keep_sandboxes: Annotated[
         bool, typer.Option("--keep-sandboxes", help="Do not remove sandboxes at the end.")
@@ -203,9 +200,21 @@ def run(
         config = config.model_copy(
             update={"github": config.github.model_copy(update={"report": report})}
         )
-    if config.github.report and not config.github.enabled:
+    if deliver is not None:
+        config = config.model_copy(
+            update={"github": config.github.model_copy(update={"deliver": deliver})}
+        )
+    wanted = [
+        feature
+        for feature, enabled in (
+            ("progress reporting (--report)", config.github.report),
+            ("PR delivery (--deliver)", config.github.deliver),
+        )
+        if enabled
+    ]
+    if wanted and not config.github.enabled:
         console.print(
-            "[bold red]GitHub integration is not configured.[/] Progress reporting "
+            f"[bold red]GitHub integration is not configured.[/] {', '.join(wanted)} "
             'needs a repository: set [cyan]\\[github] repo = "owner/repo"[/] in '
             "sbxloop.toml (see `sbxloop init`), then re-run."
         )
@@ -353,7 +362,7 @@ def artifacts(
     if not target.is_dir():
         console.print(f"[bold red]artifacts directory is gone:[/] {target}")
         raise typer.Exit(2)
-    files = _artifact_files(target)
+    files = artifact_files(target)
     via = "live workspace mount" if record.mounted else "harvested copy"
     console.print(f"run [bold cyan]{run_id}[/]: {len(files)} file(s) ({via}) in [bold]{target}[/]")
     if tree:
@@ -487,6 +496,11 @@ extra_allow_domains = []
 # repo = "you/your-repo"
 # Post run progress (issues/comments) to the configured repo.
 # report = false
+# Open a PR with the run's artifacts when a run completes (or `--deliver`).
+# GH_TOKEN needs contents:write + pull_requests:write on the repo.
+# deliver = false
+# deliver_base = "main"   # base branch; unset uses the repo's default
+# deliver_draft = false
 
 [budgets]
 max_revisions_per_task = 2
