@@ -323,6 +323,45 @@ class TestRunCommand:
         assert "completed" in result.output
         assert "t1: done" in result.output
 
+    def test_run_tui_preserves_full_transcript_history(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The TUI must never wipe history: every agent message printed
+        during the run has to be present in the final output, not just the
+        last few entries of a bounded buffer."""
+        messages = [f"progress report number {i}" for i in range(1, 11)]
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Only task",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+                {
+                    "text": "did it",
+                    "events": [{"type": "agent.message", "data": {"content": m}} for m in messages],
+                },
+                {"json": {"verdict": "pass"}},
+                {"json": {"verdict": "accept"}},
+            ],
+        )
+        result = runner.invoke(app, ["run", "make it so"])  # tui mode (default)
+        assert result.exit_code == 0, result.output
+        for message in messages:
+            assert message in result.output
+
     def test_run_report_refused_without_github_config(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -468,7 +507,7 @@ class TestArtifactsTree:
 
 
 class TestDashboard:
-    def test_dashboard_renders_state(self) -> None:
+    def test_pinned_status_renders_run_and_tasks(self) -> None:
         from rich.console import Console
 
         from sbxloop.cli.tui import Dashboard
@@ -479,7 +518,6 @@ class TestDashboard:
             Event.now("run.state", "r1", state="running"),
             Event.now("task.start", "r1", task_id="t1", title="First task"),
             Event.now("task.state", "r1", task_id="t1", state="executing", revisions=1, replans=0),
-            Event.now("agent.message", "r1", content="working on it"),
         ]:
             dashboard.on_event(event)
 
@@ -490,7 +528,21 @@ class TestDashboard:
         assert "running" in text
         assert "First task" in text
         assert "executing" in text
-        assert "working on it" in text
+
+    def test_status_region_holds_no_transcript(self) -> None:
+        """The pinned region must stay compact: transcript entries live in
+        the terminal scrollback (printed once, never rewritten), so agent
+        messages must NOT appear in the re-rendered status panel."""
+        from rich.console import Console
+
+        from sbxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        dashboard.on_event(Event.now("run.state", "r1", state="running"))
+        dashboard.on_event(Event.now("agent.message", "r1", content="a very chatty message"))
+        console = Console(record=True, width=100)
+        console.print(dashboard.renderable())
+        assert "a very chatty message" not in console.export_text()
 
     def test_agent_messages_render_as_wrapped_markdown_panels(self) -> None:
         """Field complaint: ```json blocks flew by truncated and unwrapped.
@@ -498,7 +550,7 @@ class TestDashboard:
         lines wrapped), not as clipped single lines."""
         from rich.console import Console
 
-        from sbxloop.cli.tui import Dashboard
+        from sbxloop.cli.tui import render_event
 
         long_value = "x" * 200  # far beyond one terminal row
         content = (
@@ -507,10 +559,10 @@ class TestDashboard:
             f'{{"tasks": [{{"id": "t1", "note": "{long_value}"}}]}}\n'
             "```"
         )
-        dashboard = Dashboard()
-        dashboard.on_event(Event.now("agent.message", "r1", content=content))
+        rendered = render_event(Event.now("agent.message", "r1", content=content))
+        assert rendered is not None
         console = Console(record=True, width=80)
-        console.print(dashboard.renderable())
+        console.print(rendered)
         text = console.export_text()
         assert "agent" in text  # chat bubble title
         assert '"tasks"' in text  # code block content survived
@@ -519,13 +571,11 @@ class TestDashboard:
         assert text.count("x") >= 200
 
     def test_deltas_and_heartbeats_stay_out_of_transcript(self) -> None:
-        from sbxloop.cli.tui import Dashboard
+        from sbxloop.cli.tui import render_event
 
-        dashboard = Dashboard()
-        dashboard.on_event(Event.now("agent.message_delta", "r1", delta="chunk"))
-        dashboard.on_event(Event.now("worker.heartbeat", "r1"))
-        dashboard.on_event(Event.now("worker.stdout", "r1", line="noise"))
-        assert len(dashboard.transcript) == 0
+        assert render_event(Event.now("agent.message_delta", "r1", delta="chunk")) is None
+        assert render_event(Event.now("worker.heartbeat", "r1")) is None
+        assert render_event(Event.now("worker.stdout", "r1", line="noise")) is None
 
     def test_worker_error_renders_red_panel(self) -> None:
         from rich.console import Console

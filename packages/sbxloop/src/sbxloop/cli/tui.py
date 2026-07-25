@@ -1,16 +1,20 @@
-"""Rich rendering for runs: a chat-style live transcript and plain logging.
+"""Rich rendering for runs: a permanent scrollback transcript plus a small
+pinned status region.
 
-Agent output is conversational (markdown, fenced code blocks), so the live
-view renders it as a chat thread — markdown panels with syntax-highlighted
-code — rather than truncated log lines. Host lifecycle events stay compact
-one-liners. ``format_event`` remains the dense single-line form used by
+Agent output is conversational (markdown, fenced code blocks), so the
+transcript renders it as a chat thread — markdown panels with
+syntax-highlighted code — rather than truncated log lines. Transcript
+entries are printed to the terminal's normal scrollback as they happen and
+are never rewritten or dropped: the full history of a run stays scrollable.
+Only the compact status region (run state + task table) is live-updated in
+place at the bottom. Host lifecycle events stay compact one-liners.
+``format_event`` remains the dense single-line form used by
 ``sbxloop logs``.
 """
 
 from __future__ import annotations
 
 import datetime
-from collections import deque
 from typing import Any
 
 from rich.console import Console, Group, RenderableType
@@ -144,14 +148,16 @@ def render_event(event: Event) -> RenderableType | None:
 
 
 class Dashboard:
-    """Accumulates run state from the event stream and renders it."""
+    """Accumulates run status from the event stream and renders the pinned
+    region. Transcript entries are NOT kept here — the drive loop prints
+    them straight to scrollback via ``render_event`` so history is never
+    truncated or rewritten."""
 
-    def __init__(self, max_entries: int = 6) -> None:
+    def __init__(self) -> None:
         self.run_id: str | None = None
         self.run_state: str = "starting"
         self.outcome: str = ""
         self.tasks: dict[str, dict[str, Any]] = {}
-        self.transcript: deque[RenderableType] = deque(maxlen=max_entries)
 
     # -- event intake ------------------------------------------------------
 
@@ -177,9 +183,6 @@ class Dashboard:
             if data.get("title"):
                 entry["title"] = str(data["title"])
             entry["state"] = str(data.get("state", entry["state"]))
-        rendered = render_event(event)
-        if rendered is not None:
-            self.transcript.append(rendered)
 
     # -- rendering ---------------------------------------------------------
 
@@ -208,15 +211,10 @@ class Dashboard:
         if not self.tasks:
             table.add_row("…", "decomposing outcome", Text("pending", style="dim"), "")
 
-        transcript: RenderableType
-        if self.transcript:
-            transcript = Group(*self.transcript)
-        else:
-            transcript = Text("waiting for events…", style="dim")
-        return Group(
-            Panel(Group(header, outcome), border_style="cyan"),
-            table,
-            transcript,
+        return Panel(
+            Group(header, outcome, table),
+            border_style="cyan",
+            padding=(0, 1),
         )
 
 
