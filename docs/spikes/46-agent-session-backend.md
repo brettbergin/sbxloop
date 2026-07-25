@@ -45,8 +45,7 @@ script maps to these directly.
 ### Session surface
 
 - `sbx run [flags] [AGENT] [PATH...] [-- AGENT_ARGS...]` — runs an agent in
-  a sandbox, creating it if absent. Native agents: `claude, codex, copilot,
-  cursor, docker-agent, droid, gemini, kiro, opencode, shell`. Each has a
+  a sandbox, creating it if absent. Native agents: `claude, codex, copilot, cursor, docker-agent, droid, gemini, kiro, opencode, shell`. Each has a
   default startup command — notably `claude --dangerously-skip-permissions`,
   `copilot --yolo`, `shell` → `bash -l` (sbx runs agents unattended-style by
   default, same trust model as our `approve_all` inside the microVM).
@@ -155,13 +154,13 @@ stay cattle).
 `scripts/spike-46-agent-session-probe.sh` — dummy-secret-only, timeboxed,
 self-cleaning; runnable on the sbx machine or the e2e workflow environment.
 
-| Probe | Verifies | Gates |
-|-------|----------|-------|
-| P1 | Installed flag surface (`run`, `set-custom --placeholder`, `inspect`, `kit`) | everything |
-| P2 | `sbx run --name X -- -c "cmd"` with no TTY | architecture 1 |
-| P3 | Placeholder visibility matrix: run-session / exec -it / exec plain / exec login | the fork above |
-| P4 | Token-shaped `--placeholder` accepted | SDK compatibility |
-| P5 | Sandbox/session lifecycle after exit | resume model |
+| Probe | Verifies                                                                        | Gates             |
+| ----- | ------------------------------------------------------------------------------- | ----------------- |
+| P1    | Installed flag surface (`run`, `set-custom --placeholder`, `inspect`, `kit`)    | everything        |
+| P2    | `sbx run --name X -- -c "cmd"` with no TTY                                      | architecture 1    |
+| P3    | Placeholder visibility matrix: run-session / exec -it / exec plain / exec login | the fork above    |
+| P4    | Token-shaped `--placeholder` accepted                                           | SDK compatibility |
+| P5    | Sandbox/session lifecycle after exit                                            | resume model      |
 
 One follow-up needs a real PAT and is deliberately not in the probe script:
 end-to-end SDK-through-proxy (register the real PAT with a

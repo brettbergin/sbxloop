@@ -13,10 +13,10 @@ sbxloop turns a large outcome ("migrate this service to async", "add coverage to
 
 Every run gets an isolated microVM agent sandbox — plus, when the GitHub integration is configured, a second github-ops sandbox, so no single environment ever holds both credentials:
 
-| Sandbox | Credential | Purpose |
-|---|---|---|
-| `sbxloop-<run>-agent` | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM. |
-| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: issues write, contents read, …) | Performs user-facing GitHub operations (issues, PRs, statuses) against the one configured repository. Only provisioned when `[github] repo` is set. |
+| Sandbox                | Credential                                                               | Purpose                                                                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM.      |
+| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: issues write, contents read, …)            | Performs user-facing GitHub operations (issues, PRs, statuses) against the one configured repository. Only provisioned when `[github] repo` is set. |
 
 Both sandboxes run under sbx's **balanced network policy** (default-deny egress plus a curated allowlist), and tokens are injected through sbx's secret proxy — **credential values never enter the VM**; the host proxy substitutes them only on egress to their declared domains.
 
@@ -166,7 +166,9 @@ dispatched workflow.
 ## Setup
 
 1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then `sbx login` and `sbx policy init balanced`.
+
 2. Create a fine-grained GitHub PAT:
+
    - `COPILOT_GITHUB_TOKEN` — personal account, **Copilot Requests** permission. Used *only* by the agent sandbox.
 
    Export it, or put it in a `.env` file (loaded automatically from the working directory; real environment variables always win):
@@ -174,6 +176,7 @@ dispatched workflow.
    ```bash
    cp .env.example .env   # then fill in the token(s)
    ```
+
 3. **Optional — the GitHub integration.** sbxloop has no GitHub capability until you configure the one repository it may work with:
 
    ```toml
@@ -185,6 +188,7 @@ dispatched workflow.
    ```
 
    With `repo` set, runs provision the github-ops sandbox and require a second PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with (e.g. issues: write, contents: read) — used *only* by that sandbox. Without it, no github sandbox exists, `GH_TOKEN` is not needed, and repo-facing features refuse to run.
+
 4. `sbxloop doctor` verifies all of it and prints remediation for anything missing. It also runs the **sbx conformance suite**: every empirically-learned assumption about sbx semantics (secret visibility under `exec`, `cp` directory semantics, workspace-mount discovery, ...) is a named probe whose verdict is cached per `sbx` version — `sbxloop doctor --deep` runs the full suite in a scratch sandbox, and doctor warns loudly when an sbx upgrade flips a verdict that sbxloop's behavior depends on.
 
 ### Secret registration hygiene
