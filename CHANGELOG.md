@@ -119,6 +119,30 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Delivery now batches blob creation into O(1) worker jobs (#66).**
+  `deliver_workspace` used to submit one `github.op` job per file — a full
+  job cycle (`sbx cp` job JSON in, fresh worker process, `sbx cp` result
+  out) per blob POST, so a 200-file workspace meant 200+ sequential job
+  round trips and tens of minutes of delivery. A new `blobs.create_many`
+  worker op receives the whole file manifest (base64-embedded in the job
+  JSON) and performs the per-file blob POSTs inside the github sandbox,
+  chunked only by a payload-size cap (4 MiB of base64 per job), with the
+  job timeout scaled to the manifest size. The worker streams
+  `gh.op_progress` events every 10 blobs so long deliveries stay visibly
+  alive in the TUI, and a per-file failure names the failing file (and its
+  position in the manifest) in the `run.deliver` error event. The e2e
+  workflow gains a gated 50-file delivery smoke asserting the PR opens
+  under a 120 s budget (`E2E_DELIVER_REPO` repository variable).
+- The poll transport's event tailing is now binary-safe and its completion
+  check parses events instead of substring-matching
+  ([#65](https://github.com/brettbergin/sbxloop/issues/65)). Chunks are
+  fetched base64-encoded and the byte offset advances by decoded byte count,
+  so `\r\n` in worker output can no longer drift the offset (duplicating or
+  dropping event lines), and a `tail -c` boundary that splits a multibyte
+  UTF-8 character is held by an incremental decoder instead of crashing the
+  host-side decode. Polling now ends only on a *parsed* `worker.end` event —
+  an agent message whose payload merely contains the literal string
+  `"worker.end"` no longer terminates the poll early.
 - `resume` now runs under the config the run was started with (#60). The
   full config has always been persisted in the runs table, but resume drove
   with whatever `load_config()` produced at resume time — so editing

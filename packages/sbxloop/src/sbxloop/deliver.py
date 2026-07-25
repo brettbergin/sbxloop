@@ -14,10 +14,14 @@ real-sbx e2e workflow exercises it. Known e2e-validation items:
 
 - TODO(e2e): branch-name collisions (re-delivering the same run id — the
   refs POST will 422; decide between force-update and suffixing)
-- TODO(e2e): large workspaces (one blob POST per file; may need chunking
-  or a tarball-artifact fallback beyond a few hundred files)
 - TODO(e2e): executable permission bits (every file is committed 100644)
 - TODO(e2e): empty repositories (no base ref to branch from)
+
+Blob creation is batched (#66): the whole file manifest ships to the github
+sandbox as ``blobs.create_many`` jobs — chunked only by payload size, so a
+delivery issues O(total bytes / chunk cap) worker jobs, not one per file.
+The worker performs the per-file blob POSTs in-sandbox and streams
+``gh.op_progress`` events so long deliveries stay visible in the TUI.
 """
 
 from __future__ import annotations
@@ -33,6 +37,11 @@ from sbxloop.gh.ops import GithubOps, PrRef
 FILE_MODE = "100644"
 BODY_FILE_LIST_CAP = 50
 TITLE_CLIP = 72
+# Cap on base64 payload bytes per blobs.create_many job. The manifest rides
+# inside the job JSON (staged into the sandbox with one `sbx cp`), so this
+# bounds the staged file size; a single oversized file still gets its own
+# chunk rather than failing.
+BLOB_BATCH_MAX_B64_BYTES = 4 * 1024 * 1024
 
 
 def branch_name(run_id: str) -> str:
@@ -59,12 +68,13 @@ def deliver_workspace(
     base_sha = _base_commit_sha(ops, repo, base)
     base_tree = _commit_tree_sha(ops, repo, base_sha)
 
+    shas = _create_blobs(ops, repo, source_dir, files)
     entries = [
         {
             "path": file.relative_to(source_dir).as_posix(),
             "mode": FILE_MODE,
             "type": "blob",
-            "sha": _create_blob(ops, repo, file),
+            "sha": shas[file.relative_to(source_dir).as_posix()],
         }
         for file in files
     ]
@@ -113,12 +123,33 @@ def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:
         raise DeliveryError(f"cannot read base commit {commit_sha} of {repo}") from exc
 
 
-def _create_blob(ops: GithubOps, repo: str, file: Path) -> str:
-    content = base64.b64encode(file.read_bytes()).decode("ascii")
-    return _sha(
-        ops.raw("POST", f"/repos/{repo}/git/blobs", {"content": content, "encoding": "base64"}),
-        f"blob for {file.name}",
-    )
+def _create_blobs(ops: GithubOps, repo: str, source_dir: Path, files: list[Path]) -> dict[str, str]:
+    """Create all blobs via batched worker jobs; returns relative path -> sha."""
+    shas: dict[str, str] = {}
+    for chunk in _manifest_chunks(source_dir, files):
+        shas.update(ops.blobs_create_many(repo, chunk))
+    missing = [f.relative_to(source_dir).as_posix() for f in files]
+    missing = [path for path in missing if path not in shas]
+    if missing:
+        raise DeliveryError(f"GitHub returned no blob sha for: {', '.join(missing[:5])}")
+    return shas
+
+
+def _manifest_chunks(source_dir: Path, files: list[Path]) -> list[list[dict[str, str]]]:
+    """Split the file manifest into payload-size-capped job chunks."""
+    chunks: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    current_bytes = 0
+    for file in files:
+        content = base64.b64encode(file.read_bytes()).decode("ascii")
+        if current and current_bytes + len(content) > BLOB_BATCH_MAX_B64_BYTES:
+            chunks.append(current)
+            current, current_bytes = [], 0
+        current.append({"path": file.relative_to(source_dir).as_posix(), "content_b64": content})
+        current_bytes += len(content)
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _sha(response: Any, what: str) -> str:
