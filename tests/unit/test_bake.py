@@ -1,0 +1,162 @@
+"""`sbxloop bake` tests: scratch sandbox, install ladder, template save.
+
+The install ladder execs are scripted (the real-pip path is covered in
+test_worker_client); the template save/seed round trip runs against the
+fake sbx's real template snapshot model.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+import sbxloop
+from sbxloop.config import Config
+from sbxloop.errors import BakeError
+from sbxloop.sbx.bake import (
+    DEFAULT_TEMPLATE_REF,
+    bake_record_path,
+    bake_template,
+    load_bake_record,
+)
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxSpec
+from tests.conftest import FakeSbx
+
+BOX = "bakebox"
+VENV_PY = "/home/agent/.sbxloop/venv/bin/python"
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> Config:
+    return Config(state_dir=tmp_path / "state")
+
+
+@pytest.fixture
+def cli(fake_sbx: FakeSbx) -> SbxCLI:
+    return SbxCLI(binary=str(fake_sbx.binary))
+
+
+def script_install(fake_sbx: FakeSbx, *, runtime_rc: int = 0) -> None:
+    fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=0)
+    fake_sbx.script(f"exec {BOX} python3 -m venv", returncode=0)
+    fake_sbx.script(f"exec {BOX} /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+    fake_sbx.script(f"exec {BOX} {VENV_PY} -c", stdout=f"{sbxloop.__version__}\n")
+    fake_sbx.script(f"exec {BOX} {VENV_PY} -m sbxloop_worker", returncode=64)
+    fake_sbx.script(f"exec {BOX} {VENV_PY} -m copilot", returncode=runtime_rc)
+
+
+class TestBakeHappyPath:
+    def test_bake_saves_template_and_records(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        script_install(fake_sbx)
+        record = bake_template(cli, config, name=BOX)
+
+        assert record.ref == DEFAULT_TEMPLATE_REF
+        assert record.worker_version == sbxloop.__version__
+        assert record.python == VENV_PY
+        assert record.runtime_cached
+
+        # template saved AFTER the manifest was written into the VM
+        assert ["template", "save", BOX, DEFAULT_TEMPLATE_REF] in fake_sbx.invocations("template")
+        saved = fake_sbx.state / "templates" / "sbxloop-baked_latest" / "fs"
+        manifest = json.loads((saved / "home/agent/.sbxloop/bake.json").read_text())
+        assert manifest["worker_version"] == sbxloop.__version__
+        assert manifest["python"] == VENV_PY
+        assert manifest["runtime_cached"] is True
+
+        # scratch sandbox removed; host record persisted for doctor
+        assert not (fake_sbx.state / "sandboxes" / BOX).exists()
+        assert bake_record_path(config).is_file()
+        loaded = load_bake_record(config)
+        assert loaded is not None and loaded.ref == record.ref
+
+        # copilot runtime pre-cache ran under the installed interpreter
+        assert [c for c in fake_sbx.invocations("exec") if "copilot" in c]
+
+    def test_bake_applies_agent_network_allows_and_no_secrets(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        script_install(fake_sbx)
+        bake_template(cli, config, name=BOX)
+        allows = [p for p in fake_sbx.policies() if p[:2] == ["allow", "network"]]
+        assert any("api.githubcopilot.com" in p for p in allows)
+        # templates carry software, never secrets
+        assert fake_sbx.secrets() == []
+
+    def test_baked_template_seeds_new_sandboxes(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Round trip through the fake's template model: a sandbox created
+        from the baked ref starts with the bake manifest in its fs."""
+        script_install(fake_sbx)
+        record = bake_template(cli, config, name=BOX)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        cli.create(
+            SandboxSpec(name="fromtpl", role="agent", workspace=workspace, template=record.ref)
+        )
+        fs = fake_sbx.sandbox_fs("fromtpl")
+        assert (fs / "home/agent/.sbxloop/bake.json").is_file()
+        # the mount model still points at the NEW sandbox's workspace
+        assert (fs / "workspace").resolve() == workspace.resolve()
+
+
+class TestBakeOptions:
+    def test_runtime_cache_failure_is_nonfatal(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        script_install(fake_sbx, runtime_rc=1)
+        record = bake_template(cli, config, name=BOX)
+        assert not record.runtime_cached
+        saved = fake_sbx.state / "templates" / "sbxloop-baked_latest" / "fs"
+        manifest = json.loads((saved / "home/agent/.sbxloop/bake.json").read_text())
+        assert manifest["runtime_cached"] is False
+
+    def test_no_runtime_cache_skips_download(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        script_install(fake_sbx)
+        bake_template(cli, config, name=BOX, cache_runtime=False)
+        assert not [c for c in fake_sbx.invocations("exec") if "copilot" in c]
+
+    def test_custom_ref_and_base_template(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        script_install(fake_sbx)
+        record = bake_template(cli, config, name=BOX, ref="me/mine:v2", base_template="base:v1")
+        assert record.ref == "me/mine:v2"
+        creates = fake_sbx.invocations("create")
+        assert any("base:v1" in arg for c in creates for arg in c)
+        assert ["template", "save", BOX, "me/mine:v2"] in fake_sbx.invocations("template")
+
+    def test_keep_retains_scratch_sandbox(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        script_install(fake_sbx)
+        bake_template(cli, config, name=BOX, keep=True)
+        assert (fake_sbx.state / "sandboxes" / BOX).exists()
+
+
+class TestBakeFailure:
+    def test_install_failure_cleans_up_and_raises(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        # ladder fully fails: venv, apt heal, and user-site pip all refuse
+        fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=1, stderr="no apt")
+        fake_sbx.script(f"exec {BOX} python3 -m venv", returncode=1, stderr="no venv")
+        fake_sbx.script(f"exec {BOX} python3 -m pip install", returncode=1, stderr="pip broken")
+        with pytest.raises(BakeError, match="bake failed"):
+            bake_template(cli, config, name=BOX)
+        assert not (fake_sbx.state / "sandboxes" / BOX).exists()
+        assert not bake_record_path(config).is_file()
+        assert fake_sbx.invocations("template") == []
+
+    def test_load_bake_record_tolerates_garbage(self, config: Config) -> None:
+        path = bake_record_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json")
+        assert load_bake_record(config) is None

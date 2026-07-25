@@ -128,6 +128,38 @@ def remote_to_host(fs: Path, path: str) -> Path:
     return Path(str(fs) + (path if path.startswith("/") else f"/{path}"))
 
 
+def template_dir(root: Path, ref: str) -> Path:
+    return root / "templates" / re.sub(r"[^A-Za-z0-9._-]", "_", ref)
+
+
+def cmd_template(root: Path, args: list[str]) -> int:
+    """Model `sbx template save/ls`: save snapshots a sandbox's fs so a
+    later `create --template <ref>` starts from that filesystem."""
+    if args[:1] == ["save"]:
+        if len(args) != 3:
+            print("usage: sbx template save SANDBOX REF", file=sys.stderr)
+            return 2
+        _, name, ref = args
+        path = require_sandbox(root, name)
+        target = template_dir(root, ref)
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(path / "fs", target / "fs", symlinks=True)
+        (target / "ref").write_text(ref)
+        return 0
+    if args[:1] == ["ls"]:
+        print("REPOSITORY  TAG")
+        templates = root / "templates"
+        if templates.is_dir():
+            for path in sorted(templates.iterdir()):
+                ref = (path / "ref").read_text()
+                repo, _, tag = ref.partition(":")
+                print(f"{repo}  {tag or 'latest'}")
+        return 0
+    print(f"fake sbx: unknown template subcommand {args!r}", file=sys.stderr)
+    return 2
+
+
 def cmd_create(root: Path, args: list[str]) -> int:
     name = None
     template = None
@@ -157,6 +189,10 @@ def cmd_create(root: Path, args: list[str]) -> int:
         print(f'Error: sandbox "{name}" already exists', file=sys.stderr)
         return 1
     fs = path / "fs"
+    saved = template_dir(root, template) if template else None
+    if saved is not None and (saved / "fs").is_dir():
+        # Seed the new sandbox from the saved template snapshot.
+        shutil.copytree(saved / "fs", fs, symlinks=True)
     (fs / "home/agent").mkdir(parents=True, exist_ok=True)
     (fs / "etc").mkdir(parents=True, exist_ok=True)
     # Model the sbx workspace mount: /workspace inside the sandbox is the
@@ -164,6 +200,9 @@ def cmd_create(root: Path, args: list[str]) -> int:
     # like a real mount). SBX_FAKE_NO_MOUNT disables it so tests can force
     # discovery failure / harvest mode.
     if not os.environ.get("SBX_FAKE_NO_MOUNT") and Path(workspace).is_dir():
+        # A template snapshot may carry the bake sandbox's stale mount link.
+        if (fs / "workspace").is_symlink():
+            (fs / "workspace").unlink()
         (fs / "workspace").symlink_to(workspace)
     meta = {"agent": agent, "workspace": workspace, "template": template, "status": "running"}
     (path / "meta.json").write_text(json.dumps(meta))
@@ -404,6 +443,8 @@ def main() -> int:
         return cmd_rm(root, rest)
     if command == "policy":
         return cmd_policy(root, rest)
+    if command == "template":
+        return cmd_template(root, rest)
     if command == "secret":
         return cmd_secret(root, rest, stdin)
     if command == "version":

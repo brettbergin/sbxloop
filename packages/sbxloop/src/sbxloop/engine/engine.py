@@ -157,11 +157,21 @@ class LoopEngine:
                         else None
                     )
                     if self.install_workers:
+                        # A configured template is expected to be prebaked
+                        # (`sbxloop bake`): install() probes it and skips the
+                        # ladder on success, falling back when stale.
+                        prebaked_expected = bool(self.config.sandbox.template)
                         # ensure_dev_tools: the agent builds projects in this VM
                         # (venvs, pip) — the github sandbox only runs API ops.
-                        agent.install(extras="copilot", ensure_dev_tools=True)
+                        agent.install(
+                            extras="copilot",
+                            ensure_dev_tools=True,
+                            expect_prebaked=prebaked_expected,
+                        )
                         if github is not None:
-                            github.install(extras="")
+                            github.install(extras="", expect_prebaked=prebaked_expected)
+                        if prebaked_expected:
+                            self._emit_prebaked(run_id, pair, agent, github)
                     reporter, detach = self._attach_reporter(github, run_id, outcome)
                     try:
                         phases = PhaseRunner(
@@ -205,6 +215,34 @@ class LoopEngine:
             mounted=pair.mounted,
             kept_sandboxes=self._pair_names(pair) if pair.keep else [],
         )
+
+    def _emit_prebaked(
+        self,
+        run_id: str,
+        pair: SandboxPair,
+        agent: WorkerClient,
+        github: WorkerClient | None,
+    ) -> None:
+        """One event per sandbox saying whether the configured template's
+        baked worker was used, or was stale and the install ladder ran."""
+        clients = [(pair.agent.name, agent)]
+        if github is not None and pair.github is not None:
+            clients.append((pair.github.name, github))
+        for name, client in clients:
+            message = (
+                "prebaked worker verified; install skipped"
+                if client.prebaked
+                else "template not prebaked or stale; ran the install ladder "
+                "(re-run `sbxloop bake` to refresh)"
+            )
+            self.bus.emit(
+                HostEventTypes.SANDBOX_PREBAKED,
+                run_id,
+                name=name,
+                template=self.config.sandbox.template,
+                prebaked=client.prebaked,
+                message=message,
+            )
 
     @staticmethod
     def _pair_names(pair: SandboxPair) -> list[str]:

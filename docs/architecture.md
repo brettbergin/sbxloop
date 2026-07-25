@@ -42,13 +42,13 @@ The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`); without it, `pair.github` is `None`, `GH_TOKEN`
 is not required, and the run has no GitHub capability at all:
 
-| | agent sandbox | github sandbox |
-|---|---|---|
-| name | `sbxloop-<run>-agent` | `sbxloop-<run>-github` |
-| credential | `COPILOT_GITHUB_TOKEN` only | `GH_TOKEN` only |
-| injection | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` secret service |
-| network | balanced policy + copilot hosts + plan-declared grants | balanced policy + github hosts |
-| runs | Copilot SDK agent sessions, shell checks | `github.op` jobs (gh CLI or REST) |
+|            | agent sandbox                                                                                                                                                           | github sandbox                    |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| name       | `sbxloop-<run>-agent`                                                                                                                                                   | `sbxloop-<run>-github`            |
+| credential | `COPILOT_GITHUB_TOKEN` only                                                                                                                                             | `GH_TOKEN` only                   |
+| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` secret service  |
+| network    | balanced policy + copilot hosts + plan-declared grants                                                                                                                  | balanced policy + github hosts    |
+| runs       | Copilot SDK agent sessions, shell checks                                                                                                                                | `github.op` jobs (gh CLI or REST) |
 
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
@@ -74,11 +74,9 @@ Beyond the static baseline, egress is **plan-declared and grant-late**: the
 PLAN phase may declare extra domains a task needs during EXECUTE (each with a
 justification), validated against operator bounds (`[policy] allow` /
 `[policy] deny` in sbxloop.toml — out-of-bounds requests fail plan
-validation) and applied via `sbx policy allow network <domain> --sandbox
-<agent>` only at EXECUTE entry. Every grant and refusal is emitted as a
+validation) and applied via `sbx policy allow network <domain> --sandbox <agent>` only at EXECUTE entry. Every grant and refusal is emitted as a
 `policy.allow` / `policy.deny` run event, so the persisted event log doubles
-as an egress audit trail (`sbxloop logs RUN --type policy.`); `sbxloop
-config policy` renders the effective per-phase policy. sbx 0.35 has no
+as an egress audit trail (`sbxloop logs RUN --type policy.`); `sbxloop config policy` renders the effective per-phase policy. sbx 0.35 has no
 revocation primitive, so grants persist for the sandbox's lifetime
 (SCRUTINIZE/VERIFY inherit them) but never outlive a run — sandboxes are
 removed at run end and `resume` provisions fresh ones.

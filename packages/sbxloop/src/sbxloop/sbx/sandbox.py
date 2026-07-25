@@ -23,6 +23,9 @@ EVENTS_DIR = f"{SBXLOOP_DIR}/events"
 ENV_FILE = f"{SBXLOOP_DIR}/env.sh"
 VENV_DIR = f"{SBXLOOP_DIR}/venv"
 VENV_PYTHON = f"{VENV_DIR}/bin/python"
+# Written by `sbxloop bake` into the template; provisioning reads it to
+# decide whether the worker install ladder can be skipped.
+BAKE_MANIFEST = f"{SBXLOOP_DIR}/bake.json"
 
 
 class Sandbox:

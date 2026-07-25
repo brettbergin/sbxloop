@@ -53,6 +53,10 @@ class ProvisionError(SdxloopError):
     """Sandbox pair provisioning failed."""
 
 
+class BakeError(SdxloopError):
+    """Building or saving a prebaked sandbox template failed."""
+
+
 class WorkerError(SdxloopError):
     """The in-sandbox worker failed or returned an invalid result."""
 

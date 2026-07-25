@@ -189,6 +189,15 @@ class SbxCLI:
     def version(self) -> str | None:
         return parse_version(self.run("version", check=False).stdout)
 
+    # -- templates ---------------------------------------------------------
+
+    def template_save(self, name: str, ref: str, *, timeout: float = 600.0) -> None:
+        """Persist a sandbox's current state as a reusable template image."""
+        self.run("template", "save", name, ref, timeout=timeout)
+
+    def template_ls(self) -> str:
+        return self.run("template", "ls").stdout
+
     # -- network policy ----------------------------------------------------
 
     def policy_allow(self, domain: str, *, sandbox: str | None = None) -> None:
