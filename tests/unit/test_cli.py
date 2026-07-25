@@ -402,6 +402,51 @@ class TestDoctor:
         assert result.exit_code == 0, result.output
         assert "sandbox template" not in result.output
 
+    def _sdk_kind_check(self, fake_sbx: FakeSbx):
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        checks = collect_checks(
+            {"COPILOT_GITHUB_TOKEN": "tok"}, cli=SbxCLI(binary=str(fake_sbx.binary))
+        )
+        return {c.name: c for c in checks}["copilot sdk permission kinds"]
+
+    def test_doctor_sdk_kinds_soft_ok_when_sdk_absent(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.cli import doctor
+
+        monkeypatch.setattr(doctor, "installed_sdk_permission_kinds", lambda: None)
+        check = self._sdk_kind_check(fake_sbx)
+        assert check.ok and not check.hard
+        assert "not installed" in check.detail
+        assert "fails closed" in check.detail
+
+    def test_doctor_sdk_kinds_match_verified_vocabulary(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.cli import doctor
+
+        monkeypatch.setattr(
+            doctor, "installed_sdk_permission_kinds", lambda: doctor.SDK_PERMISSION_KINDS
+        )
+        check = self._sdk_kind_check(fake_sbx)
+        assert check.ok
+        assert "matches the verified vocabulary" in check.detail
+
+    def test_doctor_sdk_kind_drift_warns_naming_the_kinds(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.cli import doctor
+
+        drifted = (doctor.SDK_PERMISSION_KINDS - {"read"}) | {"novel-kind"}
+        monkeypatch.setattr(doctor, "installed_sdk_permission_kinds", lambda: drifted)
+        check = self._sdk_kind_check(fake_sbx)
+        # drift is a loud warning, never a FAIL: the barrier fails closed
+        assert not check.ok and not check.hard
+        assert "novel-kind" in check.detail
+        assert "read" in check.detail
+
     def test_doctor_without_sbx(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PATH", str(workdir))  # nothing on PATH
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
