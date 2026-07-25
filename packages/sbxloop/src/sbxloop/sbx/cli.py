@@ -209,6 +209,12 @@ class SbxCLI:
             value,
         )
 
+    def secret_ls(self) -> ExecResult:
+        """``sbx secret ls``, never raising on failure: whether (and how) a
+        given sbx build enumerates secrets is unverified, so callers treat a
+        non-ok result as "listing unsupported" and fall back to probing."""
+        return self.run("secret", "ls", check=False)
+
     def secret_rm(
         self,
         *,

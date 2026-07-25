@@ -127,6 +127,24 @@ dispatched workflow.
    With `repo` set, runs provision the github-ops sandbox and require a second PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with (e.g. issues: write, contents: read) — used *only* by that sandbox. Without it, no github sandbox exists, `GH_TOKEN` is not needed, and repo-facing features refuse to run.
 4. `sbxloop doctor` verifies all of it and prints remediation for anything missing.
 
+### Secret registration hygiene
+
+sbx keys custom secrets by env var name (one registration per var, whatever the
+scope), so leftover registrations from old runs or old versions surface as
+`already exists in scope …` collisions. Provisioning recovers automatically,
+and `sbxloop secrets` manages the same state proactively:
+
+```bash
+sbxloop secrets list             # registrations + pre-collision warnings
+sbxloop secrets clean            # dry-run removal of stale entries (--apply to execute)
+sbxloop secrets rotate           # replace the COPILOT_GITHUB_TOKEN registration
+                                 # (token from env/.env or --prompt, never argv)
+```
+
+`rotate` also reports which secret strategy (proxy vs plain-env fallback) the
+next run will use. None of these commands touch the built-in `github` service
+secret or registrations owned by other tools.
+
 Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLOOP_*` env vars (`sbxloop init` writes a commented starter file; `sbxloop config show` shows the resolved values and their sources).
 
 ## Documentation

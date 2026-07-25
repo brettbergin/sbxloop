@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -25,6 +26,16 @@ from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.secretstate import (
+    COPILOT_TOKEN_ENV,
+    SANDBOX_SCOPE_PREFIX,
+    assess,
+    inspect_custom_secret,
+    removal_ladder,
+    replace_registration,
+    tracked_custom_secrets,
+    verify_secret_visibility,
+)
 
 app = typer.Typer(
     name="sbxloop",
@@ -34,8 +45,12 @@ app = typer.Typer(
 )
 sandbox_app = typer.Typer(help="Manage sbxloop sandboxes.", no_args_is_help=True)
 config_app = typer.Typer(help="Inspect configuration.", no_args_is_help=True)
+secrets_app = typer.Typer(
+    help="Manage the sbx custom-secret registrations sbxloop owns.", no_args_is_help=True
+)
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(config_app, name="config")
+app.add_typer(secrets_app, name="secrets")
 
 console = Console()
 
@@ -412,6 +427,210 @@ def sandbox_rm(
             console.print(f"removed {target}")
         except SdxloopError as exc:
             console.print(f"[yellow]skip {target}:[/] {exc}")
+
+
+_STATUS_STYLES = {"ok": "[green]ok[/]", "warn": "[yellow]warn[/]", "unknown": "[dim]?[/]"}
+
+
+def _secrets_context() -> tuple[Config, SbxCLI, set[str]]:
+    """Config, an sbx handle, and the live sbxloop sandbox names (for
+    telling in-use registration scopes from stale ones)."""
+    config = load_config()
+    cli = SbxCLI(app_name=config.app_name or None)
+    live = {i.name for i in cli.ls() if i.name.startswith(SANDBOX_SCOPE_PREFIX)}
+    return config, cli, live
+
+
+@secrets_app.command("list")
+def secrets_list(
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe/--no-probe",
+            help="When `sbx secret ls` cannot answer, detect registrations by "
+            "transiently registering (and immediately removing) a sentinel — "
+            "the collision error names the real owner.",
+        ),
+    ] = True,
+) -> None:
+    """Show sbxloop's custom-secret registrations across scopes.
+
+    Flags registrations that no longer match what provisioning would
+    register (stale scopes, wrong host bindings) — the pre-collision
+    warnings. The built-in `github` service secret is sbx-managed and never
+    touched by these commands.
+    """
+    try:
+        config, cli, live = _secrets_context()
+        table = Table(title="sbxloop custom-secret registrations")
+        for column in ("env", "expected", "actual", "status", "note"):
+            table.add_column(column)
+        warned = False
+        for env, host in tracked_custom_secrets(config):
+            state = inspect_custom_secret(cli, env, host=host, probe=probe)
+            judgement = assess(state, canonical_host=host, live_sandboxes=live)
+            warned = warned or judgement.status == "warn"
+            if state.exists:
+                actual = f"scope {state.scope or '(unknown)'}"
+                if state.hosts:
+                    actual += f" @ {', '.join(state.hosts)}"
+            elif state.exists is None:
+                actual = "(undetermined)"
+            else:
+                actual = "not registered"
+            table.add_row(
+                env,
+                f"custom @ {host} (per-run scope)",
+                actual,
+                _STATUS_STYLES[judgement.status],
+                judgement.note,
+            )
+        console.print(table)
+        console.print(
+            "[dim]GH_TOKEN uses sbx's built-in `github` service secret; "
+            "it is never managed here.[/]"
+        )
+        if warned:
+            console.print(
+                "\n[yellow]warnings above are pre-collision state[/] — "
+                "`sbxloop secrets clean` removes the stale entries"
+            )
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+
+@secrets_app.command("clean")
+def secrets_clean(
+    apply: Annotated[
+        bool, typer.Option("--apply", help="Actually remove (default is a dry run).")
+    ] = False,
+    all_: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Also remove healthy sbxloop-owned registrations (global with the "
+            "canonical binding, live-sandbox scopes), not just stale ones.",
+        ),
+    ] = False,
+) -> None:
+    """Remove stale sbxloop-owned custom-secret registrations (dry-run by default).
+
+    Only touches registrations sbxloop itself created (sbxloop-* sandbox
+    scopes and global entries for its tracked env vars) — never foreign
+    scopes and never the built-in `github` service secret.
+    """
+    try:
+        config, cli, live = _secrets_context()
+        failed = False
+        removed_any = False
+        for env, host in tracked_custom_secrets(config):
+            state = inspect_custom_secret(cli, env, host=host)
+            judgement = assess(state, canonical_host=host, live_sandboxes=live)
+            if not (judgement.stale or (all_ and judgement.owned)):
+                console.print(f"{env}: nothing to clean ({judgement.note})")
+                continue
+            where = f"scope {state.scope or '(unknown)'}"
+            if not apply:
+                console.print(f"{env}: would remove the registration in {where} — {judgement.note}")
+                removed_any = True
+                continue
+            if any(rm() for rm in removal_ladder(cli, state, host=host)):
+                console.print(f"[green]{env}: removed the registration in {where}[/]")
+                removed_any = True
+            else:
+                console.print(f"[bold red]{env}: sbx rejected every removal for {where}[/]")
+                failed = True
+        if not apply and removed_any:
+            console.print("\ndry run — re-run with [cyan]--apply[/] to remove")
+        if failed:
+            raise typer.Exit(1)
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+
+@secrets_app.command("rotate")
+def secrets_rotate(
+    prompt: Annotated[
+        bool,
+        typer.Option(
+            "--prompt",
+            help="Read the new token from a hidden interactive prompt instead of "
+            f"the {COPILOT_TOKEN_ENV} environment variable / ./.env.",
+        ),
+    ] = False,
+    verify: Annotated[
+        bool,
+        typer.Option(
+            "--verify/--no-verify",
+            help="Boot a throwaway sandbox to report which secret strategy "
+            "(proxy vs plain-env fallback) the next run will use.",
+        ),
+    ] = True,
+) -> None:
+    """Rotate the Copilot token's sbx registration in one step.
+
+    Replaces the existing registration (wherever its scope) with a global
+    one carrying the canonical host binding — the rm + set-custom dance
+    provisioning would otherwise perform mid-run. The token is read from
+    the environment/.env or an interactive prompt, never from argv.
+    """
+    if prompt:
+        token = typer.prompt(f"new {COPILOT_TOKEN_ENV}", hide_input=True)
+    else:
+        token = os.environ.get(COPILOT_TOKEN_ENV, "")
+        if not token:
+            console.print(
+                f"[bold red]{COPILOT_TOKEN_ENV} is not set.[/] Export the new token "
+                "(or put it in ./.env), or pass [cyan]--prompt[/] to type it — "
+                "it is never accepted as a command-line argument."
+            )
+            raise typer.Exit(2)
+    try:
+        config, cli, live = _secrets_context()
+        for env, host in tracked_custom_secrets(config):
+            replace_registration(cli, env=env, host=host, token=token)
+            console.print(f"[green]rotated:[/] {env} registered @ {host} (global scope)")
+        if live:
+            console.print(
+                f"[yellow]live sbxloop sandboxes exist ({', '.join(sorted(live))})[/] — "
+                "they may still hold the old token in their in-VM env file; "
+                "remove them with `sbxloop sandbox rm --all`"
+            )
+        if prompt:
+            console.print(
+                f"[yellow]runs read {COPILOT_TOKEN_ENV} from the environment at "
+                "provision time[/] — update your export / ./.env with the new value too"
+            )
+        if config.secret_strategy == "plain-env":
+            console.print(
+                "next run: [bold]plain-env[/] strategy (configured) — the token is "
+                "written to the in-VM env file from your environment"
+            )
+        elif verify:
+            workspace = config.state_dir / "secretcheck"
+            workspace.mkdir(parents=True, exist_ok=True)
+            visible = verify_secret_visibility(
+                cli,
+                env=COPILOT_TOKEN_ENV,
+                workspace=workspace,
+                template=config.sandbox.template,
+            )
+            if visible is True:
+                console.print(
+                    "next run: [bold green]proxy[/] strategy — the token stays out of the VM"
+                )
+            elif visible is False:
+                console.print(
+                    "next run: [bold yellow]plain-env fallback[/] — sbx's proxy secret is "
+                    "invisible to exec sessions, so provisioning will write the in-VM env file"
+                )
+            else:
+                console.print("[yellow]could not verify secret visibility[/] (see logs)")
+    except SdxloopError as exc:
+        console.print(f"[bold red]rotate failed:[/] {exc}")
+        raise typer.Exit(2) from exc
 
 
 @config_app.command("show")
