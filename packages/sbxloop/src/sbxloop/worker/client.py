@@ -90,6 +90,11 @@ class WorkerClient:
         # through to the worker's heartbeat sampler.
         self.role = role
         self.limits = limits
+        # job_id -> agent persona (planner, executor, ...) supplied at
+        # submit(); stamped onto that job's agent.* events so the transcript
+        # can say who is speaking (the worker doesn't know which phase it
+        # serves).
+        self._job_agents: dict[str, str] = {}
 
     # -- install -----------------------------------------------------------
 
@@ -334,7 +339,15 @@ class WorkerClient:
 
     # -- submit ------------------------------------------------------------
 
-    def submit(self, job: JobRequest) -> JobResult:
+    def submit(self, job: JobRequest, *, agent: str | None = None) -> JobResult:
+        if agent is not None:
+            self._job_agents[job.job_id] = agent
+        try:
+            return self._submit(job)
+        finally:
+            self._job_agents.pop(job.job_id, None)
+
+    def _submit(self, job: JobRequest) -> JobResult:
         job_path = f"{JOBS_DIR}/{job.job_id}.json"
         events_path = f"{EVENTS_DIR}/{job.job_id}.jsonl"
         result_path = f"{RESULTS_DIR}/{job.job_id}.json"
@@ -447,6 +460,9 @@ class WorkerClient:
             EventTypes.SANDBOX_RESOURCES_WARNING,
         ):
             event.data.setdefault("role", self.role)
+        agent = self._job_agents.get(job.job_id)
+        if agent is not None and event.type.startswith("agent."):
+            event.data.setdefault("agent", agent)
         self.bus.publish(event)
         return event
 

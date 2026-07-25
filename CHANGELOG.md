@@ -8,6 +8,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Added
 
+- **Transcript panels name the responding agent.** Agent feedback bubbles
+  used to be titled a generic `agent <time>`, so you couldn't tell which
+  Copilot session was speaking. Each phase now stamps its persona
+  (`decomposer`, `planner`, `executor`, `scrutinizer`, `validator`) onto its
+  job's `agent.*` events host-side (the in-sandbox worker doesn't know which
+  phase it serves), the TUI header shows it, and `sbxloop logs` lines carry
+  it as `[<name>]`. Events without a name (older runs) keep the `agent`
+  title.
+
 - **`sbxloop list-models`** — lists the models the GitHub Copilot SDK gives
   the authenticated subscription access to, straight from the SDK's
   `list_models()` API on the host (no sandbox): model id, display name,

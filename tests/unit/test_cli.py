@@ -1056,6 +1056,29 @@ class TestDashboard:
         # of payload are present in the output across multiple lines
         assert text.count("x") >= 200
 
+    def test_agent_message_header_names_the_persona(self) -> None:
+        """Attributed messages title the chat bubble with the phase persona
+        (planner, executor, ...); unattributed ones keep the generic
+        "agent" title (covered above)."""
+        from rich.console import Console
+
+        from sbxloop.cli.tui import render_event
+
+        rendered = render_event(
+            Event.now("agent.message", "r1", content="looks good", agent="scrutinizer")
+        )
+        assert rendered is not None
+        console = Console(record=True, width=80)
+        console.print(rendered)
+        assert "scrutinizer" in console.export_text()
+
+    def test_format_event_includes_agent_name(self) -> None:
+        from sbxloop.cli.tui import format_event
+
+        line = format_event(Event.now("agent.message", "r1", agent="planner", content="hi"))
+        assert "[planner]" in line
+        assert "hi" in line
+
     def test_deltas_and_heartbeats_stay_out_of_transcript(self) -> None:
         from sbxloop.cli.tui import render_event
 
