@@ -2,10 +2,20 @@
 
 Status: **feasibility report — no implementation commitment yet.**
 Desk research done 2026-07-24 against the `docker/docs` source tree and
-`docker/sbx-releases` (sbx 0.37.0). Field verification: run
+`docker/sbx-releases` (sbx 0.37.0). Field round 1 done 2026-07-25 on sbx
+v0.35.0 (results:
+[issue #96](https://github.com/brettbergin/sbxloop/issues/96); analysis in
+the round-1 section below). Round 2: dispatch the **sbx probe** workflow
+([`.github/workflows/sbx-probe.yml`](../../.github/workflows/sbx-probe.yml)),
+which runs
 [`scripts/spike-46-agent-session-probe.sh`](../../scripts/spike-46-agent-session-probe.sh)
-on an sbx-capable machine and paste the report into
+against real sbx on the Actions runner and publishes the report (run
+summary + artifact); attach it to
 [issue #46](https://github.com/brettbergin/sbxloop/issues/46).
+
+**Standing rule (2026-07-25):** sbx field verification happens on the CI
+harness — runner hardware we control. Probe scripts are never to be run on
+customer or user devices.
 
 ## Why
 
@@ -152,7 +162,7 @@ stay cattle).
 ## Field-verification protocol
 
 `scripts/spike-46-agent-session-probe.sh` — dummy-secret-only, timeboxed,
-self-cleaning; runnable on the sbx machine or the e2e workflow environment.
+self-cleaning; runs in CI via the sbx probe workflow.
 
 | Probe | Verifies                                                                        | Gates             |
 | ----- | ------------------------------------------------------------------------------- | ----------------- |
@@ -168,6 +178,61 @@ end-to-end SDK-through-proxy (register the real PAT with a
 whichever channel P3 says sees the placeholder, confirm the exchange
 succeeds). Do this only after P1–P4 look right.
 
+## Field results — round 1 (sbx v0.35.0, 2026-07-25, issue #96)
+
+What round 1 settled:
+
+- **Custom-secret placeholder env is NOT visible to exec** — plain, login
+  shell, or TTY — *when the secret is registered after sandbox creation*
+  (which is both what the probe did and what sbxloop's provisioner does).
+  This reconfirms the 0.1.8 finding; sbx-releases#348's `-it` repro did not
+  reproduce. `inspect` even reported `Secrets: none` right after a
+  successful sandbox-scoped `set-custom` — attach semantics on 0.35 are
+  murky.
+- **`sbx run --name X -- -c "cmd"` exits 0 but returns no command output**
+  (banners only), so round 1 proved nothing about whether the command ran
+  or what env a session sees. Bare `run` without a TTY hangs until killed
+  (`inspect exec: context deadline exceeded`). Consequence either way: a
+  session-launched worker could only use the poll transport (events file
+  tailed via exec) — the stream transport's stdout channel does not exist
+  over `run`.
+- **Token-shaped `--placeholder` works**: `github_pat_spike46{rand}` was
+  accepted and the CLI printed the generated value — confirming both SDK
+  prefix-check compatibility and that **the host always knows the
+  placeholder**.
+- The shell template stamps built-in cred env names (`ANTHROPIC_API_KEY`
+  etc., with `SBX_CRED_*_MODE` markers) visible to exec even with auth "not
+  configured" — a creation-time env-stamping mechanism exists; custom
+  secrets just didn't participate post-creation.
+- `sbx secret rm <scope> --env NAME` alone is rejected on v0.35 (`--host`
+  or `--placeholder` required). Round 1's cleanup used exactly that form,
+  so its two dummy secrets leaked (round 2's R0 removes them). Side
+  finding for provision.py: the env-only rm candidate in the
+  replace-on-exists ladder can never succeed on v0.35 (harmless —
+  best-effort — but dead).
+
+What round 1 could **not** test, and round 2 targets:
+
+1. **Ordering** (R1): `set-custom`'s own output says *"You may need to
+   update environment variable … inside existing sandboxes to \<placeholder>"*
+   — implying env is stamped at creation. A global secret registered
+   *before* `create` is the doc-blessed path and is untested. R2 adds the
+   stop/auto-restart rehydration variant.
+2. **The placeholder-in-env-file design** (R4, the linchpin): since the
+   host chooses/knows the placeholder, sbxloop can write the *placeholder*
+   into `~/.sbxloop/env.sh` instead of the real token — the VM never holds
+   the credential, the egress proxy substitutes it in flight, and **env
+   stamping stops mattering entirely**. This works on the existing exec
+   backend with the existing env-file mechanics if and only if the proxy
+   rewrites placeholders in requests from exec'd processes. That is
+   expected (the proxy is a network-level MITM at 172.17.0.0:3128 with
+   sandbox-global `HTTP_PROXY`/CA env, and credentials.md says "when a
+   sandboxed process sends a request" — process-agnostic wording), and it
+   is observably testable with dummy values: curl `httpbin.org/headers`
+   with the placeholder in a header and see which value the server echoes
+   back.
+3. **Whether `run -- -c` executes at all** (R3, via side-effect files).
+
 ## Relationship to other work
 
 - **#52 (doctor→sbx conformance suite)**: permanent home for P1–P5 once
@@ -176,15 +241,20 @@ succeeds). Do this only after P1–P4 look right.
   mitigation if this all fails.
 - The `plain-env` fallback and `secret_strategy` config stay regardless.
 
-## Recommendation
+## Recommendation (updated after round 1)
 
-Run the probe before writing any backend code. Decision tree:
+Run the round-2 probe before writing any backend code. Decision tree:
 
-- Placeholder visible to exec → skip the new backend entirely; ship the
-  token-shaped-placeholder provisioning change against the existing exec
-  path, then do the real-PAT SDK follow-up.
-- Exec blind but non-TTY `run` works → architecture 1 (session-wrapped
-  worker) behind `[sbx] backend`, small scoped PR.
-- Both fail → close #46 as infeasible for now, fold findings into #49/#52,
-  revisit when sandboxd's HTTP API is published (issue #139) or the SSH
-  channel goes GA.
+- **R4 rewrite fires for exec'd processes** (expected) → skip the session
+  backend entirely. Implement **placeholder-in-env-file**: the provisioner
+  registers `COPILOT_GITHUB_TOKEN` with a host-generated token-shaped
+  placeholder and writes the *placeholder* (never the token) into the env
+  file. The `sandbox.secret_env_fallback` security concession disappears;
+  #46's actual goal (proxy-held secrets) is met on the exec backend.
+  Follow up with the real-PAT SDK end-to-end, then close #46.
+- **R4 fails but R1 ordering stamps env AND R3 shows sessions execute** →
+  architecture 1 (session-wrapped worker, poll transport only) behind
+  `[sbx] backend`, small scoped PR.
+- **R4 fails and sessions are undrivable** → close #46 as infeasible for
+  now, fold findings into #49/#52, revisit when sandboxd's HTTP API is
+  published (issue #139) or the SSH channel goes GA.

@@ -1,0 +1,93 @@
+name: sbx probe (real sbx, CI harness)
+
+# The sanctioned harness for field-verifying sbx semantics: installs real
+# Docker Sandboxes on the Actions runner and runs the probe script against
+# it. Probe scripts are NEVER to be run on customer or user devices — this
+# workflow (runner hardware we control) is where sbx-behavior questions get
+# answered.
+#
+# Requires repository secrets:
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  - for `sbx login`
+#
+# The probe uses dummy secret values only; no Copilot/GitHub tokens needed.
+# The report lands in the run summary and as an uploaded artifact.
+
+on:
+  workflow_dispatch:
+
+env:
+  SBX_INSTALL_DIR: /home/runner/.docker/sbx
+  SBX_APP_NAME: sbxloop-probe
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require Docker Hub secrets
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN repository secrets are not configured; sbx login is impossible"
+            exit 1
+          fi
+
+      - name: Enable KVM and user namespaces
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install sbx
+        run: |
+          set -euo pipefail
+          url=$(curl -fsSL https://api.github.com/repos/docker/sbx-releases/releases/latest \
+            | python3 -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and 'x86_64' in a['name'] and a['name'].endswith('.tar.gz')]; print(assets[0])")
+          echo "downloading $url"
+          curl -fsSL -o /tmp/sbx.tar.gz "$url"
+          mkdir -p /tmp/docker-sbx && tar -xzf /tmp/sbx.tar.gz -C /tmp/docker-sbx --strip-components=1
+          sudo PREFIX="$SBX_INSTALL_DIR" /tmp/docker-sbx/install.sh
+          echo "$SBX_INSTALL_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Start keyring (Secret Service for sbx credential storage)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gnome-keyring dbus-x11
+          echo 'DBUS_SESSION_BUS_ADDRESS='$(dbus-daemon --session --fork --print-address) >> "$GITHUB_ENV"
+
+      - name: sbx login
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo -n "" | gnome-keyring-daemon --unlock --components=secrets || true
+          printf '%s' "$DOCKERHUB_TOKEN" | sbx --app-name "$SBX_APP_NAME" login --username "$DOCKERHUB_USERNAME" --password-stdin
+          sbx --app-name "$SBX_APP_NAME" version
+
+      - name: sbx policy init balanced
+        run: sbx --app-name "$SBX_APP_NAME" policy init balanced
+
+      - name: Run probe
+        run: ./scripts/spike-46-agent-session-probe.sh spike-46-report.txt
+
+      - name: Publish report to run summary
+        if: always()
+        run: |
+          {
+            echo '## spike-46 probe report'
+            echo '```text'
+            cat spike-46-report.txt 2>/dev/null || echo "(no report produced)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spike-46-report
+          path: spike-46-report.txt
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: sbx --app-name "$SBX_APP_NAME" logout --yes || true
