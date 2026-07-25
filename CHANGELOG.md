@@ -122,8 +122,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 - Artifact listings and delivery no longer silently drop dot-path artifacts
   (#67). `artifact_files` excluded every file with any dot-prefixed path
   component, so agent-produced `.github/workflows/*.yml`, `.gitignore`,
-  `.env.example` and friends vanished from the run summary, `sbxloop
-  artifacts`, and delivered PRs — with no indication anywhere. The exclusion
+  `.env.example` and friends vanished from the run summary, `sbxloop artifacts`, and delivered PRs — with no indication anywhere. The exclusion
   is now a targeted denylist (`.git`, `.sbxloop` by default, matched as path
   components at any depth), tunable via `[artifacts] exclude` in config, and
   exclusions are always surfaced: the `run.artifacts` event carries per-entry
