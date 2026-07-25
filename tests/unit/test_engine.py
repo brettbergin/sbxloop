@@ -374,6 +374,163 @@ class TestWorkspaceExecution:
         assert reports[0].data["path"] == str(result.workspace)
 
 
+def m(entry: dict[str, Any], match: str) -> dict[str, Any]:
+    """Scripted response consumable only by jobs whose prompt mentions
+    ``match`` (a task id) — required once tasks run concurrently."""
+    return {**entry, "match": match}
+
+
+def scripted_task(task_id: str, files: dict[str, str]) -> list[dict[str, Any]]:
+    execute = {"text": f"{task_id} wrote files", "files": files}
+    return [m(PLAN, task_id), m(execute, task_id), m(PASS, task_id), m(ACCEPT, task_id)]
+
+
+class TestParallelExecution:
+    """[run] max_parallel > 1: wave scheduling across sandboxes, isolated
+    workdirs, merge with per-task ownership enforcement."""
+
+    GRAPH = taskgraph(
+        {**task("t1"), "owns": ["a"]},
+        {**task("t2"), "owns": ["b"]},
+        task("t3", deps=["t1", "t2"], verify=["test -f a/one.txt", "test -f b/two.txt"]),
+    )
+
+    def three_task_script(self, harness: Harness) -> None:
+        harness.script(
+            [
+                self.GRAPH,
+                *scripted_task("t1", {"a/one.txt": "1"}),
+                *scripted_task("t2", {"b/two.txt": "2"}),
+                *scripted_task("t3", {"c.txt": "3"}),
+            ]
+        )
+
+    def test_wave_fans_out_and_merges(self, harness: Harness) -> None:
+        self.three_task_script(harness)
+        engine = harness.engine(run={"max_parallel": 2})
+        result = engine.start("build three things")
+
+        assert result.state == "completed"
+        assert [t.state for t in result.tasks] == ["done", "done", "done"]
+        # the wave's disjoint writes and the dependent task's write all
+        # landed merged in the host workspace
+        assert result.workspace is not None
+        assert (result.workspace / "a/one.txt").read_text() == "1"
+        assert (result.workspace / "b/two.txt").read_text() == "2"
+        assert (result.workspace / "c.txt").read_text() == "3"
+
+        # one extra agent sandbox was provisioned for the 2-task wave
+        created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
+        suffixes = sorted(name.rsplit("-", 1)[-1] for name in created)
+        assert suffixes == ["agent", "agent2"]
+        # ...and cleaned up with the pair
+        assert harness.sandboxes_left() == []
+
+        waves = [e for e in harness.events if e.type == HostEventTypes.WAVE_START]
+        assert [e.data["tasks"] for e in waves] == [["t1", "t2"]]
+        wave_end = next(e for e in harness.events if e.type == HostEventTypes.WAVE_END)
+        assert wave_end.data["merged"] == {"t1": 1, "t2": 1}
+        # per-task sandbox attribution: the wave ran on two distinct VMs
+        starts = {
+            e.data["task_id"]: e.data["sandbox"]
+            for e in harness.events
+            if e.type == HostEventTypes.TASK_START
+        }
+        assert starts["t1"] != starts["t2"]
+
+    def test_unmounted_wave_merges_into_artifacts(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Harvest mode: the wave merges into runs/<id>/artifacts, and the
+        dependent single-slot task is re-seeded so its verify commands see
+        BOTH siblings' outputs (that is what t3's verify asserts)."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        self.three_task_script(harness)
+        result = harness.engine(run={"max_parallel": 2}).start("parallel harvest")
+
+        assert result.state == "completed"
+        assert not result.mounted
+        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        assert (harvested / "a/one.txt").read_text() == "1"
+        assert (harvested / "b/two.txt").read_text() == "2"
+        assert (harvested / "c.txt").read_text() == "3"
+
+    def test_write_outside_owns_fails_task_loudly(self, harness: Harness) -> None:
+        harness.script(
+            [
+                taskgraph({**task("t1"), "owns": ["a"]}, {**task("t2"), "owns": ["b"]}),
+                *scripted_task("t1", {"a/one.txt": "1"}),
+                *scripted_task("t2", {"b/two.txt": "2", "a/evil.txt": "E"}),
+            ]
+        )
+        result = harness.engine(run={"max_parallel": 2}).start("one task misbehaves")
+
+        assert result.state == "failed"
+        by_id = {t.spec.id: t for t in result.tasks}
+        assert by_id["t1"].state == "done"
+        assert by_id["t2"].state == "failed"
+        assert "outside its declared owns" in by_id["t2"].last_feedback
+        # the violating task's writes were discarded wholesale — no
+        # last-writer-wins, not even for the paths it did own
+        assert result.workspace is not None
+        assert (result.workspace / "a/one.txt").read_text() == "1"
+        assert not (result.workspace / "a/evil.txt").exists()
+        assert not (result.workspace / "b/two.txt").exists()
+        conflicts = [e for e in harness.events if e.type == HostEventTypes.TASK_CONFLICT]
+        assert [e.data["task_id"] for e in conflicts] == ["t2"]
+        assert "a/evil.txt" in conflicts[0].data["paths"]
+
+    def test_unmounted_violation_never_leaks_via_final_harvest(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The violating task runs on the PRIMARY slot in harvest mode: its
+        discarded writes must not sneak back into artifacts through the
+        additive task-boundary/finalize harvest of the primary workdir."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script(
+            [
+                taskgraph({**task("t1"), "owns": ["a"]}, {**task("t2"), "owns": ["b"]}),
+                *scripted_task("t1", {"a/one.txt": "1", "b/steal.txt": "S"}),
+                *scripted_task("t2", {"b/two.txt": "2"}),
+            ]
+        )
+        result = harness.engine(run={"max_parallel": 2}).start("primary slot violates")
+
+        assert result.state == "failed"
+        by_id = {t.spec.id: t for t in result.tasks}
+        assert by_id["t1"].state == "failed"
+        assert by_id["t2"].state == "done"
+        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        assert (harvested / "b/two.txt").read_text() == "2"
+        assert not (harvested / "a/one.txt").exists()
+        assert not (harvested / "b/steal.txt").exists()
+
+    def test_tasks_without_owns_stay_sequential(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1"), task("t2")), *HAPPY_TASK, *HAPPY_TASK])
+        result = harness.engine(run={"max_parallel": 3}).start("no ownership declared")
+
+        assert result.state == "completed"
+        created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
+        assert all(name.endswith("-agent") for name in created), created
+        assert [e for e in harness.events if e.type == HostEventTypes.WAVE_START] == []
+
+    def test_max_parallel_one_is_untouched_sequential_path(self, harness: Harness) -> None:
+        """Default config: the parallel scheduler is never entered, even
+        when tasks declare owns."""
+        harness.script(
+            [
+                taskgraph({**task("t1"), "owns": ["a"]}, {**task("t2"), "owns": ["b"]}),
+                *HAPPY_TASK,
+                *HAPPY_TASK,
+            ]
+        )
+        result = harness.engine().start("sequential by default")
+        assert result.state == "completed"
+        assert [e for e in harness.events if e.type == HostEventTypes.WAVE_START] == []
+        created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
+        assert all(name.endswith("-agent") for name in created), created
+
+
 class TestDeliverHook:
     """The engine's finalize hook; the git-data flow itself is covered in
     test_deliver.py. deliver_workspace is patched — no GitHub, no network."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -34,6 +35,9 @@ class EventBus:
 
     def __init__(self) -> None:
         self._subscribers: list[Subscriber] = []
+        # Parallel waves publish from worker threads; serializing publish
+        # keeps subscribers (store persistence, TUI queue) single-file.
+        self._lock = threading.Lock()
 
     def subscribe(self, fn: Subscriber) -> Callable[[], None]:
         """Register a subscriber; returns an unsubscribe callable."""
@@ -49,11 +53,12 @@ class EventBus:
         return self.subscribe(hook.on_event)
 
     def publish(self, event: Event) -> None:
-        for fn in list(self._subscribers):
-            try:
-                fn(event)
-            except Exception:
-                logger.exception("event subscriber %r failed for %s", fn, event.type)
+        with self._lock:
+            for fn in list(self._subscribers):
+                try:
+                    fn(event)
+                except Exception:
+                    logger.exception("event subscriber %r failed for %s", fn, event.type)
 
     def emit(
         self,
@@ -79,6 +84,9 @@ class HostEventTypes:
     TASK_START = "task.start"
     TASK_STATE = "task.state"
     TASK_END = "task.end"
+    WAVE_START = "wave.start"
+    WAVE_END = "wave.end"
+    TASK_CONFLICT = "task.conflict"
     PHASE_START = "phase.start"
     PHASE_END = "phase.end"
     SANDBOX_PROVISION_START = "sandbox.provision_start"

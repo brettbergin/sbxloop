@@ -192,10 +192,23 @@ def run(
     keep_sandboxes: Annotated[
         bool, typer.Option("--keep-sandboxes", help="Do not remove sandboxes at the end.")
     ] = False,
+    max_parallel: Annotated[
+        int | None,
+        typer.Option(
+            "--max-parallel",
+            min=1,
+            help="Run up to N independent tasks concurrently, one sandbox each "
+            "(default 1: sequential). Each slot is a full microVM.",
+        ),
+    ] = None,
     tui: Annotated[bool, typer.Option("--tui/--no-tui", help="Live dashboard.")] = True,
 ) -> None:
     """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
     config = _config_with_overrides(model=model, keep_sandboxes=keep_sandboxes or None)
+    if max_parallel is not None:
+        config = config.model_copy(
+            update={"run": config.run.model_copy(update={"max_parallel": max_parallel})}
+        )
     if report is not None:
         config = config.model_copy(
             update={"github": config.github.model_copy(update={"report": report})}
@@ -508,6 +521,14 @@ max_replans_per_task = 1
 max_tasks = 20
 max_wall_clock_s = 7200.0
 per_job_timeout_s = 900.0
+
+[run]
+# Upper bound on tasks executing concurrently, one agent sandbox each.
+# 1 (the default) is strictly sequential. Independent tasks only fan out
+# when they declare disjoint `owns` subtrees at decompose time; every
+# extra slot is a full microVM plus worker install — see
+# docs/parallel-execution.md before raising this.
+max_parallel = 1
 """
 
 

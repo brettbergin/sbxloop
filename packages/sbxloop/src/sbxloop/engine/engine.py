@@ -16,17 +16,28 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from sbxloop.config import Config, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace
+from sbxloop.engine.merge import (
+    apply_changes,
+    build_seed_dir,
+    owns_violations,
+    snapshot_tree,
+    tree_changes,
+)
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     RunResult,
     RunState,
     TaskRecord,
     TaskState,
+    pack_parallel_batch,
 )
 from sbxloop.engine.phases import PhaseRunner, clip
 from sbxloop.engine.store import StateStore
@@ -45,6 +56,7 @@ from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
+from sbxloop.sbx.sandbox import WORK_DIR
 from sbxloop.worker.client import WorkerClient
 
 logger = logging.getLogger(__name__)
@@ -144,7 +156,7 @@ class LoopEngine:
                     phases = PhaseRunner(
                         agent, self.config, run_id, outcome, workdir=pair.agent_workdir
                     )
-                    state = self._run_phases(run_id, phases, deadline, pair)
+                    state = self._run_phases(run_id, phases, deadline, pair, provisioner)
                 finally:
                     detach()
                     # Harvest even when a phase raised: the sandbox is still
@@ -247,7 +259,12 @@ class LoopEngine:
         self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, pr=pr.number, url=pr.url)
 
     def _run_phases(
-        self, run_id: str, phases: PhaseRunner, deadline: float, pair: SandboxPair
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        deadline: float,
+        pair: SandboxPair,
+        provisioner: Provisioner,
     ) -> RunState:
         tasks = self.store.get_tasks(run_id)
         if not tasks:
@@ -273,6 +290,9 @@ class LoopEngine:
             tasks = self.store.get_tasks(run_id)
 
         self._set_run_state(run_id, "running")
+        if self.config.run.max_parallel > 1:
+            return self._run_tasks_parallel(run_id, phases, tasks, deadline, pair, provisioner)
+
         failed_ids: set[str] = {t.spec.id for t in tasks if t.state == "failed"}
         skipped_ids: set[str] = {t.spec.id for t in tasks if t.state == "skipped"}
         for task in tasks:
@@ -293,6 +313,239 @@ class LoopEngine:
         self._set_run_state(run_id, "finalizing")
         return "failed" if failed_ids or skipped_ids else "completed"
 
+    # -- parallel scheduling -------------------------------------------------
+
+    def _run_tasks_parallel(
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        tasks: list[TaskRecord],
+        deadline: float,
+        pair: SandboxPair,
+        provisioner: Provisioner,
+    ) -> RunState:
+        """Wave scheduler: fan independent tasks out across agent sandboxes.
+
+        Each round takes the dependency-ready tasks and packs a wave of
+        tasks with pairwise-disjoint declared ``owns`` (see
+        ``pack_parallel_batch``). Single-task waves run exactly like the
+        sequential loop, in the primary sandbox's canonical workdir.
+        Multi-task waves get one sandbox per task, isolated workdirs seeded
+        from the merged host tree, and a merge with per-task write
+        attribution afterwards. Extra sandboxes are provisioned lazily on
+        the first multi-task wave — a run whose graph turns out sequential
+        never pays for them.
+        """
+        done_ids = {t.spec.id for t in tasks if t.state == "done"}
+        failed_ids = {t.spec.id for t in tasks if t.state == "failed"}
+        skipped_ids = {t.spec.id for t in tasks if t.state == "skipped"}
+        slots: list[WorkerClient] = [phases.agent]
+
+        while True:
+            self._check_cancelled_and_clock(run_id, deadline)
+            for task in tasks:
+                if task.terminal:
+                    continue
+                if any(d in failed_ids | skipped_ids for d in task.spec.depends_on):
+                    task.state = "skipped"
+                    skipped_ids.add(task.spec.id)
+                    self.store.update_task(run_id, task)
+                    self._emit_task_end(run_id, task)
+            ready = [
+                t for t in tasks if not t.terminal and all(d in done_ids for d in t.spec.depends_on)
+            ]
+            if not ready:
+                break
+            batch = pack_parallel_batch(ready, self.config.run.max_parallel)
+            if len(batch) == 1:
+                if not pair.mounted:
+                    # Harvest-mode primary workdir only holds what THIS
+                    # sandbox wrote; re-seed from the merged tree so the
+                    # task sees changes merged from sibling sandboxes.
+                    self._seed_primary_workdir(run_id, phases.agent, pair)
+                self._run_task(run_id, phases, batch[0], deadline, pair)
+            else:
+                self._ensure_slots(slots, len(batch), pair, provisioner)
+                self._run_wave(run_id, phases.outcome, batch, slots, deadline, pair)
+            for task in batch:
+                if task.state == "done":
+                    done_ids.add(task.spec.id)
+                elif task.state == "failed":
+                    failed_ids.add(task.spec.id)
+                elif task.state == "skipped":
+                    skipped_ids.add(task.spec.id)
+                else:  # pragma: no cover - defensive
+                    raise StateError(
+                        f"task {task.spec.id} non-terminal ({task.state}) after its wave"
+                    )
+
+        self._set_run_state(run_id, "finalizing")
+        return "failed" if failed_ids or skipped_ids else "completed"
+
+    def _ensure_slots(
+        self,
+        slots: list[WorkerClient],
+        needed: int,
+        pair: SandboxPair,
+        provisioner: Provisioner,
+    ) -> None:
+        if len(slots) >= needed:
+            return
+        # Every slot is a full microVM plus worker install — warm pools and
+        # prebaked templates are what make this cheap; see the design doc.
+        for sandbox in provisioner.add_agents(pair, needed - len(slots)):
+            client = WorkerClient(
+                sandbox,
+                self.bus,
+                transport=self.config.worker_transport,
+                python=self.worker_python,
+            )
+            if self.install_workers:
+                client.install(extras="copilot", ensure_dev_tools=True)
+            slots.append(client)
+
+    def _merged_dir(self, run_id: str, pair: SandboxPair) -> Path:
+        """The run's canonical merged host tree (same resolution as
+        artifacts_dir): the live workspace when mounted, else the harvest
+        target."""
+        if pair.mounted:
+            assert pair.workspace is not None
+            return pair.workspace
+        return self.config.state_dir / "runs" / run_id / "artifacts"
+
+    def _run_wave(
+        self,
+        run_id: str,
+        outcome: str,
+        batch: list[TaskRecord],
+        slots: list[WorkerClient],
+        deadline: float,
+        pair: SandboxPair,
+    ) -> None:
+        """Execute one multi-task wave and merge the results.
+
+        Tasks run concurrently, one sandbox each, in isolated in-VM
+        workdirs seeded from the merged tree — never a shared writable
+        mount. Afterwards each workdir is harvested to per-task staging and
+        diffed against the pre-wave baseline: with one writer per sandbox,
+        attribution is exact. A completed task whose writes escape its
+        declared ``owns`` is failed loudly (task.conflict event) and its
+        changes are discarded — never last-writer-wins. Failed tasks'
+        partial writes are discarded too. Surviving change sets are
+        disjoint by construction (wave packing requires disjoint owns), so
+        applying them is conflict-free.
+        """
+        run_dir = self.config.state_dir / "runs" / run_id
+        merged_dir = self._merged_dir(run_id, pair)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        baseline = snapshot_tree(merged_dir)
+        seed = build_seed_dir(merged_dir, run_dir / "seed") if baseline else None
+        assignments = list(zip(slots, batch, strict=False))
+        for client, _task in assignments:
+            self._reset_slot_workdir(client, seed)
+
+        task_ids = [t.spec.id for t in batch]
+        self.bus.emit(HostEventTypes.WAVE_START, run_id, tasks=task_ids, size=len(batch))
+        errors: list[Exception] = []
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            futures = [
+                pool.submit(
+                    self._advance_task,
+                    run_id,
+                    PhaseRunner(client, self.config, run_id, outcome, workdir=WORK_DIR),
+                    task,
+                    deadline,
+                )
+                for client, task in assignments
+            ]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(exc)
+
+        merged: dict[str, int] = {}
+        for client, task in assignments:
+            changes = self._harvest_slot(client, task, run_dir / "staging", baseline)
+            if changes is None:
+                if task.state == "done":
+                    task.last_feedback = "workspace harvest from the task sandbox failed"
+                    self._set_task_state(run_id, task, "failed")
+                continue
+            if task.state != "done":
+                continue  # never merge partial writes from a failed task
+            violations = owns_violations(changes, task.spec)
+            if violations:
+                shown = ", ".join(violations[:10])
+                task.last_feedback = (
+                    f"task wrote outside its declared owns subtrees "
+                    f"({', '.join(task.spec.owns)}): {shown}"
+                )
+                self._set_task_state(run_id, task, "failed")
+                self.bus.emit(
+                    HostEventTypes.TASK_CONFLICT,
+                    run_id,
+                    task_id=task.spec.id,
+                    paths=violations[:50],
+                    owns=task.spec.owns,
+                )
+                continue
+            if changes:
+                apply_changes(run_dir / "staging" / task.spec.id, merged_dir, changes)
+            merged[task.spec.id] = len(changes)
+        self.bus.emit(HostEventTypes.WAVE_END, run_id, tasks=task_ids, merged=merged)
+        if not pair.mounted:
+            # The primary slot's task-boundary/finalize harvests are additive
+            # and unattributed; re-seed it to the post-merge view so writes
+            # discarded above can never leak back in through them.
+            self._seed_primary_workdir(run_id, slots[0], pair)
+        for _client, task in assignments:
+            if task.terminal:
+                self._emit_task_end(run_id, task)
+        if errors:
+            raise errors[0]
+
+    def _seed_primary_workdir(self, run_id: str, client: WorkerClient, pair: SandboxPair) -> None:
+        merged_dir = self._merged_dir(run_id, pair)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        baseline = snapshot_tree(merged_dir)
+        run_dir = self.config.state_dir / "runs" / run_id
+        seed = build_seed_dir(merged_dir, run_dir / "seed") if baseline else None
+        self._reset_slot_workdir(client, seed)
+
+    def _reset_slot_workdir(self, client: WorkerClient, seed: Path | None) -> None:
+        sandbox = client.sandbox
+        sandbox.exec(["sh", "-c", f"rm -rf {WORK_DIR} && mkdir -p {WORK_DIR}"])
+        if seed is not None:
+            # Trailing /. copies directory contents (docker-style cp), the
+            # same convention the harvest path relies on.
+            sandbox.cli.cp(f"{seed}/.", f"{sandbox.name}:{WORK_DIR}")
+
+    def _harvest_slot(
+        self,
+        client: WorkerClient,
+        task: TaskRecord,
+        staging_root: Path,
+        baseline: dict[str, str],
+    ) -> dict[str, str] | None:
+        """Copy one wave task's workdir to staging; return its change set
+        against the pre-wave baseline, or None when the copy failed."""
+        staging = staging_root / task.spec.id
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        try:
+            client.sandbox.cp_out(f"{WORK_DIR}/.", staging)
+        except SbxError:
+            logger.warning(
+                "wave harvest failed for task %s (%s)",
+                task.spec.id,
+                client.sandbox.name,
+                exc_info=True,
+            )
+            return None
+        return tree_changes(baseline, snapshot_tree(staging))
+
     # -- task state machine ------------------------------------------------
 
     def _run_task(
@@ -303,11 +556,28 @@ class LoopEngine:
         deadline: float,
         pair: SandboxPair,
     ) -> None:
+        self._advance_task(run_id, phases, task, deadline)
+        # Task-boundary harvest narrows the loss window on long runs; the
+        # finalize harvest in _drive remains the authoritative sweep.
+        self._harvest(run_id, pair)
+        self._emit_task_end(run_id, task)
+
+    def _advance_task(
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord,
+        deadline: float,
+    ) -> None:
         budgets = self.config.budgets
         if task.state == "pending":
             self._set_task_state(run_id, task, "planning")
         self.bus.emit(
-            HostEventTypes.TASK_START, run_id, task_id=task.spec.id, title=task.spec.title
+            HostEventTypes.TASK_START,
+            run_id,
+            task_id=task.spec.id,
+            title=task.spec.title,
+            sandbox=phases.agent.sandbox.name,
         )
         # Resume mapping: executing/scrutinizing restart at executing (the
         # plan is persisted); a missing plan always restarts at planning.
@@ -330,11 +600,6 @@ class LoopEngine:
                 self._phase_validate(run_id, phases, task, budgets)
             else:  # pragma: no cover - defensive
                 raise StateError(f"task {task.spec.id} in unexpected state {task.state}")
-
-        # Task-boundary harvest narrows the loss window on long runs; the
-        # finalize harvest in _drive remains the authoritative sweep.
-        self._harvest(run_id, pair)
-        self._emit_task_end(run_id, task)
 
     def _phase_plan(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
         started = time.time()

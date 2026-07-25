@@ -35,6 +35,20 @@ EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
 
 OUTPUT_CLIP = 6_000
 
+# Extra decompose guidance, injected only when [run] max_parallel > 1: a
+# single-slot run must never be nudged toward declaring ownership it cannot
+# use.
+PARALLEL_DECOMPOSE_CONTEXT = """
+- This run may execute independent tasks IN PARALLEL, each in its own
+  isolated sandbox. To opt a task in, give it an `owns` field: a list of
+  relative paths (files or directories) the task will create or modify
+  exclusively, e.g. `"owns": ["src/parser/", "tests/test_parser.py"]`.
+  Tasks only run concurrently when they are independent (no `depends_on`
+  path between them) AND their `owns` do not overlap. A task that writes
+  outside its declared `owns` fails. Omit `owns` for tasks whose writes
+  cannot be scoped — they will run alone.
+""".rstrip()
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
@@ -141,6 +155,9 @@ class PhaseRunner:
             {
                 "outcome": self.outcome,
                 "max_tasks": str(self.config.budgets.max_tasks),
+                "parallel_context": (
+                    PARALLEL_DECOMPOSE_CONTEXT if self.config.run.max_parallel > 1 else ""
+                ),
             },
         )
 

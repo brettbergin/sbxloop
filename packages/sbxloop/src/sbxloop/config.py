@@ -68,6 +68,19 @@ class GithubConfig(_ConfigModel):
         return self.repo is not None
 
 
+class RunSettings(_ConfigModel):
+    """Execution shape of a run.
+
+    ``max_parallel`` is the upper bound on agent sandboxes executing tasks
+    concurrently. The default of 1 preserves the strictly sequential loop
+    exactly. Values above 1 only fan out tasks that are independent AND
+    declare disjoint ``owns`` subtrees (see docs/parallel-execution.md);
+    every extra slot is a full microVM plus provisioning cost.
+    """
+
+    max_parallel: int = Field(default=1, ge=1)
+
+
 class Budgets(_ConfigModel):
     max_revisions_per_task: int = 2
     max_replans_per_task: int = 1
@@ -95,6 +108,7 @@ class Config(_ConfigModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
     budgets: Budgets = Field(default_factory=Budgets)
+    run: RunSettings = Field(default_factory=RunSettings)
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

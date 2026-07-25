@@ -19,6 +19,7 @@ $outcome
   genuinely done — e.g. test runs, linters, greps; never `echo`).
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
+$parallel_context
 
 ## Response format
 

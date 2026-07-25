@@ -199,6 +199,61 @@ class Provisioner:
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
 
+    def add_agents(self, pair: SandboxPair, count: int) -> list[Sandbox]:
+        """Provision ``count`` extra agent sandboxes for parallel waves.
+
+        Extras always receive the Copilot token via the in-VM env file
+        (plain-env), never ``secret set-custom``: sbx keys custom secrets
+        globally by env name (field-verified), so a second registration of
+        ``COPILOT_GITHUB_TOKEN`` would steal the binding from the primary
+        sandbox. The tradeoff (token visible inside the microVM the agent
+        already controls) is the same one every exec-driven run already
+        makes via the proxy-invisibility fallback; egress stays bounded by
+        the network policy. Created sandboxes are appended to
+        ``pair.extras`` so pair cleanup covers them.
+        """
+        assert pair.workspace is not None
+        token = self.copilot_token()
+        extra = tuple(self.config.sandbox.extra_allow_domains)
+        created: list[Sandbox] = []
+        try:
+            for _ in range(count):
+                index = len(pair.agents) + 1
+                spec = SandboxSpec(
+                    name=f"{sandbox_name(pair.run_id, 'agent')}{index}",
+                    role="agent",
+                    workspace=pair.workspace,
+                    template=self.config.sandbox.template,
+                    policy_allows=[*AGENT_ALLOW_DOMAINS, *extra],
+                )
+                self.bus.emit(
+                    "sandbox.provision_start", pair.run_id, name=spec.name, role=spec.role
+                )
+                self.cli.create(spec)
+                sandbox = Sandbox(self.cli, spec.name)
+                created.append(sandbox)
+                self._apply_policy(spec)
+                self._apply_plain_env(spec, sandbox, token)
+                sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, WORK_DIR)
+                if self.post_create is not None:
+                    self.post_create(sandbox, spec.role)
+                pair.extras.append(sandbox)
+                self.bus.emit("sandbox.ready", pair.run_id, name=spec.name, role=spec.role)
+            return created
+        except Exception as exc:
+            for sandbox in created:
+                if sandbox in pair.extras:
+                    continue  # already owned by the pair; its cleanup handles it
+                try:
+                    sandbox.rm()
+                except SbxError:
+                    logger.warning("rollback: failed to remove %s", sandbox.name, exc_info=True)
+            if isinstance(exc, ProvisionError):
+                raise
+            raise ProvisionError(
+                f"provisioning extra agents for run {pair.run_id} failed: {exc}"
+            ) from exc
+
     def _apply_policy(self, spec: SandboxSpec) -> None:
         for domain in spec.policy_allows:
             self.cli.policy_allow(domain, sandbox=spec.name)

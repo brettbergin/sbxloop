@@ -60,6 +60,10 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
 - Budgets bound revisions, replans, tasks, and wall clock. State is checkpointed to
   SQLite after every transition; `sbxloop resume <run>` re-provisions sandboxes
   (they're cattle) and continues where it left off.
+- Optionally, independent tasks run **in parallel, one sandbox each**:
+  `sbxloop run --max-parallel 3 "..."` (or `[run] max_parallel`). Tasks opt in by
+  declaring disjoint `owns` workspace subtrees at decompose time, enforced at
+  harvest — see [docs/parallel-execution.md](docs/parallel-execution.md).
 
 ## Artifacts
 

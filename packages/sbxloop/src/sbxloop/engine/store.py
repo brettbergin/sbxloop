@@ -7,11 +7,14 @@ a phase whose result was never committed is simply re-run from its start.
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Concatenate, cast
 
 from sbxloop.engine.model import (
     PlanModel,
@@ -78,9 +81,27 @@ _RUNS_MIGRATIONS = (
 )
 
 
+def _locked[**P, R](
+    method: Callable[Concatenate[StateStore, P], R],
+) -> Callable[Concatenate[StateStore, P], R]:
+    """Serialize a StateStore method on the instance lock (thread safety)."""
+
+    @functools.wraps(method)
+    def wrapper(self: StateStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    # Quoted: cast's type argument is evaluated at decoration time, while
+    # the StateStore class body is still executing.
+    return cast("Callable[Concatenate[StateStore, P], R]", wrapper)
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        # Parallel waves touch the store from worker threads; one connection
+        # guarded by one lock keeps every transaction serialized.
+        self._lock = threading.RLock()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -97,6 +118,7 @@ class StateStore:
 
     # -- runs --------------------------------------------------------------
 
+    @_locked
     def create_run(self, run_id: str, outcome: str, config_json: str = "{}") -> RunRecord:
         now = time.time()
         try:
@@ -112,6 +134,7 @@ class StateStore:
             run_id=run_id, outcome=outcome, state="created", created_at=now, updated_at=now
         )
 
+    @_locked
     def set_run_state(self, run_id: str, state: RunState) -> None:
         cursor = self._conn.execute(
             "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
@@ -121,6 +144,7 @@ class StateStore:
             raise StateError(f"unknown run {run_id}")
         self._conn.commit()
 
+    @_locked
     def set_run_workspace(self, run_id: str, workspace: Path, mounted: bool) -> None:
         cursor = self._conn.execute(
             "UPDATE runs SET workspace = ?, mounted = ?, updated_at = ? WHERE run_id = ?",
@@ -142,18 +166,21 @@ class StateStore:
             mounted=bool(row["mounted"]),
         )
 
+    @_locked
     def get_run(self, run_id: str) -> RunRecord:
         row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             raise StateError(f"unknown run {run_id}")
         return self._run_record(row)
 
+    @_locked
     def list_runs(self) -> list[RunRecord]:
         rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
         return [self._run_record(row) for row in rows]
 
     # -- tasks -------------------------------------------------------------
 
+    @_locked
     def save_tasks(self, run_id: str, specs: list[TaskSpec]) -> None:
         for index, spec in enumerate(specs):
             self._conn.execute(
@@ -163,6 +190,7 @@ class StateStore:
             )
         self._conn.commit()
 
+    @_locked
     def update_task(self, run_id: str, task: TaskRecord) -> None:
         cursor = self._conn.execute(
             "UPDATE tasks SET state = ?, plan_json = ?, revisions = ?, replans = ?,"
@@ -182,6 +210,7 @@ class StateStore:
             raise StateError(f"unknown task {task.spec.id} in run {run_id}")
         self._conn.commit()
 
+    @_locked
     def get_tasks(self, run_id: str) -> list[TaskRecord]:
         rows = self._conn.execute(
             "SELECT * FROM tasks WHERE run_id = ? ORDER BY order_idx", (run_id,)
@@ -208,6 +237,7 @@ class StateStore:
 
     # -- phase attempts ----------------------------------------------------
 
+    @_locked
     def record_phase(
         self,
         run_id: str,
@@ -227,6 +257,7 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def phase_attempts(self, run_id: str, task_id: str | None = None) -> list[sqlite3.Row]:
         if task_id is None:
             return list(
@@ -243,6 +274,7 @@ class StateStore:
 
     # -- events ------------------------------------------------------------
 
+    @_locked
     def append_event(self, event: Event) -> None:
         self._conn.execute(
             "INSERT INTO events (run_id, ts, type, job_id, data_json) VALUES (?, ?, ?, ?, ?)",
@@ -250,6 +282,7 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def events(
         self,
         run_id: str,
@@ -263,14 +296,20 @@ class StateStore:
             query += " AND type LIKE ?"
             params.append(type_prefix + "%")
         query += " ORDER BY seq"
-        for row in self._conn.execute(query, params):
-            yield (
-                row["seq"],
-                Event(
-                    ts=row["ts"],
-                    run_id=row["run_id"],
-                    job_id=row["job_id"],
-                    type=row["type"],
-                    data=json.loads(row["data_json"]),
-                ),
-            )
+        # Materialized under the lock: lazy row iteration would interleave
+        # with writer threads on the shared connection.
+        return iter(
+            [
+                (
+                    row["seq"],
+                    Event(
+                        ts=row["ts"],
+                        run_id=row["run_id"],
+                        job_id=row["job_id"],
+                        type=row["type"],
+                        data=json.loads(row["data_json"]),
+                    ),
+                )
+                for row in self._conn.execute(query, params)
+            ]
+        )
