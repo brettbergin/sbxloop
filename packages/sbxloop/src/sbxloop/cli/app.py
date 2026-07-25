@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -96,6 +96,34 @@ def _store(config: Config) -> StateStore:
 _INTERRUPT_JOIN_S = 10.0
 
 
+def _exit_interrupted(run_id: str | None) -> NoReturn:
+    """Finish a Ctrl+C cleanly: exit 130 with a resume hint, no traceback.
+
+    Runs after the engine was quiesced; the registry's signal handler
+    normally tore the sandboxes down already, and the ``cleanup_all`` here
+    covers environments where the handlers could not install. The run's
+    persisted state is untouched (interrupted states are all resumable),
+    so `sbxloop resume` picks the run back up with fresh sandboxes. A
+    second Ctrl+C during teardown force-quits and leaves any remaining
+    sandboxes to `sbxloop sandbox prune`.
+    """
+    console.print("\n[bold yellow]interrupted[/] — removing sandboxes (Ctrl+C again to force quit)")
+    try:
+        cleanup_registry.cleanup_all()
+    except KeyboardInterrupt:
+        console.print(
+            "[bold red]force quit[/] — sandboxes may be left behind; "
+            "clean up with [cyan]sbxloop sandbox prune --force[/]"
+        )
+        # atexit would re-enter the same blocking cleanup; skip it.
+        os._exit(130)
+    if run_id is not None:
+        console.print(
+            f"run [bold cyan]{run_id}[/] interrupted — resume with [cyan]sbxloop resume {run_id}[/]"
+        )
+    raise typer.Exit(130)
+
+
 def _drive_with_ui(engine: LoopEngine, *, tui: bool, chat: bool = True, action: Any) -> RunResult:
     """Run start/resume with the scrollback transcript + pinned status, or
     plain event logs (--no-tui).
@@ -118,17 +146,29 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, chat: bool = True, action: 
     registry's signal handler (and, when handlers could not install, the
     KeyboardInterrupt path here) signals the engine's cancel flag —
     checked at phase boundaries — and briefly joins the daemon thread, so
-    cleanup doesn't race an engine still mid-``sbx exec``.
+    cleanup doesn't race an engine still mid-``sbx exec``. After teardown
+    a Ctrl-C exits 130 with a `sbxloop resume` hint instead of a
+    traceback; a second Ctrl-C force-quits (see ``_exit_interrupted``).
     """
     # The TUI runs the engine on a background thread, where pair
     # registration cannot install signal handlers — install them here,
     # on the main thread, so SIGTERM/SIGINT still clean up the sandboxes.
     cleanup_registry.install_handlers()
+    seen: dict[str, str] = {}
+
+    def remember(event: Event) -> None:
+        seen.setdefault("run_id", event.run_id)
+
+    engine.bus.subscribe(remember)
     if not tui:
         engine.bus.subscribe(plain_printer(console))
         if chat and sys.stdin.isatty():
             threading.Thread(target=_stdin_chat_reader, args=(engine,), daemon=True).start()
-        return action()  # type: ignore[no-any-return]
+        try:
+            return action()  # type: ignore[no-any-return]
+        except KeyboardInterrupt:
+            # The pair context manager already cleaned up while unwinding.
+            _exit_interrupted(seen.get("run_id"))
 
     dashboard = Dashboard()
     pending: queue.SimpleQueue[Event] = queue.SimpleQueue()
@@ -195,6 +235,11 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, chat: bool = True, action: 
                 raise
             drain()
             refresh()
+    except KeyboardInterrupt:
+        # The signal handler (or the fallback above) already quiesced the
+        # engine and tore the sandboxes down; finish with exit 130, a
+        # resume hint, and no traceback.
+        _exit_interrupted(dashboard.run_id or seen.get("run_id"))
     finally:
         cleanup_registry.set_quiesce(None)
     if dashboard.chat_pending:

@@ -134,6 +134,11 @@ class CleanupRegistry:
         with self._lock:
             pairs = list(self._pairs)
         for pair in pairs:
+            if pair.keep:
+                # Deliberately kept pairs (--keep-sandboxes) survive aborts
+                # too; their kept marker is already in the run DB.
+                self.unregister(pair)
+                continue
             try:
                 pair.cleanup()
             except Exception:

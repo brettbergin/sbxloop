@@ -147,6 +147,14 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Ctrl+C now finishes cleanly instead of surfacing tracebacks/`Aborted!`.
+  Building on the #64 signal handlers and the #68 engine quiesce, the CLI
+  handles the interrupt in both display modes: after the sandboxes are
+  torn down it prints an `interrupted` notice and a `sbxloop resume RUN_ID` hint (interrupted runs stay resumable) and exits 130; a second
+  Ctrl+C during teardown force-quits, deferring leftover sandboxes to
+  `sbxloop sandbox prune`. The registry's `cleanup_all` additionally
+  respects `--keep-sandboxes` pairs on abnormal exit instead of deleting
+  sandboxes the run DB just marked as kept.
 - **P4 papercut batch (#68):**
   - `--keep-sandboxes` is now tri-state
     (`--keep-sandboxes/--no-keep-sandboxes`, default "no override") like
@@ -213,6 +221,9 @@ All notable changes to sdxloop are documented here. The project adheres to
   host-side decode. Polling now ends only on a *parsed* `worker.end` event —
   an agent message whose payload merely contains the literal string
   `"worker.end"` no longer terminates the poll early.
+
+> > > > > > > origin/main
+
 - `resume` now runs under the config the run was started with (#60). The
   full config has always been persisted in the runs table, but resume drove
   with whatever `load_config()` produced at resume time — so editing

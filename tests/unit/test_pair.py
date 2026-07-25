@@ -80,6 +80,17 @@ def test_registry_cleanup_all(fake_sbx: FakeSbx, tmp_path: Path) -> None:
     assert pair not in cleanup_registry._pairs
 
 
+def test_cleanup_all_leaves_kept_pairs_alive(fake_sbx: FakeSbx, tmp_path: Path) -> None:
+    """--keep-sandboxes pairs survive aborts too: cleanup_all only drops
+    them from the registry (their kept marker is already in the run DB)."""
+    pair = make_pair(fake_sbx, tmp_path, keep=True)
+    cleanup_registry.register(pair)
+    cleanup_registry.cleanup_all()
+    assert not gone(fake_sbx, "sbxloop-r1-agent")
+    assert not gone(fake_sbx, "sbxloop-r1-github")
+    assert pair not in cleanup_registry._pairs
+
+
 def test_signal_handler_cleans_and_reraises(fake_sbx: FakeSbx, tmp_path: Path) -> None:
     pair = make_pair(fake_sbx, tmp_path)
     cleanup_registry.register(pair)
