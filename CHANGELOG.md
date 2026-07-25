@@ -8,6 +8,19 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Added
 
+- **`sbxloop list-models`** — lists the models the GitHub Copilot SDK gives
+  the authenticated subscription access to, straight from the SDK's
+  `list_models()` API on the host (no sandbox): model id, display name,
+  billing multiplier, context window, vision support, reasoning-effort
+  levels (default marked), and policy state, with the configured `model`
+  highlighted and a warning when it is not in the list. `--json` emits the
+  SDK's raw model dicts for scripting. The SDK is optional host-side — the
+  new `sbxloop[copilot]` extra installs it, and the command explains that
+  when it is missing. Auth uses the SDK's normal env chain
+  (`COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN`, `./.env`
+  included), and failures carry an auth diagnostic naming which token env
+  var was visible.
+
 - **Prebaked sandbox templates + `sbxloop bake` (#48).** `sbxloop bake` runs
   the worker install ladder once in a scratch sandbox (plus a best-effort
   Copilot runtime pre-cache) and persists the result with `sbx template save`. With `[sandbox] template` pointing at the baked ref, provisioning
@@ -17,6 +30,7 @@ All notable changes to sdxloop are documented here. The project adheres to
   degrades to today's behavior instead of failing the run. Runs emit a
   `sandbox.prebaked` event either way, and `sbxloop doctor` warns when the
   configured template was baked with an older worker (re-run `sbxloop bake`) or is missing from `sbx template ls`.
+
 - **`sbxloop doctor` now runs an sbx conformance suite** (#52): every
   field-learned assumption about sbx semantics is a named probe with a
   machine-checkable verdict — secret-env visibility under `exec`, the
@@ -30,9 +44,11 @@ All notable changes to sdxloop are documented here. The project adheres to
   version's cache — doctor warns loudly, naming the dependent behavior.
   Provisioning's existing checks (secret visibility, mount discovery) now
   feed the same cache, so ordinary runs keep the verdicts fresh for free.
+
 - **`sbxloop secrets` command group** — proactive lifecycle management for
   the sbx custom-secret registrations sbxloop owns
   ([#55](https://github.com/brettbergin/sbxloop/issues/55)):
+
   - `secrets list` enumerates the tracked registrations (the Copilot token)
     across scopes and flags pre-collision state: stale registrations owned
     by dead run sandboxes, wrong host bindings from older versions, and
@@ -47,9 +63,11 @@ All notable changes to sdxloop are documented here. The project adheres to
     argv), warns when live sandboxes may still hold the old token, and
     verifies which secret strategy (proxy vs plain-env fallback) the next
     run will use via a throwaway sandbox (`--no-verify` skips).
+
 - The 0.1.3 secret-collision recovery logic now lives in a shared module
   (`sbxloop.sbx.secretstate`); provisioning and the `secrets` commands use
   the same field-hardened implementation.
+
 - **Plan-declared, least-privilege network egress** (#49). The PLAN phase
   may now declare external domains a task needs during EXECUTE (each with a
   justification) via a new `egress` field in the plan schema. Declarations
@@ -62,16 +80,19 @@ All notable changes to sdxloop are documented here. The project adheres to
   egress audit trail (`sbxloop logs RUN --type policy.`). `sbxloop config policy` renders the effective per-phase policy. sbx 0.35 has no
   revocation primitive, so grants persist for the sandbox's lifetime but
   never outlive a run (sandboxes are removed at run end).
+
 - **`keep_on_failure`** (config + `--keep-on-failure`) — successful runs clean
   up as always; failed runs (task failures and infra crashes alike) leave the
   sandbox pair alive, mark the run `kept_reason="debug"` in the state DB, emit
   a `run.keep` event, and print a hint naming the sandboxes and the shell
   command to inspect them. `--keep-sandboxes` runs are now marked
   `kept_reason="manual"` so `sandbox prune` respects them too.
+
 - **`sbxloop shell <run> [--role agent|github] [-c CMD]`** — opens an
   interactive shell (or runs a one-off command) inside a run's sandbox after
   verifying liveness via `sbx ls`. Works for kept, in-flight, and leaked
   sandboxes; the inner exit code is passed through.
+
 - **`sbxloop sandbox prune`** — garbage-collect orphaned `sbxloop-*` sandboxes
   left behind by crashed hosts or killed runs, by cross-referencing `sbx ls`
   against the state DB. Dry-run by default; `--force` removes, `--min-age`
@@ -127,6 +148,30 @@ All notable changes to sdxloop are documented here. The project adheres to
   - `status <run>` now prints the run's sandbox pair names with their
     current liveness per `sbx ls`, plus a `sbxloop shell` hint when one is
     running — no more reconstructing `sbxloop-<run>-agent` by hand.
+- **Delivery now batches blob creation into O(1) worker jobs (#66).**
+  `deliver_workspace` used to submit one `github.op` job per file — a full
+  job cycle (`sbx cp` job JSON in, fresh worker process, `sbx cp` result
+  out) per blob POST, so a 200-file workspace meant 200+ sequential job
+  round trips and tens of minutes of delivery. A new `blobs.create_many`
+  worker op receives the whole file manifest (base64-embedded in the job
+  JSON) and performs the per-file blob POSTs inside the github sandbox,
+  chunked only by a payload-size cap (4 MiB of base64 per job), with the
+  job timeout scaled to the manifest size. The worker streams
+  `gh.op_progress` events every 10 blobs so long deliveries stay visibly
+  alive in the TUI, and a per-file failure names the failing file (and its
+  position in the manifest) in the `run.deliver` error event. The e2e
+  workflow gains a gated 50-file delivery smoke asserting the PR opens
+  under a 120 s budget (`E2E_DELIVER_REPO` repository variable).
+- The poll transport's event tailing is now binary-safe and its completion
+  check parses events instead of substring-matching
+  ([#65](https://github.com/brettbergin/sbxloop/issues/65)). Chunks are
+  fetched base64-encoded and the byte offset advances by decoded byte count,
+  so `\r\n` in worker output can no longer drift the offset (duplicating or
+  dropping event lines), and a `tail -c` boundary that splits a multibyte
+  UTF-8 character is held by an incremental decoder instead of crashing the
+  host-side decode. Polling now ends only on a *parsed* `worker.end` event —
+  an agent message whose payload merely contains the literal string
+  `"worker.end"` no longer terminates the poll early.
 - `resume` now runs under the config the run was started with (#60). The
   full config has always been persisted in the runs table, but resume drove
   with whatever `load_config()` produced at resume time — so editing

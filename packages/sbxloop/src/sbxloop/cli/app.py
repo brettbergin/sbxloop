@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -12,6 +13,7 @@ from typing import Annotated, Any
 import typer
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape as rich_escape
 from rich.table import Table
 from rich.tree import Tree
 
@@ -985,6 +987,67 @@ def bake(
         console.print(
             f'set [cyan]\\[sandbox] template = "{record.ref}"[/] in sbxloop.toml to use it.'
         )
+
+
+@app.command("list-models")
+def list_models(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Machine-readable JSON on stdout (for scripting).")
+    ] = False,
+    timeout_s: Annotated[
+        float,
+        typer.Option("--timeout", help="Seconds to wait for the Copilot runtime and API."),
+    ] = 60.0,
+) -> None:
+    """List the models the GitHub Copilot SDK gives this host access to.
+
+    Queries the SDK directly on the host (no sandbox) with the same auth
+    chain agent sessions use, so the ids shown here are valid values for
+    `model` in sbxloop.toml and `sbxloop run --model`.
+    """
+    from sbxloop.cli.models import fetch_models, format_context, format_efforts, model_row
+
+    config = load_config()
+    try:
+        rows = [model_row(info) for info in fetch_models(timeout_s=timeout_s)]
+    except SdxloopError as exc:
+        # escape(): the install hint (`sbxloop[copilot]`) and arbitrary SDK
+        # error text must not be parsed as rich markup.
+        console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
+        raise typer.Exit(2) from exc
+    if json_output:
+        # bare JSON on stdout, nothing else — `sbxloop list-models --json | jq`
+        typer.echo(json.dumps([row.raw or {"id": row.id, "name": row.name} for row in rows]))
+        return
+    table = Table(title="copilot models")
+    for column in ("model", "name", "billing", "context", "vision", "reasoning", "policy"):
+        table.add_column(column)
+    for row in rows:
+        configured = row.id == config.model
+        # SDK-provided text is escaped: a model name with brackets must not
+        # be parsed as rich markup.
+        table.add_row(
+            f"[bold cyan]{rich_escape(row.id)}[/] ◀" if configured else rich_escape(row.id),
+            rich_escape(row.name),
+            f"{row.multiplier:g}x" if row.multiplier is not None else "",
+            format_context(row.context_window),
+            "yes" if row.vision else "",
+            format_efforts(row),
+            row.policy_state or "",
+        )
+    console.print(table)
+    if not rows:
+        console.print(
+            "[yellow]the SDK returned no models[/] — the subscription may have "
+            "no model access, or model policy blocks them all"
+        )
+    marker = (
+        f"◀ = configured model ({config.model})"
+        if any(row.id == config.model for row in rows)
+        else f"configured model: {config.model}"
+        + (" (the SDK picks one per session)" if config.model == "auto" else " — not in this list!")
+    )
+    console.print(f"[dim]{marker}; * = default reasoning effort[/]")
 
 
 @app.command()
