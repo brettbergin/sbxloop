@@ -98,6 +98,21 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- The fake sbx used in tests now scopes `pkill` to the sandbox's own
+  processes, emulating the microVM boundary. A timeout kill's host-wide
+  `pkill -f sbxloop_worker.*<job_id>` could TERM other tests' live worker
+  processes under pytest-xdist (job ids repeat across tests), surfacing as
+  spurious `exec rc=-15` / no-result failures in unrelated tests.
+- Worker wheel builds no longer mutate the live source tree, removing the
+  remaining parallel-test flakes and a version-skew hazard. Both
+  `resolve_worker_wheel`'s workspace build and the packaging test built in
+  place, which rewrote the packages' hatch-vcs `_version.py` files (raced
+  by every worker subprocess import under pytest-xdist) and deleted/rebuilt
+  the wheels in `src/sbxloop/_vendor/` mid-suite. Builds now run against a
+  private temp copy with the version pinned to the host's
+  (`SETUPTOOLS_SCM_PRETEND_VERSION`), which also guarantees the built wheel
+  passes the install ladder's lockstep version check even when git HEAD has
+  moved since the environment was last synced.
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and
   sbx-level errors raised by the delivery op jobs (`WorkerError`,

@@ -122,6 +122,43 @@ class TestStreamTransport:
         assert kills, "expected a pkill inside the sandbox"
         assert any("j1" in arg for c in kills for arg in c)
 
+    def test_timeout_kill_never_escapes_the_sandbox(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """The fake's pkill must emulate the microVM boundary. Job ids repeat
+        across tests ("j1" everywhere), so a host-wide
+        ``pkill -f sbxloop_worker.*j1`` from one test's timeout kill would
+        TERM other xdist workers' live worker processes mid-test."""
+        import subprocess
+        import time
+
+        # A process that matches the kill pattern but belongs to no sandbox.
+        decoy = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+                "sbxloop_worker-decoy",
+                "--job",
+                "j1.json",
+            ]
+        )
+        script = tmp_path / "script.json"
+        script.write_text(json.dumps([{"text": "slow", "sleep_s": 30}]))
+        import os
+
+        os.environ["SBXLOOP_ECHO_SCRIPT"] = str(script)
+        try:
+            client = make_client(sandbox, EventBus(), grace_s=1.0)
+            with pytest.raises(WorkerTimeoutError, match="exceeded"):
+                client.submit(agent_job(timeout_s=0.2))
+            time.sleep(0.5)  # let a stray SIGTERM (the bug) be delivered
+            assert decoy.poll() is None, "pkill escaped the sandbox and killed a foreign process"
+        finally:
+            del os.environ["SBXLOOP_ECHO_SCRIPT"]
+            decoy.kill()
+            decoy.wait()
+
     def test_missing_result_raises_worker_error(self, sandbox: Sandbox) -> None:
         client = make_client(sandbox, EventBus(), python="true")  # worker never runs
         with pytest.raises(WorkerError, match="produced no result"):

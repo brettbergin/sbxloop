@@ -18,10 +18,12 @@ sandboxes, 2 for usage errors.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -209,6 +211,41 @@ def cmd_create(root: Path, args: list[str]) -> int:
     return 0
 
 
+def fake_pkill(fs: Path, args: list[str]) -> int:
+    """Emulate pkill scoped to this sandbox's own processes.
+
+    A real sandbox is a microVM, so ``pkill -f PATTERN`` can only ever see
+    the VM's own processes. The fake runs on the host, where a raw pkill
+    would TERM matching processes belonging to *other* tests — pytest-xdist
+    runs many sandboxes concurrently and job ids repeat across tests, so
+    the client's ``sbxloop_worker.*<job_id>`` pattern collides. Emulate the
+    VM boundary: only processes whose command line references this
+    sandbox's fs are candidates (processes launched through this sandbox's
+    exec always qualify, because absolute-path rewriting embeds the fs path
+    in their argv).
+    """
+    pattern = args[-1] if args else ""
+    try:
+        regex = re.compile(pattern)
+    except re.error:
+        return 2
+    listing = subprocess.run(
+        ["ps", "-axo", "pid=,command="], capture_output=True, text=True, check=False
+    ).stdout
+    killed = False
+    for line in listing.splitlines():
+        pid_str, _, command = line.strip().partition(" ")
+        if not pid_str.isdigit() or str(fs) not in command or not regex.search(command):
+            continue
+        pid = int(pid_str)
+        if pid == os.getpid():
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)
+            killed = True
+    return 0 if killed else 1
+
+
 def cmd_exec(root: Path, args: list[str]) -> int:
     args = [a for a in args if a not in ("-it", "-i", "-t")]
     if not args:
@@ -225,6 +262,8 @@ def cmd_exec(root: Path, args: list[str]) -> int:
         return 2
     fs = path / "fs"
     rewritten = [rewrite_abs(fs, c) for c in cmd]
+    if rewritten[0] == "pkill":
+        return fake_pkill(fs, rewritten[1:])
     home = fs / "home/agent"
     home.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
