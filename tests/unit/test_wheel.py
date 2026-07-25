@@ -26,9 +26,7 @@ def test_vendored_wheel_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     vendor.mkdir()
     name = f"sbxloop_worker-{sbxloop.__version__}-py3-none-any.whl"
     (vendor / name).write_bytes(b"wheel")
-    monkeypatch.setattr(
-        wheel_mod, "resources", SimpleNamespace(files=lambda package: tmp_path)
-    )
+    monkeypatch.setattr(wheel_mod, "resources", SimpleNamespace(files=lambda package: tmp_path))
     resolved = wheel_mod.resolve_worker_wheel()
     assert resolved is not None
     assert resolved.name == name
