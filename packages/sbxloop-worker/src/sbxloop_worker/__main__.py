@@ -66,6 +66,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--heartbeat", type=float, default=15.0)
     run.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     run.add_argument("--cwd", type=Path, default=None)
+    # Resource guardrail thresholds (percent used; 0 disables). Sampling on
+    # the heartbeat always happens — thresholds only add warn/abort levels.
+    run.add_argument("--disk-warn", type=float, default=0.0)
+    run.add_argument("--disk-abort", type=float, default=0.0)
+    run.add_argument("--mem-warn", type=float, default=0.0)
     args = parser.parse_args(argv)
 
     apply_env_file(args.env_file)
@@ -95,6 +100,9 @@ def main(argv: list[str] | None = None) -> int:
             events_path=args.events,
             result_path=args.result,
             heartbeat_s=args.heartbeat,
+            disk_warn=args.disk_warn,
+            disk_abort=args.disk_abort,
+            mem_warn=args.mem_warn,
         ).run()
     except BaseException as exc:
         print(f"sbxloop_worker: fatal: {exc}", file=sys.stderr)

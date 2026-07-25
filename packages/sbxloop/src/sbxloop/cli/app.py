@@ -587,6 +587,56 @@ def config_show() -> None:
     console.print(table)
 
 
+@config_app.command("policy")
+def config_policy() -> None:
+    """Show the effective per-phase network egress policy."""
+    from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS
+    from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, GITHUB_ALLOW_DOMAINS
+
+    try:
+        config = load_config()
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+    extra = list(config.sandbox.extra_allow_domains)
+    baseline = ", ".join([*AGENT_ALLOW_DOMAINS, *extra])
+    advertised = ", ".join(PROMPT_ADVERTISED_DOMAINS)
+
+    table = Table(title="agent sandbox: effective egress per phase")
+    table.add_column("phase", no_wrap=True)
+    table.add_column("policy", overflow="fold")
+    table.add_row("decompose / plan", "baseline")
+    table.add_row(
+        "execute",
+        "baseline + plan-declared grants (auto-granted just before execute, "
+        "within the [policy] bounds below; every grant/refusal is event-logged)",
+    )
+    table.add_row(
+        "scrutinize / verify / validate",
+        "baseline + grants already made — sbx has no policy revocation, so "
+        "grants persist for the sandbox's lifetime (sandboxes are removed at "
+        "run end; grants never outlive a run)",
+    )
+    console.print(table)
+    console.print(f"baseline (provisioned per-sandbox): {baseline}")
+    console.print(f"advertised by the user's balanced preset: {advertised}")
+
+    bounds = Table(title="[policy] bounds for plan-declared grants")
+    bounds.add_column("bound", no_wrap=True)
+    bounds.add_column("patterns", overflow="fold")
+    bounds.add_row(
+        "allow", ", ".join(config.policy.allow) or "(empty — plans may only use the baseline)"
+    )
+    bounds.add_row("deny", ", ".join(config.policy.deny) or "(none)")
+    console.print(bounds)
+
+    if config.github.enabled:
+        gh_domains = ", ".join([*GITHUB_ALLOW_DOMAINS, *extra])
+        console.print(f"github sandbox (all phases, no plan grants): {gh_domains}")
+    console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
+
+
 @app.command()
 def init(
     force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
@@ -635,6 +685,19 @@ secret_strategy = "proxy"
 # Extra network allow rules applied to both sandboxes.
 extra_allow_domains = []
 
+[policy]
+# Bounds for plan-declared egress. At PLAN time the agent may declare extra
+# domains a task needs during EXECUTE (each with a justification); they are
+# auto-granted to the agent sandbox just before EXECUTE only when they match
+# `allow` and no `deny` pattern, and every grant/refusal is logged as a run
+# event (`sbxloop logs RUN --type policy.`). Patterns: exact domains,
+# "*.example.com" (the domain and all subdomains), or "*" (everything).
+# Empty `allow` (the default) means plans may only use the always-reachable
+# baseline: the Copilot/GitHub hosts, PyPI, and apt mirrors.
+# See `sbxloop config policy` for the effective per-phase policy.
+allow = []
+deny = []
+
 [github]
 # The GitHub integration. Unset (the default) disables GitHub entirely:
 # no github sandbox is provisioned, GH_TOKEN is not required, and
@@ -655,6 +718,15 @@ max_replans_per_task = 1
 max_tasks = 20
 max_wall_clock_s = 7200.0
 per_job_timeout_s = 900.0
+
+[limits]
+# Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
+# the worker heartbeat and shown as a gauge in the TUI status panel.
+# Crossing disk_abort fails the current task with an explicit
+# "sandbox disk exhausted" error.
+disk_warn = 85.0
+disk_abort = 95.0
+mem_warn = 90.0
 """
 
 

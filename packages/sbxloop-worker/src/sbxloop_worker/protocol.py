@@ -193,3 +193,8 @@ class EventTypes:
 
     GH_OP_START = "gh.op_start"
     GH_OP_END = "gh.op_end"
+
+    # Resource telemetry sampled on the heartbeat cadence. Worker-emitted,
+    # but sandbox-scoped: the host enriches these with the sandbox role.
+    SANDBOX_RESOURCES = "sandbox.resources"
+    SANDBOX_RESOURCES_WARNING = "sandbox.resources_warning"

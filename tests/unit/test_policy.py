@@ -1,0 +1,157 @@
+"""Plan-declared egress: pattern matching, bounds, and the grant-late granter."""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from sbxloop.config import Config
+from sbxloop.engine.model import EgressSpec
+from sbxloop.events import Event, EventBus, HostEventTypes
+from sbxloop.policy import (
+    EgressGranter,
+    effective_egress_bounds,
+    egress_rejection,
+    pattern_covers,
+    valid_pattern,
+)
+from sbxloop.sbx.cli import SbxCLI
+from tests.conftest import FakeSbx
+
+
+class TestPatterns:
+    def test_exact_match(self) -> None:
+        assert pattern_covers("registry.npmjs.org", "registry.npmjs.org")
+        assert not pattern_covers("registry.npmjs.org", "npmjs.org")
+
+    def test_case_insensitive(self) -> None:
+        assert pattern_covers("Example.COM", "example.com")
+
+    def test_wildcard_covers_base_and_subdomains(self) -> None:
+        assert pattern_covers("*.example.com", "example.com")
+        assert pattern_covers("*.example.com", "api.example.com")
+        assert pattern_covers("*.example.com", "deep.api.example.com")
+        assert not pattern_covers("*.example.com", "example.org")
+        assert not pattern_covers("*.example.com", "badexample.com")
+
+    def test_wildcard_request_needs_covering_wildcard(self) -> None:
+        assert pattern_covers("*.example.com", "*.example.com")
+        assert pattern_covers("*.example.com", "*.api.example.com")
+        assert not pattern_covers("api.example.com", "*.example.com")
+
+    def test_star_covers_everything(self) -> None:
+        assert pattern_covers("*", "anything.example")
+        assert pattern_covers("*", "*.example.com")
+
+    def test_valid_pattern(self) -> None:
+        assert valid_pattern("pypi.org")
+        assert valid_pattern("*.crates.io")
+        assert not valid_pattern("*")
+        assert valid_pattern("*", operator=True)
+        assert not valid_pattern("https://pypi.org")
+        assert not valid_pattern("pypi.org/simple")
+        assert not valid_pattern("pypi.org:443")
+        assert not valid_pattern("localhost")
+
+
+class TestBounds:
+    def test_deny_wins_over_allow(self) -> None:
+        reason = egress_rejection("evil.example.com", ["*.example.com"], ["evil.example.com"])
+        assert reason is not None and "deny" in reason
+
+    def test_unlisted_domain_rejected(self) -> None:
+        reason = egress_rejection("registry.npmjs.org", [], [])
+        assert reason is not None and "allow" in reason
+
+    def test_allowed_domain_passes(self) -> None:
+        assert egress_rejection("registry.npmjs.org", ["registry.npmjs.org"], []) is None
+
+    def test_effective_bounds_include_baseline_and_advertised(self) -> None:
+        config = Config.model_validate(
+            {
+                "sandbox": {"extra_allow_domains": ["internal.example.com"]},
+                "policy": {"allow": ["registry.npmjs.org"]},
+            }
+        )
+        allow, _deny = effective_egress_bounds(config)
+        # declaring an already-reachable domain must never fail a plan
+        assert "api.githubcopilot.com" in allow
+        assert "internal.example.com" in allow
+        assert "pypi.org" in allow
+        assert "registry.npmjs.org" in allow
+
+
+class TestEgressSpec:
+    def test_normalizes_domain(self) -> None:
+        assert EgressSpec(domain="  Registry.NPMJS.org ").domain == "registry.npmjs.org"
+
+    @pytest.mark.parametrize(
+        "bad", ["https://pypi.org", "pypi.org/simple", "*", "not a domain", ""]
+    )
+    def test_rejects_non_domains(self, bad: str) -> None:
+        with pytest.raises(ValidationError):
+            EgressSpec(domain=bad)
+
+
+class TestEgressGranter:
+    def make_granter(
+        self, fake_sbx: FakeSbx, events: list[Event], **config_overrides: object
+    ) -> EgressGranter:
+        config = Config.model_validate(config_overrides)
+        bus = EventBus()
+        bus.subscribe(events.append)
+        return EgressGranter(
+            SbxCLI(binary=str(fake_sbx.binary)), config, bus, "r1", "sbxloop-r1-agent"
+        )
+
+    def test_grants_in_bounds_domain_and_emits_event(self, fake_sbx: FakeSbx) -> None:
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events, policy={"allow": ["registry.npmjs.org"]})
+        granter.apply("t1", [("registry.npmjs.org", "npm install")])
+        assert [
+            "allow",
+            "network",
+            "registry.npmjs.org",
+            "--sandbox",
+            "sbxloop-r1-agent",
+        ] in fake_sbx.policies()
+        (event,) = [e for e in events if e.type == HostEventTypes.POLICY_ALLOW]
+        assert event.data["domain"] == "registry.npmjs.org"
+        assert event.data["reason"] == "npm install"
+        assert event.data["task_id"] == "t1"
+
+    def test_grant_is_idempotent_per_domain(self, fake_sbx: FakeSbx) -> None:
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events, policy={"allow": ["*.crates.io"]})
+        granter.apply("t1", [("static.crates.io", "cargo build")])
+        granter.apply("t2", [("static.crates.io", "cargo build again")])
+        assert len(fake_sbx.policies()) == 1
+        assert len([e for e in events if e.type == HostEventTypes.POLICY_ALLOW]) == 1
+
+    def test_baseline_domain_needs_no_grant(self, fake_sbx: FakeSbx) -> None:
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events)
+        granter.apply("t1", [("api.github.com", "call the API")])
+        assert fake_sbx.policies() == []
+        assert [e for e in events if e.type.startswith("policy.")] == []
+
+    def test_out_of_bounds_refused_with_deny_event(self, fake_sbx: FakeSbx) -> None:
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events)
+        granter.apply("t1", [("exfil.example.com", "totally legit")])
+        assert fake_sbx.policies() == []
+        (event,) = [e for e in events if e.type == HostEventTypes.POLICY_DENY]
+        assert event.data["domain"] == "exfil.example.com"
+
+    def test_deny_pattern_blocks_allowed_domain(self, fake_sbx: FakeSbx) -> None:
+        events: list[Event] = []
+        granter = self.make_granter(
+            fake_sbx,
+            events,
+            policy={"allow": ["*.example.com"], "deny": ["secrets.example.com"]},
+        )
+        granter.apply("t1", [("secrets.example.com", "read the secrets")])
+        assert fake_sbx.policies() == []
+        assert [e.type for e in events if e.type.startswith("policy.")] == [
+            HostEventTypes.POLICY_DENY
+        ]

@@ -6,7 +6,7 @@ from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 RunState = Literal[
     "created",
@@ -95,12 +95,40 @@ class TaskGraph(_Model):
         return 1 + max(self._depth(by_id[d], by_id) for d in task.depends_on)
 
 
+class EgressSpec(_Model):
+    """One plan-declared network need: a domain EXECUTE must reach, and why.
+
+    Granted to the agent sandbox just before EXECUTE — but only within the
+    operator's ``[policy]`` bounds (checked at plan time, enforced again at
+    grant time). ``domain`` is a bare domain or ``*.domain`` wildcard; no
+    scheme, path, or port, and never the bare ``"*"``.
+    """
+
+    domain: str
+    reason: str = ""
+
+    @field_validator("domain")
+    @classmethod
+    def _check_domain(cls, value: str) -> str:
+        from sbxloop.policy import valid_pattern
+
+        value = value.strip().lower()
+        if not valid_pattern(value):
+            raise ValueError(
+                f"egress domain must be a domain or *.domain wildcard "
+                f"(no scheme/path/port), got {value!r}"
+            )
+        return value
+
+
 class PlanModel(_Model):
     """The agent's plan for one task."""
 
     steps: list[str]
     expected_artifacts: list[str] = Field(default_factory=list)
     verify_commands: list[str] = Field(default_factory=list)
+    # External domains EXECUTE needs beyond the baseline, with justification.
+    egress: list[EgressSpec] = Field(default_factory=list)
 
 
 class Issue(_Model):

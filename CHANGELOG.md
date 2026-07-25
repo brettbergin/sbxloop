@@ -7,6 +7,20 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [Unreleased]
 
 ### Added
+- **Plan-declared, least-privilege network egress** (#49). The PLAN phase
+  may now declare external domains a task needs during EXECUTE (each with a
+  justification) via a new `egress` field in the plan schema. Declarations
+  are validated against operator-set bounds — a new `[policy]` section in
+  sbxloop.toml with `allow`/`deny` domain patterns (exact, `*.wildcard`, or
+  `*`) — and out-of-bounds requests fail plan validation with a remediation
+  hint. In-bounds grants are applied grant-late (`sbx policy allow network
+  <domain> --sandbox <agent>` at EXECUTE entry, so resumed runs re-grant on
+  their fresh sandboxes) and every grant/refusal is emitted as a
+  `policy.allow`/`policy.deny` run event, making the persisted event log an
+  egress audit trail (`sbxloop logs RUN --type policy.`). `sbxloop config
+  policy` renders the effective per-phase policy. sbx 0.35 has no
+  revocation primitive, so grants persist for the sandbox's lifetime but
+  never outlive a run (sandboxes are removed at run end).
 - **`keep_on_failure`** (config + `--keep-on-failure`) — successful runs clean
   up as always; failed runs (task failures and infra crashes alike) leave the
   sandbox pair alive, mark the run `kept_reason="debug"` in the state DB, emit

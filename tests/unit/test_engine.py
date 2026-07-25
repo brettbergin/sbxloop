@@ -75,8 +75,16 @@ class Harness:
         state.unlink(missing_ok=True)
 
     def engine(self, **config_overrides: Any) -> LoopEngine:
+        # Resource guardrails default OFF in the harness: the real worker
+        # samples the host filesystem here, so default thresholds would make
+        # tests depend on how full the developer's disk is.
+        limits = config_overrides.pop("limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0})
         config = Config.model_validate(
-            {"state_dir": str(self.state_dir), "budgets": config_overrides.pop("budgets", {})}
+            {
+                "state_dir": str(self.state_dir),
+                "budgets": config_overrides.pop("budgets", {}),
+                "limits": limits,
+            }
             | config_overrides
         )
         bus = EventBus()
@@ -298,6 +306,49 @@ class TestJsonRetry:
         harness.script([{"json": {"tasks": [{"id": "t1"}]}}, {"json": {"tasks": [{"id": "t1"}]}}])
         with pytest.raises(WorkerError, match="invalid output twice"):
             harness.engine().start("never valid")
+
+
+PLAN_NPM = {
+    "json": {
+        "steps": ["npm install"],
+        "expected_artifacts": [],
+        "verify_commands": [],
+        "egress": [{"domain": "registry.npmjs.org", "reason": "npm install"}],
+    }
+}
+
+
+class TestPlanEgress:
+    """Plan-declared egress: bounded by [policy], granted just before EXECUTE."""
+
+    def test_in_bounds_egress_granted_and_event_logged(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_NPM, EXECUTE, PASS, ACCEPT])
+        result = harness.engine(policy={"allow": ["registry.npmjs.org"]}).start("npm task")
+        assert result.state == "completed"
+        agent = f"sbxloop-{result.run_id}-agent"
+        assert [
+            "allow",
+            "network",
+            "registry.npmjs.org",
+            "--sandbox",
+            agent,
+        ] in harness.fake_sbx.policies()
+        (event,) = [e for e in harness.events if e.type == "policy.allow"]
+        assert event.data["domain"] == "registry.npmjs.org"
+        assert event.data["reason"] == "npm install"
+        assert event.data["task_id"] == "t1"
+
+    def test_out_of_bounds_egress_rejected_then_retried(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_NPM, PLAN, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("npm denied")
+        assert result.state == "completed"
+        grants = [c for c in harness.fake_sbx.policies() if "registry.npmjs.org" in c]
+        assert grants == []
+
+    def test_out_of_bounds_egress_twice_fails(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_NPM, PLAN_NPM])
+        with pytest.raises(WorkerError, match="invalid output twice"):
+            harness.engine().start("insists on npm")
 
 
 class TestKeepOnFailure:
@@ -530,6 +581,43 @@ class TestDeliverHook:
         result = harness.engine().start("plain run")
         assert result.state == "completed"
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
+
+
+class TestResourceGuardrail:
+    """[limits] guardrails end-to-end: the real worker samples the real
+    filesystem, so a tiny threshold reliably classifies warn/abort."""
+
+    def test_disk_abort_fails_task_with_diagnosis(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1"))])
+        # disk_warn=0 (disabled) + microscopic disk_abort: any real fs
+        # sample crosses it, so the decompose job's baseline sample puts the
+        # agent sandbox at level=abort before the task loop starts.
+        result = harness.engine(limits={"disk_warn": 0, "disk_abort": 0.1}).start("doomed")
+        assert result.state == "failed"
+        assert [t.state for t in result.tasks] == ["failed"]
+        assert "sandbox disk exhausted" in (result.tasks[0].last_feedback or "")
+
+    def test_disk_warn_never_fails_tasks(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(limits={"disk_warn": 0.1, "disk_abort": 95.0}).start("warned")
+        assert result.succeeded
+        warnings = [e for e in harness.events if e.type == "sandbox.resources_warning"]
+        assert warnings and warnings[0].data["role"] == "agent"
+
+    def test_artifacts_event_carries_disk_pressure_note(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        harness.engine(limits={"disk_warn": 0.1, "disk_abort": 95.0}).start("pressured")
+        artifacts = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS]
+        assert artifacts
+        assert artifacts[-1].data.get("resources_level") == "warn"
+        assert artifacts[-1].data.get("disk_used_pct") is not None
+
+    def test_resource_events_are_persisted_for_post_hoc_queries(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(limits={"disk_warn": 0.1, "disk_abort": 95.0})
+        result = engine.start("queryable")
+        rows = engine.store.events(result.run_id, type_prefix="sandbox.resources")
+        assert rows, "sandbox.resources events were not persisted"
 
 
 class TestGithubReporting:
