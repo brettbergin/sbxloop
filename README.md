@@ -133,6 +133,7 @@ Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLO
 
 - [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume
 - [Worker protocol](docs/worker-protocol.md) — the host↔worker contract: job kinds, events, transports
+- [Spike: agent-session backend](docs/spikes/46-agent-session-backend.md) — feasibility study for proxy-held secrets via sbx native sessions (issue #46)
 - [Changelog](CHANGELOG.md)
 
 ## Requirements
