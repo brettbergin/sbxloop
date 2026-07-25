@@ -659,6 +659,78 @@ class TestRunCommand:
         for message in messages:
             assert message in result.output
 
+    def test_run_no_tui_ctrl_c_removes_sandboxes_and_hints_resume(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl+C mid-run exits 130 without a traceback, removes the run's
+        sandboxes, and points at `sbxloop resume` (the run state stays
+        resumable)."""
+        self.make_run_env(workdir, monkeypatch, [])
+        from sbxloop.engine.phases import PhaseRunner
+
+        def interrupt(self: PhaseRunner) -> Any:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(PhaseRunner, "decompose", interrupt)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui"])
+        assert result.exit_code == 130, result.output
+        assert "interrupted" in result.output
+        assert "resume" in result.output
+        assert "Traceback" not in result.output
+        removed = fake_sbx.invocations("rm")
+        assert any(arg.endswith("-agent") for args in removed for arg in args), removed
+
+    def test_run_tui_ctrl_c_exits_130_without_traceback(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A KeyboardInterrupt in the main display loop (where Ctrl+C lands
+        in TUI mode, while the engine runs on a worker thread) exits 130
+        cleanly instead of leaking a traceback and a live engine thread."""
+        import time as real_time
+
+        import sbxloop.cli.app as app_module
+
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Only task",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+                {"text": "did it"},
+                {"json": {"verdict": "pass"}},
+                {"json": {"verdict": "accept"}},
+            ],
+        )
+
+        class InterruptingTime:
+            """time shim for the drive loop: first sleep is the Ctrl+C."""
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_time, name)
+
+            @staticmethod
+            def sleep(seconds: float) -> None:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(app_module, "time", InterruptingTime())
+        result = runner.invoke(app, ["run", "make it so"])  # tui mode (default)
+        assert result.exit_code == 130, result.output
+        assert "interrupted" in result.output
+        assert "Traceback" not in result.output
+
     def test_run_report_refused_without_github_config(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:

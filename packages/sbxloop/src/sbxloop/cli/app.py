@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -26,6 +26,7 @@ from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
 from sbxloop.sbx.secretstate import (
@@ -85,6 +86,37 @@ def _store(config: Config) -> StateStore:
     return StateStore(config.state_dir / "state.db")
 
 
+def _exit_interrupted(
+    run_id: str | None, engine_thread: threading.Thread | None = None
+) -> NoReturn:
+    """Ctrl+C: remove the run's sandboxes and exit 130, without a traceback.
+
+    The run's persisted state is untouched (interrupted states are all
+    resumable), so `sbxloop resume` picks the run back up with fresh
+    sandboxes. A second Ctrl+C during teardown force-quits and leaves any
+    remaining sandboxes to `sbxloop sandbox prune`.
+    """
+    console.print("\n[bold yellow]interrupted[/] — removing sandboxes (Ctrl+C again to force quit)")
+    try:
+        cleanup_registry.cleanup_all()
+        if engine_thread is not None and engine_thread.is_alive():
+            # Sandbox removal fails the engine thread's in-flight sbx call;
+            # give it a moment to unwind (it is a daemon thread either way).
+            engine_thread.join(timeout=10.0)
+    except KeyboardInterrupt:
+        console.print(
+            "[bold red]force quit[/] — sandboxes may be left behind; "
+            "clean up with [cyan]sbxloop sandbox prune --force[/]"
+        )
+        # atexit would re-enter the same blocking cleanup; skip it.
+        os._exit(130)
+    if run_id is not None:
+        console.print(
+            f"run [bold cyan]{run_id}[/] interrupted — resume with [cyan]sbxloop resume {run_id}[/]"
+        )
+    raise typer.Exit(130)
+
+
 def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     """Run start/resume with the scrollback transcript + pinned status, or
     plain event logs (--no-tui).
@@ -95,10 +127,29 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     the bottom is redrawn in place. Events arrive on the engine thread but
     every terminal write happens here on the main thread, via a queue —
     ordering stays deterministic and rich's Live never interleaves.
+
+    Ctrl+C is handled here for both modes: the first interrupt tears the
+    sandboxes down and exits 130 with a resume hint, a second one
+    force-quits (see ``_exit_interrupted``).
     """
+    # Pair registration happens on the engine thread in TUI mode, which
+    # cannot install signal handlers; install them from the main thread so
+    # SIGTERM also unwinds into cleanup instead of killing the process cold.
+    cleanup_registry.install_signal_handlers()
+    seen: dict[str, str] = {}
+
+    def remember(event: Event) -> None:
+        seen.setdefault("run_id", event.run_id)
+
+    engine.bus.subscribe(remember)
+
     if not tui:
         engine.bus.subscribe(plain_printer(console))
-        return action()  # type: ignore[no-any-return]
+        try:
+            return action()  # type: ignore[no-any-return]
+        except KeyboardInterrupt:
+            # The pair context manager already cleaned up while unwinding.
+            _exit_interrupted(seen.get("run_id"))
 
     dashboard = Dashboard()
     pending: queue.SimpleQueue[Event] = queue.SimpleQueue()
@@ -112,29 +163,32 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
             outcome["error"] = exc
 
     thread = threading.Thread(target=target, daemon=True)
-    with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
+    try:
+        with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
 
-        def drain() -> None:
-            while True:
-                try:
-                    event = pending.get_nowait()
-                except queue.Empty:
-                    return
-                dashboard.on_event(event)
-                rendered = render_event(event)
-                if rendered is not None:
-                    live.console.print(rendered)
+            def drain() -> None:
+                while True:
+                    try:
+                        event = pending.get_nowait()
+                    except queue.Empty:
+                        return
+                    dashboard.on_event(event)
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        live.console.print(rendered)
 
-        thread.start()
-        while thread.is_alive():
+            thread.start()
+            while thread.is_alive():
+                drain()
+                live.update(dashboard.renderable())
+                time.sleep(0.15)
             drain()
             live.update(dashboard.renderable())
-            time.sleep(0.15)
-        drain()
-        live.update(dashboard.renderable())
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome["result"]  # type: ignore[no-any-return]
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]  # type: ignore[no-any-return]
+    except KeyboardInterrupt:
+        _exit_interrupted(dashboard.run_id or seen.get("run_id"), engine_thread=thread)
 
 
 _TREE_MAX_FILES = 50

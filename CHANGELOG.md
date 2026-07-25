@@ -98,6 +98,22 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Ctrl+C now exits cleanly instead of throwing tracebacks and leaving the
+  process in limbo. The CLI handles the interrupt in both display modes:
+  the first Ctrl+C tears the run's sandboxes down, prints a
+  `sbxloop resume RUN_ID` hint (interrupted runs stay resumable), and
+  exits 130; a second Ctrl+C during teardown force-quits, deferring
+  leftover sandboxes to `sbxloop sandbox prune`. Under the hood the
+  cleanup registry's signal handlers no longer tear sandboxes down inside
+  the handler (seconds of `sbx` subprocess work that re-entered on a
+  second Ctrl+C) — they convert SIGINT/SIGTERM into their ordinary Python
+  exceptions and cleanup happens by unwinding, with atexit as the
+  backstop. TUI runs also install those handlers now: pair registration
+  happens on the engine worker thread, which cannot install signal
+  handlers, and the failed attempt used to latch so SIGTERM killed the
+  process without any cleanup. `cleanup_all` additionally respects
+  `--keep-sandboxes` pairs on abnormal exit instead of deleting sandboxes
+  the run DB just marked as kept.
 - `resume` now runs under the config the run was started with (#60). The
   full config has always been persisted in the runs table, but resume drove
   with whatever `load_config()` produced at resume time — so editing

@@ -85,8 +85,13 @@ revocation primitive, so grants persist for the sandbox's lifetime
 removed at run end and `resume` provisions fresh ones.
 
 Cleanup is guaranteed by `SandboxPair` (context manager) plus a process-wide
-registry hooked into `atexit` and SIGINT/SIGTERM: aborted runs do not leak
-microVMs. Sandboxes are **cattle** — `resume` always provisions a fresh pair.
+registry hooked into `atexit`; its SIGINT/SIGTERM handlers convert the signal
+into the ordinary Python exception so teardown happens by unwinding (never
+inside a signal handler). Aborted runs do not leak microVMs: the CLI's first
+Ctrl+C removes the run's sandboxes and exits 130 with a `sbxloop resume` hint
+(interrupted runs stay resumable), a second force-quits and defers to
+`sbxloop sandbox prune`. Sandboxes are **cattle** — `resume` always
+provisions a fresh pair.
 
 ## The loop
 

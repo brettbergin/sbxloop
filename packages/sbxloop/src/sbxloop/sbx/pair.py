@@ -6,8 +6,10 @@ github-ops sandbox (GH_TOKEN only) — otherwise ``pair.github`` is None and
 no GitHub capability exists anywhere in the run. The pair is a context
 manager whose
 exit stops and removes both sandboxes unless ``keep`` is set; a process-wide
-registry additionally cleans up on interpreter exit and on SIGINT/SIGTERM,
-so aborted runs do not leak microVMs.
+registry additionally cleans up on interpreter exit, and turns SIGINT/SIGTERM
+into the ordinary Python exceptions so cleanup happens by unwinding (context
+managers, the CLI's interrupt path, the atexit hook) — aborted runs do not
+leak microVMs, and no sandbox teardown ever runs inside a signal handler.
 """
 
 from __future__ import annotations
@@ -86,12 +88,20 @@ class SandboxPair:
 
 
 class CleanupRegistry:
-    """Process-wide safety net: cleans registered pairs on exit and signals."""
+    """Process-wide safety net: cleans registered pairs on interpreter exit.
+
+    The signal handlers only convert SIGINT/SIGTERM into their ordinary
+    Python exceptions; the actual sandbox teardown happens by unwinding —
+    pair context managers, the CLI's interrupt path, and the atexit hook.
+    Tearing sandboxes down inside a signal handler would block Ctrl+C for
+    seconds of ``sbx`` subprocess work and re-enter on a second signal.
+    """
 
     def __init__(self) -> None:
         self._pairs: list[SandboxPair] = []
         self._lock = threading.Lock()
-        self._installed = False
+        self._atexit_installed = False
+        self._signals_installed = False
         self._previous: dict[int, Any] = {}
 
     def register(self, pair: SandboxPair) -> None:
@@ -109,26 +119,42 @@ class CleanupRegistry:
         with self._lock:
             pairs = list(self._pairs)
         for pair in pairs:
+            if pair.keep:
+                # Deliberately kept pairs (--keep-sandboxes) survive aborts
+                # too; their kept marker is already in the run DB.
+                self.unregister(pair)
+                continue
             try:
                 pair.cleanup()
             except Exception:
                 logger.warning("cleanup failed for run %s", pair.run_id, exc_info=True)
 
+    def install_signal_handlers(self) -> None:
+        """Install the SIGINT/SIGTERM handlers (idempotent, main thread only).
+
+        ``register()`` installs them as a side effect, but only when it runs
+        on the main thread — the CLI drives runs on a worker thread in TUI
+        mode, so it calls this from the main thread before starting one.
+        """
+        with self._lock:
+            self._install_handlers()
+
     def _install_handlers(self) -> None:
-        if self._installed:
+        if not self._atexit_installed:
+            self._atexit_installed = True
+            atexit.register(self.cleanup_all)
+        if self._signals_installed:
             return
-        self._installed = True
-        atexit.register(self.cleanup_all)
         if threading.current_thread() is not threading.main_thread():
             return  # signal handlers can only be installed from the main thread
+        self._signals_installed = True
         for signum in (signal.SIGINT, signal.SIGTERM):
             # ValueError/OSError: not installable in this context (e.g. no tty)
             with contextlib.suppress(ValueError, OSError):
                 self._previous[signum] = signal.signal(signum, self._handle_signal)
 
     def _handle_signal(self, signum: int, frame: types.FrameType | None) -> None:
-        logger.info("signal %s received; cleaning up sandboxes", signum)
-        self.cleanup_all()
+        logger.info("signal %s received", signum)
         previous = self._previous.get(signum)
         if callable(previous):
             previous(signum, frame)
