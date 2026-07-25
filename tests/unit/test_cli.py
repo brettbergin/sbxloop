@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, ClassVar
@@ -78,7 +79,11 @@ class TestBasics:
         for command in ("run", "resume"):
             result = runner.invoke(app, [command, "--help"])
             assert result.exit_code == 0
-            assert "--no-chat" in result.output
+            # GitHub Actions forces typer's terminal colors on, and the
+            # option highlighter styles the negative-flag prefix separately —
+            # ANSI codes land INSIDE "--no-chat". Assert on stripped text.
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+            assert "--no-chat" in plain
 
 
 class TestStatusAndLogs:
