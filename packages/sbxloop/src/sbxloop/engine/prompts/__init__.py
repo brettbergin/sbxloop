@@ -20,8 +20,13 @@ def _template(name: str) -> Template:
 
 
 def render(name: str, **context: str) -> str:
-    """Render prompt template ``name`` with strict substitution."""
+    """Render prompt template ``name`` with strict substitution.
+
+    ``retry_context`` and ``parallel_context`` are optional sections that
+    default to empty; every other variable is required.
+    """
     context.setdefault("retry_context", "")
+    context.setdefault("parallel_context", "")
     return _template(name).substitute(context)
 
 

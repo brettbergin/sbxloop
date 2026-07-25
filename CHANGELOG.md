@@ -6,6 +6,23 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Parallel task execution across agent sandboxes** (#53): with
+  `[run] max_parallel > 1` (or `sbxloop run --max-parallel N`), independent
+  tasks that declare disjoint `owns` workspace subtrees in DECOMPOSE fan
+  out across extra agent sandboxes, one per task, in isolated workdirs
+  seeded from the merged tree. Writes are attributed per task at harvest
+  and enforced against the declared ownership — a task that writes outside
+  its `owns` fails loudly (`task.conflict` event) and its changes are
+  discarded, never merged last-writer-wins. Tasks without `owns` always
+  run alone. The default (`max_parallel = 1`) preserves the sequential
+  loop exactly. New `wave.start`/`wave.end` events; `task.start` now
+  carries the executing sandbox name. Extra sandboxes receive the Copilot
+  token via the in-VM env file (sbx keys custom secrets globally by env
+  name, so a second proxy binding would steal the primary's). See
+  docs/parallel-execution.md for the design and cost tradeoffs (warm
+  pools/templates are near-prerequisites for real wall-clock wins).
+
 ### Changed
 - **Releases are now fully automated** (aligned with the entrygraph release
   strategy): every merge to `main` runs the check suite, auto-bumps the patch

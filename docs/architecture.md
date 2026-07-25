@@ -108,6 +108,19 @@ whole run.
 Structured JSON phases are validated against pydantic models with one retry
 that feeds the validation error back to the agent.
 
+### Parallel waves (`[run] max_parallel > 1`)
+
+By default the loop is strictly sequential. With `max_parallel > 1` the
+engine schedules the task DAG in **waves**: dependency-ready tasks that
+declare pairwise-disjoint `owns` subtrees fan out across extra agent
+sandboxes (provisioned lazily, one per concurrent task), each running its
+full per-task pipeline in an isolated in-VM workdir seeded from the merged
+host tree. At wave end each task's writes are harvested, attributed
+exactly, checked against its declared ownership (violations fail the task
+loudly — never last-writer-wins), and merged. Tasks without `owns` always
+run alone. See [parallel-execution.md](parallel-execution.md) for the full
+design, cost tradeoffs, and open sbx field questions.
+
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with

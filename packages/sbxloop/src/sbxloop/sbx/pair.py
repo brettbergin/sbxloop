@@ -3,7 +3,9 @@
 A run's pair consists of the agent sandbox (COPILOT_GITHUB_TOKEN only) and,
 when the GitHub integration is configured (``[github].repo``), the
 github-ops sandbox (GH_TOKEN only) — otherwise ``pair.github`` is None and
-no GitHub capability exists anywhere in the run. The pair is a context
+no GitHub capability exists anywhere in the run. Parallel runs may add
+extra agent sandboxes (``pair.extras``) once the fan-out is known; cleanup
+covers them all. The pair is a context
 manager whose
 exit stops and removes both sandboxes unless ``keep`` is set; a process-wide
 registry additionally cleans up on interpreter exit and on SIGINT/SIGTERM,
@@ -49,7 +51,15 @@ class SandboxPair:
         self.workspace = workspace
         self.agent_workdir = agent_workdir
         self.mounted = mounted
+        # Additional agent sandboxes for parallel waves, provisioned lazily
+        # by Provisioner.add_agents once the engine knows the actual fan-out.
+        self.extras: list[Sandbox] = []
         self._cleaned = False
+
+    @property
+    def agents(self) -> list[Sandbox]:
+        """All agent sandboxes: the primary first, then extras."""
+        return [self.agent, *self.extras]
 
     def __enter__(self) -> SandboxPair:
         cleanup_registry.register(self)
@@ -72,7 +82,7 @@ class SandboxPair:
             return
         self._cleaned = True
         cleanup_registry.unregister(self)
-        for sandbox in (self.agent, self.github):
+        for sandbox in (self.agent, *self.extras, self.github):
             if sandbox is None:
                 continue
             try:
