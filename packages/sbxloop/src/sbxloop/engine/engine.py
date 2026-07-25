@@ -32,8 +32,6 @@ from sbxloop.engine.phases import PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
-    DeliveryError,
-    GithubOpsError,
     SbxError,
     SdxloopError,
     StateError,
@@ -256,7 +254,12 @@ class LoopEngine:
                 base=gh.deliver_base,
                 draft=gh.deliver_draft,
             )
-        except (DeliveryError, GithubOpsError) as exc:
+        except SdxloopError as exc:
+            # Catches the whole family the delivery path can raise — not just
+            # DeliveryError/GithubOpsError but WorkerError/WorkerTimeoutError/
+            # SbxError from the op jobs themselves. Anything narrower lets an
+            # infra hiccup during this optional post-completion step escape
+            # _drive and leave the completed run looking failed (#59).
             logger.warning("delivery to %s failed for run %s", repo, run_id, exc_info=True)
             self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
             return

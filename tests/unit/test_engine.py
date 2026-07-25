@@ -426,6 +426,33 @@ class TestDeliverHook:
         deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
         assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
 
+    def test_delivery_infra_error_never_fails_a_completed_run(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """WorkerError/SbxError from the op jobs (not just DeliveryError)
+        must stay inside _deliver: the run already succeeded (#59)."""
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.errors import SbxError, WorkerTimeoutError
+
+        for exc in (
+            WorkerError("worker for job j1 produced no result file"),
+            WorkerTimeoutError("job j1 exceeded 120s"),
+            SbxError("sbx command failed: cp", stderr="daemon exploded"),
+        ):
+
+            def fake_deliver(*args: Any, _exc: Exception = exc, **kwargs: Any) -> Any:
+                raise _exc
+
+            monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+            harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+            harness.events.clear()
+            result = self.deliver_engine(harness).start(f"ship {type(exc).__name__}")
+
+            assert result.state == "completed", type(exc).__name__
+            deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+            assert len(deliver_events) == 1
+            assert str(exc) in deliver_events[0].data["error"]
+
     def test_failed_run_never_delivers(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:

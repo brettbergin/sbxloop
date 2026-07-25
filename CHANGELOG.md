@@ -7,6 +7,13 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [Unreleased]
 
 ### Fixed
+- A delivery infrastructure failure can no longer mark a completed run as
+  failed (#59). `--deliver` runs after the run has succeeded; worker- and
+  sbx-level errors raised by the delivery op jobs (`WorkerError`,
+  `WorkerTimeoutError`, `SbxError`) were escaping the delivery guard and
+  leaving the run stuck in `finalizing`, reported as failed. Delivery now
+  contains every sbxloop error, keeps the loud `run.deliver` event, and the
+  run finishes `completed` as documented.
 - GitHub progress reporting (`--report`) now actually reports (#58). The
   tracking issue was never created: the hook subscribed to run lifecycle
   events that are emitted before the github sandbox exists and after it is
