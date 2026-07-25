@@ -1,7 +1,10 @@
 """SandboxPair — the core sbxloop primitive — and its cleanup guarantees.
 
-A run's pair consists of the agent sandbox (COPILOT_GITHUB_TOKEN only) and
-the github-ops sandbox (GH_TOKEN only). The pair is a context manager whose
+A run's pair consists of the agent sandbox (COPILOT_GITHUB_TOKEN only) and,
+when the GitHub integration is configured (``[github].repo``), the
+github-ops sandbox (GH_TOKEN only) — otherwise ``pair.github`` is None and
+no GitHub capability exists anywhere in the run. The pair is a context
+manager whose
 exit stops and removes both sandboxes unless ``keep`` is set; a process-wide
 registry additionally cleans up on interpreter exit and on SIGINT/SIGTERM,
 so aborted runs do not leak microVMs.
@@ -28,7 +31,7 @@ class SandboxPair:
         self,
         run_id: str,
         agent: Sandbox,
-        github: Sandbox,
+        github: Sandbox | None = None,
         *,
         keep: bool = False,
         workspace: Path | None = None,
@@ -64,12 +67,14 @@ class SandboxPair:
             self.cleanup()
 
     def cleanup(self) -> None:
-        """Stop and remove both sandboxes. Idempotent, best-effort per sandbox."""
+        """Stop and remove the pair's sandboxes. Idempotent, best-effort each."""
         if self._cleaned:
             return
         self._cleaned = True
         cleanup_registry.unregister(self)
         for sandbox in (self.agent, self.github):
+            if sandbox is None:
+                continue
             try:
                 sandbox.stop()
             except Exception:

@@ -79,4 +79,4 @@ class TestEnvExample:
         assert env, "expected commented SBXLOOP_ examples"
         config = load_config(cwd=tmp_path, env=env)
         assert isinstance(config, Config)
-        assert config.github.report_repo == "owner/repo"
+        assert config.github.repo == "owner/repo"

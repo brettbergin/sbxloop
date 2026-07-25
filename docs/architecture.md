@@ -37,7 +37,10 @@ Two distributions ship from this repo in lockstep versions:
 
 ## The security primitive: one run = two sandboxes
 
-Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`:
+Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`.
+The github sandbox exists only when the GitHub integration is configured
+(`[github] repo = "owner/repo"`); without it, `pair.github` is `None`, `GH_TOKEN`
+is not required, and the run has no GitHub capability at all:
 
 | | agent sandbox | github sandbox |
 |---|---|---|

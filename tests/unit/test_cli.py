@@ -246,6 +246,28 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "FAIL" in result.output
 
+    def test_doctor_ok_without_gh_token_when_github_unconfigured(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "github integration" in result.output
+        assert "not configured" in result.output
+
+    def test_doctor_fails_missing_gh_token_when_github_configured(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("SBXLOOP_GITHUB__REPO", "owner/repo")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "FAIL" in result.output
+
     def test_doctor_without_sbx(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PATH", str(workdir))  # nothing on PATH
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
@@ -300,6 +322,57 @@ class TestRunCommand:
         assert "finished" in result.output
         assert "completed" in result.output
         assert "t1: done" in result.output
+
+    def test_run_report_refused_without_github_config(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, [])
+        result = runner.invoke(app, ["run", "anything", "--report", "--no-tui"])
+        assert result.exit_code == 2
+        assert "GitHub integration is not configured" in result.output
+        # refused before any sandbox was created
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_report_config_without_repo_refused(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, [])
+        monkeypatch.setenv("SBXLOOP_GITHUB__REPORT", "true")
+        result = runner.invoke(app, ["run", "anything", "--no-tui"])
+        assert result.exit_code == 2
+        assert "GitHub integration is not configured" in result.output
+
+    def test_run_no_report_overrides_config(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # report=true in config but no repo: --no-report must make the run legal.
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Only task",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+                {"text": "did it"},
+                {"json": {"verdict": "pass"}},
+                {"json": {"verdict": "accept"}},
+            ],
+        )
+        monkeypatch.setenv("SBXLOOP_GITHUB__REPORT", "true")
+        result = runner.invoke(app, ["run", "make it so", "--no-report", "--no-tui"])
+        assert result.exit_code == 0, result.output
 
     def test_run_summary_lists_artifacts(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

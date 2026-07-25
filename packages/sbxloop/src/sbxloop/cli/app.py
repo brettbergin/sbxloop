@@ -158,8 +158,12 @@ def _finish(result: RunResult, config: Config) -> None:
 @app.command()
 def run(
     outcome: Annotated[str, typer.Argument(help="The outcome to achieve.")],
-    repo: Annotated[
-        str | None, typer.Option("--repo", help="owner/repo for GitHub progress reporting.")
+    report: Annotated[
+        bool | None,
+        typer.Option(
+            "--report/--no-report",
+            help="Post run progress to the configured [github].repo.",
+        ),
     ] = None,
     model: Annotated[str | None, typer.Option("--model", help="Copilot model id.")] = None,
     keep_sandboxes: Annotated[
@@ -169,10 +173,17 @@ def run(
 ) -> None:
     """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
     config = _config_with_overrides(model=model, keep_sandboxes=keep_sandboxes or None)
-    if repo:
+    if report is not None:
         config = config.model_copy(
-            update={"github": config.github.model_copy(update={"report_repo": repo})}
+            update={"github": config.github.model_copy(update={"report": report})}
         )
+    if config.github.report and not config.github.enabled:
+        console.print(
+            "[bold red]GitHub integration is not configured.[/] Progress reporting "
+            'needs a repository: set [cyan]\\[github] repo = "owner/repo"[/] in '
+            "sbxloop.toml (see `sbxloop init`), then re-run."
+        )
+        raise typer.Exit(2)
     engine = LoopEngine(config)
     try:
         result = _drive_with_ui(engine, tui=tui, action=lambda: engine.start(outcome))
@@ -443,8 +454,13 @@ secret_strategy = "proxy"
 extra_allow_domains = []
 
 [github]
-# Report run progress to a GitHub repo ("owner/repo"); empty disables.
-# report_repo = "you/your-repo"
+# The GitHub integration. Unset (the default) disables GitHub entirely:
+# no github sandbox is provisioned, GH_TOKEN is not required, and
+# repo-facing features refuse to run. Set `repo` to the ONE repository
+# sbxloop may work with; the toggles below act on it.
+# repo = "you/your-repo"
+# Post run progress (issues/comments) to the configured repo.
+# report = false
 
 [budgets]
 max_revisions_per_task = 2

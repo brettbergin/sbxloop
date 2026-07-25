@@ -120,6 +120,25 @@ class TestHappyPath:
         # sandboxes cleaned up
         assert harness.sandboxes_left() == []
 
+    def test_default_run_is_github_less(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No [github].repo → only the agent sandbox exists, GH_TOKEN unneeded."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("no github anywhere")
+        assert result.succeeded
+        created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
+        assert all(name.endswith("-agent") for name in created), created
+
+    def test_configured_github_provisions_ops_sandbox(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(github={"repo": "owner/repo"}).start("with github")
+        assert result.succeeded
+        created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
+        assert any(name.endswith("-github") for name in created), created
+
     def test_two_tasks_dependency_order(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t2", deps=["t1"]), task("t1")), *HAPPY_TASK, *HAPPY_TASK])
         engine = harness.engine()

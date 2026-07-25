@@ -14,6 +14,10 @@ from tests.conftest import FakeSbx
 
 TOKENS = {"COPILOT_GITHUB_TOKEN": "github_pat_copilot", "GH_TOKEN": "github_pat_user"}
 
+# Most tests exercise the full two-sandbox pair, which now requires the
+# GitHub integration to be configured.
+GITHUB_ENABLED = {"github": {"repo": "owner/repo"}}
+
 
 def make_provisioner(
     fake_sbx: FakeSbx,
@@ -23,7 +27,9 @@ def make_provisioner(
     config: Config | None = None,
     bus: EventBus | None = None,
 ) -> Provisioner:
-    config = config or Config.model_validate({"state_dir": str(tmp_path / "state")})
+    config = config or Config.model_validate(
+        {"state_dir": str(tmp_path / "state"), **GITHUB_ENABLED}
+    )
     return Provisioner(
         SbxCLI(binary=str(fake_sbx.binary)),
         config,
@@ -84,6 +90,55 @@ class TestTokens:
         with pytest.raises(ProvisionError):
             provisioner.ensure_pair("r1")
         assert fake_sbx.invocations("create") == []
+
+
+class TestGithubGating:
+    """Without [github].repo there is no github sandbox and no GH_TOKEN need."""
+
+    def unconfigured(self, fake_sbx: FakeSbx, tmp_path: Path, **kwargs: object) -> Provisioner:
+        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        assert not config.github.enabled
+        return make_provisioner(fake_sbx, tmp_path, config=config, **kwargs)  # type: ignore[arg-type]
+
+    def test_agent_only_when_unconfigured(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = self.unconfigured(
+            fake_sbx, tmp_path, env={"COPILOT_GITHUB_TOKEN": "github_pat_x"}
+        )
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.github is None
+            assert pair.agent.name == sandbox_name("r1", "agent")
+            created = [c[1].removeprefix("--name=") for c in fake_sbx.invocations("create")]
+            assert created == [sandbox_name("r1", "agent")]
+        finally:
+            pair.cleanup()
+
+    def test_no_gh_token_required_when_unconfigured(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # GH_TOKEN absent entirely: provisioning must not even ask for it.
+        provisioner = self.unconfigured(
+            fake_sbx, tmp_path, env={"COPILOT_GITHUB_TOKEN": "github_pat_x"}
+        )
+        pair = provisioner.ensure_pair("r1")
+        pair.cleanup()
+
+    def test_gh_token_still_required_when_configured(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, env={"COPILOT_GITHUB_TOKEN": "github_pat_x"}
+        )
+        with pytest.raises(ProvisionError, match="GH_TOKEN"):
+            provisioner.ensure_pair("r1")
+
+    def test_cleanup_with_no_github_sandbox(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = self.unconfigured(
+            fake_sbx, tmp_path, env={"COPILOT_GITHUB_TOKEN": "github_pat_x"}
+        )
+        pair = provisioner.ensure_pair("r1")
+        pair.cleanup()
+        assert fake_sbx.invocations("rm") != []
 
 
 class TestEnsurePair:
@@ -154,7 +209,7 @@ class TestEnsurePair:
 
     def test_plain_env_strategy_writes_env_file(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         config = Config.model_validate(
-            {"secret_strategy": "plain-env", "state_dir": str(tmp_path / "state")}
+            {"secret_strategy": "plain-env", "state_dir": str(tmp_path / "state"), **GITHUB_ENABLED}
         )
         provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
         pair = provisioner.ensure_pair("r1")
@@ -341,7 +396,7 @@ class TestSecretEnvVerification:
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
         monkeypatch.delenv("GH_TOKEN", raising=False)
         config = Config.model_validate(
-            {"secret_strategy": "plain-env", "state_dir": str(tmp_path / "state")}
+            {"secret_strategy": "plain-env", "state_dir": str(tmp_path / "state"), **GITHUB_ENABLED}
         )
         bus = EventBus()
         events: list[Event] = []

@@ -115,15 +115,20 @@ class LoopEngine:
                     transport=self.config.worker_transport,
                     python=self.worker_python,
                 )
-                github = WorkerClient(
-                    pair.github,
-                    self.bus,
-                    transport=self.config.worker_transport,
-                    python=self.worker_python,
+                github = (
+                    WorkerClient(
+                        pair.github,
+                        self.bus,
+                        transport=self.config.worker_transport,
+                        python=self.worker_python,
+                    )
+                    if pair.github is not None
+                    else None
                 )
                 if self.install_workers:
                     agent.install(extras="copilot")
-                    github.install(extras="")
+                    if github is not None:
+                        github.install(extras="")
                 detach = self._attach_reporter(github, run_id)
                 try:
                     phases = PhaseRunner(
@@ -150,11 +155,12 @@ class LoopEngine:
             mounted=pair.mounted,
         )
 
-    def _attach_reporter(self, github: WorkerClient, run_id: str) -> Callable[[], None]:
-        repo = self.config.github.report_repo
-        if not repo:
+    def _attach_reporter(self, github: WorkerClient | None, run_id: str) -> Callable[[], None]:
+        gh = self.config.github
+        if not gh.report or github is None:
             return lambda: None
-        hook = GithubReporterHook(GithubOps(github, run_id), repo)
+        assert gh.repo is not None  # report=True without a repo cannot provision a github worker
+        hook = GithubReporterHook(GithubOps(github, run_id), gh.repo)
         return self.bus.attach_hook(hook)
 
     def _harvest(self, run_id: str, pair: SandboxPair) -> None:

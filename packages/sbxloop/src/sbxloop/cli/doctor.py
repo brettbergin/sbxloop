@@ -109,17 +109,31 @@ def collect_checks(
             f"permission and export {COPILOT_TOKEN_ENV}",
         )
     )
-    gh_set = any(env.get(name) for name in GH_TOKEN_ENVS)
-    checks.append(
-        Check(
-            "/".join(GH_TOKEN_ENVS),
-            gh_set,
-            "set"
-            if gh_set
-            else "not set — create a fine-grained PAT (issues:write, contents:read, ...) "
-            "and export GH_TOKEN",
+    # GH_TOKEN matters only when the GitHub integration is configured; an
+    # unconfigured integration is a valid (GitHub-less) setup, not a failure.
+    if config.github.enabled:
+        gh_set = any(env.get(name) for name in GH_TOKEN_ENVS)
+        checks.append(
+            Check(
+                "/".join(GH_TOKEN_ENVS),
+                gh_set,
+                f"set (github integration: {config.github.repo})"
+                if gh_set
+                else f"not set but [github].repo = {config.github.repo!r} is configured — "
+                "create a fine-grained PAT (issues:write, contents:read, ...) "
+                "and export GH_TOKEN",
+            )
         )
-    )
+    else:
+        checks.append(
+            Check(
+                "github integration",
+                True,
+                'not configured — GitHub features disabled (set [github] repo = "owner/repo" '
+                "in sbxloop.toml to enable)",
+                hard=False,
+            )
+        )
 
     # worker wheel
     wheel = resolve_worker_wheel()
