@@ -122,6 +122,16 @@ All notable changes to sdxloop are documented here. The project adheres to
   into terminals, logs, or events (#57). The remaining `ps`-visibility of
   the live subprocess argv needs stdin support in sbx itself and stays
   tracked in #57.
+- The `ps`-visibility half of #57 is now a doctor conformance probe
+  (`secret-value-stdin`, cheap tier): desk-verified against the sbx docs and
+  release history through v0.37, `sbx secret set-custom` accepts the secret
+  only via `--token`/`--value` on argv (both documented as "less secure:
+  visible in shell history") — no stdin path exists, so the exposure window
+  cannot be closed from sbxloop's side yet. The probe checks
+  `set-custom --help` on every `sbxloop doctor` run and alarms the moment an
+  sbx upgrade grows a stdin path, naming the switch-over as the fix.
+  `exec_interactive`'s missing-binary error now carries the redacted argv
+  copy like every other observable path.
 
 ## [0.2.0] — 2026-07-23
 
