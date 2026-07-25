@@ -73,6 +73,7 @@ class HostEventTypes:
 
     RUN_START = "run.start"
     RUN_STATE = "run.state"
+    RUN_CONFIG_DRIFT = "run.config_drift"
     RUN_ARTIFACTS = "run.artifacts"
     RUN_DELIVER = "run.deliver"
     RUN_KEEP = "run.keep"

@@ -367,6 +367,74 @@ class TestResume:
         with pytest.raises(StateError, match="only unfinished runs"):
             engine.resume(result.run_id)
 
+    def _crashed_run(self, harness: Harness, **config_overrides: Any) -> str:
+        """Start a run that crashes during t1's execute; returns its run id."""
+        harness.script([taskgraph(task("t1")), PLAN, {"fail": "sandbox exploded"}])
+        engine = harness.engine(**config_overrides)
+        with pytest.raises(WorkerError, match="sandbox exploded"):
+            engine.start("crashy run")
+        return engine.store.list_runs()[0].run_id
+
+    def test_resume_uses_persisted_config_not_current(self, harness: Harness) -> None:
+        run_id = self._crashed_run(harness, budgets={"max_revisions_per_task": 2})
+
+        # Resume under a *tighter* on-disk config (zero revisions). The
+        # persisted budget must govern: one revise round still completes.
+        harness.script([EXECUTE, REVISE, EXECUTE, PASS, ACCEPT])
+        engine2 = harness.engine(budgets={"max_revisions_per_task": 0})
+        result = engine2.resume(run_id)
+        assert result.state == "completed"
+        assert engine2.config.budgets.max_revisions_per_task == 2
+
+        drift = [e for e in harness.events if e.type == HostEventTypes.RUN_CONFIG_DRIFT]
+        assert len(drift) == 1
+        assert "budgets.max_revisions_per_task" in drift[0].data["message"]
+
+    def test_resume_with_unchanged_config_reports_no_drift(self, harness: Harness) -> None:
+        run_id = self._crashed_run(harness)
+        harness.script([EXECUTE, PASS, ACCEPT])
+        result = harness.engine().resume(run_id)
+        assert result.state == "completed"
+        assert HostEventTypes.RUN_CONFIG_DRIFT not in harness.event_types()
+
+    def test_resume_cannot_relocate_workspace_via_config(self, harness: Harness) -> None:
+        run_id = self._crashed_run(harness)
+        engine = harness.engine()
+        original = engine.store.get_run(run_id).workspace
+        assert original is not None
+
+        # The current config now points the workspace somewhere else — the
+        # run must continue in its recorded workspace, not a fresh empty one.
+        elsewhere = harness.tmp_path / "elsewhere"
+        harness.script([EXECUTE, PASS, ACCEPT])
+        engine2 = harness.engine(sandbox={"workspace": str(elsewhere)})
+        result = engine2.resume(run_id)
+        assert result.state == "completed"
+        assert result.workspace == original
+        assert engine2.store.get_run(run_id).workspace == original
+        assert not elsewhere.exists()
+        drift = [e for e in harness.events if e.type == HostEventTypes.RUN_CONFIG_DRIFT]
+        assert len(drift) == 1
+        assert "sandbox.workspace" in drift[0].data["message"]
+
+    def test_resume_legacy_row_still_pins_workspace_from_run_row(self, harness: Harness) -> None:
+        # Rows created before config persistence carry config_json '{}'.
+        # Rehydration has nothing to adopt, but the workspace must still
+        # come from the runs table, never be recomputed from current config.
+        run_id = self._crashed_run(harness)
+        engine = harness.engine()
+        original = engine.store.get_run(run_id).workspace
+        engine.store._conn.execute("UPDATE runs SET config_json = '{}' WHERE run_id = ?", (run_id,))
+        engine.store._conn.commit()
+
+        elsewhere = harness.tmp_path / "elsewhere"
+        harness.script([EXECUTE, PASS, ACCEPT])
+        engine2 = harness.engine(sandbox={"workspace": str(elsewhere)})
+        result = engine2.resume(run_id)
+        assert result.state == "completed"
+        assert result.workspace == original
+        assert not elsewhere.exists()
+
 
 class TestJsonRetry:
     def test_invalid_decompose_retried_once_with_error(self, harness: Harness) -> None:

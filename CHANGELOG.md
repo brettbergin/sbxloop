@@ -98,6 +98,16 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- `resume` now runs under the config the run was started with (#60). The
+  full config has always been persisted in the runs table, but resume drove
+  with whatever `load_config()` produced at resume time — so editing
+  config (or resuming from a different directory) silently changed budgets,
+  model, or GitHub toggles mid-run, and could relocate the run into a
+  fresh, empty workspace. Resume now rehydrates the persisted config
+  (tokens still come from the current environment; `state_dir` stays where
+  the run was found), pins the workspace from the runs table instead of
+  recomputing it, refuses a workspace mismatch, and reports any difference
+  from the current on-disk config as a `run.config_drift` event.
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and
   sbx-level errors raised by the delivery op jobs (`WorkerError`,
