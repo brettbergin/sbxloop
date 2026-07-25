@@ -2,9 +2,17 @@
 
 The default consumer of the github-ops sandbox. When the GitHub integration
 is configured (``[github].repo``) and reporting is enabled (``report = true``
-or ``--report``), the hook opens a tracking issue at run start, comments as
-tasks finish, and posts a final summary at run end. It never raises — a
-reporting failure must not fail a run — and the EventBus isolates it anyway.
+or ``--report``), the engine opens a tracking issue right after the github
+sandbox is ready, comments as tasks finish, and posts a final summary while
+the sandbox is still alive.
+
+Run start/end are **explicit calls** (``open_run``/``close_run``) rather
+than bus events: the run lifecycle events are emitted outside the window in
+which the hook is attached and the github sandbox exists, so subscribing to
+them can never work — see #58. Only per-task progress arrives via the bus.
+
+Every entry point is guarded: a reporting failure must not fail a run — and
+the EventBus isolates ``on_event`` anyway.
 """
 
 from __future__ import annotations
@@ -24,31 +32,57 @@ class GithubReporterHook:
         self.issue: IssueRef | None = None
         self._task_lines: list[str] = []
 
-    # -- Hook protocol -----------------------------------------------------
+    # -- explicit lifecycle (called by the engine, sandbox guaranteed alive) --
+
+    def open_run(self, run_id: str, outcome: str) -> None:
+        """Open (or on resume, re-find) the run's tracking issue."""
+        try:
+            self.issue = self._find_existing(run_id) or self._create(run_id, outcome)
+        except Exception:
+            logger.warning("github reporting: opening tracking issue failed", exc_info=True)
+
+    def close_run(self, run_id: str, state: str) -> None:
+        """Post the final summary comment; call before sandbox teardown."""
+        if self.issue is None:
+            return
+        summary = "\n".join(self._task_lines) or "_no tasks were executed_"
+        try:
+            self.ops.issue_comment(
+                self.repo,
+                self.issue.number,
+                f"Run `{run_id}` finished: **{state}**\n\n{summary}",
+            )
+        except Exception:
+            logger.warning("github reporting: final summary failed", exc_info=True)
+
+    # -- Hook protocol (task progress only) ----------------------------------
 
     def on_event(self, event: Event) -> None:
         try:
-            if event.type == HostEventTypes.RUN_START:
-                self._on_run_start(event)
-            elif event.type == HostEventTypes.TASK_END:
+            if event.type == HostEventTypes.TASK_END:
                 self._on_task_end(event)
-            elif event.type == HostEventTypes.RUN_END:
-                self._on_run_end(event)
         except Exception:
             logger.warning("github reporting failed for %s", event.type, exc_info=True)
 
-    # -- handlers ----------------------------------------------------------
+    # -- internals -----------------------------------------------------------
 
-    def _on_run_start(self, event: Event) -> None:
-        outcome = str(event.data.get("outcome", ""))
+    def _find_existing(self, run_id: str) -> IssueRef | None:
+        """A resumed run reuses its issue instead of opening a duplicate."""
+        query = f'repo:{self.repo} is:issue in:title "sbxloop run {run_id}"'
+        for item in self.ops.search_issues(query, per_page=5):
+            if item.get("title") == f"sbxloop run {run_id}" and item.get("number"):
+                return IssueRef(number=int(item["number"]), url=str(item.get("html_url", "")))
+        return None
+
+    def _create(self, run_id: str, outcome: str) -> IssueRef:
         body = (
-            f"sbxloop run `{event.run_id}` started.\n\n"
+            f"sbxloop run `{run_id}` started.\n\n"
             f"**Outcome:**\n\n> {outcome}\n\n"
             "Progress is reported as comments on this issue."
         )
-        self.issue = self.ops.issue_create(
+        return self.ops.issue_create(
             self.repo,
-            title=f"sbxloop run {event.run_id}",
+            title=f"sbxloop run {run_id}",
             body=body,
             labels=["sbxloop"],
         )
@@ -63,14 +97,3 @@ class GithubReporterHook:
         line = f"{marker} `{task_id}` {title} — **{state}**"
         self._task_lines.append(line)
         self.ops.issue_comment(self.repo, self.issue.number, line)
-
-    def _on_run_end(self, event: Event) -> None:
-        if self.issue is None:
-            return
-        state = event.data.get("state", "?")
-        summary = "\n".join(self._task_lines) or "_no tasks were executed_"
-        self.ops.issue_comment(
-            self.repo,
-            self.issue.number,
-            f"Run `{event.run_id}` finished: **{state}**\n\n{summary}",
-        )

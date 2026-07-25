@@ -33,25 +33,22 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     PROBE_SECRET_ENV_VISIBILITY,
     PROBE_WORKSPACE_MOUNT,
-    SECRET_EXISTS_MARKERS,
-    parse_secret_conflict_scope,
     record_field_verdict,
 )
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.sandbox import ENV_FILE, EVENTS_DIR, JOBS_DIR, RESULTS_DIR, WORK_DIR, Sandbox
+from sbxloop.sbx.secretstate import (
+    COPILOT_TOKEN_ENV,
+    COPILOT_TOKEN_HOST,
+    custom_rm_candidates,
+    service_rm_candidates,
+    set_secret_replacing,
+)
 
 logger = logging.getLogger(__name__)
 
-COPILOT_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"
 GH_TOKEN_ENVS = ("GH_TOKEN", "GITHUB_TOKEN")
-
-# The PAT is exchanged for a Copilot API token at api.github.com; the
-# exchanged token lives in SDK process memory, so the copilot API hosts only
-# need network allows - never an env rewrite. One env var also cannot be
-# registered twice: sbx keys custom secrets by env name, so binding the same
-# env to two hosts fails with "already exists".
-COPILOT_TOKEN_HOST = "api.github.com"
 
 # Hosts the agent sandbox must be able to reach (doctor checks these).
 AGENT_TOKEN_HOSTS = ("api.githubcopilot.com", "api.github.com")
@@ -236,14 +233,14 @@ class Provisioner:
             if secret.kind == "service":
                 assert secret.service is not None
                 service = secret.service
-                self._set_secret_replacing(
+                set_secret_replacing(
                     f"service {service} ({spec.name})",
                     set_fn=partial(self.cli.secret_set, service, sandbox=spec.name, token=token),
-                    rm_candidates=partial(self._service_rm_candidates, service, spec.name),
+                    rm_candidates=partial(service_rm_candidates, self.cli, service, spec.name),
                 )
             else:
                 assert secret.host is not None and secret.env is not None
-                self._set_secret_replacing(
+                set_secret_replacing(
                     f"custom {secret.env}@{secret.host} ({spec.name})",
                     set_fn=partial(
                         self.cli.secret_set_custom,
@@ -253,104 +250,9 @@ class Provisioner:
                         sandbox=spec.name,
                     ),
                     rm_candidates=partial(
-                        self._custom_rm_candidates, secret.host, secret.env, spec.name
+                        custom_rm_candidates, self.cli, secret.host, secret.env, spec.name
                     ),
                 )
-
-    # The exists-markers and scope regex live in the conformance catalog (the
-    # canonical home of sbx error-shape knowledge, kept honest by the
-    # secret-exists-error probe).
-    _SECRET_EXISTS_MARKERS = SECRET_EXISTS_MARKERS
-
-    @staticmethod
-    def _parsed_scope(stderr: str) -> str | None:
-        """The scope owning the conflicting secret, per sbx's error message.
-
-        Returns None when unparseable; the literal scopes "global"/"-g" map
-        to None-as-global in secret_rm terms via the callers below.
-        """
-        return parse_secret_conflict_scope(stderr)
-
-    def _service_rm_candidates(
-        self, service: str, sandbox: str, stderr: str
-    ) -> list[Callable[[], bool]]:
-        scopes: list[str | None] = []
-        parsed = self._parsed_scope(stderr)
-        if parsed:
-            scopes.append(None if parsed in ("global", "-g") else parsed)
-        scopes += [sandbox, None]
-        seen: list[str | None] = []
-        candidates: list[Callable[[], bool]] = []
-        for scope in scopes:
-            if scope in seen:
-                continue
-            seen.append(scope)
-            candidates.append(partial(self.cli.secret_rm, service=service, sandbox=scope))
-        return candidates
-
-    def _custom_rm_candidates(
-        self, host: str, env: str, sandbox: str, stderr: str
-    ) -> list[Callable[[], bool]]:
-        scopes: list[str | None] = []
-        parsed = self._parsed_scope(stderr)
-        if parsed:
-            scopes.append(None if parsed in ("global", "-g") else parsed)
-        scopes += [sandbox, None]
-        seen: list[str | None] = []
-        candidates: list[Callable[[], bool]] = []
-        for scope in scopes:
-            if scope in seen:
-                continue
-            seen.append(scope)
-            # env+host first, then env-only: sbx keys custom secrets by env
-            # name, so the conflicting entry may carry a different host.
-            candidates.append(partial(self.cli.secret_rm, host=host, env=env, sandbox=scope))
-            candidates.append(partial(self.cli.secret_rm, env=env, sandbox=scope))
-        return candidates
-
-    def _set_secret_replacing(
-        self,
-        describe: str,
-        *,
-        set_fn: Callable[[], None],
-        rm_candidates: Callable[[str], list[Callable[[], bool]]],
-    ) -> None:
-        """Set a secret, replacing a leftover one from a previous run.
-
-        sbx refuses to overwrite an existing secret and keys custom secrets
-        by env name, with the conflicting entry possibly owned by another
-        scope (a previous run's sandbox). On an exists-error we parse the
-        owning scope out of sbx's stderr and try removal candidates from
-        most to least specific, retrying the set after each successful
-        removal. An exists-conflict NEVER fails provisioning: if nothing
-        can be replaced, the existing value is kept with a warning (it may
-        be stale if the token was rotated). Non-exists errors raise.
-
-        Only sbx's stderr is matched for exists-markers: the full exception
-        string embeds argv, and arbitrary paths can contain words like
-        "exists" (a pytest tmp dir did exactly that).
-        """
-        try:
-            set_fn()
-            return
-        except SbxError as exc:
-            if not any(m in exc.stderr.lower() for m in self._SECRET_EXISTS_MARKERS):
-                raise
-            stderr = exc.stderr
-        for rm_fn in rm_candidates(stderr):
-            if not rm_fn():
-                continue
-            try:
-                set_fn()
-                return
-            except SbxError as exc:
-                if not any(m in exc.stderr.lower() for m in self._SECRET_EXISTS_MARKERS):
-                    raise
-        logger.warning(
-            "secret %s already exists and could not be replaced; keeping the "
-            "existing value (it may be stale if the token was rotated)",
-            describe,
-        )
 
     def _verify_secret_env(
         self, run_id: str, spec: SandboxSpec, sandbox: Sandbox, token: str

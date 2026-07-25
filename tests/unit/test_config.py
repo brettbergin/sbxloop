@@ -113,3 +113,64 @@ def test_deliver_config_layers(tmp_path: Path) -> None:
     assert config.github.deliver_base == "develop"
 
     assert Config().github.deliver is False  # delivery is opt-in
+
+
+def test_policy_defaults_empty(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path, env={})
+    assert config.policy.allow == []
+    assert config.policy.deny == []
+
+
+def test_policy_patterns_parse_and_normalize(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text(
+        "[policy]\n"
+        'allow = ["Registry.NPMJS.org", "*.crates.io", "*"]\n'
+        'deny = ["evil.example.com"]\n'
+    )
+    config = load_config(cwd=tmp_path, env={})
+    assert config.policy.allow == ["registry.npmjs.org", "*.crates.io", "*"]
+    assert config.policy.deny == ["evil.example.com"]
+
+
+def test_policy_invalid_pattern_is_config_error(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[policy]\nallow = ["https://pypi.org"]\n')
+    with pytest.raises(ConfigError, match="invalid egress pattern"):
+        load_config(cwd=tmp_path, env={})
+
+
+def test_limits_defaults(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path, env={})
+    assert config.limits.disk_warn == 85.0
+    assert config.limits.disk_abort == 95.0
+    assert config.limits.mem_warn == 90.0
+
+
+def test_limits_layers_and_env(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text("[limits]\ndisk_warn = 70.0\ndisk_abort = 80.0\n")
+    config = load_config(cwd=tmp_path, env={})
+    assert config.limits.disk_warn == 70.0
+    assert config.limits.disk_abort == 80.0
+
+    config = load_config(cwd=tmp_path, env={"SBXLOOP_LIMITS__DISK_ABORT": "90.0"})
+    assert config.limits.disk_abort == 90.0
+
+
+def test_limits_zero_disables_without_error(tmp_path: Path) -> None:
+    # warn disabled + abort enabled is a valid (abort-only) configuration.
+    (tmp_path / "sbxloop.toml").write_text(
+        "[limits]\ndisk_warn = 0\ndisk_abort = 95.0\nmem_warn = 0\n"
+    )
+    config = load_config(cwd=tmp_path, env={})
+    assert config.limits.disk_warn == 0.0
+    assert config.limits.disk_abort == 95.0
+
+
+def test_limits_abort_must_exceed_warn(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text("[limits]\ndisk_warn = 90.0\ndisk_abort = 80.0\n")
+    with pytest.raises(ConfigError, match="disk_abort"):
+        load_config(cwd=tmp_path, env={})
+
+
+def test_limits_must_be_percentages(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"0\.\.100"):
+        load_config(cwd=tmp_path, env={"SBXLOOP_LIMITS__DISK_WARN": "150"})

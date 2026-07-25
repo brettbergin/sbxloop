@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -25,6 +26,17 @@ from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
+from sbxloop.sbx.secretstate import (
+    COPILOT_TOKEN_ENV,
+    SANDBOX_SCOPE_PREFIX,
+    assess,
+    inspect_custom_secret,
+    removal_ladder,
+    replace_registration,
+    tracked_custom_secrets,
+    verify_secret_visibility,
+)
 
 app = typer.Typer(
     name="sbxloop",
@@ -34,8 +46,12 @@ app = typer.Typer(
 )
 sandbox_app = typer.Typer(help="Manage sbxloop sandboxes.", no_args_is_help=True)
 config_app = typer.Typer(help="Inspect configuration.", no_args_is_help=True)
+secrets_app = typer.Typer(
+    help="Manage the sbx custom-secret registrations sbxloop owns.", no_args_is_help=True
+)
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(config_app, name="config")
+app.add_typer(secrets_app, name="secrets")
 
 console = Console()
 
@@ -168,6 +184,10 @@ def _finish(result: RunResult, config: Config) -> None:
     for task in result.tasks:
         console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
     _print_artifacts_summary(result, config)
+    if result.kept_sandboxes:
+        console.print(f"\n[bold yellow]sandboxes kept:[/] {', '.join(result.kept_sandboxes)}")
+        console.print(f"  inspect: [cyan]sbxloop shell {result.run_id}[/] (--role github)")
+        console.print(f"  remove:  [cyan]sbxloop sandbox rm --run {result.run_id}[/]")
     raise typer.Exit(0 if result.succeeded else 1)
 
 
@@ -192,10 +212,21 @@ def run(
     keep_sandboxes: Annotated[
         bool, typer.Option("--keep-sandboxes", help="Do not remove sandboxes at the end.")
     ] = False,
+    keep_on_failure: Annotated[
+        bool | None,
+        typer.Option(
+            "--keep-on-failure/--no-keep-on-failure",
+            help="Keep the sandbox pair alive when the run fails (inspect with `sbxloop shell`).",
+        ),
+    ] = None,
     tui: Annotated[bool, typer.Option("--tui/--no-tui", help="Live dashboard.")] = True,
 ) -> None:
     """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
-    config = _config_with_overrides(model=model, keep_sandboxes=keep_sandboxes or None)
+    config = _config_with_overrides(
+        model=model,
+        keep_sandboxes=keep_sandboxes or None,
+        keep_on_failure=keep_on_failure,
+    )
     if report is not None:
         config = config.model_copy(
             update={"github": config.github.model_copy(update={"report": report})}
@@ -330,6 +361,57 @@ def logs(
         time.sleep(0.5)
 
 
+# Prefer bash when the template has it, fall back to POSIX sh. `sbx exec`
+# has no documented -it flags; terminal attachment is inherited stdio.
+_INTERACTIVE_SHELL = ("sh", "-c", "command -v bash >/dev/null && exec bash -l; exec sh -l")
+
+
+@app.command()
+def shell(
+    run_id: Annotated[str, typer.Argument(help="Run id.")],
+    role: Annotated[
+        str, typer.Option("--role", help="Which sandbox of the pair: agent or github.")
+    ] = "agent",
+    command: Annotated[
+        str | None,
+        typer.Option(
+            "--command", "-c", help="Run one shell command instead of an interactive shell."
+        ),
+    ] = None,
+) -> None:
+    """Open a shell inside a run's sandbox (kept, in-flight, or leaked).
+
+    Attaching to an in-flight run is meant as observation: the worker owns
+    its env files and workspace, so avoid mutating them mid-phase.
+    """
+    if role not in ("agent", "github"):
+        console.print(f"[bold red]invalid --role {role!r}:[/] must be agent or github")
+        raise typer.Exit(2)
+    config = load_config()
+    store = _store(config)
+    try:
+        store.get_run(run_id)
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    cli = SbxCLI(app_name=config.app_name or None)
+    name = sandbox_name(run_id, "agent" if role == "agent" else "github")
+    try:
+        live = any(info.name == name for info in cli.ls())
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    if not live:
+        console.print(
+            f"[bold red]sandbox {name} is not running.[/] Sandboxes are removed at run end "
+            "unless kept (keep_on_failure, --keep-sandboxes), and kept ones may have been "
+            "pruned since."
+        )
+        raise typer.Exit(2)
+    argv = ("sh", "-lc", command) if command else _INTERACTIVE_SHELL
+    raise typer.Exit(cli.exec_interactive(name, argv))
+
+
 @app.command()
 def artifacts(
     run_id: Annotated[str, typer.Argument(help="Run id.")],
@@ -414,6 +496,288 @@ def sandbox_rm(
             console.print(f"[yellow]skip {target}:[/] {exc}")
 
 
+_STATUS_STYLES = {"ok": "[green]ok[/]", "warn": "[yellow]warn[/]", "unknown": "[dim]?[/]"}
+
+
+def _secrets_context() -> tuple[Config, SbxCLI, set[str]]:
+    """Config, an sbx handle, and the live sbxloop sandbox names (for
+    telling in-use registration scopes from stale ones)."""
+    config = load_config()
+    cli = SbxCLI(app_name=config.app_name or None)
+    live = {i.name for i in cli.ls() if i.name.startswith(SANDBOX_SCOPE_PREFIX)}
+    return config, cli, live
+
+
+@secrets_app.command("list")
+def secrets_list(
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe/--no-probe",
+            help="When `sbx secret ls` cannot answer, detect registrations by "
+            "transiently registering (and immediately removing) a sentinel — "
+            "the collision error names the real owner.",
+        ),
+    ] = True,
+) -> None:
+    """Show sbxloop's custom-secret registrations across scopes.
+
+    Flags registrations that no longer match what provisioning would
+    register (stale scopes, wrong host bindings) — the pre-collision
+    warnings. The built-in `github` service secret is sbx-managed and never
+    touched by these commands.
+    """
+    try:
+        config, cli, live = _secrets_context()
+        table = Table(title="sbxloop custom-secret registrations")
+        for column in ("env", "expected", "actual", "status", "note"):
+            table.add_column(column)
+        warned = False
+        for env, host in tracked_custom_secrets(config):
+            state = inspect_custom_secret(cli, env, host=host, probe=probe)
+            judgement = assess(state, canonical_host=host, live_sandboxes=live)
+            warned = warned or judgement.status == "warn"
+            if state.exists:
+                actual = f"scope {state.scope or '(unknown)'}"
+                if state.hosts:
+                    actual += f" @ {', '.join(state.hosts)}"
+            elif state.exists is None:
+                actual = "(undetermined)"
+            else:
+                actual = "not registered"
+            table.add_row(
+                env,
+                f"custom @ {host} (per-run scope)",
+                actual,
+                _STATUS_STYLES[judgement.status],
+                judgement.note,
+            )
+        console.print(table)
+        console.print(
+            "[dim]GH_TOKEN uses sbx's built-in `github` service secret; "
+            "it is never managed here.[/]"
+        )
+        if warned:
+            console.print(
+                "\n[yellow]warnings above are pre-collision state[/] — "
+                "`sbxloop secrets clean` removes the stale entries"
+            )
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+
+@secrets_app.command("clean")
+def secrets_clean(
+    apply: Annotated[
+        bool, typer.Option("--apply", help="Actually remove (default is a dry run).")
+    ] = False,
+    all_: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Also remove healthy sbxloop-owned registrations (global with the "
+            "canonical binding, live-sandbox scopes), not just stale ones.",
+        ),
+    ] = False,
+) -> None:
+    """Remove stale sbxloop-owned custom-secret registrations (dry-run by default).
+
+    Only touches registrations sbxloop itself created (sbxloop-* sandbox
+    scopes and global entries for its tracked env vars) — never foreign
+    scopes and never the built-in `github` service secret.
+    """
+    try:
+        config, cli, live = _secrets_context()
+        failed = False
+        removed_any = False
+        for env, host in tracked_custom_secrets(config):
+            state = inspect_custom_secret(cli, env, host=host)
+            judgement = assess(state, canonical_host=host, live_sandboxes=live)
+            if not (judgement.stale or (all_ and judgement.owned)):
+                console.print(f"{env}: nothing to clean ({judgement.note})")
+                continue
+            where = f"scope {state.scope or '(unknown)'}"
+            if not apply:
+                console.print(f"{env}: would remove the registration in {where} — {judgement.note}")
+                removed_any = True
+                continue
+            if any(rm() for rm in removal_ladder(cli, state, host=host)):
+                console.print(f"[green]{env}: removed the registration in {where}[/]")
+                removed_any = True
+            else:
+                console.print(f"[bold red]{env}: sbx rejected every removal for {where}[/]")
+                failed = True
+        if not apply and removed_any:
+            console.print("\ndry run — re-run with [cyan]--apply[/] to remove")
+        if failed:
+            raise typer.Exit(1)
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+
+@secrets_app.command("rotate")
+def secrets_rotate(
+    prompt: Annotated[
+        bool,
+        typer.Option(
+            "--prompt",
+            help="Read the new token from a hidden interactive prompt instead of "
+            f"the {COPILOT_TOKEN_ENV} environment variable / ./.env.",
+        ),
+    ] = False,
+    verify: Annotated[
+        bool,
+        typer.Option(
+            "--verify/--no-verify",
+            help="Boot a throwaway sandbox to report which secret strategy "
+            "(proxy vs plain-env fallback) the next run will use.",
+        ),
+    ] = True,
+) -> None:
+    """Rotate the Copilot token's sbx registration in one step.
+
+    Replaces the existing registration (wherever its scope) with a global
+    one carrying the canonical host binding — the rm + set-custom dance
+    provisioning would otherwise perform mid-run. The token is read from
+    the environment/.env or an interactive prompt, never from argv.
+    """
+    if prompt:
+        token = typer.prompt(f"new {COPILOT_TOKEN_ENV}", hide_input=True)
+    else:
+        token = os.environ.get(COPILOT_TOKEN_ENV, "")
+        if not token:
+            console.print(
+                f"[bold red]{COPILOT_TOKEN_ENV} is not set.[/] Export the new token "
+                "(or put it in ./.env), or pass [cyan]--prompt[/] to type it — "
+                "it is never accepted as a command-line argument."
+            )
+            raise typer.Exit(2)
+    try:
+        config, cli, live = _secrets_context()
+        for env, host in tracked_custom_secrets(config):
+            replace_registration(cli, env=env, host=host, token=token)
+            console.print(f"[green]rotated:[/] {env} registered @ {host} (global scope)")
+        if live:
+            console.print(
+                f"[yellow]live sbxloop sandboxes exist ({', '.join(sorted(live))})[/] — "
+                "they may still hold the old token in their in-VM env file; "
+                "remove them with `sbxloop sandbox rm --all`"
+            )
+        if prompt:
+            console.print(
+                f"[yellow]runs read {COPILOT_TOKEN_ENV} from the environment at "
+                "provision time[/] — update your export / ./.env with the new value too"
+            )
+        if config.secret_strategy == "plain-env":
+            console.print(
+                "next run: [bold]plain-env[/] strategy (configured) — the token is "
+                "written to the in-VM env file from your environment"
+            )
+        elif verify:
+            workspace = config.state_dir / "secretcheck"
+            workspace.mkdir(parents=True, exist_ok=True)
+            visible = verify_secret_visibility(
+                cli,
+                env=COPILOT_TOKEN_ENV,
+                workspace=workspace,
+                template=config.sandbox.template,
+            )
+            if visible is True:
+                console.print(
+                    "next run: [bold green]proxy[/] strategy — the token stays out of the VM"
+                )
+            elif visible is False:
+                console.print(
+                    "next run: [bold yellow]plain-env fallback[/] — sbx's proxy secret is "
+                    "invisible to exec sessions, so provisioning will write the in-VM env file"
+                )
+            else:
+                console.print("[yellow]could not verify secret visibility[/] (see logs)")
+    except SdxloopError as exc:
+        console.print(f"[bold red]rotate failed:[/] {exc}")
+        raise typer.Exit(2) from exc
+
+
+@sandbox_app.command("prune")
+def sandbox_prune(
+    force: Annotated[
+        bool,
+        typer.Option("--force", "--yes", help="Actually remove (default is a dry run)."),
+    ] = False,
+    min_age: Annotated[
+        float,
+        typer.Option(
+            "--min-age",
+            help="Hours a run must be inactive before its sandboxes count as orphaned.",
+        ),
+    ] = 1.0,
+    include_kept: Annotated[
+        bool,
+        typer.Option("--include-kept", help="Also prune kept-for-debugging sandboxes."),
+    ] = False,
+) -> None:
+    """Garbage-collect orphaned sbxloop sandboxes (crashed hosts, killed runs).
+
+    Cross-references `sbx ls` against this working copy's state DB. Dry-run
+    by default: prints the classification and removes nothing without
+    --force.
+    """
+    config = load_config()
+    store = _store(config)
+    cli = SbxCLI(app_name=config.app_name or None)
+    try:
+        verdicts = classify_sandboxes(
+            cli.ls(), store, min_age_s=min_age * 3600.0, include_kept=include_kept
+        )
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    if not verdicts:
+        console.print("no sbxloop sandboxes found")
+        return
+
+    table = Table(title="sbxloop sandbox prune")
+    for column in ("sandbox", "run", "run state", "age", "verdict"):
+        table.add_column(column)
+    for v in verdicts:
+        table.add_row(
+            v.name,
+            v.run_id or "",
+            v.run_state or "[dim]unknown[/]",
+            format_age(v.age_s),
+            ("[red]orphan[/] — " if v.orphan else "[green]keep[/] — ") + v.reason,
+        )
+    console.print(table)
+    console.print(
+        "[dim]note: the state DB is per working copy — 'unknown' sandboxes may "
+        "belong to another checkout's runs on this sbx host[/]"
+    )
+
+    orphans = [v for v in verdicts if v.orphan]
+    if not orphans:
+        console.print("nothing to prune")
+        return
+    if not force:
+        console.print(f"dry run: {len(orphans)} orphan candidate(s); re-run with --force to remove")
+        return
+    failures = 0
+    for v in orphans:
+        try:
+            remove_sandbox(cli, v.name)
+        except SdxloopError as exc:
+            failures += 1
+            console.print(f"[yellow]skip {v.name}:[/] {exc}")
+            continue
+        console.print(f"removed {v.name}")
+        # A pruned kept run is no longer kept; keep the DB marker honest.
+        if v.kept_reason is not None and v.run_id is not None:
+            store.set_run_kept(v.run_id, None)
+    if failures:
+        raise typer.Exit(1)
+
+
 @config_app.command("show")
 def config_show() -> None:
     """Show the resolved configuration and where each value came from."""
@@ -440,6 +804,56 @@ def config_show() -> None:
     for dotted in sorted(flat):
         table.add_row(dotted, repr(flat[dotted]), sources.get(dotted, "default"))
     console.print(table)
+
+
+@config_app.command("policy")
+def config_policy() -> None:
+    """Show the effective per-phase network egress policy."""
+    from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS
+    from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, GITHUB_ALLOW_DOMAINS
+
+    try:
+        config = load_config()
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+    extra = list(config.sandbox.extra_allow_domains)
+    baseline = ", ".join([*AGENT_ALLOW_DOMAINS, *extra])
+    advertised = ", ".join(PROMPT_ADVERTISED_DOMAINS)
+
+    table = Table(title="agent sandbox: effective egress per phase")
+    table.add_column("phase", no_wrap=True)
+    table.add_column("policy", overflow="fold")
+    table.add_row("decompose / plan", "baseline")
+    table.add_row(
+        "execute",
+        "baseline + plan-declared grants (auto-granted just before execute, "
+        "within the [policy] bounds below; every grant/refusal is event-logged)",
+    )
+    table.add_row(
+        "scrutinize / verify / validate",
+        "baseline + grants already made — sbx has no policy revocation, so "
+        "grants persist for the sandbox's lifetime (sandboxes are removed at "
+        "run end; grants never outlive a run)",
+    )
+    console.print(table)
+    console.print(f"baseline (provisioned per-sandbox): {baseline}")
+    console.print(f"advertised by the user's balanced preset: {advertised}")
+
+    bounds = Table(title="[policy] bounds for plan-declared grants")
+    bounds.add_column("bound", no_wrap=True)
+    bounds.add_column("patterns", overflow="fold")
+    bounds.add_row(
+        "allow", ", ".join(config.policy.allow) or "(empty — plans may only use the baseline)"
+    )
+    bounds.add_row("deny", ", ".join(config.policy.deny) or "(none)")
+    console.print(bounds)
+
+    if config.github.enabled:
+        gh_domains = ", ".join([*GITHUB_ALLOW_DOMAINS, *extra])
+        console.print(f"github sandbox (all phases, no plan grants): {gh_domains}")
+    console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
 
 
 @app.command()
@@ -486,6 +900,8 @@ app_name = ""
 state_dir = ".sbxloop"
 # Keep sandboxes around after a run (for debugging).
 keep_sandboxes = false
+# Keep the pair alive only when a run fails; inspect with `sbxloop shell <run>`.
+keep_on_failure = false
 # Worker transport: "stream" (default) or "poll".
 worker_transport = "stream"
 # Secret injection: "proxy" (sbx keychain proxy; recommended) or "plain-env".
@@ -496,6 +912,19 @@ secret_strategy = "proxy"
 # template = "docker.io/you/your-template:v1"
 # Extra network allow rules applied to both sandboxes.
 extra_allow_domains = []
+
+[policy]
+# Bounds for plan-declared egress. At PLAN time the agent may declare extra
+# domains a task needs during EXECUTE (each with a justification); they are
+# auto-granted to the agent sandbox just before EXECUTE only when they match
+# `allow` and no `deny` pattern, and every grant/refusal is logged as a run
+# event (`sbxloop logs RUN --type policy.`). Patterns: exact domains,
+# "*.example.com" (the domain and all subdomains), or "*" (everything).
+# Empty `allow` (the default) means plans may only use the always-reachable
+# baseline: the Copilot/GitHub hosts, PyPI, and apt mirrors.
+# See `sbxloop config policy` for the effective per-phase policy.
+allow = []
+deny = []
 
 [github]
 # The GitHub integration. Unset (the default) disables GitHub entirely:
@@ -517,6 +946,15 @@ max_replans_per_task = 1
 max_tasks = 20
 max_wall_clock_s = 7200.0
 per_job_timeout_s = 900.0
+
+[limits]
+# Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
+# the worker heartbeat and shown as a gauge in the TUI status panel.
+# Crossing disk_abort fails the current task with an explicit
+# "sandbox disk exhausted" error.
+disk_warn = 85.0
+disk_abort = 95.0
+mem_warn = 90.0
 """
 
 

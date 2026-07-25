@@ -18,9 +18,10 @@ Three probe tiers:
   discovery) and refreshes the cache for free via
   :func:`record_field_verdict`.
 
-This module is also the canonical home of the sbx error-shape knowledge the
-rest of the codebase depends on (secret exists-markers, the conflicting-scope
-regex): provisioning imports them from here.
+The sbx error shapes themselves (secret exists-markers, the
+conflicting-scope regex) live in :mod:`sbxloop.sbx.secretstate`, shared with
+provisioning and the ``sbxloop secrets`` commands; the ``secret-exists-error``
+probe here is what keeps that encoded knowledge honest against sbx drift.
 """
 
 from __future__ import annotations
@@ -44,22 +45,7 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
 from sbxloop.sbx.sandbox import Sandbox
-
-# -- sbx error shapes (single source of truth; provisioning imports these) --
-
-# Substrings marking an "already exists" refusal from `sbx secret set*`.
-SECRET_EXISTS_MARKERS = ("exist", "already")
-# sbx names the owner of a conflicting secret, e.g.
-#   ERROR: custom secret env "X" already exists in scope NAME with placeholder ...
-SECRET_SCOPE_RE = re.compile(r'in scope "?([A-Za-z0-9._-]+)"?')
-
-
-def parse_secret_conflict_scope(stderr: str) -> str | None:
-    """The scope owning a conflicting secret, per sbx's error message
-    (None when unparseable)."""
-    match = SECRET_SCOPE_RE.search(stderr)
-    return match.group(1) if match else None
-
+from sbxloop.sbx.secretstate import SECRET_EXISTS_MARKERS, parsed_scope
 
 # -- probe ids (importable so provisioning hooks can't typo them) -----------
 
@@ -260,7 +246,7 @@ def _probe_secret_exists_error(ctx: ProbeContext) -> tuple[str, str]:
                     "unrecognized-error",
                     f"duplicate set failed without exists-marker: {stderr!r}",
                 )
-            scope = parse_secret_conflict_scope(stderr)
+            scope = parsed_scope(stderr)
             if scope is None:
                 return "unparseable-scope", f"exists-error names no scope: {stderr!r}"
             return "parseable-scope", f"exists-error names owning scope {scope!r}"

@@ -62,6 +62,7 @@ class TestBasics:
             "status",
             "logs",
             "artifacts",
+            "shell",
             "doctor",
             "sandbox",
             "config",
@@ -181,6 +182,23 @@ class TestConfigAndInit:
         assert "sbxloop.toml" in result.output
         assert "env" in result.output
 
+    def test_config_policy_defaults(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["config", "policy"])
+        assert result.exit_code == 0
+        assert "execute" in result.output
+        assert "plan-declared grants" in result.output
+        assert "empty" in result.output  # no [policy] allow configured
+        assert "api.githubcopilot.com" in result.output
+
+    def test_config_policy_shows_bounds(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[policy]\nallow = ["registry.npmjs.org"]\ndeny = ["evil.example.com"]\n'
+        )
+        result = runner.invoke(app, ["config", "policy"])
+        assert result.exit_code == 0
+        assert "registry.npmjs.org" in result.output
+        assert "evil.example.com" in result.output
+
     def test_init_writes_and_refuses_overwrite(self, workdir: Path) -> None:
         result = runner.invoke(app, ["init"])
         assert result.exit_code == 0
@@ -224,6 +242,45 @@ class TestSandboxCommands:
     def test_sandbox_rm_requires_target(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         result = runner.invoke(app, ["sandbox", "rm"])
         assert result.exit_code == 2
+
+
+class TestShellCommand:
+    def seed_run_with_sandbox(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.models import SandboxSpec
+
+        seed_store(workdir)
+        SbxCLI(binary=str(fake_sbx.binary)).create(
+            SandboxSpec(name="sbxloop-rseeded11-agent", role="agent", workspace=workdir)
+        )
+
+    def test_unknown_run_errors(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        result = runner.invoke(app, ["shell", "rghost"])
+        assert result.exit_code == 2
+        assert "unknown run" in result.output
+
+    def test_invalid_role_errors(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["shell", "rseeded11", "--role", "bogus"])
+        assert result.exit_code == 2
+        assert "agent or github" in result.output
+
+    def test_missing_sandbox_errors_with_keep_hint(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        seed_store(workdir)
+        result = runner.invoke(app, ["shell", "rseeded11"])
+        assert result.exit_code == 2
+        assert "not running" in result.output
+        assert "keep_on_failure" in result.output
+
+    def test_command_runs_inside_the_sandbox(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        self.seed_run_with_sandbox(workdir, fake_sbx)
+        result = runner.invoke(app, ["shell", "rseeded11", "-c", "touch /home/agent/proof"])
+        assert result.exit_code == 0, result.output
+        assert (fake_sbx.sandbox_fs("sbxloop-rseeded11-agent") / "home/agent/proof").is_file()
+
+    def test_inner_exit_code_passes_through(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        self.seed_run_with_sandbox(workdir, fake_sbx)
+        result = runner.invoke(app, ["shell", "rseeded11", "-c", "exit 7"])
+        assert result.exit_code == 7
 
 
 class TestDoctor:
@@ -580,6 +637,59 @@ class TestRunCommand:
         result = runner.invoke(app, ["run", "impossible", "--no-tui"])
         assert result.exit_code == 2
         assert "run failed" in result.output
+        # default: even a failed run's sandboxes are torn down
+        assert (fake_sbx.state / "sandboxes").is_dir() is False or not any(
+            (fake_sbx.state / "sandboxes").iterdir()
+        )
+
+    def test_run_keep_on_failure_flag_keeps_sandboxes(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bad = {"json": {"tasks": [{"id": "t1"}]}}
+        self.make_run_env(workdir, monkeypatch, [bad, bad])
+        result = runner.invoke(app, ["run", "impossible", "--no-tui", "--keep-on-failure"])
+        assert result.exit_code == 2
+        boxes = fake_sbx.state / "sandboxes"
+        assert any(p.name.startswith("sbxloop-") for p in boxes.iterdir())
+        # the run.keep event reaches the transcript with the shell pointer
+        assert "sbxloop shell" in result.output
+
+    def test_failed_run_summary_prints_kept_hint(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Task fails on budgets (not infra), so the run finishes "failed"
+        # and the summary must point at the kept pair.
+        revise = {"json": {"verdict": "revise", "feedback": "nope"}}
+        plan = {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}}
+        execute = {"text": "tried"}
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Only task",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                plan,
+                *[execute, revise] * 3,
+            ],
+        )
+        monkeypatch.setenv("SBXLOOP_KEEP_ON_FAILURE", "true")
+        result = runner.invoke(app, ["run", "doomed", "--no-tui"])
+        assert result.exit_code == 1, result.output
+        assert "sandboxes kept:" in result.output
+        assert "sbxloop shell" in result.output
+        assert "sandbox rm --run" in result.output
 
 
 class TestArtifactsTree:
@@ -880,3 +990,90 @@ class TestDoctorRendering:
         # the table may fold the hint across lines; assert on whole words
         assert "--app-name" in result.output
         assert "sbxloop-iso" in result.output
+
+
+class TestResourceGauge:
+    def sample_event(self, **data: Any) -> Any:
+        from sbxloop.events import Event
+
+        base: dict[str, Any] = {
+            "role": "agent",
+            "level": "ok",
+            "disk_used_pct": 42.0,
+            "mem_used_pct": 31.0,
+            "load1": 0.5,
+        }
+        base.update(data)
+        return Event.now("sandbox.resources", "r1", **base)
+
+    def test_gauge_renders_in_status_panel(self) -> None:
+        from rich.console import Console
+
+        from sbxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        dashboard.on_event(self.sample_event())
+        dashboard.on_event(self.sample_event(role="github", disk_used_pct=12.0))
+        console = Console(record=True, width=100)
+        console.print(dashboard.renderable())
+        text = console.export_text()
+        assert "agent: disk 42%" in text
+        assert "mem 31%" in text
+        assert "load 0.5" in text
+        assert "github: disk 12%" in text
+
+    def test_gauge_escalates_past_thresholds(self) -> None:
+        from rich.console import Console
+
+        from sbxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        dashboard.on_event(self.sample_event(level="abort", disk_used_pct=97.0))
+        console = Console(record=True, width=100)
+        console.print(dashboard.renderable())
+        assert "⚠ abort" in console.export_text()
+
+    def test_samples_stay_out_of_transcript(self) -> None:
+        from sbxloop.cli.tui import render_event
+
+        assert render_event(self.sample_event()) is None
+
+    def test_warning_event_prints_to_transcript(self) -> None:
+        from rich.console import Console
+
+        from sbxloop.cli.tui import render_event
+        from sbxloop.events import Event
+
+        rendered = render_event(
+            Event.now(
+                "sandbox.resources_warning",
+                "r1",
+                level="warn",
+                message="sandbox resources under pressure: disk 90.0% used (disk_warn: 85.0%)",
+            )
+        )
+        assert rendered is not None
+        console = Console(record=True, width=120)
+        console.print(rendered)
+        assert "disk 90.0% used" in console.export_text()
+
+    def test_format_event_shows_resource_summary(self) -> None:
+        from sbxloop.cli.tui import format_event
+
+        line = format_event(self.sample_event(level="warn"))
+        assert "disk=42.0%" in line
+        assert "mem=31.0%" in line
+        assert "warn" in line
+
+
+class TestDoctorStatsProbe:
+    def test_doctor_reports_in_vm_sampling(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "sandbox stats" in result.output
+        # fake sbx (like real 0.35.x) has no stats command -> in-VM sampling
+        assert "samples in-VM" in result.output

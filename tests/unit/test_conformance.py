@@ -21,11 +21,11 @@ from sbxloop.sbx.conformance import (
     ProbeRecord,
     cache_path,
     load_verdicts,
-    parse_secret_conflict_scope,
     record_field_verdict,
     run_conformance,
     save_verdicts,
 )
+from sbxloop.sbx.secretstate import parsed_scope
 from tests.conftest import FakeSbx
 
 FAKE_VERSION = "0.35.0"
@@ -49,9 +49,10 @@ class TestCatalog:
             assert probe.depends, probe.id
 
     def test_scope_parser_matches_observed_error_shape(self) -> None:
+        # the probe leans on secretstate's parser — the shared error-shape home
         stderr = 'ERROR: custom secret env "X" already exists in scope other-box with placeholder p'
-        assert parse_secret_conflict_scope(stderr) == "other-box"
-        assert parse_secret_conflict_scope("some unrelated error") is None
+        assert parsed_scope(stderr) == "other-box"
+        assert parsed_scope("some unrelated error") is None
 
 
 class TestDeepRun:

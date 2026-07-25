@@ -10,6 +10,7 @@ from pathlib import Path
 from sbxloop_worker.backends import get_backend
 from sbxloop_worker.events import EventWriter
 from sbxloop_worker.protocol import ErrorInfo, EventTypes, JobRequest, JobResult
+from sbxloop_worker.resources import LEVEL_SEVERITY, classify_level, sample_resources
 
 OUTPUT_TAIL_CHARS = 20_000
 
@@ -23,12 +24,20 @@ class JobRunner:
         *,
         heartbeat_s: float = 15.0,
         backend_name: str | None = None,
+        disk_warn: float = 0.0,
+        disk_abort: float = 0.0,
+        mem_warn: float = 0.0,
     ) -> None:
         self.job = job
         self.events_path = events_path
         self.result_path = result_path
         self.heartbeat_s = heartbeat_s
         self.backend_name = backend_name
+        self.disk_warn = disk_warn
+        self.disk_abort = disk_abort
+        self.mem_warn = mem_warn
+        self._resource_level = "ok"
+        self._resource_abort: str | None = None
 
     def run(self) -> JobResult:
         """Execute the job and write the authoritative result file.
@@ -39,6 +48,11 @@ class JobRunner:
             heartbeat_stop = self._start_heartbeat(writer)
             try:
                 writer.emit(EventTypes.WORKER_START, kind=self.job.kind)
+                # Baseline resource sample: even a job that finishes inside
+                # one heartbeat gets a datapoint, and a sandbox already past
+                # a threshold is flagged before work starts.
+                if self.heartbeat_s > 0:
+                    self._sample_and_emit(writer)
                 result = self._dispatch(writer)
             except subprocess.TimeoutExpired:
                 result = self._error_result("timeout", "Timeout", "job timed out")
@@ -51,6 +65,22 @@ class JobRunner:
                 )
             finally:
                 heartbeat_stop.set()
+
+            if self._resource_abort and result.status != "ok":
+                # The sandbox blew past disk_abort while this job ran: name
+                # the real cause instead of whatever confusing failure the
+                # in-VM tooling produced on a full disk.
+                original = ""
+                if result.error is not None:
+                    original = f"underlying failure: {result.error.type}: {result.error.message}"
+                    if result.error.detail:
+                        original += f"\n{result.error.detail}"
+                result = self._error_result(
+                    "error",
+                    "SandboxResourcesExhausted",
+                    self._resource_abort,
+                    detail=original[-OUTPUT_TAIL_CHARS:] or None,
+                )
 
             self.result_path.parent.mkdir(parents=True, exist_ok=True)
             self.result_path.write_text(result.model_dump_json())
@@ -152,9 +182,50 @@ class JobRunner:
             while not stop.wait(self.heartbeat_s):
                 try:
                     writer.emit(EventTypes.WORKER_HEARTBEAT)
+                    self._sample_and_emit(writer)
                 except Exception:  # pragma: no cover - writer closed during shutdown
                     return
 
         thread = threading.Thread(target=beat, name="sbxloop-heartbeat", daemon=True)
         thread.start()
         return stop
+
+    def _sample_and_emit(self, writer: EventWriter) -> None:
+        """Emit one ``sandbox.resources`` sample; escalations additionally
+        emit a prominent warning event (edge-triggered, so a long run at 90%
+        disk produces one warning, not one per beat)."""
+        sample = sample_resources()
+        if not sample:
+            return
+        level = classify_level(
+            sample,
+            disk_warn=self.disk_warn,
+            disk_abort=self.disk_abort,
+            mem_warn=self.mem_warn,
+        )
+        writer.emit(EventTypes.SANDBOX_RESOURCES, level=level, **sample)
+        if LEVEL_SEVERITY[level] > LEVEL_SEVERITY[self._resource_level]:
+            writer.emit(
+                EventTypes.SANDBOX_RESOURCES_WARNING,
+                level=level,
+                message=self._level_message(level, sample),
+                **sample,
+            )
+        if level == "abort" and self._resource_abort is None:
+            self._resource_abort = self._level_message(level, sample)
+        self._resource_level = level
+
+    def _level_message(self, level: str, sample: dict[str, object]) -> str:
+        disk = sample.get("disk_used_pct")
+        mem = sample.get("mem_used_pct")
+        if level == "abort":
+            return (
+                f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
+                f"(disk_abort threshold: {self.disk_abort}%)"
+            )
+        parts = []
+        if isinstance(disk, (int, float)) and self.disk_warn > 0 and disk >= self.disk_warn:
+            parts.append(f"disk {disk}% used (disk_warn: {self.disk_warn}%)")
+        if isinstance(mem, (int, float)) and self.mem_warn > 0 and mem >= self.mem_warn:
+            parts.append(f"memory {mem}% used (mem_warn: {self.mem_warn}%)")
+        return "sandbox resources under pressure: " + ", ".join(parts)

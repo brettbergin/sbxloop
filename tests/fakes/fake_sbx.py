@@ -340,6 +340,15 @@ def cmd_secret(root: Path, args: list[str], stdin: str) -> int:
                 "host": flags.get("host", ""),
                 "value": flags.get("value", ""),
             }
+    elif sub == "ls":
+        # The real `sbx secret ls` output format is unverified; this shape is
+        # speculative on purpose — the production parser is token-tolerant.
+        print("SCOPE  TYPE  NAME  HOST")
+        for env, entry in state["custom"].items():
+            print(f"{entry['scope']}  custom  {env}  {entry['host']}")
+        for key in state["service"]:
+            svc_scope, service = key.split("|", 1)
+            print(f"{svc_scope}  service  {service}  -")
     elif sub == "rm":
         scope = positional[0]
         if "env" in flags:
