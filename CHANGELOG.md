@@ -6,6 +6,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Security
+- Secret values no longer leak through error text or the process-observable
+  argv carried on `ExecResult`/`SbxError`: the value passed to
+  `sbx secret set-custom --value` is masked (`***`) in every observable copy
+  of the invocation, so provisioning failures cannot print the Copilot PAT
+  into terminals, logs, or events (#57). The remaining `ps`-visibility of
+  the live subprocess argv needs stdin support in sbx itself and stays
+  tracked in #57.
+
 ### Changed
 - **Releases are now fully automated** (aligned with the entrygraph release
   strategy): every merge to `main` runs the check suite, auto-bumps the patch
