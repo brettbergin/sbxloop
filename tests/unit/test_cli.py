@@ -71,7 +71,10 @@ class TestBasics:
         ):
             assert command in result.output
 
-    def test_run_and_resume_offer_chat_toggle(self) -> None:
+    def test_run_and_resume_offer_chat_toggle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Wide terminal: rich wraps 80-col help panels mid-token in CI,
+        # splitting "--no-chat" across lines.
+        monkeypatch.setenv("COLUMNS", "300")
         for command in ("run", "resume"):
             result = runner.invoke(app, [command, "--help"])
             assert result.exit_code == 0
