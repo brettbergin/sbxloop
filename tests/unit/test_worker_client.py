@@ -687,3 +687,50 @@ class TestWorkerCwd:
         )
         with pytest.raises(WorkerError, match="produced no result file"):
             make_client(sandbox, EventBus()).submit(job)
+
+
+class TestResourceTelemetry:
+    def test_role_enriches_resource_events(self, sandbox: Sandbox) -> None:
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        client = make_client(sandbox, bus, role="agent")
+        client._handle_line(
+            agent_job(),
+            Event.now(
+                EventTypes.SANDBOX_RESOURCES, "r1", level="ok", disk_used_pct=42.0
+            ).to_json_line(),
+        )
+        client._handle_line(
+            agent_job(),
+            Event.now(EventTypes.AGENT_MESSAGE, "r1", content="hi").to_json_line(),
+        )
+        assert seen[0].data["role"] == "agent"
+        assert "role" not in seen[1].data  # only resource events are enriched
+
+    def test_submit_passes_thresholds_and_role(self, sandbox: Sandbox) -> None:
+        """End-to-end: limits ride the worker argv, the worker emits a
+        baseline sample classified against them, and the host stamps the
+        sandbox role onto the republished event."""
+        from sbxloop.config import Limits
+
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        client = make_client(sandbox, bus, role="agent", limits=Limits())
+        result = client.submit(agent_job())
+        assert result.status == "ok"
+        samples = [e for e in seen if e.type == EventTypes.SANDBOX_RESOURCES]
+        assert samples, "worker emitted no baseline resource sample"
+        assert samples[0].data["role"] == "agent"
+        assert samples[0].data["level"] in ("ok", "warn", "abort")
+        assert 0.0 <= samples[0].data["disk_used_pct"] <= 100.0
+
+    def test_submit_without_limits_still_samples(self, sandbox: Sandbox) -> None:
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        result = make_client(sandbox, bus).submit(agent_job())
+        assert result.status == "ok"
+        samples = [e for e in seen if e.type == EventTypes.SANDBOX_RESOURCES]
+        assert samples and samples[0].data["level"] == "ok"  # thresholds disabled

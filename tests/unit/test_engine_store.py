@@ -110,6 +110,13 @@ class TestPhasesAndEvents:
         last_seq = all_events[-1][0]
         assert list(store.events("r1", after_seq=last_seq)) == []
 
+    def test_last_event_ts(self, store: StateStore) -> None:
+        assert store.last_event_ts("r1") is None
+        store.append_event(Event(ts=5.0, run_id="r1", type="run.start"))
+        store.append_event(Event(ts=9.0, run_id="r1", type="worker.heartbeat"))
+        store.append_event(Event(ts=99.0, run_id="other", type="run.start"))
+        assert store.last_event_ts("r1") == 9.0
+
 
 class TestWorkspaceColumns:
     def test_set_and_read_workspace(self, store: StateStore, tmp_path: Path) -> None:
@@ -147,7 +154,23 @@ class TestWorkspaceColumns:
         record = store.get_run("r1")
         assert record.workspace is None
         assert record.mounted is False
+        assert record.kept_reason is None
         store.set_run_workspace("r1", tmp_path / "ws", True)
         assert store.get_run("r1").mounted is True
         # reopening does not re-apply the ALTERs
         StateStore(db).get_run("r1")
+
+
+class TestKeptMarker:
+    def test_set_and_clear(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        assert store.get_run("r1").kept_reason is None
+        store.set_run_kept("r1", "debug")
+        assert store.get_run("r1").kept_reason == "debug"
+        assert store.list_runs()[0].kept_reason == "debug"
+        store.set_run_kept("r1", None)
+        assert store.get_run("r1").kept_reason is None
+
+    def test_unknown_run(self, store: StateStore) -> None:
+        with pytest.raises(StateError, match="unknown run"):
+            store.set_run_kept("ghost", "debug")

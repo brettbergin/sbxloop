@@ -29,6 +29,7 @@ pip install sbxloop
 sbx login
 sbx policy init balanced
 sbxloop doctor          # verifies sbx, policy, tokens, worker wheel
+sbxloop doctor --deep   # + full sbx conformance suite in a scratch sandbox
 
 # go
 sbxloop run "Add mypy strict typing to every module in ./src and fix all findings"
@@ -98,6 +99,51 @@ github-ops sandbox — `GH_TOKEN` only, one atomic commit via the git data API, 
 Delivery failures are reported loudly (`run.deliver` event) but never fail a
 completed run. Without the integration configured, `--deliver` refuses to run.
 
+## Debugging failed runs
+
+By default sandboxes are torn down at run end — including failed runs, which is
+exactly when the in-sandbox evidence (worker stderr, install leftovers, workspace
+state) matters most. Two levers:
+
+```toml
+# sbxloop.toml
+keep_on_failure = true   # keep the pair alive only when a run fails (or --keep-on-failure)
+keep_sandboxes = true    # keep it always (or --keep-sandboxes)
+```
+
+A failed run then ends with a prominent hint naming the kept sandboxes, and
+`sbxloop shell` drops you inside — kept, in-flight, or leaked:
+
+```bash
+sbxloop shell <run>                    # interactive shell in the agent sandbox
+sbxloop shell <run> --role github      # ... or the github-ops sandbox
+sbxloop shell <run> -c 'cat ~/.sbxloop/env.sh'   # one-off command
+```
+
+Attaching to an in-flight run is meant as observation — the worker owns its env
+files and workspace, so avoid mutating them mid-phase. Kept runs are marked in the
+state DB (`kept_reason`) and stay exempt from `sandbox prune` until you pass
+`--include-kept`, so debugging convenience cannot become a permanent leak.
+
+## Sandbox hygiene
+
+Sandboxes are torn down at run end, and an in-process registry also cleans up on
+Ctrl-C/SIGTERM — but a host crash or `kill -9` can still leak a run's microVM pair.
+`sbxloop sandbox prune` garbage-collects those orphans by cross-referencing
+`sbx ls` against the state DB:
+
+```bash
+sbxloop sandbox prune            # dry run: classify every sbxloop sandbox
+sbxloop sandbox prune --force    # actually remove the orphan candidates
+```
+
+A sandbox counts as an orphan candidate when its run is terminal
+(completed/failed/cancelled), unknown to this working copy's state DB, or
+non-terminal but silent past `--min-age` (default 1 hour — the persisted event
+stream, heartbeats included, is the liveness signal). Sandboxes deliberately kept
+for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor`
+reports the current orphan-candidate count.
+
 ## Repository layout
 
 This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with two distributions:
@@ -139,7 +185,25 @@ dispatched workflow.
    ```
 
    With `repo` set, runs provision the github-ops sandbox and require a second PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with (e.g. issues: write, contents: read) — used *only* by that sandbox. Without it, no github sandbox exists, `GH_TOKEN` is not needed, and repo-facing features refuse to run.
-4. `sbxloop doctor` verifies all of it and prints remediation for anything missing.
+4. `sbxloop doctor` verifies all of it and prints remediation for anything missing. It also runs the **sbx conformance suite**: every empirically-learned assumption about sbx semantics (secret visibility under `exec`, `cp` directory semantics, workspace-mount discovery, ...) is a named probe whose verdict is cached per `sbx` version — `sbxloop doctor --deep` runs the full suite in a scratch sandbox, and doctor warns loudly when an sbx upgrade flips a verdict that sbxloop's behavior depends on.
+
+### Secret registration hygiene
+
+sbx keys custom secrets by env var name (one registration per var, whatever the
+scope), so leftover registrations from old runs or old versions surface as
+`already exists in scope …` collisions. Provisioning recovers automatically,
+and `sbxloop secrets` manages the same state proactively:
+
+```bash
+sbxloop secrets list             # registrations + pre-collision warnings
+sbxloop secrets clean            # dry-run removal of stale entries (--apply to execute)
+sbxloop secrets rotate           # replace the COPILOT_GITHUB_TOKEN registration
+                                 # (token from env/.env or --prompt, never argv)
+```
+
+`rotate` also reports which secret strategy (proxy vs plain-env fallback) the
+next run will use. None of these commands touch the built-in `github` service
+secret or registrations owned by other tools.
 
 Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLOOP_*` env vars (`sbxloop init` writes a commented starter file; `sbxloop config show` shows the resolved values and their sources).
 
@@ -147,6 +211,7 @@ Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLO
 
 - [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume
 - [Worker protocol](docs/worker-protocol.md) — the host↔worker contract: job kinds, events, transports
+- [Spike: agent-session backend](docs/spikes/46-agent-session-backend.md) — feasibility study for proxy-held secrets via sbx native sessions (issue #46)
 - [Changelog](CHANGELOG.md)
 
 ## Requirements

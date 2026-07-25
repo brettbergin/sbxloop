@@ -13,6 +13,10 @@ class ConfigError(SdxloopError):
     """Invalid or unloadable configuration."""
 
 
+class SecretStateError(SdxloopError):
+    """A secret registration could not be inspected or replaced."""
+
+
 class SbxError(SdxloopError):
     """An sbx CLI invocation failed."""
 

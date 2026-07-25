@@ -15,9 +15,10 @@ Session strategy per phase (a deliberate design decision):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Literal, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from sbxloop.config import Config
 from sbxloop.engine.model import PlanModel, TaskGraph, TaskRecord, Verdict
@@ -99,16 +100,41 @@ class PhaseRunner:
         context: dict[str, str],
         *,
         permission_mode: Literal["auto", "read_only"] = "auto",
+        check: Callable[[ModelT], None] | None = None,
     ) -> ModelT:
-        """Run a JSON-expecting agent job; one retry with the validation error."""
+        """Run a JSON-expecting agent job; one retry with what went wrong.
+
+        Retryable failures: schema mismatch (ValidationError), semantic
+        rejection by ``check`` (host-side validation on the parsed model;
+        raise ValueError to reject — pydantic's ValidationError is a
+        ValueError subclass, so both share the retry path), and a reply
+        containing no JSON at all (ExpectedJsonMissing — the field failure
+        that used to kill whole runs on one chatty reply). Anything else
+        raises immediately.
+        """
         retry_context = ""
         last_error: Exception | None = None
         for _ in range(2):
             prompt = render(prompt_name, retry_context=retry_context, **context)
-            result = self._agent_job(prompt, permission_mode=permission_mode, expect="json")
             try:
-                return model_cls.model_validate(result.output_json)
-            except ValidationError as exc:
+                result = self._agent_job(prompt, permission_mode=permission_mode, expect="json")
+            except WorkerError as exc:
+                if "ExpectedJsonMissing" not in str(exc):
+                    raise
+                last_error = exc
+                retry_context = (
+                    "\n## Previous attempt was invalid\n\n"
+                    "Your previous response contained no parseable JSON. Respond "
+                    "with ONLY one fenced ```json block in the format above — no "
+                    "prose before or after it."
+                )
+                continue
+            try:
+                model = model_cls.model_validate(result.output_json)
+                if check is not None:
+                    check(model)
+                return model
+            except ValueError as exc:  # includes pydantic's ValidationError
                 last_error = exc
                 retry_context = (
                     "\n## Previous attempt was invalid\n\n"
@@ -156,7 +182,32 @@ class PhaseRunner:
                 "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
                 "feedback": task.last_feedback or "(none — first attempt)",
             },
+            check=self._check_plan_egress,
         )
+
+    def _check_plan_egress(self, plan: PlanModel) -> None:
+        """Reject plans declaring egress outside the operator's bounds.
+
+        Feeds the retry loop, so the planner gets one chance to drop the
+        domain (or find a baseline-reachable alternative) before the run
+        fails — the "grant only within operator-set limits" guardrail.
+        """
+        from sbxloop.policy import effective_egress_bounds, egress_rejection
+
+        allow, deny = effective_egress_bounds(self.config)
+        problems = [
+            f"- {egress.domain}: {rejection}"
+            for egress in plan.egress
+            if (rejection := egress_rejection(egress.domain, allow, deny)) is not None
+        ]
+        if problems:
+            raise ValueError(
+                "plan-declared egress is outside the operator's bounds:\n"
+                + "\n".join(problems)
+                + "\nDrop these domains from `egress` (prefer baseline-reachable hosts: "
+                "PyPI, GitHub, apt mirrors). Only the operator can extend the bounds, "
+                "via [policy] allow in sbxloop.toml."
+            )
 
     def execute(self, task: TaskRecord, plan: PlanModel) -> JobResult:
         prompt = render(

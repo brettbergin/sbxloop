@@ -17,11 +17,13 @@ destroyed.
   project commands through `.venv/bin/...`.
 - If a tool or apt package is missing, you have passwordless sudo:
   `sudo apt-get install -y <package>`.
-- Network egress is allowlisted. PyPI, GitHub, and apt mirrors are
-  reachable; other hosts (npm registry, arbitrary APIs) may not be. If a
-  download times out repeatedly, say so in your summary instead of
-  retrying forever — the allowlist is user configuration, not something
-  you can change.
+- Network egress is allowlisted. PyPI, GitHub, apt mirrors, and any
+  domains the plan declared as `egress` are reachable; other hosts (npm
+  registry, arbitrary APIs) may not be. If a download times out
+  repeatedly, treat the host as blocked: name the exact blocked domain in
+  your summary — a re-plan can declare it — instead of retrying forever.
+  The allowlist is operator-bounded configuration, not something you can
+  change from in here.
 
 ## Overall outcome
 

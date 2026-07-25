@@ -40,6 +40,15 @@ def test_execute_and_plan_carry_environment_notes() -> None:
         assert "python3 -m venv" in text
         assert "sudo" in text
         assert "allowlist" in text
+    # Plan-declared egress: the planner must know the field and its bounds,
+    # and the executor must report blocked domains instead of retrying.
+    assert "egress" in plan
+    assert "egress" in execute
+    assert "blocked domain" in execute
+    # 0.5.0 regression: environment notes buried the response-format section
+    # and JSON compliance dropped. The format instructions must come LAST.
+    assert plan.index("Environment facts") < plan.index("Response format")
+    assert "ONLY the fenced JSON block" in plan
 
 
 def test_render_all_templates_have_no_leftover_vars() -> None:

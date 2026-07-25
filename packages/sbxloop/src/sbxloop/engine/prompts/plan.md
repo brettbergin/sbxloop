@@ -18,6 +18,15 @@ $acceptance_criteria
 
 $feedback
 
+## Environment facts to plan around
+
+Debian/Ubuntu VM; the system Python is externally managed (PEP 668), so
+Python dependencies belong in a project virtualenv (`python3 -m venv .venv`)
+and commands — including your `verify_commands` — should use `.venv/bin/...`
+paths; missing apt packages can be installed with passwordless sudo; network
+egress is allowlisted (PyPI, GitHub, and apt mirrors are reachable — declare
+anything else in `egress`).
+
 ## Response format
 
 Respond with exactly one fenced JSON block:
@@ -26,17 +35,21 @@ Respond with exactly one fenced JSON block:
 {
   "steps": ["specific action 1", "specific action 2"],
   "expected_artifacts": ["files or outputs this task should produce"],
-  "verify_commands": ["shell commands that exit 0 only when the work is correct"]
+  "verify_commands": ["shell commands that exit 0 only when the work is correct"],
+  "egress": [{"domain": "registry.npmjs.org", "reason": "npm install for the build"}]
 }
 ```
 
 Steps must be specific enough that an executor with no other context can
 follow them. Include the task's own verification ideas in `verify_commands`.
 
-Environment facts to plan around: Debian/Ubuntu VM; the system Python is
-externally managed (PEP 668), so Python dependencies belong in a project
-virtualenv (`python3 -m venv .venv`) and commands — including your
-`verify_commands` — should use `.venv/bin/...` paths; missing apt packages
-can be installed with passwordless sudo; network egress is allowlisted
-(PyPI, GitHub, and apt mirrors are reachable — other registries may not be).
+`egress` declares external domains the executor will need to reach beyond
+the baseline. PyPI, GitHub, and apt mirrors are always reachable — never
+declare those. Each entry needs a short justification; use `[]` when the
+baseline suffices (the common case). Domains only — no scheme, path, or
+port; `*.example.com` wildcards are accepted. Declarations are auto-granted
+only within an operator-set allowlist: a request outside it fails this
+plan's validation, so prefer baseline-reachable alternatives.
+
+Respond with ONLY the fenced JSON block — no prose before or after it.
 $retry_context
