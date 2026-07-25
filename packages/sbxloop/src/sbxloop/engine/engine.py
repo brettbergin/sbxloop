@@ -139,12 +139,17 @@ class LoopEngine:
                     agent.install(extras="copilot", ensure_dev_tools=True)
                     if github is not None:
                         github.install(extras="")
-                detach = self._attach_reporter(github, run_id)
+                reporter, detach = self._attach_reporter(github, run_id, outcome)
                 try:
                     phases = PhaseRunner(
                         agent, self.config, run_id, outcome, workdir=pair.agent_workdir
                     )
                     state = self._run_phases(run_id, phases, deadline, pair)
+                    # Summary must post while the github sandbox is alive;
+                    # on an infra exception the run is resumable and the
+                    # resumed run reopens the same tracking issue.
+                    if reporter is not None:
+                        reporter.close_run(run_id, state)
                 finally:
                     detach()
                     # Harvest even when a phase raised: the sandbox is still
@@ -167,13 +172,24 @@ class LoopEngine:
             mounted=pair.mounted,
         )
 
-    def _attach_reporter(self, github: WorkerClient | None, run_id: str) -> Callable[[], None]:
+    def _attach_reporter(
+        self, github: WorkerClient | None, run_id: str, outcome: str
+    ) -> tuple[GithubReporterHook | None, Callable[[], None]]:
+        """Attach progress reporting; opens the tracking issue immediately.
+
+        Run start/end go through explicit ``open_run``/``close_run`` calls
+        rather than bus events: RUN_START is emitted before the github
+        sandbox exists and RUN_END after it is gone, so the hook could never
+        observe them (#58).
+        """
         gh = self.config.github
         if not gh.report or github is None:
-            return lambda: None
+            return None, lambda: None
         assert gh.repo is not None  # report=True without a repo cannot provision a github worker
         hook = GithubReporterHook(GithubOps(github, run_id), gh.repo)
-        return self.bus.attach_hook(hook)
+        detach = self.bus.attach_hook(hook)
+        hook.open_run(run_id, outcome)
+        return hook, detach
 
     def _harvest(self, run_id: str, pair: SandboxPair) -> None:
         """Copy the in-VM work dir out to the host (unmounted runs only).
