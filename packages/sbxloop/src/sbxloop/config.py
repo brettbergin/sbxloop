@@ -68,6 +68,14 @@ class GithubConfig(_ConfigModel):
         return self.repo is not None
 
 
+class PoolConfig(_ConfigModel):
+    """The warm sandbox pool (``sbxloop warmup``). Standby pairs expire
+    ``ttl_s`` seconds after provisioning and are discarded at the next
+    warmup/claim/prune instead of being reused."""
+
+    ttl_s: float = 1800.0
+
+
 class Budgets(_ConfigModel):
     max_revisions_per_task: int = 2
     max_replans_per_task: int = 1
@@ -94,6 +102,7 @@ class Config(_ConfigModel):
     install_workers: bool = True
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
+    pool: PoolConfig = Field(default_factory=PoolConfig)
     budgets: Budgets = Field(default_factory=Budgets)
 
 

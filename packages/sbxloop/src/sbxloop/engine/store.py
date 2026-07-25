@@ -22,6 +22,7 @@ from sbxloop.engine.model import (
     TaskState,
 )
 from sbxloop.errors import StateError
+from sbxloop.sbx.pool import PoolPairRecord
 from sbxloop_worker.protocol import Event
 
 _SCHEMA = """
@@ -68,6 +69,18 @@ CREATE TABLE IF NOT EXISTS events (
     data_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id, seq);
+CREATE TABLE IF NOT EXISTS pool_pairs (
+    pool_id       TEXT PRIMARY KEY,
+    fingerprint   TEXT NOT NULL,
+    agent_name    TEXT NOT NULL,
+    github_name   TEXT,
+    workspace     TEXT NOT NULL,
+    agent_workdir TEXT NOT NULL,
+    mounted       INTEGER NOT NULL DEFAULT 0,
+    worker_python TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    expires_at    REAL NOT NULL
+);
 """
 
 # Columns added after 0.2.0; applied idempotently so existing state
@@ -240,6 +253,88 @@ class StateStore:
                 (run_id, task_id),
             )
         )
+
+    # -- warm pool -----------------------------------------------------------
+
+    @staticmethod
+    def _pool_record(row: sqlite3.Row) -> PoolPairRecord:
+        return PoolPairRecord(
+            pool_id=row["pool_id"],
+            fingerprint=row["fingerprint"],
+            agent_name=row["agent_name"],
+            github_name=row["github_name"],
+            workspace=Path(row["workspace"]),
+            agent_workdir=row["agent_workdir"],
+            mounted=bool(row["mounted"]),
+            worker_python=row["worker_python"],
+            created_at=row["created_at"],
+            expires_at=row["expires_at"],
+        )
+
+    def add_pool_pair(self, record: PoolPairRecord) -> None:
+        self._conn.execute(
+            "INSERT INTO pool_pairs (pool_id, fingerprint, agent_name, github_name, workspace,"
+            " agent_workdir, mounted, worker_python, created_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.pool_id,
+                record.fingerprint,
+                record.agent_name,
+                record.github_name,
+                str(record.workspace),
+                record.agent_workdir,
+                int(record.mounted),
+                record.worker_python,
+                record.created_at,
+                record.expires_at,
+            ),
+        )
+        self._conn.commit()
+
+    def take_pool_pair(self, fingerprint: str, *, now: float) -> PoolPairRecord | None:
+        """Atomically consume the oldest live pair matching ``fingerprint``.
+
+        The row delete is the claim: only the process whose DELETE hits wins
+        the pair, so concurrent runs never revive the same standby."""
+        while True:
+            row = self._conn.execute(
+                "SELECT * FROM pool_pairs WHERE fingerprint = ? AND expires_at > ?"
+                " ORDER BY created_at LIMIT 1",
+                (fingerprint, now),
+            ).fetchone()
+            if row is None:
+                return None
+            if self.remove_pool_pair(row["pool_id"]):
+                return self._pool_record(row)
+
+    def list_pool_pairs(self) -> list[PoolPairRecord]:
+        rows = self._conn.execute("SELECT * FROM pool_pairs ORDER BY created_at").fetchall()
+        return [self._pool_record(row) for row in rows]
+
+    def expired_pool_pairs(self, *, now: float) -> list[PoolPairRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM pool_pairs WHERE expires_at <= ? ORDER BY created_at", (now,)
+        ).fetchall()
+        return [self._pool_record(row) for row in rows]
+
+    def remove_pool_pair(self, pool_id: str) -> bool:
+        cursor = self._conn.execute("DELETE FROM pool_pairs WHERE pool_id = ?", (pool_id,))
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def remove_pool_pairs_for_sandboxes(self, names: list[str]) -> int:
+        """Drop pool rows whose sandboxes were removed out-of-band
+        (``sbxloop sandbox rm``); returns how many rows were dropped."""
+        if not names:
+            return 0
+        placeholders = ",".join("?" for _ in names)
+        cursor = self._conn.execute(
+            f"DELETE FROM pool_pairs WHERE agent_name IN ({placeholders})"
+            f" OR github_name IN ({placeholders})",
+            (*names, *names),
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     # -- events ------------------------------------------------------------
 

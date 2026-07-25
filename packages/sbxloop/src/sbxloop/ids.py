@@ -24,6 +24,11 @@ def is_run_id(value: str) -> bool:
     return _RUN_ID_RE.fullmatch(value) is not None
 
 
+def new_pool_id() -> str:
+    """A short id for warm-pool pairs, e.g. ``p7k2m9qp3``-style."""
+    return "p" + _token(8)
+
+
 def new_job_id() -> str:
     return "j" + _token(10)
 

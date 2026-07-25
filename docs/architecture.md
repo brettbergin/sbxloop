@@ -74,6 +74,29 @@ Cleanup is guaranteed by `SandboxPair` (context manager) plus a process-wide
 registry hooked into `atexit` and SIGINT/SIGTERM: aborted runs do not leak
 microVMs. Sandboxes are **cattle** — `resume` always provisions a fresh pair.
 
+## The warm pool
+
+Cold provisioning dominates run startup, so `sbxloop warmup` can pre-provision
+standby pairs (`WarmPool` in `sbxloop.sbx.pool`, persisted in the `pool_pairs`
+table). `run` claims a warm pair when its **provision fingerprint** matches —
+a digest over the sbxloop/worker version, template, app-name, network allows,
+secret strategy, GitHub enablement, and explicit workspace — otherwise cold
+provisioning proceeds unchanged. `resume` never claims: a claim swaps in a
+freshly reset pool workspace, while a resumed run must keep its persisted run
+workspace (the interrupted run's partial work lives there).
+
+Pooled sandboxes are named `sbxloop-pool-<pool_id>-<role>` so `sbx ls`
+parsing and orphan classification still work. Claims are self-verifying:
+the row delete in SQLite is the atomic claim (no double-revive across
+processes), the pair is probed (liveness + worker version), secrets are
+re-applied from the current host env via the replace-on-exists flow (token
+rotation propagates; registrations surviving stop/start is not assumed), and
+run-scoped state is reset (in-VM job/result/event dirs, the agent work dir,
+and the pool-owned host workspace — an explicit `[sandbox] workspace` is the
+user's directory and is never wiped). Any failed check discards the pair; a
+TTL (`[pool] ttl_s`) ages out idle standbys. Reuse is an optimization, never
+a correctness dependency.
+
 ## The loop
 
 ```
@@ -111,7 +134,7 @@ that feeds the validation error back to the agent.
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with
-four tables: `runs`, `tasks`, `phase_attempts`, `events`. A row is committed
+five tables: `runs`, `tasks`, `phase_attempts`, `events`, `pool_pairs`. A row is committed
 after **every** state transition. Infrastructure failures propagate after
 persisting — a crash and a `kill -9` look identical to the store — and
 `resume`:

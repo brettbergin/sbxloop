@@ -37,6 +37,8 @@ class SandboxPair:
         workspace: Path | None = None,
         agent_workdir: str = WORK_DIR,
         mounted: bool = False,
+        preinstalled: bool = False,
+        worker_python: str | None = None,
     ) -> None:
         self.run_id = run_id
         self.agent = agent
@@ -49,6 +51,11 @@ class SandboxPair:
         self.workspace = workspace
         self.agent_workdir = agent_workdir
         self.mounted = mounted
+        # Warm-pool claims arrive with workers already installed; the engine
+        # skips the install ladder and uses the recorded interpreter (the
+        # ladder may have fallen back to the system python3 at warmup).
+        self.preinstalled = preinstalled
+        self.worker_python = worker_python
         self._cleaned = False
 
     def __enter__(self) -> SandboxPair:
