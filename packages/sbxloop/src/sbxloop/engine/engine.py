@@ -134,7 +134,9 @@ class LoopEngine:
                     else None
                 )
                 if self.install_workers:
-                    agent.install(extras="copilot")
+                    # ensure_dev_tools: the agent builds projects in this VM
+                    # (venvs, pip) — the github sandbox only runs API ops.
+                    agent.install(extras="copilot", ensure_dev_tools=True)
                     if github is not None:
                         github.install(extras="")
                 detach = self._attach_reporter(github, run_id)

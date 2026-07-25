@@ -277,6 +277,82 @@ class TestInstallFallbacks:
         apt_calls = [c for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)]
         assert apt_calls, "expected an apt-get self-heal attempt"
 
+    def test_ensure_dev_tools_installs_apt_packages_up_front(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        import sbxloop
+
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
+        )
+        client.install(wheel=wheel, ensure_dev_tools=True)
+        execs = fake_sbx.invocations("exec")
+        apt_idx = [i for i, c in enumerate(execs) if any("apt-get" in a for a in c)]
+        venv_idx = [i for i, c in enumerate(execs) if "-m venv" in " ".join(c)]
+        assert apt_idx, "expected the dev-tools apt install"
+        assert venv_idx and apt_idx[0] < venv_idx[0], "apt must run before venv creation"
+        # both packages named in one invocation
+        apt_cmd = " ".join(execs[apt_idx[0]])
+        assert "python3-venv" in apt_cmd and "python3-pip" in apt_cmd
+
+    def test_ensure_dev_tools_failure_is_nonfatal_but_loud(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import sbxloop
+
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=100, stderr="apt exploded")
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
+        )
+        with caplog.at_level("WARNING"):
+            client.install(wheel=wheel, ensure_dev_tools=True)
+        assert any("dev-tools ensure failed" in r.getMessage() for r in caplog.records)
+        assert any("apt exploded" in r.getMessage() for r in caplog.records)
+
+    def test_install_without_flag_skips_dev_tools(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        import sbxloop
+
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
+        )
+        client.install(wheel=wheel)
+        execs = fake_sbx.invocations("exec")
+        assert not [c for c in execs if any("apt-get" in a for a in c)]
+
     def test_user_site_fallback_when_venv_impossible(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
