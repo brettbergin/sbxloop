@@ -84,6 +84,25 @@ github-ops sandbox — `GH_TOKEN` only, one atomic commit via the git data API, 
 Delivery failures are reported loudly (`run.deliver` event) but never fail a
 completed run. Without the integration configured, `--deliver` refuses to run.
 
+## Sandbox hygiene
+
+Sandboxes are torn down at run end, and an in-process registry also cleans up on
+Ctrl-C/SIGTERM — but a host crash or `kill -9` can still leak a run's microVM pair.
+`sbxloop sandbox prune` garbage-collects those orphans by cross-referencing
+`sbx ls` against the state DB:
+
+```bash
+sbxloop sandbox prune            # dry run: classify every sbxloop sandbox
+sbxloop sandbox prune --force    # actually remove the orphan candidates
+```
+
+A sandbox counts as an orphan candidate when its run is terminal
+(completed/failed/cancelled), unknown to this working copy's state DB, or
+non-terminal but silent past `--min-age` (default 1 hour — the persisted event
+stream, heartbeats included, is the liveness signal). Sandboxes deliberately kept
+for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor`
+reports the current orphan-candidate count.
+
 ## Repository layout
 
 This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with two distributions:
