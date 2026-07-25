@@ -113,3 +113,26 @@ def test_deliver_config_layers(tmp_path: Path) -> None:
     assert config.github.deliver_base == "develop"
 
     assert Config().github.deliver is False  # delivery is opt-in
+
+
+def test_policy_defaults_empty(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path, env={})
+    assert config.policy.allow == []
+    assert config.policy.deny == []
+
+
+def test_policy_patterns_parse_and_normalize(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text(
+        "[policy]\n"
+        'allow = ["Registry.NPMJS.org", "*.crates.io", "*"]\n'
+        'deny = ["evil.example.com"]\n'
+    )
+    config = load_config(cwd=tmp_path, env={})
+    assert config.policy.allow == ["registry.npmjs.org", "*.crates.io", "*"]
+    assert config.policy.deny == ["evil.example.com"]
+
+
+def test_policy_invalid_pattern_is_config_error(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[policy]\nallow = ["https://pypi.org"]\n')
+    with pytest.raises(ConfigError, match="invalid egress pattern"):
+        load_config(cwd=tmp_path, env={})

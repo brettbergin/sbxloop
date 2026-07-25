@@ -47,7 +47,7 @@ is not required, and the run has no GitHub capability at all:
 | name | `sbxloop-<run>-agent` | `sbxloop-<run>-github` |
 | credential | `COPILOT_GITHUB_TOKEN` only | `GH_TOKEN` only |
 | injection | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` secret service |
-| network | balanced policy + copilot hosts | balanced policy + github hosts |
+| network | balanced policy + copilot hosts + plan-declared grants | balanced policy + github hosts |
 | runs | Copilot SDK agent sessions, shell checks | `github.op` jobs (gh CLI or REST) |
 
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
@@ -69,6 +69,19 @@ directly); setting `app_name` in config opts into isolated sbx state, which
 then needs its own `sbx --app-name <name> login` and policy init. The `plain-env` fallback strategy (tokens
 written to `~/.sbxloop/env.sh` in-VM) exists for hosts where the experimental
 `set-custom` proxying is unavailable, and is documented as weaker.
+
+Beyond the static baseline, egress is **plan-declared and grant-late**: the
+PLAN phase may declare extra domains a task needs during EXECUTE (each with a
+justification), validated against operator bounds (`[policy] allow` /
+`[policy] deny` in sbxloop.toml — out-of-bounds requests fail plan
+validation) and applied via `sbx policy allow network <domain> --sandbox
+<agent>` only at EXECUTE entry. Every grant and refusal is emitted as a
+`policy.allow` / `policy.deny` run event, so the persisted event log doubles
+as an egress audit trail (`sbxloop logs RUN --type policy.`); `sbxloop
+config policy` renders the effective per-phase policy. sbx 0.35 has no
+revocation primitive, so grants persist for the sandbox's lifetime
+(SCRUTINIZE/VERIFY inherit them) but never outlive a run — sandboxes are
+removed at run end and `resume` provisions fresh ones.
 
 Cleanup is guaranteed by `SandboxPair` (context manager) plus a process-wide
 registry hooked into `atexit` and SIGINT/SIGTERM: aborted runs do not leak

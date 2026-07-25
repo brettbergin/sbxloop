@@ -300,6 +300,49 @@ class TestJsonRetry:
             harness.engine().start("never valid")
 
 
+PLAN_NPM = {
+    "json": {
+        "steps": ["npm install"],
+        "expected_artifacts": [],
+        "verify_commands": [],
+        "egress": [{"domain": "registry.npmjs.org", "reason": "npm install"}],
+    }
+}
+
+
+class TestPlanEgress:
+    """Plan-declared egress: bounded by [policy], granted just before EXECUTE."""
+
+    def test_in_bounds_egress_granted_and_event_logged(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_NPM, EXECUTE, PASS, ACCEPT])
+        result = harness.engine(policy={"allow": ["registry.npmjs.org"]}).start("npm task")
+        assert result.state == "completed"
+        agent = f"sbxloop-{result.run_id}-agent"
+        assert [
+            "allow",
+            "network",
+            "registry.npmjs.org",
+            "--sandbox",
+            agent,
+        ] in harness.fake_sbx.policies()
+        (event,) = [e for e in harness.events if e.type == "policy.allow"]
+        assert event.data["domain"] == "registry.npmjs.org"
+        assert event.data["reason"] == "npm install"
+        assert event.data["task_id"] == "t1"
+
+    def test_out_of_bounds_egress_rejected_then_retried(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_NPM, PLAN, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("npm denied")
+        assert result.state == "completed"
+        grants = [c for c in harness.fake_sbx.policies() if "registry.npmjs.org" in c]
+        assert grants == []
+
+    def test_out_of_bounds_egress_twice_fails(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_NPM, PLAN_NPM])
+        with pytest.raises(WorkerError, match="invalid output twice"):
+            harness.engine().start("insists on npm")
+
+
 class TestWorkspaceExecution:
     """The artifacts linchpin: jobs run in the workspace mount, so files the
     executor writes appear on the host live and survive sandbox teardown."""

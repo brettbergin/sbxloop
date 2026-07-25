@@ -81,6 +81,8 @@ class HostEventTypes:
     TASK_END = "task.end"
     PHASE_START = "phase.start"
     PHASE_END = "phase.end"
+    POLICY_ALLOW = "policy.allow"
+    POLICY_DENY = "policy.deny"
     SANDBOX_PROVISION_START = "sandbox.provision_start"
     SANDBOX_READY = "sandbox.ready"
     SANDBOX_CLEANUP = "sandbox.cleanup"

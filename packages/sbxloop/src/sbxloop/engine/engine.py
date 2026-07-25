@@ -42,6 +42,7 @@ from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_run_id
+from sbxloop.policy import EgressGranter
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
@@ -144,7 +145,10 @@ class LoopEngine:
                     phases = PhaseRunner(
                         agent, self.config, run_id, outcome, workdir=pair.agent_workdir
                     )
-                    state = self._run_phases(run_id, phases, deadline, pair)
+                    granter = EgressGranter(
+                        self.sbx, self.config, self.bus, run_id, pair.agent.name
+                    )
+                    state = self._run_phases(run_id, phases, deadline, pair, granter)
                 finally:
                     detach()
                     # Harvest even when a phase raised: the sandbox is still
@@ -247,7 +251,12 @@ class LoopEngine:
         self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, pr=pr.number, url=pr.url)
 
     def _run_phases(
-        self, run_id: str, phases: PhaseRunner, deadline: float, pair: SandboxPair
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        deadline: float,
+        pair: SandboxPair,
+        granter: EgressGranter,
     ) -> RunState:
         tasks = self.store.get_tasks(run_id)
         if not tasks:
@@ -286,7 +295,7 @@ class LoopEngine:
                 self.store.update_task(run_id, task)
                 self._emit_task_end(run_id, task)
                 continue
-            self._run_task(run_id, phases, task, deadline, pair)
+            self._run_task(run_id, phases, task, deadline, pair, granter)
             if task.state == "failed":
                 failed_ids.add(task.spec.id)
 
@@ -302,6 +311,7 @@ class LoopEngine:
         task: TaskRecord,
         deadline: float,
         pair: SandboxPair,
+        granter: EgressGranter,
     ) -> None:
         budgets = self.config.budgets
         if task.state == "pending":
@@ -323,7 +333,7 @@ class LoopEngine:
             if task.state == "planning":
                 self._phase_plan(run_id, phases, task)
             elif task.state == "executing":
-                self._phase_execute_and_scrutinize(run_id, phases, task, budgets)
+                self._phase_execute_and_scrutinize(run_id, phases, task, granter)
             elif task.state == "verifying":
                 self._phase_verify(run_id, phases, task, budgets)
             elif task.state == "validating":
@@ -356,9 +366,14 @@ class LoopEngine:
         run_id: str,
         phases: PhaseRunner,
         task: TaskRecord,
-        budgets: object,
+        granter: EgressGranter,
     ) -> None:
         assert task.plan is not None
+        # Grant-late: plan-declared egress is applied at EXECUTE entry, not
+        # at plan time. Runs here (not in _phase_plan) so resumed tasks whose
+        # persisted state skips planning still get their grants on the
+        # freshly provisioned sandbox.
+        granter.apply(task.spec.id, [(egress.domain, egress.reason) for egress in task.plan.egress])
         started = time.time()
         result = phases.execute(task, task.plan)
         task.session_id = result.session_id

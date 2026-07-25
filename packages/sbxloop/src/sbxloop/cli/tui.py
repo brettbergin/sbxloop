@@ -39,7 +39,7 @@ TASK_STATE_STYLES = {
 }
 
 # Compact one-liner lifecycle events (chat "system" messages).
-_LIFECYCLE_PREFIXES = ("run.", "task.", "phase.", "sandbox.", "gh.")
+_LIFECYCLE_PREFIXES = ("run.", "task.", "phase.", "sandbox.", "gh.", "policy.")
 
 # High-volume noise excluded from the transcript (still queryable via
 # `sbxloop logs`): streaming deltas, raw stdout passthrough, heartbeats.
@@ -148,7 +148,11 @@ def render_event(event: Event) -> RenderableType | None:
         style = "dim"
         if event.type == HostEventTypes.TASK_STATE:
             style = TASK_STATE_STYLES.get(str(data.get("state", "")), "dim")
-        elif "fallback" in event.type or "missing" in event.type:
+        elif (
+            "fallback" in event.type
+            or "missing" in event.type
+            or event.type == HostEventTypes.POLICY_DENY
+        ):
             style = "yellow"
         return Text(line, style=style, overflow="fold")
 
