@@ -179,7 +179,7 @@ class TestPolicy:
         self, cli: SbxCLI, fake_sbx: FakeSbx
     ) -> None:
         # sbx answering "denied" with a nonzero exit is still a policy answer
-        fake_sbx.fail_next("policy check", returncode=1, stdout="denied by policy\n")
+        fake_sbx.script("policy check", returncode=1, stdout="denied by policy\n", once=True)
         assert cli.policy_check("x.example") is False
 
     def test_policy_check_invocation_failure_raises(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
