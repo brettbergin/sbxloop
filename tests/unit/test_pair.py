@@ -89,6 +89,30 @@ def test_signal_handler_cleans_and_reraises(fake_sbx: FakeSbx, tmp_path: Path) -
     assert gone(fake_sbx, "sbxloop-r1-agent")
 
 
+def test_signal_handler_quiesces_before_cleanup(fake_sbx: FakeSbx, tmp_path: Path) -> None:
+    # The driver's quiesce callback (the TUI signals + joins its engine
+    # thread) must run BEFORE the pairs are torn down, and a raising
+    # callback must never block cleanup.
+    pair = make_pair(fake_sbx, tmp_path)
+    cleanup_registry.register(pair)
+    cleanup_registry._previous[signal.SIGINT] = None
+    order: list[str] = []
+
+    def quiesce() -> None:
+        order.append("quiesce")
+        assert not gone(fake_sbx, "sbxloop-r1-agent")  # sandboxes still alive
+        raise RuntimeError("quiesce hiccup")  # contained, never blocks cleanup
+
+    cleanup_registry.set_quiesce(quiesce)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            cleanup_registry._handle_signal(signal.SIGINT, None)
+    finally:
+        cleanup_registry.set_quiesce(None)
+    assert order == ["quiesce"]
+    assert gone(fake_sbx, "sbxloop-r1-agent")
+
+
 def test_signal_handler_sigterm_exits(fake_sbx: FakeSbx, tmp_path: Path) -> None:
     pair = make_pair(fake_sbx, tmp_path)
     cleanup_registry.register(pair)

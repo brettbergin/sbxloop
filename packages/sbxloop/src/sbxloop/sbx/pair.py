@@ -18,6 +18,7 @@ import logging
 import signal
 import threading
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,7 @@ class CleanupRegistry:
         self._installed = False
         self._atexit_registered = False
         self._previous: dict[int, Any] = {}
+        self._quiesce: Callable[[], None] | None = None
 
     def register(self, pair: SandboxPair) -> None:
         with self._lock:
@@ -112,6 +114,16 @@ class CleanupRegistry:
         """
         with self._lock:
             self._install_handlers()
+
+    def set_quiesce(self, fn: Callable[[], None] | None) -> None:
+        """Callback run before signal-triggered cleanup (None clears it).
+
+        Lets a driver stop the work that is still using the sandboxes —
+        the TUI signals its engine thread and joins it briefly — so
+        teardown does not race an engine mid-``sbx exec``. Best-effort:
+        a raising callback never blocks cleanup.
+        """
+        self._quiesce = fn
 
     def unregister(self, pair: SandboxPair) -> None:
         with self._lock:
@@ -146,6 +158,12 @@ class CleanupRegistry:
 
     def _handle_signal(self, signum: int, frame: types.FrameType | None) -> None:
         logger.info("signal %s received; cleaning up sandboxes", signum)
+        quiesce = self._quiesce
+        if quiesce is not None:
+            try:
+                quiesce()
+            except Exception:
+                logger.warning("quiesce before signal cleanup failed", exc_info=True)
         self.cleanup_all()
         previous = self._previous.get(signum)
         if callable(previous):

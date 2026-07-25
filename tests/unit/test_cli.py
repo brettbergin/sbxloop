@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from typer.testing import CliRunner
@@ -80,11 +80,36 @@ class TestStatusAndLogs:
         assert "rseeded11" in result.output
         assert "completed" in result.output
 
-    def test_status_run_detail(self, workdir: Path) -> None:
+    def test_status_run_detail(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         seed_store(workdir)
         result = runner.invoke(app, ["status", "rseeded11"])
         assert result.exit_code == 0
         assert "Task one" in result.output
+        # the pair names print with liveness, so no by-hand reconstruction
+        assert "sbxloop-rseeded11-agent" in result.output
+        assert "sbxloop-rseeded11-github" in result.output
+        assert "not running" in result.output
+        assert "sbxloop shell" not in result.output
+
+    def test_status_run_detail_flags_live_sandboxes(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.models import SandboxSpec
+
+        seed_store(workdir)
+        SbxCLI(binary=str(fake_sbx.binary)).create(
+            SandboxSpec(name="sbxloop-rseeded11-agent", role="agent", workspace=workdir)
+        )
+        result = runner.invoke(app, ["status", "rseeded11"])
+        assert result.exit_code == 0
+        assert "running" in result.output
+        assert "sbxloop shell rseeded11" in result.output
+
+    def test_status_run_detail_survives_sbx_failure(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        seed_store(workdir)
+        fake_sbx.fail_next("ls")
+        result = runner.invoke(app, ["status", "rseeded11"])
+        assert result.exit_code == 0
+        assert "liveness unknown" in result.output
 
     def test_status_unknown_run(self, workdir: Path) -> None:
         seed_store(workdir)
@@ -107,6 +132,21 @@ class TestStatusAndLogs:
         result = runner.invoke(app, ["logs", "rseeded11", "--follow"])
         assert result.exit_code == 0
         assert "run.end" in result.output
+
+    def test_logs_follow_exits_on_stale_run(self, workdir: Path) -> None:
+        # A run whose driving process died hard stays `running` in the DB
+        # forever; --follow must notice the silence and exit, not spin.
+        store = seed_store(workdir)
+        store.set_run_state("rseeded11", "running")
+        store._conn.execute(  # backdate the state change (no public setter)
+            "UPDATE runs SET updated_at = 1.0 WHERE run_id = 'rseeded11'"
+        )
+        store._conn.commit()
+        result = runner.invoke(app, ["logs", "rseeded11", "--follow"])
+        assert result.exit_code == 0
+        # single words: rich may wrap the note anywhere between words
+        assert "activity" in result.output
+        assert "resume" in result.output
 
 
 class TestArtifactsCommand:
@@ -620,6 +660,47 @@ class TestRunCommand:
         assert "finished" in result.output
         assert "completed" in result.output
         assert "t1: done" in result.output
+
+    HAPPY_RUN: ClassVar[list[dict[str, Any]]] = [
+        {
+            "json": {
+                "tasks": [
+                    {
+                        "id": "t1",
+                        "title": "Only task",
+                        "description": "",
+                        "depends_on": [],
+                        "acceptance_criteria": ["works"],
+                        "verify_commands": ["true"],
+                    }
+                ]
+            }
+        },
+        {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+        {"text": "did it"},
+        {"json": {"verdict": "pass"}},
+        {"json": {"verdict": "accept"}},
+    ]
+
+    def test_run_no_keep_sandboxes_overrides_config(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # keep_sandboxes=true in config must be forceable OFF from the CLI.
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        monkeypatch.setenv("SBXLOOP_KEEP_SANDBOXES", "true")
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--no-keep-sandboxes"])
+        assert result.exit_code == 0, result.output
+        boxes = fake_sbx.state / "sandboxes"
+        assert not boxes.is_dir() or not any(boxes.iterdir())
+
+    def test_run_keep_sandboxes_flag_keeps(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--keep-sandboxes"])
+        assert result.exit_code == 0, result.output
+        boxes = fake_sbx.state / "sandboxes"
+        assert any(p.name.startswith("sbxloop-") for p in boxes.iterdir())
 
     def test_run_tui_preserves_full_transcript_history(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

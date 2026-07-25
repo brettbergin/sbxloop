@@ -119,6 +119,37 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **P4 papercut batch (#68):**
+  - `--keep-sandboxes` is now tri-state
+    (`--keep-sandboxes/--no-keep-sandboxes`, default "no override") like
+    `--report`/`--deliver` already were, so a config-file
+    `keep_sandboxes = true` can be forced off from the CLI.
+  - `cancel` refuses runs already in a terminal state
+    (`completed`/`failed`/`cancelled`) with a clear message instead of
+    silently rewriting their recorded state to `cancelled`.
+  - `logs --follow` no longer spins forever on a run whose driving process
+    died hard (state stuck non-terminal): after `--stale-after` minutes
+    (default 10; 0 follows forever) with no activity — no new events and no
+    state change — it prints a note and exits.
+  - Provisioning rollback now best-effort unregisters the secrets the
+    failed attempt registered, symmetric with sandbox removal, so the next
+    run starts clean instead of depending on collision-recovery
+    scope-parsing heuristics against a registration owned by a
+    now-deleted sandbox scope.
+  - Ctrl-C in the TUI now signals the engine thread (via a new
+    `LoopEngine.request_cancel()`, checked at the same phase boundaries as
+    store-level cancellation) and joins it briefly before sandbox cleanup,
+    instead of tearing sandboxes down under an engine still mid-`sbx exec`.
+    The interrupted run's persisted state is untouched, so it stays
+    resumable. Composed with the #64 signal handlers: the cleanup registry
+    runs a driver-set quiesce callback before signal-triggered teardown,
+    so SIGINT/SIGTERM stop the engine first, then remove the sandboxes.
+  - The `Hook` protocol docstring no longer claims hooks "must not raise":
+    the bus has always contained and logged subscriber exceptions, so hook
+    authors need no defensive boilerplate (hooks should still be fast).
+  - `status <run>` now prints the run's sandbox pair names with their
+    current liveness per `sbx ls`, plus a `sbxloop shell` hint when one is
+    running — no more reconstructing `sbxloop-<run>-agent` by hand.
 - SIGTERM during a TUI-mode run no longer leaks the sandbox pair (#64). The
   TUI runs the engine on a background thread, and the cleanup registry's
   handler installer latched itself as "installed" *before* discovering it
