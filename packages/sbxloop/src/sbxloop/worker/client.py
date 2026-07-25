@@ -79,6 +79,7 @@ class WorkerClient:
         timeout: float = 600.0,
         no_deps: bool = False,
         system_site_packages: bool = False,
+        ensure_dev_tools: bool = False,
     ) -> None:
         """Install sbxloop-worker into the sandbox, venv-first with fallbacks.
 
@@ -98,7 +99,13 @@ class WorkerClient:
         ``no_deps``/``system_site_packages`` are test seams for hermetic
         installs; production uses full dependency resolution (PyPI is
         reachable under the balanced network policy).
+
+        ``ensure_dev_tools`` additionally makes the sandbox dev-ready for
+        the AGENT's own work (see _ensure_dev_tools) — the engine sets it
+        for the agent sandbox only.
         """
+        if ensure_dev_tools:
+            self._ensure_dev_tools(timeout)
         wheel = wheel if wheel is not None else resolve_worker_wheel()
         if wheel is not None:
             staged = f"{STAGED_WHEEL_DIR}/{wheel.name}"
@@ -151,6 +158,37 @@ class WorkerClient:
             raise WorkerError(
                 "worker entrypoint check failed "
                 f"(rc={smoke.returncode}, expected 64): {_output_tail(smoke)}"
+            )
+
+    def _ensure_dev_tools(self, timeout: float) -> None:
+        """Best-effort: make the sandbox dev-ready for the agent's own work.
+
+        Field failure (0.4.0): templates ship a system python without
+        ensurepip. The worker self-heals its OWN venv (the ladder below),
+        but when that apt heal silently fails the worker still succeeds via
+        the user-site fallback — leaving python3-venv missing, so the
+        AGENT's `python3 -m venv` for the project it is building dies with
+        "ensurepip is not available" on every revision until the budget
+        exhausts. Install the venv/pip packages up front, unconditionally
+        (a fast no-op when the template already has them), and WARN loudly
+        on failure instead of ignoring it. Never fatal: worker installation
+        has its own ladder, and the agent may not need venvs at all.
+        """
+        result = self.sandbox.exec(
+            [
+                "sh",
+                "-c",
+                "sudo -n apt-get update -q && "
+                "sudo -n apt-get install -y -q python3-venv python3-pip",
+            ],
+            timeout=timeout,
+        )
+        if not result.ok:
+            logger.warning(
+                "dev-tools ensure failed (rc=%s) — the agent's own venv/pip use "
+                "may fail with 'ensurepip is not available': %s",
+                result.returncode,
+                _output_tail(result),
             )
 
     def _create_venv(self, timeout: float, system_site_packages: bool) -> bool:
