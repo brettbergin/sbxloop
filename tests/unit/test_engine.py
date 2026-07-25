@@ -185,9 +185,48 @@ class TestReviseAndVerify:
         assert result.state == "completed"
         assert result.tasks[0].revisions == 1
 
-    def test_verify_failure_exhausts_revisions(self, harness: Harness) -> None:
-        # verify command always fails -> execute/scrutinize repeat until the
-        # revision budget (2) is exhausted -> task failed, run failed
+    def test_verify_exhaustion_spends_replan_with_fresh_plan(self, harness: Harness) -> None:
+        # Field failure (rv4zfdb1m): the executor cannot edit verify_commands,
+        # so a plan whose commands disagree with where the work landed burned
+        # every revision and killed the task. Exhaustion from verify failures
+        # must replan — a fresh plan regenerates the commands.
+        bad_plan = {
+            "json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": ["exit 1"]}
+        }
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                bad_plan,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS,  # revisions exhausted -> replan instead of failed
+                PLAN,  # fresh plan drops the broken command
+                EXECUTE,
+                PASS,
+                ACCEPT,
+            ]
+        )
+        result = harness.engine().start("verify unsticks via replan")
+        assert result.state == "completed"
+        assert result.tasks[0].state == "done"
+        assert result.tasks[0].replans == 1
+
+    def test_verify_failure_exhausts_revisions_and_replans(self, harness: Harness) -> None:
+        # A spec-level verify command no plan can fix: revisions burn, one
+        # replan burns, then the task fails — the loop is bounded.
+        cycle = [EXECUTE, PASS, EXECUTE, PASS, EXECUTE, PASS]
+        harness.script([taskgraph(task("t1", verify=["exit 1"])), PLAN, *cycle, PLAN, *cycle])
+        result = harness.engine().start("verify never passes")
+        assert result.state == "failed"
+        assert result.tasks[0].state == "failed"
+        assert result.tasks[0].replans == 1
+        assert result.tasks[0].revisions == 3
+        assert "verify command failed" in result.tasks[0].last_feedback
+
+    def test_verify_exhaustion_without_replan_budget_fails(self, harness: Harness) -> None:
         harness.script(
             [
                 taskgraph(task("t1", verify=["exit 1"])),
@@ -200,11 +239,35 @@ class TestReviseAndVerify:
                 PASS,
             ]
         )
-        result = harness.engine().start("verify never passes")
+        result = harness.engine(budgets={"max_replans_per_task": 0}).start("verify never passes")
         assert result.state == "failed"
         assert result.tasks[0].state == "failed"
         assert result.tasks[0].revisions == 3
-        assert "verify command failed" in result.tasks[0].last_feedback
+
+    def test_verify_failure_surfaces_in_event_stream(self, harness: Harness) -> None:
+        # Field failure (rv4zfdb1m): the transcript jumped verifying -> failed
+        # with the failing command visible only via sqlite on phase_attempts.
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["exit 1", "exit 2"])),
+                PLAN,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS,
+            ]
+        )
+        harness.engine(budgets={"max_replans_per_task": 0}).start("loud verify failure")
+        fails = [e for e in harness.events if e.type == HostEventTypes.PHASE_END]
+        assert fails, "verify failure emitted no phase.end event"
+        first = fails[0].data
+        assert first["task_id"] == "t1"
+        assert first["phase"] == "verify"
+        assert first["status"] == "failed"
+        assert "verify command failed" in first["message"]
+        assert "(+1 more)" in first["message"]  # both failing commands counted
 
 
 class TestReplanAndSkip:

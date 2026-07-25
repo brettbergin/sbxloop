@@ -27,6 +27,14 @@ paths; missing apt packages can be installed with passwordless sudo; network
 egress is allowlisted (PyPI, GitHub, and apt mirrors are reachable — declare
 anything else in `egress`).
 
+`verify_commands` run mechanically from the **workspace root** — the same
+directory the executor starts in — never from a subdirectory your steps
+create. The executor cannot edit these commands, so a path mismatch is
+fatal: if the plan builds the project in a subdirectory, every verify
+command must name it explicitly (`test -f app/requirements.txt`, or
+`cd app && .venv/bin/pytest`). A bare `test -f requirements.txt` fails
+when the file lives one level down.
+
 ## Response format
 
 Respond with exactly one fenced JSON block:
