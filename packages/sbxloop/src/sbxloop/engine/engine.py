@@ -33,8 +33,6 @@ from sbxloop.engine.phases import PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
-    DeliveryError,
-    GithubOpsError,
     SbxError,
     SdxloopError,
     StateError,
@@ -128,48 +126,64 @@ class LoopEngine:
         pair = provisioner.ensure_pair(run_id)
         assert pair.workspace is not None
         self.store.set_run_workspace(run_id, pair.workspace, pair.mounted)
+        if pair.keep:
+            # keep_sandboxes: mark up front so `sandbox prune` respects it.
+            self.store.set_run_kept(run_id, "manual")
         try:
             with pair:
-                agent = WorkerClient(
-                    pair.agent,
-                    self.bus,
-                    transport=self.config.worker_transport,
-                    python=self.worker_python,
-                    role="agent",
-                    limits=self.config.limits,
-                )
-                github = (
-                    WorkerClient(
-                        pair.github,
+                try:
+                    agent = WorkerClient(
+                        pair.agent,
                         self.bus,
                         transport=self.config.worker_transport,
                         python=self.worker_python,
-                        role="github",
+                        role="agent",
                         limits=self.config.limits,
                     )
-                    if pair.github is not None
-                    else None
-                )
-                if self.install_workers:
-                    # ensure_dev_tools: the agent builds projects in this VM
-                    # (venvs, pip) — the github sandbox only runs API ops.
-                    agent.install(extras="copilot", ensure_dev_tools=True)
-                    if github is not None:
-                        github.install(extras="")
-                detach = self._attach_reporter(github, run_id)
-                try:
-                    phases = PhaseRunner(
-                        agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                    github = (
+                        WorkerClient(
+                            pair.github,
+                            self.bus,
+                            transport=self.config.worker_transport,
+                            python=self.worker_python,
+                            role="github",
+                            limits=self.config.limits,
+                        )
+                        if pair.github is not None
+                        else None
                     )
-                    state = self._run_phases(run_id, phases, deadline, pair)
-                finally:
-                    detach()
-                    # Harvest even when a phase raised: the sandbox is still
-                    # alive here, and partial artifacts beat none.
-                    self._harvest(run_id, pair)
-                    self._report_artifacts(run_id, pair)
+                    if self.install_workers:
+                        # ensure_dev_tools: the agent builds projects in this VM
+                        # (venvs, pip) — the github sandbox only runs API ops.
+                        agent.install(extras="copilot", ensure_dev_tools=True)
+                        if github is not None:
+                            github.install(extras="")
+                    reporter, detach = self._attach_reporter(github, run_id, outcome)
+                    try:
+                        phases = PhaseRunner(
+                            agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                        )
+                        state = self._run_phases(run_id, phases, deadline, pair)
+                        # Summary must post while the github sandbox is alive;
+                        # on an infra exception the run is resumable and the
+                        # resumed run reopens the same tracking issue.
+                        if reporter is not None:
+                            reporter.close_run(run_id, state)
+                    finally:
+                        detach()
+                        # Harvest even when a phase raised: the sandbox is still
+                        # alive here, and partial artifacts beat none.
+                        self._harvest(run_id, pair)
+                        self._report_artifacts(run_id, pair)
+                except SdxloopError:
+                    # Infra failures (install, worker, sbx) are exactly what
+                    # gets diagnosed in-sandbox; decide keep before pair exit.
+                    self._keep_on_failure(run_id, pair)
+                    raise
                 if state == "completed":
                     self._deliver(run_id, outcome, pair, github)
+                else:
+                    self._keep_on_failure(run_id, pair)
         except SdxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
@@ -182,15 +196,50 @@ class LoopEngine:
             tasks=tasks,
             workspace=pair.workspace,
             mounted=pair.mounted,
+            kept_sandboxes=self._pair_names(pair) if pair.keep else [],
         )
 
-    def _attach_reporter(self, github: WorkerClient | None, run_id: str) -> Callable[[], None]:
+    @staticmethod
+    def _pair_names(pair: SandboxPair) -> list[str]:
+        return [s.name for s in (pair.agent, pair.github) if s is not None]
+
+    def _keep_on_failure(self, run_id: str, pair: SandboxPair) -> None:
+        """Flip the pair to kept when configured, so a failed run's evidence
+        survives for `sbxloop shell`. Marked in the DB for `sandbox prune`."""
+        if not self.config.keep_on_failure or pair.keep:
+            return
+        pair.keep = True
+        self.store.set_run_kept(run_id, "debug")
+        names = self._pair_names(pair)
+        self.bus.emit(
+            HostEventTypes.RUN_KEEP,
+            run_id,
+            sandboxes=names,
+            reason="debug",
+            message=(
+                f"sandboxes kept for debugging: {', '.join(names)} — "
+                f"inspect with `sbxloop shell {run_id}`"
+            ),
+        )
+
+    def _attach_reporter(
+        self, github: WorkerClient | None, run_id: str, outcome: str
+    ) -> tuple[GithubReporterHook | None, Callable[[], None]]:
+        """Attach progress reporting; opens the tracking issue immediately.
+
+        Run start/end go through explicit ``open_run``/``close_run`` calls
+        rather than bus events: RUN_START is emitted before the github
+        sandbox exists and RUN_END after it is gone, so the hook could never
+        observe them (#58).
+        """
         gh = self.config.github
         if not gh.report or github is None:
-            return lambda: None
+            return None, lambda: None
         assert gh.repo is not None  # report=True without a repo cannot provision a github worker
         hook = GithubReporterHook(GithubOps(github, run_id), gh.repo)
-        return self.bus.attach_hook(hook)
+        detach = self.bus.attach_hook(hook)
+        hook.open_run(run_id, outcome)
+        return hook, detach
 
     def _harvest(self, run_id: str, pair: SandboxPair) -> None:
         """Copy the in-VM work dir out to the host (unmounted runs only).
@@ -273,7 +322,12 @@ class LoopEngine:
                 base=gh.deliver_base,
                 draft=gh.deliver_draft,
             )
-        except (DeliveryError, GithubOpsError) as exc:
+        except SdxloopError as exc:
+            # Catches the whole family the delivery path can raise — not just
+            # DeliveryError/GithubOpsError but WorkerError/WorkerTimeoutError/
+            # SbxError from the op jobs themselves. Anything narrower lets an
+            # infra hiccup during this optional post-completion step escape
+            # _drive and leave the completed run looking failed (#59).
             logger.warning("delivery to %s failed for run %s", repo, run_id, exc_info=True)
             self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
             return

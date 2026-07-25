@@ -121,6 +121,11 @@ class Config(_ConfigModel):
     app_name: str = ""
     state_dir: Path = Path(".sbxloop")
     keep_sandboxes: bool = False
+    # Keep the pair alive only when a run fails, so the evidence (worker
+    # stderr, install leftovers, workspace state) survives for
+    # `sbxloop shell <run>`. Kept runs are marked in the state DB and
+    # eventually collectable via `sbxloop sandbox prune --include-kept`.
+    keep_on_failure: bool = False
     worker_transport: WorkerTransport = "stream"
     secret_strategy: SecretStrategy = "proxy"
     # Advanced: in-sandbox interpreter for the worker, and whether to run the

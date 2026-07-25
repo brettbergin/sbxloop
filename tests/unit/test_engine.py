@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -308,6 +308,53 @@ class TestJsonRetry:
             harness.engine().start("never valid")
 
 
+class TestKeepOnFailure:
+    def test_failed_run_keeps_pair_and_marks_db(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, REVISE])
+        engine = harness.engine(keep_on_failure=True, budgets={"max_revisions_per_task": 0})
+        result = engine.start("doomed outcome")
+
+        assert result.state == "failed"
+        assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
+        assert harness.sandboxes_left() == result.kept_sandboxes
+        assert engine.store.get_run(result.run_id).kept_reason == "debug"
+        keep_events = [e for e in harness.events if e.type == "run.keep"]
+        assert len(keep_events) == 1
+        assert "sbxloop shell" in str(keep_events[0].data.get("message"))
+
+    def test_infra_failure_keeps_pair(self, harness: Harness) -> None:
+        # Bad decompose output twice -> WorkerError: the exception path must
+        # keep the evidence too (install/worker crashes are diagnosed
+        # in-sandbox).
+        bad = {"json": {"tasks": [{"id": "t1"}]}}
+        harness.script([bad, bad])
+        engine = harness.engine(keep_on_failure=True)
+        with pytest.raises(WorkerError):
+            engine.start("impossible")
+        assert len(harness.sandboxes_left()) == 1
+        run = engine.store.list_runs()[0]
+        assert run.kept_reason == "debug"
+        assert "run.keep" in harness.event_types()
+
+    def test_completed_run_still_cleans_up(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(keep_on_failure=True)
+        result = engine.start("all fine")
+        assert result.state == "completed"
+        assert result.kept_sandboxes == []
+        assert harness.sandboxes_left() == []
+        assert engine.store.get_run(result.run_id).kept_reason is None
+        assert "run.keep" not in harness.event_types()
+
+    def test_keep_sandboxes_marks_manual(self, harness: Harness) -> None:
+        # `sandbox prune` must understand manually kept pairs as well.
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(keep_sandboxes=True)
+        result = engine.start("kept run")
+        assert engine.store.get_run(result.run_id).kept_reason == "manual"
+        assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
+
+
 class TestWorkspaceExecution:
     """The artifacts linchpin: jobs run in the workspace mount, so files the
     executor writes appear on the host live and survive sandbox teardown."""
@@ -434,6 +481,33 @@ class TestDeliverHook:
         deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
         assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
 
+    def test_delivery_infra_error_never_fails_a_completed_run(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """WorkerError/SbxError from the op jobs (not just DeliveryError)
+        must stay inside _deliver: the run already succeeded (#59)."""
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.errors import SbxError, WorkerTimeoutError
+
+        for exc in (
+            WorkerError("worker for job j1 produced no result file"),
+            WorkerTimeoutError("job j1 exceeded 120s"),
+            SbxError("sbx command failed: cp", stderr="daemon exploded"),
+        ):
+
+            def fake_deliver(*args: Any, _exc: Exception = exc, **kwargs: Any) -> Any:
+                raise _exc
+
+            monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+            harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+            harness.events.clear()
+            result = self.deliver_engine(harness).start(f"ship {type(exc).__name__}")
+
+            assert result.state == "completed", type(exc).__name__
+            deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+            assert len(deliver_events) == 1
+            assert str(exc) in deliver_events[0].data["error"]
+
     def test_failed_run_never_delivers(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -501,3 +575,69 @@ class TestResourceGuardrail:
         result = engine.start("queryable")
         rows = engine.store.events(result.run_id, type_prefix="sandbox.resources")
         assert rows, "sandbox.resources events were not persisted"
+
+
+class TestGithubReporting:
+    """Wiring for --report: the engine must open the tracking issue after
+    the github sandbox exists, mirror task ends, and post the summary while
+    the sandbox is still alive (#58). GithubOps is patched at the engine
+    module — no GitHub, no network."""
+
+    class RecordingOps:
+        instances: ClassVar[list[TestGithubReporting.RecordingOps]] = []
+
+        def __init__(self, client: Any, run_id: str, **kwargs: Any) -> None:
+            self.run_id = run_id
+            self.created: list[str] = []
+            self.comments: list[str] = []
+            type(self).instances.append(self)
+
+        def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
+            return []
+
+        def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> Any:
+            from sbxloop.gh.ops import IssueRef
+
+            self.created.append(title)
+            return IssueRef(number=11, url="https://x/11")
+
+        def issue_comment(self, repo: str, number: int, body: str) -> str:
+            self.comments.append(body)
+            return "https://c"
+
+    @pytest.fixture(autouse=True)
+    def _patch_ops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sbxloop.engine.engine as engine_mod
+
+        self.RecordingOps.instances = []
+        monkeypatch.setattr(engine_mod, "GithubOps", self.RecordingOps)
+
+    def test_report_opens_comments_and_summarizes(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(github={"repo": "o/r", "report": True}).start("do it")
+
+        assert result.state == "completed"
+        assert len(self.RecordingOps.instances) == 1
+        ops = self.RecordingOps.instances[0]
+        assert ops.created == [f"sbxloop run {result.run_id}"]
+        # one comment per task end + the final summary
+        assert len(ops.comments) == 2
+        assert "✅ `t1`" in ops.comments[0]
+        assert "finished: **completed**" in ops.comments[1]
+
+    def test_failed_run_summary_reports_failed(self, harness: Harness) -> None:
+        harness.script(
+            [taskgraph(task("t1")), PLAN, EXECUTE, PASS, REJECT, PLAN, EXECUTE, PASS, REJECT]
+        )
+        result = harness.engine(github={"repo": "o/r", "report": True}).start("doomed")
+
+        assert result.state == "failed"
+        ops = self.RecordingOps.instances[0]
+        assert "❌ `t1`" in ops.comments[0]
+        assert "finished: **failed**" in ops.comments[-1]
+
+    def test_report_disabled_touches_nothing(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(github={"repo": "o/r"}).start("quiet")
+        assert result.state == "completed"
+        assert self.RecordingOps.instances == []

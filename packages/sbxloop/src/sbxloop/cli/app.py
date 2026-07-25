@@ -25,6 +25,7 @@ from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
 
 app = typer.Typer(
     name="sbxloop",
@@ -168,6 +169,10 @@ def _finish(result: RunResult, config: Config) -> None:
     for task in result.tasks:
         console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
     _print_artifacts_summary(result, config)
+    if result.kept_sandboxes:
+        console.print(f"\n[bold yellow]sandboxes kept:[/] {', '.join(result.kept_sandboxes)}")
+        console.print(f"  inspect: [cyan]sbxloop shell {result.run_id}[/] (--role github)")
+        console.print(f"  remove:  [cyan]sbxloop sandbox rm --run {result.run_id}[/]")
     raise typer.Exit(0 if result.succeeded else 1)
 
 
@@ -192,10 +197,21 @@ def run(
     keep_sandboxes: Annotated[
         bool, typer.Option("--keep-sandboxes", help="Do not remove sandboxes at the end.")
     ] = False,
+    keep_on_failure: Annotated[
+        bool | None,
+        typer.Option(
+            "--keep-on-failure/--no-keep-on-failure",
+            help="Keep the sandbox pair alive when the run fails (inspect with `sbxloop shell`).",
+        ),
+    ] = None,
     tui: Annotated[bool, typer.Option("--tui/--no-tui", help="Live dashboard.")] = True,
 ) -> None:
     """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
-    config = _config_with_overrides(model=model, keep_sandboxes=keep_sandboxes or None)
+    config = _config_with_overrides(
+        model=model,
+        keep_sandboxes=keep_sandboxes or None,
+        keep_on_failure=keep_on_failure,
+    )
     if report is not None:
         config = config.model_copy(
             update={"github": config.github.model_copy(update={"report": report})}
@@ -330,6 +346,57 @@ def logs(
         time.sleep(0.5)
 
 
+# Prefer bash when the template has it, fall back to POSIX sh. `sbx exec`
+# has no documented -it flags; terminal attachment is inherited stdio.
+_INTERACTIVE_SHELL = ("sh", "-c", "command -v bash >/dev/null && exec bash -l; exec sh -l")
+
+
+@app.command()
+def shell(
+    run_id: Annotated[str, typer.Argument(help="Run id.")],
+    role: Annotated[
+        str, typer.Option("--role", help="Which sandbox of the pair: agent or github.")
+    ] = "agent",
+    command: Annotated[
+        str | None,
+        typer.Option(
+            "--command", "-c", help="Run one shell command instead of an interactive shell."
+        ),
+    ] = None,
+) -> None:
+    """Open a shell inside a run's sandbox (kept, in-flight, or leaked).
+
+    Attaching to an in-flight run is meant as observation: the worker owns
+    its env files and workspace, so avoid mutating them mid-phase.
+    """
+    if role not in ("agent", "github"):
+        console.print(f"[bold red]invalid --role {role!r}:[/] must be agent or github")
+        raise typer.Exit(2)
+    config = load_config()
+    store = _store(config)
+    try:
+        store.get_run(run_id)
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    cli = SbxCLI(app_name=config.app_name or None)
+    name = sandbox_name(run_id, "agent" if role == "agent" else "github")
+    try:
+        live = any(info.name == name for info in cli.ls())
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    if not live:
+        console.print(
+            f"[bold red]sandbox {name} is not running.[/] Sandboxes are removed at run end "
+            "unless kept (keep_on_failure, --keep-sandboxes), and kept ones may have been "
+            "pruned since."
+        )
+        raise typer.Exit(2)
+    argv = ("sh", "-lc", command) if command else _INTERACTIVE_SHELL
+    raise typer.Exit(cli.exec_interactive(name, argv))
+
+
 @app.command()
 def artifacts(
     run_id: Annotated[str, typer.Argument(help="Run id.")],
@@ -414,6 +481,84 @@ def sandbox_rm(
             console.print(f"[yellow]skip {target}:[/] {exc}")
 
 
+@sandbox_app.command("prune")
+def sandbox_prune(
+    force: Annotated[
+        bool,
+        typer.Option("--force", "--yes", help="Actually remove (default is a dry run)."),
+    ] = False,
+    min_age: Annotated[
+        float,
+        typer.Option(
+            "--min-age",
+            help="Hours a run must be inactive before its sandboxes count as orphaned.",
+        ),
+    ] = 1.0,
+    include_kept: Annotated[
+        bool,
+        typer.Option("--include-kept", help="Also prune kept-for-debugging sandboxes."),
+    ] = False,
+) -> None:
+    """Garbage-collect orphaned sbxloop sandboxes (crashed hosts, killed runs).
+
+    Cross-references `sbx ls` against this working copy's state DB. Dry-run
+    by default: prints the classification and removes nothing without
+    --force.
+    """
+    config = load_config()
+    store = _store(config)
+    cli = SbxCLI(app_name=config.app_name or None)
+    try:
+        verdicts = classify_sandboxes(
+            cli.ls(), store, min_age_s=min_age * 3600.0, include_kept=include_kept
+        )
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    if not verdicts:
+        console.print("no sbxloop sandboxes found")
+        return
+
+    table = Table(title="sbxloop sandbox prune")
+    for column in ("sandbox", "run", "run state", "age", "verdict"):
+        table.add_column(column)
+    for v in verdicts:
+        table.add_row(
+            v.name,
+            v.run_id or "",
+            v.run_state or "[dim]unknown[/]",
+            format_age(v.age_s),
+            ("[red]orphan[/] — " if v.orphan else "[green]keep[/] — ") + v.reason,
+        )
+    console.print(table)
+    console.print(
+        "[dim]note: the state DB is per working copy — 'unknown' sandboxes may "
+        "belong to another checkout's runs on this sbx host[/]"
+    )
+
+    orphans = [v for v in verdicts if v.orphan]
+    if not orphans:
+        console.print("nothing to prune")
+        return
+    if not force:
+        console.print(f"dry run: {len(orphans)} orphan candidate(s); re-run with --force to remove")
+        return
+    failures = 0
+    for v in orphans:
+        try:
+            remove_sandbox(cli, v.name)
+        except SdxloopError as exc:
+            failures += 1
+            console.print(f"[yellow]skip {v.name}:[/] {exc}")
+            continue
+        console.print(f"removed {v.name}")
+        # A pruned kept run is no longer kept; keep the DB marker honest.
+        if v.kept_reason is not None and v.run_id is not None:
+            store.set_run_kept(v.run_id, None)
+    if failures:
+        raise typer.Exit(1)
+
+
 @config_app.command("show")
 def config_show() -> None:
     """Show the resolved configuration and where each value came from."""
@@ -477,6 +622,8 @@ app_name = ""
 state_dir = ".sbxloop"
 # Keep sandboxes around after a run (for debugging).
 keep_sandboxes = false
+# Keep the pair alive only when a run fails; inspect with `sbxloop shell <run>`.
+keep_on_failure = false
 # Worker transport: "stream" (default) or "poll".
 worker_transport = "stream"
 # Secret injection: "proxy" (sbx keychain proxy; recommended) or "plain-env".
