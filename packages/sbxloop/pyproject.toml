@@ -3,7 +3,7 @@ name = "sbxloop"
 dynamic = ["version"]  # derived from git tags by hatch-vcs (see [tool.hatch.version])
 description = "Agentic loop orchestration on Docker Sandboxes (sbx) with isolated credential domains"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = "MIT"
 authors = [{ name = "Brett Bergin" }]
 keywords = ["agents", "sandbox", "docker", "copilot", "orchestration"]
@@ -11,9 +11,8 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 dependencies = [

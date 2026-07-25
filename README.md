@@ -137,7 +137,7 @@ Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLO
 
 ## Requirements
 
-- Python ≥ 3.11
+- Python ≥ 3.13
 - [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/) on the host (macOS Apple silicon, Windows 11, or Ubuntu 24.04+/KVM)
 - A GitHub Copilot subscription (any plan) + a fine-grained PAT (a second one only if the GitHub integration is configured — see above)
 
