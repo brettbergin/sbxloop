@@ -32,4 +32,11 @@ Respond with exactly one fenced JSON block:
 
 Steps must be specific enough that an executor with no other context can
 follow them. Include the task's own verification ideas in `verify_commands`.
+
+Environment facts to plan around: Debian/Ubuntu VM; the system Python is
+externally managed (PEP 668), so Python dependencies belong in a project
+virtualenv (`python3 -m venv .venv`) and commands — including your
+`verify_commands` — should use `.venv/bin/...` paths; missing apt packages
+can be installed with passwordless sudo; network egress is allowlisted
+(PyPI, GitHub, and apt mirrors are reachable — other registries may not be).
 $retry_context
