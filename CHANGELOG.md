@@ -7,6 +7,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [Unreleased]
 
 ### Added
+
 - **`sbxloop doctor` now runs an sbx conformance suite** (#52): every
   field-learned assumption about sbx semantics is a named probe with a
   machine-checkable verdict — secret-env visibility under `exec`, the
@@ -46,12 +47,10 @@ All notable changes to sdxloop are documented here. The project adheres to
   are validated against operator-set bounds — a new `[policy]` section in
   sbxloop.toml with `allow`/`deny` domain patterns (exact, `*.wildcard`, or
   `*`) — and out-of-bounds requests fail plan validation with a remediation
-  hint. In-bounds grants are applied grant-late (`sbx policy allow network
-  <domain> --sandbox <agent>` at EXECUTE entry, so resumed runs re-grant on
+  hint. In-bounds grants are applied grant-late (`sbx policy allow network <domain> --sandbox <agent>` at EXECUTE entry, so resumed runs re-grant on
   their fresh sandboxes) and every grant/refusal is emitted as a
   `policy.allow`/`policy.deny` run event, making the persisted event log an
-  egress audit trail (`sbxloop logs RUN --type policy.`). `sbxloop config
-  policy` renders the effective per-phase policy. sbx 0.35 has no
+  egress audit trail (`sbxloop logs RUN --type policy.`). `sbxloop config policy` renders the effective per-phase policy. sbx 0.35 has no
   revocation primitive, so grants persist for the sandbox's lifetime but
   never outlive a run (sandboxes are removed at run end).
 - **`keep_on_failure`** (config + `--keep-on-failure`) — successful runs clean
@@ -73,6 +72,7 @@ All notable changes to sdxloop are documented here. The project adheres to
   kept-sandbox taxonomy prune respects; applied as an in-place migration).
 
 ### Changed
+
 - The test suite runs parallel by default (pytest-xdist, `-n auto` with
   work-stealing): ~8min → ~2.5min locally. Pass `-n0` for a serial run when
   debugging with `-s`/`--pdb`. Two wheel-resolution tests were made hermetic:
@@ -88,6 +88,7 @@ All notable changes to sdxloop are documented here. The project adheres to
   metadata at build time. See [RELEASING.md](RELEASING.md).
 
 ### Fixed
+
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and
   sbx-level errors raised by the delivery op jobs (`WorkerError`,
@@ -104,6 +105,7 @@ All notable changes to sdxloop are documented here. The project adheres to
   re-finds its existing tracking issue instead of opening a duplicate.
 
 ### Security
+
 - Secret values no longer leak through error text or the process-observable
   argv carried on `ExecResult`/`SbxError`: the value passed to
   `sbx secret set-custom --value` is masked (`***`) in every observable copy
@@ -115,6 +117,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.2.0] — 2026-07-23
 
 ### Changed
+
 - **Project renamed: sdxloop → sbxloop — hard cutover, no compatibility
   layer.** The underlying Docker product is the `sbx` CLI; the name now
   matches. Everything renames with it: the distributions (`sbxloop`,
@@ -123,16 +126,16 @@ All notable changes to sdxloop are documented here. The project adheres to
   (`sbxloop.toml` / `[tool.sbxloop]`), the state dir (`.sbxloop/`), and
   sandbox name prefixes (`sbxloop-<run>-*`). The old `sdxloop` /
   `sdxloop-worker` PyPI packages are frozen at 0.1.10 and will receive no
-  further releases. Migration: `pip uninstall sdxloop sdxloop-worker &&
-  pip install sbxloop`, rename `SDXLOOP_*` env vars / `.env` entries and
+  further releases. Migration: `pip uninstall sdxloop sdxloop-worker && pip install sbxloop`, rename `SDXLOOP_*` env vars / `.env` entries and
   `sdxloop.toml`, and optionally rename `.sdxloop/` state dirs to
   `.sbxloop/` to keep old run history visible.
 
 ## [0.1.10] — 2026-07-23
 
 ### Changed
+
 - The live run view is now a chat-style transcript: agent messages render
-  as markdown panels (fenced ```json blocks syntax-highlighted and
+  as markdown panels (fenced \`\`\`json blocks syntax-highlighted and
   word-wrapped instead of truncated), errors as red panels, tool calls as
   compact colored lines, lifecycle events as dim one-liners. Streaming
   deltas, heartbeats, and stdout noise no longer flood the feed (they
@@ -145,6 +148,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.9] — 2026-07-23
 
 ### Fixed
+
 - Runs work out of the box on real sbx: field testing confirmed the sbx
   secret proxy never exposes env vars to `sbx exec` processes (only to
   the interactive agent sessions sbx launches). Under the default proxy
@@ -157,6 +161,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.8] — 2026-07-23
 
 ### Fixed
+
 - Copilot session auth: the worker now runs under a login shell
   (`sh -lc`) so sbx-injected secret env vars reach it, and it also loads
   `/etc/sandbox-persistent.sh`. Provisioning verifies the secret env is
@@ -170,6 +175,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.7] — 2026-07-23
 
 ### Fixed
+
 - Job files staged into sandboxes are now world-readable: they were
   created 0600 by the host tempfile machinery and `sbx cp` preserves the
   mode, so the in-sandbox `agent` user could not read its own job files
@@ -178,6 +184,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.6] — 2026-07-23
 
 ### Fixed
+
 - "produced no result file" failures are now diagnosable: the worker's
   stderr is drained (also fixing a potential pipe-deadlock for chatty
   workers) and the error carries the exec exit code, stderr tail, and
@@ -191,6 +198,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.5] — 2026-07-23
 
 ### Fixed
+
 - Worker wheels are staged into the sandbox under their canonical
   filename: pip validates the name-version-python-abi-platform structure
   of the wheel FILENAME and refused the previously renamed
@@ -200,9 +208,9 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.4] — 2026-07-23
 
 ### Fixed
+
 - Worker installation no longer dies when the sandbox template lacks
-  python3-venv: it self-heals via `sudo apt-get install python3-venv
-  python3-pip` and, failing that, falls back to a user-site pip install
+  python3-venv: it self-heals via `sudo apt-get install python3-venv python3-pip` and, failing that, falls back to a user-site pip install
   under the system python3 (handling PEP 668 externally-managed
   environments). Install/exec errors now include stdout as well as
   stderr — sbx exec surfaces some errors on stdout, which previously
@@ -211,6 +219,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.3] — 2026-07-23
 
 ### Fixed
+
 - Secret provisioning now survives sbx's real conflict semantics: custom
   secrets are keyed by env name (one host per env), so the Copilot token
   binds to `api.github.com` only (the token-exchange host; the exchanged
@@ -222,6 +231,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.2] — 2026-07-23
 
 ### Fixed
+
 - Provisioning no longer fails with "secret exists" on re-runs and resumes:
   sbx refuses to overwrite existing secrets, so the provisioner now removes
   and re-sets them (rotated tokens take effect). When removal is rejected,
@@ -230,6 +240,7 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [0.1.1] — 2026-07-23
 
 ### Changed
+
 - `app_name` now defaults to empty: sdxloop shares the user's normal sbx
   application state, so `sbx login` and `sbx policy init balanced` apply
   directly. Isolation via `--app-name` is opt-in (and documented to need
@@ -240,6 +251,7 @@ All notable changes to sdxloop are documented here. The project adheres to
   multi-line sbx error output so the results table renders cleanly.
 
 ### Added
+
 - `.env` support: the CLI and `LoopEngine` automatically load `./.env`
   (via python-dotenv) for the two PATs and `SDXLOOP_*` settings. Real
   environment variables always take precedence, and explicit `env=`

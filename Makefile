@@ -6,10 +6,12 @@ install:
 fmt:
 	uv run ruff format .
 	uv run ruff check --fix .
+	uv run mdformat .
 
 lint:
 	uv run ruff format --check .
 	uv run ruff check .
+	uv run mdformat --check .
 
 typecheck:
 	uv run mypy

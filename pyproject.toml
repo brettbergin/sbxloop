@@ -8,6 +8,8 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "pytest-xdist>=3.6",
+    "mdformat>=0.7.22",
+    "mdformat-gfm>=0.4.1",
 ]
 
 [tool.ruff]

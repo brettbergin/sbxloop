@@ -33,11 +33,11 @@ Worker exit codes: `0` result written (including error/timeout results),
 
 ## Job kinds
 
-| kind | fields | result |
-|---|---|---|
-| `agent.session` | `prompt`, `system_message?`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last ```json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage` |
-| `shell.check` | `argv`, `cwd?` | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision |
-| `github.op` | `op`, `params` | op-specific JSON (see below) |
+| kind            | fields                                                                                                                | result                                                                                                                                                              |
+| --------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent.session` | `prompt`, `system_message?`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage` |
+| `shell.check`   | `argv`, `cwd?`                                                                                                        | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                         |
+| `github.op`     | `op`, `params`                                                                                                        | op-specific JSON (see below)                                                                                                                                        |
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
 microVM is the security boundary. `read_only` rejects shell/write requests

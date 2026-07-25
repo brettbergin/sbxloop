@@ -1,0 +1,15 @@
+# Renumber ordered lists consecutively (1. 2. 3.) instead of collapsing to
+# all-1. — the engine prompt files are fed to an LLM as raw text, so the
+# plain-text numbering must stay readable.
+number = true
+
+# Directories mdformat should never descend into when given "." as the target.
+exclude = [
+    ".venv/**",
+    ".git/**",
+    ".pytest_cache/**",
+    ".mypy_cache/**",
+    ".ruff_cache/**",
+    "dist/**",
+    "**/node_modules/**",
+]
