@@ -300,6 +300,53 @@ class TestJsonRetry:
             harness.engine().start("never valid")
 
 
+class TestKeepOnFailure:
+    def test_failed_run_keeps_pair_and_marks_db(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, REVISE])
+        engine = harness.engine(keep_on_failure=True, budgets={"max_revisions_per_task": 0})
+        result = engine.start("doomed outcome")
+
+        assert result.state == "failed"
+        assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
+        assert harness.sandboxes_left() == result.kept_sandboxes
+        assert engine.store.get_run(result.run_id).kept_reason == "debug"
+        keep_events = [e for e in harness.events if e.type == "run.keep"]
+        assert len(keep_events) == 1
+        assert "sbxloop shell" in str(keep_events[0].data.get("message"))
+
+    def test_infra_failure_keeps_pair(self, harness: Harness) -> None:
+        # Bad decompose output twice -> WorkerError: the exception path must
+        # keep the evidence too (install/worker crashes are diagnosed
+        # in-sandbox).
+        bad = {"json": {"tasks": [{"id": "t1"}]}}
+        harness.script([bad, bad])
+        engine = harness.engine(keep_on_failure=True)
+        with pytest.raises(WorkerError):
+            engine.start("impossible")
+        assert len(harness.sandboxes_left()) == 1
+        run = engine.store.list_runs()[0]
+        assert run.kept_reason == "debug"
+        assert "run.keep" in harness.event_types()
+
+    def test_completed_run_still_cleans_up(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(keep_on_failure=True)
+        result = engine.start("all fine")
+        assert result.state == "completed"
+        assert result.kept_sandboxes == []
+        assert harness.sandboxes_left() == []
+        assert engine.store.get_run(result.run_id).kept_reason is None
+        assert "run.keep" not in harness.event_types()
+
+    def test_keep_sandboxes_marks_manual(self, harness: Harness) -> None:
+        # `sandbox prune` must understand manually kept pairs as well.
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(keep_sandboxes=True)
+        result = engine.start("kept run")
+        assert engine.store.get_run(result.run_id).kept_reason == "manual"
+        assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
+
+
 class TestWorkspaceExecution:
     """The artifacts linchpin: jobs run in the workspace mount, so files the
     executor writes appear on the host live and survive sandbox teardown."""

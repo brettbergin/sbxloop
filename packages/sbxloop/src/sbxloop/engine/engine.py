@@ -113,49 +113,60 @@ class LoopEngine:
         pair = provisioner.ensure_pair(run_id)
         assert pair.workspace is not None
         self.store.set_run_workspace(run_id, pair.workspace, pair.mounted)
+        if pair.keep:
+            # keep_sandboxes: mark up front so `sandbox prune` respects it.
+            self.store.set_run_kept(run_id, "manual")
         try:
             with pair:
-                agent = WorkerClient(
-                    pair.agent,
-                    self.bus,
-                    transport=self.config.worker_transport,
-                    python=self.worker_python,
-                )
-                github = (
-                    WorkerClient(
-                        pair.github,
+                try:
+                    agent = WorkerClient(
+                        pair.agent,
                         self.bus,
                         transport=self.config.worker_transport,
                         python=self.worker_python,
                     )
-                    if pair.github is not None
-                    else None
-                )
-                if self.install_workers:
-                    # ensure_dev_tools: the agent builds projects in this VM
-                    # (venvs, pip) — the github sandbox only runs API ops.
-                    agent.install(extras="copilot", ensure_dev_tools=True)
-                    if github is not None:
-                        github.install(extras="")
-                reporter, detach = self._attach_reporter(github, run_id, outcome)
-                try:
-                    phases = PhaseRunner(
-                        agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                    github = (
+                        WorkerClient(
+                            pair.github,
+                            self.bus,
+                            transport=self.config.worker_transport,
+                            python=self.worker_python,
+                        )
+                        if pair.github is not None
+                        else None
                     )
-                    state = self._run_phases(run_id, phases, deadline, pair)
-                    # Summary must post while the github sandbox is alive;
-                    # on an infra exception the run is resumable and the
-                    # resumed run reopens the same tracking issue.
-                    if reporter is not None:
-                        reporter.close_run(run_id, state)
-                finally:
-                    detach()
-                    # Harvest even when a phase raised: the sandbox is still
-                    # alive here, and partial artifacts beat none.
-                    self._harvest(run_id, pair)
-                    self._report_artifacts(run_id, pair)
+                    if self.install_workers:
+                        # ensure_dev_tools: the agent builds projects in this VM
+                        # (venvs, pip) — the github sandbox only runs API ops.
+                        agent.install(extras="copilot", ensure_dev_tools=True)
+                        if github is not None:
+                            github.install(extras="")
+                    reporter, detach = self._attach_reporter(github, run_id, outcome)
+                    try:
+                        phases = PhaseRunner(
+                            agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                        )
+                        state = self._run_phases(run_id, phases, deadline, pair)
+                        # Summary must post while the github sandbox is alive;
+                        # on an infra exception the run is resumable and the
+                        # resumed run reopens the same tracking issue.
+                        if reporter is not None:
+                            reporter.close_run(run_id, state)
+                    finally:
+                        detach()
+                        # Harvest even when a phase raised: the sandbox is still
+                        # alive here, and partial artifacts beat none.
+                        self._harvest(run_id, pair)
+                        self._report_artifacts(run_id, pair)
+                except SdxloopError:
+                    # Infra failures (install, worker, sbx) are exactly what
+                    # gets diagnosed in-sandbox; decide keep before pair exit.
+                    self._keep_on_failure(run_id, pair)
+                    raise
                 if state == "completed":
                     self._deliver(run_id, outcome, pair, github)
+                else:
+                    self._keep_on_failure(run_id, pair)
         except SdxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
@@ -168,6 +179,30 @@ class LoopEngine:
             tasks=tasks,
             workspace=pair.workspace,
             mounted=pair.mounted,
+            kept_sandboxes=self._pair_names(pair) if pair.keep else [],
+        )
+
+    @staticmethod
+    def _pair_names(pair: SandboxPair) -> list[str]:
+        return [s.name for s in (pair.agent, pair.github) if s is not None]
+
+    def _keep_on_failure(self, run_id: str, pair: SandboxPair) -> None:
+        """Flip the pair to kept when configured, so a failed run's evidence
+        survives for `sbxloop shell`. Marked in the DB for `sandbox prune`."""
+        if not self.config.keep_on_failure or pair.keep:
+            return
+        pair.keep = True
+        self.store.set_run_kept(run_id, "debug")
+        names = self._pair_names(pair)
+        self.bus.emit(
+            HostEventTypes.RUN_KEEP,
+            run_id,
+            sandboxes=names,
+            reason="debug",
+            message=(
+                f"sandboxes kept for debugging: {', '.join(names)} — "
+                f"inspect with `sbxloop shell {run_id}`"
+            ),
         )
 
     def _attach_reporter(
