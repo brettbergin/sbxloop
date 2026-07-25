@@ -163,6 +163,16 @@ class StateStore:
             raise StateError(f"unknown run {run_id}")
         return self._run_record(row)
 
+    def get_run_config(self, run_id: str) -> str:
+        """The config JSON persisted at run creation. ``'{}'`` means nothing
+        was persisted (rows from versions that predate config storage)."""
+        row = self._conn.execute(
+            "SELECT config_json FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StateError(f"unknown run {run_id}")
+        return str(row["config_json"])
+
     def list_runs(self) -> list[RunRecord]:
         rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
         return [self._run_record(row) for row in rows]

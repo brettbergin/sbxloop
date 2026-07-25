@@ -13,6 +13,10 @@ Failure semantics:
   sandbox pair (sandboxes are cattle; the workspace and SQLite state
   persist on the host) and continues from the last committed transition:
   a phase whose result was never committed re-runs from its start.
+  Resume rehydrates the run's persisted config and pins the workspace
+  from the runs table, so on-disk config edits (or a different cwd)
+  cannot silently change the run's rules or relocate its workspace;
+  drift is surfaced as a ``run.config_drift`` event.
 """
 
 from __future__ import annotations
@@ -21,9 +25,12 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
-from sbxloop.config import Config, load_config, load_dotenv_file
+from pydantic import ValidationError
+
+from sbxloop.config import Config, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
@@ -79,6 +86,12 @@ class LoopEngine:
         self.install_workers = (
             install_workers if install_workers is not None else self.config.install_workers
         )
+        # Which collaborators were derived from config (vs passed explicitly):
+        # resume() re-derives exactly these after rehydrating the run's
+        # persisted config, and leaves caller-supplied ones alone.
+        self._sbx_from_config = sbx is None
+        self._worker_python_from_config = worker_python is None
+        self._install_workers_from_config = install_workers is None
         self.clock = clock
         # Latest sandbox.resources sample per sandbox role, fed by the bus;
         # consulted for the disk guardrail and the harvest-truncation note.
@@ -114,21 +127,101 @@ class LoopEngine:
         run = self.store.get_run(run_id)
         if run.state not in RESUMABLE_RUN_STATES:
             raise StateError(f"run {run_id} is {run.state}; only unfinished runs can resume")
+        self._rehydrate_config(run_id)
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
-        return self._drive(run_id, run.outcome)
+        return self._drive(run_id, run.outcome, workspace=run.workspace)
 
     def cancel(self, run_id: str) -> None:
         self.store.get_run(run_id)  # raises for unknown runs
         self.store.set_run_state(run_id, "cancelled")
 
+    # -- resume config rehydration ------------------------------------------
+
+    def _rehydrate_config(self, run_id: str) -> None:
+        """Adopt the config persisted when the run was created, so a resumed
+        run keeps its original rules (budgets, model, github toggles,
+        workspace) even if the on-disk config changed — or the resume happens
+        from a different directory — in between.
+
+        Tokens still come from the current environment (they are never
+        persisted), and ``state_dir`` stays the one that located the run: the
+        store is already open there. The debug/cleanup toggles
+        (``keep_sandboxes``, ``keep_on_failure``) also stay resume-time
+        choices — they are operator intent about THIS attempt, not run
+        identity, and flipping keep on to debug a crashing run must work.
+        Drift from the config this engine was built with is reported via a
+        ``run.config_drift`` event, never applied silently.
+        """
+        raw = self.store.get_run_config(run_id)
+        try:
+            legacy = not json.loads(raw)
+        except ValueError:
+            legacy = False
+        if legacy:
+            # Row predates config persistence; current config is all we have.
+            return
+        try:
+            stored = Config.model_validate_json(raw)
+        except ValidationError as exc:
+            message = (
+                "persisted run config no longer validates (config schema "
+                "changed since the run started?); resuming with the current "
+                f"config instead: {exc}"
+            )
+            logger.warning("run %s: %s", run_id, message)
+            self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
+            return
+        stored = stored.model_copy(
+            update={
+                "state_dir": self.config.state_dir,
+                "keep_sandboxes": self.config.keep_sandboxes,
+                "keep_on_failure": self.config.keep_on_failure,
+            }
+        )
+        drift = self._config_drift(stored, self.config)
+        if drift:
+            message = (
+                "resuming with the run's original config; the current config "
+                "differs: " + "; ".join(drift)
+            )
+            logger.warning("run %s: %s", run_id, message)
+            self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
+        self.config = stored
+        if self._worker_python_from_config:
+            self.worker_python = stored.worker_python
+        if self._install_workers_from_config:
+            self.install_workers = stored.install_workers
+        if self._sbx_from_config:
+            self.sbx = SbxCLI(app_name=stored.app_name or None)
+
+    @staticmethod
+    def _config_drift(stored: Config, current: Config) -> list[str]:
+        """Dotted keys where the run's persisted config and the config this
+        engine was built with disagree, with both values."""
+        stored_flat = _flatten(stored.model_dump(mode="json"))
+        current_flat = _flatten(current.model_dump(mode="json"))
+        return [
+            f"{key} (run: {stored_flat.get(key)!r}, current: {current_flat.get(key)!r})"
+            for key in sorted(stored_flat.keys() | current_flat.keys())
+            if stored_flat.get(key) != current_flat.get(key)
+        ]
+
     # -- run driver --------------------------------------------------------
 
-    def _drive(self, run_id: str, outcome: str) -> RunResult:
+    def _drive(self, run_id: str, outcome: str, *, workspace: Path | None = None) -> RunResult:
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
         self._set_run_state(run_id, "provisioning")
         provisioner = Provisioner(self.sbx, self.config, self.bus)
-        pair = provisioner.ensure_pair(run_id)
+        # A resumed run's workspace is pinned from the runs table — never
+        # recomputed from config, which would silently relocate it (#60).
+        pair = provisioner.ensure_pair(run_id, workspace)
         assert pair.workspace is not None
+        if workspace is not None and pair.workspace != workspace:
+            raise StateError(
+                f"run {run_id} workspace mismatch: the run recorded {workspace} "
+                f"but provisioning produced {pair.workspace}; refusing to "
+                "continue in a relocated workspace"
+            )
         self.store.set_run_workspace(run_id, pair.workspace, pair.mounted)
         if pair.keep:
             # keep_sandboxes: mark up front so `sandbox prune` respects it.

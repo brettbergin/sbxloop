@@ -98,6 +98,18 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- `resume` now runs under the config the run was started with (#60). The
+  full config has always been persisted in the runs table, but resume drove
+  with whatever `load_config()` produced at resume time — so editing
+  config (or resuming from a different directory) silently changed budgets,
+  model, or GitHub toggles mid-run, and could relocate the run into a
+  fresh, empty workspace. Resume now rehydrates the persisted config
+  (tokens still come from the current environment; `state_dir` stays where
+  the run was found; the `keep_sandboxes`/`keep_on_failure` debug toggles
+  stay resume-time choices so a crashing run can be resumed with keep
+  flipped on), pins the workspace from the runs table instead of
+  recomputing it, refuses a workspace mismatch, and reports any difference
+  from the current on-disk config as a `run.config_drift` event.
 - The fake sbx used in tests now scopes `pkill` to the sandbox's own
   processes, emulating the microVM boundary. A timeout kill's host-wide
   `pkill -f sbxloop_worker.*<job_id>` could TERM other tests' live worker

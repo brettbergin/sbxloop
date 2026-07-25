@@ -265,7 +265,7 @@ def resume(
     run_id: Annotated[str, typer.Argument(help="Run id to resume.")],
     tui: Annotated[bool, typer.Option("--tui/--no-tui")] = True,
 ) -> None:
-    """Resume an unfinished run (fresh sandboxes, persisted state)."""
+    """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
     config = load_config()
     engine = LoopEngine(config)
     try:
@@ -273,7 +273,8 @@ def resume(
     except SdxloopError as exc:
         console.print(f"[bold red]resume failed:[/] {exc}")
         raise typer.Exit(2) from exc
-    _finish(result, config)
+    # engine.config is the run's rehydrated config, which is what drove the run.
+    _finish(result, engine.config)
 
 
 @app.command()

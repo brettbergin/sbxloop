@@ -130,9 +130,16 @@ after **every** state transition. Infrastructure failures propagate after
 persisting — a crash and a `kill -9` look identical to the store — and
 `resume`:
 
-1. re-provisions a fresh sandbox pair,
-2. reloads task records (plans included),
-3. continues from the last committed transition. A phase whose result was
+1. rehydrates the config persisted at run creation (tokens still come from
+   the current environment; `state_dir` stays the one that located the run;
+   the `keep_sandboxes`/`keep_on_failure` debug toggles stay resume-time
+   choices) and pins the workspace from the `runs` table — editing config between
+   start and resume, or resuming from another directory, cannot silently
+   change budgets/toggles or relocate the workspace. Any difference from
+   the current on-disk config is reported as a `run.config_drift` event,
+2. re-provisions a fresh sandbox pair,
+3. reloads task records (plans included),
+4. continues from the last committed transition. A phase whose result was
    never committed re-runs from its start; nothing is replayed.
 
 ## Events
