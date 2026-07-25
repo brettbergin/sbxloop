@@ -18,8 +18,10 @@ Subscriber = Callable[[Event], None]
 class Hook(Protocol):
     """Extension point: receives every event published on the bus.
 
-    Implementations must be fast and must not raise; exceptions are caught
-    and logged so one misbehaving hook cannot break a run.
+    Exceptions are contained: ``EventBus.publish`` catches and logs anything
+    a hook raises, so a misbehaving hook can never break a run and hook
+    authors need no defensive try/except of their own. Hooks run
+    synchronously on the publishing thread, though, so keep them fast.
     """
 
     def on_event(self, event: Event) -> None: ...
