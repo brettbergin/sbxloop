@@ -22,8 +22,9 @@ from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RunResult, artifact_files, artifacts_dir
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
-from sbxloop.events import Event
+from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.pool import WarmPool, provision_fingerprint
 from sbxloop.sbx.provision import sandbox_name
 
 app = typer.Typer(
@@ -229,6 +230,36 @@ def run(
 
 
 @app.command()
+def warmup(
+    count: Annotated[
+        int, typer.Option("--count", "-n", min=1, help="Standby pairs to provision.")
+    ] = 1,
+) -> None:
+    """Pre-provision standby sandbox pairs so the next runs start warm.
+
+    `sbxloop run` claims a warm pair when its provisioning inputs match
+    (same sbxloop version, template, secret strategy, network allows, ...);
+    otherwise it falls back to cold provisioning unchanged. Expired pairs
+    (see [pool].ttl_s) are discarded automatically.
+    """
+    config = load_config()
+    bus = EventBus()
+    bus.subscribe(plain_printer(console))
+    pool = WarmPool(SbxCLI(app_name=config.app_name or None), config, _store(config), bus)
+    try:
+        records = pool.warmup(count)
+    except SdxloopError as exc:
+        console.print(f"[bold red]warmup failed:[/] {exc}")
+        raise typer.Exit(2) from exc
+    for record in records:
+        expires = time.strftime("%H:%M:%S", time.localtime(record.expires_at))
+        console.print(
+            f"warm pair [bold cyan]{record.pool_id}[/] ready "
+            f"(fingerprint {record.fingerprint}, expires {expires})"
+        )
+
+
+@app.command()
 def resume(
     run_id: Annotated[str, typer.Argument(help="Run id to resume.")],
     tui: Annotated[bool, typer.Option("--tui/--no-tui")] = True,
@@ -387,6 +418,35 @@ def sandbox_ls() -> None:
     console.print(table)
 
 
+@sandbox_app.command("pool")
+def sandbox_pool() -> None:
+    """List warm standby pairs (see `sbxloop warmup`)."""
+    config = load_config()
+    store = _store(config)
+    current = provision_fingerprint(config)
+    # Sandbox names derive from the pool id (sbxloop-pool-<pool>-<role>), so
+    # the table stays narrow enough for an 80-column terminal.
+    table = Table(title="sbxloop warm pool (sandboxes: sbxloop-pool-<pool>-<role>)")
+    for column in ("pool", "fingerprint", "github", "expires", "claimable"):
+        table.add_column(column)
+    now = time.time()
+    for record in store.list_pool_pairs():
+        if record.expires_at <= now:
+            state = "expired"
+        elif record.fingerprint == current:
+            state = "yes"
+        else:
+            state = "no (mismatch)"
+        table.add_row(
+            record.pool_id,
+            record.fingerprint,
+            "yes" if record.github_name else "",
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(record.expires_at)),
+            state,
+        )
+    console.print(table)
+
+
 @sandbox_app.command("rm")
 def sandbox_rm(
     name: Annotated[str | None, typer.Argument(help="Sandbox name.")] = None,
@@ -412,6 +472,11 @@ def sandbox_rm(
             console.print(f"removed {target}")
         except SdxloopError as exc:
             console.print(f"[yellow]skip {target}:[/] {exc}")
+    # Removing a pooled sandbox out-of-band leaves a dead DB row; drop it so
+    # `sandbox pool` stays truthful (claims self-verify either way).
+    dropped = _store(config).remove_pool_pairs_for_sandboxes(list(dict.fromkeys(targets)))
+    if dropped:
+        console.print(f"dropped {dropped} warm-pool record(s)")
 
 
 @config_app.command("show")
@@ -501,6 +566,12 @@ extra_allow_domains = []
 # deliver = false
 # deliver_base = "main"   # base branch; unset uses the repo's default
 # deliver_draft = false
+
+[pool]
+# Warm sandbox pool: `sbxloop warmup` pre-provisions standby pairs that
+# `sbxloop run` claims when the provisioning inputs match. Standby pairs
+# expire after ttl_s seconds and are discarded, never reused stale.
+# ttl_s = 1800.0
 
 [budgets]
 max_revisions_per_task = 2

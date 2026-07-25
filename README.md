@@ -84,6 +84,28 @@ github-ops sandbox — `GH_TOKEN` only, one atomic commit via the git data API, 
 Delivery failures are reported loudly (`run.deliver` event) but never fail a
 completed run. Without the integration configured, `--deliver` refuses to run.
 
+## Warm pool: faster starts for iterative use
+
+Cold provisioning (two `sbx create` calls, network policy, secret registration,
+the worker install ladder) dominates run startup. `sbxloop warmup` pays that
+cost ahead of time:
+
+```bash
+sbxloop warmup --count 2      # pre-provision two standby pairs
+sbxloop run "..."             # claims a warm pair; starts in seconds
+sbxloop sandbox pool          # inspect standby pairs
+```
+
+A pair is only claimed when its **provision fingerprint** matches the run's —
+sbxloop/worker version, template, app-name, network allows, secret strategy,
+GitHub enablement. Every claim is self-verifying: the pair is probed for
+liveness and worker version, secrets are re-applied from the current host
+environment (so rotated tokens propagate), and run-scoped state (job dirs and
+the pool workspace) is reset so runs can't leak artifacts into each other.
+Anything that fails a check is discarded and the run falls back to cold
+provisioning. Standby pairs expire after `[pool] ttl_s` seconds (default 30
+minutes) and are pruned automatically.
+
 ## Repository layout
 
 This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with two distributions:

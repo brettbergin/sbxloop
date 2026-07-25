@@ -6,6 +6,24 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Warm sandbox pool** ([#47](https://github.com/brettbergin/sbxloop/issues/47)):
+  `sbxloop warmup [--count N]` pre-provisions standby sandbox pairs (create,
+  network policy, secrets, and the full worker install ladder) and records
+  them in the state DB; `sbxloop run` claims a matching pair and starts in
+  seconds instead of paying cold-provision cost. Reuse is keyed by a
+  *provision fingerprint* (sbxloop/worker version, template, app-name,
+  network allows, secret strategy, GitHub enablement, explicit workspace) —
+  any mismatch falls back to cold provisioning unchanged. Claims are
+  self-verifying: liveness + worker-version probe, secrets re-applied from
+  the current host env (token rotation propagates), and run-scoped state
+  reset (job dirs + pool workspace) so runs cannot leak artifacts into each
+  other; anything failing a check is discarded. Standby pairs expire after
+  `[pool] ttl_s` (default 1800s), are visible via `sbxloop sandbox pool`,
+  and use `sbxloop-pool-<id>-<role>` names so `sbx ls` classification and
+  future orphan GC keep working. `resume` intentionally never claims — it
+  must keep the interrupted run's persisted workspace.
+
 ### Changed
 - **Releases are now fully automated** (aligned with the entrygraph release
   strategy): every merge to `main` runs the check suite, auto-bumps the patch

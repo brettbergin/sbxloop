@@ -199,6 +199,14 @@ class Provisioner:
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
 
+    def refresh_secrets(self, run_id: str, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
+        """Re-apply and re-verify one sandbox's secrets (warm-pool claims).
+
+        The replace-on-exists flow makes re-application idempotent, so a
+        claim always carries the *current* host tokens even after rotation."""
+        self._apply_secrets(spec, sandbox, token)
+        self._verify_secret_env(run_id, spec, sandbox, token)
+
     def _apply_policy(self, spec: SandboxSpec) -> None:
         for domain in spec.policy_allows:
             self.cli.policy_allow(domain, sandbox=spec.name)

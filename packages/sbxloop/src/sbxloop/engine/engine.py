@@ -44,6 +44,7 @@ from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
+from sbxloop.sbx.pool import WarmPool
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.worker.client import WorkerClient
 
@@ -100,7 +101,7 @@ class LoopEngine:
         if run.state not in RESUMABLE_RUN_STATES:
             raise StateError(f"run {run_id} is {run.state}; only unfinished runs can resume")
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
-        return self._drive(run_id, run.outcome)
+        return self._drive(run_id, run.outcome, resumed=True)
 
     def cancel(self, run_id: str) -> None:
         self.store.get_run(run_id)  # raises for unknown runs
@@ -108,32 +109,43 @@ class LoopEngine:
 
     # -- run driver --------------------------------------------------------
 
-    def _drive(self, run_id: str, outcome: str) -> RunResult:
+    def _drive(self, run_id: str, outcome: str, *, resumed: bool = False) -> RunResult:
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
         self._set_run_state(run_id, "provisioning")
-        provisioner = Provisioner(self.sbx, self.config, self.bus)
-        pair = provisioner.ensure_pair(run_id)
+        # A warm pair (sbxloop warmup) skips create/policy/secrets/install
+        # entirely; cold provisioning is the unchanged fallback. Resumes
+        # never claim: a claim swaps in a freshly reset pool workspace,
+        # while a resumed run must keep its persisted run workspace (the
+        # interrupted run's partial work lives there).
+        pair = None
+        if not resumed:
+            pair = WarmPool(self.sbx, self.config, self.store, self.bus).claim(run_id)
+        if pair is None:
+            pair = Provisioner(self.sbx, self.config, self.bus).ensure_pair(run_id)
         assert pair.workspace is not None
         self.store.set_run_workspace(run_id, pair.workspace, pair.mounted)
+        worker_python = (
+            pair.worker_python if pair.preinstalled and pair.worker_python else self.worker_python
+        )
         try:
             with pair:
                 agent = WorkerClient(
                     pair.agent,
                     self.bus,
                     transport=self.config.worker_transport,
-                    python=self.worker_python,
+                    python=worker_python,
                 )
                 github = (
                     WorkerClient(
                         pair.github,
                         self.bus,
                         transport=self.config.worker_transport,
-                        python=self.worker_python,
+                        python=worker_python,
                     )
                     if pair.github is not None
                     else None
                 )
-                if self.install_workers:
+                if self.install_workers and not pair.preinstalled:
                     # ensure_dev_tools: the agent builds projects in this VM
                     # (venvs, pip) — the github sandbox only runs API ops.
                     agent.install(extras="copilot", ensure_dev_tools=True)

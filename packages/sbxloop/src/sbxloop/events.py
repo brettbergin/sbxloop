@@ -84,6 +84,9 @@ class HostEventTypes:
     SANDBOX_PROVISION_START = "sandbox.provision_start"
     SANDBOX_READY = "sandbox.ready"
     SANDBOX_CLEANUP = "sandbox.cleanup"
+    SANDBOX_POOL_READY = "sandbox.pool_ready"
+    SANDBOX_POOL_CLAIM = "sandbox.pool_claim"
+    SANDBOX_POOL_DISCARD = "sandbox.pool_discard"
 
 
 __all__ = ["Event", "EventBus", "Hook", "HostEventTypes", "Subscriber"]
