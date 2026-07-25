@@ -6,6 +6,31 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- A delivery infrastructure failure can no longer mark a completed run as
+  failed (#59). `--deliver` runs after the run has succeeded; worker- and
+  sbx-level errors raised by the delivery op jobs (`WorkerError`,
+  `WorkerTimeoutError`, `SbxError`) were escaping the delivery guard and
+  leaving the run stuck in `finalizing`, reported as failed. Delivery now
+  contains every sbxloop error, keeps the loud `run.deliver` event, and the
+  run finishes `completed` as documented.
+- GitHub progress reporting (`--report`) now actually reports (#58). The
+  tracking issue was never created: the hook subscribed to run lifecycle
+  events that are emitted before the github sandbox exists and after it is
+  torn down. Run start/end are now explicit `open_run`/`close_run` calls
+  made while the sandbox is alive; task-end comments flow via the bus as
+  before, and the final summary posts before teardown. A resumed run
+  re-finds its existing tracking issue instead of opening a duplicate.
+
+### Security
+- Secret values no longer leak through error text or the process-observable
+  argv carried on `ExecResult`/`SbxError`: the value passed to
+  `sbx secret set-custom --value` is masked (`***`) in every observable copy
+  of the invocation, so provisioning failures cannot print the Copilot PAT
+  into terminals, logs, or events (#57). The remaining `ps`-visibility of
+  the live subprocess argv needs stdin support in sbx itself and stays
+  tracked in #57.
+
 ### Changed
 - **Releases are now fully automated** (aligned with the entrygraph release
   strategy): every merge to `main` runs the check suite, auto-bumps the patch
