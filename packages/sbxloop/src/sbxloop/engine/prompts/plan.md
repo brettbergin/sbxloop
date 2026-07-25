@@ -18,6 +18,15 @@ $acceptance_criteria
 
 $feedback
 
+## Environment facts to plan around
+
+Debian/Ubuntu VM; the system Python is externally managed (PEP 668), so
+Python dependencies belong in a project virtualenv (`python3 -m venv .venv`)
+and commands — including your `verify_commands` — should use `.venv/bin/...`
+paths; missing apt packages can be installed with passwordless sudo; network
+egress is allowlisted (PyPI, GitHub, and apt mirrors are reachable — declare
+anything else in `egress`).
+
 ## Response format
 
 Respond with exactly one fenced JSON block:
@@ -42,11 +51,5 @@ port; `*.example.com` wildcards are accepted. Declarations are auto-granted
 only within an operator-set allowlist: a request outside it fails this
 plan's validation, so prefer baseline-reachable alternatives.
 
-Environment facts to plan around: Debian/Ubuntu VM; the system Python is
-externally managed (PEP 668), so Python dependencies belong in a project
-virtualenv (`python3 -m venv .venv`) and commands — including your
-`verify_commands` — should use `.venv/bin/...` paths; missing apt packages
-can be installed with passwordless sudo; network egress is allowlisted
-(PyPI, GitHub, and apt mirrors are reachable — declare anything else in
-`egress`).
+Respond with ONLY the fenced JSON block — no prose before or after it.
 $retry_context

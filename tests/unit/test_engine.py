@@ -147,6 +147,21 @@ class TestHappyPath:
         created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
         assert any(name.endswith("-github") for name in created), created
 
+    def test_json_missing_reply_retries_instead_of_killing_run(self, harness: Harness) -> None:
+        """Field failure (0.5.0): one chatty no-JSON reply on a JSON phase
+        raised ExpectedJsonMissing straight through and the run died. It
+        must retry once with format feedback instead."""
+        chatty = {"text": "Sure! Let me think about the tasks for a moment..."}
+        harness.script([chatty, taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("survive a chatty decompose")
+        assert result.state == "completed"
+
+    def test_json_missing_twice_still_fails(self, harness: Harness) -> None:
+        chatty = {"text": "no json from me"}
+        harness.script([chatty, chatty])
+        with pytest.raises(WorkerError, match="invalid output twice"):
+            harness.engine().start("never json")
+
     def test_two_tasks_dependency_order(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t2", deps=["t1"]), task("t1")), *HAPPY_TASK, *HAPPY_TASK])
         engine = harness.engine()
