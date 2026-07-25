@@ -98,6 +98,29 @@ def collect_checks(
                 )
             )
 
+        # Host-side resource stats: sbx 0.35.x has no stats command, so
+        # resource telemetry samples in-VM on the worker heartbeat. This is
+        # the field-check for the day sbx grows one (issue #54) — purely
+        # informational either way.
+        report("checking for host-side sandbox stats")
+        stats_available = False
+        try:
+            stats_available = cli.run("stats", "--help", check=False).returncode == 0
+        except SbxError:
+            stats_available = False
+        checks.append(
+            Check(
+                "sandbox stats",
+                True,
+                "host-side `sbx stats` available — sbxloop still samples in-VM; "
+                "consider filing an issue to prefer host-side stats"
+                if stats_available
+                else "no host-side `sbx stats`; resource telemetry samples in-VM "
+                f"on the worker heartbeat (expected on {TESTED_SBX_SERIES}.x)",
+                hard=False,
+            )
+        )
+
     # tokens
     checks.append(
         Check(

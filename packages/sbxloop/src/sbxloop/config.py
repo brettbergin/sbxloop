@@ -18,7 +18,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from sbxloop.errors import ConfigError
 
@@ -68,6 +75,35 @@ class GithubConfig(_ConfigModel):
         return self.repo is not None
 
 
+class Limits(_ConfigModel):
+    """Sandbox resource guardrails, sampled in-VM on the worker heartbeat.
+
+    Thresholds are percent-used of the workspace filesystem / memory; 0
+    disables a guardrail. Crossing a warn threshold emits a prominent
+    ``sandbox.resources_warning`` event and escalates the TUI gauge;
+    crossing ``disk_abort`` fails the current task with an explicit
+    "sandbox disk exhausted" error instead of letting in-VM tooling fail
+    confusingly on a full disk.
+    """
+
+    disk_warn: float = 85.0
+    disk_abort: float = 95.0
+    mem_warn: float = 90.0
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> Limits:
+        for name in ("disk_warn", "disk_abort", "mem_warn"):
+            value = getattr(self, name)
+            if value < 0 or value > 100:
+                raise ValueError(f"limits.{name} must be a percentage in 0..100, got {value}")
+        if 0 < self.disk_abort <= self.disk_warn:
+            raise ValueError(
+                f"limits.disk_abort ({self.disk_abort}) must be greater than "
+                f"limits.disk_warn ({self.disk_warn})"
+            )
+        return self
+
+
 class Budgets(_ConfigModel):
     max_revisions_per_task: int = 2
     max_replans_per_task: int = 1
@@ -95,6 +131,7 @@ class Config(_ConfigModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
     budgets: Budgets = Field(default_factory=Budgets)
+    limits: Limits = Field(default_factory=Limits)
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

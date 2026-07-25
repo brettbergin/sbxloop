@@ -75,8 +75,16 @@ class Harness:
         state.unlink(missing_ok=True)
 
     def engine(self, **config_overrides: Any) -> LoopEngine:
+        # Resource guardrails default OFF in the harness: the real worker
+        # samples the host filesystem here, so default thresholds would make
+        # tests depend on how full the developer's disk is.
+        limits = config_overrides.pop("limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0})
         config = Config.model_validate(
-            {"state_dir": str(self.state_dir), "budgets": config_overrides.pop("budgets", {})}
+            {
+                "state_dir": str(self.state_dir),
+                "budgets": config_overrides.pop("budgets", {}),
+                "limits": limits,
+            }
             | config_overrides
         )
         bus = EventBus()
@@ -456,3 +464,40 @@ class TestDeliverHook:
         result = harness.engine().start("plain run")
         assert result.state == "completed"
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
+
+
+class TestResourceGuardrail:
+    """[limits] guardrails end-to-end: the real worker samples the real
+    filesystem, so a tiny threshold reliably classifies warn/abort."""
+
+    def test_disk_abort_fails_task_with_diagnosis(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1"))])
+        # disk_warn=0 (disabled) + microscopic disk_abort: any real fs
+        # sample crosses it, so the decompose job's baseline sample puts the
+        # agent sandbox at level=abort before the task loop starts.
+        result = harness.engine(limits={"disk_warn": 0, "disk_abort": 0.1}).start("doomed")
+        assert result.state == "failed"
+        assert [t.state for t in result.tasks] == ["failed"]
+        assert "sandbox disk exhausted" in (result.tasks[0].last_feedback or "")
+
+    def test_disk_warn_never_fails_tasks(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(limits={"disk_warn": 0.1, "disk_abort": 95.0}).start("warned")
+        assert result.succeeded
+        warnings = [e for e in harness.events if e.type == "sandbox.resources_warning"]
+        assert warnings and warnings[0].data["role"] == "agent"
+
+    def test_artifacts_event_carries_disk_pressure_note(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        harness.engine(limits={"disk_warn": 0.1, "disk_abort": 95.0}).start("pressured")
+        artifacts = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS]
+        assert artifacts
+        assert artifacts[-1].data.get("resources_level") == "warn"
+        assert artifacts[-1].data.get("disk_used_pct") is not None
+
+    def test_resource_events_are_persisted_for_post_hoc_queries(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(limits={"disk_warn": 0.1, "disk_abort": 95.0})
+        result = engine.start("queryable")
+        rows = engine.store.events(result.run_id, type_prefix="sandbox.resources")
+        assert rows, "sandbox.resources events were not persisted"
