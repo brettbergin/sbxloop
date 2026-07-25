@@ -191,7 +191,13 @@ def cmd_exec(root: Path, args: list[str]) -> int:
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["SBX_FAKE_FS"] = str(fs)
-    proc = subprocess.run(rewritten, cwd=home, env=env, check=False)
+    try:
+        proc = subprocess.run(rewritten, cwd=home, env=env, check=False)
+    except FileNotFoundError:
+        # Model field-observed sbx behavior: exec launch errors (missing
+        # binary) surface on STDOUT, not stderr.
+        print(f'Error: exec failed: executable "{rewritten[0]}" was not located in the sandbox')
+        return 1
     return proc.returncode
 
 
@@ -369,6 +375,12 @@ def main() -> int:
         print("usage: sbx COMMAND", file=sys.stderr)
         return 2
     command, *rest = args
+    if command in ("--help", "help"):
+        print(
+            "Usage: sbx [OPTIONS] COMMAND\n\nCommands:\n"
+            "  create  exec  cp  ls  stop  rm  policy  secret  version  login"
+        )
+        return 0
     if command == "create":
         return cmd_create(root, rest)
     if command == "exec":

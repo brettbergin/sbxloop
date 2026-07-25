@@ -464,3 +464,42 @@ class TestMountDiscovery:
             assert pair.agent_workdir == WORK_DIR
         finally:
             pair.cleanup()
+
+
+class TestConformanceRecording:
+    """Provisioning's own field checks double as conformance probes: every
+    run refreshes the version-keyed verdict cache for free."""
+
+    def test_ensure_pair_records_field_verdicts(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        from sbxloop.sbx.conformance import (
+            PROBE_SECRET_ENV_VISIBILITY,
+            PROBE_WORKSPACE_MOUNT,
+            load_verdicts,
+        )
+
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            cached = load_verdicts(tmp_path / "state", "0.35.0")
+            assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "invisible-under-exec"
+            assert cached[PROBE_SECRET_ENV_VISIBILITY].source == "provision"
+            assert cached[PROBE_WORKSPACE_MOUNT].verdict == "discoverable"
+            assert cached[PROBE_WORKSPACE_MOUNT].source == "provision"
+        finally:
+            pair.cleanup()
+
+    def test_recording_failure_never_breaks_provisioning(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.sbx import provision as provision_module
+
+        def boom(*args: object, **kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(provision_module, "record_field_verdict", boom)
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.mounted
+        finally:
+            pair.cleanup()

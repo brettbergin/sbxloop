@@ -275,6 +275,65 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 1
         assert "not found on PATH" in result.output
+        assert "conformance skipped" in result.output
+
+    def test_doctor_shows_conformance_with_deep_hint(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "sbx conformance" in result.output
+        # rich may wrap the hint, so match the flag token alone
+        assert "--deep" in result.output
+        assert "unprobed" in result.output
+        # cheap probes never create a sandbox
+        assert not (fake_sbx.state / "sandboxes").is_dir() or not list(
+            (fake_sbx.state / "sandboxes").iterdir()
+        )
+
+    def test_doctor_deep_probes_and_caches(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.sbx.conformance import CATALOG, load_verdicts
+
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor", "--deep"])
+        assert result.exit_code == 0, result.output
+        assert "DRIFT" not in result.output
+        cached = load_verdicts(workdir / ".sbxloop", "0.35.0")
+        assert set(cached) == {probe.id for probe in CATALOG}
+        # the scratch sandbox is gone afterwards
+        assert not list((fake_sbx.state / "sandboxes").iterdir())
+        # and a follow-up shallow doctor is fully probed: no more deep nudge
+        again = runner.invoke(app, ["doctor"])
+        assert "unprobed" not in again.output
+
+    def test_doctor_alarms_on_cached_drift(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import time as time_module
+
+        from sbxloop.sbx.conformance import (
+            PROBE_SECRET_ENV_VISIBILITY,
+            ProbeRecord,
+            save_verdicts,
+        )
+
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        save_verdicts(
+            workdir / ".sbxloop",
+            "0.35.0",
+            {
+                PROBE_SECRET_ENV_VISIBILITY: ProbeRecord(
+                    verdict="visible-under-exec", checked_at=time_module.time()
+                )
+            },
+        )
+        result = runner.invoke(app, ["doctor"])
+        assert "sbx drift" in result.output
+        # drift warns loudly but does not fail an otherwise-ready host
+        assert result.exit_code == 0, result.output
 
 
 class TestRunCommand:

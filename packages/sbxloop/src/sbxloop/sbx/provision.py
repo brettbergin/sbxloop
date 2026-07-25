@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import secrets
 import shlex
 from collections.abc import Callable, Mapping
@@ -31,6 +30,13 @@ from sbxloop.config import Config
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.conformance import (
+    PROBE_SECRET_ENV_VISIBILITY,
+    PROBE_WORKSPACE_MOUNT,
+    SECRET_EXISTS_MARKERS,
+    parse_secret_conflict_scope,
+    record_field_verdict,
+)
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.sandbox import ENV_FILE, EVENTS_DIR, JOBS_DIR, RESULTS_DIR, WORK_DIR, Sandbox
@@ -92,6 +98,25 @@ class Provisioner:
         self.bus = bus or EventBus()
         self.env = os.environ if env is None else env
         self.post_create = post_create
+        self._sbx_version: str | None = None
+        self._sbx_version_known = False
+
+    def _record_probe(self, probe_id: str, verdict: str, detail: str = "") -> None:
+        """Refresh the conformance cache from a field observation.
+
+        Provisioning already performs these checks for its own needs; feeding
+        the verdicts into the version-keyed cache keeps `doctor` fresh for
+        free. Best-effort: recording must never affect provisioning.
+        """
+        try:
+            if not self._sbx_version_known:
+                self._sbx_version = self.cli.version()
+                self._sbx_version_known = True
+            record_field_verdict(
+                self.config.state_dir, self._sbx_version, probe_id, verdict, detail
+            )
+        except Exception:
+            logger.debug("conformance verdict recording failed", exc_info=True)
 
     # -- spec construction -------------------------------------------------
 
@@ -232,20 +257,19 @@ class Provisioner:
                     ),
                 )
 
-    _SECRET_EXISTS_MARKERS = ("exist", "already")
-    # sbx reports the owner of a conflicting secret, e.g.
-    #   ERROR: custom secret env "X" already exists in scope NAME with placeholder ...
-    _SCOPE_RE = re.compile(r'in scope "?([A-Za-z0-9._-]+)"?')
+    # The exists-markers and scope regex live in the conformance catalog (the
+    # canonical home of sbx error-shape knowledge, kept honest by the
+    # secret-exists-error probe).
+    _SECRET_EXISTS_MARKERS = SECRET_EXISTS_MARKERS
 
-    @classmethod
-    def _parsed_scope(cls, stderr: str) -> str | None:
+    @staticmethod
+    def _parsed_scope(stderr: str) -> str | None:
         """The scope owning the conflicting secret, per sbx's error message.
 
         Returns None when unparseable; the literal scopes "global"/"-g" map
         to None-as-global in secret_rm terms via the callers below.
         """
-        match = cls._SCOPE_RE.search(stderr)
-        return match.group(1) if match else None
+        return parse_secret_conflict_scope(stderr)
 
     def _service_rm_candidates(
         self, service: str, sandbox: str, stderr: str
@@ -347,6 +371,11 @@ class Provisioner:
             return
         env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
         result = sandbox.exec(["sh", "-lc", f'test -n "${{{env_name}}}"'])
+        self._record_probe(
+            PROBE_SECRET_ENV_VISIBILITY,
+            "visible-under-exec" if result.ok else "invisible-under-exec",
+            f"observed while provisioning {spec.name} ({env_name})",
+        )
         if result.ok:
             return
         # Auto-heal: fall back to the plain-env file for this sandbox. The
@@ -395,6 +424,11 @@ class Provisioner:
         finally:
             (workspace / marker).unlink(missing_ok=True)
         if not hit.endswith(f"/{marker}"):
+            self._record_probe(
+                PROBE_WORKSPACE_MOUNT,
+                "not-found",
+                f"observed while provisioning {sandbox.name}",
+            )
             self.bus.emit(
                 "sandbox.workspace_mount",
                 run_id,
@@ -404,6 +438,11 @@ class Provisioner:
             )
             return None
         mount_dir = hit[: -len(f"/{marker}")] or "/"
+        self._record_probe(
+            PROBE_WORKSPACE_MOUNT,
+            "discoverable",
+            f"workspace mounted at {mount_dir} (observed while provisioning {sandbox.name})",
+        )
         self.bus.emit(
             "sandbox.workspace_mount",
             run_id,
