@@ -112,21 +112,25 @@ def collect_checks(
         # network policy reachable for the copilot hosts
         for host in AGENT_TOKEN_HOSTS:
             report(f"checking network policy for {host}")
-            allowed = False
             try:
                 allowed = cli.policy_check(host)
-            except SbxError:
-                allowed = False
-            checks.append(
-                Check(
-                    f"policy: {host}",
-                    allowed,
+                detail = (
                     "reachable"
                     if allowed
                     else (
                         "blocked — run `sbx policy init balanced` and/or "
                         f"`sbx policy allow network {host}`"
-                    ),
+                    )
+                )
+            except SbxError as exc:
+                # The check itself broke; that is not a policy verdict.
+                allowed = False
+                detail = f"policy check errored (not a policy answer): {exc}"
+            checks.append(
+                Check(
+                    f"policy: {host}",
+                    allowed,
+                    detail,
                     hard=False,  # per-sandbox allows are applied at provision time
                 )
             )

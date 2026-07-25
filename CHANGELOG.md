@@ -115,6 +115,21 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Security
 
+- sbx infra failures can no longer silently downgrade the secret strategy
+  (#63). The secret visibility probe only accepts a clean `test -n` answer
+  (exit 0/1): an sbx-level failure or any other exit code is retried once
+  and then **fails provisioning loudly** (with a distinct
+  `sandbox.secret_probe_error` event) instead of being misread as "proxy
+  secret invisible" and auto-writing the token into the VM. Supporting
+  changes: `SbxCLI.exec` now classifies recognizable sbx-level stderr
+  shapes (sandbox not running, daemon unreachable, transport failures) and
+  raises `SbxError` for them instead of returning them as command results;
+  mount discovery still degrades to harvest mode on a broken probe but its
+  `sandbox.workspace_mount` event now distinguishes `probe="error"` from
+  `probe="answered"` (and only clean answers refresh the conformance
+  cache); `policy_check` raises on invocation failure rather than
+  reporting infra trouble as "blocked", and `doctor` labels that case as a
+  check error, not a policy verdict.
 - Secret values no longer leak through error text or the process-observable
   argv carried on `ExecResult`/`SbxError`: the value passed to
   `sbx secret set-custom --value` is masked (`***`) in every observable copy
