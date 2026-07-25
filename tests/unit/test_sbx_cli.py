@@ -79,6 +79,36 @@ class TestExec:
         with pytest.raises(SbxNotFoundError):
             cli.exec("ghost", ["true"])
 
+    def test_exec_stopped_sandbox_raises_infra_error(self, cli: SbxCLI, tmp_path: Path) -> None:
+        # "is not running" is an sbx-level refusal, not the inner command's
+        # exit code — it must raise instead of masquerading as a result (#63)
+        cli.create(spec("boxa", tmp_path))
+        cli.stop("boxa")
+        with pytest.raises(SbxError):
+            cli.exec("boxa", ["true"])
+
+    def test_exec_daemon_failure_raises(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        cli.create(spec("boxa", tmp_path))
+        fake_sbx.fail_next(
+            "exec boxa",
+            returncode=1,
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        )
+        with pytest.raises(SbxError) as excinfo:
+            cli.exec("boxa", ["true"])
+        assert not isinstance(excinfo.value, SbxNotFoundError)
+
+    def test_exec_inner_failure_with_stderr_still_returns(
+        self, cli: SbxCLI, tmp_path: Path
+    ) -> None:
+        # Ordinary inner-command stderr must not trip the infra classifier.
+        cli.create(spec("boxa", tmp_path))
+        fail = cli.exec("boxa", ["sh", "-c", "echo 'connection refused by host' >&2; exit 7"])
+        assert fail.returncode == 7
+        assert "connection refused" in fail.stderr
+
     def test_exec_writes_inside_fs(self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         cli.create(spec("boxa", tmp_path))
         cli.exec(
@@ -145,9 +175,19 @@ class TestPolicy:
         fake_sbx.script("policy check network evil.example", stdout="denied by policy\n")
         assert cli.policy_check("evil.example") is False
 
-    def test_policy_check_nonzero_is_false(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
-        fake_sbx.fail_next("policy check", returncode=1, stderr="no policy")
+    def test_policy_check_denied_via_nonzero_exit_is_false(
+        self, cli: SbxCLI, fake_sbx: FakeSbx
+    ) -> None:
+        # sbx answering "denied" with a nonzero exit is still a policy answer
+        fake_sbx.script("policy check", returncode=1, stdout="denied by policy\n", once=True)
         assert cli.policy_check("x.example") is False
+
+    def test_policy_check_invocation_failure_raises(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
+        # a failed invocation with no deny-shaped answer is infra trouble,
+        # not "blocked" (#63)
+        fake_sbx.fail_next("policy check", returncode=1, stderr="no policy")
+        with pytest.raises(SbxError):
+            cli.policy_check("x.example")
 
     def test_policy_init(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
         cli.policy_init("balanced")
