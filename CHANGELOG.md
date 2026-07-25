@@ -7,6 +7,19 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [Unreleased]
 
 ### Added
+- **`sbxloop doctor` now runs an sbx conformance suite** (#52): every
+  field-learned assumption about sbx semantics is a named probe with a
+  machine-checkable verdict — secret-env visibility under `exec`, the
+  exec error channel, `cp <dir>/.` semantics, workspace-mount
+  discoverability, template python3-venv presence, custom-secret keying and
+  the parseable exists-error scope, plus cheap CLI-surface probes. Verdicts
+  are cached per `sbx version` in the state dir; `doctor` runs the cheap
+  probes and serves live-sandbox verdicts from the cache, `doctor --deep`
+  boots one scratch sandbox for the full suite. When a verdict flips —
+  against the verdict this sbxloop build depends on, or against a prior sbx
+  version's cache — doctor warns loudly, naming the dependent behavior.
+  Provisioning's existing checks (secret visibility, mount discovery) now
+  feed the same cache, so ordinary runs keep the verdicts fresh for free.
 - **`sbxloop secrets` command group** — proactive lifecycle management for
   the sbx custom-secret registrations sbxloop owns
   ([#55](https://github.com/brettbergin/sbxloop/issues/55)):

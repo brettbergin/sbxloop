@@ -1,8 +1,17 @@
-"""sbxloop doctor: host readiness checks with remediation hints."""
+"""sbxloop doctor: host readiness checks plus the sbx conformance suite.
+
+Readiness checks (binary, login, tokens, ...) say whether this host can run
+sbxloop at all. The conformance section reruns the probe catalog from
+:mod:`sbxloop.sbx.conformance` — every field-learned assumption about sbx
+semantics — and warns loudly when an sbx upgrade flips a verdict a code path
+depends on. Cheap probes run every time; ``--deep`` boots a scratch sandbox
+for the full suite and refreshes the version-keyed verdict cache.
+"""
 
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -13,6 +22,7 @@ from sbxloop.config import load_config
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.conformance import ConformanceReport, run_conformance
 from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, GH_TOKEN_ENVS
 from sbxloop.sbx.prune import count_orphans
 from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
@@ -210,13 +220,65 @@ def _clean(detail: str, limit: int = 300) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "\u2026"
 
 
-def run_doctor(console: Console, env: dict[str, str] | None = None) -> bool:
+def _age(checked_at: float | None) -> str:
+    if checked_at is None:
+        return ""
+    delta = max(0.0, time.time() - checked_at)
+    if delta < 3600:
+        return f"{delta / 60:.0f}m ago"
+    if delta < 86400:
+        return f"{delta / 3600:.0f}h ago"
+    return f"{delta / 86400:.0f}d ago"
+
+
+def render_conformance(console: Console, report: ConformanceReport) -> None:
+    table = Table(title=f"sbx conformance \u2014 sbx {report.version or '(unknown version)'}")
+    table.add_column("probe", no_wrap=True)
+    table.add_column("verdict", no_wrap=True)
+    table.add_column("status", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for outcome in report.outcomes:
+        if outcome.source == "unprobed":
+            status = "[dim]unprobed[/]"
+            detail = "needs a live sandbox \u2014 run `sbxloop doctor --deep`"
+        elif outcome.is_error:
+            status = "[yellow]error[/]"
+            detail = outcome.detail
+        elif outcome.drifts:
+            status = "[bold red]DRIFT[/]"
+            detail = outcome.detail
+        else:
+            status = "[green]ok[/]"
+            detail = outcome.detail
+        if outcome.source == "cache":
+            status += f" [dim](cached {_age(outcome.checked_at)})[/]"
+        elif outcome.source == "provision":
+            status += f" [dim](field {_age(outcome.checked_at)})[/]"
+        table.add_row(outcome.probe.id, _clean(outcome.verdict, 60), status, _clean(detail))
+    console.print(table)
+
+    for outcome in report.drifted:
+        for drift in outcome.drifts:
+            console.print(
+                f"[bold red]sbx drift[/] [bold]{outcome.probe.id}[/] = "
+                f"{outcome.verdict!r}: {drift}",
+                highlight=False,
+            )
+    if report.deep_run_hint:
+        console.print(f"[bold yellow]{report.deep_run_hint}[/]", highlight=False)
+
+
+def run_doctor(console: Console, env: dict[str, str] | None = None, *, deep: bool = False) -> bool:
     import os
 
-    checks = collect_checks(
-        dict(os.environ) if env is None else env,
-        progress=lambda message: console.print(f"[dim]\u2026 {message}[/dim]", highlight=False),
-    )
+    env = dict(os.environ) if env is None else env
+    config = load_config(env=env)
+    cli = SbxCLI(app_name=config.app_name or None)
+
+    def progress(message: str) -> None:
+        console.print(f"[dim]\u2026 {message}[/dim]", highlight=False)
+
+    checks = collect_checks(env, cli=cli, progress=progress)
     table = Table(title="sbxloop doctor")
     table.add_column("check", no_wrap=True)
     table.add_column("status", no_wrap=True)
@@ -227,4 +289,25 @@ def run_doctor(console: Console, env: dict[str, str] | None = None) -> bool:
         )
         table.add_row(check.name, status, _clean(check.detail))
     console.print(table)
-    return all(check.ok or not check.hard for check in checks)
+    ready = all(check.ok or not check.hard for check in checks)
+
+    sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
+    if not sbx_present:
+        console.print("[dim]sbx conformance skipped: no usable sbx binary[/]", highlight=False)
+        return ready
+    try:
+        report = run_conformance(
+            cli,
+            config.state_dir,
+            deep=deep,
+            template=config.sandbox.template,
+            progress=progress,
+        )
+    except SbxError as exc:
+        console.print(f"[yellow]sbx conformance suite failed to run:[/] {_clean(str(exc))}")
+        return ready
+    render_conformance(console, report)
+    # Drift is a loud warning, not a failure: the dependent code paths all
+    # probe-don't-assume at runtime, so runs may still work \u2014 but the verdict
+    # snapshot above is exactly what a bug report should include.
+    return ready

@@ -70,6 +70,24 @@ jobs:
         # Doctor exits 1 when tokens are missing; report but don't hide it.
         run: uv run sbxloop doctor || echo "::warning::doctor reported failures (expected when e2e token secrets are not configured)"
 
+      # The full sbx conformance suite against the real sbx binary: every
+      # field-learned assumption (secret visibility under exec, cp dir
+      # semantics, workspace mount discovery, ...) probed in a live scratch
+      # sandbox. Drift against the verdicts this codebase was built for is
+      # surfaced as a workflow warning — the release-gate question is
+      # tracked in #52.
+      - name: sbx conformance suite (doctor --deep)
+        if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+          COPILOT_GITHUB_TOKEN: ${{ secrets.E2E_COPILOT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.E2E_GH_TOKEN }}
+        run: |
+          uv run sbxloop doctor --deep | tee doctor-deep.out
+          if grep -q "sbx drift" doctor-deep.out; then
+            echo "::warning::sbx conformance drift detected — see the doctor --deep output above"
+          fi
+
       - name: Smoke run
         if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
         env:

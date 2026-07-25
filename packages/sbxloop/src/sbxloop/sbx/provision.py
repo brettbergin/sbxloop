@@ -30,6 +30,11 @@ from sbxloop.config import Config
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.conformance import (
+    PROBE_SECRET_ENV_VISIBILITY,
+    PROBE_WORKSPACE_MOUNT,
+    record_field_verdict,
+)
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.sandbox import ENV_FILE, EVENTS_DIR, JOBS_DIR, RESULTS_DIR, WORK_DIR, Sandbox
@@ -90,6 +95,25 @@ class Provisioner:
         self.bus = bus or EventBus()
         self.env = os.environ if env is None else env
         self.post_create = post_create
+        self._sbx_version: str | None = None
+        self._sbx_version_known = False
+
+    def _record_probe(self, probe_id: str, verdict: str, detail: str = "") -> None:
+        """Refresh the conformance cache from a field observation.
+
+        Provisioning already performs these checks for its own needs; feeding
+        the verdicts into the version-keyed cache keeps `doctor` fresh for
+        free. Best-effort: recording must never affect provisioning.
+        """
+        try:
+            if not self._sbx_version_known:
+                self._sbx_version = self.cli.version()
+                self._sbx_version_known = True
+            record_field_verdict(
+                self.config.state_dir, self._sbx_version, probe_id, verdict, detail
+            )
+        except Exception:
+            logger.debug("conformance verdict recording failed", exc_info=True)
 
     # -- spec construction -------------------------------------------------
 
@@ -249,6 +273,11 @@ class Provisioner:
             return
         env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
         result = sandbox.exec(["sh", "-lc", f'test -n "${{{env_name}}}"'])
+        self._record_probe(
+            PROBE_SECRET_ENV_VISIBILITY,
+            "visible-under-exec" if result.ok else "invisible-under-exec",
+            f"observed while provisioning {spec.name} ({env_name})",
+        )
         if result.ok:
             return
         # Auto-heal: fall back to the plain-env file for this sandbox. The
@@ -297,6 +326,11 @@ class Provisioner:
         finally:
             (workspace / marker).unlink(missing_ok=True)
         if not hit.endswith(f"/{marker}"):
+            self._record_probe(
+                PROBE_WORKSPACE_MOUNT,
+                "not-found",
+                f"observed while provisioning {sandbox.name}",
+            )
             self.bus.emit(
                 "sandbox.workspace_mount",
                 run_id,
@@ -306,6 +340,11 @@ class Provisioner:
             )
             return None
         mount_dir = hit[: -len(f"/{marker}")] or "/"
+        self._record_probe(
+            PROBE_WORKSPACE_MOUNT,
+            "discoverable",
+            f"workspace mounted at {mount_dir} (observed while provisioning {sandbox.name})",
+        )
         self.bus.emit(
             "sandbox.workspace_mount",
             run_id,
