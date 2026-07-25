@@ -6,10 +6,8 @@ github-ops sandbox (GH_TOKEN only) — otherwise ``pair.github`` is None and
 no GitHub capability exists anywhere in the run. The pair is a context
 manager whose
 exit stops and removes both sandboxes unless ``keep`` is set; a process-wide
-registry additionally cleans up on interpreter exit, and turns SIGINT/SIGTERM
-into the ordinary Python exceptions so cleanup happens by unwinding (context
-managers, the CLI's interrupt path, the atexit hook) — aborted runs do not
-leak microVMs, and no sandbox teardown ever runs inside a signal handler.
+registry additionally cleans up on interpreter exit and on SIGINT/SIGTERM,
+so aborted runs do not leak microVMs.
 """
 
 from __future__ import annotations
@@ -20,6 +18,7 @@ import logging
 import signal
 import threading
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -88,27 +87,43 @@ class SandboxPair:
 
 
 class CleanupRegistry:
-    """Process-wide safety net: cleans registered pairs on interpreter exit.
-
-    The signal handlers only convert SIGINT/SIGTERM into their ordinary
-    Python exceptions; the actual sandbox teardown happens by unwinding —
-    pair context managers, the CLI's interrupt path, and the atexit hook.
-    Tearing sandboxes down inside a signal handler would block Ctrl+C for
-    seconds of ``sbx`` subprocess work and re-enter on a second signal.
-    """
+    """Process-wide safety net: cleans registered pairs on exit and signals."""
 
     def __init__(self) -> None:
         self._pairs: list[SandboxPair] = []
         self._lock = threading.Lock()
-        self._atexit_installed = False
-        self._signals_installed = False
+        self._installed = False
+        self._atexit_registered = False
         self._previous: dict[int, Any] = {}
+        self._quiesce: Callable[[], None] | None = None
 
     def register(self, pair: SandboxPair) -> None:
         with self._lock:
             if pair not in self._pairs:
                 self._pairs.append(pair)
             self._install_handlers()
+
+    def install_handlers(self) -> None:
+        """Install the atexit hook and signal handlers now.
+
+        Signal handlers can only be installed from the main thread; call
+        this from it before handing the engine to a background thread
+        (the TUI does), or registration there would silently skip them —
+        and SIGTERM's default disposition kills the process without
+        running atexit, leaking the sandboxes.
+        """
+        with self._lock:
+            self._install_handlers()
+
+    def set_quiesce(self, fn: Callable[[], None] | None) -> None:
+        """Callback run before signal-triggered cleanup (None clears it).
+
+        Lets a driver stop the work that is still using the sandboxes —
+        the TUI signals its engine thread and joins it briefly — so
+        teardown does not race an engine mid-``sbx exec``. Best-effort:
+        a raising callback never blocks cleanup.
+        """
+        self._quiesce = fn
 
     def unregister(self, pair: SandboxPair) -> None:
         with self._lock:
@@ -129,32 +144,32 @@ class CleanupRegistry:
             except Exception:
                 logger.warning("cleanup failed for run %s", pair.run_id, exc_info=True)
 
-    def install_signal_handlers(self) -> None:
-        """Install the SIGINT/SIGTERM handlers (idempotent, main thread only).
-
-        ``register()`` installs them as a side effect, but only when it runs
-        on the main thread — the CLI drives runs on a worker thread in TUI
-        mode, so it calls this from the main thread before starting one.
-        """
-        with self._lock:
-            self._install_handlers()
-
     def _install_handlers(self) -> None:
-        if not self._atexit_installed:
-            self._atexit_installed = True
-            atexit.register(self.cleanup_all)
-        if self._signals_installed:
+        if self._installed:
             return
+        if not self._atexit_registered:
+            self._atexit_registered = True
+            atexit.register(self.cleanup_all)
         if threading.current_thread() is not threading.main_thread():
-            return  # signal handlers can only be installed from the main thread
-        self._signals_installed = True
+            # Signal handlers can only be installed from the main thread.
+            # Do NOT latch _installed here: a later register (or an explicit
+            # install_handlers) from the main thread must still install them.
+            return
+        self._installed = True
         for signum in (signal.SIGINT, signal.SIGTERM):
             # ValueError/OSError: not installable in this context (e.g. no tty)
             with contextlib.suppress(ValueError, OSError):
                 self._previous[signum] = signal.signal(signum, self._handle_signal)
 
     def _handle_signal(self, signum: int, frame: types.FrameType | None) -> None:
-        logger.info("signal %s received", signum)
+        logger.info("signal %s received; cleaning up sandboxes", signum)
+        quiesce = self._quiesce
+        if quiesce is not None:
+            try:
+                quiesce()
+            except Exception:
+                logger.warning("quiesce before signal cleanup failed", exc_info=True)
+        self.cleanup_all()
         previous = self._previous.get(signum)
         if callable(previous):
             previous(signum, frame)

@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS runs (
     updated_at REAL NOT NULL,
     workspace  TEXT,
     mounted    INTEGER NOT NULL DEFAULT 0,
-    kept_reason TEXT
+    kept_reason TEXT,
+    user_guidance TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -77,6 +78,10 @@ _RUNS_MIGRATIONS = (
     ("workspace", "ALTER TABLE runs ADD COLUMN workspace TEXT"),
     ("mounted", "ALTER TABLE runs ADD COLUMN mounted INTEGER NOT NULL DEFAULT 0"),
     ("kept_reason", "ALTER TABLE runs ADD COLUMN kept_reason TEXT"),
+    (
+        "user_guidance",
+        "ALTER TABLE runs ADD COLUMN user_guidance TEXT NOT NULL DEFAULT '[]'",
+    ),
 )
 
 
@@ -143,6 +148,31 @@ class StateStore:
         if cursor.rowcount == 0:
             raise StateError(f"unknown run {run_id}")
         self._conn.commit()
+
+    def append_run_guidance(self, run_id: str, text: str) -> None:
+        """Append one standing chat-guidance entry (a ``steer_run`` verdict)
+        to the run. Persisted so a resumed run re-applies it to its prompts."""
+        row = self._conn.execute(
+            "SELECT user_guidance FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StateError(f"unknown run {run_id}")
+        items = json.loads(row["user_guidance"] or "[]")
+        items.append(text)
+        self._conn.execute(
+            "UPDATE runs SET user_guidance = ?, updated_at = ? WHERE run_id = ?",
+            (json.dumps(items), time.time(), run_id),
+        )
+        self._conn.commit()
+
+    def get_run_guidance(self, run_id: str) -> list[str]:
+        row = self._conn.execute(
+            "SELECT user_guidance FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StateError(f"unknown run {run_id}")
+        items = json.loads(row["user_guidance"] or "[]")
+        return [str(item) for item in items]
 
     @staticmethod
     def _run_record(row: sqlite3.Row) -> RunRecord:
