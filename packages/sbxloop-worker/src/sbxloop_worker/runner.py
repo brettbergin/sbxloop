@@ -153,7 +153,11 @@ class JobRunner:
 
         assert self.job.op is not None
         writer.emit(EventTypes.GH_OP_START, op=self.job.op)
-        output = execute_op(self.job.op, self.job.params)
+
+        def progress(**data: object) -> None:
+            writer.emit(EventTypes.GH_OP_PROGRESS, op=self.job.op, **data)
+
+        output = execute_op(self.job.op, self.job.params, progress=progress)
         writer.emit(EventTypes.GH_OP_END, op=self.job.op)
         return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
 

@@ -39,14 +39,14 @@ class GithubOps:
         self.run_id = run_id
         self.timeout_s = timeout_s
 
-    def _op(self, op: str, params: dict[str, Any]) -> Any:
+    def _op(self, op: str, params: dict[str, Any], *, timeout_s: float | None = None) -> Any:
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
             kind="github.op",
             op=op,
             params=params,
-            timeout_s=self.timeout_s,
+            timeout_s=timeout_s if timeout_s is not None else self.timeout_s,
         )
         result = self.client.submit(job)
         if result.status != "ok":
@@ -138,3 +138,26 @@ class GithubOps:
         if body is not None:
             params["body"] = body
         return self._op("raw.api", params)
+
+    # Extra seconds of job timeout granted per file in a blob batch: the
+    # batch job makes one REST call per file, so the flat per-op timeout
+    # would starve large manifests.
+    BLOB_BATCH_TIMEOUT_PER_FILE_S = 2.0
+
+    def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
+        """Create git blobs for a manifest of {path, content_b64} entries in
+        one worker job; returns path -> blob sha."""
+        data = self._op(
+            "blobs.create_many",
+            {"repo": repo, "files": files},
+            timeout_s=self.timeout_s + self.BLOB_BATCH_TIMEOUT_PER_FILE_S * len(files),
+        )
+        blobs = data.get("blobs") if isinstance(data, dict) else None
+        if not isinstance(blobs, list):
+            raise GithubOpsError(f"blobs.create_many returned no blob list: {data!r}")
+        shas: dict[str, str] = {}
+        for blob in blobs:
+            if not isinstance(blob, dict) or not blob.get("path") or not blob.get("sha"):
+                raise GithubOpsError(f"blobs.create_many returned a malformed entry: {blob!r}")
+            shas[str(blob["path"])] = str(blob["sha"])
+        return shas
