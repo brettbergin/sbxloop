@@ -109,6 +109,36 @@ class TestBackendRegistry:
             backend.run_session(agent_job(), lambda *a, **k: None)  # type: ignore[arg-type,return-value]
 
 
+class TestCopilotEventHelpers:
+    """Pure helpers from the copilot backend (importable without the SDK)."""
+
+    def test_tool_args_prefers_glob_pattern(self) -> None:
+        from sbxloop_worker.backends.copilot import _tool_args
+
+        assert _tool_args({"pattern": "**/*.py"}) == "**/*.py"
+
+    def test_tool_error_reads_failure_message(self) -> None:
+        from types import SimpleNamespace
+
+        from sbxloop_worker.backends.copilot import _tool_error
+
+        # A failed ToolExecutionComplete: result is None, error carries the
+        # reason (the SDK documents `result` as success-only).
+        data = SimpleNamespace(
+            success=False,
+            result=None,
+            error=SimpleNamespace(message="permission denied", code=None),
+        )
+        assert _tool_error(data) == "permission denied"
+
+    def test_tool_error_none_when_absent(self) -> None:
+        from types import SimpleNamespace
+
+        from sbxloop_worker.backends.copilot import _tool_error
+
+        assert _tool_error(SimpleNamespace(success=True, result=None, error=None)) is None
+
+
 class TestEchoScriptEdgeCases:
     def test_script_entry_must_be_object(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

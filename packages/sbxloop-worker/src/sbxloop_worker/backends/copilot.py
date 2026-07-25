@@ -69,7 +69,7 @@ def _tool_args(arguments: Any) -> str | None:
     if arguments is None:
         return None
     if isinstance(arguments, dict):
-        for key in ("command", "cmd", "input", "query", "path"):
+        for key in ("command", "cmd", "input", "query", "pattern", "path"):
             value = arguments.get(key)
             if isinstance(value, str) and value.strip():
                 return value[:TOOL_ARGS_CLIP]
@@ -106,6 +106,20 @@ def _tool_output(data: Any) -> str | None:
     return content[-TOOL_OUTPUT_CLIP:]
 
 
+def _tool_error(data: Any) -> str | None:
+    """The failure reason from a ToolExecutionComplete, when present.
+
+    On failed executions the SDK leaves ``result`` unset (it is documented
+    as "tool execution result on success") and reports the reason in
+    ``error.message`` instead, so this is the only failure text available.
+    """
+    error = getattr(data, "error", None)
+    message = getattr(error, "message", None)
+    if not isinstance(message, str) or not message.strip():
+        return None
+    return message[-TOOL_OUTPUT_CLIP:]
+
+
 class CopilotBackend:
     name = "copilot"
 
@@ -129,9 +143,9 @@ class CopilotBackend:
 
         usage = Usage()
         final_text: list[str] = []
-        # tool_call_id -> tool name, so completion events can name the tool
-        # (the SDK's Complete event carries only the call id).
-        tool_names: dict[str, str] = {}
+        # tool_call_id -> (tool name, displayed args), so completion events
+        # can say what ran (the SDK's Complete event carries only the call id).
+        tool_calls: dict[str, tuple[str | None, str | None]] = {}
 
         def on_event(event: Any) -> None:
             nonlocal usage
@@ -150,23 +164,27 @@ class CopilotBackend:
             elif type_name.startswith("ToolExecutionStart"):
                 tool = getattr(data, "tool_name", None) or getattr(data, "toolName", None)
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
-                if tool and call_id:
-                    tool_names[str(call_id)] = str(tool)
+                args = _tool_args(getattr(data, "arguments", None))
+                if call_id:
+                    tool_calls[str(call_id)] = (str(tool) if tool else None, args)
                 emit(
                     EventTypes.AGENT_TOOL_START,
                     tool=tool,
                     tool_call_id=call_id,
-                    args=_tool_args(getattr(data, "arguments", None)),
+                    args=args,
                 )
             elif type_name.startswith("ToolExecutionComplete"):
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
+                tool, args = tool_calls.get(str(call_id), (None, None))
                 emit(
                     EventTypes.AGENT_TOOL_END,
                     tool_call_id=call_id,
-                    tool=tool_names.get(str(call_id)),
+                    tool=tool,
+                    args=args,
                     success=getattr(data, "success", None),
                     exit_code=_tool_exit_code(data),
                     output=_tool_output(data),
+                    error=_tool_error(data),
                 )
             elif type_name == "AssistantUsageData":
                 sample = Usage(
