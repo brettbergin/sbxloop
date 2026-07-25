@@ -20,11 +20,20 @@ class StubOps:
         self.raw_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.repo_get_calls: list[str] = []
         self.pr_kwargs: dict[str, Any] = {}
+        self.blob_batches: list[list[dict[str, str]]] = []
         self.blob_count = 0
 
     def repo_get(self, repo: str) -> dict[str, Any]:
         self.repo_get_calls.append(repo)
         return {"default_branch": "main"}
+
+    def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
+        self.blob_batches.append(files)
+        shas = {}
+        for entry in files:
+            self.blob_count += 1
+            shas[entry["path"]] = f"blob{self.blob_count}"
+        return shas
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
@@ -32,9 +41,6 @@ class StubOps:
             return {"object": {"sha": "base123"}}
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree"}}
-        if path.endswith("/git/blobs"):
-            self.blob_count += 1
-            return {"sha": f"blob{self.blob_count}"}
         if path.endswith("/git/trees"):
             return {"sha": "tree456"}
         if path.endswith("/git/commits"):
@@ -74,11 +80,11 @@ class TestDeliverWorkspace:
         assert ops.repo_get_calls == ["o/r"]
         assert ("GET", "/repos/o/r/git/ref/heads/main", None) in ops.raw_calls
 
-        # blobs are base64 (binary-safe); .git excluded
-        blob_bodies = [b for _, p, b in ops.raw_calls if p.endswith("/git/blobs")]
-        assert len(blob_bodies) == 2
-        assert all(b is not None and b["encoding"] == "base64" for b in blob_bodies)
-        contents = {base64.b64decode(b["content"]) for b in blob_bodies if b}
+        # all blobs ride ONE batched worker job (base64, binary-safe);
+        # .git excluded
+        (batch,) = ops.blob_batches
+        assert [e["path"] for e in batch] == ["hello.txt", "sub/logo.bin"]
+        contents = {base64.b64decode(e["content_b64"]) for e in batch}
         assert contents == {b"hi\n", b"\x00\x01\x02"}
 
         # one tree on top of the base tree, posix relative paths, mode 100644
@@ -204,21 +210,61 @@ class TestDeliverWorkspace:
                 source_dir=make_workspace(tmp_path),
             )
 
-    def test_missing_sha_in_response(self, tmp_path: Path) -> None:
-        class NoShaOps(StubOps):
-            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if path.endswith("/git/blobs"):
-                    return {"oops": True}
-                return super().raw(method, path, body)
+    def test_missing_blob_sha_names_file(self, tmp_path: Path) -> None:
+        class DroppingOps(StubOps):
+            def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
+                shas = super().blobs_create_many(repo, files)
+                shas.pop("sub/logo.bin")
+                return shas
 
-        with pytest.raises(DeliveryError, match="no sha"):
+        with pytest.raises(DeliveryError, match=r"no blob sha for: sub/logo\.bin"):
             deliver_workspace(
-                NoShaOps(),  # type: ignore[arg-type]
+                DroppingOps(),  # type: ignore[arg-type]
                 "o/r",
                 run_id="r1",
                 outcome="x",
                 source_dir=make_workspace(tmp_path),
             )
+
+    def test_large_manifest_chunks_by_payload_not_file_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """50 files stay O(1) jobs; chunk splits happen only on the byte cap,
+        and a single file over the cap still ships in its own chunk."""
+        import sbxloop.deliver as deliver_mod
+
+        root = tmp_path / "big"
+        root.mkdir()
+        for i in range(50):
+            (root / f"f{i:02}.txt").write_text("x" * 10)
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r1",
+            outcome="x",
+            source_dir=root,
+        )
+        assert len(ops.blob_batches) == 1
+        assert sum(len(batch) for batch in ops.blob_batches) == 50
+
+        # Cap of 40 base64 bytes: ~2 ten-byte files (16 b64 chars each) per
+        # chunk, and the 100-byte file exceeds the cap alone yet still ships.
+        (root / "huge.bin").write_bytes(b"y" * 100)
+        monkeypatch.setattr(deliver_mod, "BLOB_BATCH_MAX_B64_BYTES", 40)
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r2",
+            outcome="x",
+            source_dir=root,
+        )
+        assert len(ops.blob_batches) > 1
+        delivered = [e["path"] for batch in ops.blob_batches for e in batch]
+        assert len(delivered) == 51
+        assert "huge.bin" in delivered
+        assert all(len(batch) >= 1 for batch in ops.blob_batches)
 
     def test_long_outcome_clipped_in_title(self, tmp_path: Path) -> None:
         ops = StubOps()

@@ -671,14 +671,21 @@ dependencies = [
     { name = "typer" },
 ]
 
+[package.optional-dependencies]
+copilot = [
+    { name = "github-copilot-sdk" },
+]
+
 [package.metadata]
 requires-dist = [
+    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "rich", specifier = ">=13.7" },
     { name = "sbxloop-worker", editable = "packages/sbxloop-worker" },
     { name = "typer", specifier = ">=0.12" },
 ]
+provides-extras = ["copilot"]
 
 [[package]]
 name = "sbxloop-worker"

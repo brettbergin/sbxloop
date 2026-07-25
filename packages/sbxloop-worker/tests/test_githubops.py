@@ -135,6 +135,94 @@ class TestOpRegistry:
         with pytest.raises(GithubOpError, match="unknown github op"):
             execute_op("teleport.repo", {}, RecordingTransport())
 
+    def test_unknown_op_lists_progress_ops(self) -> None:
+        with pytest.raises(GithubOpError, match=r"blobs\.create_many"):
+            execute_op("teleport.repo", {}, RecordingTransport())
+
+
+class SequencedBlobTransport:
+    """Returns a distinct sha per call; can be told to fail on one call."""
+
+    def __init__(self, fail_on_call: int | None = None, no_sha_on_call: int | None = None) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.fail_on_call = fail_on_call
+        self.no_sha_on_call = no_sha_on_call
+
+    def request(
+        self, method: str, path: str, body: dict[str, Any] | None = None
+    ) -> dict[str, Any] | list[Any]:
+        self.calls.append((method, path, body))
+        n = len(self.calls)
+        if n == self.fail_on_call:
+            raise GithubOpError(f"POST {path} -> HTTP 502: bad gateway")
+        if n == self.no_sha_on_call:
+            return {"message": "no sha here"}
+        return {"sha": f"sha{n}"}
+
+
+def blob_manifest(count: int) -> list[dict[str, str]]:
+    return [
+        {"path": f"f{i}.txt", "content_b64": base64.b64encode(f"c{i}".encode()).decode()}
+        for i in range(count)
+    ]
+
+
+class TestBlobsCreateMany:
+    def test_one_rest_call_per_file_shas_in_order(self) -> None:
+        t = SequencedBlobTransport()
+        out = execute_op("blobs.create_many", {"repo": "o/r", "files": blob_manifest(3)}, t)
+        assert out == {
+            "blobs": [
+                {"path": "f0.txt", "sha": "sha1"},
+                {"path": "f1.txt", "sha": "sha2"},
+                {"path": "f2.txt", "sha": "sha3"},
+            ]
+        }
+        assert [(m, p) for m, p, _ in t.calls] == [("POST", "/repos/o/r/git/blobs")] * 3
+        assert all(b is not None and b["encoding"] == "base64" for _, _, b in t.calls)
+
+    def test_progress_every_n_and_final(self) -> None:
+        seen: list[dict[str, Any]] = []
+        execute_op(
+            "blobs.create_many",
+            {"repo": "o/r", "files": blob_manifest(23)},
+            SequencedBlobTransport(),
+            progress=lambda **data: seen.append(data),
+        )
+        assert seen == [
+            {"done": 10, "total": 23},
+            {"done": 20, "total": 23},
+            {"done": 23, "total": 23},
+        ]
+
+    def test_transport_failure_names_file(self) -> None:
+        with pytest.raises(GithubOpError, match=r"'f1\.txt' \(file 2/3\)"):
+            execute_op(
+                "blobs.create_many",
+                {"repo": "o/r", "files": blob_manifest(3)},
+                SequencedBlobTransport(fail_on_call=2),
+            )
+
+    def test_missing_sha_names_file(self) -> None:
+        with pytest.raises(GithubOpError, match=r"no sha for blob 'f2\.txt'"):
+            execute_op(
+                "blobs.create_many",
+                {"repo": "o/r", "files": blob_manifest(3)},
+                SequencedBlobTransport(no_sha_on_call=3),
+            )
+
+    def test_malformed_entry_rejected(self) -> None:
+        with pytest.raises(GithubOpError, match=r"files\[1\]"):
+            execute_op(
+                "blobs.create_many",
+                {"repo": "o/r", "files": [blob_manifest(1)[0], {"path": "x"}]},
+                SequencedBlobTransport(),
+            )
+
+    def test_empty_manifest_rejected(self) -> None:
+        with pytest.raises(GithubOpError, match="missing required params: files"):
+            execute_op("blobs.create_many", {"repo": "o/r", "files": []}, SequencedBlobTransport())
+
 
 class TestGhCliTransport:
     @pytest.fixture
@@ -270,6 +358,36 @@ class TestRunnerIntegration:
         types = [json.loads(line)["type"] for line in lines]
         assert EventTypes.GH_OP_START in types
         assert EventTypes.GH_OP_END in types
+
+    def test_blob_batch_emits_progress_events(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """blobs.create_many streams gh.op_progress through the runner."""
+        from sbxloop_worker.protocol import EventTypes, JobRequest
+        from sbxloop_worker.runner import JobRunner
+
+        gh = tmp_path / "gh"
+        gh.write_text('#!/bin/sh\necho \'{"sha": "s"}\'\n')
+        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+        monkeypatch.setenv("PATH", str(tmp_path), prepend=":")
+
+        job = JobRequest(
+            job_id="j10",
+            run_id="r1",
+            kind="github.op",
+            op="blobs.create_many",
+            params={"repo": "o/r", "files": blob_manifest(10)},
+        )
+        result = JobRunner(
+            job,
+            events_path=tmp_path / "e.jsonl",
+            result_path=tmp_path / "r.json",
+            heartbeat_s=0,
+        ).run()
+        assert result.status == "ok"
+        events = [json.loads(line) for line in (tmp_path / "e.jsonl").read_text().splitlines()]
+        progress = [e["data"] for e in events if e["type"] == EventTypes.GH_OP_PROGRESS]
+        assert progress == [{"op": "blobs.create_many", "done": 10, "total": 10}]
 
 
 if sys.platform == "win32":  # pragma: no cover

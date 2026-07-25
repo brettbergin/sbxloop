@@ -92,12 +92,25 @@ class CleanupRegistry:
         self._pairs: list[SandboxPair] = []
         self._lock = threading.Lock()
         self._installed = False
+        self._atexit_registered = False
         self._previous: dict[int, Any] = {}
 
     def register(self, pair: SandboxPair) -> None:
         with self._lock:
             if pair not in self._pairs:
                 self._pairs.append(pair)
+            self._install_handlers()
+
+    def install_handlers(self) -> None:
+        """Install the atexit hook and signal handlers now.
+
+        Signal handlers can only be installed from the main thread; call
+        this from it before handing the engine to a background thread
+        (the TUI does), or registration there would silently skip them —
+        and SIGTERM's default disposition kills the process without
+        running atexit, leaking the sandboxes.
+        """
+        with self._lock:
             self._install_handlers()
 
     def unregister(self, pair: SandboxPair) -> None:
@@ -117,10 +130,15 @@ class CleanupRegistry:
     def _install_handlers(self) -> None:
         if self._installed:
             return
-        self._installed = True
-        atexit.register(self.cleanup_all)
+        if not self._atexit_registered:
+            self._atexit_registered = True
+            atexit.register(self.cleanup_all)
         if threading.current_thread() is not threading.main_thread():
-            return  # signal handlers can only be installed from the main thread
+            # Signal handlers can only be installed from the main thread.
+            # Do NOT latch _installed here: a later register (or an explicit
+            # install_handlers) from the main thread must still install them.
+            return
+        self._installed = True
         for signum in (signal.SIGINT, signal.SIGTERM):
             # ValueError/OSError: not installable in this context (e.g. no tty)
             with contextlib.suppress(ValueError, OSError):
