@@ -80,12 +80,47 @@ def test_registry_cleanup_all(fake_sbx: FakeSbx, tmp_path: Path) -> None:
     assert pair not in cleanup_registry._pairs
 
 
+def test_cleanup_all_leaves_kept_pairs_alive(fake_sbx: FakeSbx, tmp_path: Path) -> None:
+    """--keep-sandboxes pairs survive aborts too: cleanup_all only drops
+    them from the registry (their kept marker is already in the run DB)."""
+    pair = make_pair(fake_sbx, tmp_path, keep=True)
+    cleanup_registry.register(pair)
+    cleanup_registry.cleanup_all()
+    assert not gone(fake_sbx, "sbxloop-r1-agent")
+    assert not gone(fake_sbx, "sbxloop-r1-github")
+    assert pair not in cleanup_registry._pairs
+
+
 def test_signal_handler_cleans_and_reraises(fake_sbx: FakeSbx, tmp_path: Path) -> None:
     pair = make_pair(fake_sbx, tmp_path)
     cleanup_registry.register(pair)
     cleanup_registry._previous[signal.SIGINT] = None
     with pytest.raises(KeyboardInterrupt):
         cleanup_registry._handle_signal(signal.SIGINT, None)
+    assert gone(fake_sbx, "sbxloop-r1-agent")
+
+
+def test_signal_handler_quiesces_before_cleanup(fake_sbx: FakeSbx, tmp_path: Path) -> None:
+    # The driver's quiesce callback (the TUI signals + joins its engine
+    # thread) must run BEFORE the pairs are torn down, and a raising
+    # callback must never block cleanup.
+    pair = make_pair(fake_sbx, tmp_path)
+    cleanup_registry.register(pair)
+    cleanup_registry._previous[signal.SIGINT] = None
+    order: list[str] = []
+
+    def quiesce() -> None:
+        order.append("quiesce")
+        assert not gone(fake_sbx, "sbxloop-r1-agent")  # sandboxes still alive
+        raise RuntimeError("quiesce hiccup")  # contained, never blocks cleanup
+
+    cleanup_registry.set_quiesce(quiesce)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            cleanup_registry._handle_signal(signal.SIGINT, None)
+    finally:
+        cleanup_registry.set_quiesce(None)
+    assert order == ["quiesce"]
     assert gone(fake_sbx, "sbxloop-r1-agent")
 
 
@@ -202,7 +237,10 @@ def test_tui_run_sigterm_removes_both_sandboxes(fake_sbx: FakeSbx, tmp_path: Pat
         state = None
         while time.monotonic() < deadline:
             state = _latest_run_state(db)
-            if state not in (None, "provisioning") or proc.poll() is not None:
+            # "created" precedes "provisioning": a fast poll can sample the
+            # DB between create_run and the provisioning flip, so wait
+            # through both pre-decompose states.
+            if state not in (None, "created", "provisioning") or proc.poll() is not None:
                 break
             time.sleep(0.2)
         assert proc.poll() is None, f"run exited early:\n{log_path.read_text()}"

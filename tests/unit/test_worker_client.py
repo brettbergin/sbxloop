@@ -74,6 +74,25 @@ class TestStreamTransport:
         assert (fs / "home/agent/.sbxloop/results/j1.json").is_file()
         assert (fs / "home/agent/.sbxloop/events/j1.jsonl").is_file()
 
+    def test_submit_agent_name_stamps_agent_events(self, sandbox: Sandbox) -> None:
+        """submit(agent=...) attributes that job's agent.* events to the
+        phase persona (the transcript header shows who is speaking); worker
+        lifecycle events stay unattributed, and the mapping is dropped once
+        the job completes."""
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+
+        client = make_client(sandbox, bus)
+        result = client.submit(agent_job(), agent="planner")
+
+        assert result.status == "ok"
+        messages = [e for e in seen if e.type == EventTypes.AGENT_MESSAGE]
+        assert messages and all(e.data["agent"] == "planner" for e in messages)
+        starts = [e for e in seen if e.type == EventTypes.WORKER_START]
+        assert starts and "agent" not in starts[0].data
+        assert client._job_agents == {}
+
     def test_shell_check_job(self, sandbox: Sandbox) -> None:
         job = JobRequest(
             job_id="j2",

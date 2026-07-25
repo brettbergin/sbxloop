@@ -128,6 +128,44 @@ class TestHappyPath:
         # sandboxes cleaned up
         assert harness.sandboxes_left() == []
 
+    def test_full_roster_announced_before_first_task_runs(self, harness: Harness) -> None:
+        """Every decomposed task is announced (with title) before any task
+        starts, so UIs can show the whole plan as waiting up front instead
+        of revealing rows one at a time (#63)."""
+        harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), *HAPPY_TASK, *HAPPY_TASK])
+        result = harness.engine().start("two tasks up front")
+        assert result.succeeded
+
+        first_start = next(
+            i for i, e in enumerate(harness.events) if e.type == HostEventTypes.TASK_START
+        )
+        roster = [
+            (e.data["task_id"], e.data["state"])
+            for e in harness.events[:first_start]
+            if e.type == HostEventTypes.TASK_STATE and e.data.get("title")
+        ]
+        assert roster == [("t1", "pending"), ("t2", "pending")]
+
+    def test_agent_messages_carry_phase_persona(self, harness: Harness) -> None:
+        """Every agent.message names the persona that produced it, so the
+        transcript header says WHO responded (planner, executor, ...), not a
+        generic "agent". Echo only emits agent.message for entries with
+        "text", so give each scripted phase reply some."""
+        harness.script(
+            [
+                {**taskgraph(task("t1")), "text": "breaking it down"},
+                {**PLAN, "text": "here is my plan"},
+                EXECUTE,
+                {**PASS, "text": "work checks out"},
+                {**ACCEPT, "text": "criteria met"},
+            ]
+        )
+        result = harness.engine().start("build the feature")
+
+        assert result.succeeded
+        speakers = [e.data.get("agent") for e in harness.events if e.type == "agent.message"]
+        assert speakers == ["decomposer", "planner", "executor", "scrutinizer", "validator"]
+
     def test_default_run_is_github_less(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -329,6 +367,31 @@ class TestBudgetsAndCancel:
         assert engine.store.get_run("rcancel").state == "cancelled"
         with pytest.raises(StateError, match="only unfinished runs"):
             engine.resume("rcancel")
+
+    @pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
+    def test_cancel_refuses_terminal_runs(self, harness: Harness, state: str) -> None:
+        # Rewriting a finished run to cancelled would corrupt history.
+        engine = harness.engine()
+        engine.store.create_run("rterm", "x")
+        engine.store.set_run_state("rterm", state)  # type: ignore[arg-type]
+        with pytest.raises(StateError, match="nothing to cancel"):
+            engine.cancel("rterm")
+        assert engine.store.get_run("rterm").state == state
+
+    def test_request_cancel_stops_at_phase_boundary_and_stays_resumable(
+        self, harness: Harness
+    ) -> None:
+        # The in-process cancel (TUI Ctrl-C) stops the engine at the next
+        # phase boundary without marking the run cancelled — it must remain
+        # resumable, exactly like any other interrupted run.
+        harness.script([taskgraph(task("t1"))])
+        engine = harness.engine()
+        engine.request_cancel()
+        with pytest.raises(StateError, match="interrupted"):
+            engine.start("interrupt me")
+        run_id = engine.store.list_runs()[0].run_id
+        assert engine.store.get_run(run_id).state == "running"
+        assert harness.sandboxes_left() == []  # pair context cleaned up
 
 
 class TestResume:
@@ -976,3 +1039,168 @@ class TestGithubReporting:
         result = harness.engine(github={"repo": "o/r"}).start("quiet")
         assert result.state == "completed"
         assert self.RecordingOps.instances == []
+
+
+class TestInteractiveChat:
+    """post_user_message → STEER at the next phase boundary → applied verdict."""
+
+    STEER_CONTINUE: ClassVar[dict[str, Any]] = {
+        "json": {"reply": "all on track", "action": "continue"}
+    }
+    STEER_RUN: ClassVar[dict[str, Any]] = {
+        "json": {
+            "reply": "switching direction",
+            "action": "steer_run",
+            "guidance": "use postgres everywhere",
+        }
+    }
+    STEER_TASK: ClassVar[dict[str, Any]] = {
+        "json": {
+            "reply": "re-planning this task",
+            "action": "steer_task",
+            "guidance": "write it in Go instead",
+        }
+    }
+
+    def test_continue_replies_without_changing_course(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), self.STEER_CONTINUE, *HAPPY_TASK])
+        engine = harness.engine()
+        message_id = engine.post_user_message("how is it going?")
+        result = engine.start("build the feature")
+
+        assert result.state == "completed"
+        assert result.tasks[0].revisions == 0
+        assert result.tasks[0].replans == 0
+        chat_message = next(e for e in harness.events if e.type == "chat.message")
+        assert chat_message.data["text"] == "how is it going?"
+        assert chat_message.data["message_id"] == message_id
+        reply = next(e for e in harness.events if e.type == "chat.reply")
+        assert reply.data["reply"] == "all on track"
+        assert reply.data["action"] == "continue"
+        assert reply.data["message_id"] == message_id
+        assert "chat.action" not in harness.event_types()
+        attempts = engine.store.phase_attempts(result.run_id)
+        steer = [a for a in attempts if a["phase"] == "steer"]
+        assert len(steer) == 1
+        assert steer[0]["status"] == "continue"
+        assert steer[0]["task_id"] == "t1"
+
+    def test_steer_run_persists_standing_guidance(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), self.STEER_RUN, *HAPPY_TASK])
+        engine = harness.engine()
+        engine.post_user_message("please use postgres")
+        result = engine.start("build the feature")
+
+        assert result.state == "completed"
+        assert engine.store.get_run_guidance(result.run_id) == ["use postgres everywhere"]
+        action = next(e for e in harness.events if e.type == "chat.action")
+        assert action.data["action"] == "steer_run"
+        assert "use postgres everywhere" in action.data["message"]
+        # chat events are persisted like everything else
+        persisted = [
+            event.type
+            for _, event in engine.store.events(result.run_id)
+            if event.type.startswith("chat.")
+        ]
+        assert persisted == ["chat.message", "chat.action", "chat.reply"]
+
+    def test_steer_task_replans_without_spending_budgets(self, harness: Harness) -> None:
+        # Message absorbed at the first boundary (task in `planning`): the
+        # steer verdict re-plans it with the guidance as feedback.
+        harness.script([taskgraph(task("t1")), self.STEER_TASK, *HAPPY_TASK])
+        engine = harness.engine()
+        engine.post_user_message("do it in Go")
+        result = engine.start("build the feature")
+
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 0
+        assert result.tasks[0].revisions == 0
+        action = next(e for e in harness.events if e.type == "chat.action")
+        assert action.data["action"] == "steer_task"
+        assert action.data["task_id"] == "t1"
+        attempts = engine.store.phase_attempts(result.run_id)
+        steer = next(a for a in attempts if a["phase"] == "steer")
+        assert steer["status"] == "steer_task"
+        output = json.loads(steer["output_json"])
+        assert output["applied"] == "steer_task"
+        assert output["message"] == "do it in Go"
+
+    def test_steer_failure_never_fails_the_run(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), {"fail": "backend exploded"}, *HAPPY_TASK])
+        engine = harness.engine()
+        engine.post_user_message("hello?")
+        result = engine.start("build the feature")
+
+        assert result.state == "completed"
+        reply = next(e for e in harness.events if e.type == "chat.reply")
+        assert "error" in reply.data
+        attempts = engine.store.phase_attempts(result.run_id)
+        steer = next(a for a in attempts if a["phase"] == "steer")
+        assert steer["status"] == "error"
+
+    def test_invalid_steer_verdict_is_retried(self, harness: Harness) -> None:
+        # steer_task without guidance fails SteerVerdict validation; the
+        # retry consumes the next script entry.
+        bad = {"json": {"reply": "ok", "action": "steer_task", "guidance": ""}}
+        harness.script([taskgraph(task("t1")), bad, self.STEER_CONTINUE, *HAPPY_TASK])
+        engine = harness.engine()
+        engine.post_user_message("tweak it")
+        result = engine.start("build the feature")
+
+        assert result.state == "completed"
+        reply = next(e for e in harness.events if e.type == "chat.reply")
+        assert reply.data["action"] == "continue"
+
+    def test_multiple_messages_processed_fifo(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), self.STEER_CONTINUE, self.STEER_RUN, *HAPPY_TASK])
+        engine = harness.engine()
+        first = engine.post_user_message("first")
+        second = engine.post_user_message("second")
+        result = engine.start("build the feature")
+
+        assert result.state == "completed"
+        messages = [e for e in harness.events if e.type == "chat.message"]
+        assert [m.data["message_id"] for m in messages] == [first, second]
+        assert engine.store.get_run_guidance(result.run_id) == ["use postgres everywhere"]
+
+    def test_resume_replays_persisted_guidance_into_prompts(self, harness: Harness) -> None:
+        from sbxloop.engine.phases import PhaseRunner
+
+        # Run 1: steer_run lands guidance, then the task fails its only
+        # scrutiny (max_revisions=0) and the run fails — a resumable state.
+        harness.script([taskgraph(task("t1")), self.STEER_RUN, PLAN, EXECUTE, REVISE])
+        engine = harness.engine(budgets={"max_revisions_per_task": 0})
+        engine.post_user_message("use postgres")
+        result = engine.start("build the feature")
+        assert result.state == "failed"
+        assert engine.store.get_run_guidance(result.run_id) == ["use postgres everywhere"]
+
+        # Run 2 (resume): the fresh PhaseRunner must be rehydrated with the
+        # persisted guidance before any phase runs.
+        captured: dict[str, PhaseRunner] = {}
+        original_init = PhaseRunner.__init__
+
+        def spy_init(self: PhaseRunner, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            captured["phases"] = self
+
+        harness.monkeypatch.setattr(PhaseRunner, "__init__", spy_init)
+        harness.script([])
+        resumed = harness.engine(budgets={"max_revisions_per_task": 0}).resume(result.run_id)
+        assert resumed.state == "failed"  # all tasks already terminal
+        assert captured["phases"].user_guidance == ["use postgres everywhere"]
+
+    def test_steer_task_with_no_live_task_downgrades_to_steer_run(self, harness: Harness) -> None:
+        from sbxloop.engine.model import SteerVerdict
+        from sbxloop.engine.phases import PhaseRunner
+
+        engine = harness.engine()
+        engine.store.create_run("r1chat", "outcome", "{}")
+        phases = PhaseRunner(None, engine.config, "r1chat", "outcome")  # type: ignore[arg-type]
+        verdict = SteerVerdict(reply="ok", action="steer_task", guidance="switch approach")
+
+        applied = engine._apply_steer("r1chat", None, verdict, phases)
+
+        assert applied == "steer_run"
+        assert engine.store.get_run_guidance("r1chat") == ["switch approach"]
+        assert phases.user_guidance == ["switch approach"]

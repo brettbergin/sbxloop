@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from pydantic import ValidationError
 
@@ -34,8 +36,10 @@ from sbxloop.config import Config, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
+    TERMINAL_RUN_STATES,
     RunResult,
     RunState,
+    SteerVerdict,
     TaskRecord,
     TaskState,
     scan_artifacts,
@@ -47,11 +51,12 @@ from sbxloop.errors import (
     SbxError,
     SdxloopError,
     StateError,
+    WorkerError,
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.reporter import GithubReporterHook
-from sbxloop.ids import new_run_id
+from sbxloop.ids import new_message_id, new_run_id
 from sbxloop.policy import EgressGranter
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
@@ -59,6 +64,13 @@ from sbxloop.sbx.provision import Provisioner
 from sbxloop.worker.client import WorkerClient
 
 logger = logging.getLogger(__name__)
+
+
+class ChatMessage(NamedTuple):
+    """One queued interactive chat message, waiting for a phase boundary."""
+
+    message_id: str
+    text: str
 
 
 class LoopEngine:
@@ -94,9 +106,19 @@ class LoopEngine:
         self._worker_python_from_config = worker_python is None
         self._install_workers_from_config = install_workers is None
         self.clock = clock
+        # In-process cancellation (Ctrl-C in the TUI): checked at the same
+        # phase boundaries as the store's cancelled state, but leaves the
+        # persisted run state alone so the run stays resumable.
+        self._cancel_event = threading.Event()
         # Latest sandbox.resources sample per sandbox role, fed by the bus;
         # consulted for the disk guardrail and the harvest-truncation note.
         self._last_resources: dict[str, dict[str, object]] = {}
+        # Interactive chat mailbox: messages posted from any thread (the CLI
+        # chat form) queue here and are absorbed at phase boundaries — the
+        # same boundaries cancellation uses. All bus/store activity for a
+        # message happens on the engine thread when it is drained.
+        self._chat_queue: queue.SimpleQueue[ChatMessage] = queue.SimpleQueue()
+        self._steer_attempts = 0
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
@@ -133,8 +155,28 @@ class LoopEngine:
         return self._drive(run_id, run.outcome, workspace=run.workspace)
 
     def cancel(self, run_id: str) -> None:
-        self.store.get_run(run_id)  # raises for unknown runs
+        run = self.store.get_run(run_id)  # raises for unknown runs
+        if run.state in TERMINAL_RUN_STATES:
+            # Rewriting a finished run to cancelled would corrupt history
+            # (and `status` output); only in-flight runs are cancellable.
+            raise StateError(f"run {run_id} is already {run.state}; nothing to cancel")
         self.store.set_run_state(run_id, "cancelled")
+
+    def request_cancel(self) -> None:
+        """Ask a running engine (from another thread) to stop at the next
+        phase boundary. In-process only: unlike ``cancel`` it does not touch
+        the persisted run state, so the interrupted run remains resumable."""
+        self._cancel_event.set()
+
+    def post_user_message(self, text: str) -> str:
+        """Queue an interactive chat message for the run this engine is
+        driving. Thread-safe; returns the message id. The agent pauses at
+        the next phase boundary, answers over a read-only STEER session, and
+        applies any course change the reply calls for.
+        """
+        message = ChatMessage(new_message_id(), text)
+        self._chat_queue.put(message)
+        return message.message_id
 
     # -- resume config rehydration ------------------------------------------
 
@@ -271,6 +313,10 @@ class LoopEngine:
                         phases = PhaseRunner(
                             agent, self.config, run_id, outcome, workdir=pair.agent_workdir
                         )
+                        # Replay persisted chat guidance (steer_run verdicts)
+                        # so a resumed run keeps the direction the user set.
+                        for guidance in self.store.get_run_guidance(run_id):
+                            phases.add_guidance(guidance)
                         granter = EgressGranter(
                             self.sbx, self.config, self.bus, run_id, pair.agent.name
                         )
@@ -507,6 +553,20 @@ class LoopEngine:
             tasks = self.store.get_tasks(run_id)
 
         self._set_run_state(run_id, "running")
+        # Announce the full roster up front (with titles) so UIs can show
+        # every task waiting immediately, instead of revealing rows one at a
+        # time as each prior task finishes. Also runs on resume, where it
+        # restores the table with each task's persisted state.
+        for task in tasks:
+            self.bus.emit(
+                HostEventTypes.TASK_STATE,
+                run_id,
+                task_id=task.spec.id,
+                title=task.spec.title,
+                state=task.state,
+                revisions=task.revisions,
+                replans=task.replans,
+            )
         failed_ids: set[str] = {t.spec.id for t in tasks if t.state == "failed"}
         skipped_ids: set[str] = {t.spec.id for t in tasks if t.state == "skipped"}
         for task in tasks:
@@ -524,6 +584,9 @@ class LoopEngine:
             if task.state == "failed":
                 failed_ids.add(task.spec.id)
 
+        # Final drain: messages that arrived during the last phase still get
+        # answered (as steer_run — there is no task left to steer).
+        self._process_chat(run_id, phases, None)
         self._set_run_state(run_id, "finalizing")
         return "failed" if failed_ids or skipped_ids else "completed"
 
@@ -555,6 +618,11 @@ class LoopEngine:
 
         while not task.terminal:
             self._check_cancelled_and_clock(run_id, deadline)
+            # Interactive chat: absorb queued user messages at the same
+            # boundary cancellation uses — the agent pauses here, replies,
+            # and any course change (re-plan, standing guidance) lands
+            # before the next phase runs.
+            self._process_chat(run_id, phases, task)
             abort_reason = self._resource_abort_reason()
             if abort_reason:
                 # Fail the task with a diagnosis instead of letting the next
@@ -760,6 +828,109 @@ class LoopEngine:
             return
         self._set_task_state(run_id, task, "failed")
 
+    # -- interactive chat --------------------------------------------------
+
+    def _process_chat(self, run_id: str, phases: PhaseRunner, task: TaskRecord | None) -> None:
+        """Drain queued user messages: one STEER session each, FIFO.
+
+        A failed steer never fails the run — the error rides on the
+        ``chat.reply`` event and the message is dropped; real infrastructure
+        breakage will surface loudly in the next phase anyway.
+        """
+        while True:
+            try:
+                message = self._chat_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.bus.emit(
+                HostEventTypes.CHAT_MESSAGE,
+                run_id,
+                message_id=message.message_id,
+                text=message.text,
+            )
+            self._steer_attempts += 1
+            started = time.time()
+            try:
+                verdict = phases.steer(message.text, tasks=self.store.get_tasks(run_id), task=task)
+            except WorkerError as exc:
+                logger.warning("steer failed for run %s", run_id, exc_info=True)
+                self.store.record_phase(
+                    run_id,
+                    "steer",
+                    task_id=task.spec.id if task else None,
+                    attempt=self._steer_attempts,
+                    status="error",
+                    output_json=json.dumps({"message": message.text, "error": str(exc)}),
+                    started_at=started,
+                )
+                self.bus.emit(
+                    HostEventTypes.CHAT_REPLY,
+                    run_id,
+                    message_id=message.message_id,
+                    error=str(exc),
+                )
+                continue
+            action = self._apply_steer(run_id, task, verdict, phases)
+            self.store.record_phase(
+                run_id,
+                "steer",
+                task_id=task.spec.id if task else None,
+                attempt=self._steer_attempts,
+                status=action,
+                output_json=json.dumps(
+                    {"message": message.text} | verdict.model_dump() | {"applied": action}
+                ),
+                started_at=started,
+            )
+            self.bus.emit(
+                HostEventTypes.CHAT_REPLY,
+                run_id,
+                message_id=message.message_id,
+                reply=verdict.reply,
+                action=action,
+            )
+
+    def _apply_steer(
+        self,
+        run_id: str,
+        task: TaskRecord | None,
+        verdict: SteerVerdict,
+        phases: PhaseRunner,
+    ) -> str:
+        """Apply a steer verdict's course change; returns the action actually
+        applied (``steer_task`` downgrades to ``steer_run`` when no task is
+        live to steer)."""
+        action = verdict.action
+        if action == "steer_task" and (task is None or task.terminal):
+            action = "steer_run"
+        if action == "steer_task":
+            assert task is not None
+            # User direction, not a failure: the task re-plans with the
+            # guidance as feedback, and neither budget counter is spent.
+            task.last_feedback = f"user steering (must be honored): {verdict.guidance}"
+            task.plan = None
+            task.revisions = 0
+            self._set_task_state(run_id, task, "planning")
+            self.bus.emit(
+                HostEventTypes.CHAT_ACTION,
+                run_id,
+                task_id=task.spec.id,
+                action=action,
+                guidance=verdict.guidance,
+                message=f"user steering: re-planning task {task.spec.id} — {verdict.guidance}",
+            )
+        elif action == "steer_run":
+            self.store.append_run_guidance(run_id, verdict.guidance)
+            phases.add_guidance(verdict.guidance)
+            self.bus.emit(
+                HostEventTypes.CHAT_ACTION,
+                run_id,
+                action=action,
+                guidance=verdict.guidance,
+                message=f"user steering: standing guidance added — {verdict.guidance}",
+            )
+        return action
+
     # -- bookkeeping -------------------------------------------------------
 
     def _resource_abort_reason(self) -> str | None:
@@ -775,6 +946,8 @@ class LoopEngine:
         return None
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
+        if self._cancel_event.is_set():
+            raise StateError(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
         if self.store.get_run(run_id).state == "cancelled":
             raise StateError(f"run {run_id} was cancelled")
         if self.clock() > deadline:

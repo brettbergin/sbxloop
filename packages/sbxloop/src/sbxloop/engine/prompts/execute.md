@@ -48,6 +48,13 @@ $expected_artifacts
 
 $feedback
 
+## Standing user guidance
+
+The user can steer the run over live chat; these instructions are in effect
+for all remaining work and your changes must honor them:
+
+$user_guidance
+
 ## When you are done
 
 Finish with a short summary of what you changed, listing the files you

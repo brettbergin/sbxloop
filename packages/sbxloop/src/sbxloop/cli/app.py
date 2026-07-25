@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -19,15 +21,16 @@ from rich.tree import Tree
 
 import sbxloop
 from sbxloop.cli.doctor import run_doctor
-from sbxloop.cli.tui import Dashboard, format_event, plain_printer, render_event
+from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import RunResult, artifacts_dir, scan_artifacts
+from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
@@ -88,7 +91,40 @@ def _store(config: Config) -> StateStore:
     return StateStore(config.state_dir / "state.db")
 
 
-def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
+# How long a Ctrl-C waits for the engine thread to reach a phase boundary
+# and unwind before sandbox cleanup proceeds regardless.
+_INTERRUPT_JOIN_S = 10.0
+
+
+def _exit_interrupted(run_id: str | None) -> NoReturn:
+    """Finish a Ctrl+C cleanly: exit 130 with a resume hint, no traceback.
+
+    Runs after the engine was quiesced; the registry's signal handler
+    normally tore the sandboxes down already, and the ``cleanup_all`` here
+    covers environments where the handlers could not install. The run's
+    persisted state is untouched (interrupted states are all resumable),
+    so `sbxloop resume` picks the run back up with fresh sandboxes. A
+    second Ctrl+C during teardown force-quits and leaves any remaining
+    sandboxes to `sbxloop sandbox prune`.
+    """
+    console.print("\n[bold yellow]interrupted[/] — removing sandboxes (Ctrl+C again to force quit)")
+    try:
+        cleanup_registry.cleanup_all()
+    except KeyboardInterrupt:
+        console.print(
+            "[bold red]force quit[/] — sandboxes may be left behind; "
+            "clean up with [cyan]sbxloop sandbox prune --force[/]"
+        )
+        # atexit would re-enter the same blocking cleanup; skip it.
+        os._exit(130)
+    if run_id is not None:
+        console.print(
+            f"run [bold cyan]{run_id}[/] interrupted — resume with [cyan]sbxloop resume {run_id}[/]"
+        )
+    raise typer.Exit(130)
+
+
+def _drive_with_ui(engine: LoopEngine, *, tui: bool, chat: bool = True, action: Any) -> RunResult:
     """Run start/resume with the scrollback transcript + pinned status, or
     plain event logs (--no-tui).
 
@@ -98,14 +134,41 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     the bottom is redrawn in place. Events arrive on the engine thread but
     every terminal write happens here on the main thread, via a queue —
     ordering stays deterministic and rich's Live never interleaves.
+
+    With ``chat`` on (and stdin a TTY), the user can type messages to the
+    running agent: the TUI captures keystrokes in cbreak mode and renders
+    the input line inside the pinned panel; --no-tui falls back to plain
+    line input. Messages queue on the engine and are absorbed at the next
+    phase boundary, where the agent pauses, replies, and applies any course
+    change before continuing.
+
+    Ctrl-C/SIGTERM quiesce the engine before sandbox teardown: the
+    registry's signal handler (and, when handlers could not install, the
+    KeyboardInterrupt path here) signals the engine's cancel flag —
+    checked at phase boundaries — and briefly joins the daemon thread, so
+    cleanup doesn't race an engine still mid-``sbx exec``. After teardown
+    a Ctrl-C exits 130 with a `sbxloop resume` hint instead of a
+    traceback; a second Ctrl-C force-quits (see ``_exit_interrupted``).
     """
     # The TUI runs the engine on a background thread, where pair
     # registration cannot install signal handlers — install them here,
     # on the main thread, so SIGTERM/SIGINT still clean up the sandboxes.
     cleanup_registry.install_handlers()
+    seen: dict[str, str] = {}
+
+    def remember(event: Event) -> None:
+        seen.setdefault("run_id", event.run_id)
+
+    engine.bus.subscribe(remember)
     if not tui:
         engine.bus.subscribe(plain_printer(console))
-        return action()  # type: ignore[no-any-return]
+        if chat and sys.stdin.isatty():
+            threading.Thread(target=_stdin_chat_reader, args=(engine,), daemon=True).start()
+        try:
+            return action()  # type: ignore[no-any-return]
+        except KeyboardInterrupt:
+            # The pair context manager already cleaned up while unwinding.
+            _exit_interrupted(seen.get("run_id"))
 
     dashboard = Dashboard()
     pending: queue.SimpleQueue[Event] = queue.SimpleQueue()
@@ -118,30 +181,84 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
         except BaseException as exc:
             outcome["error"] = exc
 
+    def submit(text: str) -> None:
+        dashboard.post_chat(engine.post_user_message(text), text)
+
+    chat_input = ChatInput(submit) if chat and ChatInput.available() else None
+
     thread = threading.Thread(target=target, daemon=True)
-    with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
 
-        def drain() -> None:
-            while True:
-                try:
-                    event = pending.get_nowait()
-                except queue.Empty:
-                    return
-                dashboard.on_event(event)
-                rendered = render_event(event)
-                if rendered is not None:
-                    live.console.print(rendered)
+    def quiesce() -> None:
+        # Idempotent: the signal handler runs it before cleanup, and the
+        # KeyboardInterrupt fallback below may run it again after.
+        engine.request_cancel()
+        if thread.is_alive():
+            thread.join(timeout=_INTERRUPT_JOIN_S)
 
-        thread.start()
-        while thread.is_alive():
+    cleanup_registry.set_quiesce(quiesce)
+    try:
+        with contextlib.ExitStack() as stack:
+            live = stack.enter_context(
+                Live(dashboard.renderable(), console=console, refresh_per_second=8)
+            )
+            if chat_input is not None:
+                stack.enter_context(chat_input)
+
+            def drain() -> None:
+                while True:
+                    try:
+                        event = pending.get_nowait()
+                    except queue.Empty:
+                        return
+                    dashboard.on_event(event)
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        live.console.print(rendered)
+
+            def refresh() -> None:
+                line = chat_input.renderable() if chat_input is not None else None
+                live.update(dashboard.renderable(line))
+
+            thread.start()
+            try:
+                while thread.is_alive():
+                    drain()
+                    refresh()
+                    if chat_input is not None:
+                        chat_input.pump(0.15)
+                    else:
+                        time.sleep(0.15)
+            except KeyboardInterrupt:
+                # Fallback for environments where the signal handlers could
+                # not install (no-op re-quiesce when they did).
+                quiesce()
+                raise
             drain()
-            live.update(dashboard.renderable())
-            time.sleep(0.15)
-        drain()
-        live.update(dashboard.renderable())
+            refresh()
+    except KeyboardInterrupt:
+        # The signal handler (or the fallback above) already quiesced the
+        # engine and tore the sandboxes down; finish with exit 130, a
+        # resume hint, and no traceback.
+        _exit_interrupted(dashboard.run_id or seen.get("run_id"))
+    finally:
+        cleanup_registry.set_quiesce(None)
+    if dashboard.chat_pending:
+        console.print(
+            "[yellow]chat message(s) the run ended before answering:[/] "
+            + "; ".join(dashboard.chat_pending.values())
+        )
     if "error" in outcome:
         raise outcome["error"]
     return outcome["result"]  # type: ignore[no-any-return]
+
+
+def _stdin_chat_reader(engine: LoopEngine) -> None:
+    """--no-tui chat: plain line input (terminal echo shows the typing)."""
+    with contextlib.suppress(ValueError, OSError):  # stdin closed mid-run
+        for line in sys.stdin:
+            text = line.strip()
+            if text:
+                engine.post_user_message(text)
 
 
 _TREE_MAX_FILES = 50
@@ -222,8 +339,12 @@ def run(
     ] = None,
     model: Annotated[str | None, typer.Option("--model", help="Copilot model id.")] = None,
     keep_sandboxes: Annotated[
-        bool, typer.Option("--keep-sandboxes", help="Do not remove sandboxes at the end.")
-    ] = False,
+        bool | None,
+        typer.Option(
+            "--keep-sandboxes/--no-keep-sandboxes",
+            help="Do not remove sandboxes at the end (either flag overrides config).",
+        ),
+    ] = None,
     keep_on_failure: Annotated[
         bool | None,
         typer.Option(
@@ -232,11 +353,19 @@ def run(
         ),
     ] = None,
     tui: Annotated[bool, typer.Option("--tui/--no-tui", help="Live dashboard.")] = True,
+    chat: Annotated[
+        bool,
+        typer.Option(
+            "--chat/--no-chat",
+            help="Interactive chat: type a message + Enter to pause the agent at the "
+            "next checkpoint, get an answer, and steer the run (needs a TTY).",
+        ),
+    ] = True,
 ) -> None:
     """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
     config = _config_with_overrides(
         model=model,
-        keep_sandboxes=keep_sandboxes or None,
+        keep_sandboxes=keep_sandboxes,
         keep_on_failure=keep_on_failure,
     )
     if report is not None:
@@ -264,7 +393,7 @@ def run(
         raise typer.Exit(2)
     engine = LoopEngine(config)
     try:
-        result = _drive_with_ui(engine, tui=tui, action=lambda: engine.start(outcome))
+        result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.start(outcome))
     except SdxloopError as exc:
         console.print(f"[bold red]run failed:[/] {exc}")
         raise typer.Exit(2) from exc
@@ -275,12 +404,16 @@ def run(
 def resume(
     run_id: Annotated[str, typer.Argument(help="Run id to resume.")],
     tui: Annotated[bool, typer.Option("--tui/--no-tui")] = True,
+    chat: Annotated[
+        bool,
+        typer.Option("--chat/--no-chat", help="Interactive chat (see `sbxloop run --help`)."),
+    ] = True,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
     config = load_config()
     engine = LoopEngine(config)
     try:
-        result = _drive_with_ui(engine, tui=tui, action=lambda: engine.resume(run_id))
+        result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.resume(run_id))
     except SdxloopError as exc:
         console.print(f"[bold red]resume failed:[/] {exc}")
         raise typer.Exit(2) from exc
@@ -345,6 +478,26 @@ def status(
     console.print(table)
     attempts = store.phase_attempts(run_id)
     console.print(f"{len(attempts)} phase attempts recorded")
+    # The pair names, so debugging a live run needs no by-hand
+    # `sbxloop-<run>-agent` reconstruction.
+    console.print("sandboxes:")
+    roles: tuple[SandboxRole, ...] = ("agent", "github")
+    try:
+        live = {info.name for info in SbxCLI(app_name=config.app_name or None).ls()}
+    except SdxloopError:
+        for role in roles:
+            console.print(
+                f"  {sandbox_name(run_id, role)}  [dim](liveness unknown: sbx ls failed)[/]"
+            )
+        return
+    any_live = False
+    for role in roles:
+        name = sandbox_name(run_id, role)
+        any_live = any_live or name in live
+        state_note = "[green]running[/]" if name in live else "[dim]not running[/]"
+        console.print(f"  {name}  {state_note}")
+    if any_live:
+        console.print(f"  inspect: [cyan]sbxloop shell {run_id}[/] (--role github)")
 
 
 @app.command()
@@ -355,6 +508,15 @@ def logs(
         str | None, typer.Option("--type", help="Filter by event type prefix.")
     ] = None,
     task: Annotated[str | None, typer.Option("--task", help="Filter by task id.")] = None,
+    stale_after: Annotated[
+        float,
+        typer.Option(
+            "--stale-after",
+            help="With --follow: exit once a non-terminal run has shown no "
+            "activity (events or state changes) for this many minutes; "
+            "0 follows forever.",
+        ),
+    ] = 10.0,
 ) -> None:
     """Replay (or tail) a run's event stream from the state store."""
     config = load_config()
@@ -369,7 +531,19 @@ def logs(
             console.print(format_event(event), highlight=False)
         if not follow:
             break
-        if store.get_run(run_id).state in ("completed", "failed", "cancelled"):
+        record = store.get_run(run_id)
+        if record.state in TERMINAL_RUN_STATES:
+            break
+        # A run whose driving process died hard stays non-terminal in the DB
+        # forever; without this, --follow would spin indefinitely.
+        last_activity = max(record.updated_at, store.last_event_ts(run_id) or 0.0)
+        if stale_after > 0 and time.time() - last_activity > stale_after * 60.0:
+            console.print(
+                f"[yellow]run {run_id} is {record.state} but has shown no activity "
+                f"for over {stale_after:g} minutes[/] — its process may be dead. "
+                f"Exiting; resume with [cyan]sbxloop resume {run_id}[/] or keep "
+                "waiting with [cyan]--stale-after 0[/]."
+            )
             break
         time.sleep(0.5)
 

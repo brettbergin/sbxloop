@@ -34,6 +34,7 @@ TaskState = Literal[
 ]
 
 TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
+TERMINAL_RUN_STATES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {"created", "provisioning", "decomposing", "running", "finalizing", "failed"}
 )
@@ -144,6 +145,36 @@ class Verdict(_Model):
     verdict: Literal["pass", "revise", "accept", "reject"]
     issues: list[Issue] = Field(default_factory=list)
     feedback: str = ""
+
+
+SteerAction = Literal["continue", "steer_task", "steer_run"]
+
+
+class SteerVerdict(_Model):
+    """STEER output: a user-facing reply to a chat message, plus the course
+    change the message requires (if any).
+
+    - ``continue``: the message changes nothing (a question, a status check);
+      only ``reply`` is used.
+    - ``steer_task``: the current task must be done differently — it is
+      re-planned with ``guidance`` as feedback (without spending its replan
+      budget: this is user direction, not a failure).
+    - ``steer_run``: the whole remaining run changes direction — ``guidance``
+      becomes standing guidance injected into every later plan/execute
+      prompt, persisted so a resumed run keeps it.
+    """
+
+    reply: str
+    action: SteerAction = "continue"
+    guidance: str = ""
+
+    @model_validator(mode="after")
+    def _check_guidance(self) -> SteerVerdict:
+        if self.action != "continue" and not self.guidance.strip():
+            raise ValueError(
+                f"action {self.action!r} requires non-empty `guidance` for the planner"
+            )
+        return self
 
 
 class TaskRecord(_Model):

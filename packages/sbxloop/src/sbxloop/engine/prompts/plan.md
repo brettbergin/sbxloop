@@ -18,6 +18,13 @@ $acceptance_criteria
 
 $feedback
 
+## Standing user guidance
+
+The user can steer the run over live chat; these instructions are in effect
+for all remaining work and the plan must honor them:
+
+$user_guidance
+
 ## Environment facts to plan around
 
 Debian/Ubuntu VM; the system Python is externally managed (PEP 668), so

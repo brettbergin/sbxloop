@@ -25,6 +25,7 @@ def test_execute_and_plan_carry_environment_notes() -> None:
         plan_steps="- s",
         expected_artifacts="- a",
         feedback="(none)",
+        user_guidance="(none)",
     )
     plan = render(
         "plan",
@@ -34,6 +35,7 @@ def test_execute_and_plan_carry_environment_notes() -> None:
         task_description="td",
         acceptance_criteria="- c",
         feedback="(none)",
+        user_guidance="(none)",
     )
     for text in (execute, plan):
         assert "externally managed" in text
@@ -68,6 +70,7 @@ def test_render_all_templates_have_no_leftover_vars() -> None:
             "task_description": "d",
             "acceptance_criteria": "- c",
             "feedback": "f",
+            "user_guidance": "g",
         },
         "execute": {
             "outcome": "o",
@@ -77,6 +80,7 @@ def test_render_all_templates_have_no_leftover_vars() -> None:
             "plan_steps": "- s",
             "expected_artifacts": "- a",
             "feedback": "f",
+            "user_guidance": "g",
         },
         "scrutinize": {
             "task_id": "t1",
@@ -95,6 +99,13 @@ def test_render_all_templates_have_no_leftover_vars() -> None:
             "acceptance_criteria": "- c",
             "verify_results": "v",
         },
+        "steer": {
+            "outcome": "o",
+            "tasks_summary": "- t1 [executing] T",
+            "current_task": "Task t1: T",
+            "user_guidance": "(none)",
+            "user_message": "how is it going?",
+        },
     }
     for name, context in contexts.items():
         text = render(name, **context)
@@ -111,6 +122,52 @@ def test_retry_context_defaults_empty_and_substitutes() -> None:
     retried = render("decompose", outcome="o", max_tasks="3", retry_context="TRY AGAIN")
     assert "TRY AGAIN" not in base
     assert "TRY AGAIN" in retried
+
+
+def test_steer_prompt_carries_chat_contract() -> None:
+    """STEER must present the user's message, the three actions, and the
+    read-only rule — direction changes flow through the engine, not edits."""
+    text = render(
+        "steer",
+        outcome="build it",
+        tasks_summary="- t1 [executing] Build",
+        current_task="Task t1: Build (state: executing)",
+        user_guidance="- use uv",
+        user_message="switch the storage layer to postgres",
+    )
+    assert "switch the storage layer to postgres" in text
+    for action in ("continue", "steer_task", "steer_run"):
+        assert action in text
+    assert "read-only" in text
+    assert "Do not modify anything" in text
+    assert "ONLY the fenced JSON block" in text
+
+
+def test_plan_and_execute_render_standing_guidance() -> None:
+    plan = render(
+        "plan",
+        outcome="o",
+        task_id="t1",
+        task_title="T",
+        task_description="d",
+        acceptance_criteria="- c",
+        feedback="f",
+        user_guidance="- always use postgres",
+    )
+    execute = render(
+        "execute",
+        outcome="o",
+        task_id="t1",
+        task_title="T",
+        task_description="d",
+        plan_steps="- s",
+        expected_artifacts="- a",
+        feedback="f",
+        user_guidance="- always use postgres",
+    )
+    for text in (plan, execute):
+        assert "Standing user guidance" in text
+        assert "always use postgres" in text
 
 
 def test_bullet_list() -> None:

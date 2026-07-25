@@ -8,6 +8,34 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Added
 
+- **Interactive chat with a running loop.** `sbxloop run` is no longer
+  watch-only: the TUI grows a chat form (keystrokes captured in cbreak mode,
+  the in-progress line rendered inside the pinned status panel; `--no-tui`
+  reads plain stdin lines). A submitted message queues on the engine and is
+  absorbed at the next phase boundary — the same checkpoint cancellation
+  uses — where the agent pauses and answers it in a fresh read-only STEER
+  session that may inspect the workspace. The verdict decides the course
+  change: `continue` (answer only), `steer_task` (the current task re-plans
+  immediately with the user's guidance as feedback, spending no
+  revision/replan budget — user direction is not a failure), or `steer_run`
+  (standing guidance injected into every later plan/execute prompt,
+  persisted in a new `runs.user_guidance` column so resumed runs keep their
+  direction; the schema migrates in place). Every chat turn is event-logged
+  (`chat.message` / `chat.reply` / `chat.action`, query with
+  `sbxloop logs RUN --type chat.`) and recorded as a `steer` phase attempt;
+  a failed steer never fails the run. The status panel shows
+  queued/answering messages, and `--chat/--no-chat` (on `run` and `resume`,
+  default on with a TTY) controls the whole feature.
+
+- **Transcript panels name the responding agent.** Agent feedback bubbles
+  used to be titled a generic `agent <time>`, so you couldn't tell which
+  Copilot session was speaking. Each phase now stamps its persona
+  (`decomposer`, `planner`, `executor`, `scrutinizer`, `validator`) onto its
+  job's `agent.*` events host-side (the in-sandbox worker doesn't know which
+  phase it serves), the TUI header shows it, and `sbxloop logs` lines carry
+  it as `[<name>]`. Events without a name (older runs) keep the `agent`
+  title.
+
 - **`sbxloop list-models`** — lists the models the GitHub Copilot SDK gives
   the authenticated subscription access to, straight from the SDK's
   `list_models()` API on the host (no sandbox): model id, display name,
@@ -128,6 +156,51 @@ All notable changes to sdxloop are documented here. The project adheres to
   exclusions are always surfaced: the `run.artifacts` event carries per-entry
   excluded counts, the run summary and `sbxloop artifacts` print an
   "N file(s) excluded (…)" note, and delivery PRs list what was left out.
+- The pinned status panel now shows the whole decomposed task list up
+  front (#63). Previously a task's row only appeared when it started, so
+  t2…tn were invisible until each prior task finished. The engine now
+  announces the full roster (ids, titles, states) right after
+  decomposition — and on resume, restoring each task's persisted state —
+  and the TUI renders not-yet-started rows as `waiting` until their turn.
+- Ctrl+C now finishes cleanly instead of surfacing tracebacks/`Aborted!`.
+  Building on the #64 signal handlers and the #68 engine quiesce, the CLI
+  handles the interrupt in both display modes: after the sandboxes are
+  torn down it prints an `interrupted` notice and a `sbxloop resume RUN_ID` hint (interrupted runs stay resumable) and exits 130; a second
+  Ctrl+C during teardown force-quits, deferring leftover sandboxes to
+  `sbxloop sandbox prune`. The registry's `cleanup_all` additionally
+  respects `--keep-sandboxes` pairs on abnormal exit instead of deleting
+  sandboxes the run DB just marked as kept.
+- **P4 papercut batch (#68):**
+  - `--keep-sandboxes` is now tri-state
+    (`--keep-sandboxes/--no-keep-sandboxes`, default "no override") like
+    `--report`/`--deliver` already were, so a config-file
+    `keep_sandboxes = true` can be forced off from the CLI.
+  - `cancel` refuses runs already in a terminal state
+    (`completed`/`failed`/`cancelled`) with a clear message instead of
+    silently rewriting their recorded state to `cancelled`.
+  - `logs --follow` no longer spins forever on a run whose driving process
+    died hard (state stuck non-terminal): after `--stale-after` minutes
+    (default 10; 0 follows forever) with no activity — no new events and no
+    state change — it prints a note and exits.
+  - Provisioning rollback now best-effort unregisters the secrets the
+    failed attempt registered, symmetric with sandbox removal, so the next
+    run starts clean instead of depending on collision-recovery
+    scope-parsing heuristics against a registration owned by a
+    now-deleted sandbox scope.
+  - Ctrl-C in the TUI now signals the engine thread (via a new
+    `LoopEngine.request_cancel()`, checked at the same phase boundaries as
+    store-level cancellation) and joins it briefly before sandbox cleanup,
+    instead of tearing sandboxes down under an engine still mid-`sbx exec`.
+    The interrupted run's persisted state is untouched, so it stays
+    resumable. Composed with the #64 signal handlers: the cleanup registry
+    runs a driver-set quiesce callback before signal-triggered teardown,
+    so SIGINT/SIGTERM stop the engine first, then remove the sandboxes.
+  - The `Hook` protocol docstring no longer claims hooks "must not raise":
+    the bus has always contained and logged subscriber exceptions, so hook
+    authors need no defensive boilerplate (hooks should still be fast).
+  - `status <run>` now prints the run's sandbox pair names with their
+    current liveness per `sbx ls`, plus a `sbxloop shell` hint when one is
+    running — no more reconstructing `sbxloop-<run>-agent` by hand.
 - SIGTERM during a TUI-mode run no longer leaks the sandbox pair (#64). The
   TUI runs the engine on a background thread, and the cleanup registry's
   handler installer latched itself as "installed" *before* discovering it

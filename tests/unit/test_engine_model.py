@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from sbxloop.engine.model import (
     DEFAULT_ARTIFACT_EXCLUDES,
     RunRecord,
+    SteerVerdict,
     TaskGraph,
     TaskSpec,
     Verdict,
@@ -165,3 +166,22 @@ class TestArtifactsDir:
             run_id="r1", outcome="x", state="created", created_at=1.0, updated_at=1.0
         )
         assert artifacts_dir(record, Path("/state")) is None
+
+
+class TestSteerVerdict:
+    def test_continue_needs_no_guidance(self) -> None:
+        verdict = SteerVerdict(reply="all fine")
+        assert verdict.action == "continue"
+        assert verdict.guidance == ""
+
+    def test_steer_actions_require_guidance(self) -> None:
+        with pytest.raises(ValidationError, match="guidance"):
+            SteerVerdict(reply="ok", action="steer_task")
+        with pytest.raises(ValidationError, match="guidance"):
+            SteerVerdict(reply="ok", action="steer_run", guidance="   ")
+        verdict = SteerVerdict(reply="ok", action="steer_run", guidance="use Go")
+        assert verdict.guidance == "use Go"
+
+    def test_unknown_action_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            SteerVerdict(reply="ok", action="abort_everything", guidance="g")

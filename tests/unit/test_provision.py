@@ -259,6 +259,45 @@ class TestEnsurePair:
         # everything created so far was rolled back
         assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-agent").exists()
         assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-github").exists()
+        # ...including the agent's custom-secret registration, which would
+        # otherwise be left owned by the now-deleted sandbox scope
+        assert self.registered_custom_secrets(fake_sbx) == {}
+
+    @staticmethod
+    def registered_custom_secrets(fake_sbx: FakeSbx) -> dict[str, dict[str, str]]:
+        import json
+
+        state_path = fake_sbx.state / "secrets-state.json"
+        if not state_path.is_file():
+            return {}
+        return dict(json.loads(state_path.read_text())["custom"])
+
+    def test_rollback_unregisters_secrets_from_this_attempt(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """A failure after secrets were registered removes those
+        registrations, symmetric with sandbox removal — the next run starts
+        clean instead of relying on collision-recovery heuristics."""
+        import json
+
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        # both sandboxes' secrets land; the github probe then dies at the
+        # sbx level twice, which fails provisioning loudly
+        fake_sbx.script(
+            "exec sbxloop-r1-github sh -lc test -n",
+            returncode=1,
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        )
+        with pytest.raises(ProvisionError, match="probe failed twice"):
+            provisioner.ensure_pair("r1")
+        assert self.registered_custom_secrets(fake_sbx) == {}
+        state = json.loads((fake_sbx.state / "secrets-state.json").read_text())
+        assert state["service"] == {}
+        # a fresh attempt provisions without needing any collision recovery
+        rm_calls_before = len(fake_sbx.invocations("secret rm"))
+        pair = provisioner.ensure_pair("r2")
+        pair.cleanup()
+        assert len(fake_sbx.invocations("secret rm")) == rm_calls_before
 
     def test_explicit_workspace_wins(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
