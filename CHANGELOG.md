@@ -6,6 +6,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- GitHub progress reporting (`--report`) now actually reports (#58). The
+  tracking issue was never created: the hook subscribed to run lifecycle
+  events that are emitted before the github sandbox exists and after it is
+  torn down. Run start/end are now explicit `open_run`/`close_run` calls
+  made while the sandbox is alive; task-end comments flow via the bus as
+  before, and the final summary posts before teardown. A resumed run
+  re-finds its existing tracking issue instead of opening a duplicate.
+
 ### Security
 - Secret values no longer leak through error text or the process-observable
   argv carried on `ExecResult`/`SbxError`: the value passed to

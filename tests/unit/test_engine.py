@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -456,3 +456,69 @@ class TestDeliverHook:
         result = harness.engine().start("plain run")
         assert result.state == "completed"
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
+
+
+class TestGithubReporting:
+    """Wiring for --report: the engine must open the tracking issue after
+    the github sandbox exists, mirror task ends, and post the summary while
+    the sandbox is still alive (#58). GithubOps is patched at the engine
+    module — no GitHub, no network."""
+
+    class RecordingOps:
+        instances: ClassVar[list[TestGithubReporting.RecordingOps]] = []
+
+        def __init__(self, client: Any, run_id: str, **kwargs: Any) -> None:
+            self.run_id = run_id
+            self.created: list[str] = []
+            self.comments: list[str] = []
+            type(self).instances.append(self)
+
+        def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
+            return []
+
+        def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> Any:
+            from sbxloop.gh.ops import IssueRef
+
+            self.created.append(title)
+            return IssueRef(number=11, url="https://x/11")
+
+        def issue_comment(self, repo: str, number: int, body: str) -> str:
+            self.comments.append(body)
+            return "https://c"
+
+    @pytest.fixture(autouse=True)
+    def _patch_ops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sbxloop.engine.engine as engine_mod
+
+        self.RecordingOps.instances = []
+        monkeypatch.setattr(engine_mod, "GithubOps", self.RecordingOps)
+
+    def test_report_opens_comments_and_summarizes(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(github={"repo": "o/r", "report": True}).start("do it")
+
+        assert result.state == "completed"
+        assert len(self.RecordingOps.instances) == 1
+        ops = self.RecordingOps.instances[0]
+        assert ops.created == [f"sbxloop run {result.run_id}"]
+        # one comment per task end + the final summary
+        assert len(ops.comments) == 2
+        assert "✅ `t1`" in ops.comments[0]
+        assert "finished: **completed**" in ops.comments[1]
+
+    def test_failed_run_summary_reports_failed(self, harness: Harness) -> None:
+        harness.script(
+            [taskgraph(task("t1")), PLAN, EXECUTE, PASS, REJECT, PLAN, EXECUTE, PASS, REJECT]
+        )
+        result = harness.engine(github={"repo": "o/r", "report": True}).start("doomed")
+
+        assert result.state == "failed"
+        ops = self.RecordingOps.instances[0]
+        assert "❌ `t1`" in ops.comments[0]
+        assert "finished: **failed**" in ops.comments[-1]
+
+    def test_report_disabled_touches_nothing(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(github={"repo": "o/r"}).start("quiet")
+        assert result.state == "completed"
+        assert self.RecordingOps.instances == []
