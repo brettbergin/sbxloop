@@ -668,7 +668,7 @@ wheels = [
 
 [[package]]
 name = "sbxloop"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/sbxloop" }
 dependencies = [
     { name = "pydantic" },
@@ -689,7 +689,7 @@ requires-dist = [
 
 [[package]]
 name = "sbxloop-worker"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/sbxloop-worker" }
 dependencies = [
     { name = "pydantic" },
