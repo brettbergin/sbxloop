@@ -132,9 +132,7 @@ class TestHappyPath:
         """Every decomposed task is announced (with title) before any task
         starts, so UIs can show the whole plan as waiting up front instead
         of revealing rows one at a time (#63)."""
-        harness.script(
-            [taskgraph(task("t1"), task("t2", deps=["t1"])), *HAPPY_TASK, *HAPPY_TASK]
-        )
+        harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), *HAPPY_TASK, *HAPPY_TASK])
         result = harness.engine().start("two tasks up front")
         assert result.succeeded
 
