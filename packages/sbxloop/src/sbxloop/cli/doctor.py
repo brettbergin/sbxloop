@@ -13,12 +13,9 @@ from sbxloop.config import load_config
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.cli import SbxCLI
-from sbxloop.sbx.provision import (
-    AGENT_TOKEN_HOSTS,
-    COPILOT_TOKEN_ENV,
-    GH_TOKEN_ENVS,
-)
+from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, GH_TOKEN_ENVS
 from sbxloop.sbx.prune import count_orphans
+from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
 from sbxloop.worker.wheel import resolve_worker_wheel
 
 TESTED_SBX_SERIES = "0.35"

@@ -7,6 +7,26 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [Unreleased]
 
 ### Added
+- **`sbxloop secrets` command group** — proactive lifecycle management for
+  the sbx custom-secret registrations sbxloop owns
+  ([#55](https://github.com/brettbergin/sbxloop/issues/55)):
+  - `secrets list` enumerates the tracked registrations (the Copilot token)
+    across scopes and flags pre-collision state: stale registrations owned
+    by dead run sandboxes, wrong host bindings from older versions, and
+    foreign-scope conflicts. Enumeration tries `sbx secret ls` and falls
+    back to a transient set-custom collision probe (the exists-error names
+    the owning scope) when the build doesn't support listing.
+  - `secrets clean` removes stale sbxloop-owned registrations — dry-run by
+    default (`--apply` to execute, `--all` to include healthy ones). Never
+    touches foreign scopes or the built-in `github` service secret.
+  - `secrets rotate` replaces the registration with a new token value in
+    one step (read from the environment/.env or a hidden prompt, never
+    argv), warns when live sandboxes may still hold the old token, and
+    verifies which secret strategy (proxy vs plain-env fallback) the next
+    run will use via a throwaway sandbox (`--no-verify` skips).
+- The 0.1.3 secret-collision recovery logic now lives in a shared module
+  (`sbxloop.sbx.secretstate`); provisioning and the `secrets` commands use
+  the same field-hardened implementation.
 - **Plan-declared, least-privilege network egress** (#49). The PLAN phase
   may now declare external domains a task needs during EXECUTE (each with a
   justification) via a new `egress` field in the plan schema. Declarations
@@ -46,6 +66,13 @@ All notable changes to sdxloop are documented here. The project adheres to
   they no longer plant or depend on wheels in the real installed package's
   `_vendor/` directory, which raced with the build hook and real pip installs
   under parallel execution.
+- **Releases are now fully automated** (aligned with the entrygraph release
+  strategy): every merge to `main` runs the check suite, auto-bumps the patch
+  version via a new `vX.Y.Z` git tag, and publishes both distributions to
+  PyPI — no more release PRs or manual version edits. Package versions are
+  derived from git tags by hatch-vcs (`dynamic = ["version"]`); the exact
+  `sbxloop-worker==X.Y.Z` lockstep pin is injected into the host wheel
+  metadata at build time. See [RELEASING.md](RELEASING.md).
 
 ### Fixed
 - A delivery infrastructure failure can no longer mark a completed run as
@@ -71,15 +98,6 @@ All notable changes to sdxloop are documented here. The project adheres to
   into terminals, logs, or events (#57). The remaining `ps`-visibility of
   the live subprocess argv needs stdin support in sbx itself and stays
   tracked in #57.
-
-### Changed
-- **Releases are now fully automated** (aligned with the entrygraph release
-  strategy): every merge to `main` runs the check suite, auto-bumps the patch
-  version via a new `vX.Y.Z` git tag, and publishes both distributions to
-  PyPI — no more release PRs or manual version edits. Package versions are
-  derived from git tags by hatch-vcs (`dynamic = ["version"]`); the exact
-  `sbxloop-worker==X.Y.Z` lockstep pin is injected into the host wheel
-  metadata at build time. See [RELEASING.md](RELEASING.md).
 
 ## [0.2.0] — 2026-07-23
 
