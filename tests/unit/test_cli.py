@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, ClassVar
@@ -70,6 +71,19 @@ class TestBasics:
             "config",
         ):
             assert command in result.output
+
+    def test_run_and_resume_offer_chat_toggle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Wide terminal: rich wraps 80-col help panels mid-token in CI,
+        # splitting "--no-chat" across lines.
+        monkeypatch.setenv("COLUMNS", "300")
+        for command in ("run", "resume"):
+            result = runner.invoke(app, [command, "--help"])
+            assert result.exit_code == 0
+            # GitHub Actions forces typer's terminal colors on, and the
+            # option highlighter styles the negative-flag prefix separately —
+            # ANSI codes land INSIDE "--no-chat". Assert on stripped text.
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+            assert "--no-chat" in plain
 
 
 class TestStatusAndLogs:

@@ -10,11 +10,23 @@ Only the compact status region (run state + task table) is live-updated in
 place at the bottom. Host lifecycle events stay compact one-liners.
 ``format_event`` remains the dense single-line form used by
 ``sbxloop logs``.
+
+The status region also hosts the interactive chat form (``ChatInput``):
+keystrokes are captured in cbreak mode (echo off — the Live region owns the
+screen) and the in-progress line is rendered inside the pinned panel, with
+queued/answering messages shown above it. Chat turns appear in the
+transcript as ``chat.message``/``chat.reply`` panels.
 """
 
 from __future__ import annotations
 
+import codecs
 import datetime
+import os
+import select
+import sys
+from collections.abc import Callable
+from types import TracebackType
 from typing import Any
 
 from rich.console import Console, Group, RenderableType
@@ -40,6 +52,9 @@ TASK_STATE_STYLES = {
 
 # Compact one-liner lifecycle events (chat "system" messages).
 _LIFECYCLE_PREFIXES = ("run.", "task.", "phase.", "sandbox.", "gh.", "policy.")
+
+# Chat message text shown in the pinned panel is clipped to one line.
+CHAT_PENDING_CLIP = 80
 
 # High-volume noise excluded from the transcript (still queryable via
 # `sbxloop logs`): streaming deltas, raw stdout passthrough, heartbeats,
@@ -149,6 +164,40 @@ def render_event(event: Event) -> RenderableType | None:
             )
         return failure
 
+    if event.type == HostEventTypes.CHAT_MESSAGE:
+        return Panel(
+            Text(str(data.get("text", "")), overflow="fold"),
+            title=f"[bold green]you[/] [dim]{_stamp(event)}[/]",
+            title_align="left",
+            border_style="green",
+            padding=(0, 1),
+        )
+
+    if event.type == HostEventTypes.CHAT_REPLY:
+        error = str(data.get("error") or "").strip()
+        if error:
+            return Panel(
+                Text(f"steering failed: {error}", style="red", overflow="fold"),
+                title=f"[bold red]agent · reply[/] [dim]{_stamp(event)}[/]",
+                title_align="left",
+                border_style="red",
+                padding=(0, 1),
+            )
+        return Panel(
+            Markdown(str(data.get("reply", "")).strip() or "*(no reply)*"),
+            title=f"[bold cyan]agent · reply[/] [dim]{_stamp(event)}[/]",
+            title_align="left",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+
+    if event.type == HostEventTypes.CHAT_ACTION:
+        return Text(
+            f"{_stamp(event)}  ↪ {data.get('message', 'user steering applied')}",
+            style="bold yellow",
+            overflow="fold",
+        )
+
     if event.type.startswith(_LIFECYCLE_PREFIXES):
         line = format_event(event)
         style = "dim"
@@ -168,6 +217,108 @@ def render_event(event: Event) -> RenderableType | None:
     return None
 
 
+class ChatInput:
+    """The run TUI's chat form: cbreak-mode keystroke capture on stdin.
+
+    Terminal echo is off (the Live region owns the screen), so the
+    in-progress line is rendered inside the pinned panel via
+    ``renderable()`` instead. ``pump()`` replaces the drive loop's sleep:
+    it waits on stdin with a timeout and feeds any bytes through ``feed()``.
+    Enter submits the stripped line to ``on_submit``; Backspace edits;
+    Ctrl-U clears; arrow/function-key escape sequences are swallowed.
+    POSIX-with-a-TTY only — gate construction on ``available()``. cbreak
+    keeps ISIG, so Ctrl-C still interrupts the run as before.
+    """
+
+    def __init__(self, on_submit: Callable[[str], None]) -> None:
+        self.on_submit = on_submit
+        self.buffer = ""
+        self._saved: list[Any] | None = None
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # "" (normal) | "esc" (just saw ESC) | "csi" (inside a CSI/SS3
+        # sequence, skipping until its terminator).
+        self._esc_state = ""
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            import termios  # noqa: F401
+            import tty  # noqa: F401
+        except ImportError:  # pragma: no cover - non-POSIX platform
+            return False
+        try:
+            return sys.stdin.isatty()
+        except (ValueError, OSError):  # pragma: no cover - closed stdin
+            return False
+
+    def __enter__(self) -> ChatInput:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        self._saved = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        import termios
+
+        if self._saved is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved)
+            self._saved = None
+
+    def pump(self, timeout: float) -> None:
+        """Wait up to ``timeout`` for keystrokes and absorb them."""
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        except (ValueError, OSError):  # pragma: no cover - stdin went away
+            return
+        if not ready:
+            return
+        data = os.read(sys.stdin.fileno(), 1024)
+        if data:
+            self.feed(data)
+
+    def feed(self, data: bytes) -> None:
+        for ch in self._decoder.decode(data):
+            if self._esc_state == "esc":
+                # '['/'O' opens a CSI/SS3 sequence (arrows, Home, F-keys);
+                # anything else was Alt+key or a bare Esc — drop just it.
+                self._esc_state = "csi" if ch in "[O" else ""
+                continue
+            if self._esc_state == "csi":
+                # Sequences end on a letter or '~'.
+                if ch.isalpha() or ch == "~":
+                    self._esc_state = ""
+                continue
+            if ch == "\x1b":
+                self._esc_state = "esc"
+            elif ch in ("\r", "\n"):
+                text = self.buffer.strip()
+                self.buffer = ""
+                if text:
+                    self.on_submit(text)
+            elif ch in ("\x7f", "\x08"):
+                self.buffer = self.buffer[:-1]
+            elif ch == "\x15":  # Ctrl-U
+                self.buffer = ""
+            elif ch.isprintable():
+                self.buffer += ch
+
+    def renderable(self) -> Text:
+        if not self.buffer:
+            return Text.assemble(
+                ("> ", "bold green"),
+                ("type to chat with the agent · Enter to send", "dim italic"),
+            )
+        return Text.assemble(("> ", "bold green"), (self.buffer, "bold"), ("▌", "blink green"))
+
+
 class Dashboard:
     """Accumulates run status from the event stream and renders the pinned
     region. Transcript entries are NOT kept here — the drive loop prints
@@ -182,12 +333,29 @@ class Dashboard:
         # Latest resource sample per sandbox role, rendered as one compact
         # gauge line each; only escalates visually past warn/abort levels.
         self.resources: dict[str, dict[str, Any]] = {}
+        # Chat lifecycle for the pinned panel: messages submitted from the
+        # form but not yet absorbed by the engine (message_id → text), and
+        # the text of the message a STEER session is currently answering.
+        self.chat_pending: dict[str, str] = {}
+        self.chat_processing: str | None = None
+
+    def post_chat(self, message_id: str, text: str) -> None:
+        """Record a just-submitted message as queued (fed by the chat form)."""
+        self.chat_pending[message_id] = text
 
     # -- event intake ------------------------------------------------------
 
     def on_event(self, event: Event) -> None:
         self.run_id = self.run_id or event.run_id
         data = event.data
+        if event.type == HostEventTypes.CHAT_MESSAGE:
+            # The engine picked the message up: no longer queued, now the
+            # one being answered.
+            self.chat_processing = self.chat_pending.pop(
+                str(data.get("message_id")), str(data.get("text", ""))
+            )
+        elif event.type == HostEventTypes.CHAT_REPLY:
+            self.chat_processing = None
         if event.type == EventTypes.SANDBOX_RESOURCES:
             self.resources[str(data.get("role") or "sandbox")] = dict(data)
         elif event.type == HostEventTypes.RUN_START:
@@ -212,7 +380,7 @@ class Dashboard:
 
     # -- rendering ---------------------------------------------------------
 
-    def renderable(self) -> RenderableType:
+    def renderable(self, chat_line: RenderableType | None = None) -> RenderableType:
         header = Text.assemble(
             ("run ", "bold"),
             (self.run_id or "…", "bold cyan"),
@@ -238,8 +406,26 @@ class Dashboard:
             table.add_row("…", "decomposing outcome", Text("pending", style="dim"), "")
 
         gauges = [self._gauge_line(role) for role in sorted(self.resources)]
+        chat_lines: list[RenderableType] = []
+        if self.chat_processing is not None:
+            chat_lines.append(
+                Text(
+                    f"✉ steering: {_one_line(self.chat_processing, CHAT_PENDING_CLIP)}",
+                    style="yellow",
+                )
+            )
+        for text in self.chat_pending.values():
+            chat_lines.append(
+                Text(
+                    f"✉ queued (pauses at the next checkpoint): "
+                    f"{_one_line(text, CHAT_PENDING_CLIP)}",
+                    style="dim",
+                )
+            )
+        if chat_line is not None:
+            chat_lines.append(chat_line)
         return Panel(
-            Group(header, outcome, table, *gauges),
+            Group(header, outcome, table, *gauges, *chat_lines),
             border_style="cyan",
             padding=(0, 1),
         )
@@ -268,7 +454,20 @@ def format_event(event: Event) -> str:
         parts.append(f"[{event.data['task_id']}]")
     if event.data.get("agent"):
         parts.append(f"[{event.data['agent']}]")
-    keys = ("state", "content", "tool", "op", "line", "message", "outcome", "error", "url", "path")
+    keys = (
+        "state",
+        "content",
+        "text",
+        "reply",
+        "tool",
+        "op",
+        "line",
+        "message",
+        "outcome",
+        "error",
+        "url",
+        "path",
+    )
     picked = ""
     for key in keys:
         if event.data.get(key):

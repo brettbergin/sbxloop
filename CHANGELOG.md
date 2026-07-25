@@ -8,6 +8,25 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Added
 
+- **Interactive chat with a running loop.** `sbxloop run` is no longer
+  watch-only: the TUI grows a chat form (keystrokes captured in cbreak mode,
+  the in-progress line rendered inside the pinned status panel; `--no-tui`
+  reads plain stdin lines). A submitted message queues on the engine and is
+  absorbed at the next phase boundary — the same checkpoint cancellation
+  uses — where the agent pauses and answers it in a fresh read-only STEER
+  session that may inspect the workspace. The verdict decides the course
+  change: `continue` (answer only), `steer_task` (the current task re-plans
+  immediately with the user's guidance as feedback, spending no
+  revision/replan budget — user direction is not a failure), or `steer_run`
+  (standing guidance injected into every later plan/execute prompt,
+  persisted in a new `runs.user_guidance` column so resumed runs keep their
+  direction; the schema migrates in place). Every chat turn is event-logged
+  (`chat.message` / `chat.reply` / `chat.action`, query with
+  `sbxloop logs RUN --type chat.`) and recorded as a `steer` phase attempt;
+  a failed steer never fails the run. The status panel shows
+  queued/answering messages, and `--chat/--no-chat` (on `run` and `resume`,
+  default on with a TTY) controls the whole feature.
+
 - **Transcript panels name the responding agent.** Agent feedback bubbles
   used to be titled a generic `agent <time>`, so you couldn't tell which
   Copilot session was speaking. Each phase now stamps its persona
