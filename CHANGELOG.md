@@ -147,6 +147,12 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- The pinned status panel now shows the whole decomposed task list up
+  front (#63). Previously a task's row only appeared when it started, so
+  t2…tn were invisible until each prior task finished. The engine now
+  announces the full roster (ids, titles, states) right after
+  decomposition — and on resume, restoring each task's persisted state —
+  and the TUI renders not-yet-started rows as `waiting` until their turn.
 - Ctrl+C now finishes cleanly instead of surfacing tracebacks/`Aborted!`.
   Building on the #64 signal handlers and the #68 engine quiesce, the CLI
   handles the interrupt in both display modes: after the sandboxes are
@@ -221,9 +227,6 @@ All notable changes to sdxloop are documented here. The project adheres to
   host-side decode. Polling now ends only on a *parsed* `worker.end` event —
   an agent message whose payload merely contains the literal string
   `"worker.end"` no longer terminates the poll early.
-
-> > > > > > > origin/main
-
 - `resume` now runs under the config the run was started with (#60). The
   full config has always been persisted in the runs table, but resume drove
   with whatever `load_config()` produced at resume time — so editing

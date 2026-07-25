@@ -128,6 +128,24 @@ class TestHappyPath:
         # sandboxes cleaned up
         assert harness.sandboxes_left() == []
 
+    def test_full_roster_announced_before_first_task_runs(self, harness: Harness) -> None:
+        """Every decomposed task is announced (with title) before any task
+        starts, so UIs can show the whole plan as waiting up front instead
+        of revealing rows one at a time (#63)."""
+        harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), *HAPPY_TASK, *HAPPY_TASK])
+        result = harness.engine().start("two tasks up front")
+        assert result.succeeded
+
+        first_start = next(
+            i for i, e in enumerate(harness.events) if e.type == HostEventTypes.TASK_START
+        )
+        roster = [
+            (e.data["task_id"], e.data["state"])
+            for e in harness.events[:first_start]
+            if e.type == HostEventTypes.TASK_STATE and e.data.get("title")
+        ]
+        assert roster == [("t1", "pending"), ("t2", "pending")]
+
     def test_agent_messages_carry_phase_persona(self, harness: Harness) -> None:
         """Every agent.message names the persona that produced it, so the
         transcript header says WHO responded (planner, executor, ...), not a

@@ -1101,6 +1101,31 @@ class TestDashboard:
         assert "First task" in text
         assert "executing" in text
 
+    def test_roster_announcement_shows_all_tasks_waiting(self) -> None:
+        """The engine announces every decomposed task up front; pending rows
+        render as "waiting" until their turn instead of appearing one at a
+        time as prior tasks complete."""
+        from rich.console import Console
+
+        from sbxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        for event in [
+            Event.now("run.state", "r1", state="running"),
+            Event.now("task.state", "r1", task_id="t1", title="First task", state="pending"),
+            Event.now("task.state", "r1", task_id="t2", title="Second task", state="pending"),
+            Event.now("task.state", "r1", task_id="t3", title="Third task", state="pending"),
+        ]:
+            dashboard.on_event(event)
+
+        console = Console(record=True, width=100)
+        console.print(dashboard.renderable())
+        text = console.export_text()
+        for title in ("First task", "Second task", "Third task"):
+            assert title in text
+        assert text.count("waiting") == 3
+        assert "pending" not in text
+
     def test_status_region_holds_no_transcript(self) -> None:
         """The pinned region must stay compact: transcript entries live in
         the terminal scrollback (printed once, never rewritten), so agent

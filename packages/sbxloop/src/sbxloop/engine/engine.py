@@ -549,6 +549,20 @@ class LoopEngine:
             tasks = self.store.get_tasks(run_id)
 
         self._set_run_state(run_id, "running")
+        # Announce the full roster up front (with titles) so UIs can show
+        # every task waiting immediately, instead of revealing rows one at a
+        # time as each prior task finishes. Also runs on resume, where it
+        # restores the table with each task's persisted state.
+        for task in tasks:
+            self.bus.emit(
+                HostEventTypes.TASK_STATE,
+                run_id,
+                task_id=task.spec.id,
+                title=task.spec.title,
+                state=task.state,
+                revisions=task.revisions,
+                replans=task.replans,
+            )
         failed_ids: set[str] = {t.spec.id for t in tasks if t.state == "failed"}
         skipped_ids: set[str] = {t.spec.id for t in tasks if t.state == "skipped"}
         for task in tasks:
