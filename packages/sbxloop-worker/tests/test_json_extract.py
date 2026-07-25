@@ -29,9 +29,10 @@ def test_no_json_returns_none() -> None:
     assert extract_json("no structured data here") is None
 
 
-def test_invalid_fence_and_invalid_whole_text_is_none() -> None:
-    # The broken fence swallows its content and the whole text (fences
-    # included) is not valid JSON either -> extraction fails cleanly; the
-    # engine handles this by retrying the phase with the error appended.
+def test_broken_fence_recovers_embedded_value() -> None:
+    # Behavior change with the embedded-JSON fallback (0.5.x field fix):
+    # a broken fence no longer poisons the reply — the valid object
+    # outside it is salvaged. Schema validation still guards the shape,
+    # and the engine retries on a schema mismatch.
     text = '```json\n{broken\n```\n{"ok": 1}'
-    assert extract_json(text) is None
+    assert extract_json(text) == {"ok": 1}
