@@ -8,6 +8,25 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Added
 
+- **Interactive chat with a running loop.** `sbxloop run` is no longer
+  watch-only: the TUI grows a chat form (keystrokes captured in cbreak mode,
+  the in-progress line rendered inside the pinned status panel; `--no-tui`
+  reads plain stdin lines). A submitted message queues on the engine and is
+  absorbed at the next phase boundary — the same checkpoint cancellation
+  uses — where the agent pauses and answers it in a fresh read-only STEER
+  session that may inspect the workspace. The verdict decides the course
+  change: `continue` (answer only), `steer_task` (the current task re-plans
+  immediately with the user's guidance as feedback, spending no
+  revision/replan budget — user direction is not a failure), or `steer_run`
+  (standing guidance injected into every later plan/execute prompt,
+  persisted in a new `runs.user_guidance` column so resumed runs keep their
+  direction; the schema migrates in place). Every chat turn is event-logged
+  (`chat.message` / `chat.reply` / `chat.action`, query with
+  `sbxloop logs RUN --type chat.`) and recorded as a `steer` phase attempt;
+  a failed steer never fails the run. The status panel shows
+  queued/answering messages, and `--chat/--no-chat` (on `run` and `resume`,
+  default on with a TTY) controls the whole feature.
+
 - **Prebaked sandbox templates + `sbxloop bake` (#48).** `sbxloop bake` runs
   the worker install ladder once in a scratch sandbox (plus a best-effort
   Copilot runtime pre-cache) and persists the result with `sbx template save`. With `[sandbox] template` pointing at the baked ref, provisioning
@@ -17,6 +36,7 @@ All notable changes to sdxloop are documented here. The project adheres to
   degrades to today's behavior instead of failing the run. Runs emit a
   `sandbox.prebaked` event either way, and `sbxloop doctor` warns when the
   configured template was baked with an older worker (re-run `sbxloop bake`) or is missing from `sbx template ls`.
+
 - **`sbxloop doctor` now runs an sbx conformance suite** (#52): every
   field-learned assumption about sbx semantics is a named probe with a
   machine-checkable verdict — secret-env visibility under `exec`, the
@@ -30,9 +50,11 @@ All notable changes to sdxloop are documented here. The project adheres to
   version's cache — doctor warns loudly, naming the dependent behavior.
   Provisioning's existing checks (secret visibility, mount discovery) now
   feed the same cache, so ordinary runs keep the verdicts fresh for free.
+
 - **`sbxloop secrets` command group** — proactive lifecycle management for
   the sbx custom-secret registrations sbxloop owns
   ([#55](https://github.com/brettbergin/sbxloop/issues/55)):
+
   - `secrets list` enumerates the tracked registrations (the Copilot token)
     across scopes and flags pre-collision state: stale registrations owned
     by dead run sandboxes, wrong host bindings from older versions, and
@@ -47,9 +69,11 @@ All notable changes to sdxloop are documented here. The project adheres to
     argv), warns when live sandboxes may still hold the old token, and
     verifies which secret strategy (proxy vs plain-env fallback) the next
     run will use via a throwaway sandbox (`--no-verify` skips).
+
 - The 0.1.3 secret-collision recovery logic now lives in a shared module
   (`sbxloop.sbx.secretstate`); provisioning and the `secrets` commands use
   the same field-hardened implementation.
+
 - **Plan-declared, least-privilege network egress** (#49). The PLAN phase
   may now declare external domains a task needs during EXECUTE (each with a
   justification) via a new `egress` field in the plan schema. Declarations
@@ -62,16 +86,19 @@ All notable changes to sdxloop are documented here. The project adheres to
   egress audit trail (`sbxloop logs RUN --type policy.`). `sbxloop config policy` renders the effective per-phase policy. sbx 0.35 has no
   revocation primitive, so grants persist for the sandbox's lifetime but
   never outlive a run (sandboxes are removed at run end).
+
 - **`keep_on_failure`** (config + `--keep-on-failure`) — successful runs clean
   up as always; failed runs (task failures and infra crashes alike) leave the
   sandbox pair alive, mark the run `kept_reason="debug"` in the state DB, emit
   a `run.keep` event, and print a hint naming the sandboxes and the shell
   command to inspect them. `--keep-sandboxes` runs are now marked
   `kept_reason="manual"` so `sandbox prune` respects them too.
+
 - **`sbxloop shell <run> [--role agent|github] [-c CMD]`** — opens an
   interactive shell (or runs a one-off command) inside a run's sandbox after
   verifying liveness via `sbx ls`. Works for kept, in-flight, and leaked
   sandboxes; the inner exit code is passed through.
+
 - **`sbxloop sandbox prune`** — garbage-collect orphaned `sbxloop-*` sandboxes
   left behind by crashed hosts or killed runs, by cross-referencing `sbx ls`
   against the state DB. Dry-run by default; `--force` removes, `--min-age`

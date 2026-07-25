@@ -28,6 +28,11 @@ def new_job_id() -> str:
     return "j" + _token(10)
 
 
+def new_message_id() -> str:
+    """Id for one interactive chat message posted into a run."""
+    return "m" + _token(10)
+
+
 def task_id(index: int) -> str:
     """Deterministic task ids within a run: t1, t2, ..."""
     if index < 1:

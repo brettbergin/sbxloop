@@ -11,17 +11,21 @@ Session strategy per phase (a deliberate design decision):
   workspace state the critic must inspect (a fresh sandbox per critic would
   cost minutes and lose it).
 - VERIFY is mechanical — shell commands, no LLM, no opinions.
+- STEER (interactive chat) runs as a fresh read-only session, like the
+  critics: it may inspect the workspace to answer the user accurately but
+  must not "helpfully" edit anything — direction changes flow back through
+  the engine as re-plans or standing guidance, never as direct edits.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Literal, NamedTuple, TypeVar
 
 from pydantic import BaseModel
 
 from sbxloop.config import Config
-from sbxloop.engine.model import PlanModel, TaskGraph, TaskRecord, Verdict
+from sbxloop.engine.model import PlanModel, SteerVerdict, TaskGraph, TaskRecord, Verdict
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
@@ -76,6 +80,16 @@ class PhaseRunner:
         # discovered workspace mount, or the harvest dir. Evidence and verify
         # commands must run where the executor wrote its files.
         self.workdir = workdir
+        # Standing chat guidance (steer_run verdicts), injected into every
+        # later plan/execute prompt. The engine appends live entries and
+        # replays persisted ones on resume.
+        self.user_guidance: list[str] = []
+
+    def add_guidance(self, text: str) -> None:
+        self.user_guidance.append(text)
+
+    def _guidance(self) -> str:
+        return bullet_list(self.user_guidance)
 
     # -- job plumbing ------------------------------------------------------
 
@@ -191,6 +205,7 @@ class PhaseRunner:
                 "task_description": task.spec.description or "(no further description)",
                 "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
                 "feedback": task.last_feedback or "(none — first attempt)",
+                "user_guidance": self._guidance(),
             },
             check=self._check_plan_egress,
         )
@@ -229,8 +244,46 @@ class PhaseRunner:
             plan_steps=bullet_list(plan.steps),
             expected_artifacts=bullet_list(plan.expected_artifacts),
             feedback=task.last_feedback or "(none — first attempt)",
+            user_guidance=self._guidance(),
         )
         return self._agent_job(prompt, permission_mode="auto", expect="text")
+
+    def steer(
+        self, message: str, *, tasks: Sequence[TaskRecord], task: TaskRecord | None
+    ) -> SteerVerdict:
+        """Answer one interactive chat message and rule on its course change.
+
+        ``task`` is the task the engine is currently driving (None between
+        tasks); ``tasks`` is the whole board, so the agent can speak to
+        overall progress.
+        """
+        board = bullet_list(
+            [f"{t.spec.id} [{t.state}] {t.spec.title}" for t in tasks],
+            empty="(the outcome has not been decomposed into tasks yet)",
+        )
+        if task is None:
+            current = "(no task is active right now — the run is between tasks)"
+        else:
+            plan_steps = bullet_list(task.plan.steps) if task.plan else "(not yet planned)"
+            current = (
+                f"Task {task.spec.id}: {task.spec.title} (state: {task.state}, "
+                f"revisions: {task.revisions}, replans: {task.replans})\n\n"
+                f"{task.spec.description or '(no further description)'}\n\n"
+                f"Plan steps:\n{plan_steps}\n\n"
+                f"Prior feedback:\n{task.last_feedback or '(none)'}"
+            )
+        return self._agent_json(
+            SteerVerdict,
+            "steer",
+            {
+                "outcome": self.outcome,
+                "tasks_summary": board,
+                "current_task": current,
+                "user_guidance": self._guidance(),
+                "user_message": message,
+            },
+            permission_mode="read_only",
+        )
 
     def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> Verdict:
         evidence_parts: list[str] = []

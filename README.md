@@ -76,6 +76,25 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
   SQLite after every transition; `sbxloop resume <run>` re-provisions sandboxes
   (they're cattle) and continues where it left off.
 
+### Chatting with a running loop
+
+A run is not read-only: type a message into the TUI's input line (Enter to send)
+and the agent pauses at the next checkpoint — the same phase boundary
+cancellation uses — to answer it in a fresh **read-only STEER session** that can
+inspect the workspace. The reply lands in the transcript, and the agent decides
+what your message means for the work:
+
+- **continue** — a question or status check; it answers and carries on.
+- **steer task** — the current task is re-planned immediately with your guidance
+  as feedback (user direction spends no revision/replan budget).
+- **steer run** — your guidance becomes a standing instruction injected into
+  every later planning/execution prompt, persisted so `sbxloop resume` keeps it.
+
+Messages queue while a phase is in flight (the status panel shows them), every
+chat turn is a persisted event (`sbxloop logs <run> --type chat.`), and
+`--no-chat` disables the input entirely. With `--no-tui`, plain line input on
+stdin does the same job.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory

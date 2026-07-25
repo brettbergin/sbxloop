@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -17,7 +19,7 @@ from rich.tree import Tree
 
 import sbxloop
 from sbxloop.cli.doctor import run_doctor
-from sbxloop.cli.tui import Dashboard, format_event, plain_printer, render_event
+from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RunResult, artifact_files, artifacts_dir
@@ -85,7 +87,7 @@ def _store(config: Config) -> StateStore:
     return StateStore(config.state_dir / "state.db")
 
 
-def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
+def _drive_with_ui(engine: LoopEngine, *, tui: bool, chat: bool = True, action: Any) -> RunResult:
     """Run start/resume with the scrollback transcript + pinned status, or
     plain event logs (--no-tui).
 
@@ -95,9 +97,18 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     the bottom is redrawn in place. Events arrive on the engine thread but
     every terminal write happens here on the main thread, via a queue —
     ordering stays deterministic and rich's Live never interleaves.
+
+    With ``chat`` on (and stdin a TTY), the user can type messages to the
+    running agent: the TUI captures keystrokes in cbreak mode and renders
+    the input line inside the pinned panel; --no-tui falls back to plain
+    line input. Messages queue on the engine and are absorbed at the next
+    phase boundary, where the agent pauses, replies, and applies any course
+    change before continuing.
     """
     if not tui:
         engine.bus.subscribe(plain_printer(console))
+        if chat and sys.stdin.isatty():
+            threading.Thread(target=_stdin_chat_reader, args=(engine,), daemon=True).start()
         return action()  # type: ignore[no-any-return]
 
     dashboard = Dashboard()
@@ -111,8 +122,18 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
         except BaseException as exc:
             outcome["error"] = exc
 
+    def submit(text: str) -> None:
+        dashboard.post_chat(engine.post_user_message(text), text)
+
+    chat_input = ChatInput(submit) if chat and ChatInput.available() else None
+
     thread = threading.Thread(target=target, daemon=True)
-    with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
+    with contextlib.ExitStack() as stack:
+        live = stack.enter_context(
+            Live(dashboard.renderable(), console=console, refresh_per_second=8)
+        )
+        if chat_input is not None:
+            stack.enter_context(chat_input)
 
         def drain() -> None:
             while True:
@@ -125,16 +146,37 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
                 if rendered is not None:
                     live.console.print(rendered)
 
+        def refresh() -> None:
+            line = chat_input.renderable() if chat_input is not None else None
+            live.update(dashboard.renderable(line))
+
         thread.start()
         while thread.is_alive():
             drain()
-            live.update(dashboard.renderable())
-            time.sleep(0.15)
+            refresh()
+            if chat_input is not None:
+                chat_input.pump(0.15)
+            else:
+                time.sleep(0.15)
         drain()
-        live.update(dashboard.renderable())
+        refresh()
+    if dashboard.chat_pending:
+        console.print(
+            "[yellow]chat message(s) the run ended before answering:[/] "
+            + "; ".join(dashboard.chat_pending.values())
+        )
     if "error" in outcome:
         raise outcome["error"]
     return outcome["result"]  # type: ignore[no-any-return]
+
+
+def _stdin_chat_reader(engine: LoopEngine) -> None:
+    """--no-tui chat: plain line input (terminal echo shows the typing)."""
+    with contextlib.suppress(ValueError, OSError):  # stdin closed mid-run
+        for line in sys.stdin:
+            text = line.strip()
+            if text:
+                engine.post_user_message(text)
 
 
 _TREE_MAX_FILES = 50
@@ -221,6 +263,14 @@ def run(
         ),
     ] = None,
     tui: Annotated[bool, typer.Option("--tui/--no-tui", help="Live dashboard.")] = True,
+    chat: Annotated[
+        bool,
+        typer.Option(
+            "--chat/--no-chat",
+            help="Interactive chat: type a message + Enter to pause the agent at the "
+            "next checkpoint, get an answer, and steer the run (needs a TTY).",
+        ),
+    ] = True,
 ) -> None:
     """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
     config = _config_with_overrides(
@@ -253,7 +303,7 @@ def run(
         raise typer.Exit(2)
     engine = LoopEngine(config)
     try:
-        result = _drive_with_ui(engine, tui=tui, action=lambda: engine.start(outcome))
+        result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.start(outcome))
     except SdxloopError as exc:
         console.print(f"[bold red]run failed:[/] {exc}")
         raise typer.Exit(2) from exc
@@ -264,12 +314,16 @@ def run(
 def resume(
     run_id: Annotated[str, typer.Argument(help="Run id to resume.")],
     tui: Annotated[bool, typer.Option("--tui/--no-tui")] = True,
+    chat: Annotated[
+        bool,
+        typer.Option("--chat/--no-chat", help="Interactive chat (see `sbxloop run --help`)."),
+    ] = True,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
     config = load_config()
     engine = LoopEngine(config)
     try:
-        result = _drive_with_ui(engine, tui=tui, action=lambda: engine.resume(run_id))
+        result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.resume(run_id))
     except SdxloopError as exc:
         console.print(f"[bold red]resume failed:[/] {exc}")
         raise typer.Exit(2) from exc

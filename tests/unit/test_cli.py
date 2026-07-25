@@ -70,6 +70,12 @@ class TestBasics:
         ):
             assert command in result.output
 
+    def test_run_and_resume_offer_chat_toggle(self) -> None:
+        for command in ("run", "resume"):
+            result = runner.invoke(app, [command, "--help"])
+            assert result.exit_code == 0
+            assert "--no-chat" in result.output
+
 
 class TestStatusAndLogs:
     def test_status_lists_runs(self, workdir: Path) -> None:
