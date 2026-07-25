@@ -39,6 +39,14 @@ All notable changes to sdxloop are documented here. The project adheres to
   orphan-candidate count. The runs table gained a `kept_reason` column (the
   kept-sandbox taxonomy prune respects; applied as an in-place migration).
 
+### Changed
+- The test suite runs parallel by default (pytest-xdist, `-n auto` with
+  work-stealing): ~8min → ~2.5min locally. Pass `-n0` for a serial run when
+  debugging with `-s`/`--pdb`. Two wheel-resolution tests were made hermetic:
+  they no longer plant or depend on wheels in the real installed package's
+  `_vendor/` directory, which raced with the build hook and real pip installs
+  under parallel execution.
+
 ### Fixed
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and
