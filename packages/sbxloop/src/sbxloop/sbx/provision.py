@@ -226,7 +226,7 @@ class Provisioner:
             self.cli.policy_allow(domain, sandbox=spec.name)
 
     def _apply_secrets(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
-        if self.config.secret_strategy == "plain-env":
+        if self.config.secret_strategy == "plain-env":  # nosec B105 - strategy label
             self._apply_plain_env(spec, sandbox, token)
             return
         for secret in spec.secrets:
@@ -267,7 +267,7 @@ class Provisioner:
         security tradeoff. If sbx later injects secrets into exec sessions,
         this check passes and the token stays out of the VM.
         """
-        if self.config.secret_strategy != "proxy":
+        if self.config.secret_strategy != "proxy":  # nosec B105 - strategy label
             # plain-env: the worker loads the env file itself; a shell
             # visibility check can never pass and would only produce noise.
             return

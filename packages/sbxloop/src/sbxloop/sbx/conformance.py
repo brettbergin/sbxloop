@@ -56,8 +56,8 @@ PROBE_EXEC_ERROR_CHANNEL = "exec-error-channel"
 PROBE_CP_DIR_SEMANTICS = "cp-dir-semantics"
 PROBE_WORKSPACE_MOUNT = "workspace-mount"
 PROBE_PYTHON3_VENV = "python3-venv"
-PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"
-PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"
+PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"  # nosec B105 - probe name
+PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"  # nosec B105 - probe name
 
 VERDICT_ERROR = "error"
 VERDICT_UNPROBED = "unprobed"
@@ -199,7 +199,7 @@ def _probe_python3_venv(ctx: ProbeContext) -> tuple[str, str]:
 
 _VIS_PROBE_ENV = "SBXLOOP_CONFORMANCE_VIS"
 _DUP_PROBE_ENV = "SBXLOOP_CONFORMANCE_DUP"
-_PROBE_SECRET_HOST = "example.com"
+_PROBE_SECRET_HOST = "example.com"  # nosec B105 - hostname, not a secret
 
 
 def _cleanup_probe_secret(cli: SbxCLI, env: str, sandbox: str) -> None:

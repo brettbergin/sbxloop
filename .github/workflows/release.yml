@@ -26,6 +26,7 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy
+      - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
       - run: uv run pytest
 
   release:

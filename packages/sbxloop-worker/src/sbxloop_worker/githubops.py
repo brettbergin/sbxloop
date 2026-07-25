@@ -61,7 +61,7 @@ class GhCliTransport:
         if body is not None:
             argv += ["--input", "-"]
             stdin = json.dumps(body)
-        proc = subprocess.run(
+        proc = subprocess.run(  # nosec B603 - list argv, gh CLI, no shell
             argv, capture_output=True, text=True, input=stdin, timeout=120, check=False
         )
         if proc.returncode != 0:
@@ -87,6 +87,10 @@ class RestTransport:
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
         url = path if path.startswith("http") else f"{API_ROOT}{path}"
+        # The bearer token rides on every request: never let it travel over
+        # anything but HTTPS (also rules out file:// and custom schemes).
+        if not url.startswith("https://"):
+            raise GithubOpError(f"refusing non-HTTPS GitHub API URL: {url}")
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(
             url,
@@ -101,7 +105,7 @@ class RestTransport:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - https enforced above
                 raw = response.read().decode()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]

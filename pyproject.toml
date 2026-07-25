@@ -8,6 +8,7 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "pytest-xdist>=3.6",
+    "bandit>=1.8",
     "mdformat>=0.7.22",
     "mdformat-gfm>=0.4.1",
 ]
@@ -37,6 +38,14 @@ select = [
 "packages/*/tests/**" = ["T20"]
 # The worker communicates over stdout by design.
 "packages/sbxloop-worker/src/sbxloop_worker/**" = ["T20"]
+
+[tool.bandit]
+# B101: asserts here are mypy-strict type-narrowing invariants on internal
+#       state, not input validation; nothing runs under python -O.
+# B404: informational "subprocess imported" — spawning sbx/worker processes
+#       is this tool's core function; each call site carries its own vetted
+#       `# nosec B603` (fixed argv lists, never shell=True).
+skips = ["B101", "B404"]
 
 [tool.mypy]
 strict = true

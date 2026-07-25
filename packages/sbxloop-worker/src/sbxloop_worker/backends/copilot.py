@@ -17,6 +17,7 @@ from unit coverage accordingly.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from typing import Any
@@ -272,9 +273,9 @@ class CopilotBackend:
     async def _close_session(session: Any) -> None:
         disconnect = getattr(session, "disconnect", None)
         if disconnect is not None:
-            try:
+            # Best-effort teardown: a failed disconnect must never mask the
+            # job outcome already produced.
+            with contextlib.suppress(Exception):
                 result = disconnect()
                 if asyncio.iscoroutine(result):
                     await result
-            except Exception:
-                pass

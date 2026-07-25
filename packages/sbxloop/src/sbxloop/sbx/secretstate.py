@@ -38,14 +38,14 @@ from sbxloop.sbx.models import SandboxSpec
 
 logger = logging.getLogger(__name__)
 
-COPILOT_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"
+COPILOT_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"  # nosec B105 - env var name, not a secret
 
 # The PAT is exchanged for a Copilot API token at api.github.com; the
 # exchanged token lives in SDK process memory, so the copilot API hosts only
 # need network allows - never an env rewrite. One env var also cannot be
 # registered twice: sbx keys custom secrets by env name, so binding the same
 # env to two hosts fails with "already exists".
-COPILOT_TOKEN_HOST = "api.github.com"
+COPILOT_TOKEN_HOST = "api.github.com"  # nosec B105 - hostname, not a secret
 
 # Every sbxloop sandbox (and therefore every sandbox-scoped registration
 # sbxloop creates) is named with this prefix.
