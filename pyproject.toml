@@ -11,7 +11,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py313"
 src = ["packages/sbxloop/src", "packages/sbxloop-worker/src", "tests"]
 
 [tool.ruff.lint]
@@ -37,7 +37,7 @@ select = [
 
 [tool.mypy]
 strict = true
-python_version = "3.11"
+python_version = "3.13"
 mypy_path = ["packages/sbxloop/src", "packages/sbxloop-worker/src"]
 files = ["packages/sbxloop/src", "packages/sbxloop-worker/src"]
 explicit_package_bases = true
