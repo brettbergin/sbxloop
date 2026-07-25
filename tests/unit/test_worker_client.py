@@ -437,6 +437,136 @@ class TestRealPipInstall:
         assert result.stdout.strip() == sbxloop.__version__
 
 
+def script_ladder_success(fake_sbx: FakeSbx) -> None:
+    """Script the full install ladder to succeed (venv, pip, checks)."""
+    import sbxloop
+
+    fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+    fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+    fake_sbx.script(
+        "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+        stdout=f"{sbxloop.__version__}\n",
+    )
+    fake_sbx.script(
+        "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
+    )
+
+
+class TestPrebakedTemplate:
+    """expect_prebaked: verify the baked worker with fast probes and skip the
+    install ladder; ANY probe failure degrades to the ladder, never the run."""
+
+    def write_manifest(self, sandbox: Sandbox, *, python: str, version: str | None = None) -> None:
+        import sbxloop
+
+        manifest = {
+            "worker_version": version or sbxloop.__version__,
+            "python": python,
+            "runtime_cached": True,
+            "baked_at": 0.0,
+        }
+        sandbox.write_text("/home/agent/.sbxloop/bake.json", json.dumps(manifest))
+
+    def test_verified_prebaked_skips_ladder(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        """The REAL probe chain: manifest read, import/version check, and
+        entrypoint smoke all run genuinely (sys.executable has the worker
+        importable) — no scripting, no ladder invocations."""
+        self.write_manifest(sandbox, python=sys.executable)
+        client = make_client(sandbox, EventBus(), python="python3")
+        client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
+
+        assert client.prebaked
+        assert client.python == sys.executable  # adopted from the manifest
+        joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j or "apt-get" in j]
+        # no wheel was staged either — the fast path never resolves one
+        assert not [c for c in fake_sbx.invocations("cp") if any(".whl" in a for a in c)]
+
+    def test_missing_manifest_falls_back_to_ladder(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        script_ladder_success(fake_sbx)
+        client = make_client(sandbox, EventBus())
+        client.install(wheel=wheel, expect_prebaked=True)
+        assert not client.prebaked
+        assert [c for c in fake_sbx.invocations("exec") if "-m venv" in " ".join(c)]
+
+    def test_stale_version_falls_back_and_warns(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        self.write_manifest(sandbox, python=sys.executable, version="0.0.0")
+        script_ladder_success(fake_sbx)
+        client = make_client(sandbox, EventBus())
+        with caplog.at_level("WARNING"):
+            client.install(wheel=wheel, expect_prebaked=True)
+        assert not client.prebaked
+        assert any("stale template" in r.getMessage() for r in caplog.records)
+        assert any("sbxloop bake" in r.getMessage() for r in caplog.records)
+
+    def test_corrupt_manifest_falls_back(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        sandbox.write_text("/home/agent/.sbxloop/bake.json", "not json{")
+        script_ladder_success(fake_sbx)
+        client = make_client(sandbox, EventBus())
+        client.install(wheel=wheel, expect_prebaked=True)
+        assert not client.prebaked
+
+    def test_broken_baked_python_falls_back(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Manifest points at an interpreter that fails the version probe
+        (e.g. the venv did not survive into the template)."""
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        self.write_manifest(sandbox, python="false")
+        script_ladder_success(fake_sbx)
+        client = make_client(sandbox, EventBus())
+        client.install(wheel=wheel, expect_prebaked=True)
+        assert not client.prebaked
+
+    def test_smoke_probe_failure_falls_back(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Version probe passes but the entrypoint probe does not exit 64."""
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        self.write_manifest(sandbox, python=sys.executable)
+        fake_sbx.script(
+            f"exec boxa {sys.executable} -m sbxloop_worker",
+            returncode=1,
+            stderr="entrypoint broken in template",
+            once=True,
+        )
+        script_ladder_success(fake_sbx)
+        client = make_client(sandbox, EventBus())
+        client.install(wheel=wheel, expect_prebaked=True)
+        assert not client.prebaked
+
+    def test_without_flag_manifest_is_ignored(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """No configured template → no probe execs, straight to the ladder."""
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        self.write_manifest(sandbox, python=sys.executable)
+        script_ladder_success(fake_sbx)
+        client = make_client(sandbox, EventBus())
+        client.install(wheel=wheel)
+        assert not client.prebaked
+        assert not [c for c in fake_sbx.invocations("exec") if "cat" in c]
+
+
 class TestNoResultDiagnostics:
     def test_missing_result_error_carries_rc_and_stderr(
         self, sandbox: Sandbox, tmp_path: Path

@@ -35,6 +35,20 @@ sbxloop doctor --deep   # + full sbx conformance suite in a scratch sandbox
 sbxloop run "Add mypy strict typing to every module in ./src and fix all findings"
 ```
 
+Optional, but cuts provisioning latency a lot: bake a sandbox template with
+the worker preinstalled once, instead of installing it on every run.
+
+```bash
+sbxloop bake            # installs the worker + Copilot runtime into a template
+# then set in sbxloop.toml:
+#   [sandbox]
+#   template = "sbxloop-baked:latest"
+```
+
+Runs verify the baked worker with fast probes and fall back to the normal
+install if the template is stale (`sbxloop doctor` will tell you to re-bake
+after upgrading sbxloop).
+
 Or as a library:
 
 ```python

@@ -74,7 +74,7 @@ class Harness:
         state = self.script_path.with_suffix(".json.state")
         state.unlink(missing_ok=True)
 
-    def engine(self, **config_overrides: Any) -> LoopEngine:
+    def engine(self, *, install_workers: bool = False, **config_overrides: Any) -> LoopEngine:
         # Resource guardrails default OFF in the harness: the real worker
         # samples the host filesystem here, so default thresholds would make
         # tests depend on how full the developer's disk is.
@@ -95,7 +95,7 @@ class Harness:
             bus=bus,
             sbx=SbxCLI(binary=str(self.fake_sbx.binary)),
             worker_python=sys.executable,
-            install_workers=False,
+            install_workers=install_workers,
         )
 
     def event_types(self) -> list[str]:
@@ -659,6 +659,59 @@ class TestDeliverHook:
         result = harness.engine().start("plain run")
         assert result.state == "completed"
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
+
+
+class TestPrebakedTemplate:
+    """[sandbox].template + a baked template: install verifies and skips the
+    ladder, and the run emits sandbox.prebaked telemetry."""
+
+    REF = "sbxloop-baked:latest"
+
+    def seed_template(self, harness: Harness, *, version: str | None = None) -> None:
+        """Bake a template the fake-sbx way: seed sandbox fs with a manifest
+        whose interpreter is the test python, save, remove."""
+        import sbxloop
+        from sbxloop.sbx.models import SandboxSpec
+        from sbxloop.sbx.sandbox import Sandbox
+
+        cli = SbxCLI(binary=str(harness.fake_sbx.binary))
+        workspace = harness.tmp_path / "seed-ws"
+        workspace.mkdir(exist_ok=True)
+        cli.create(SandboxSpec(name="seed", role="agent", workspace=workspace))
+        manifest = {
+            "worker_version": version or sbxloop.__version__,
+            "python": sys.executable,
+            "runtime_cached": True,
+            "baked_at": 0.0,
+        }
+        Sandbox(cli, "seed").write_text("/home/agent/.sbxloop/bake.json", json.dumps(manifest))
+        cli.template_save("seed", self.REF)
+        cli.rm("seed")
+
+    def test_prebaked_run_skips_install_and_emits_event(self, harness: Harness) -> None:
+        self.seed_template(harness)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(install_workers=True, sandbox={"template": self.REF}).start(
+            "use the baked template"
+        )
+
+        assert result.state == "completed"
+        # provisioning created the agent sandbox FROM the template
+        creates = harness.fake_sbx.invocations("create")
+        assert any(self.REF in arg for c in creates for arg in c)
+        # verified prebaked → the whole install ladder was skipped
+        joined = [" ".join(c) for c in harness.fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j or "apt-get" in j]
+        prebaked = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_PREBAKED]
+        assert len(prebaked) == 1
+        assert prebaked[0].data["prebaked"] is True
+        assert prebaked[0].data["template"] == self.REF
+
+    def test_no_template_emits_no_prebaked_event(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("plain run")
+        assert result.state == "completed"
+        assert [e for e in harness.events if e.type == HostEventTypes.SANDBOX_PREBAKED] == []
 
 
 class TestResourceGuardrail:
