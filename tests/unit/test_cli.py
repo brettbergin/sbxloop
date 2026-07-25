@@ -914,3 +914,90 @@ class TestDoctorRendering:
         # the table may fold the hint across lines; assert on whole words
         assert "--app-name" in result.output
         assert "sbxloop-iso" in result.output
+
+
+class TestResourceGauge:
+    def sample_event(self, **data: Any) -> Any:
+        from sbxloop.events import Event
+
+        base: dict[str, Any] = {
+            "role": "agent",
+            "level": "ok",
+            "disk_used_pct": 42.0,
+            "mem_used_pct": 31.0,
+            "load1": 0.5,
+        }
+        base.update(data)
+        return Event.now("sandbox.resources", "r1", **base)
+
+    def test_gauge_renders_in_status_panel(self) -> None:
+        from rich.console import Console
+
+        from sbxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        dashboard.on_event(self.sample_event())
+        dashboard.on_event(self.sample_event(role="github", disk_used_pct=12.0))
+        console = Console(record=True, width=100)
+        console.print(dashboard.renderable())
+        text = console.export_text()
+        assert "agent: disk 42%" in text
+        assert "mem 31%" in text
+        assert "load 0.5" in text
+        assert "github: disk 12%" in text
+
+    def test_gauge_escalates_past_thresholds(self) -> None:
+        from rich.console import Console
+
+        from sbxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        dashboard.on_event(self.sample_event(level="abort", disk_used_pct=97.0))
+        console = Console(record=True, width=100)
+        console.print(dashboard.renderable())
+        assert "⚠ abort" in console.export_text()
+
+    def test_samples_stay_out_of_transcript(self) -> None:
+        from sbxloop.cli.tui import render_event
+
+        assert render_event(self.sample_event()) is None
+
+    def test_warning_event_prints_to_transcript(self) -> None:
+        from rich.console import Console
+
+        from sbxloop.cli.tui import render_event
+        from sbxloop.events import Event
+
+        rendered = render_event(
+            Event.now(
+                "sandbox.resources_warning",
+                "r1",
+                level="warn",
+                message="sandbox resources under pressure: disk 90.0% used (disk_warn: 85.0%)",
+            )
+        )
+        assert rendered is not None
+        console = Console(record=True, width=120)
+        console.print(rendered)
+        assert "disk 90.0% used" in console.export_text()
+
+    def test_format_event_shows_resource_summary(self) -> None:
+        from sbxloop.cli.tui import format_event
+
+        line = format_event(self.sample_event(level="warn"))
+        assert "disk=42.0%" in line
+        assert "mem=31.0%" in line
+        assert "warn" in line
+
+
+class TestDoctorStatsProbe:
+    def test_doctor_reports_in_vm_sampling(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "sandbox stats" in result.output
+        # fake sbx (like real 0.35.x) has no stats command -> in-VM sampling
+        assert "samples in-VM" in result.output

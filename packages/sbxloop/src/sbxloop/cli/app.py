@@ -655,6 +655,15 @@ max_replans_per_task = 1
 max_tasks = 20
 max_wall_clock_s = 7200.0
 per_job_timeout_s = 900.0
+
+[limits]
+# Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
+# the worker heartbeat and shown as a gauge in the TUI status panel.
+# Crossing disk_abort fails the current task with an explicit
+# "sandbox disk exhausted" error.
+disk_warn = 85.0
+disk_abort = 95.0
+mem_warn = 90.0
 """
 
 

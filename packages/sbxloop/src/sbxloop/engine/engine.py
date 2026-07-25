@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from sbxloop.config import Config, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace
@@ -75,15 +76,27 @@ class LoopEngine:
             install_workers if install_workers is not None else self.config.install_workers
         )
         self.clock = clock
+        # Latest sandbox.resources sample per sandbox role, fed by the bus;
+        # consulted for the disk guardrail and the harvest-truncation note.
+        self._last_resources: dict[str, dict[str, object]] = {}
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
+        self.bus.subscribe(self._track_resources)
 
     def _persist_event(self, event: object) -> None:
         from sbxloop_worker.protocol import Event
 
         assert isinstance(event, Event)
         self.store.append_event(event)
+
+    def _track_resources(self, event: object) -> None:
+        from sbxloop_worker.protocol import Event, EventTypes
+
+        assert isinstance(event, Event)
+        if event.type == EventTypes.SANDBOX_RESOURCES:
+            role = str(event.data.get("role") or "agent")
+            self._last_resources[role] = dict(event.data)
 
     # -- public API --------------------------------------------------------
 
@@ -124,6 +137,8 @@ class LoopEngine:
                         self.bus,
                         transport=self.config.worker_transport,
                         python=self.worker_python,
+                        role="agent",
+                        limits=self.config.limits,
                     )
                     github = (
                         WorkerClient(
@@ -131,6 +146,8 @@ class LoopEngine:
                             self.bus,
                             transport=self.config.worker_transport,
                             python=self.worker_python,
+                            role="github",
+                            limits=self.config.limits,
                         )
                         if pair.github is not None
                         else None
@@ -249,12 +266,28 @@ class LoopEngine:
         if target is None or not target.is_dir():
             return
         count = sum(1 for p in target.rglob("*") if p.is_file())
+        extra: dict[str, Any] = {}
+        sample = self._last_resources.get("agent")
+        if sample and sample.get("level") in ("warn", "abort"):
+            # Disk was under pressure at the last sample — harvested
+            # artifacts may be truncated or missing.
+            extra = {
+                "disk_used_pct": sample.get("disk_used_pct"),
+                "resources_level": sample.get("level"),
+            }
+            logger.warning(
+                "run %s: sandbox disk was at %s%% at the last sample — "
+                "harvested artifacts may be incomplete",
+                run_id,
+                sample.get("disk_used_pct"),
+            )
         self.bus.emit(
             HostEventTypes.RUN_ARTIFACTS,
             run_id,
             path=str(target),
             files=count,
             mounted=pair.mounted,
+            **extra,
         )
 
     def _deliver(
@@ -374,6 +407,14 @@ class LoopEngine:
 
         while not task.terminal:
             self._check_cancelled_and_clock(run_id, deadline)
+            abort_reason = self._resource_abort_reason()
+            if abort_reason:
+                # Fail the task with a diagnosis instead of letting the next
+                # phase produce garbage in a full sandbox. Dependents are
+                # skipped by the normal failed-task machinery.
+                task.last_feedback = abort_reason
+                self._set_task_state(run_id, task, "failed")
+                break
             if task.state == "planning":
                 self._phase_plan(run_id, phases, task)
             elif task.state == "executing":
@@ -509,6 +550,18 @@ class LoopEngine:
             self._set_task_state(run_id, task, "executing")
 
     # -- bookkeeping -------------------------------------------------------
+
+    def _resource_abort_reason(self) -> str | None:
+        """Non-None when the agent sandbox's last resource sample crossed
+        the disk_abort threshold (the worker classifies; the level rides on
+        the event)."""
+        sample = self._last_resources.get("agent")
+        if sample and sample.get("level") == "abort":
+            return (
+                f"sandbox disk exhausted: {sample.get('disk_used_pct')}% of the workspace "
+                f"filesystem is used (limits.disk_abort={self.config.limits.disk_abort}%)"
+            )
+        return None
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
         if self.store.get_run(run_id).state == "cancelled":
