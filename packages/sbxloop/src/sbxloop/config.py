@@ -18,7 +18,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from sbxloop.errors import ConfigError
 
@@ -40,6 +47,35 @@ class SandboxConfig(_ConfigModel):
     template: str | None = None
     workspace: Path | None = None
     extra_allow_domains: list[str] = Field(default_factory=list)
+
+
+class PolicyConfig(_ConfigModel):
+    """Operator bounds for plan-declared egress.
+
+    The PLAN phase may request extra network allows for EXECUTE (each with a
+    justification). Requests are auto-granted just before EXECUTE only when
+    they match ``allow`` and no ``deny`` pattern; everything is event-logged
+    (``sbxloop logs RUN --type policy.``). Patterns are exact domains,
+    ``*.example.com`` wildcards (the domain and all subdomains), or ``*``
+    (everything). Empty ``allow`` — the default — means plans may only use
+    the always-reachable baseline (Copilot/GitHub hosts, PyPI, apt mirrors).
+    """
+
+    allow: list[str] = Field(default_factory=list)
+    deny: list[str] = Field(default_factory=list)
+
+    @field_validator("allow", "deny")
+    @classmethod
+    def _check_patterns(cls, value: list[str]) -> list[str]:
+        from sbxloop.policy import valid_pattern
+
+        value = [p.strip().lower() for p in value]
+        bad = [p for p in value if not valid_pattern(p, operator=True)]
+        if bad:
+            raise ValueError(
+                f"invalid egress pattern(s) {bad}: use a domain, *.domain wildcard, or *"
+            )
+        return value
 
 
 class GithubConfig(_ConfigModel):
@@ -68,6 +104,35 @@ class GithubConfig(_ConfigModel):
         return self.repo is not None
 
 
+class Limits(_ConfigModel):
+    """Sandbox resource guardrails, sampled in-VM on the worker heartbeat.
+
+    Thresholds are percent-used of the workspace filesystem / memory; 0
+    disables a guardrail. Crossing a warn threshold emits a prominent
+    ``sandbox.resources_warning`` event and escalates the TUI gauge;
+    crossing ``disk_abort`` fails the current task with an explicit
+    "sandbox disk exhausted" error instead of letting in-VM tooling fail
+    confusingly on a full disk.
+    """
+
+    disk_warn: float = 85.0
+    disk_abort: float = 95.0
+    mem_warn: float = 90.0
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> Limits:
+        for name in ("disk_warn", "disk_abort", "mem_warn"):
+            value = getattr(self, name)
+            if value < 0 or value > 100:
+                raise ValueError(f"limits.{name} must be a percentage in 0..100, got {value}")
+        if 0 < self.disk_abort <= self.disk_warn:
+            raise ValueError(
+                f"limits.disk_abort ({self.disk_abort}) must be greater than "
+                f"limits.disk_warn ({self.disk_warn})"
+            )
+        return self
+
+
 class Budgets(_ConfigModel):
     max_revisions_per_task: int = 2
     max_replans_per_task: int = 1
@@ -85,6 +150,11 @@ class Config(_ConfigModel):
     app_name: str = ""
     state_dir: Path = Path(".sbxloop")
     keep_sandboxes: bool = False
+    # Keep the pair alive only when a run fails, so the evidence (worker
+    # stderr, install leftovers, workspace state) survives for
+    # `sbxloop shell <run>`. Kept runs are marked in the state DB and
+    # eventually collectable via `sbxloop sandbox prune --include-kept`.
+    keep_on_failure: bool = False
     worker_transport: WorkerTransport = "stream"
     secret_strategy: SecretStrategy = "proxy"
     # Advanced: in-sandbox interpreter for the worker, and whether to run the
@@ -93,8 +163,10 @@ class Config(_ConfigModel):
     worker_python: str = "/home/agent/.sbxloop/venv/bin/python"
     install_workers: bool = True
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
     budgets: Budgets = Field(default_factory=Budgets)
+    limits: Limits = Field(default_factory=Limits)
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

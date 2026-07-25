@@ -62,9 +62,23 @@ Envelope: `{v, ts, run_id, job_id?, type, data}` — one JSON object per line.
 
 - Worker: `worker.start|heartbeat|result|error|end`, `agent.message`,
   `agent.message_delta`, `agent.tool_start|tool_end`, `agent.usage`,
-  `gh.op_start|op_end`
+  `gh.op_start|op_end`, `sandbox.resources|resources_warning`
 - Host: `run.start|state|end`, `task.start|state|end`, `phase.start|end`,
   `sandbox.provision_start|ready|cleanup`, `worker.stdout`
+
+### Resource telemetry
+
+`sandbox.resources` is emitted once at job start and then on every heartbeat:
+disk usage of the workspace filesystem (statvfs), memory from
+`/proc/meminfo`, 1-minute load average, plus a guardrail `level`
+(`ok`/`warn`/`abort`) classified against the `--disk-warn`/`--disk-abort`/
+`--mem-warn` thresholds the host passes from `[limits]`. The host enriches
+the event with the sandbox `role`. Escalations (ok→warn, →abort) emit an
+additional edge-triggered `sandbox.resources_warning`. When a job fails after
+crossing `disk_abort`, the worker rewrites the result error to
+`SandboxResourcesExhausted` so a full disk is diagnosed instead of surfacing
+as whatever confusing error the in-VM tooling produced. Query history with
+`sbxloop logs <run> --type-prefix sandbox.resources`.
 
 ## GitHub ops
 

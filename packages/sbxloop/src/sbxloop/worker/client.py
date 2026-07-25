@@ -27,7 +27,7 @@ from collections import deque
 from pathlib import Path
 
 import sbxloop
-from sbxloop.config import WorkerTransport
+from sbxloop.config import Limits, WorkerTransport
 from sbxloop.errors import SbxError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
 from sbxloop.sbx.models import ExecResult
@@ -61,6 +61,8 @@ class WorkerClient:
         python: str = DEFAULT_PYTHON,
         poll_interval: float = 2.0,
         grace_s: float = 60.0,
+        role: str | None = None,
+        limits: Limits | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.bus = bus or EventBus()
@@ -68,6 +70,11 @@ class WorkerClient:
         self.python = python
         self.poll_interval = poll_interval
         self.grace_s = grace_s
+        # Sandbox role for enriching resource telemetry (the worker doesn't
+        # know which sandbox it lives in), and guardrail thresholds to pass
+        # through to the worker's heartbeat sampler.
+        self.role = role
+        self.limits = limits
 
     # -- install -----------------------------------------------------------
 
@@ -266,6 +273,15 @@ class WorkerClient:
         # process itself chdirs there — agent SDK sessions inherit it.
         if job.cwd:
             argv += ["--cwd", job.cwd]
+        if self.limits is not None:
+            argv += [
+                "--disk-warn",
+                str(self.limits.disk_warn),
+                "--disk-abort",
+                str(self.limits.disk_abort),
+                "--mem-warn",
+                str(self.limits.mem_warn),
+            ]
         # sbx injects secrets through the sandbox session/profile machinery;
         # a bare exec'd process may not see them. Run the worker under a
         # login shell so the sandbox environment is fully loaded.
@@ -338,6 +354,11 @@ class WorkerClient:
                 Event.now(EventTypes.WORKER_STDOUT, job.run_id, job_id=job.job_id, line=line)
             )
             return
+        if self.role is not None and event.type in (
+            EventTypes.SANDBOX_RESOURCES,
+            EventTypes.SANDBOX_RESOURCES_WARNING,
+        ):
+            event.data.setdefault("role", self.role)
         self.bus.publish(event)
 
     # -- poll transport ----------------------------------------------------

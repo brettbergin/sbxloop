@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from sbxloop.errors import SbxError, SbxNotFoundError
-from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.cli import SbxCLI, redacted_argv
 from sbxloop.sbx.models import SandboxSpec, SecretSpec
 from tests.conftest import FakeSbx
 
@@ -184,6 +184,53 @@ class TestSecrets:
             "--value",
             "github_pat_x",
         ]
+
+
+class TestSecretRedaction:
+    """Secret values must never surface through argv-carrying errors/results.
+
+    The subprocess still receives the real value (asserted by
+    test_secret_set_custom above); everything observable — ExecResult.argv,
+    SbxError.argv, and therefore str(exc), logs, and events — must carry the
+    masked copy.
+    """
+
+    def test_redacted_argv_masks_flag_value(self) -> None:
+        argv = ["sbx", "secret", "set-custom", "-g", "--value", "github_pat_SECRET"]
+        assert redacted_argv(argv) == ["sbx", "secret", "set-custom", "-g", "--value", "***"]
+
+    def test_redacted_argv_masks_equals_form(self) -> None:
+        argv = ["sbx", "secret", "set-custom", "--value=github_pat_SECRET"]
+        assert redacted_argv(argv) == ["sbx", "secret", "set-custom", "--value=***"]
+
+    def test_redacted_argv_leaves_normal_args_alone(self) -> None:
+        argv = ["sbx", "exec", "boxa", "echo", "hi"]
+        assert redacted_argv(argv) == argv
+
+    def test_trailing_secret_flag_without_value(self) -> None:
+        argv = ["sbx", "secret", "set-custom", "--value"]
+        assert redacted_argv(argv) == argv
+
+    def test_set_custom_failure_never_leaks_the_value(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
+        fake_sbx.fail_next("secret set-custom", returncode=125, stderr="daemon exploded")
+        with pytest.raises(SbxError) as excinfo:
+            cli.secret_set_custom(
+                host="api.github.com",
+                env="COPILOT_GITHUB_TOKEN",
+                value="github_pat_SUPERSECRET",
+                sandbox="boxa",
+            )
+        text = str(excinfo.value)
+        assert "github_pat_SUPERSECRET" not in text
+        assert "***" in text
+        assert "github_pat_SUPERSECRET" not in " ".join(excinfo.value.argv)
+
+    def test_exec_result_argv_is_redacted(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
+        result = cli.run(
+            "secret", "set-custom", "-g", "--host", "h", "--env", "E", "--value", "tok_SECRET"
+        )
+        assert "tok_SECRET" not in result.argv
+        assert "***" in result.argv
 
 
 class TestSecretSpecModel:

@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     workspace  TEXT,
-    mounted    INTEGER NOT NULL DEFAULT 0
+    mounted    INTEGER NOT NULL DEFAULT 0,
+    kept_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -75,6 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id, seq);
 _RUNS_MIGRATIONS = (
     ("workspace", "ALTER TABLE runs ADD COLUMN workspace TEXT"),
     ("mounted", "ALTER TABLE runs ADD COLUMN mounted INTEGER NOT NULL DEFAULT 0"),
+    ("kept_reason", "ALTER TABLE runs ADD COLUMN kept_reason TEXT"),
 )
 
 
@@ -130,6 +132,18 @@ class StateStore:
             raise StateError(f"unknown run {run_id}")
         self._conn.commit()
 
+    def set_run_kept(self, run_id: str, reason: str | None) -> None:
+        """Mark a run's sandboxes as deliberately kept (``"debug"``,
+        ``"manual"``), or clear the marker with None. ``sandbox prune``
+        excludes kept runs unless explicitly told otherwise."""
+        cursor = self._conn.execute(
+            "UPDATE runs SET kept_reason = ? WHERE run_id = ?",
+            (reason, run_id),
+        )
+        if cursor.rowcount == 0:
+            raise StateError(f"unknown run {run_id}")
+        self._conn.commit()
+
     @staticmethod
     def _run_record(row: sqlite3.Row) -> RunRecord:
         return RunRecord(
@@ -140,6 +154,7 @@ class StateStore:
             updated_at=row["updated_at"],
             workspace=Path(row["workspace"]) if row["workspace"] else None,
             mounted=bool(row["mounted"]),
+            kept_reason=row["kept_reason"],
         )
 
     def get_run(self, run_id: str) -> RunRecord:
@@ -242,6 +257,18 @@ class StateStore:
         )
 
     # -- events ------------------------------------------------------------
+
+    def last_event_ts(self, run_id: str) -> float | None:
+        """Timestamp of the run's most recent persisted event, if any.
+
+        Every bus event (heartbeats included) is persisted, so this is the
+        best liveness signal available for a run whose recorded state says
+        non-terminal but whose process may be long dead.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(ts) AS ts FROM events WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return row["ts"] if row and row["ts"] is not None else None
 
     def append_event(self, event: Event) -> None:
         self._conn.execute(

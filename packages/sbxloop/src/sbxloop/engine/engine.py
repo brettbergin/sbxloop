@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from sbxloop.config import Config, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace
@@ -32,8 +33,6 @@ from sbxloop.engine.phases import PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
-    DeliveryError,
-    GithubOpsError,
     SbxError,
     SdxloopError,
     StateError,
@@ -42,6 +41,7 @@ from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_run_id
+from sbxloop.policy import EgressGranter
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
@@ -77,15 +77,27 @@ class LoopEngine:
             install_workers if install_workers is not None else self.config.install_workers
         )
         self.clock = clock
+        # Latest sandbox.resources sample per sandbox role, fed by the bus;
+        # consulted for the disk guardrail and the harvest-truncation note.
+        self._last_resources: dict[str, dict[str, object]] = {}
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
+        self.bus.subscribe(self._track_resources)
 
     def _persist_event(self, event: object) -> None:
         from sbxloop_worker.protocol import Event
 
         assert isinstance(event, Event)
         self.store.append_event(event)
+
+    def _track_resources(self, event: object) -> None:
+        from sbxloop_worker.protocol import Event, EventTypes
+
+        assert isinstance(event, Event)
+        if event.type == EventTypes.SANDBOX_RESOURCES:
+            role = str(event.data.get("role") or "agent")
+            self._last_resources[role] = dict(event.data)
 
     # -- public API --------------------------------------------------------
 
@@ -115,44 +127,67 @@ class LoopEngine:
         pair = provisioner.ensure_pair(run_id)
         assert pair.workspace is not None
         self.store.set_run_workspace(run_id, pair.workspace, pair.mounted)
+        if pair.keep:
+            # keep_sandboxes: mark up front so `sandbox prune` respects it.
+            self.store.set_run_kept(run_id, "manual")
         try:
             with pair:
-                agent = WorkerClient(
-                    pair.agent,
-                    self.bus,
-                    transport=self.config.worker_transport,
-                    python=self.worker_python,
-                )
-                github = (
-                    WorkerClient(
-                        pair.github,
+                try:
+                    agent = WorkerClient(
+                        pair.agent,
                         self.bus,
                         transport=self.config.worker_transport,
                         python=self.worker_python,
+                        role="agent",
+                        limits=self.config.limits,
                     )
-                    if pair.github is not None
-                    else None
-                )
-                if self.install_workers:
-                    # ensure_dev_tools: the agent builds projects in this VM
-                    # (venvs, pip) — the github sandbox only runs API ops.
-                    agent.install(extras="copilot", ensure_dev_tools=True)
-                    if github is not None:
-                        github.install(extras="")
-                detach = self._attach_reporter(github, run_id)
-                try:
-                    phases = PhaseRunner(
-                        agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                    github = (
+                        WorkerClient(
+                            pair.github,
+                            self.bus,
+                            transport=self.config.worker_transport,
+                            python=self.worker_python,
+                            role="github",
+                            limits=self.config.limits,
+                        )
+                        if pair.github is not None
+                        else None
                     )
-                    state = self._run_phases(run_id, phases, deadline, pair)
-                finally:
-                    detach()
-                    # Harvest even when a phase raised: the sandbox is still
-                    # alive here, and partial artifacts beat none.
-                    self._harvest(run_id, pair)
-                    self._report_artifacts(run_id, pair)
+                    if self.install_workers:
+                        # ensure_dev_tools: the agent builds projects in this VM
+                        # (venvs, pip) — the github sandbox only runs API ops.
+                        agent.install(extras="copilot", ensure_dev_tools=True)
+                        if github is not None:
+                            github.install(extras="")
+                    reporter, detach = self._attach_reporter(github, run_id, outcome)
+                    try:
+                        phases = PhaseRunner(
+                            agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                        )
+                        granter = EgressGranter(
+                            self.sbx, self.config, self.bus, run_id, pair.agent.name
+                        )
+                        state = self._run_phases(run_id, phases, deadline, pair, granter)
+                        # Summary must post while the github sandbox is alive;
+                        # on an infra exception the run is resumable and the
+                        # resumed run reopens the same tracking issue.
+                        if reporter is not None:
+                            reporter.close_run(run_id, state)
+                    finally:
+                        detach()
+                        # Harvest even when a phase raised: the sandbox is still
+                        # alive here, and partial artifacts beat none.
+                        self._harvest(run_id, pair)
+                        self._report_artifacts(run_id, pair)
+                except SdxloopError:
+                    # Infra failures (install, worker, sbx) are exactly what
+                    # gets diagnosed in-sandbox; decide keep before pair exit.
+                    self._keep_on_failure(run_id, pair)
+                    raise
                 if state == "completed":
                     self._deliver(run_id, outcome, pair, github)
+                else:
+                    self._keep_on_failure(run_id, pair)
         except SdxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
@@ -165,15 +200,50 @@ class LoopEngine:
             tasks=tasks,
             workspace=pair.workspace,
             mounted=pair.mounted,
+            kept_sandboxes=self._pair_names(pair) if pair.keep else [],
         )
 
-    def _attach_reporter(self, github: WorkerClient | None, run_id: str) -> Callable[[], None]:
+    @staticmethod
+    def _pair_names(pair: SandboxPair) -> list[str]:
+        return [s.name for s in (pair.agent, pair.github) if s is not None]
+
+    def _keep_on_failure(self, run_id: str, pair: SandboxPair) -> None:
+        """Flip the pair to kept when configured, so a failed run's evidence
+        survives for `sbxloop shell`. Marked in the DB for `sandbox prune`."""
+        if not self.config.keep_on_failure or pair.keep:
+            return
+        pair.keep = True
+        self.store.set_run_kept(run_id, "debug")
+        names = self._pair_names(pair)
+        self.bus.emit(
+            HostEventTypes.RUN_KEEP,
+            run_id,
+            sandboxes=names,
+            reason="debug",
+            message=(
+                f"sandboxes kept for debugging: {', '.join(names)} — "
+                f"inspect with `sbxloop shell {run_id}`"
+            ),
+        )
+
+    def _attach_reporter(
+        self, github: WorkerClient | None, run_id: str, outcome: str
+    ) -> tuple[GithubReporterHook | None, Callable[[], None]]:
+        """Attach progress reporting; opens the tracking issue immediately.
+
+        Run start/end go through explicit ``open_run``/``close_run`` calls
+        rather than bus events: RUN_START is emitted before the github
+        sandbox exists and RUN_END after it is gone, so the hook could never
+        observe them (#58).
+        """
         gh = self.config.github
         if not gh.report or github is None:
-            return lambda: None
+            return None, lambda: None
         assert gh.repo is not None  # report=True without a repo cannot provision a github worker
         hook = GithubReporterHook(GithubOps(github, run_id), gh.repo)
-        return self.bus.attach_hook(hook)
+        detach = self.bus.attach_hook(hook)
+        hook.open_run(run_id, outcome)
+        return hook, detach
 
     def _harvest(self, run_id: str, pair: SandboxPair) -> None:
         """Copy the in-VM work dir out to the host (unmounted runs only).
@@ -200,12 +270,28 @@ class LoopEngine:
         if target is None or not target.is_dir():
             return
         count = sum(1 for p in target.rglob("*") if p.is_file())
+        extra: dict[str, Any] = {}
+        sample = self._last_resources.get("agent")
+        if sample and sample.get("level") in ("warn", "abort"):
+            # Disk was under pressure at the last sample — harvested
+            # artifacts may be truncated or missing.
+            extra = {
+                "disk_used_pct": sample.get("disk_used_pct"),
+                "resources_level": sample.get("level"),
+            }
+            logger.warning(
+                "run %s: sandbox disk was at %s%% at the last sample — "
+                "harvested artifacts may be incomplete",
+                run_id,
+                sample.get("disk_used_pct"),
+            )
         self.bus.emit(
             HostEventTypes.RUN_ARTIFACTS,
             run_id,
             path=str(target),
             files=count,
             mounted=pair.mounted,
+            **extra,
         )
 
     def _deliver(
@@ -240,14 +326,24 @@ class LoopEngine:
                 base=gh.deliver_base,
                 draft=gh.deliver_draft,
             )
-        except (DeliveryError, GithubOpsError) as exc:
+        except SdxloopError as exc:
+            # Catches the whole family the delivery path can raise — not just
+            # DeliveryError/GithubOpsError but WorkerError/WorkerTimeoutError/
+            # SbxError from the op jobs themselves. Anything narrower lets an
+            # infra hiccup during this optional post-completion step escape
+            # _drive and leave the completed run looking failed (#59).
             logger.warning("delivery to %s failed for run %s", repo, run_id, exc_info=True)
             self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
             return
         self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, pr=pr.number, url=pr.url)
 
     def _run_phases(
-        self, run_id: str, phases: PhaseRunner, deadline: float, pair: SandboxPair
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        deadline: float,
+        pair: SandboxPair,
+        granter: EgressGranter,
     ) -> RunState:
         tasks = self.store.get_tasks(run_id)
         if not tasks:
@@ -286,7 +382,7 @@ class LoopEngine:
                 self.store.update_task(run_id, task)
                 self._emit_task_end(run_id, task)
                 continue
-            self._run_task(run_id, phases, task, deadline, pair)
+            self._run_task(run_id, phases, task, deadline, pair, granter)
             if task.state == "failed":
                 failed_ids.add(task.spec.id)
 
@@ -302,6 +398,7 @@ class LoopEngine:
         task: TaskRecord,
         deadline: float,
         pair: SandboxPair,
+        granter: EgressGranter,
     ) -> None:
         budgets = self.config.budgets
         if task.state == "pending":
@@ -320,10 +417,18 @@ class LoopEngine:
 
         while not task.terminal:
             self._check_cancelled_and_clock(run_id, deadline)
+            abort_reason = self._resource_abort_reason()
+            if abort_reason:
+                # Fail the task with a diagnosis instead of letting the next
+                # phase produce garbage in a full sandbox. Dependents are
+                # skipped by the normal failed-task machinery.
+                task.last_feedback = abort_reason
+                self._set_task_state(run_id, task, "failed")
+                break
             if task.state == "planning":
                 self._phase_plan(run_id, phases, task)
             elif task.state == "executing":
-                self._phase_execute_and_scrutinize(run_id, phases, task, budgets)
+                self._phase_execute_and_scrutinize(run_id, phases, task, granter)
             elif task.state == "verifying":
                 self._phase_verify(run_id, phases, task, budgets)
             elif task.state == "validating":
@@ -356,9 +461,14 @@ class LoopEngine:
         run_id: str,
         phases: PhaseRunner,
         task: TaskRecord,
-        budgets: object,
+        granter: EgressGranter,
     ) -> None:
         assert task.plan is not None
+        # Grant-late: plan-declared egress is applied at EXECUTE entry, not
+        # at plan time. Runs here (not in _phase_plan) so resumed tasks whose
+        # persisted state skips planning still get their grants on the
+        # freshly provisioned sandbox.
+        granter.apply(task.spec.id, [(egress.domain, egress.reason) for egress in task.plan.egress])
         started = time.time()
         result = phases.execute(task, task.plan)
         task.session_id = result.session_id
@@ -455,6 +565,18 @@ class LoopEngine:
             self._set_task_state(run_id, task, "executing")
 
     # -- bookkeeping -------------------------------------------------------
+
+    def _resource_abort_reason(self) -> str | None:
+        """Non-None when the agent sandbox's last resource sample crossed
+        the disk_abort threshold (the worker classifies; the level rides on
+        the event)."""
+        sample = self._last_resources.get("agent")
+        if sample and sample.get("level") == "abort":
+            return (
+                f"sandbox disk exhausted: {sample.get('disk_used_pct')}% of the workspace "
+                f"filesystem is used (limits.disk_abort={self.config.limits.disk_abort}%)"
+            )
+        return None
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
         if self.store.get_run(run_id).state == "cancelled":
