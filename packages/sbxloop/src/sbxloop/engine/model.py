@@ -142,6 +142,10 @@ class RunRecord(_Model):
     # agent VM (False → artifacts are harvested to runs/<run>/artifacts).
     workspace: Path | None = None
     mounted: bool = False
+    # Why this run's sandboxes were deliberately left alive ("debug",
+    # "manual"); None means normal teardown applied. `sandbox prune`
+    # excludes kept runs unless asked to include them.
+    kept_reason: str | None = None
 
 
 class RunResult(_Model):

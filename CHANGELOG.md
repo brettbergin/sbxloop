@@ -6,6 +6,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+- **`sbxloop sandbox prune`** — garbage-collect orphaned `sbxloop-*` sandboxes
+  left behind by crashed hosts or killed runs, by cross-referencing `sbx ls`
+  against the state DB. Dry-run by default; `--force` removes, `--min-age`
+  (hours, default 1) guards against racing live runs, `--include-kept` also
+  prunes kept-for-debugging sandboxes. `sbxloop doctor` now reports the
+  orphan-candidate count. The runs table gained a `kept_reason` column (the
+  kept-sandbox taxonomy prune respects; applied as an in-place migration).
+
 ### Fixed
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and

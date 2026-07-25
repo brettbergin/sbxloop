@@ -25,6 +25,7 @@ from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
 
 app = typer.Typer(
     name="sbxloop",
@@ -412,6 +413,84 @@ def sandbox_rm(
             console.print(f"removed {target}")
         except SdxloopError as exc:
             console.print(f"[yellow]skip {target}:[/] {exc}")
+
+
+@sandbox_app.command("prune")
+def sandbox_prune(
+    force: Annotated[
+        bool,
+        typer.Option("--force", "--yes", help="Actually remove (default is a dry run)."),
+    ] = False,
+    min_age: Annotated[
+        float,
+        typer.Option(
+            "--min-age",
+            help="Hours a run must be inactive before its sandboxes count as orphaned.",
+        ),
+    ] = 1.0,
+    include_kept: Annotated[
+        bool,
+        typer.Option("--include-kept", help="Also prune kept-for-debugging sandboxes."),
+    ] = False,
+) -> None:
+    """Garbage-collect orphaned sbxloop sandboxes (crashed hosts, killed runs).
+
+    Cross-references `sbx ls` against this working copy's state DB. Dry-run
+    by default: prints the classification and removes nothing without
+    --force.
+    """
+    config = load_config()
+    store = _store(config)
+    cli = SbxCLI(app_name=config.app_name or None)
+    try:
+        verdicts = classify_sandboxes(
+            cli.ls(), store, min_age_s=min_age * 3600.0, include_kept=include_kept
+        )
+    except SdxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    if not verdicts:
+        console.print("no sbxloop sandboxes found")
+        return
+
+    table = Table(title="sbxloop sandbox prune")
+    for column in ("sandbox", "run", "run state", "age", "verdict"):
+        table.add_column(column)
+    for v in verdicts:
+        table.add_row(
+            v.name,
+            v.run_id or "",
+            v.run_state or "[dim]unknown[/]",
+            format_age(v.age_s),
+            ("[red]orphan[/] — " if v.orphan else "[green]keep[/] — ") + v.reason,
+        )
+    console.print(table)
+    console.print(
+        "[dim]note: the state DB is per working copy — 'unknown' sandboxes may "
+        "belong to another checkout's runs on this sbx host[/]"
+    )
+
+    orphans = [v for v in verdicts if v.orphan]
+    if not orphans:
+        console.print("nothing to prune")
+        return
+    if not force:
+        console.print(f"dry run: {len(orphans)} orphan candidate(s); re-run with --force to remove")
+        return
+    failures = 0
+    for v in orphans:
+        try:
+            remove_sandbox(cli, v.name)
+        except SdxloopError as exc:
+            failures += 1
+            console.print(f"[yellow]skip {v.name}:[/] {exc}")
+            continue
+        console.print(f"removed {v.name}")
+        # A pruned kept run is no longer kept; keep the DB marker honest.
+        if v.kept_reason is not None and v.run_id is not None:
+            store.set_run_kept(v.run_id, None)
+    if failures:
+        raise typer.Exit(1)
 
 
 @config_app.command("show")
