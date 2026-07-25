@@ -265,6 +265,13 @@ class TestSecretRedaction:
         assert "***" in text
         assert "github_pat_SUPERSECRET" not in " ".join(excinfo.value.argv)
 
+    def test_exec_interactive_missing_binary_redacts_argv(self, tmp_path: Path) -> None:
+        cli = SbxCLI(binary=str(tmp_path / "no-such-sbx"))
+        with pytest.raises(SbxNotFoundError) as excinfo:
+            cli.exec_interactive("boxa", ["some-tool", "--value", "tok_SECRET"])
+        assert "tok_SECRET" not in " ".join(excinfo.value.argv)
+        assert "***" in excinfo.value.argv
+
     def test_exec_result_argv_is_redacted(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
         result = cli.run(
             "secret", "set-custom", "-g", "--host", "h", "--env", "E", "--value", "tok_SECRET"

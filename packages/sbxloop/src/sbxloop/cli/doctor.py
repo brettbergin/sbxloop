@@ -29,6 +29,7 @@ from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, GH_TOKEN_ENVS
 from sbxloop.sbx.prune import count_orphans
 from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
 from sbxloop.worker.wheel import resolve_worker_wheel
+from sbxloop_worker.backends.copilot import SDK_PERMISSION_KINDS, installed_sdk_permission_kinds
 
 TESTED_SBX_SERIES = "0.35"
 
@@ -42,6 +43,15 @@ class Check:
 
 
 ProgressFn = Callable[[str], None]
+
+
+def _sdk_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("github-copilot-sdk")
+    except PackageNotFoundError:
+        return "unknown version"
 
 
 def collect_checks(
@@ -239,6 +249,48 @@ def collect_checks(
                 True,
                 'not configured — GitHub features disabled (set [github] repo = "owner/repo" '
                 "in sbxloop.toml to enable)",
+                hard=False,
+            )
+        )
+
+    # copilot SDK permission-kind vocabulary: the worker's read-only critic
+    # barrier is an allowlist over these kinds and fails closed on drift, so
+    # a vocabulary change never grants write access — but it can silently
+    # cost the critic a read capability. Surface drift here on SDK bumps
+    # instead of as degraded reviews in the field.
+    sdk_kinds = installed_sdk_permission_kinds()
+    if sdk_kinds is None:
+        checks.append(
+            Check(
+                "copilot sdk permission kinds",
+                True,
+                "github-copilot-sdk not installed on this host — vocabulary "
+                "unverifiable here (checked where the SDK runs, e.g. e2e); the "
+                "read-only barrier fails closed on unknown kinds regardless",
+                hard=False,
+            )
+        )
+    elif sdk_kinds == SDK_PERMISSION_KINDS:
+        checks.append(
+            Check(
+                "copilot sdk permission kinds",
+                True,
+                f"installed SDK ({_sdk_version()}) matches the verified "
+                f"vocabulary ({len(sdk_kinds)} kinds)",
+            )
+        )
+    else:
+        added = ", ".join(sorted(sdk_kinds - SDK_PERMISSION_KINDS)) or "none"
+        removed = ", ".join(sorted(SDK_PERMISSION_KINDS - sdk_kinds)) or "none"
+        checks.append(
+            Check(
+                "copilot sdk permission kinds",
+                False,
+                f"installed SDK ({_sdk_version()}) drifted from the verified "
+                f"vocabulary — new kinds: {added}; missing kinds: {removed}. "
+                "New kinds are denied in read-only critic sessions (fails "
+                "closed); update READ_ONLY_ALLOWED_KINDS/SDK_PERMISSION_KINDS "
+                "in sbxloop_worker.backends.copilot after re-verifying",
                 hard=False,
             )
         )

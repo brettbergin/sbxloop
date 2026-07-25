@@ -16,7 +16,7 @@ Session strategy per phase (a deliberate design decision):
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal, TypeVar
+from typing import Literal, NamedTuple, TypeVar
 
 from pydantic import BaseModel
 
@@ -37,6 +37,16 @@ EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
 OUTPUT_CLIP = 6_000
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+class VerifyOutcome(NamedTuple):
+    """VERIFY's result: pass/fail, failure feedback for the executor, and
+    the full command transcript — persisted on the phase row so VALIDATE
+    (including a resumed one) judges with the same evidence."""
+
+    passed: bool
+    feedback: str
+    results: str
 
 
 def clip(text: str | None, limit: int = OUTPUT_CLIP) -> str:
@@ -250,8 +260,8 @@ class PhaseRunner:
             raise WorkerError(f"scrutinize returned invalid verdict {verdict.verdict!r}")
         return verdict
 
-    def verify(self, task: TaskRecord, plan: PlanModel) -> tuple[bool, str]:
-        """Run every verify command; returns (all_passed, failure_feedback)."""
+    def verify(self, task: TaskRecord, plan: PlanModel) -> VerifyOutcome:
+        """Run every verify command; the transcript rides on the outcome."""
         commands = list(dict.fromkeys(task.spec.verify_commands + plan.verify_commands))
         failures: list[str] = []
         results: list[str] = []
@@ -263,12 +273,13 @@ class PhaseRunner:
                 failures.append(
                     f"verify command failed: `{command}` (exit {result.exit_code})\n{output}"
                 )
-        self._last_verify_results = "\n\n".join(results) or "(no verify commands)"
-        return (not failures, "\n\n".join(failures))
+        return VerifyOutcome(
+            passed=not failures,
+            feedback="\n\n".join(failures),
+            results="\n\n".join(results) or "(no verify commands)",
+        )
 
-    _last_verify_results: str = "(verification not run)"
-
-    def validate(self, task: TaskRecord) -> Verdict:
+    def validate(self, task: TaskRecord, verify_results: str) -> Verdict:
         verdict = self._agent_json(
             Verdict,
             "validate",
@@ -278,7 +289,7 @@ class PhaseRunner:
                 "task_title": task.spec.title,
                 "task_description": task.spec.description or "(no further description)",
                 "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
-                "verify_results": self._last_verify_results,
+                "verify_results": verify_results,
             },
             permission_mode="read_only",
         )

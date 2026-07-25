@@ -98,6 +98,17 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- A run resumed while a task was checkpointed `validating` no longer asks
+  the VALIDATE judge to rule without evidence (#61). The verify-command
+  transcript lived only in memory on the `PhaseRunner` (a class-level
+  default of `"(verification not run)"`), so a fresh process entering
+  VALIDATE rendered the prompt with the placeholder instead of the real
+  results. VERIFY now persists its full command transcript on the
+  `phase_attempts` row and VALIDATE reads it from there — the single source
+  of truth for both fresh and resumed runs — and the class-level mutable
+  state is gone. A checkpoint whose verify row predates this change (no
+  stored transcript) rewinds to `verifying` on resume; VERIFY is mechanical
+  and idempotent, so the evidence is cheaply repopulated.
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and
   sbx-level errors raised by the delivery op jobs (`WorkerError`,
@@ -130,6 +141,19 @@ All notable changes to sdxloop are documented here. The project adheres to
   cache); `policy_check` raises on invocation failure rather than
   reporting infra trouble as "blocked", and `doctor` labels that case as a
   check error, not a policy verdict.
+- **The read-only critic barrier is now allowlist + default-deny (#62).**
+  SCRUTINIZE/VALIDATE sessions previously denied only `{"shell", "write"}`
+  permission kinds and approved everything else — an unverified denylist,
+  so an SDK rename or a new mutating kind would have silently handed the
+  critic approve-all over the workspace it reviews. The barrier now allows
+  only known-read kinds (`read`, `url`) and rejects everything else with
+  feedback naming the denied kind, so unknown kinds fail closed (worst
+  case: the critic loses a read capability and says so). The full `kind`
+  vocabulary was field-verified against github-copilot-sdk 1.0.8 (`shell`,
+  `write`, `read`, `mcp`, `url`, `memory`, `custom-tool`, `hook`,
+  `extension-management`, `extension-permission-access`), and
+  `sbxloop doctor` now compares the installed SDK's vocabulary against
+  that snapshot, warning loudly on drift after an SDK bump.
 - Secret values no longer leak through error text or the process-observable
   argv carried on `ExecResult`/`SbxError`: the value passed to
   `sbx secret set-custom --value` is masked (`***`) in every observable copy
@@ -137,6 +161,16 @@ All notable changes to sdxloop are documented here. The project adheres to
   into terminals, logs, or events (#57). The remaining `ps`-visibility of
   the live subprocess argv needs stdin support in sbx itself and stays
   tracked in #57.
+- The `ps`-visibility half of #57 is now a doctor conformance probe
+  (`secret-value-stdin`, cheap tier): desk-verified against the sbx docs and
+  release history through v0.37, `sbx secret set-custom` accepts the secret
+  only via `--token`/`--value` on argv (both documented as "less secure:
+  visible in shell history") — no stdin path exists, so the exposure window
+  cannot be closed from sbxloop's side yet. The probe checks
+  `set-custom --help` on every `sbxloop doctor` run and alarms the moment an
+  sbx upgrade grows a stdin path, naming the switch-over as the fix.
+  `exec_interactive`'s missing-binary error now carries the redacted argv
+  copy like every other observable path.
 
 ## [0.2.0] — 2026-07-23
 
