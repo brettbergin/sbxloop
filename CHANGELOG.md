@@ -8,6 +8,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Added
 
+- **Transcript panels name the responding agent.** Agent feedback bubbles
+  used to be titled a generic `agent <time>`, so you couldn't tell which
+  Copilot session was speaking. Each phase now stamps its persona
+  (`decomposer`, `planner`, `executor`, `scrutinizer`, `validator`) onto its
+  job's `agent.*` events host-side (the in-sandbox worker doesn't know which
+  phase it serves), the TUI header shows it, and `sbxloop logs` lines carry
+  it as `[<name>]`. Events without a name (older runs) keep the `agent`
+  title.
+
 - **Prebaked sandbox templates + `sbxloop bake` (#48).** `sbxloop bake` runs
   the worker install ladder once in a scratch sandbox (plus a best-effort
   Copilot runtime pre-cache) and persists the result with `sbx template save`. With `[sandbox] template` pointing at the baked ref, provisioning

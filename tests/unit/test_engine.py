@@ -128,6 +128,26 @@ class TestHappyPath:
         # sandboxes cleaned up
         assert harness.sandboxes_left() == []
 
+    def test_agent_messages_carry_phase_persona(self, harness: Harness) -> None:
+        """Every agent.message names the persona that produced it, so the
+        transcript header says WHO responded (planner, executor, ...), not a
+        generic "agent". Echo only emits agent.message for entries with
+        "text", so give each scripted phase reply some."""
+        harness.script(
+            [
+                {**taskgraph(task("t1")), "text": "breaking it down"},
+                {**PLAN, "text": "here is my plan"},
+                EXECUTE,
+                {**PASS, "text": "work checks out"},
+                {**ACCEPT, "text": "criteria met"},
+            ]
+        )
+        result = harness.engine().start("build the feature")
+
+        assert result.succeeded
+        speakers = [e.data.get("agent") for e in harness.events if e.type == "agent.message"]
+        assert speakers == ["decomposer", "planner", "executor", "scrutinizer", "validator"]
+
     def test_default_run_is_github_less(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:

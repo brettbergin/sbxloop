@@ -36,6 +36,17 @@ EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
 
 OUTPUT_CLIP = 6_000
 
+# Persona label per phase prompt: stamped onto the job's agent.* events (via
+# WorkerClient.submit) so the transcript header says WHO is responding
+# (planner, executor, ...) instead of a generic "agent".
+AGENT_NAMES = {
+    "decompose": "decomposer",
+    "plan": "planner",
+    "execute": "executor",
+    "scrutinize": "scrutinizer",
+    "validate": "validator",
+}
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
@@ -83,6 +94,7 @@ class PhaseRunner:
         self,
         prompt: str,
         *,
+        agent_name: str,
         permission_mode: Literal["auto", "read_only"],
         expect: Literal["text", "json"],
     ) -> JobResult:
@@ -97,7 +109,7 @@ class PhaseRunner:
             cwd=self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
         )
-        result = self.agent.submit(job)
+        result = self.agent.submit(job, agent=agent_name)
         if result.status != "ok":
             assert result.error is not None
             raise WorkerError(f"agent job failed ({result.error.type}): {result.error.message}")
@@ -127,7 +139,12 @@ class PhaseRunner:
         for _ in range(2):
             prompt = render(prompt_name, retry_context=retry_context, **context)
             try:
-                result = self._agent_job(prompt, permission_mode=permission_mode, expect="json")
+                result = self._agent_job(
+                    prompt,
+                    agent_name=AGENT_NAMES[prompt_name],
+                    permission_mode=permission_mode,
+                    expect="json",
+                )
             except WorkerError as exc:
                 if "ExpectedJsonMissing" not in str(exc):
                     raise
@@ -230,7 +247,9 @@ class PhaseRunner:
             expected_artifacts=bullet_list(plan.expected_artifacts),
             feedback=task.last_feedback or "(none — first attempt)",
         )
-        return self._agent_job(prompt, permission_mode="auto", expect="text")
+        return self._agent_job(
+            prompt, agent_name=AGENT_NAMES["execute"], permission_mode="auto", expect="text"
+        )
 
     def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> Verdict:
         evidence_parts: list[str] = []
