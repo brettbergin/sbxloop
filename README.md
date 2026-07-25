@@ -84,6 +84,32 @@ github-ops sandbox — `GH_TOKEN` only, one atomic commit via the git data API, 
 Delivery failures are reported loudly (`run.deliver` event) but never fail a
 completed run. Without the integration configured, `--deliver` refuses to run.
 
+## Debugging failed runs
+
+By default sandboxes are torn down at run end — including failed runs, which is
+exactly when the in-sandbox evidence (worker stderr, install leftovers, workspace
+state) matters most. Two levers:
+
+```toml
+# sbxloop.toml
+keep_on_failure = true   # keep the pair alive only when a run fails (or --keep-on-failure)
+keep_sandboxes = true    # keep it always (or --keep-sandboxes)
+```
+
+A failed run then ends with a prominent hint naming the kept sandboxes, and
+`sbxloop shell` drops you inside — kept, in-flight, or leaked:
+
+```bash
+sbxloop shell <run>                    # interactive shell in the agent sandbox
+sbxloop shell <run> --role github      # ... or the github-ops sandbox
+sbxloop shell <run> -c 'cat ~/.sbxloop/env.sh'   # one-off command
+```
+
+Attaching to an in-flight run is meant as observation — the worker owns its env
+files and workspace, so avoid mutating them mid-phase. Kept runs are marked in the
+state DB (`kept_reason`) and stay exempt from `sandbox prune` until you pass
+`--include-kept`, so debugging convenience cannot become a permanent leak.
+
 ## Sandbox hygiene
 
 Sandboxes are torn down at run end, and an in-process registry also cleans up on

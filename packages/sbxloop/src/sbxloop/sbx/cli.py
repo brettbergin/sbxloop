@@ -155,6 +155,22 @@ class SbxCLI:
                 raise self._error_for(result)
         return result
 
+    def exec_interactive(self, name: str, cmd: Sequence[str]) -> int:
+        """Run a command in a sandbox with the caller's terminal attached
+        (stdin/stdout/stderr inherited); returns the command's exit code.
+
+        `sbx exec` documents no -it-style flags; terminal attachment is
+        simply inheriting the caller's stdio.
+        """
+        argv = self.argv("exec", name, *cmd)
+        try:
+            return subprocess.run(argv, check=False).returncode
+        except FileNotFoundError as exc:
+            raise SbxNotFoundError(
+                f"sbx binary {self.binary!r} not found on PATH",
+                argv=argv,
+            ) from exc
+
     def cp(self, src: str, dst: str, *, timeout: float | None = None) -> None:
         self.run("cp", src, dst, timeout=timeout)
 

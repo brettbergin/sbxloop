@@ -7,6 +7,16 @@ All notable changes to sdxloop are documented here. The project adheres to
 ## [Unreleased]
 
 ### Added
+- **`keep_on_failure`** (config + `--keep-on-failure`) — successful runs clean
+  up as always; failed runs (task failures and infra crashes alike) leave the
+  sandbox pair alive, mark the run `kept_reason="debug"` in the state DB, emit
+  a `run.keep` event, and print a hint naming the sandboxes and the shell
+  command to inspect them. `--keep-sandboxes` runs are now marked
+  `kept_reason="manual"` so `sandbox prune` respects them too.
+- **`sbxloop shell <run> [--role agent|github] [-c CMD]`** — opens an
+  interactive shell (or runs a one-off command) inside a run's sandbox after
+  verifying liveness via `sbx ls`. Works for kept, in-flight, and leaked
+  sandboxes; the inner exit code is passed through.
 - **`sbxloop sandbox prune`** — garbage-collect orphaned `sbxloop-*` sandboxes
   left behind by crashed hosts or killed runs, by cross-referencing `sbx ls`
   against the state DB. Dry-run by default; `--force` removes, `--min-age`
