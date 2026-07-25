@@ -6,7 +6,16 @@ agentic layer, and a GitHub-ops sandbox holding only ``GH_TOKEN`` for
 user-facing GitHub interactions. The balanced network policy is the default.
 """
 
-__version__ = "0.4.0"
+try:
+    # written at build time by hatch-vcs (see pyproject [tool.hatch.build.hooks.vcs])
+    from sbxloop._version import __version__
+except ImportError:  # pragma: no cover - raw source tree that was never built
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        __version__ = _pkg_version("sbxloop")
+    except Exception:
+        __version__ = "0.0.0"
 
 from sbxloop.config import Budgets, Config, load_config
 from sbxloop.engine import LoopEngine, RunResult, run_outcome

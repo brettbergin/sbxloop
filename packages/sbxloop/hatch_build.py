@@ -29,6 +29,12 @@ class VendorWorkerWheelHook(BuildHookInterface):  # type: ignore[type-arg]
         host_version = self.metadata.version
         expected = f"sbxloop_worker-{host_version}-py3-none-any.whl"
 
+        # The static dependency list can't carry an exact pin now that versions
+        # come from git tags (hatch-vcs), so add the lockstep pin to the wheel
+        # metadata here.
+        if self.target_name == "wheel":
+            build_data.setdefault("dependencies", []).append(f"sbxloop-worker=={host_version}")
+
         if (vendor_dir / expected).is_file():
             return
 

@@ -1,61 +1,111 @@
 name: Release
 
+# Every merge/push to main auto-bumps the patch version (via a new git tag) and
+# publishes both distributions (sbxloop, sbxloop-worker) to PyPI using Trusted
+# Publishing (OIDC — no tokens). hatch-vcs derives the package versions from
+# the tag, so nothing is committed back to main.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch: {}  # allow a manual release from the Actions tab
+
+# Serialize releases so two quick merges can't race on the tag / version.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - name: Check tag matches package versions
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          for pkg in packages/sbxloop packages/sbxloop-worker; do
-            version=$(uv run --no-project python -c "import tomllib,sys; print(tomllib.load(open('$pkg/pyproject.toml','rb'))['project']['version'])")
-            if [ "$version" != "$tag" ]; then
-              echo "::error::$pkg version $version does not match tag $tag"
-              exit 1
-            fi
-          done
-      - run: uv build --package sbxloop-worker -o dist
-      - run: uv build --package sbxloop -o dist
-      - name: Assert worker wheel is vendored inside the host wheel
-        run: |
-          unzip -l dist/sbxloop-*.whl | grep 'sbxloop/_vendor/sbxloop_worker-.*\.whl'
-      - name: Run the full check suite against the release tree
-        run: |
-          uv sync --all-packages
-          uv run ruff format --check .
-          uv run ruff check .
-          uv run mypy
-          uv run pytest
-      - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
+          fetch-depth: 0  # hatch-vcs needs tags to resolve the version
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-packages
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy
+      - run: uv run pytest
 
-  publish:
-    needs: build
+  release:
+    needs: check
     runs-on: ubuntu-latest
-    # Trusted Publishing (OIDC): configure this repo + workflow + environment
-    # as a Trusted Publisher on pypi.org for BOTH projects (sbxloop and
-    # sbxloop-worker). No API token secrets are used.
+    # Trusted Publishing (OIDC): this repo + workflow + environment are
+    # configured as a Trusted Publisher on pypi.org for BOTH projects
+    # (sbxloop and sbxloop-worker). No API token secrets are used.
     environment: pypi
     permissions:
-      id-token: write
+      contents: write   # push the new version tag + create the GitHub Release
+      id-token: write   # PyPI Trusted Publishing (OIDC)
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          fetch-depth: 0   # full history + all tags so hatch-vcs can resolve the version
+
+      - name: Compute release version
+        id: ver
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          # If this commit is already tagged (manual minor/major bump, or a
+          # re-run), release that version as-is instead of minting a new tag.
+          if existing="$(git describe --exact-match --tags HEAD 2>/dev/null)"; then
+            echo "HEAD is already tagged as ${existing} — releasing it without re-tagging."
+            echo "need_tag=false" >> "$GITHUB_OUTPUT"
+            echo "version=${existing#v}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          latest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)"
+          if [ -z "$latest" ]; then
+            next="0.1.0"                       # first release
+          else
+            v="${latest#v}"
+            IFS=. read -r major minor patch <<< "$v"
+            next="${major}.${minor}.$((patch + 1))"   # bump patch on every merge
+          fi
+          echo "Releasing v${next} (previous: ${latest:-none})"
+          echo "need_tag=true" >> "$GITHUB_OUTPUT"
+          echo "version=${next}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        if: steps.ver.outputs.need_tag == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.ver.outputs.version }}" -m "Release v${{ steps.ver.outputs.version }}"
+          git push origin "v${{ steps.ver.outputs.version }}"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build sdists + wheels
+        run: |
+          uv build --package sbxloop-worker -o dist
+          uv build --package sbxloop -o dist
+
+      - name: Assert worker wheel is vendored inside the host wheel at the release version
+        run: |
+          unzip -l "dist/sbxloop-${{ steps.ver.outputs.version }}-py3-none-any.whl" \
+            | grep -F "sbxloop/_vendor/sbxloop_worker-${{ steps.ver.outputs.version }}-py3-none-any.whl"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           # Both dists publish from one job; if one project's upload fails
           # (e.g. missing Trusted Publisher) the re-run must not trip over
           # the files that already made it to PyPI.
           skip-existing: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${{ steps.ver.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "GitHub Release $tag already exists — skipping."
+          else
+            gh release create "$tag" --title "$tag" --generate-notes dist/*
+          fi

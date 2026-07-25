@@ -1,6 +1,6 @@
 [project]
 name = "sbxloop"
-version = "0.4.0"
+dynamic = ["version"]  # derived from git tags by hatch-vcs (see [tool.hatch.version])
 description = "Agentic loop orchestration on Docker Sandboxes (sbx) with isolated credential domains"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,10 @@ dependencies = [
     "python-dotenv>=1.0",
     "typer>=0.12",
     "rich>=13.7",
-    "sbxloop-worker==0.4.0",
+    # Unpinned here because the version is dynamic; the build hook
+    # (hatch_build.py) adds the exact lockstep pin `sbxloop-worker==X.Y.Z`
+    # to the wheel metadata at build time.
+    "sbxloop-worker",
 ]
 
 [project.scripts]
@@ -36,8 +39,20 @@ Issues = "https://github.com/brettbergin/sbxloop/issues"
 sbxloop-worker = { workspace = true }
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+# Both workspace packages version from the same repo-root git tag, keeping the
+# lockstep invariant by construction. `fallback_root` lets a wheel built from
+# an extracted sdist (no git) pick the version up from the sdist's PKG-INFO.
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "../..", fallback_root = ".", local_scheme = "no-local-version", fallback_version = "0.0.0" }
+
+# Write the resolved version into the package so `sbxloop.__version__` and
+# `sbxloop --version` report it at runtime.
+[tool.hatch.build.hooks.vcs]
+version-file = "src/sbxloop/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sbxloop"]

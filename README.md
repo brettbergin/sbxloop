@@ -143,7 +143,7 @@ Configuration lives in `sbxloop.toml` / `pyproject.toml [tool.sbxloop]` / `SBXLO
 
 ## Releasing
 
-Tag `vX.Y.Z` (matching both package versions) and push: `release.yml` rebuilds, re-runs the full check suite, and publishes both distributions to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — configure the publisher for repo `brettbergin/sbxloop`, workflow `release.yml`, environment `pypi` on both PyPI projects; no token secrets). The manually-dispatched `e2e.yml` workflow installs real sbx on a GitHub runner for end-to-end validation.
+Releases are fully automated — just merge to `main`. Every merge runs the full check suite, auto-bumps the patch version via a new `vX.Y.Z` git tag ([hatch-vcs](https://github.com/ofek/hatch-vcs) derives both package versions from the tag), and publishes both distributions to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC, no token secrets). See [RELEASING.md](RELEASING.md) for details, including how to cut a minor/major release. The manually-dispatched `e2e.yml` workflow installs real sbx on a GitHub runner for end-to-end validation.
 
 ## License
 
