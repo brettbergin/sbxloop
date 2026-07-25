@@ -69,6 +69,15 @@ Runs verify the baked worker with fast probes and fall back to the normal
 install if the template is stale (`sbxloop doctor` will tell you to re-bake
 after upgrading sbxloop).
 
+Wondering what to put in `model = "..."` (or `--model`)? Ask the Copilot SDK
+which models your subscription can actually use:
+
+```bash
+pip install 'sbxloop[copilot]'   # the SDK is optional on the host
+sbxloop list-models              # id, billing multiplier, context, reasoning, policy
+sbxloop list-models --json       # machine-readable, for scripting
+```
+
 Or as a library:
 
 ```python
