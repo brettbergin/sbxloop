@@ -221,3 +221,7 @@ __marimo__/
 .sbxloop/
 .sdxloop/
 packages/sbxloop/src/sbxloop/_vendor/
+
+# written at build time by hatch-vcs
+packages/sbxloop/src/sbxloop/_version.py
+packages/sbxloop-worker/src/sbxloop_worker/_version.py

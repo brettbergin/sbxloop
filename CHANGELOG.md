@@ -6,6 +6,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+- **Releases are now fully automated** (aligned with the entrygraph release
+  strategy): every merge to `main` runs the check suite, auto-bumps the patch
+  version via a new `vX.Y.Z` git tag, and publishes both distributions to
+  PyPI — no more release PRs or manual version edits. Package versions are
+  derived from git tags by hatch-vcs (`dynamic = ["version"]`); the exact
+  `sbxloop-worker==X.Y.Z` lockstep pin is injected into the host wheel
+  metadata at build time. See [RELEASING.md](RELEASING.md).
+
 ## [0.2.0] — 2026-07-23
 
 ### Changed

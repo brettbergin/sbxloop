@@ -1,6 +1,6 @@
 [project]
 name = "sbxloop-worker"
-version = "0.4.0"
+dynamic = ["version"]  # derived from git tags by hatch-vcs (see [tool.hatch.version])
 description = "In-sandbox worker runtime for sbxloop (protocol models, agent backends, job runner)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,8 +25,20 @@ Homepage = "https://github.com/brettbergin/sbxloop"
 Repository = "https://github.com/brettbergin/sbxloop"
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+# Both workspace packages version from the same repo-root git tag, keeping the
+# lockstep invariant by construction. `fallback_root` lets a wheel built from
+# an extracted sdist (no git) pick the version up from the sdist's PKG-INFO.
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "../..", fallback_root = ".", local_scheme = "no-local-version", fallback_version = "0.0.0" }
+
+# Write the resolved version into the package so `sbxloop_worker.__version__`
+# reports it at runtime (inside the sandbox, where dist metadata may be absent).
+[tool.hatch.build.hooks.vcs]
+version-file = "src/sbxloop_worker/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sbxloop_worker"]
