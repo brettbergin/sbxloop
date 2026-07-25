@@ -226,7 +226,10 @@ def test_tui_run_sigterm_removes_both_sandboxes(fake_sbx: FakeSbx, tmp_path: Pat
         state = None
         while time.monotonic() < deadline:
             state = _latest_run_state(db)
-            if state not in (None, "provisioning") or proc.poll() is not None:
+            # "created" precedes "provisioning": a fast poll can sample the
+            # DB between create_run and the provisioning flip, so wait
+            # through both pre-decompose states.
+            if state not in (None, "created", "provisioning") or proc.poll() is not None:
                 break
             time.sleep(0.2)
         assert proc.poll() is None, f"run exited early:\n{log_path.read_text()}"
