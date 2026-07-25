@@ -12,6 +12,36 @@ def test_render_decompose() -> None:
     assert "$outcome" not in text
 
 
+def test_execute_and_plan_carry_environment_notes() -> None:
+    """Field regression: the agent burned its whole revision budget on
+    `python3 -m venv` failing (missing ensurepip) and bare pip hitting
+    PEP 668 — the prompts must state the environment facts."""
+    execute = render(
+        "execute",
+        outcome="o",
+        task_id="t1",
+        task_title="tt",
+        task_description="td",
+        plan_steps="- s",
+        expected_artifacts="- a",
+        feedback="(none)",
+    )
+    plan = render(
+        "plan",
+        outcome="o",
+        task_id="t1",
+        task_title="tt",
+        task_description="td",
+        acceptance_criteria="- c",
+        feedback="(none)",
+    )
+    for text in (execute, plan):
+        assert "externally managed" in text
+        assert "python3 -m venv" in text
+        assert "sudo" in text
+        assert "allowlist" in text
+
+
 def test_render_all_templates_have_no_leftover_vars() -> None:
     contexts = {
         "decompose": {"outcome": "o", "max_tasks": "3"},
