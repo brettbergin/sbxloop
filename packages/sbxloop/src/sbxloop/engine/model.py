@@ -32,6 +32,7 @@ TaskState = Literal[
 ]
 
 TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
+TERMINAL_RUN_STATES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {"created", "provisioning", "decomposing", "running", "finalizing", "failed"}
 )

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -35,6 +36,7 @@ from sbxloop.config import Config, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
+    TERMINAL_RUN_STATES,
     RunResult,
     RunState,
     SteerVerdict,
@@ -103,6 +105,10 @@ class LoopEngine:
         self._worker_python_from_config = worker_python is None
         self._install_workers_from_config = install_workers is None
         self.clock = clock
+        # In-process cancellation (Ctrl-C in the TUI): checked at the same
+        # phase boundaries as the store's cancelled state, but leaves the
+        # persisted run state alone so the run stays resumable.
+        self._cancel_event = threading.Event()
         # Latest sandbox.resources sample per sandbox role, fed by the bus;
         # consulted for the disk guardrail and the harvest-truncation note.
         self._last_resources: dict[str, dict[str, object]] = {}
@@ -148,8 +154,18 @@ class LoopEngine:
         return self._drive(run_id, run.outcome, workspace=run.workspace)
 
     def cancel(self, run_id: str) -> None:
-        self.store.get_run(run_id)  # raises for unknown runs
+        run = self.store.get_run(run_id)  # raises for unknown runs
+        if run.state in TERMINAL_RUN_STATES:
+            # Rewriting a finished run to cancelled would corrupt history
+            # (and `status` output); only in-flight runs are cancellable.
+            raise StateError(f"run {run_id} is already {run.state}; nothing to cancel")
         self.store.set_run_state(run_id, "cancelled")
+
+    def request_cancel(self) -> None:
+        """Ask a running engine (from another thread) to stop at the next
+        phase boundary. In-process only: unlike ``cancel`` it does not touch
+        the persisted run state, so the interrupted run remains resumable."""
+        self._cancel_event.set()
 
     def post_user_message(self, text: str) -> str:
         """Queue an interactive chat message for the run this engine is
@@ -912,6 +928,8 @@ class LoopEngine:
         return None
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
+        if self._cancel_event.is_set():
+            raise StateError(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
         if self.store.get_run(run_id).state == "cancelled":
             raise StateError(f"run {run_id} was cancelled")
         if self.clock() > deadline:

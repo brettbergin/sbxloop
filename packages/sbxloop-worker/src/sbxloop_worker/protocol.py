@@ -192,6 +192,7 @@ class EventTypes:
     AGENT_USAGE = "agent.usage"
 
     GH_OP_START = "gh.op_start"
+    GH_OP_PROGRESS = "gh.op_progress"
     GH_OP_END = "gh.op_end"
 
     # Resource telemetry sampled on the heartbeat cadence. Worker-emitted,

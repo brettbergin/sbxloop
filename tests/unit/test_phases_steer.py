@@ -18,8 +18,10 @@ class StubAgent:
         self.output_json = output_json
         self.jobs: list[JobRequest] = []
 
-    def submit(self, job: JobRequest) -> JobResult:
+    def submit(self, job: JobRequest, *, agent: str | None = None) -> JobResult:
         self.jobs.append(job)
+        self.agents: list[str | None] = getattr(self, "agents", [])
+        self.agents.append(agent)
         return JobResult(
             job_id=job.job_id,
             status="ok",

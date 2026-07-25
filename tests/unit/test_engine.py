@@ -128,6 +128,26 @@ class TestHappyPath:
         # sandboxes cleaned up
         assert harness.sandboxes_left() == []
 
+    def test_agent_messages_carry_phase_persona(self, harness: Harness) -> None:
+        """Every agent.message names the persona that produced it, so the
+        transcript header says WHO responded (planner, executor, ...), not a
+        generic "agent". Echo only emits agent.message for entries with
+        "text", so give each scripted phase reply some."""
+        harness.script(
+            [
+                {**taskgraph(task("t1")), "text": "breaking it down"},
+                {**PLAN, "text": "here is my plan"},
+                EXECUTE,
+                {**PASS, "text": "work checks out"},
+                {**ACCEPT, "text": "criteria met"},
+            ]
+        )
+        result = harness.engine().start("build the feature")
+
+        assert result.succeeded
+        speakers = [e.data.get("agent") for e in harness.events if e.type == "agent.message"]
+        assert speakers == ["decomposer", "planner", "executor", "scrutinizer", "validator"]
+
     def test_default_run_is_github_less(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -329,6 +349,31 @@ class TestBudgetsAndCancel:
         assert engine.store.get_run("rcancel").state == "cancelled"
         with pytest.raises(StateError, match="only unfinished runs"):
             engine.resume("rcancel")
+
+    @pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
+    def test_cancel_refuses_terminal_runs(self, harness: Harness, state: str) -> None:
+        # Rewriting a finished run to cancelled would corrupt history.
+        engine = harness.engine()
+        engine.store.create_run("rterm", "x")
+        engine.store.set_run_state("rterm", state)  # type: ignore[arg-type]
+        with pytest.raises(StateError, match="nothing to cancel"):
+            engine.cancel("rterm")
+        assert engine.store.get_run("rterm").state == state
+
+    def test_request_cancel_stops_at_phase_boundary_and_stays_resumable(
+        self, harness: Harness
+    ) -> None:
+        # The in-process cancel (TUI Ctrl-C) stops the engine at the next
+        # phase boundary without marking the run cancelled — it must remain
+        # resumable, exactly like any other interrupted run.
+        harness.script([taskgraph(task("t1"))])
+        engine = harness.engine()
+        engine.request_cancel()
+        with pytest.raises(StateError, match="interrupted"):
+            engine.start("interrupt me")
+        run_id = engine.store.list_runs()[0].run_id
+        assert engine.store.get_run(run_id).state == "running"
+        assert harness.sandboxes_left() == []  # pair context cleaned up
 
 
 class TestResume:

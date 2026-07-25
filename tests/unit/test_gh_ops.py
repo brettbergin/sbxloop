@@ -90,6 +90,35 @@ class TestGithubOpsFacade:
         with pytest.raises(GithubOpsError, match="HTTP 403"):
             ops.issue_create("o/r", "T")
 
+    def test_blobs_create_many_maps_paths_and_scales_timeout(self) -> None:
+        ops, client = make_ops(
+            {
+                "blobs.create_many": {
+                    "blobs": [
+                        {"path": "a.txt", "sha": "s1"},
+                        {"path": "sub/b.bin", "sha": "s2"},
+                    ]
+                }
+            }
+        )
+        files = [
+            {"path": "a.txt", "content_b64": "YQ=="},
+            {"path": "sub/b.bin", "content_b64": "Yg=="},
+        ]
+        assert ops.blobs_create_many("o/r", files) == {"a.txt": "s1", "sub/b.bin": "s2"}
+        job = client.jobs[0]
+        assert job.params == {"repo": "o/r", "files": files}
+        # 2 files: flat op timeout plus the per-file allowance.
+        assert job.timeout_s == ops.timeout_s + 2 * GithubOps.BLOB_BATCH_TIMEOUT_PER_FILE_S
+
+    def test_blobs_create_many_malformed_response(self) -> None:
+        ops, _ = make_ops({"blobs.create_many": {"blobs": [{"path": "a.txt"}]}})
+        with pytest.raises(GithubOpsError, match="malformed"):
+            ops.blobs_create_many("o/r", [{"path": "a.txt", "content_b64": "YQ=="}])
+        ops, _ = make_ops({"blobs.create_many": {"nope": 1}})
+        with pytest.raises(GithubOpsError, match="no blob list"):
+            ops.blobs_create_many("o/r", [{"path": "a.txt", "content_b64": "YQ=="}])
+
 
 class RecordingOps:
     """GithubOps stand-in recording reporter interactions."""

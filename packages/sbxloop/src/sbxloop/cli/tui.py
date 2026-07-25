@@ -104,9 +104,10 @@ def render_event(event: Event) -> RenderableType | None:
             return None
         if len(content) > AGENT_MESSAGE_CLIP:
             content = content[:AGENT_MESSAGE_CLIP] + "\n\n*…truncated — see `sbxloop logs`*"
+        speaker = str(data.get("agent") or "agent")
         return Panel(
             Markdown(content),
-            title=f"[bold cyan]agent[/] [dim]{_stamp(event)}[/]",
+            title=f"[bold cyan]{speaker}[/] [dim]{_stamp(event)}[/]",
             title_align="left",
             border_style="cyan",
             padding=(0, 1),
@@ -451,6 +452,8 @@ def format_event(event: Event) -> str:
     parts = [_stamp(event), event.type]
     if event.data.get("task_id"):
         parts.append(f"[{event.data['task_id']}]")
+    if event.data.get("agent"):
+        parts.append(f"[{event.data['agent']}]")
     keys = (
         "state",
         "content",
