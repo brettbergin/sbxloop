@@ -182,6 +182,23 @@ class TestConfigAndInit:
         assert "sbxloop.toml" in result.output
         assert "env" in result.output
 
+    def test_config_policy_defaults(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["config", "policy"])
+        assert result.exit_code == 0
+        assert "execute" in result.output
+        assert "plan-declared grants" in result.output
+        assert "empty" in result.output  # no [policy] allow configured
+        assert "api.githubcopilot.com" in result.output
+
+    def test_config_policy_shows_bounds(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[policy]\nallow = ["registry.npmjs.org"]\ndeny = ["evil.example.com"]\n'
+        )
+        result = runner.invoke(app, ["config", "policy"])
+        assert result.exit_code == 0
+        assert "registry.npmjs.org" in result.output
+        assert "evil.example.com" in result.output
+
     def test_init_writes_and_refuses_overwrite(self, workdir: Path) -> None:
         result = runner.invoke(app, ["init"])
         assert result.exit_code == 0
