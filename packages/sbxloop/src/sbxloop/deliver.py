@@ -27,10 +27,11 @@ The worker performs the per-file blob POSTs in-sandbox and streams
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from sbxloop.engine.model import artifact_files
+from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, ArtifactScan, scan_artifacts
 from sbxloop.errors import DeliveryError
 from sbxloop.gh.ops import GithubOps, PrRef
 
@@ -57,9 +58,11 @@ def deliver_workspace(
     source_dir: Path,
     base: str | None = None,
     draft: bool = False,
+    exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES,
 ) -> PrRef:
     """Publish source_dir as one commit on a new branch and open a PR."""
-    files = artifact_files(source_dir)
+    scan = scan_artifacts(source_dir, exclude)
+    files = scan.files
     if not files:
         raise DeliveryError(f"nothing to deliver: no files in {source_dir}")
 
@@ -102,7 +105,7 @@ def deliver_workspace(
         base=base,
         head=branch,
         title=_title(outcome),
-        body=_body(run_id, outcome, source_dir, files),
+        body=_body(run_id, outcome, source_dir, scan),
         draft=draft,
     )
 
@@ -164,12 +167,16 @@ def _title(outcome: str) -> str:
     return title if len(title) <= TITLE_CLIP else title[: TITLE_CLIP - 1] + "…"
 
 
-def _body(run_id: str, outcome: str, source_dir: Path, files: list[Path]) -> str:
+def _body(run_id: str, outcome: str, source_dir: Path, scan: ArtifactScan) -> str:
+    files = scan.files
     listed = [f"- `{f.relative_to(source_dir).as_posix()}`" for f in files[:BODY_FILE_LIST_CAP]]
     if len(files) > BODY_FILE_LIST_CAP:
         listed.append(f"- … +{len(files) - BODY_FILE_LIST_CAP} more")
-    return (
+    body = (
         f"Artifacts produced by sbxloop run `{run_id}`.\n\n"
         f"**Outcome:** {outcome}\n\n"
         f"**Files ({len(files)}):**\n" + "\n".join(listed) + "\n"
     )
+    if scan.excluded_note:
+        body += f"\n**Not delivered:** {scan.excluded_note}\n"
+    return body

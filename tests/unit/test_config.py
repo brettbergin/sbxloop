@@ -15,6 +15,19 @@ def test_defaults(tmp_path: Path) -> None:
     assert config.budgets.max_revisions_per_task == 2
 
 
+def test_artifacts_exclude_default_and_override(tmp_path: Path) -> None:
+    assert load_config(cwd=tmp_path, env={}).artifacts.exclude == [".git", ".sbxloop"]
+    (tmp_path / "sbxloop.toml").write_text('[artifacts]\nexclude = [".git", "node_modules"]\n')
+    config = load_config(cwd=tmp_path, env={})
+    assert config.artifacts.exclude == [".git", "node_modules"]
+
+
+def test_artifacts_exclude_rejects_path_separators(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[artifacts]\nexclude = [".git/objects"]\n')
+    with pytest.raises(ConfigError, match=r"artifacts\.exclude"):
+        load_config(cwd=tmp_path, env={})
+
+
 def test_pyproject_layer(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[tool.sbxloop]\nmodel = "gpt-5"\n[tool.sbxloop.budgets]\nmax_tasks = 5\n'

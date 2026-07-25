@@ -147,6 +147,15 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Artifact listings and delivery no longer silently drop dot-path artifacts
+  (#67). `artifact_files` excluded every file with any dot-prefixed path
+  component, so agent-produced `.github/workflows/*.yml`, `.gitignore`,
+  `.env.example` and friends vanished from the run summary, `sbxloop artifacts`, and delivered PRs — with no indication anywhere. The exclusion
+  is now a targeted denylist (`.git`, `.sbxloop` by default, matched as path
+  components at any depth), tunable via `[artifacts] exclude` in config, and
+  exclusions are always surfaced: the `run.artifacts` event carries per-entry
+  excluded counts, the run summary and `sbxloop artifacts` print an
+  "N file(s) excluded (…)" note, and delivery PRs list what was left out.
 - The pinned status panel now shows the whole decomposed task list up
   front (#63). Previously a task's row only appeared when it started, so
   t2…tn were invisible until each prior task finished. The engine now

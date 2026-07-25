@@ -24,7 +24,7 @@ from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifact_files, artifacts_dir
+from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
@@ -294,13 +294,17 @@ def _print_artifacts_summary(result: RunResult, config: Config) -> None:
     target = artifacts_dir(result, config.state_dir)
     if target is None or not target.is_dir():
         return
-    files = artifact_files(target)
-    if not files:
+    scan = scan_artifacts(target, config.artifacts.exclude)
+    if not scan.files:
         console.print(f"\nartifacts: none produced (workspace: {target})")
+        if scan.excluded_note:
+            console.print(f"  [dim]{scan.excluded_note}[/]")
         return
     via = "live workspace mount" if result.mounted else "harvested from the sandbox"
-    console.print(f"\nartifacts: {len(files)} file(s), {via}")
-    console.print(_artifacts_tree(target, files))
+    console.print(f"\nartifacts: {len(scan.files)} file(s), {via}")
+    console.print(_artifacts_tree(target, scan.files))
+    if scan.excluded_note:
+        console.print(f"  [dim]{scan.excluded_note}[/]")
 
 
 def _finish(result: RunResult, config: Config) -> None:
@@ -627,15 +631,18 @@ def artifacts(
     if not target.is_dir():
         console.print(f"[bold red]artifacts directory is gone:[/] {target}")
         raise typer.Exit(2)
-    files = artifact_files(target)
+    scan = scan_artifacts(target, config.artifacts.exclude)
+    files = scan.files
     via = "live workspace mount" if record.mounted else "harvested copy"
     console.print(f"run [bold cyan]{run_id}[/]: {len(files)} file(s) ({via}) in [bold]{target}[/]")
     if tree:
         console.print(_artifacts_tree(target, files))
-        return
-    for file in files:
-        size = _human_size(file.stat().st_size)
-        console.print(f"  {file.relative_to(target)}  [dim]{size}[/]")
+    else:
+        for file in files:
+            size = _human_size(file.stat().st_size)
+            console.print(f"  {file.relative_to(target)}  [dim]{size}[/]")
+    if scan.excluded_note:
+        console.print(f"  [dim]{scan.excluded_note}[/]")
 
 
 @sandbox_app.command("ls")
@@ -1241,6 +1248,13 @@ deny = []
 # deliver = false
 # deliver_base = "main"   # base branch; unset uses the repo's default
 # deliver_draft = false
+
+[artifacts]
+# Path components excluded from artifact listings and delivery, matched at
+# any depth (a bare name each, no slashes). The default drops only noisy
+# state dirs — dot-path artifacts like .github/ or .gitignore are kept.
+# Exclusions are counted and surfaced, never silent.
+exclude = [".git", ".sbxloop"]
 
 [budgets]
 max_revisions_per_task = 2

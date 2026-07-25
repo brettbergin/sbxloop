@@ -42,6 +42,7 @@ from sbxloop.engine.model import (
     SteerVerdict,
     TaskRecord,
     TaskState,
+    scan_artifacts,
 )
 from sbxloop.engine.phases import PhaseRunner, clip
 from sbxloop.engine.store import StateStore
@@ -449,16 +450,18 @@ class LoopEngine:
         )
         if target is None or not target.is_dir():
             return
-        count = sum(1 for p in target.rglob("*") if p.is_file())
+        scan = scan_artifacts(target, self.config.artifacts.exclude)
         extra: dict[str, Any] = {}
+        if scan.excluded:
+            # Surface what the listing/delivery resolvers leave out — silent
+            # truncation is the bug (#67).
+            extra["excluded"] = dict(scan.excluded)
         sample = self._last_resources.get("agent")
         if sample and sample.get("level") in ("warn", "abort"):
             # Disk was under pressure at the last sample — harvested
             # artifacts may be truncated or missing.
-            extra = {
-                "disk_used_pct": sample.get("disk_used_pct"),
-                "resources_level": sample.get("level"),
-            }
+            extra["disk_used_pct"] = sample.get("disk_used_pct")
+            extra["resources_level"] = sample.get("level")
             logger.warning(
                 "run %s: sandbox disk was at %s%% at the last sample — "
                 "harvested artifacts may be incomplete",
@@ -469,7 +472,7 @@ class LoopEngine:
             HostEventTypes.RUN_ARTIFACTS,
             run_id,
             path=str(target),
-            files=count,
+            files=len(scan.files),
             mounted=pair.mounted,
             **extra,
         )
@@ -505,6 +508,7 @@ class LoopEngine:
                 source_dir=source,
                 base=gh.deliver_base,
                 draft=gh.deliver_draft,
+                exclude=self.config.artifacts.exclude,
             )
         except SdxloopError as exc:
             # Catches the whole family the delivery path can raise — not just

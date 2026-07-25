@@ -6,12 +6,15 @@ import pytest
 from pydantic import ValidationError
 
 from sbxloop.engine.model import (
+    DEFAULT_ARTIFACT_EXCLUDES,
     RunRecord,
     SteerVerdict,
     TaskGraph,
     TaskSpec,
     Verdict,
+    artifact_files,
     artifacts_dir,
+    scan_artifacts,
 )
 
 
@@ -61,6 +64,76 @@ class TestVerdict:
         t = TaskSpec(id="t1", title="X")
         assert t.acceptance_criteria == []
         assert t.verify_commands == []
+
+
+class TestArtifactFiles:
+    """The exclusion is a targeted denylist, not "anything dot-prefixed":
+    dot-path artifacts agents produce on purpose (.github/, .gitignore) must
+    survive listings and delivery (#67)."""
+
+    def make_workspace(self, tmp_path: Path) -> Path:
+        root = tmp_path / "ws"
+        (root / ".github" / "workflows").mkdir(parents=True)
+        (root / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+        (root / ".gitignore").write_text("*.pyc\n")
+        (root / "src").mkdir()
+        (root / "src" / "main.py").write_text("pass\n")
+        (root / ".git" / "refs").mkdir(parents=True)
+        (root / ".git" / "HEAD").write_text("ref\n")
+        (root / ".git" / "refs" / "x").write_text("sha\n")
+        return root
+
+    def test_dot_path_artifacts_kept_git_excluded(self, tmp_path: Path) -> None:
+        root = self.make_workspace(tmp_path)
+        rels = [p.relative_to(root).as_posix() for p in artifact_files(root)]
+        assert rels == [".github/workflows/ci.yml", ".gitignore", "src/main.py"]
+
+    def test_scan_counts_exclusions_per_entry(self, tmp_path: Path) -> None:
+        root = self.make_workspace(tmp_path)
+        scan = scan_artifacts(root)
+        assert scan.excluded == {".git": 2}
+        assert scan.excluded_total == 2
+        assert scan.excluded_note == "2 file(s) excluded (.git)"
+
+    def test_nested_excluded_dir_is_caught(self, tmp_path: Path) -> None:
+        root = self.make_workspace(tmp_path)
+        (root / "vendor" / ".git").mkdir(parents=True)
+        (root / "vendor" / ".git" / "config").write_text("x\n")
+        scan = scan_artifacts(root)
+        assert scan.excluded == {".git": 3}
+        assert all(".git" not in p.parts for p in scan.files)
+
+    def test_sbxloop_state_dir_excluded_by_default(self, tmp_path: Path) -> None:
+        root = self.make_workspace(tmp_path)
+        (root / ".sbxloop").mkdir()
+        (root / ".sbxloop" / "state.db").write_text("db\n")
+        scan = scan_artifacts(root)
+        assert scan.excluded == {".git": 2, ".sbxloop": 1}
+        assert scan.excluded_note == "3 file(s) excluded (.git, .sbxloop)"
+
+    def test_custom_exclude_list(self, tmp_path: Path) -> None:
+        root = self.make_workspace(tmp_path)
+        scan = scan_artifacts(root, exclude=[".git", "src"])
+        assert [p.relative_to(root).as_posix() for p in scan.files] == [
+            ".github/workflows/ci.yml",
+            ".gitignore",
+        ]
+        assert scan.excluded == {".git": 2, "src": 1}
+
+    def test_no_exclusions_has_no_note(self, tmp_path: Path) -> None:
+        root = tmp_path / "clean"
+        root.mkdir()
+        (root / "a.txt").write_text("a")
+        scan = scan_artifacts(root)
+        assert scan.excluded == {}
+        assert scan.excluded_note is None
+
+    def test_config_default_mirrors_model_default(self) -> None:
+        # config.py keeps a literal copy (importing engine.model there would
+        # be circular); this pins the two against drift.
+        from sbxloop.config import ArtifactsConfig
+
+        assert tuple(ArtifactsConfig().exclude) == DEFAULT_ARTIFACT_EXCLUDES
 
 
 class TestArtifactsDir:

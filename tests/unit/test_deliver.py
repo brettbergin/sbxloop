@@ -81,7 +81,7 @@ class TestDeliverWorkspace:
         assert ("GET", "/repos/o/r/git/ref/heads/main", None) in ops.raw_calls
 
         # all blobs ride ONE batched worker job (base64, binary-safe);
-        # dotfiles excluded
+        # .git excluded
         (batch,) = ops.blob_batches
         assert [e["path"] for e in batch] == ["hello.txt", "sub/logo.bin"]
         contents = {base64.b64decode(e["content_b64"]) for e in batch}
@@ -108,6 +108,63 @@ class TestDeliverWorkspace:
         assert ops.pr_kwargs["draft"] is False
         assert "hello.txt" in ops.pr_kwargs["body"]
         assert "sub/logo.bin" in ops.pr_kwargs["body"]
+        # ...and the exclusion is surfaced, not silent (#67)
+        assert "1 file(s) excluded (.git)" in ops.pr_kwargs["body"]
+
+    def test_dot_path_artifacts_are_delivered(self, tmp_path: Path) -> None:
+        """.github/ and .gitignore are the point of many outcomes — they must
+        ship; only the denylist (.git) stays out (#67)."""
+        root = make_workspace(tmp_path)
+        (root / ".github" / "workflows").mkdir(parents=True)
+        (root / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+        (root / ".gitignore").write_text("*.pyc\n")
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r1",
+            outcome="add CI",
+            source_dir=root,
+        )
+        (tree_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/trees")]
+        assert tree_body is not None
+        assert [e["path"] for e in tree_body["tree"]] == [
+            ".github/workflows/ci.yml",
+            ".gitignore",
+            "hello.txt",
+            "sub/logo.bin",
+        ]
+        assert ".github/workflows/ci.yml" in ops.pr_kwargs["body"]
+        assert "1 file(s) excluded (.git)" in ops.pr_kwargs["body"]
+
+    def test_custom_exclude_and_no_note_when_nothing_excluded(self, tmp_path: Path) -> None:
+        root = make_workspace(tmp_path)
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r1",
+            outcome="x",
+            source_dir=root,
+            exclude=[".git", "sub"],
+        )
+        (tree_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/trees")]
+        assert tree_body is not None
+        assert [e["path"] for e in tree_body["tree"]] == ["hello.txt"]
+        assert "excluded (.git, sub)" in ops.pr_kwargs["body"]
+
+        clean = tmp_path / "clean"
+        clean.mkdir()
+        (clean / "only.txt").write_text("x")
+        ops2 = StubOps()
+        deliver_workspace(
+            ops2,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r2",
+            outcome="x",
+            source_dir=clean,
+        )
+        assert "excluded" not in ops2.pr_kwargs["body"]
 
     def test_explicit_base_skips_repo_get(self, tmp_path: Path) -> None:
         ops = StubOps()

@@ -752,6 +752,25 @@ class TestWorkspaceExecution:
         assert [e.data["mounted"] for e in reports] == [True]
         assert reports[0].data["files"] == 1
         assert reports[0].data["path"] == str(result.workspace)
+        assert "excluded" not in reports[0].data  # nothing was excluded
+
+    def test_artifacts_event_surfaces_exclusions(self, harness: Harness) -> None:
+        """Dot-path artifacts count as files; only the denylist (.git) is
+        excluded, and the exclusion is visible in the event (#67)."""
+        execute = {
+            "text": "added CI",
+            "files": {
+                ".github/workflows/ci.yml": "on: push\n",
+                ".gitignore": "*.pyc\n",
+                ".git/HEAD": "ref\n",
+            },
+        }
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        result = harness.engine().start("add CI")
+        assert result.state == "completed"
+        reports = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS]
+        assert reports[0].data["files"] == 2  # .github/workflows/ci.yml, .gitignore
+        assert reports[0].data["excluded"] == {".git": 1}
 
 
 class TestDeliverHook:
@@ -784,6 +803,7 @@ class TestDeliverHook:
         assert calls[0]["run_id"] == result.run_id
         assert calls[0]["outcome"] == "ship it"
         assert calls[0]["source_dir"] == result.workspace
+        assert calls[0]["exclude"] == [".git", ".sbxloop"]  # config default threaded through
         deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
         assert [e.data for e in deliver_events] == [
             {"repo": "o/r", "pr": 3, "url": "https://github.com/o/r/pull/3"}

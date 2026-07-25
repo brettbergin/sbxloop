@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Literal
@@ -224,14 +226,55 @@ class RunResult(_Model):
         return self.state == "completed"
 
 
-def artifact_files(root: Path) -> list[Path]:
-    """Regular files under root, hidden files/dirs excluded (an agent's .git
-    would otherwise swamp listings and deliveries), sorted for stable output."""
-    return sorted(
-        p
-        for p in root.rglob("*")
-        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
-    )
+# Path components excluded from artifact listings and delivery by default.
+# A denylist, not "anything dot-prefixed": agents legitimately produce
+# .github/workflows, .gitignore, .env.example and friends — only genuinely
+# noisy state dirs are dropped (an agent's .git would otherwise swamp
+# listings and deliveries). Overridable via [artifacts] exclude.
+DEFAULT_ARTIFACT_EXCLUDES = (".git", ".sbxloop")
+
+
+@dataclass(frozen=True)
+class ArtifactScan:
+    """artifact_files plus what was excluded, so callers can surface it —
+    silent truncation of deliveries is exactly the bug (#67)."""
+
+    files: list[Path]
+    excluded: dict[str, int]  # exclude entry -> count of files dropped under it
+
+    @property
+    def excluded_total(self) -> int:
+        return sum(self.excluded.values())
+
+    @property
+    def excluded_note(self) -> str | None:
+        """Human-readable note like '3 file(s) excluded (.git)', or None."""
+        if not self.excluded:
+            return None
+        return f"{self.excluded_total} file(s) excluded ({', '.join(sorted(self.excluded))})"
+
+
+def scan_artifacts(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES) -> ArtifactScan:
+    """Regular files under root, sorted for stable output, partitioned into
+    kept files and per-entry counts of files whose path contains an excluded
+    component (at any depth, so vendored nested .git dirs are caught too)."""
+    names = frozenset(exclude)
+    files: list[Path] = []
+    excluded: dict[str, int] = {}
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        hit = next((part for part in p.relative_to(root).parts if part in names), None)
+        if hit is None:
+            files.append(p)
+        else:
+            excluded[hit] = excluded.get(hit, 0) + 1
+    return ArtifactScan(files=files, excluded=excluded)
+
+
+def artifact_files(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES) -> list[Path]:
+    """The kept files of scan_artifacts, for callers that need no exclusion note."""
+    return scan_artifacts(root, exclude).files
 
 
 def artifacts_dir(run: RunRecord | RunResult, state_dir: Path) -> Path | None:
