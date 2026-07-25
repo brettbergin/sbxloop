@@ -29,6 +29,7 @@ from sbxloop.events import Event
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
+from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
 from sbxloop.sbx.secretstate import (
@@ -104,10 +105,16 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     every terminal write happens here on the main thread, via a queue —
     ordering stays deterministic and rich's Live never interleaves.
 
-    Ctrl-C signals the engine (its cancel flag is checked at phase
-    boundaries) and briefly joins the daemon thread, so atexit sandbox
-    teardown doesn't race an engine still mid-``sbx exec`` against them.
+    Ctrl-C/SIGTERM quiesce the engine before sandbox teardown: the
+    registry's signal handler (and, when handlers could not install, the
+    KeyboardInterrupt path here) signals the engine's cancel flag —
+    checked at phase boundaries — and briefly joins the daemon thread, so
+    cleanup doesn't race an engine still mid-``sbx exec``.
     """
+    # The TUI runs the engine on a background thread, where pair
+    # registration cannot install signal handlers — install them here,
+    # on the main thread, so SIGTERM/SIGINT still clean up the sandboxes.
+    cleanup_registry.install_handlers()
     if not tui:
         engine.bus.subscribe(plain_printer(console))
         return action()  # type: ignore[no-any-return]
@@ -124,31 +131,44 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
             outcome["error"] = exc
 
     thread = threading.Thread(target=target, daemon=True)
-    with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
 
-        def drain() -> None:
-            while True:
-                try:
-                    event = pending.get_nowait()
-                except queue.Empty:
-                    return
-                dashboard.on_event(event)
-                rendered = render_event(event)
-                if rendered is not None:
-                    live.console.print(rendered)
-
-        thread.start()
-        try:
-            while thread.is_alive():
-                drain()
-                live.update(dashboard.renderable())
-                time.sleep(0.15)
-        except KeyboardInterrupt:
-            engine.request_cancel()
+    def quiesce() -> None:
+        # Idempotent: the signal handler runs it before cleanup, and the
+        # KeyboardInterrupt fallback below may run it again after.
+        engine.request_cancel()
+        if thread.is_alive():
             thread.join(timeout=_INTERRUPT_JOIN_S)
-            raise
-        drain()
-        live.update(dashboard.renderable())
+
+    cleanup_registry.set_quiesce(quiesce)
+    try:
+        with Live(dashboard.renderable(), console=console, refresh_per_second=8) as live:
+
+            def drain() -> None:
+                while True:
+                    try:
+                        event = pending.get_nowait()
+                    except queue.Empty:
+                        return
+                    dashboard.on_event(event)
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        live.console.print(rendered)
+
+            thread.start()
+            try:
+                while thread.is_alive():
+                    drain()
+                    live.update(dashboard.renderable())
+                    time.sleep(0.15)
+            except KeyboardInterrupt:
+                # Fallback for environments where the signal handlers could
+                # not install (no-op re-quiesce when they did).
+                quiesce()
+                raise
+            drain()
+            live.update(dashboard.renderable())
+    finally:
+        cleanup_registry.set_quiesce(None)
     if "error" in outcome:
         raise outcome["error"]
     return outcome["result"]  # type: ignore[no-any-return]

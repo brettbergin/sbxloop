@@ -141,13 +141,26 @@ All notable changes to sdxloop are documented here. The project adheres to
     store-level cancellation) and joins it briefly before sandbox cleanup,
     instead of tearing sandboxes down under an engine still mid-`sbx exec`.
     The interrupted run's persisted state is untouched, so it stays
-    resumable.
+    resumable. Composed with the #64 signal handlers: the cleanup registry
+    runs a driver-set quiesce callback before signal-triggered teardown,
+    so SIGINT/SIGTERM stop the engine first, then remove the sandboxes.
   - The `Hook` protocol docstring no longer claims hooks "must not raise":
     the bus has always contained and logged subscriber exceptions, so hook
     authors need no defensive boilerplate (hooks should still be fast).
   - `status <run>` now prints the run's sandbox pair names with their
     current liveness per `sbx ls`, plus a `sbxloop shell` hint when one is
     running — no more reconstructing `sbxloop-<run>-agent` by hand.
+- SIGTERM during a TUI-mode run no longer leaks the sandbox pair (#64). The
+  TUI runs the engine on a background thread, and the cleanup registry's
+  handler installer latched itself as "installed" *before* discovering it
+  was off the main thread — so signal handlers were never installed and
+  could never be installed later, and SIGTERM's default disposition kills
+  the process without running the atexit hook. The latch now only sets
+  after handlers actually install (later main-thread registrations retry),
+  and the CLI explicitly installs the handlers from the main thread before
+  handing the engine to the TUI's background thread. A TUI run receiving
+  SIGTERM now stops and removes both sandboxes and exits 143; the lazy
+  registration path remains as a fallback for library embedding.
 - **Delivery now batches blob creation into O(1) worker jobs (#66).**
   `deliver_workspace` used to submit one `github.op` job per file — a full
   job cycle (`sbx cp` job JSON in, fresh worker process, `sbx cp` result
