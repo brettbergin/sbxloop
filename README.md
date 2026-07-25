@@ -29,6 +29,7 @@ pip install sbxloop
 sbx login
 sbx policy init balanced
 sbxloop doctor          # verifies sbx, policy, tokens, worker wheel
+sbxloop doctor --deep   # + full sbx conformance suite in a scratch sandbox
 
 # go
 sbxloop run "Add mypy strict typing to every module in ./src and fix all findings"
@@ -170,7 +171,7 @@ dispatched workflow.
    ```
 
    With `repo` set, runs provision the github-ops sandbox and require a second PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with (e.g. issues: write, contents: read) — used *only* by that sandbox. Without it, no github sandbox exists, `GH_TOKEN` is not needed, and repo-facing features refuse to run.
-4. `sbxloop doctor` verifies all of it and prints remediation for anything missing.
+4. `sbxloop doctor` verifies all of it and prints remediation for anything missing. It also runs the **sbx conformance suite**: every empirically-learned assumption about sbx semantics (secret visibility under `exec`, `cp` directory semantics, workspace-mount discovery, ...) is a named probe whose verdict is cached per `sbx` version — `sbxloop doctor --deep` runs the full suite in a scratch sandbox, and doctor warns loudly when an sbx upgrade flips a verdict that sbxloop's behavior depends on.
 
 ### Secret registration hygiene
 

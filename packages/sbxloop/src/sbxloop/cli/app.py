@@ -870,9 +870,18 @@ def init(
 
 
 @app.command()
-def doctor() -> None:
+def doctor(
+    deep: Annotated[
+        bool,
+        typer.Option(
+            "--deep",
+            help="Also run the live-sandbox sbx conformance probes (boots one "
+            "scratch sandbox) and refresh the version-keyed verdict cache.",
+        ),
+    ] = False,
+) -> None:
     """Check that this host is ready to run sbxloop."""
-    ok = run_doctor(console)
+    ok = run_doctor(console, deep=deep)
     raise typer.Exit(0 if ok else 1)
 
 
