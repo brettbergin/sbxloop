@@ -225,6 +225,54 @@ def _raw_api(t: Transport, p: dict[str, Any]) -> JsonValue:
     return t.request(str(p["method"]).upper(), str(p["path"]), p.get("body"))
 
 
+# One progress event per this many blobs keeps a multi-hundred-file delivery
+# visibly alive without flooding the event stream.
+BLOB_PROGRESS_EVERY = 10
+
+ProgressFn = Callable[..., None]
+
+
+def _blobs_create_many(t: Transport, p: dict[str, Any], progress: ProgressFn | None) -> JsonValue:
+    """Create git blobs for a whole file manifest inside one job.
+
+    The delivery path used to submit one worker job per blob POST; the fixed
+    per-job overhead (sbx cp + fresh worker process) dominated delivery time
+    for large workspaces (#66). Here the loop over files runs inside the
+    sandbox, so N files cost N REST calls but only one job cycle.
+    """
+    _require(p, "repo", "files")
+    files = p["files"]
+    if not isinstance(files, list):
+        raise GithubOpError("files must be a list of {path, content_b64} entries")
+    total = len(files)
+    blobs: list[dict[str, Any]] = []
+    for index, entry in enumerate(files):
+        path = entry.get("path") if isinstance(entry, dict) else None
+        content = entry.get("content_b64") if isinstance(entry, dict) else None
+        if not path or not isinstance(content, str):
+            raise GithubOpError(f"files[{index}] must have a path and base64 content_b64")
+        try:
+            data = t.request(
+                "POST",
+                f"/repos/{p['repo']}/git/blobs",
+                {"content": content, "encoding": "base64"},
+            )
+        except GithubOpError as exc:
+            # Name the failing file: this message rides the JobResult error all
+            # the way into the host's run.deliver event.
+            raise GithubOpError(
+                f"blob create failed for {path!r} (file {index + 1}/{total}): {exc}"
+            ) from exc
+        sha = data.get("sha") if isinstance(data, dict) else None
+        if not sha:
+            raise GithubOpError(f"GitHub returned no sha for blob {path!r}: {data!r}")
+        blobs.append({"path": path, "sha": sha})
+        done = index + 1
+        if progress is not None and (done % BLOB_PROGRESS_EVERY == 0 or done == total):
+            progress(done=done, total=total)
+    return {"blobs": blobs}
+
+
 OPS: dict[str, OpImpl] = {
     "issue.create": _issue_create,
     "issue.comment": _issue_comment,
@@ -237,13 +285,24 @@ OPS: dict[str, OpImpl] = {
     "raw.api": _raw_api,
 }
 
+# Ops that stream progress while they run (they receive a progress callback in
+# addition to the (transport, params) every op gets).
+PROGRESS_OPS: dict[str, Callable[[Transport, dict[str, Any], ProgressFn | None], JsonValue]] = {
+    "blobs.create_many": _blobs_create_many,
+}
+
 
 def execute_op(
     op: str,
     params: dict[str, Any],
     transport: Transport | None = None,
+    progress: ProgressFn | None = None,
 ) -> JsonValue:
+    progress_impl = PROGRESS_OPS.get(op)
+    if progress_impl is not None:
+        return progress_impl(transport or select_transport(), params, progress)
     impl = OPS.get(op)
     if impl is None:
-        raise GithubOpError(f"unknown github op {op!r}; known: {', '.join(sorted(OPS))}")
+        known = ", ".join(sorted({**OPS, **PROGRESS_OPS}))
+        raise GithubOpError(f"unknown github op {op!r}; known: {known}")
     return impl(transport or select_transport(), params)

@@ -18,8 +18,10 @@ Subscriber = Callable[[Event], None]
 class Hook(Protocol):
     """Extension point: receives every event published on the bus.
 
-    Implementations must be fast and must not raise; exceptions are caught
-    and logged so one misbehaving hook cannot break a run.
+    Exceptions are contained: ``EventBus.publish`` catches and logs anything
+    a hook raises, so a misbehaving hook can never break a run and hook
+    authors need no defensive try/except of their own. Hooks run
+    synchronously on the publishing thread, though, so keep them fast.
     """
 
     def on_event(self, event: Event) -> None: ...
@@ -89,6 +91,12 @@ class HostEventTypes:
     SANDBOX_READY = "sandbox.ready"
     SANDBOX_PREBAKED = "sandbox.prebaked"
     SANDBOX_CLEANUP = "sandbox.cleanup"
+    # Interactive chat: a user message entering the loop, the agent's reply,
+    # and the resulting course change (when the reply's action was not
+    # "continue").
+    CHAT_MESSAGE = "chat.message"
+    CHAT_REPLY = "chat.reply"
+    CHAT_ACTION = "chat.action"
 
 
 __all__ = ["Event", "EventBus", "Hook", "HostEventTypes", "Subscriber"]

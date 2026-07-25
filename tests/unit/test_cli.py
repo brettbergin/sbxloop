@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from typer.testing import CliRunner
@@ -63,12 +64,26 @@ class TestBasics:
             "logs",
             "artifacts",
             "bake",
+            "list-models",
             "shell",
             "doctor",
             "sandbox",
             "config",
         ):
             assert command in result.output
+
+    def test_run_and_resume_offer_chat_toggle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Wide terminal: rich wraps 80-col help panels mid-token in CI,
+        # splitting "--no-chat" across lines.
+        monkeypatch.setenv("COLUMNS", "300")
+        for command in ("run", "resume"):
+            result = runner.invoke(app, [command, "--help"])
+            assert result.exit_code == 0
+            # GitHub Actions forces typer's terminal colors on, and the
+            # option highlighter styles the negative-flag prefix separately —
+            # ANSI codes land INSIDE "--no-chat". Assert on stripped text.
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+            assert "--no-chat" in plain
 
 
 class TestStatusAndLogs:
@@ -79,11 +94,36 @@ class TestStatusAndLogs:
         assert "rseeded11" in result.output
         assert "completed" in result.output
 
-    def test_status_run_detail(self, workdir: Path) -> None:
+    def test_status_run_detail(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         seed_store(workdir)
         result = runner.invoke(app, ["status", "rseeded11"])
         assert result.exit_code == 0
         assert "Task one" in result.output
+        # the pair names print with liveness, so no by-hand reconstruction
+        assert "sbxloop-rseeded11-agent" in result.output
+        assert "sbxloop-rseeded11-github" in result.output
+        assert "not running" in result.output
+        assert "sbxloop shell" not in result.output
+
+    def test_status_run_detail_flags_live_sandboxes(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.models import SandboxSpec
+
+        seed_store(workdir)
+        SbxCLI(binary=str(fake_sbx.binary)).create(
+            SandboxSpec(name="sbxloop-rseeded11-agent", role="agent", workspace=workdir)
+        )
+        result = runner.invoke(app, ["status", "rseeded11"])
+        assert result.exit_code == 0
+        assert "running" in result.output
+        assert "sbxloop shell rseeded11" in result.output
+
+    def test_status_run_detail_survives_sbx_failure(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        seed_store(workdir)
+        fake_sbx.fail_next("ls")
+        result = runner.invoke(app, ["status", "rseeded11"])
+        assert result.exit_code == 0
+        assert "liveness unknown" in result.output
 
     def test_status_unknown_run(self, workdir: Path) -> None:
         seed_store(workdir)
@@ -106,6 +146,21 @@ class TestStatusAndLogs:
         result = runner.invoke(app, ["logs", "rseeded11", "--follow"])
         assert result.exit_code == 0
         assert "run.end" in result.output
+
+    def test_logs_follow_exits_on_stale_run(self, workdir: Path) -> None:
+        # A run whose driving process died hard stays `running` in the DB
+        # forever; --follow must notice the silence and exit, not spin.
+        store = seed_store(workdir)
+        store.set_run_state("rseeded11", "running")
+        store._conn.execute(  # backdate the state change (no public setter)
+            "UPDATE runs SET updated_at = 1.0 WHERE run_id = 'rseeded11'"
+        )
+        store._conn.commit()
+        result = runner.invoke(app, ["logs", "rseeded11", "--follow"])
+        assert result.exit_code == 0
+        # single words: rich may wrap the note anywhere between words
+        assert "activity" in result.output
+        assert "resume" in result.output
 
 
 class TestArtifactsCommand:
@@ -620,6 +675,47 @@ class TestRunCommand:
         assert "completed" in result.output
         assert "t1: done" in result.output
 
+    HAPPY_RUN: ClassVar[list[dict[str, Any]]] = [
+        {
+            "json": {
+                "tasks": [
+                    {
+                        "id": "t1",
+                        "title": "Only task",
+                        "description": "",
+                        "depends_on": [],
+                        "acceptance_criteria": ["works"],
+                        "verify_commands": ["true"],
+                    }
+                ]
+            }
+        },
+        {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+        {"text": "did it"},
+        {"json": {"verdict": "pass"}},
+        {"json": {"verdict": "accept"}},
+    ]
+
+    def test_run_no_keep_sandboxes_overrides_config(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # keep_sandboxes=true in config must be forceable OFF from the CLI.
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        monkeypatch.setenv("SBXLOOP_KEEP_SANDBOXES", "true")
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--no-keep-sandboxes"])
+        assert result.exit_code == 0, result.output
+        boxes = fake_sbx.state / "sandboxes"
+        assert not boxes.is_dir() or not any(boxes.iterdir())
+
+    def test_run_keep_sandboxes_flag_keeps(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--keep-sandboxes"])
+        assert result.exit_code == 0, result.output
+        boxes = fake_sbx.state / "sandboxes"
+        assert any(p.name.startswith("sbxloop-") for p in boxes.iterdir())
+
     def test_run_tui_preserves_full_transcript_history(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -658,6 +754,78 @@ class TestRunCommand:
         assert result.exit_code == 0, result.output
         for message in messages:
             assert message in result.output
+
+    def test_run_no_tui_ctrl_c_removes_sandboxes_and_hints_resume(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl+C mid-run exits 130 without a traceback, removes the run's
+        sandboxes, and points at `sbxloop resume` (the run state stays
+        resumable)."""
+        self.make_run_env(workdir, monkeypatch, [])
+        from sbxloop.engine.phases import PhaseRunner
+
+        def interrupt(self: PhaseRunner) -> Any:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(PhaseRunner, "decompose", interrupt)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui"])
+        assert result.exit_code == 130, result.output
+        assert "interrupted" in result.output
+        assert "resume" in result.output
+        assert "Traceback" not in result.output
+        removed = fake_sbx.invocations("rm")
+        assert any(arg.endswith("-agent") for args in removed for arg in args), removed
+
+    def test_run_tui_ctrl_c_exits_130_without_traceback(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A KeyboardInterrupt in the main display loop (where Ctrl+C lands
+        in TUI mode, while the engine runs on a worker thread) exits 130
+        cleanly instead of leaking a traceback and a live engine thread."""
+        import time as real_time
+
+        import sbxloop.cli.app as app_module
+
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Only task",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+                {"text": "did it"},
+                {"json": {"verdict": "pass"}},
+                {"json": {"verdict": "accept"}},
+            ],
+        )
+
+        class InterruptingTime:
+            """time shim for the drive loop: first sleep is the Ctrl+C."""
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_time, name)
+
+            @staticmethod
+            def sleep(seconds: float) -> None:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(app_module, "time", InterruptingTime())
+        result = runner.invoke(app, ["run", "make it so"])  # tui mode (default)
+        assert result.exit_code == 130, result.output
+        assert "interrupted" in result.output
+        assert "Traceback" not in result.output
 
     def test_run_report_refused_without_github_config(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -998,6 +1166,29 @@ class TestDashboard:
         # the long value wrapped instead of being clipped: all 200 chars
         # of payload are present in the output across multiple lines
         assert text.count("x") >= 200
+
+    def test_agent_message_header_names_the_persona(self) -> None:
+        """Attributed messages title the chat bubble with the phase persona
+        (planner, executor, ...); unattributed ones keep the generic
+        "agent" title (covered above)."""
+        from rich.console import Console
+
+        from sbxloop.cli.tui import render_event
+
+        rendered = render_event(
+            Event.now("agent.message", "r1", content="looks good", agent="scrutinizer")
+        )
+        assert rendered is not None
+        console = Console(record=True, width=80)
+        console.print(rendered)
+        assert "scrutinizer" in console.export_text()
+
+    def test_format_event_includes_agent_name(self) -> None:
+        from sbxloop.cli.tui import format_event
+
+        line = format_event(Event.now("agent.message", "r1", agent="planner", content="hi"))
+        assert "[planner]" in line
+        assert "hi" in line
 
     def test_deltas_and_heartbeats_stay_out_of_transcript(self) -> None:
         from sbxloop.cli.tui import render_event

@@ -174,3 +174,40 @@ class TestKeptMarker:
     def test_unknown_run(self, store: StateStore) -> None:
         with pytest.raises(StateError, match="unknown run"):
             store.set_run_kept("ghost", "debug")
+
+
+class TestUserGuidance:
+    def test_append_and_get(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        assert store.get_run_guidance("r1") == []
+        store.append_run_guidance("r1", "use postgres")
+        store.append_run_guidance("r1", "target python 3.13")
+        assert store.get_run_guidance("r1") == ["use postgres", "target python 3.13"]
+
+    def test_unknown_run(self, store: StateStore) -> None:
+        with pytest.raises(StateError, match="unknown run"):
+            store.append_run_guidance("ghost", "g")
+        with pytest.raises(StateError, match="unknown run"):
+            store.get_run_guidance("ghost")
+
+    def test_pre_guidance_database_migrates_in_place(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
+            " state TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}',"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL,"
+            " workspace TEXT, mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO runs VALUES ('r1', 'old', 'completed', '{}', 1.0, 1.0, NULL, 0, NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = StateStore(db)
+        assert store.get_run_guidance("r1") == []
+        store.append_run_guidance("r1", "g")
+        assert StateStore(db).get_run_guidance("r1") == ["g"]

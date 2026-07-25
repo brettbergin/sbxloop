@@ -85,8 +85,14 @@ revocation primitive, so grants persist for the sandbox's lifetime
 removed at run end and `resume` provisions fresh ones.
 
 Cleanup is guaranteed by `SandboxPair` (context manager) plus a process-wide
-registry hooked into `atexit` and SIGINT/SIGTERM: aborted runs do not leak
-microVMs. Sandboxes are **cattle** — `resume` always provisions a fresh pair.
+registry hooked into `atexit` and SIGINT/SIGTERM; signal-triggered teardown
+first runs a driver-set quiesce callback (the TUI signals the engine's
+cancel flag and briefly joins its thread) so cleanup never races an engine
+mid-`sbx exec`. Aborted runs do not leak microVMs: the CLI's first Ctrl+C
+removes the run's sandboxes and exits 130 with a `sbxloop resume` hint
+(interrupted runs stay resumable), a second force-quits and defers to
+`sbxloop sandbox prune`. Sandboxes are **cattle** — `resume` always
+provisions a fresh pair.
 
 ## The loop
 

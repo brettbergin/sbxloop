@@ -20,7 +20,7 @@ from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.sandbox import Sandbox
-from sbxloop.worker.client import WorkerClient
+from sbxloop.worker.client import WorkerClient, _PollDrain
 from sbxloop_worker.protocol import EventTypes, JobRequest
 from tests.conftest import FakeSbx
 
@@ -73,6 +73,25 @@ class TestStreamTransport:
         assert (fs / "home/agent/.sbxloop/jobs/j1.json").is_file()
         assert (fs / "home/agent/.sbxloop/results/j1.json").is_file()
         assert (fs / "home/agent/.sbxloop/events/j1.jsonl").is_file()
+
+    def test_submit_agent_name_stamps_agent_events(self, sandbox: Sandbox) -> None:
+        """submit(agent=...) attributes that job's agent.* events to the
+        phase persona (the transcript header shows who is speaking); worker
+        lifecycle events stay unattributed, and the mapping is dropped once
+        the job completes."""
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+
+        client = make_client(sandbox, bus)
+        result = client.submit(agent_job(), agent="planner")
+
+        assert result.status == "ok"
+        messages = [e for e in seen if e.type == EventTypes.AGENT_MESSAGE]
+        assert messages and all(e.data["agent"] == "planner" for e in messages)
+        starts = [e for e in seen if e.type == EventTypes.WORKER_START]
+        assert starts and "agent" not in starts[0].data
+        assert client._job_agents == {}
 
     def test_shell_check_job(self, sandbox: Sandbox) -> None:
         job = JobRequest(
@@ -194,6 +213,22 @@ class TestPollTransport:
         assert EventTypes.WORKER_START in types
         assert EventTypes.WORKER_END in types
 
+    def test_poll_end_to_end_non_ascii_prompt(self, sandbox: Sandbox) -> None:
+        """Non-ASCII survives the full poll path (base64-encoded chunks)."""
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        client = make_client(sandbox, bus, transport="poll", poll_interval=0.1)
+
+        prompt = "café — “smart quotes” ☕"
+        result = client.submit(agent_job(job_id="jn", prompt=prompt))
+
+        assert result.status == "ok"
+        assert result.output_text == f"echo: {prompt}"
+        messages = [e for e in seen if e.type == EventTypes.AGENT_MESSAGE]
+        assert messages
+        assert messages[0].data["content"] == f"echo: {prompt}"
+
     def test_poll_timeout(self, sandbox: Sandbox, tmp_path: Path) -> None:
         script = tmp_path / "script.json"
         script.write_text(json.dumps([{"text": "slow", "sleep_s": 30}]))
@@ -208,6 +243,100 @@ class TestPollTransport:
                 client.submit(agent_job(timeout_s=0.2))
         finally:
             del os.environ["SBXLOOP_ECHO_SCRIPT"]
+
+
+class TestPollDrain:
+    """Byte-level poll-chunk semantics, driven by writing the events file
+    directly in the fake sandbox fs between drain() calls (issue #65)."""
+
+    EVENTS_PATH = "/home/agent/.sbxloop/events/jd.jsonl"
+
+    def make_drain(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, bus: EventBus
+    ) -> tuple[_PollDrain, Path]:
+        client = make_client(sandbox, bus, transport="poll")
+        host_events = fake_sbx.sandbox_fs("boxa") / self.EVENTS_PATH.lstrip("/")
+        host_events.parent.mkdir(parents=True, exist_ok=True)
+        return _PollDrain(client, agent_job(job_id="jd"), self.EVENTS_PATH), host_events
+
+    def test_multibyte_char_split_across_chunks(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        """A poll boundary mid-UTF-8-character must neither crash the host
+        decode nor corrupt the reassembled line."""
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        drain, host_events = self.make_drain(sandbox, fake_sbx, bus)
+
+        # to_json_line escapes non-ASCII; serialize with ensure_ascii=False to
+        # model a writer emitting raw UTF-8 (equally valid JSONL on disk).
+        text = "café — ☕ done"
+        payload = Event.now(EventTypes.AGENT_MESSAGE, "r1", text=text).model_dump(mode="json")
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+        split = data.index("☕".encode()) + 1  # one byte into a 3-byte character
+
+        host_events.write_bytes(data[:split])
+        assert drain.drain() is False
+        assert drain.offset == split  # offset counts raw bytes, not re-encoded text
+        assert seen == []  # no newline yet: nothing published
+
+        host_events.write_bytes(data)
+        assert drain.drain() is False
+        assert drain.offset == len(data)
+        assert [e.type for e in seen] == [EventTypes.AGENT_MESSAGE]
+        assert seen[0].data["text"] == text  # character reassembled, no U+FFFD
+
+    def test_crlf_lines_do_not_drift_offset(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        r"""\r\n in worker output: offset stays byte-exact across polls, so no
+        line is replayed or dropped (the old text-layer round-trip lost one
+        byte per \r\n to universal-newline translation)."""
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        drain, host_events = self.make_drain(sandbox, fake_sbx, bus)
+
+        first = (
+            Event.now(EventTypes.WORKER_START, "r1").to_json_line()
+            + "\r\n"
+            + Event.now(EventTypes.WORKER_HEARTBEAT, "r1").to_json_line()
+            + "\r\n"
+        ).encode()
+        host_events.write_bytes(first)
+        assert drain.drain() is False
+        assert drain.offset == len(first)
+
+        second = (
+            Event.now(EventTypes.AGENT_MESSAGE, "r1", text="hi").to_json_line() + "\r\n"
+        ).encode()
+        host_events.write_bytes(first + second)
+        assert drain.drain() is False
+        assert drain.offset == len(first) + len(second)
+        assert [e.type for e in seen] == [
+            EventTypes.WORKER_START,
+            EventTypes.WORKER_HEARTBEAT,
+            EventTypes.AGENT_MESSAGE,
+        ]
+
+    def test_worker_end_literal_in_event_data_is_not_completion(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
+    ) -> None:
+        """Only a parsed worker.end event finishes the poll — an agent event
+        whose DATA contains the literal string must not."""
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        drain, host_events = self.make_drain(sandbox, fake_sbx, bus)
+
+        decoy_line = Event.now(
+            EventTypes.AGENT_MESSAGE, "r1", quoted_type="worker.end"
+        ).to_json_line()
+        assert '"worker.end"' in decoy_line  # the old substring check would end here
+        host_events.write_bytes((decoy_line + "\n").encode())
+        assert drain.drain() is False
+
+        end_line = Event.now(EventTypes.WORKER_END, "r1").to_json_line()
+        host_events.write_bytes((decoy_line + "\n" + end_line + "\n").encode())
+        assert drain.drain() is True
+        assert [e.type for e in seen] == [EventTypes.AGENT_MESSAGE, EventTypes.WORKER_END]
 
 
 class TestInstall:
