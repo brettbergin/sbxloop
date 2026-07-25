@@ -165,6 +165,21 @@ class TestArtifactsCommand:
         assert "a/" in result.output
         assert "deep.txt" in result.output
 
+    def test_dot_path_artifacts_listed_and_exclusions_noted(self, workdir: Path) -> None:
+        """.github/ and .gitignore show up; .git is excluded visibly (#67)."""
+        workspace = self.seed_with_workspace(workdir, mounted=True)
+        (workspace / ".github" / "workflows").mkdir(parents=True)
+        (workspace / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+        (workspace / ".gitignore").write_text("*.pyc\n")
+        (workspace / ".git").mkdir()
+        (workspace / ".git" / "HEAD").write_text("ref\n")
+        result = runner.invoke(app, ["artifacts", "rseeded11"])
+        assert result.exit_code == 0
+        assert "2 file(s)" in result.output
+        assert "ci.yml" in result.output
+        assert ".gitignore" in result.output
+        assert "1 file(s) excluded (.git)" in result.output
+
     def test_missing_directory_errors(self, workdir: Path) -> None:
         workspace = self.seed_with_workspace(workdir, mounted=True)
         workspace.rmdir()
@@ -874,7 +889,7 @@ class TestRunCommand:
 
 
 class TestArtifactsTree:
-    def test_tree_caps_and_hides_dotfiles(self, tmp_path: Path) -> None:
+    def test_tree_caps_and_hides_denylisted_dirs(self, tmp_path: Path) -> None:
         from rich.console import Console
 
         from sbxloop.cli.app import _artifacts_tree
@@ -890,15 +905,17 @@ class TestArtifactsTree:
         (root / "sub" / "nested.txt").write_text("y")
 
         files = artifact_files(root)
-        assert [p.name for p in files if p.name.startswith(".")] == []
-        assert len(files) == 6
+        # denylist, not "anything dot-prefixed": .git excluded, .hidden kept (#67)
+        assert ".git" not in {p.parts[-2] for p in files}
+        assert len(files) == 7
 
         console = Console(record=True, width=100)
         console.print(_artifacts_tree(root, files, cap=3))
         text = console.export_text()
+        assert ".hidden" in text
         assert "f0.txt" in text
         assert "2.0 KB" in text
-        assert "+3 more" in text
+        assert "+4 more" in text
         assert ".git" not in text
 
     def test_human_size_units(self) -> None:

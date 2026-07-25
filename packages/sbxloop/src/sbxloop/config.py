@@ -104,6 +104,33 @@ class GithubConfig(_ConfigModel):
         return self.repo is not None
 
 
+class ArtifactsConfig(_ConfigModel):
+    """What artifact listings and delivery leave out.
+
+    ``exclude`` entries are single path components matched at any depth;
+    a file is excluded when any component of its path matches. The default
+    drops only genuinely noisy state dirs (``.git``, ``.sbxloop``) — dot-path
+    artifacts like ``.github/`` or ``.gitignore`` are delivered. Exclusions
+    are always counted and surfaced, never silent.
+    """
+
+    # Mirrors engine.model.DEFAULT_ARTIFACT_EXCLUDES (kept literal here —
+    # importing engine.model from config would be a circular import).
+    exclude: list[str] = Field(default_factory=lambda: [".git", ".sbxloop"])
+
+    @field_validator("exclude")
+    @classmethod
+    def _check_exclude(cls, value: list[str]) -> list[str]:
+        value = [e.strip() for e in value]
+        bad = [e for e in value if not e or "/" in e or "\\" in e or e in (".", "..")]
+        if bad:
+            raise ValueError(
+                f"invalid artifacts.exclude entries {bad}: each must be a bare "
+                f'directory/file name (no path separators), e.g. ".git"'
+            )
+        return value
+
+
 class Limits(_ConfigModel):
     """Sandbox resource guardrails, sampled in-VM on the worker heartbeat.
 
@@ -165,6 +192,7 @@ class Config(_ConfigModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
+    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
     limits: Limits = Field(default_factory=Limits)
 
