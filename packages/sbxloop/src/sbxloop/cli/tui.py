@@ -227,10 +227,13 @@ class Dashboard:
         table.add_column("rev/replan", no_wrap=True, justify="right")
         for task_id, entry in self.tasks.items():
             state = str(entry.get("state", "?"))
+            # The engine announces the whole roster as "pending" right after
+            # decompose; show those rows as "waiting" until their turn.
+            label = "waiting" if state == "pending" else state
             table.add_row(
                 task_id,
                 str(entry.get("title", "")),
-                Text(state, style=TASK_STATE_STYLES.get(state, "")),
+                Text(label, style=TASK_STATE_STYLES.get(state, "")),
                 f"{entry.get('revisions', 0)}/{entry.get('replans', 0)}",
             )
         if not self.tasks:

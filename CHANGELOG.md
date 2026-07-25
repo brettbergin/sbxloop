@@ -98,6 +98,12 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- The pinned status panel now shows the whole decomposed task list up
+  front (#63). Previously a task's row only appeared when it started, so
+  t2…tn were invisible until each prior task finished. The engine now
+  announces the full roster (ids, titles, states) right after
+  decomposition — and on resume, restoring each task's persisted state —
+  and the TUI renders not-yet-started rows as `waiting` until their turn.
 - `resume` now runs under the config the run was started with (#60). The
   full config has always been persisted in the runs table, but resume drove
   with whatever `load_config()` produced at resume time — so editing
