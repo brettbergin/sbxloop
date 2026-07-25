@@ -26,6 +26,7 @@ from sbxloop.errors import SdxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
 from sbxloop.sbx.secretstate import (
@@ -96,6 +97,10 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, action: Any) -> RunResult:
     every terminal write happens here on the main thread, via a queue —
     ordering stays deterministic and rich's Live never interleaves.
     """
+    # The TUI runs the engine on a background thread, where pair
+    # registration cannot install signal handlers — install them here,
+    # on the main thread, so SIGTERM/SIGINT still clean up the sandboxes.
+    cleanup_registry.install_handlers()
     if not tui:
         engine.bus.subscribe(plain_printer(console))
         return action()  # type: ignore[no-any-return]
