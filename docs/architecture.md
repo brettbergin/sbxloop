@@ -131,8 +131,9 @@ persisting — a crash and a `kill -9` look identical to the store — and
 `resume`:
 
 1. rehydrates the config persisted at run creation (tokens still come from
-   the current environment; `state_dir` stays the one that located the run)
-   and pins the workspace from the `runs` table — editing config between
+   the current environment; `state_dir` stays the one that located the run;
+   the `keep_sandboxes`/`keep_on_failure` debug toggles stay resume-time
+   choices) and pins the workspace from the `runs` table — editing config between
    start and resume, or resuming from another directory, cannot silently
    change budgets/toggles or relocate the workspace. Any difference from
    the current on-disk config is reported as a `run.config_drift` event,

@@ -105,7 +105,9 @@ All notable changes to sdxloop are documented here. The project adheres to
   model, or GitHub toggles mid-run, and could relocate the run into a
   fresh, empty workspace. Resume now rehydrates the persisted config
   (tokens still come from the current environment; `state_dir` stays where
-  the run was found), pins the workspace from the runs table instead of
+  the run was found; the `keep_sandboxes`/`keep_on_failure` debug toggles
+  stay resume-time choices so a crashing run can be resumed with keep
+  flipped on), pins the workspace from the runs table instead of
   recomputing it, refuses a workspace mismatch, and reports any difference
   from the current on-disk config as a `run.config_drift` event.
 - A run resumed while a task was checkpointed `validating` no longer asks

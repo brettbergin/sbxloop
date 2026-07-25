@@ -458,6 +458,18 @@ class TestResume:
         assert result.state == "completed"
         assert HostEventTypes.RUN_CONFIG_DRIFT not in harness.event_types()
 
+    def test_resume_honors_current_keep_toggles(self, harness: Harness) -> None:
+        # keep_sandboxes/keep_on_failure are resume-time operator intent
+        # (debug this attempt), not run identity: the CURRENT config wins for
+        # them, with no drift warning — unlike everything else rehydrated.
+        run_id = self._crashed_run(harness)
+        harness.script([EXECUTE, PASS, ACCEPT])
+        engine2 = harness.engine(keep_sandboxes=True)
+        result = engine2.resume(run_id)
+        assert result.state == "completed"
+        assert result.kept_sandboxes  # this attempt's pair was kept
+        assert HostEventTypes.RUN_CONFIG_DRIFT not in harness.event_types()
+
     def test_resume_cannot_relocate_workspace_via_config(self, harness: Harness) -> None:
         run_id = self._crashed_run(harness)
         engine = harness.engine()

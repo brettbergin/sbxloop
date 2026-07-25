@@ -145,9 +145,12 @@ class LoopEngine:
 
         Tokens still come from the current environment (they are never
         persisted), and ``state_dir`` stays the one that located the run: the
-        store is already open there. Drift from the config this engine was
-        built with is reported via a ``run.config_drift`` event, never
-        applied silently.
+        store is already open there. The debug/cleanup toggles
+        (``keep_sandboxes``, ``keep_on_failure``) also stay resume-time
+        choices — they are operator intent about THIS attempt, not run
+        identity, and flipping keep on to debug a crashing run must work.
+        Drift from the config this engine was built with is reported via a
+        ``run.config_drift`` event, never applied silently.
         """
         raw = self.store.get_run_config(run_id)
         try:
@@ -168,7 +171,13 @@ class LoopEngine:
             logger.warning("run %s: %s", run_id, message)
             self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
             return
-        stored = stored.model_copy(update={"state_dir": self.config.state_dir})
+        stored = stored.model_copy(
+            update={
+                "state_dir": self.config.state_dir,
+                "keep_sandboxes": self.config.keep_sandboxes,
+                "keep_on_failure": self.config.keep_on_failure,
+            }
+        )
         drift = self._config_drift(stored, self.config)
         if drift:
             message = (
