@@ -551,14 +551,19 @@ class LoopEngine:
     ) -> None:
         assert task.plan is not None
         started = time.time()
-        passed, feedback = phases.verify(task, task.plan)
+        passed, feedback, results = phases.verify(task, task.plan)
+        # `results` (the full command transcript) is persisted so VALIDATE —
+        # including one entered on resume in a fresh process — reads its
+        # evidence from phase_attempts rather than in-memory state (#61).
         self.store.record_phase(
             run_id,
             "verify",
             task_id=task.spec.id,
             attempt=task.revisions + 1,
             status="ok" if passed else "failed",
-            output_json=json.dumps({"passed": passed, "feedback": clip(feedback)}),
+            output_json=json.dumps(
+                {"passed": passed, "feedback": clip(feedback), "results": results}
+            ),
             started_at=started,
         )
         if passed:
@@ -588,8 +593,16 @@ class LoopEngine:
         task: TaskRecord,
         budgets: object,
     ) -> None:
+        verify_results = self._verify_evidence(run_id, task)
+        if verify_results is None:
+            # No committed verify transcript for this task (a pre-upgrade
+            # checkpoint resumed into `validating`): VERIFY is mechanical and
+            # idempotent, so rewind and repopulate the evidence rather than
+            # asking the judge to rule without it.
+            self._set_task_state(run_id, task, "verifying")
+            return
         started = time.time()
-        verdict = phases.validate(task)
+        verdict = phases.validate(task, verify_results)
         self.store.record_phase(
             run_id,
             "validate",
@@ -611,6 +624,18 @@ class LoopEngine:
         task.plan = None
         task.revisions = 0
         self._set_task_state(run_id, task, "planning")
+
+    def _verify_evidence(self, run_id: str, task: TaskRecord) -> str | None:
+        """The task's latest committed verify-command transcript, or None.
+
+        phase_attempts is the single source of truth for this evidence: a
+        resumed run's VALIDATE judges with exactly what a fresh one would.
+        """
+        output = self.store.latest_phase_output(run_id, task.spec.id, "verify")
+        if output is None:
+            return None
+        results = json.loads(output).get("results")
+        return results if isinstance(results, str) else None
 
     def _register_revision(
         self, run_id: str, task: TaskRecord, feedback: str, *, verify_failure: bool = False

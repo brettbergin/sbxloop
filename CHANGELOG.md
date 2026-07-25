@@ -98,6 +98,17 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
+- A run resumed while a task was checkpointed `validating` no longer asks
+  the VALIDATE judge to rule without evidence (#61). The verify-command
+  transcript lived only in memory on the `PhaseRunner` (a class-level
+  default of `"(verification not run)"`), so a fresh process entering
+  VALIDATE rendered the prompt with the placeholder instead of the real
+  results. VERIFY now persists its full command transcript on the
+  `phase_attempts` row and VALIDATE reads it from there — the single source
+  of truth for both fresh and resumed runs — and the class-level mutable
+  state is gone. A checkpoint whose verify row predates this change (no
+  stored transcript) rewinds to `verifying` on resume; VERIFY is mechanical
+  and idempotent, so the evidence is cheaply repopulated.
 - A delivery infrastructure failure can no longer mark a completed run as
   failed (#59). `--deliver` runs after the run has succeeded; worker- and
   sbx-level errors raised by the delivery op jobs (`WorkerError`,
