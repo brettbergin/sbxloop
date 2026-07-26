@@ -61,6 +61,42 @@ class Usage(ProtocolModel):
         )
 
 
+class SessionHealth(ProtocolModel):
+    """Tooling health observed during one agent session.
+
+    ``permission_denials`` maps a denied permission kind to how many times it
+    was rejected — expected in read-only sessions (the allowlist doing its
+    job), but worth an audit trail. ``tool_failures`` maps a tool name to how
+    many of its calls failed; failures mean the session could not run its
+    intended inspection, which is what the engine's degraded-critic guard
+    reacts to (#123): a critic that lost its tooling must not emit a clean
+    verdict as if it had verified anything.
+    """
+
+    permission_denials: dict[str, int] = Field(default_factory=dict)
+    tool_failures: dict[str, int] = Field(default_factory=dict)
+
+    @property
+    def degraded(self) -> bool:
+        """True when the session lost tooling it tried to use. Denials do
+        not count: a read-only critic probing ``shell`` is the barrier
+        working as designed, not a broken session."""
+        return bool(self.tool_failures)
+
+    def summary(self) -> str:
+        """Human-readable tally for prompts, feedback, and event messages."""
+
+        def tally(counts: dict[str, int]) -> str:
+            return ", ".join(f"{name} x{count}" for name, count in sorted(counts.items()))
+
+        parts = []
+        if self.tool_failures:
+            parts.append(f"tool failures: {tally(self.tool_failures)}")
+        if self.permission_denials:
+            parts.append(f"permission denials: {tally(self.permission_denials)}")
+        return "; ".join(parts) or "healthy"
+
+
 class ErrorInfo(ProtocolModel):
     """Structured error carried in a JobResult or error event."""
 
@@ -162,6 +198,9 @@ class JobResult(ProtocolModel):
     output_json: dict[str, Any] | list[Any] | None = None
     session_id: str | None = None
     usage: Usage | None = None
+    # Tooling health of an agent session (None when nothing degraded, or for
+    # non-agent jobs / backends that do not report it).
+    health: SessionHealth | None = None
     exit_code: int | None = None
     error: ErrorInfo | None = None
     artifacts: list[str] = Field(default_factory=list)
@@ -217,6 +256,7 @@ class EventTypes:
     AGENT_TOOL_START = "agent.tool_start"
     AGENT_TOOL_END = "agent.tool_end"
     AGENT_USAGE = "agent.usage"
+    AGENT_PERMISSION_DENIED = "agent.permission_denied"
 
     GH_OP_START = "gh.op_start"
     GH_OP_PROGRESS = "gh.op_progress"
