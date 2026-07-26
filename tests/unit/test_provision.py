@@ -46,6 +46,13 @@ class TestSpecs:
         assert github.name == "sbxloop-r1-github"
         assert "api.githubcopilot.com" in agent.policy_allows
         assert "uploads.github.com" in github.policy_allows
+        # The prompt-advertised baseline (PyPI + apt mirrors) is granted to
+        # the agent sandbox up front: worker pip installs and the dev-tools
+        # apt ensure run before any plan-declared egress exists, so they
+        # must not depend on the operator's global sbx preset.
+        for host in ("pypi.org", "archive.ubuntu.com", "security.ubuntu.com"):
+            assert host in agent.policy_allows
+        assert "archive.ubuntu.com" not in github.policy_allows
         assert {s.kind for s in agent.secrets} == {"custom"}
         assert [s.service for s in github.secrets] == ["github"]
         # ONE custom secret, bound to the token-exchange host only: sbx keys

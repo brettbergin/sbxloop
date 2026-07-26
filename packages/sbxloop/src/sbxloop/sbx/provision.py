@@ -29,6 +29,7 @@ from pathlib import Path
 from sbxloop.config import Config
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
+from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     PROBE_SECRET_ENV_VISIBILITY,
@@ -125,7 +126,11 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=template,
-            policy_allows=[*AGENT_ALLOW_DOMAINS, *extra],
+            # PROMPT_ADVERTISED_DOMAINS: the prompts promise PyPI and the apt
+            # mirrors are reachable, and both the worker's pip install and the
+            # dev-tools apt ensure run before any plan-declared egress exists —
+            # the promise must not depend on the operator's global sbx preset.
+            policy_allows=[*AGENT_ALLOW_DOMAINS, *PROMPT_ADVERTISED_DOMAINS, *extra],
             secrets=[SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)],
         )
         github = SandboxSpec(

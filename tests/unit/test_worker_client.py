@@ -451,6 +451,11 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
+        fake_sbx.script(
+            "exec boxa python3 -c",
+            returncode=1,
+            stderr="ModuleNotFoundError: No module named 'ensurepip'",
+        )
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
@@ -471,6 +476,30 @@ class TestInstallFallbacks:
         apt_cmd = " ".join(execs[apt_idx[0]])
         assert "python3-venv" in apt_cmd and "python3-pip" in apt_cmd
 
+    def test_ensure_dev_tools_probe_success_skips_apt(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # A template that already has ensurepip+pip must not touch apt (or
+        # the network) at all — the ensure is a genuine no-op.
+        import sbxloop
+
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script("exec boxa python3 -c", returncode=0)
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
+        )
+        client.install(wheel=wheel, ensure_dev_tools=True)
+        execs = fake_sbx.invocations("exec")
+        assert not [c for c in execs if any("apt-get" in a for a in c)]
+
     def test_ensure_dev_tools_failure_is_nonfatal_but_loud(
         self,
         sandbox: Sandbox,
@@ -483,6 +512,11 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
+        fake_sbx.script(
+            "exec boxa python3 -c",
+            returncode=1,
+            stderr="ModuleNotFoundError: No module named 'ensurepip'",
+        )
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=100, stderr="apt exploded")
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)

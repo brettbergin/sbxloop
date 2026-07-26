@@ -175,6 +175,15 @@ class TestEgressGranter:
         assert fake_sbx.policies() == []
         assert [e for e in events if e.type.startswith("policy.")] == []
 
+    def test_prompt_advertised_domain_needs_no_grant(self, fake_sbx: FakeSbx) -> None:
+        # PyPI/apt mirrors are granted at provision time, so a plan
+        # declaring one is in-bounds AND needs no re-grant.
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events)
+        granter.apply("t1", [("archive.ubuntu.com", "apt-get for build deps")])
+        assert fake_sbx.policies() == []
+        assert [e for e in events if e.type.startswith("policy.")] == []
+
     def test_out_of_bounds_refused_with_deny_event(self, fake_sbx: FakeSbx) -> None:
         events: list[Event] = []
         granter = self.make_granter(fake_sbx, events)
