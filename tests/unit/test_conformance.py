@@ -113,6 +113,59 @@ class TestDeepRun:
         assert outcome.drifts
 
 
+class TestPageSizeProbe:
+    """Verdict logic for the bundled-ripgrep page-size probe (issue #122),
+    driven through a stub sandbox so every guest shape is coverable
+    regardless of the host running the tests."""
+
+    class _StubSandbox:
+        def __init__(self, page_out: str, page_rc: int = 0, rg_rc: int = 1) -> None:
+            self.page_out = page_out
+            self.page_rc = page_rc
+            self.rg_rc = rg_rc
+
+        def exec(self, argv: list[str], **_: object) -> object:
+            from sbxloop.sbx.models import ExecResult
+
+            if argv[0] == "getconf":
+                return ExecResult(
+                    argv=argv,
+                    returncode=self.page_rc,
+                    stdout=self.page_out,
+                    stderr="",
+                    duration_s=0.0,
+                )
+            return ExecResult(
+                argv=argv, returncode=self.rg_rc, stdout="", stderr="", duration_s=0.0
+            )
+
+    def _run(self, sandbox: object) -> tuple[str, str]:
+        from sbxloop.sbx.conformance import ProbeContext, _probe_page_size
+
+        ctx = ProbeContext(cli=None, sandbox=sandbox)  # type: ignore[arg-type]
+        return _probe_page_size(ctx)
+
+    def test_4k_guest(self) -> None:
+        verdict, _ = self._run(self._StubSandbox("4096\n"))
+        assert verdict == "4k-pages"
+
+    def test_non_4k_with_system_rg(self) -> None:
+        verdict, detail = self._run(self._StubSandbox("16384\n", rg_rc=0))
+        assert verdict == "non-4k-rg-fallback"
+        assert "16384" in detail
+
+    def test_non_4k_without_system_rg(self) -> None:
+        verdict, detail = self._run(self._StubSandbox("16384\n", rg_rc=1))
+        assert verdict == "non-4k-degraded"
+        assert "glob/grep" in detail
+
+    def test_getconf_failure_is_unknown(self) -> None:
+        verdict, _ = self._run(self._StubSandbox("", page_rc=1))
+        assert verdict == "unknown"
+        verdict, _ = self._run(self._StubSandbox("not-a-number\n"))
+        assert verdict == "unknown"
+
+
 class TestShallowRun:
     def test_sandbox_probes_unprobed_without_cache(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)

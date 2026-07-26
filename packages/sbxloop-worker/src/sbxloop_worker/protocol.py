@@ -226,3 +226,6 @@ class EventTypes:
     # but sandbox-scoped: the host enriches these with the sandbox role.
     SANDBOX_RESOURCES = "sandbox.resources"
     SANDBOX_RESOURCES_WARNING = "sandbox.resources_warning"
+    # Worker-emitted, sandbox-scoped: the sandbox runtime degrades or
+    # reroutes an agent tool (e.g. the bundled-ripgrep page-size fallback).
+    SANDBOX_TOOLING_WARNING = "sandbox.tooling_warning"

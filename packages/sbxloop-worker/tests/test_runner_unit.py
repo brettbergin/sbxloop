@@ -176,6 +176,41 @@ class TestCopilotEventHelpers:
         assert _tool_error(SimpleNamespace(success=True, result=None, error=None)) is None
 
 
+class TestRipgrepPageSizePlan:
+    """The bundled-ripgrep page-size guard (issue #122), pure decision logic."""
+
+    def test_4k_guest_changes_nothing(self) -> None:
+        from sbxloop_worker.backends.copilot import ripgrep_page_size_plan
+
+        assert ripgrep_page_size_plan(4096, "/usr/bin/rg", None) == ({}, None)
+        assert ripgrep_page_size_plan(4096, None, None) == ({}, None)
+
+    def test_non_4k_with_system_rg_reroutes(self) -> None:
+        from sbxloop_worker.backends.copilot import ripgrep_page_size_plan
+
+        updates, warning = ripgrep_page_size_plan(16384, "/usr/bin/rg", None)
+        assert updates == {"USE_BUILTIN_RIPGREP": "false"}
+        assert warning is not None
+        assert "16384" in warning
+        assert "/usr/bin/rg" in warning
+
+    def test_non_4k_without_system_rg_warns_only(self) -> None:
+        from sbxloop_worker.backends.copilot import ripgrep_page_size_plan
+
+        updates, warning = ripgrep_page_size_plan(16384, None, None)
+        assert updates == {}
+        assert warning is not None
+        assert "glob/grep" in warning
+        assert "ripgrep" in warning
+
+    def test_operator_setting_wins(self) -> None:
+        # An explicit USE_BUILTIN_RIPGREP (either polarity) is never touched.
+        from sbxloop_worker.backends.copilot import ripgrep_page_size_plan
+
+        assert ripgrep_page_size_plan(16384, "/usr/bin/rg", "true") == ({}, None)
+        assert ripgrep_page_size_plan(16384, None, "false") == ({}, None)
+
+
 class TestEchoScriptEdgeCases:
     def test_script_entry_must_be_object(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

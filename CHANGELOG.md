@@ -6,6 +6,24 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent glob/grep no longer die on 16 KiB-page sandboxes** (issue #122).
+  The Copilot CLI's bundled ripgrep is a musl-static jemalloc build compiled
+  for 4 KiB pages; on guests with a larger page size (16 KiB is common for
+  Apple-silicon microVMs) every `glob`/`grep` tool call aborted with
+  `<jemalloc>: Unsupported system page size`, silently stripping the agent —
+  and especially the shell-less read-only critic — of its search tools. Three
+  layers now cover it: the worker detects the guest page size before each
+  Copilot session and reroutes glob/grep to the system ripgrep via the CLI's
+  documented `USE_BUILTIN_RIPGREP=false` escape hatch (an operator-set value
+  is never overridden; a `sandbox.tooling_warning` event records the reroute,
+  or the degradation when no `rg` exists); provisioning's dev-tools ensure
+  apt-installs `ripgrep` on non-4-KiB guests that lack one (probe-first — a
+  4 KiB guest or a template that ships `rg` costs no apt and no network); and
+  a new `page-size` conformance probe reports the guest page size and
+  fallback readiness under `sbxloop doctor --deep`.
+
 ### Added
 
 - **Well-known package registries are declarable out of the box.** Runs

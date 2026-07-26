@@ -40,6 +40,9 @@ def cli(fake_sbx: FakeSbx) -> SbxCLI:
 
 
 def script_install(fake_sbx: FakeSbx, *, runtime_rc: int = 0) -> None:
+    # Page-size/ripgrep probe: scripted, else it runs on the host where the
+    # answer varies by machine (16 KiB pages on Apple silicon).
+    fake_sbx.script(f'exec {BOX} sh -c test "$(getconf PAGESIZE)"', returncode=0)
     fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=0)
     fake_sbx.script(f"exec {BOX} python3 -m venv", returncode=0)
     fake_sbx.script(f"exec {BOX} /home/agent/.sbxloop/venv/bin/pip", returncode=0)
