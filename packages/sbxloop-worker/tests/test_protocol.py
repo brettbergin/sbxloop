@@ -51,6 +51,29 @@ class TestJobRequest:
         )
         assert job.argv == ["pytest", "-q"]
 
+    def test_shell_batch_requires_commands(self) -> None:
+        with pytest.raises(ValidationError, match="non-empty commands"):
+            JobRequest(job_id="j1", run_id="r1", kind="shell.batch")
+
+    def test_shell_batch_rejects_argv(self) -> None:
+        with pytest.raises(ValidationError, match="must not set prompt, argv, or op"):
+            JobRequest(job_id="j1", run_id="r1", kind="shell.batch", commands=["true"], argv=["ls"])
+
+    def test_shell_batch_roundtrip(self) -> None:
+        job = JobRequest(
+            job_id="j1",
+            run_id="r1",
+            kind="shell.batch",
+            commands=["git status", "pytest -q"],
+            command_timeout_s=30.0,
+            cwd="/work",
+        )
+        assert JobRequest.model_validate_json(job.model_dump_json()) == job
+
+    def test_shell_check_rejects_commands(self) -> None:
+        with pytest.raises(ValidationError, match="must not set prompt, commands, or op"):
+            JobRequest(job_id="j1", run_id="r1", kind="shell.check", argv=["ls"], commands=["true"])
+
     def test_github_op_requires_op(self) -> None:
         with pytest.raises(ValidationError, match="requires an op name"):
             JobRequest(job_id="j1", run_id="r1", kind="github.op")

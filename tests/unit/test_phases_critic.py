@@ -23,7 +23,7 @@ DENIALS_ONLY = SessionHealth(permission_denials={"shell": 4})
 
 class ScriptedAgent:
     """Answers agent sessions from a script of (output_json, health) pairs;
-    shell jobs (scrutinize's evidence commands) get empty ok results and
+    shell jobs (scrutinize's evidence batch) get empty ok results and
     consume nothing."""
 
     def __init__(self, responses: list[tuple[Any, SessionHealth | None]]) -> None:
@@ -31,8 +31,8 @@ class ScriptedAgent:
         self.session_jobs: list[JobRequest] = []
 
     def submit(self, job: JobRequest, *, agent: str | None = None) -> JobResult:
-        if job.kind == "shell.check":
-            return JobResult(job_id=job.job_id, status="ok", exit_code=0, output_text="")
+        if job.kind == "shell.batch":
+            return JobResult(job_id=job.job_id, status="ok", exit_code=0, output_json=[])
         self.session_jobs.append(job)
         output_json, health = self.responses.pop(0)
         return JobResult(

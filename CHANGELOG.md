@@ -6,6 +6,45 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent glob/grep no longer die on 16 KiB-page sandboxes** (issue #122).
+  The Copilot CLI's bundled ripgrep is a musl-static jemalloc build compiled
+  for 4 KiB pages; on guests with a larger page size (16 KiB is common for
+  Apple-silicon microVMs) every `glob`/`grep` tool call aborted with
+  `<jemalloc>: Unsupported system page size`, silently stripping the agent —
+  and especially the shell-less read-only critic — of its search tools. Three
+  layers now cover it: the worker detects the guest page size before each
+  Copilot session and reroutes glob/grep to the system ripgrep via the CLI's
+  documented `USE_BUILTIN_RIPGREP=false` escape hatch (an operator-set value
+  is never overridden; a `sandbox.tooling_warning` event records the reroute,
+  or the degradation when no `rg` exists); provisioning's dev-tools ensure
+  apt-installs `ripgrep` on non-4-KiB guests that lack one (probe-first — a
+  4 KiB guest or a template that ships `rg` costs no apt and no network); and
+  a new `page-size` conformance probe reports the guest page size and
+  fallback readiness under `sbxloop doctor --deep`.
+
+- **A read-only critic that lost its tooling can no longer emit a confident
+  clean verdict (#123).** Field failure (the same incident as #122): a
+  SCRUTINIZE session whose `glob`/`grep` calls crashed (and whose `shell`
+  was denied by the read-only allowlist, as designed) was left with only
+  `view` — and still returned `{"verdict": "pass"}` indistinguishable from
+  a thorough review. Agent sessions now tally permission denials and
+  tool-call failures (`SessionHealth` on the job result; each denial also
+  emits an `agent.permission_denied` event), and the critic phases apply a
+  degraded-tooling guard: a `pass`/`accept` from a session with failed tool
+  calls is not trusted — the phase re-runs once in a fresh session that is
+  confronted with the failures and must account for the reduced coverage
+  (a transient crash gets its second chance), and a still-degraded clean
+  verdict is downgraded to `revise`/`reject` with the tally in the feedback.
+  Denials alone never trigger the guard (a critic probing `shell` is the
+  barrier working, not a broken session). Every critic phase row now
+  persists the session's `tooling_health` and a `downgraded` marker, and a
+  downgrade emits a `phase.end` event with `status="degraded"`, so crippled
+  critic runs are auditable live and after the fact. The scrutinize/validate
+  prompts also tell the critic up front to report lost coverage instead of
+  claiming verification it could not perform.
+
 ### Added
 
 - **Well-known package registries are declarable out of the box.** Runs
@@ -161,26 +200,6 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Fixed
 
-- **A read-only critic that lost its tooling can no longer emit a confident
-  clean verdict (#123).** Field failure: a SCRUTINIZE session whose
-  `glob`/`grep` calls crashed (and whose `shell` was denied by the read-only
-  allowlist, as designed) was left with only `view` — and still returned
-  `{"verdict": "pass"}` indistinguishable from a thorough review. Agent
-  sessions now tally permission denials and tool-call failures
-  (`SessionHealth` on the job result; each denial also emits an
-  `agent.permission_denied` event), and the critic phases apply a
-  degraded-tooling guard: a `pass`/`accept` from a session with failed tool
-  calls is not trusted — the phase re-runs once in a fresh session that is
-  confronted with the failures and must account for the reduced coverage
-  (a transient crash gets its second chance), and a still-degraded clean
-  verdict is downgraded to `revise`/`reject` with the tally in the feedback.
-  Denials alone never trigger the guard (a critic probing `shell` is the
-  barrier working, not a broken session). Every critic phase row now
-  persists the session's `tooling_health` and a `downgraded` marker, and a
-  downgrade emits a `phase.end` event with `status="degraded"`, so crippled
-  critic runs are auditable live and after the fact. The scrutinize/validate
-  prompts also tell the critic up front to report lost coverage instead of
-  claiming verification it could not perform.
 - Artifact listings and delivery no longer silently drop dot-path artifacts
   (#67). `artifact_files` excluded every file with any dot-prefixed path
   component, so agent-produced `.github/workflows/*.yml`, `.gitignore`,

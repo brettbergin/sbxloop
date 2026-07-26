@@ -279,6 +279,16 @@ marked in the state DB (`kept_reason`) and stay exempt from `sandbox prune`
 until you pass `--include-kept`, so debugging convenience cannot become a
 permanent leak.
 
+One transcript signature worth knowing: agent `glob`/`grep` calls failing
+with `<jemalloc>: Unsupported system page size` mean the guest's page size
+is not the 4 KiB the Copilot CLI's bundled ripgrep was compiled for (16 KiB
+guests are common on Apple-silicon hosts). sbxloop handles this
+automatically — the worker reroutes glob/grep to a system ripgrep
+(`USE_BUILTIN_RIPGREP=false`) and provisioning apt-installs `ripgrep` on
+such guests — so seeing the abort means the fallback had no `rg` to land
+on: look for a `sandbox.tooling_warning` event in `sbxloop logs`, and check
+the `page-size` probe under `sbxloop doctor --deep`.
+
 ## Sandbox hygiene
 
 Sandboxes are torn down at run end, and an in-process registry also cleans up

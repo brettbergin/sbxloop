@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import time
 import traceback
 from pathlib import Path
 
 from sbxloop_worker.backends import get_backend
 from sbxloop_worker.events import EventWriter
-from sbxloop_worker.protocol import ErrorInfo, EventTypes, JobRequest, JobResult
+from sbxloop_worker.protocol import (
+    BatchCommandResult,
+    ErrorInfo,
+    EventTypes,
+    JobRequest,
+    JobResult,
+)
 from sbxloop_worker.resources import LEVEL_SEVERITY, classify_level, sample_resources
 
 OUTPUT_TAIL_CHARS = 20_000
@@ -104,6 +111,8 @@ class JobRunner:
             return self._run_agent_session(writer)
         if self.job.kind == "shell.check":
             return self._run_shell_check()
+        if self.job.kind == "shell.batch":
+            return self._run_shell_batch()
         return self._run_github_op(writer)
 
     def _run_agent_session(self, writer: EventWriter) -> JobResult:
@@ -147,6 +156,42 @@ class JobRunner:
             status="ok",
             exit_code=proc.returncode,
             output_text=output[-OUTPUT_TAIL_CHARS:],
+        )
+
+    def _run_shell_batch(self) -> JobResult:
+        assert self.job.commands is not None
+        deadline = time.monotonic() + self.job.timeout_s
+        per_command = self.job.command_timeout_s or self.job.timeout_s
+        results: list[BatchCommandResult] = []
+        for command in self.job.commands:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, self.job.timeout_s)
+            # nosec below: executing the job's commands inside the sandbox IS
+            # this worker's contract, same as shell.check's argv.
+            proc = subprocess.run(  # nosec B603 B607
+                ["sh", "-c", command],
+                capture_output=True,
+                text=True,
+                cwd=self.job.cwd,
+                timeout=min(per_command, remaining),
+                check=False,
+            )
+            output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
+            results.append(
+                BatchCommandResult(
+                    command=command,
+                    exit_code=proc.returncode,
+                    output=output[-OUTPUT_TAIL_CHARS:],
+                )
+            )
+        # Job-level exit_code is the first nonzero (0 when everything
+        # passed) so a result is glanceable without parsing output_json.
+        return JobResult(
+            job_id=self.job.job_id,
+            status="ok",
+            exit_code=next((r.exit_code for r in results if r.exit_code != 0), 0),
+            output_json=[r.model_dump() for r in results],
         )
 
     def _run_github_op(self, writer: EventWriter) -> JobResult:

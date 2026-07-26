@@ -30,7 +30,7 @@ from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import JobRequest, JobResult, SessionHealth
+from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
 EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
     ("git status", "git status --short 2>&1 | head -50"),
@@ -205,20 +205,33 @@ class PhaseRunner:
                 )
         raise WorkerError(f"{prompt_name} produced invalid output twice: {last_error}")
 
-    def shell(self, command: str, *, cwd: str | None = None) -> JobResult:
+    def shell_batch(
+        self, commands: Sequence[str], *, cwd: str | None = None
+    ) -> list[BatchCommandResult]:
+        """Run mechanical shell commands as ONE worker job (#125).
+
+        Every job pays a fixed round-trip cost (stage the job JSON, boot a
+        cold interpreter under ``sbx exec``, fetch the result file) that
+        dwarfs what verify/evidence commands actually do, so they ride
+        together. Per-command semantics are preserved: each command still
+        gets the per-job timeout, and the job budget covers the worst case
+        of all of them — matching what N sequential jobs cost before.
+        """
+        per_command = self.config.budgets.per_job_timeout_s
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
-            kind="shell.check",
-            argv=["sh", "-c", command],
+            kind="shell.batch",
+            commands=list(commands),
+            command_timeout_s=per_command,
+            timeout_s=per_command * len(commands),
             cwd=cwd or self.workdir,
-            timeout_s=self.config.budgets.per_job_timeout_s,
         )
         result = self.agent.submit(job)
         if result.status != "ok":
             assert result.error is not None
-            raise WorkerError(f"shell job failed ({result.error.type}): {result.error.message}")
-        return result
+            raise WorkerError(f"shell batch failed ({result.error.type}): {result.error.message}")
+        return [BatchCommandResult.model_validate(item) for item in result.output_json or []]
 
     # -- phases ------------------------------------------------------------
 
@@ -330,13 +343,14 @@ class PhaseRunner:
         return verdict
 
     def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> CriticOutcome:
+        try:
+            evidence = self.shell_batch([command for _, command in EVIDENCE_COMMANDS])
+        except WorkerError:
+            # Evidence is best-effort context for the critic, never fatal.
+            evidence = []
         evidence_parts: list[str] = []
-        for label, command in EVIDENCE_COMMANDS:
-            try:
-                result = self.shell(command)
-            except WorkerError:
-                continue
-            output = clip(result.output_text, 1_500).strip()
+        for (label, _), result in zip(EVIDENCE_COMMANDS, evidence, strict=False):
+            output = clip(result.output, 1_500).strip()
             if output:
                 evidence_parts.append(f"### {label}\n```\n{output}\n```")
         return self._critic_json(
@@ -436,13 +450,12 @@ class PhaseRunner:
         commands = list(dict.fromkeys(task.spec.verify_commands + plan.verify_commands))
         failures: list[str] = []
         results: list[str] = []
-        for command in commands:
-            result = self.shell(command)
-            output = clip(result.output_text, 1_500)
-            results.append(f"$ {command}\n(exit {result.exit_code})\n{output}")
+        for result in self.shell_batch(commands) if commands else []:
+            output = clip(result.output, 1_500)
+            results.append(f"$ {result.command}\n(exit {result.exit_code})\n{output}")
             if result.exit_code != 0:
                 failures.append(
-                    f"verify command failed: `{command}` (exit {result.exit_code})\n{output}"
+                    f"verify command failed: `{result.command}` (exit {result.exit_code})\n{output}"
                 )
         return VerifyOutcome(
             passed=not failures,

@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PROTOCOL_VERSION = 1
 
-JobKind = Literal["agent.session", "shell.check", "github.op"]
+JobKind = Literal["agent.session", "shell.check", "shell.batch", "github.op"]
 JobStatus = Literal["ok", "error", "timeout"]
 PermissionMode = Literal["auto", "read_only"]
 ExpectMode = Literal["text", "json"]
@@ -129,6 +129,16 @@ class JobRequest(ProtocolModel):
     # kind == "shell.check"
     argv: list[str] | None = None
 
+    # kind == "shell.batch": shell command strings, each run via ``sh -c``
+    # sequentially inside ONE worker process. Every job pays a fixed
+    # round-trip cost (stage job JSON, exec a cold interpreter, fetch the
+    # result) that dwarfs a mechanical command's real work, so verify and
+    # evidence commands ride together instead of one job each.
+    commands: list[str] | None = None
+    # Per-command timeout for shell.batch (defaults to timeout_s, which
+    # always bounds the job as a whole).
+    command_timeout_s: float | None = None
+
     # agent.session + shell.check: in-sandbox working directory. The worker
     # process chdirs here (via --cwd) so agent sessions and shell commands
     # run in the run's canonical workspace.
@@ -143,19 +153,36 @@ class JobRequest(ProtocolModel):
         if self.kind == "agent.session":
             if not self.prompt:
                 raise ValueError("agent.session requires a non-empty prompt")
-            if self.argv is not None or self.op is not None:
-                raise ValueError("agent.session must not set argv or op")
+            if self.argv is not None or self.commands is not None or self.op is not None:
+                raise ValueError("agent.session must not set argv, commands, or op")
         elif self.kind == "shell.check":
             if not self.argv:
                 raise ValueError("shell.check requires a non-empty argv")
-            if self.prompt is not None or self.op is not None:
-                raise ValueError("shell.check must not set prompt or op")
+            if self.prompt is not None or self.commands is not None or self.op is not None:
+                raise ValueError("shell.check must not set prompt, commands, or op")
+        elif self.kind == "shell.batch":
+            if not self.commands:
+                raise ValueError("shell.batch requires non-empty commands")
+            if self.prompt is not None or self.argv is not None or self.op is not None:
+                raise ValueError("shell.batch must not set prompt, argv, or op")
         elif self.kind == "github.op":
             if not self.op:
                 raise ValueError("github.op requires an op name")
-            if self.prompt is not None or self.argv is not None:
-                raise ValueError("github.op must not set prompt or argv")
+            if self.prompt is not None or self.argv is not None or self.commands is not None:
+                raise ValueError("github.op must not set prompt, argv, or commands")
         return self
+
+
+class BatchCommandResult(ProtocolModel):
+    """Per-command outcome of a shell.batch job, carried in JobResult.output_json.
+
+    A nonzero exit_code is still a successful *job* — the host owns the
+    verification decision, exactly as for shell.check.
+    """
+
+    command: str
+    exit_code: int
+    output: str = ""
 
 
 class JobResult(ProtocolModel):
@@ -239,3 +266,6 @@ class EventTypes:
     # but sandbox-scoped: the host enriches these with the sandbox role.
     SANDBOX_RESOURCES = "sandbox.resources"
     SANDBOX_RESOURCES_WARNING = "sandbox.resources_warning"
+    # Worker-emitted, sandbox-scoped: the sandbox runtime degrades or
+    # reroutes an agent tool (e.g. the bundled-ripgrep page-size fallback).
+    SANDBOX_TOOLING_WARNING = "sandbox.tooling_warning"
