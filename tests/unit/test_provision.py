@@ -247,15 +247,30 @@ class TestEnsurePair:
         pair.cleanup()
 
     def test_post_create_hook_runs_per_sandbox(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        # The pair provisions on parallel threads, so hook order is not
+        # deterministic — assert the set of calls, not their sequence.
         seen: list[tuple[str, str]] = []
         provisioner = make_provisioner(fake_sbx, tmp_path)
         provisioner.post_create = lambda sandbox, role: seen.append((sandbox.name, role))
         pair = provisioner.ensure_pair("r1")
         pair.cleanup()
-        assert seen == [
+        assert sorted(seen) == [
             ("sbxloop-r1-agent", "agent"),
             ("sbxloop-r1-github", "github"),
         ]
+
+    def test_pair_provisions_concurrently(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        """Both sandboxes must be in flight at once (#127): each post_create
+        waits at a two-party barrier, which only ever releases if the other
+        sandbox's provisioning thread reaches it too."""
+        import threading
+
+        barrier = threading.Barrier(2)
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        provisioner.post_create = lambda sandbox, role: barrier.wait(timeout=30)
+        pair = provisioner.ensure_pair("r1")
+        pair.cleanup()
+        assert not barrier.broken
 
     def test_rollback_on_secret_failure(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
@@ -402,7 +417,11 @@ class TestSecretEnvVerification:
         pair = provisioner.ensure_pair("r1")
         try:
             fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
-            assert [e.data["env"] for e in fallback] == ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"]
+            # parallel provisioning: one fallback per sandbox, any order
+            assert sorted(e.data["env"] for e in fallback) == [
+                "COPILOT_GITHUB_TOKEN",
+                "GH_TOKEN",
+            ]
             # one concise single-line message, not a paragraph
             assert "plain-env" in fallback[0].data["message"]
             assert "\n" not in fallback[0].data["message"]
@@ -454,13 +473,18 @@ class TestSecretEnvVerification:
         provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
         with pytest.raises(ProvisionError, match="refusing to auto-downgrade"):
             provisioner.ensure_pair("r1")
-        # no plain-env fallback: distinct probe-error event, not the
-        # fallback event a clean "invisible" answer produces
-        assert not [e for e in events if e.type == "sandbox.secret_env_fallback"]
+        # no plain-env fallback FOR THE FAILING SANDBOX: distinct
+        # probe-error event, not the fallback event a clean "invisible"
+        # answer produces (the github sandbox provisions in parallel and
+        # its own clean answer may legitimately fall back)
+        fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+        assert not [e for e in fallback if e.data["env"] == "COPILOT_GITHUB_TOKEN"]
         errors = [e for e in events if e.type == "sandbox.secret_probe_error"]
         assert [e.data["env"] for e in errors] == ["COPILOT_GITHUB_TOKEN"]
-        # rollback removed the half-provisioned sandbox
+        # rollback removed everything the attempt created — including the
+        # github sandbox whose own provisioning succeeded
         assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-agent").exists()
+        assert not (fake_sbx.state / "sandboxes" / "sbxloop-r1-github").exists()
 
     def test_transient_probe_error_retries_to_a_clean_answer(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -481,7 +505,10 @@ class TestSecretEnvVerification:
         pair = provisioner.ensure_pair("r1")
         try:
             fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
-            assert [e.data["env"] for e in fallback] == ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"]
+            assert sorted(e.data["env"] for e in fallback) == [
+                "COPILOT_GITHUB_TOKEN",
+                "GH_TOKEN",
+            ]
             assert not [e for e in events if e.type == "sandbox.secret_probe_error"]
         finally:
             pair.cleanup()

@@ -6,6 +6,21 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Provisioning is no longer fully serial** (issue #127). The agent and
+  github sandboxes — which share nothing but the host workspace dir — now
+  create, policy, secret, and probe on parallel threads, and the engine
+  installs both workers concurrently as well, cutting the fixed pre-run
+  startup tax roughly in half on github-enabled runs. The prebaked-template
+  verification collapsed from three `sbx exec` round trips (manifest read,
+  import/version check, entrypoint smoke) into one in-sandbox script, so the
+  templated happy path costs a single probe per sandbox. Supporting changes:
+  `EventBus.publish` is now thread-safe (subscriber invocations stay
+  serialized), the workspace wheel build is lock-guarded so concurrent
+  installs share one `uv build`, and a provisioning failure on either thread
+  still drains the other before rolling back everything the attempt created.
+
 ### Fixed
 
 - **Agent glob/grep no longer die on 16 KiB-page sandboxes** (issue #122).
@@ -23,6 +38,27 @@ All notable changes to sdxloop are documented here. The project adheres to
   4 KiB guest or a template that ships `rg` costs no apt and no network); and
   a new `page-size` conformance probe reports the guest page size and
   fallback readiness under `sbxloop doctor --deep`.
+
+- **A read-only critic that lost its tooling can no longer emit a confident
+  clean verdict (#123).** Field failure (the same incident as #122): a
+  SCRUTINIZE session whose `glob`/`grep` calls crashed (and whose `shell`
+  was denied by the read-only allowlist, as designed) was left with only
+  `view` — and still returned `{"verdict": "pass"}` indistinguishable from
+  a thorough review. Agent sessions now tally permission denials and
+  tool-call failures (`SessionHealth` on the job result; each denial also
+  emits an `agent.permission_denied` event), and the critic phases apply a
+  degraded-tooling guard: a `pass`/`accept` from a session with failed tool
+  calls is not trusted — the phase re-runs once in a fresh session that is
+  confronted with the failures and must account for the reduced coverage
+  (a transient crash gets its second chance), and a still-degraded clean
+  verdict is downgraded to `revise`/`reject` with the tally in the feedback.
+  Denials alone never trigger the guard (a critic probing `shell` is the
+  barrier working, not a broken session). Every critic phase row now
+  persists the session's `tooling_health` and a `downgraded` marker, and a
+  downgrade emits a `phase.end` event with `status="degraded"`, so crippled
+  critic runs are auditable live and after the fact. The scrutinize/validate
+  prompts also tell the critic up front to report lost coverage instead of
+  claiming verification it could not perform.
 
 ### Added
 

@@ -25,12 +25,12 @@ from typing import Literal, NamedTuple, TypeVar
 from pydantic import BaseModel
 
 from sbxloop.config import Config
-from sbxloop.engine.model import PlanModel, SteerVerdict, TaskGraph, TaskRecord, Verdict
+from sbxloop.engine.model import Issue, PlanModel, SteerVerdict, TaskGraph, TaskRecord, Verdict
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult
+from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
 EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
     ("git status", "git status --short 2>&1 | head -50"),
@@ -63,6 +63,17 @@ class VerifyOutcome(NamedTuple):
     passed: bool
     feedback: str
     results: str
+
+
+class CriticOutcome(NamedTuple):
+    """A critic phase's verdict plus the tooling health of the session that
+    produced it, so the engine can persist how blind the critic actually was
+    (#123). ``downgraded`` is True when a clean verdict was replaced because
+    the session had lost its inspection tooling."""
+
+    verdict: Verdict
+    health: SessionHealth | None
+    downgraded: bool
 
 
 def clip(text: str | None, limit: int = OUTPUT_CLIP) -> str:
@@ -138,7 +149,8 @@ class PhaseRunner:
         *,
         permission_mode: Literal["auto", "read_only"] = "auto",
         check: Callable[[ModelT], None] | None = None,
-    ) -> ModelT:
+        preamble: str = "",
+    ) -> tuple[ModelT, JobResult]:
         """Run a JSON-expecting agent job; one retry with what went wrong.
 
         Retryable failures: schema mismatch (ValidationError), semantic
@@ -148,8 +160,16 @@ class PhaseRunner:
         containing no JSON at all (ExpectedJsonMissing — the field failure
         that used to kill whole runs on one chatty reply). Anything else
         raises immediately.
+
+        ``preamble`` is injected into the template's ``$retry_context`` slot
+        on every attempt (validation feedback appends to it, never replaces
+        it) — used by the degraded-critic guard to confront a re-run critic
+        with its predecessor's tooling failures.
+
+        Returns the validated model together with the raw JobResult, whose
+        session-health tally the critic phases inspect.
         """
-        retry_context = ""
+        retry_context = preamble
         last_error: Exception | None = None
         for _ in range(2):
             prompt = render(prompt_name, retry_context=retry_context, **context)
@@ -164,7 +184,7 @@ class PhaseRunner:
                 if "ExpectedJsonMissing" not in str(exc):
                     raise
                 last_error = exc
-                retry_context = (
+                retry_context = preamble + (
                     "\n## Previous attempt was invalid\n\n"
                     "Your previous response contained no parseable JSON. Respond "
                     "with ONLY one fenced ```json block in the format above — no "
@@ -175,10 +195,10 @@ class PhaseRunner:
                 model = model_cls.model_validate(result.output_json)
                 if check is not None:
                     check(model)
-                return model
+                return model, result
             except ValueError as exc:  # includes pydantic's ValidationError
                 last_error = exc
-                retry_context = (
+                retry_context = preamble + (
                     "\n## Previous attempt was invalid\n\n"
                     "Your previous response failed validation with:\n\n"
                     f"```\n{exc}\n```\n\nFix the structure and respond again."
@@ -216,7 +236,7 @@ class PhaseRunner:
     # -- phases ------------------------------------------------------------
 
     def decompose(self) -> TaskGraph:
-        return self._agent_json(
+        graph, _ = self._agent_json(
             TaskGraph,
             "decompose",
             {
@@ -224,9 +244,10 @@ class PhaseRunner:
                 "max_tasks": str(self.config.budgets.max_tasks),
             },
         )
+        return graph
 
     def plan(self, task: TaskRecord) -> PlanModel:
-        return self._agent_json(
+        plan, _ = self._agent_json(
             PlanModel,
             "plan",
             {
@@ -240,6 +261,7 @@ class PhaseRunner:
             },
             check=self._check_plan_egress,
         )
+        return plan
 
     def _check_plan_egress(self, plan: PlanModel) -> None:
         """Reject plans declaring egress outside the operator's bounds.
@@ -306,7 +328,7 @@ class PhaseRunner:
                 f"Plan steps:\n{plan_steps}\n\n"
                 f"Prior feedback:\n{task.last_feedback or '(none)'}"
             )
-        return self._agent_json(
+        verdict, _ = self._agent_json(
             SteerVerdict,
             "steer",
             {
@@ -318,8 +340,9 @@ class PhaseRunner:
             },
             permission_mode="read_only",
         )
+        return verdict
 
-    def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> Verdict:
+    def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> CriticOutcome:
         try:
             evidence = self.shell_batch([command for _, command in EVIDENCE_COMMANDS])
         except WorkerError:
@@ -330,8 +353,7 @@ class PhaseRunner:
             output = clip(result.output, 1_500).strip()
             if output:
                 evidence_parts.append(f"### {label}\n```\n{output}\n```")
-        verdict = self._agent_json(
-            Verdict,
+        return self._critic_json(
             "scrutinize",
             {
                 "task_id": task.spec.id,
@@ -342,11 +364,86 @@ class PhaseRunner:
                 "executor_report": clip(executor_report) or "(executor produced no report)",
                 "evidence": "\n\n".join(evidence_parts) or "(no evidence gathered)",
             },
-            permission_mode="read_only",
+            allowed=("pass", "revise"),
         )
-        if verdict.verdict not in ("pass", "revise"):
-            raise WorkerError(f"scrutinize returned invalid verdict {verdict.verdict!r}")
-        return verdict
+
+    def _critic_json(
+        self,
+        prompt_name: str,
+        context: dict[str, str],
+        *,
+        allowed: tuple[str, str],
+    ) -> CriticOutcome:
+        """Run a critic phase with the degraded-tooling guard (#123).
+
+        ``allowed`` is (clean, dirty) for the phase's verdict vocabulary. A
+        clean verdict from a session whose tool calls failed is not trusted:
+        the phase re-runs once in a fresh session that is confronted with
+        the failures and must account for the reduced coverage (a transient
+        crash gets its second chance here). If the re-run is also degraded
+        and still claims clean, the verdict is downgraded to the dirty one —
+        a critic that could not inspect the work must not green-light it.
+        Permission denials never trigger the guard: a read-only critic
+        probing ``shell`` is the barrier working as designed.
+        """
+        clean, dirty = allowed
+        verdict, result = self._critic_attempt(prompt_name, context, allowed)
+        health = result.health
+        if verdict.verdict != clean or health is None or not health.degraded:
+            return CriticOutcome(verdict, health, False)
+        preamble = (
+            "\n## Degraded tooling warning\n\n"
+            "A previous review session lost part of its inspection tooling "
+            f"({health.summary()}) and still claimed {clean!r} — that verdict "
+            "was discarded. Verify the work with the tools that DO function; "
+            f"if you cannot actually inspect it, respond {dirty!r} and say "
+            "which checks you could not perform. Do not claim verification "
+            "you could not carry out."
+        )
+        verdict, result = self._critic_attempt(prompt_name, context, allowed, preamble=preamble)
+        health = result.health
+        if verdict.verdict != clean or health is None or not health.degraded:
+            return CriticOutcome(verdict, health, False)
+        detail = (
+            f"{prompt_name} session had degraded tooling ({health.summary()}) "
+            f"and could not reliably verify the work; its {clean!r} was "
+            f"downgraded to {dirty!r}"
+        )
+        return CriticOutcome(
+            Verdict(
+                verdict=dirty,  # type: ignore[arg-type]
+                issues=[*verdict.issues, Issue(severity="high", detail=detail)],
+                feedback=(
+                    "the reviewer's session lost part of its inspection tooling "
+                    f"({health.summary()}), so the work could not be verified and "
+                    "must be treated as unreviewed. Re-check the acceptance "
+                    "criteria yourself and report concrete evidence (exact file "
+                    "paths and the relevant contents) so the work is verifiable "
+                    "even by file reads alone."
+                ),
+            ),
+            health,
+            True,
+        )
+
+    def _critic_attempt(
+        self,
+        prompt_name: str,
+        context: dict[str, str],
+        allowed: tuple[str, str],
+        *,
+        preamble: str = "",
+    ) -> tuple[Verdict, JobResult]:
+        verdict, result = self._agent_json(
+            Verdict,
+            prompt_name,
+            context,
+            permission_mode="read_only",
+            preamble=preamble,
+        )
+        if verdict.verdict not in allowed:
+            raise WorkerError(f"{prompt_name} returned invalid verdict {verdict.verdict!r}")
+        return verdict, result
 
     def verify(self, task: TaskRecord, plan: PlanModel) -> VerifyOutcome:
         """Run every verify command; the transcript rides on the outcome."""
@@ -366,9 +463,8 @@ class PhaseRunner:
             results="\n\n".join(results) or "(no verify commands)",
         )
 
-    def validate(self, task: TaskRecord, verify_results: str) -> Verdict:
-        verdict = self._agent_json(
-            Verdict,
+    def validate(self, task: TaskRecord, verify_results: str) -> CriticOutcome:
+        return self._critic_json(
             "validate",
             {
                 "outcome": self.outcome,
@@ -378,8 +474,5 @@ class PhaseRunner:
                 "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
                 "verify_results": verify_results,
             },
-            permission_mode="read_only",
+            allowed=("accept", "reject"),
         )
-        if verdict.verdict not in ("accept", "reject"):
-            raise WorkerError(f"validate returned invalid verdict {verdict.verdict!r}")
-        return verdict

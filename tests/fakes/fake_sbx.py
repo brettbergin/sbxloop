@@ -19,6 +19,7 @@ sandboxes, 2 for usage errors.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -472,6 +473,14 @@ def main() -> int:
     root = state_dir()
     stdin = "" if sys.stdin.isatty() else sys.stdin.read()
     args = strip_app_name(sys.argv[1:])
+    # Provisioning/install run the pair on parallel threads (#127), so fake
+    # invocations arrive concurrently. An exclusive file lock guards the
+    # shared state files — responses.json once-removal and the
+    # secrets-state.json read-modify-write would otherwise race — and is
+    # released before `exec` launches its real subprocess, so long-running
+    # workers still run concurrently.
+    lock = (root / ".lock").open("a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
     append_jsonl(root / "invocations.jsonl", {"args": args, "stdin": stdin, "ts": time.time()})
 
     scripted = scripted_response(root, args)
@@ -493,6 +502,7 @@ def main() -> int:
     if command == "create":
         return cmd_create(root, rest)
     if command == "exec":
+        fcntl.flock(lock, fcntl.LOCK_UN)
         return cmd_exec(root, rest)
     if command == "cp":
         return cmd_cp(root, rest)

@@ -751,6 +751,9 @@ class TestPrebakedTemplate:
         assert not [j for j in joined if "-m venv" in j or "pip install" in j or "apt-get" in j]
         # no wheel was staged either — the fast path never resolves one
         assert not [c for c in fake_sbx.invocations("cp") if any(".whl" in a for a in c)]
+        # the whole verification is ONE exec round trip (#127): manifest
+        # read, import check, and entrypoint smoke run inside one script
+        assert len(fake_sbx.invocations("exec")) == 1
 
     def test_missing_manifest_falls_back_to_ladder(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
@@ -808,16 +811,24 @@ class TestPrebakedTemplate:
     def test_smoke_probe_failure_falls_back(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        """Version probe passes but the entrypoint probe does not exit 64."""
+        """Version probe passes but the entrypoint probe does not exit 64.
+
+        The probes run inside one in-sandbox script, so the smoke failure is
+        staged with a half-broken interpreter: ``-c`` (the import check)
+        delegates to the real python, ``-m sbxloop_worker`` (the entrypoint
+        smoke) exits 1.
+        """
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
-        self.write_manifest(sandbox, python=sys.executable)
-        fake_sbx.script(
-            f"exec boxa {sys.executable} -m sbxloop_worker",
-            returncode=1,
-            stderr="entrypoint broken in template",
-            once=True,
+        broken = tmp_path / "half-broken-python"
+        broken.write_text(
+            '#!/bin/sh\ncase "$*" in\n'
+            "  -m\\ sbxloop_worker*) exit 1;;\n"
+            f'  *) exec "{sys.executable}" "$@";;\n'
+            "esac\n"
         )
+        broken.chmod(0o755)
+        self.write_manifest(sandbox, python=str(broken))
         script_ladder_success(fake_sbx)
         client = make_client(sandbox, EventBus())
         client.install(wheel=wheel, expect_prebaked=True)
@@ -834,7 +845,7 @@ class TestPrebakedTemplate:
         client = make_client(sandbox, EventBus())
         client.install(wheel=wheel)
         assert not client.prebaked
-        assert not [c for c in fake_sbx.invocations("exec") if "cat" in c]
+        assert not [c for c in fake_sbx.invocations("exec") if any("manifest_path" in a for a in c)]
 
 
 class TestNoResultDiagnostics:

@@ -27,6 +27,8 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -44,7 +46,7 @@ from sbxloop.engine.model import (
     TaskState,
     scan_artifacts,
 )
-from sbxloop.engine.phases import PhaseRunner, clip
+from sbxloop.engine.phases import CriticOutcome, PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -293,21 +295,7 @@ class LoopEngine:
                         else None
                     )
                     if self.install_workers:
-                        # A configured template is expected to be prebaked
-                        # (`sbxloop bake`): install() probes it and skips the
-                        # ladder on success, falling back when stale.
-                        prebaked_expected = bool(self.config.sandbox.template)
-                        # ensure_dev_tools: the agent builds projects in this VM
-                        # (venvs, pip) — the github sandbox only runs API ops.
-                        agent.install(
-                            extras="copilot",
-                            ensure_dev_tools=True,
-                            expect_prebaked=prebaked_expected,
-                        )
-                        if github is not None:
-                            github.install(extras="", expect_prebaked=prebaked_expected)
-                        if prebaked_expected:
-                            self._emit_prebaked(run_id, pair, agent, github)
+                        self._install_workers(run_id, pair, agent, github)
                     reporter, detach = self._attach_reporter(github, run_id, outcome)
                     try:
                         phases = PhaseRunner(
@@ -355,6 +343,54 @@ class LoopEngine:
             mounted=pair.mounted,
             kept_sandboxes=self._pair_names(pair) if pair.keep else [],
         )
+
+    def _install_workers(
+        self,
+        run_id: str,
+        pair: SandboxPair,
+        agent: WorkerClient,
+        github: WorkerClient | None,
+    ) -> None:
+        """Install the worker into both sandboxes, concurrently when the pair
+        exists — the installs share nothing in-sandbox, and each is seconds
+        of exec round-trips that would otherwise stack serially (#127).
+
+        A configured template is expected to be prebaked (`sbxloop bake`):
+        install() probes it and skips the ladder on success, falling back
+        when stale. ensure_dev_tools is agent-only — the agent builds
+        projects in its VM (venvs, pip); the github sandbox only runs API
+        ops. Both installs always run to completion before any failure
+        propagates, so an error never unwinds into pair teardown while the
+        other install is still mid-exec.
+        """
+        prebaked_expected = bool(self.config.sandbox.template)
+        installs: list[Callable[[], None]] = [
+            partial(
+                agent.install,
+                extras="copilot",
+                ensure_dev_tools=True,
+                expect_prebaked=prebaked_expected,
+            )
+        ]
+        if github is not None:
+            installs.append(partial(github.install, extras="", expect_prebaked=prebaked_expected))
+        if len(installs) == 1:
+            installs[0]()
+        else:
+            with ThreadPoolExecutor(
+                max_workers=len(installs), thread_name_prefix="sbxloop-install"
+            ) as pool:
+                futures = [pool.submit(fn) for fn in installs]
+                errors: list[Exception] = []
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        errors.append(exc)
+                if errors:
+                    raise errors[0]
+        if prebaked_expected:
+            self._emit_prebaked(run_id, pair, agent, github)
 
     def _emit_prebaked(
         self,
@@ -691,16 +727,18 @@ class LoopEngine:
         self._set_task_state(run_id, task, "scrutinizing")
 
         started = time.time()
-        verdict = phases.scrutinize(task, task.plan, executor_report)
+        outcome = phases.scrutinize(task, task.plan, executor_report)
+        verdict = outcome.verdict
         self.store.record_phase(
             run_id,
             "scrutinize",
             task_id=task.spec.id,
             attempt=task.revisions + 1,
             status=verdict.verdict,
-            output_json=verdict.model_dump_json(),
+            output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
         )
+        self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
         if verdict.verdict == "revise":
             self._register_revision(run_id, task, verdict.feedback or "scrutiny found issues")
         else:
@@ -767,16 +805,18 @@ class LoopEngine:
             self._set_task_state(run_id, task, "verifying")
             return
         started = time.time()
-        verdict = phases.validate(task, verify_results)
+        outcome = phases.validate(task, verify_results)
+        verdict = outcome.verdict
         self.store.record_phase(
             run_id,
             "validate",
             task_id=task.spec.id,
             attempt=task.replans + 1,
             status=verdict.verdict,
-            output_json=verdict.model_dump_json(),
+            output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
         )
+        self._emit_critic_degraded(run_id, task, "validate", outcome)
         if verdict.verdict == "accept":
             self._set_task_state(run_id, task, "done")
             return
@@ -789,6 +829,41 @@ class LoopEngine:
         task.plan = None
         task.revisions = 0
         self._set_task_state(run_id, task, "planning")
+
+    @staticmethod
+    def _critic_payload(outcome: CriticOutcome) -> dict[str, Any]:
+        """The phase-row payload for a critic verdict: the verdict itself
+        plus the session's tooling health and whether the guard downgraded a
+        clean verdict — degraded critic runs must be auditable after the
+        fact (#123)."""
+        payload: dict[str, Any] = outcome.verdict.model_dump()
+        if outcome.health is not None:
+            payload["tooling_health"] = outcome.health.model_dump()
+        if outcome.downgraded:
+            payload["downgraded"] = True
+        return payload
+
+    def _emit_critic_degraded(
+        self, run_id: str, task: TaskRecord, phase: str, outcome: CriticOutcome
+    ) -> None:
+        """Put a downgrade in the live stream: without this the transcript
+        shows an ordinary revise/reject and the real reason (a critic that
+        lost its tooling) only exists in the phase_attempts table."""
+        if not outcome.downgraded:
+            return
+        assert outcome.health is not None
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase=phase,
+            status="degraded",
+            message=(
+                f"critic tooling degraded ({outcome.health.summary()}); "
+                f"its clean verdict was not trusted and was downgraded to "
+                f"{outcome.verdict.verdict!r}"
+            ),
+        )
 
     def _verify_evidence(self, run_id: str, task: TaskRecord) -> str | None:
         """The task's latest committed verify-command transcript, or None.

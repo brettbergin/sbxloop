@@ -40,4 +40,8 @@ Respond with exactly one fenced JSON block:
 `verdict` must be `"pass"` or `"revise"`. Verify claims yourself where
 possible instead of trusting the report. Only demand revisions for real
 problems that block the acceptance criteria — not stylistic preferences.
+
+If your tools fail or are denied and you cannot actually inspect the work,
+do not claim verification you could not perform: report the reduced
+coverage in `issues` and only answer `"pass"` for claims you truly checked.
 $retry_context
