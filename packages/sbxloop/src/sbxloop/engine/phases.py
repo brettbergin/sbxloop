@@ -248,8 +248,9 @@ class PhaseRunner:
                 "plan-declared egress is outside the operator's bounds:\n"
                 + "\n".join(problems)
                 + "\nDrop these domains from `egress` (prefer baseline-reachable hosts: "
-                "PyPI, GitHub, apt mirrors). Only the operator can extend the bounds, "
-                "via [policy] allow in sbxloop.toml."
+                "PyPI, GitHub, apt mirrors — or the well-known package registries, "
+                "which are always declarable). Only the operator can extend the "
+                "bounds, via [policy] allow in sbxloop.toml."
             )
 
     def execute(self, task: TaskRecord, plan: PlanModel) -> JobResult:

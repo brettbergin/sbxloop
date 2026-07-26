@@ -8,6 +8,20 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Added
 
+- **Well-known package registries are declarable out of the box.** Runs
+  building Ruby/Node/Rust/Go projects used to die in `bundle install` /
+  `npm install`: the default `[policy] allow` is empty, so a plan declaring
+  `rubygems.org` failed validation and the sandbox blocked the host. A
+  curated set of read-only registries — RubyGems (`rubygems.org`,
+  `index.rubygems.org`), npm/yarn (`registry.npmjs.org`,
+  `registry.yarnpkg.com`), crates.io (`crates.io`, `static.crates.io`,
+  `index.crates.io`), and the Go proxy (`proxy.golang.org`,
+  `sum.golang.org`) — is now always in-bounds for plan-declared egress
+  (`policy.WELL_KNOWN_REGISTRY_DOMAINS`). They stay grant-late: unreachable
+  unless a plan declares them with a justification, every grant
+  event-logged, and `[policy] deny` still blocks them. The plan/execute
+  prompts now name the set so planners declare what the toolchain needs.
+
 - **Interactive chat with a running loop.** `sbxloop run` is no longer
   watch-only: the TUI grows a chat form (keystrokes captured in cbreak mode,
   the in-progress line rendered inside the pinned status panel; `--no-tui`

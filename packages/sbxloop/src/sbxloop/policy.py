@@ -46,6 +46,25 @@ PROMPT_ADVERTISED_DOMAINS = (
     "ports.ubuntu.com",
 )
 
+# Well-known read-only package registries the prompts advertise as
+# *declarable*: unlike the always-reachable baseline above, these are granted
+# only when a plan names them in `egress` (grant-late, event-logged), but the
+# declaration is in-bounds without any [policy] allow configuration. This is
+# what lets "write a Rails app" bundle-install out of the box while keeping
+# the audit trail. Registries beyond this set still need operator bounds;
+# [policy] deny wins over this list like everything else.
+WELL_KNOWN_REGISTRY_DOMAINS = (
+    "rubygems.org",  # gem downloads and API
+    "index.rubygems.org",  # bundler's compact index
+    "registry.npmjs.org",  # npm
+    "registry.yarnpkg.com",  # yarn classic (npm mirror)
+    "crates.io",  # cargo API
+    "static.crates.io",  # crate downloads
+    "index.crates.io",  # cargo sparse index
+    "proxy.golang.org",  # Go module proxy
+    "sum.golang.org",  # Go checksum database
+)
+
 
 def valid_pattern(pattern: str, *, operator: bool = False) -> bool:
     """Whether ``pattern`` is a well-formed domain pattern.
@@ -96,6 +115,7 @@ def effective_egress_bounds(config: Config) -> tuple[list[str], list[str]]:
         *AGENT_ALLOW_DOMAINS,
         *config.sandbox.extra_allow_domains,
         *PROMPT_ADVERTISED_DOMAINS,
+        *WELL_KNOWN_REGISTRY_DOMAINS,
         *config.policy.allow,
     ]
     return allow, list(config.policy.deny)

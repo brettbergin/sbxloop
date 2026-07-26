@@ -599,6 +599,17 @@ PLAN_NPM = {
     }
 }
 
+# npm is a well-known registry (in-bounds without config), so out-of-bounds
+# tests need a domain no built-in tier covers.
+PLAN_SAAS_API = {
+    "json": {
+        "steps": ["call the API"],
+        "expected_artifacts": [],
+        "verify_commands": [],
+        "egress": [{"domain": "api.example-saas.com", "reason": "fetch data"}],
+    }
+}
+
 
 class TestPlanEgress:
     """Plan-declared egress: bounded by [policy], granted just before EXECUTE."""
@@ -620,17 +631,30 @@ class TestPlanEgress:
         assert event.data["reason"] == "npm install"
         assert event.data["task_id"] == "t1"
 
-    def test_out_of_bounds_egress_rejected_then_retried(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN_NPM, PLAN, EXECUTE, PASS, ACCEPT])
-        result = harness.engine().start("npm denied")
+    def test_well_known_registry_granted_without_policy_config(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_NPM, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("npm task, default policy")
         assert result.state == "completed"
-        grants = [c for c in harness.fake_sbx.policies() if "registry.npmjs.org" in c]
+        agent = f"sbxloop-{result.run_id}-agent"
+        assert [
+            "allow",
+            "network",
+            "registry.npmjs.org",
+            "--sandbox",
+            agent,
+        ] in harness.fake_sbx.policies()
+
+    def test_out_of_bounds_egress_rejected_then_retried(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), PLAN_SAAS_API, PLAN, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("saas api denied")
+        assert result.state == "completed"
+        grants = [c for c in harness.fake_sbx.policies() if "api.example-saas.com" in c]
         assert grants == []
 
     def test_out_of_bounds_egress_twice_fails(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN_NPM, PLAN_NPM])
+        harness.script([taskgraph(task("t1")), PLAN_SAAS_API, PLAN_SAAS_API])
         with pytest.raises(WorkerError, match="invalid output twice"):
-            harness.engine().start("insists on npm")
+            harness.engine().start("insists on the saas api")
 
 
 class TestKeepOnFailure:

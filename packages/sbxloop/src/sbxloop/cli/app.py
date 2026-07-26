@@ -1002,7 +1002,7 @@ def config_show() -> None:
 @config_app.command("policy")
 def config_policy() -> None:
     """Show the effective per-phase network egress policy."""
-    from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS
+    from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
     from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, GITHUB_ALLOW_DOMAINS
 
     try:
@@ -1033,12 +1033,18 @@ def config_policy() -> None:
     console.print(table)
     console.print(f"baseline (provisioned per-sandbox): {baseline}")
     console.print(f"advertised by the user's balanced preset: {advertised}")
+    console.print(
+        "well-known registries (declarable without [policy] allow): "
+        + ", ".join(WELL_KNOWN_REGISTRY_DOMAINS)
+    )
 
     bounds = Table(title="[policy] bounds for plan-declared grants")
     bounds.add_column("bound", no_wrap=True)
     bounds.add_column("patterns", overflow="fold")
     bounds.add_row(
-        "allow", ", ".join(config.policy.allow) or "(empty — plans may only use the baseline)"
+        "allow",
+        ", ".join(config.policy.allow)
+        or "(empty — plans may only use the baseline and well-known registries)",
     )
     bounds.add_row("deny", ", ".join(config.policy.deny) or "(none)")
     console.print(bounds)
@@ -1233,7 +1239,9 @@ extra_allow_domains = []
 # event (`sbxloop logs RUN --type policy.`). Patterns: exact domains,
 # "*.example.com" (the domain and all subdomains), or "*" (everything).
 # Empty `allow` (the default) means plans may only use the always-reachable
-# baseline: the Copilot/GitHub hosts, PyPI, and apt mirrors.
+# baseline (the Copilot/GitHub hosts, PyPI, and apt mirrors) plus the
+# well-known package registries — RubyGems, npm/yarn, crates.io, the Go
+# proxy — which plans may declare without any configuration here.
 # See `sbxloop config policy` for the effective per-phase policy.
 allow = []
 deny = []
