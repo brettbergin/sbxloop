@@ -37,11 +37,20 @@ Worker exit codes: `0` result written (including error/timeout results),
 | --------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `agent.session` | `prompt`, `system_message?`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage` |
 | `shell.check`   | `argv`, `cwd?`                                                                                                        | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                         |
+| `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                              | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results     |
 | `github.op`     | `op`, `params`                                                                                                        | op-specific JSON (see below)                                                                                                                                        |
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
 microVM is the security boundary. `read_only` rejects shell/write requests
 and is used for critic sessions.
+
+`shell.batch` exists because every job pays a fixed round-trip cost (stage
+the job JSON, boot a cold Python under `sbx exec`, fetch the result) that
+dwarfs a mechanical command's real work: the host batches all verify
+commands into one job, and the scrutinizer's evidence commands into
+another. Each command runs via `sh -c` sequentially in the job's `cwd` with
+`command_timeout_s` (default `timeout_s`) as its individual cap; `timeout_s`
+bounds the whole job.
 
 ## Transports
 

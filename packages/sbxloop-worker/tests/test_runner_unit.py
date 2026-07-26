@@ -58,6 +58,43 @@ class TestRunnerInProcess:
         assert result.status == "ok"  # type: ignore[attr-defined]
         assert result.exit_code == 5  # type: ignore[attr-defined]
 
+    def test_shell_batch_per_command_results(self, tmp_path: Path) -> None:
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=["echo one", "exit 3", "echo three >&2"],
+        )
+        result, _ = run_job(tmp_path, job)
+        assert result.status == "ok"  # type: ignore[attr-defined]
+        # job exit_code is the first nonzero, so the result is glanceable
+        assert result.exit_code == 3  # type: ignore[attr-defined]
+        per_command = result.output_json  # type: ignore[attr-defined]
+        assert [(r["command"], r["exit_code"]) for r in per_command] == [
+            ("echo one", 0),
+            ("exit 3", 3),
+            ("echo three >&2", 0),
+        ]
+        assert per_command[0]["output"] == "one\n"
+        assert "three" in per_command[2]["output"]  # stderr captured too
+
+    def test_shell_batch_all_pass(self, tmp_path: Path) -> None:
+        job = JobRequest(job_id="j2", run_id="r1", kind="shell.batch", commands=["true", "true"])
+        result, _ = run_job(tmp_path, job)
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+
+    def test_shell_batch_timeout(self, tmp_path: Path) -> None:
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=["sleep 5"],
+            timeout_s=0.2,
+        )
+        result, events = run_job(tmp_path, job)
+        assert result.status == "timeout"  # type: ignore[attr-defined]
+        assert EventTypes.WORKER_ERROR in [e.type for e in events]
+
     def test_shell_timeout(self, tmp_path: Path) -> None:
         job = JobRequest(
             job_id="j2",
