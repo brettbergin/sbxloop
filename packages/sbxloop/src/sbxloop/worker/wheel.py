@@ -73,6 +73,7 @@ def _workspace_build() -> Path | None:
             [uv, "build", "--wheel", "-o", str(out_dir), str(src_copy)],
             check=True,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             timeout=300,
             env=env,
         )

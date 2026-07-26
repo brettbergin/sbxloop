@@ -82,12 +82,16 @@ class SbxCLI:
         safe_argv = redacted_argv(argv)
         started = time.monotonic()
         try:
+            # `sbx exec` attaches whatever stdin it inherits (see
+            # exec_interactive) — never the caller's TTY here, or background
+            # execs steal keystrokes from the run TUI's chat form.
             proc = subprocess.run(  # nosec B603 - list argv, sbx CLI, no shell
                 argv,
                 capture_output=True,
                 text=True,
                 timeout=timeout or self.default_timeout,
                 input=stdin,
+                stdin=None if stdin is not None else subprocess.DEVNULL,
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -120,6 +124,7 @@ class SbxCLI:
         try:
             return subprocess.Popen(  # nosec B603 - list argv, sbx CLI, no shell
                 argv,
+                stdin=subprocess.DEVNULL,  # long-lived: must not hold the TTY
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

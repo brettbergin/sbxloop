@@ -215,9 +215,11 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, chat: bool = True, action: 
                     if rendered is not None:
                         live.console.print(rendered)
 
-            def refresh() -> None:
+            def refresh(*, now: bool = False) -> None:
                 line = chat_input.renderable() if chat_input is not None else None
-                live.update(dashboard.renderable(line))
+                # `now` bypasses Live's refresh_per_second throttle so a
+                # keystroke echoes the instant it lands, not on the next tick.
+                live.update(dashboard.renderable(line), refresh=now)
 
             thread.start()
             try:
@@ -225,7 +227,8 @@ def _drive_with_ui(engine: LoopEngine, *, tui: bool, chat: bool = True, action: 
                     drain()
                     refresh()
                     if chat_input is not None:
-                        chat_input.pump(0.15)
+                        if chat_input.pump(0.15):
+                            refresh(now=True)
                     else:
                         time.sleep(0.15)
             except KeyboardInterrupt:

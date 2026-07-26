@@ -1,5 +1,6 @@
 """SbxCLI wrapper tests against the fake sbx harness."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,48 @@ class TestExec:
         fail = cli.exec("boxa", ["sh", "-c", "echo 'connection refused by host' >&2; exit 7"])
         assert fail.returncode == 7
         assert "connection refused" in fail.stderr
+
+    def test_exec_never_inherits_the_callers_stdin(
+        self, cli: SbxCLI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `sbx exec` attaches inherited stdin (that IS exec_interactive's
+        # mechanism), so background execs launched during a TUI run would
+        # otherwise steal the chat form's keystrokes.
+        captured: dict[str, object] = {}
+        real_run = subprocess.run
+
+        def spy(argv: list[str], **kwargs: object) -> object:
+            captured.update(kwargs)
+            return real_run(argv, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("sbxloop.sbx.cli.subprocess.run", spy)
+        cli.run("version", check=False)
+        assert captured["stdin"] is subprocess.DEVNULL
+
+        captured.clear()
+        cli.run("secret", "set", "github", stdin="tok", check=False)
+        # An explicit stdin payload still flows through `input=` (which pipes).
+        assert captured["input"] == "tok"
+        assert captured["stdin"] is None
+
+    def test_popen_never_inherits_the_callers_stdin(
+        self, cli: SbxCLI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cli.create(spec("boxa", tmp_path))
+        captured: dict[str, object] = {}
+        real_popen = subprocess.Popen
+
+        class Spy(real_popen):  # type: ignore[valid-type, misc]
+            def __init__(self, argv: list[str], **kwargs: object) -> None:
+                captured.update(kwargs)
+                super().__init__(argv, **kwargs)
+
+        monkeypatch.setattr("sbxloop.sbx.cli.subprocess.Popen", Spy)
+        proc = cli.popen("exec", "boxa", "true")
+        try:
+            assert captured["stdin"] is subprocess.DEVNULL
+        finally:
+            proc.communicate(timeout=30)
 
     def test_exec_writes_inside_fs(self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         cli.create(spec("boxa", tmp_path))
