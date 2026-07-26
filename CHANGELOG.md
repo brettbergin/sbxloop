@@ -6,6 +6,21 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Provisioning is no longer fully serial** (issue #127). The agent and
+  github sandboxes — which share nothing but the host workspace dir — now
+  create, policy, secret, and probe on parallel threads, and the engine
+  installs both workers concurrently as well, cutting the fixed pre-run
+  startup tax roughly in half on github-enabled runs. The prebaked-template
+  verification collapsed from three `sbx exec` round trips (manifest read,
+  import/version check, entrypoint smoke) into one in-sandbox script, so the
+  templated happy path costs a single probe per sandbox. Supporting changes:
+  `EventBus.publish` is now thread-safe (subscriber invocations stay
+  serialized), the workspace wheel build is lock-guarded so concurrent
+  installs share one `uv build`, and a provisioning failure on either thread
+  still drains the other before rolling back everything the attempt created.
+
 ### Fixed
 
 - **Agent glob/grep no longer die on 16 KiB-page sandboxes** (issue #122).

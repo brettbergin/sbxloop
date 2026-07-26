@@ -53,6 +53,76 @@ from sbxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult
 # refuses to install a renamed wheel ("Invalid wheel filename").
 STAGED_WHEEL_DIR = "/tmp"  # nosec B108 - path inside the sandbox VM, not host tmp
 
+_SMOKE_BASE = "/tmp/sbxloop-smoke"  # nosec B108 - path inside the sandbox VM, not host tmp
+
+# One in-sandbox orchestrator for the whole prebake verification: manifest
+# read+parse, import/version check, and entrypoint smoke — each formerly its
+# own `sbx exec` round trip (#127). Runs under the template's system python3
+# (templates ship it; a template without it fails the probe and degrades to
+# the install ladder, same as any other probe failure). argv:
+# manifest_path expected_version default_python smoke_base. Emits exactly one
+# JSON verdict line on stdout; the host maps stages onto the same decisions
+# and log messages the serial probes produced.
+_PREBAKE_PROBE = """\
+import json, subprocess, sys
+
+manifest_path, expected, default_python, smoke_base = sys.argv[1:5]
+
+
+def emit(stage, **extra):
+    print(json.dumps({"stage": stage, **extra}))
+    sys.exit(0)
+
+
+def run(argv):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True)
+    except OSError:
+        return None
+
+
+def tail(proc):
+    if proc is None:
+        return "interpreter not found"
+    parts = [p.strip() for p in (proc.stderr, proc.stdout) if p and p.strip()]
+    return "\\n".join(parts)[-2000:] or "(no output)"
+
+
+try:
+    with open(manifest_path) as f:
+        raw = f.read()
+except OSError:
+    emit("no-manifest")
+try:
+    manifest = json.loads(raw)
+    baked = str(manifest["worker_version"])
+    python = str(manifest.get("python") or default_python)
+except (ValueError, KeyError, TypeError):
+    emit("bad-manifest")
+if baked != expected:
+    emit("stale", baked=baked)
+check = run([python, "-c", "import sbxloop_worker; print(sbxloop_worker.__version__)"])
+if check is None or check.returncode != 0 or check.stdout.strip() != expected:
+    emit("import-failed", rc=check.returncode if check else -1, output=tail(check))
+smoke = run(
+    [
+        python,
+        "-m",
+        "sbxloop_worker",
+        "run",
+        "--job",
+        smoke_base + "-missing.json",
+        "--events",
+        smoke_base + ".events.jsonl",
+        "--result",
+        smoke_base + ".result.json",
+    ]
+)
+if smoke is None or smoke.returncode != 64:
+    emit("smoke-failed", rc=smoke.returncode if smoke else -1, output=tail(smoke))
+emit("ok", python=python)
+"""
+
 logger = logging.getLogger(__name__)
 
 
@@ -189,7 +259,6 @@ class WorkerClient:
     def _entrypoint_smoke(self, python: str) -> ExecResult:
         """Run the worker entrypoint against a missing job file; a healthy
         install exits 64 (the worker's usage-error code)."""
-        smoke_base = "/tmp/sbxloop-smoke"  # nosec B108 - path inside the sandbox VM, not host tmp
         return self.sandbox.exec(
             [
                 python,
@@ -197,65 +266,90 @@ class WorkerClient:
                 "sbxloop_worker",
                 "run",
                 "--job",
-                f"{smoke_base}-missing.json",
+                f"{_SMOKE_BASE}-missing.json",
                 "--events",
-                f"{smoke_base}.events.jsonl",
+                f"{_SMOKE_BASE}.events.jsonl",
                 "--result",
-                f"{smoke_base}.result.json",
+                f"{_SMOKE_BASE}.result.json",
             ]
         )
 
     def _verify_prebaked(self) -> bool:
-        """Fast prerequisite probes against a prebaked template.
+        """Fast prerequisite probe against a prebaked template.
 
-        Reads the bake manifest ``sbxloop bake`` left in the template, then
-        re-runs the two checks the install ladder ends with (version match,
-        entrypoint exits 64) under the interpreter the bake recorded. Any
-        failure returns False — the caller falls back to the install
-        ladder, so a stale or foreign template degrades to today's
-        behavior instead of failing the run.
+        One ``sbx exec`` runs the whole chain in-sandbox (_PREBAKE_PROBE):
+        read the bake manifest ``sbxloop bake`` left in the template, then
+        re-run the two checks the install ladder ends with (version match,
+        entrypoint exits 64) under the interpreter the bake recorded —
+        formerly three exec round trips (#127). Any failure returns False —
+        the caller falls back to the install ladder, so a stale or foreign
+        template degrades to today's behavior instead of failing the run.
         """
-        manifest_read = self.sandbox.exec(["cat", BAKE_MANIFEST])
-        if not manifest_read.ok:
+        probe = self.sandbox.exec(
+            [
+                "python3",
+                "-c",
+                _PREBAKE_PROBE,
+                BAKE_MANIFEST,
+                sbxloop.__version__,
+                DEFAULT_PYTHON,
+                _SMOKE_BASE,
+            ]
+        )
+        verdict: dict[str, object] = {}
+        if probe.ok and probe.stdout.strip():
+            try:
+                parsed = json.loads(probe.stdout.strip().splitlines()[-1])
+                if isinstance(parsed, dict):
+                    verdict = parsed
+            except ValueError:
+                pass
+        stage = verdict.get("stage")
+        if stage is None:
+            logger.warning(
+                "prebake probe produced no verdict (rc=%s): %s — running install ladder",
+                probe.returncode,
+                _output_tail(probe),
+            )
+            return False
+        if stage == "no-manifest":
             logger.info("no bake manifest in template (%s); running install ladder", BAKE_MANIFEST)
             return False
-        try:
-            manifest = json.loads(manifest_read.stdout)
-            baked_version = str(manifest["worker_version"])
-            python = str(manifest.get("python") or DEFAULT_PYTHON)
-        except (ValueError, KeyError, TypeError):
+        if stage == "bad-manifest":
             logger.warning("unreadable bake manifest %s; running install ladder", BAKE_MANIFEST)
             return False
-        if baked_version != sbxloop.__version__:
+        if stage == "stale":
             logger.warning(
                 "template worker %s does not match host %s — stale template, running "
                 "install ladder (re-run `sbxloop bake` to refresh)",
-                baked_version,
+                verdict.get("baked"),
                 sbxloop.__version__,
             )
             return False
-        verify = self.sandbox.exec(
-            [python, "-c", "import sbxloop_worker; print(sbxloop_worker.__version__)"]
-        )
-        if not verify.ok or verify.stdout.strip() != sbxloop.__version__:
+        if stage == "import-failed":
             logger.warning(
                 "prebaked worker failed the import/version probe (rc=%s): %s — "
                 "running install ladder",
-                verify.returncode,
-                _output_tail(verify),
+                verdict.get("rc"),
+                verdict.get("output") or "(no output)",
             )
             return False
-        smoke = self._entrypoint_smoke(python)
-        if smoke.returncode != 64:
+        if stage == "smoke-failed":
             logger.warning(
                 "prebaked worker failed the entrypoint probe (rc=%s, expected 64): %s — "
                 "running install ladder",
-                smoke.returncode,
-                _output_tail(smoke),
+                verdict.get("rc"),
+                verdict.get("output") or "(no output)",
+            )
+            return False
+        python = verdict.get("python")
+        if stage != "ok" or not isinstance(python, str) or not python:
+            logger.warning(
+                "prebake probe returned unrecognized verdict %r — running install ladder", stage
             )
             return False
         self.python = python
-        logger.info("prebaked worker %s verified; install ladder skipped", baked_version)
+        logger.info("prebaked worker %s verified; install ladder skipped", sbxloop.__version__)
         return True
 
     def _ensure_dev_tools(self, timeout: float) -> None:

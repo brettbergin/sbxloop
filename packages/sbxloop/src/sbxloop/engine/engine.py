@@ -27,6 +27,8 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -293,21 +295,7 @@ class LoopEngine:
                         else None
                     )
                     if self.install_workers:
-                        # A configured template is expected to be prebaked
-                        # (`sbxloop bake`): install() probes it and skips the
-                        # ladder on success, falling back when stale.
-                        prebaked_expected = bool(self.config.sandbox.template)
-                        # ensure_dev_tools: the agent builds projects in this VM
-                        # (venvs, pip) — the github sandbox only runs API ops.
-                        agent.install(
-                            extras="copilot",
-                            ensure_dev_tools=True,
-                            expect_prebaked=prebaked_expected,
-                        )
-                        if github is not None:
-                            github.install(extras="", expect_prebaked=prebaked_expected)
-                        if prebaked_expected:
-                            self._emit_prebaked(run_id, pair, agent, github)
+                        self._install_workers(run_id, pair, agent, github)
                     reporter, detach = self._attach_reporter(github, run_id, outcome)
                     try:
                         phases = PhaseRunner(
@@ -355,6 +343,54 @@ class LoopEngine:
             mounted=pair.mounted,
             kept_sandboxes=self._pair_names(pair) if pair.keep else [],
         )
+
+    def _install_workers(
+        self,
+        run_id: str,
+        pair: SandboxPair,
+        agent: WorkerClient,
+        github: WorkerClient | None,
+    ) -> None:
+        """Install the worker into both sandboxes, concurrently when the pair
+        exists — the installs share nothing in-sandbox, and each is seconds
+        of exec round-trips that would otherwise stack serially (#127).
+
+        A configured template is expected to be prebaked (`sbxloop bake`):
+        install() probes it and skips the ladder on success, falling back
+        when stale. ensure_dev_tools is agent-only — the agent builds
+        projects in its VM (venvs, pip); the github sandbox only runs API
+        ops. Both installs always run to completion before any failure
+        propagates, so an error never unwinds into pair teardown while the
+        other install is still mid-exec.
+        """
+        prebaked_expected = bool(self.config.sandbox.template)
+        installs: list[Callable[[], None]] = [
+            partial(
+                agent.install,
+                extras="copilot",
+                ensure_dev_tools=True,
+                expect_prebaked=prebaked_expected,
+            )
+        ]
+        if github is not None:
+            installs.append(partial(github.install, extras="", expect_prebaked=prebaked_expected))
+        if len(installs) == 1:
+            installs[0]()
+        else:
+            with ThreadPoolExecutor(
+                max_workers=len(installs), thread_name_prefix="sbxloop-install"
+            ) as pool:
+                futures = [pool.submit(fn) for fn in installs]
+                errors: list[Exception] = []
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        errors.append(exc)
+                if errors:
+                    raise errors[0]
+        if prebaked_expected:
+            self._emit_prebaked(run_id, pair, agent, github)
 
     def _emit_prebaked(
         self,

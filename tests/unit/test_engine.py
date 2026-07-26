@@ -1034,6 +1034,24 @@ class TestPrebakedTemplate:
         assert prebaked[0].data["prebaked"] is True
         assert prebaked[0].data["template"] == self.REF
 
+    def test_prebaked_pair_installs_both_and_emits_two_events(self, harness: Harness) -> None:
+        """With [github].repo the pair installs concurrently (#127); both
+        sandboxes verify their baked worker and each emits its own event."""
+        self.seed_template(harness)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(
+            install_workers=True,
+            sandbox={"template": self.REF},
+            github={"repo": "owner/repo"},
+        ).start("use the baked template with github")
+
+        assert result.state == "completed"
+        joined = [" ".join(c) for c in harness.fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j or "apt-get" in j]
+        prebaked = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_PREBAKED]
+        assert len(prebaked) == 2
+        assert all(e.data["prebaked"] is True for e in prebaked)
+
     def test_no_template_emits_no_prebaked_event(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         result = harness.engine().start("plain run")
