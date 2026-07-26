@@ -80,7 +80,7 @@ class JobRequest(ProtocolModel):
     job_id: str
     run_id: str
     kind: JobKind
-    timeout_s: float = 900.0
+    timeout_s: float = 1800.0
 
     # kind == "agent.session"
     prompt: str | None = None
