@@ -199,6 +199,17 @@ All notable changes to sdxloop are documented here. The project adheres to
 
 ### Changed
 
+- **Provisioning batches network policy grants into one `sbx` call.**
+  `sbx policy allow network` takes RESOURCES as a comma-separated list
+  (documented since the first sbx CLI reference), so provisioning and
+  template baking now grant all of a sandbox's allow-domains in a single
+  invocation instead of one CLI round-trip per domain (13 for the agent
+  sandbox). Plan-declared egress grants are unchanged: still one call per
+  domain, each individually event-logged.
+- Coverage moved out of the default pytest options and into CI /
+  `make test-cov`: tracing cost ~15% of full-suite wall time, and the
+  `--cov-fail-under` gate made every partial run (single file, `-k`,
+  `--pdb`) fail spuriously. `make check` still enforces the 85% gate.
 - The test suite runs parallel by default (pytest-xdist, `-n auto` with
   work-stealing): ~8min → ~2.5min locally. Pass `-n0` for a serial run when
   debugging with `-s`/`--pdb`. Two wheel-resolution tests were made hermetic:

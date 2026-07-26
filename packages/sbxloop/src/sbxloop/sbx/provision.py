@@ -273,8 +273,7 @@ class Provisioner:
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
 
     def _apply_policy(self, spec: SandboxSpec) -> None:
-        for domain in spec.policy_allows:
-            self.cli.policy_allow(domain, sandbox=spec.name)
+        self.cli.policy_allow(*spec.policy_allows, sandbox=spec.name)
 
     def _apply_secrets(
         self, spec: SandboxSpec, sandbox: Sandbox, token: str

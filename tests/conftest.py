@@ -44,10 +44,25 @@ class FakeSbx:
         return json.loads((self.state / "sandboxes" / name / "meta.json").read_text())
 
     def policies(self) -> list[list[str]]:
+        """Recorded policy mutations, one entry per rule.
+
+        sbx takes RESOURCES as a comma-separated list, so a batched
+        ``allow network a.com,b.com`` is expanded here into per-domain
+        entries — assertions name single domains either way. Raw argv
+        (batching included) is visible via ``invocations("policy")``.
+        """
         path = self.state / "policies.jsonl"
         if not path.is_file():
             return []
-        return [json.loads(line)["args"] for line in path.read_text().splitlines()]
+        entries = []
+        for line in path.read_text().splitlines():
+            args = json.loads(line)["args"]
+            if len(args) >= 3 and args[1] == "network":
+                for resource in args[2].split(","):
+                    entries.append([*args[:2], resource, *args[3:]])
+            else:
+                entries.append(args)
+        return entries
 
     def secrets(self) -> list[dict[str, Any]]:
         path = self.state / "secrets.jsonl"

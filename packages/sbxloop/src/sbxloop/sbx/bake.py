@@ -116,8 +116,7 @@ def bake_template(
         try:
             cli.create(spec)
             sandbox = Sandbox(cli, name)
-            for domain in spec.policy_allows:
-                cli.policy_allow(domain, sandbox=name)
+            cli.policy_allow(*spec.policy_allows, sandbox=name)
 
             report("installing the worker (full install ladder)")
             client = WorkerClient(sandbox)

@@ -222,8 +222,16 @@ class SbxCLI:
 
     # -- network policy ----------------------------------------------------
 
-    def policy_allow(self, domain: str, *, sandbox: str | None = None) -> None:
-        args = ["policy", "allow", "network", domain]
+    def policy_allow(self, *domains: str, sandbox: str | None = None) -> None:
+        """Allow network egress to ``domains`` in one invocation.
+
+        RESOURCES is documented as a comma-separated list (docker/docs
+        data/sbx_cli, unchanged since the first sbx reference), so batching
+        n domains costs one CLI round-trip instead of n.
+        """
+        if not domains:
+            return
+        args = ["policy", "allow", "network", ",".join(domains)]
         if sandbox:
             args += ["--sandbox", sandbox]
         self.run(*args)

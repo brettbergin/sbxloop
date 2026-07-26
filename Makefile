@@ -1,4 +1,4 @@
-.PHONY: install fmt lint typecheck security test check build clean
+.PHONY: install fmt lint typecheck security test test-cov check build clean
 
 install:
 	uv sync --all-packages
@@ -22,7 +22,10 @@ security:
 test:
 	uv run pytest
 
-check: lint typecheck security test
+test-cov:
+	uv run pytest --cov=sbxloop --cov=sbxloop_worker --cov-report=term-missing --cov-fail-under=85
+
+check: lint typecheck security test-cov
 
 build:
 	rm -rf dist

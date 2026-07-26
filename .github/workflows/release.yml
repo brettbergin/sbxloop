@@ -43,7 +43,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy
       - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
-      - run: uv run pytest
+      - run: uv run pytest --cov=sbxloop --cov=sbxloop_worker --cov-report=term-missing --cov-fail-under=85
 
   release:
     needs: check
