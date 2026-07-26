@@ -80,6 +80,29 @@ class TestBounds:
         assert "pypi.org" in allow
         assert "registry.npmjs.org" in allow
 
+    def test_well_known_registries_in_bounds_by_default(self) -> None:
+        # A default config (no [policy] allow) must accept plans declaring
+        # the major package registries — the "write a Rails app" case.
+        allow, _deny = effective_egress_bounds(Config())
+        for domain in (
+            "rubygems.org",
+            "index.rubygems.org",
+            "registry.npmjs.org",
+            "registry.yarnpkg.com",
+            "crates.io",
+            "static.crates.io",
+            "index.crates.io",
+            "proxy.golang.org",
+            "sum.golang.org",
+        ):
+            assert egress_rejection(domain, allow, _deny) is None
+
+    def test_deny_still_blocks_well_known_registry(self) -> None:
+        config = Config.model_validate({"policy": {"deny": ["rubygems.org"]}})
+        allow, deny = effective_egress_bounds(config)
+        reason = egress_rejection("rubygems.org", allow, deny)
+        assert reason is not None and "deny" in reason
+
 
 class TestEgressSpec:
     def test_normalizes_domain(self) -> None:
@@ -127,6 +150,23 @@ class TestEgressGranter:
         granter.apply("t2", [("static.crates.io", "cargo build again")])
         assert len(fake_sbx.policies()) == 1
         assert len([e for e in events if e.type == HostEventTypes.POLICY_ALLOW]) == 1
+
+    def test_well_known_registry_granted_without_operator_config(self, fake_sbx: FakeSbx) -> None:
+        # Registries are declarable-not-baseline: in bounds with a default
+        # config, but still granted via `sbx policy allow` (and event-logged)
+        # rather than pre-seeded.
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events)
+        granter.apply("t1", [("rubygems.org", "bundle install for the Rails app")])
+        assert [
+            "allow",
+            "network",
+            "rubygems.org",
+            "--sandbox",
+            "sbxloop-r1-agent",
+        ] in fake_sbx.policies()
+        (event,) = [e for e in events if e.type == HostEventTypes.POLICY_ALLOW]
+        assert event.data["domain"] == "rubygems.org"
 
     def test_baseline_domain_needs_no_grant(self, fake_sbx: FakeSbx) -> None:
         events: list[Event] = []

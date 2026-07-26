@@ -157,19 +157,23 @@ letting in-VM tooling fail confusingly on a full disk.
 ## Network egress: least privilege, by plan
 
 Sandboxes start with only the baseline allowlist (Copilot/GitHub hosts, PyPI,
-apt mirrors). When a task genuinely needs more, the PLAN phase declares the
-extra domains — each with a justification — and the declarations are validated
-against operator-set bounds:
+apt mirrors). Well-known package registries — RubyGems, npm/yarn, crates.io,
+the Go module proxy — are one notch wider: not reachable by default, but a
+plan may declare them in `egress` with no configuration, so `bundle install`
+or `npm install` works out of the box while every grant still lands in the
+audit log. Anything else the PLAN phase declares — each domain with a
+justification — is validated against operator-set bounds:
 
 ```toml
 # sbxloop.toml
 [policy]
-allow = ["*.crates.io", "static.crates.io"]  # what plans MAY request
-deny  = []                                    # never grantable, even if allowed
+allow = ["repo.maven.apache.org", "repo1.maven.org"]  # what plans MAY request
+deny  = []                                # never grantable, even if allowed
 ```
 
 Patterns are exact domains, `*.example.com` wildcards, or `*`. Empty `allow`
-(the default) means plans may only use the baseline. In-bounds grants are
+(the default) means plans may only use the baseline and the well-known
+registries. In-bounds grants are
 applied **grant-late** — `sbx policy allow network` runs at EXECUTE entry, so
 resumed runs re-grant on their fresh sandboxes — and every grant and refusal
 is a `policy.allow` / `policy.deny` run event, making the persisted event log
