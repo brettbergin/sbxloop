@@ -875,6 +875,64 @@ class TestWorkspaceExecution:
         assert reports[0].data["files"] == 2  # .github/workflows/ci.yml, .gitignore
         assert reports[0].data["excluded"] == {".git": 1}
 
+    def test_harvest_respects_excludes_at_transfer_time(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Excluded dirs (.git) must not appear in the harvested artifacts
+        even in unmounted mode — they must be stripped by tar inside the VM,
+        not just at listing/delivery time (#128)."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        execute = {
+            "text": "wrote files",
+            "files": {
+                "hello.txt": "hi\n",
+                ".git/HEAD": "ref: refs/heads/main\n",
+                ".git/objects/abc": "blob",
+            },
+        }
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        result = harness.engine().start("write files in harvest mode")
+
+        assert result.state == "completed"
+        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        # Regular file must arrive
+        assert (harvested / "hello.txt").read_text() == "hi\n"
+        # .git must be absent — tar excluded it before the copy
+        assert not (harvested / ".git").exists()
+
+    def test_harvest_mode_final_skips_per_task_harvest(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With harvest_mode='final', mid-run copies are skipped; only the
+        authoritative sweep at finalize runs.  The result is still complete
+        and artifacts are delivered — just with fewer sbx exec tar calls."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        harness.script(
+            [
+                taskgraph(task("t1"), task("t2", deps=["t1"])),
+                PLAN,
+                execute,
+                PASS,
+                ACCEPT,
+                PLAN,
+                execute,
+                PASS,
+                ACCEPT,
+            ]
+        )
+        engine = harness.engine(artifacts={"harvest_mode": "final"})
+        result = engine.start("two-task harvest-final run")
+
+        assert result.state == "completed"
+        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        assert (harvested / "hello.txt").read_text() == "hi\n"
+
+        # Per-task mode would run tar once per task + once at finalize.
+        # Final mode runs tar only at finalize (1 call).
+        tar_calls = [inv for inv in harness.fake_sbx.invocations("exec") if "tar" in inv]
+        assert len(tar_calls) == 1
+
 
 class TestDeliverHook:
     """The engine's finalize hook; the git-data flow itself is covered in

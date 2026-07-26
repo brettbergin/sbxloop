@@ -37,6 +37,7 @@ RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
 
 WorkerTransport = Literal["stream", "poll"]
 SecretStrategy = Literal["proxy", "plain-env"]
+HarvestMode = Literal["per-task", "final"]
 
 
 class _ConfigModel(BaseModel):
@@ -108,18 +109,25 @@ class GithubConfig(_ConfigModel):
 
 
 class ArtifactsConfig(_ConfigModel):
-    """What artifact listings and delivery leave out.
+    """What artifact listings and delivery leave out, and how harvesting works.
 
     ``exclude`` entries are single path components matched at any depth;
     a file is excluded when any component of its path matches. The default
     drops only genuinely noisy state dirs (``.git``, ``.sbxloop``) — dot-path
     artifacts like ``.github/`` or ``.gitignore`` are delivered. Exclusions
     are always counted and surfaced, never silent.
+
+    ``harvest_mode`` controls when unmounted-run artifacts are copied to the
+    host.  ``"per-task"`` (default) copies after every task boundary plus the
+    final sweep — narrowing the loss window on long runs.  ``"final"`` skips
+    the mid-run copies and only performs the authoritative sweep at the end,
+    which is cheaper for runs with large workspaces.
     """
 
     # Mirrors engine.model.DEFAULT_ARTIFACT_EXCLUDES (kept literal here —
     # importing engine.model from config would be a circular import).
     exclude: list[str] = Field(default_factory=lambda: [".git", ".sbxloop"])
+    harvest_mode: HarvestMode = "per-task"
 
     @field_validator("exclude")
     @classmethod
