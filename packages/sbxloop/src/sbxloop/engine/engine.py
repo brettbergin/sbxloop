@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import tarfile
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -63,6 +65,7 @@ from sbxloop.policy import EgressGranter
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
+from sbxloop.sbx.sandbox import SBXLOOP_DIR
 from sbxloop.worker.client import WorkerClient
 
 logger = logging.getLogger(__name__)
@@ -465,16 +468,35 @@ class LoopEngine:
     def _harvest(self, run_id: str, pair: SandboxPair) -> None:
         """Copy the in-VM work dir out to the host (unmounted runs only).
 
-        Best-effort by design: a failed copy must never fail the run. The
-        trailing ``/.`` copies directory *contents* (docker-style cp) — real
-        sbx cp directory semantics are e2e-validated.
+        Best-effort by design: a failed copy must never fail the run.  Uses
+        ``tar`` inside the VM with the configured ``artifacts.exclude`` entries
+        so that ``.git``, venvs, and other heavy dirs are never transferred —
+        the excluded content is not delivered anyway.  The tarball is staged in
+        the VM's ``.sbxloop`` dir, copied out, and extracted on the host.
         """
         if pair.mounted:
             return
         target = self.config.state_dir / "runs" / run_id / "artifacts"
         target.mkdir(parents=True, exist_ok=True)
+        exclude = self.config.artifacts.exclude
+        # Build tar exclude flags: --exclude=<name> for each entry.
+        exclude_args = [arg for name in exclude for arg in ("--exclude", name)]
+        vm_tar = f"{SBXLOOP_DIR}/harvest.tar"
         try:
-            pair.agent.cp_out(f"{pair.agent_workdir}/.", target)
+            result = pair.agent.exec(
+                ["tar", "-cf", vm_tar, "-C", pair.agent_workdir, *exclude_args, "."]
+            )
+            if not result.ok:
+                raise SbxError(
+                    f"tar failed (exit {result.returncode})",
+                    argv=result.argv,
+                    stderr=result.stderr,
+                )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                host_tar = Path(tmpdir) / "harvest.tar"
+                pair.agent.cp_out(vm_tar, host_tar)
+                with tarfile.open(host_tar) as tf:
+                    tf.extractall(target, filter="data")
         except SbxError:
             logger.warning("artifact harvest failed for run %s", run_id, exc_info=True)
 
@@ -680,7 +702,10 @@ class LoopEngine:
 
         # Task-boundary harvest narrows the loss window on long runs; the
         # finalize harvest in _drive remains the authoritative sweep.
-        self._harvest(run_id, pair)
+        # When harvest_mode is "final", skip the mid-run copy for cheaper
+        # per-task cost on runs with large workspaces.
+        if self.config.artifacts.harvest_mode == "per-task":
+            self._harvest(run_id, pair)
         self._emit_task_end(run_id, task)
 
     def _phase_plan(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
