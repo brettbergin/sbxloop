@@ -1200,6 +1200,36 @@ class TestDashboard:
         console.print(rendered)
         assert "scrutinizer" in console.export_text()
 
+    def test_agent_message_header_names_the_model(self) -> None:
+        """When the event carries the answering model's slug, the chat
+        bubble title shows it next to the persona; events without one keep
+        the plain persona-and-timestamp header."""
+        from rich.console import Console
+
+        from sbxloop.cli.tui import render_event
+
+        rendered = render_event(
+            Event.now(
+                "agent.message",
+                "r1",
+                content="done",
+                agent="executor",
+                model="claude-sonnet-5",
+            )
+        )
+        assert rendered is not None
+        console = Console(record=True, width=80)
+        console.print(rendered)
+        text = console.export_text()
+        assert "executor" in text
+        assert "claude-sonnet-5" in text
+
+        rendered = render_event(Event.now("agent.message", "r1", content="done", agent="executor"))
+        assert rendered is not None
+        console = Console(record=True, width=80)
+        console.print(rendered)
+        assert "·" not in console.export_text()
+
     def test_format_event_includes_agent_name(self) -> None:
         from sbxloop.cli.tui import format_event
 
