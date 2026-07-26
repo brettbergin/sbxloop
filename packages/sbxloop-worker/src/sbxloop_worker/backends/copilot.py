@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 from typing import Any, get_args
 
 from sbxloop_worker._json import extract_json
@@ -60,6 +61,47 @@ SDK_PERMISSION_KINDS = frozenset(
 READ_ONLY_ALLOWED_KINDS = frozenset({"read", "url"})
 
 _TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
+
+# -- bundled-ripgrep page-size guard (issue #122) ----------------------------
+# The Copilot CLI's glob/grep tools spawn a bundled ripgrep that is a
+# musl-static, jemalloc-linked build compiled for 4 KiB pages (verified
+# against @github/copilot 1.0.73: the binary carries jemalloc's "Unsupported
+# system page size" abort string). On guests with a larger page size (16 KiB
+# is common for Apple-silicon microVMs) that binary aborts at startup, so
+# the agent silently loses its search tools — fatal for the read-only critic,
+# which cannot fall back to shell. The CLI documents USE_BUILTIN_RIPGREP:
+# when set to exactly "false" it spawns `rg` from PATH instead of the
+# bundled binary (same release, `process.env.USE_BUILTIN_RIPGREP==="false"`).
+EXPECTED_PAGE_SIZE = 4096
+RIPGREP_ENV = "USE_BUILTIN_RIPGREP"
+
+
+def ripgrep_page_size_plan(
+    page_size: int, system_rg: str | None, current: str | None
+) -> tuple[dict[str, str], str | None]:
+    """Env updates + warning for the bundled-ripgrep page-size hazard.
+
+    Pure decision logic so the polarity is unit-testable: on a 4 KiB guest
+    (or when the operator already set ``USE_BUILTIN_RIPGREP``) nothing
+    changes; on a larger page size the plan reroutes glob/grep to the
+    system ripgrep when one exists, and warns that search tooling is lost
+    when none does.
+    """
+    if page_size == EXPECTED_PAGE_SIZE or current is not None:
+        return {}, None
+    if system_rg:
+        return {RIPGREP_ENV: "false"}, (
+            f"guest page size is {page_size} (not {EXPECTED_PAGE_SIZE}): the Copilot "
+            "CLI's bundled ripgrep would abort (jemalloc 'Unsupported system page "
+            f"size'); rerouting glob/grep to the system ripgrep at {system_rg} "
+            f"via {RIPGREP_ENV}=false"
+        )
+    return {}, (
+        f"guest page size is {page_size} (not {EXPECTED_PAGE_SIZE}) and no system "
+        "ripgrep is on PATH: the agent's glob/grep tools will fail (jemalloc "
+        "'Unsupported system page size'); install ripgrep in the sandbox "
+        "(sudo apt-get install ripgrep) to restore them"
+    )
 
 
 def read_only_denial(request: Any) -> str | None:
@@ -198,6 +240,7 @@ class CopilotBackend:
             raise BackendUnavailableError(
                 "github-copilot-sdk is not installed; install sbxloop-worker[copilot]"
             ) from exc
+        self._guard_bundled_ripgrep(emit)
         try:
             return asyncio.run(self._run(job, emit))
         except Exception as exc:
@@ -205,6 +248,25 @@ class CopilotBackend:
             # created with authentication info..."); say what the token
             # environment actually looks like from inside the sandbox.
             raise RuntimeError(f"{exc} | {_auth_diagnostic()}") from exc
+
+    @staticmethod
+    def _guard_bundled_ripgrep(emit: EmitFn) -> None:
+        """Apply :func:`ripgrep_page_size_plan` to this process's environment.
+
+        The SDK's CLI subprocess inherits ``os.environ``, so setting
+        ``USE_BUILTIN_RIPGREP`` here reaches the glob/grep tool spawns.
+        Best-effort: a host without ``sysconf`` support just skips the guard.
+        """
+        try:
+            page_size = os.sysconf("SC_PAGESIZE")
+        except (AttributeError, OSError, ValueError):
+            return
+        updates, warning = ripgrep_page_size_plan(
+            page_size, shutil.which("rg"), os.environ.get(RIPGREP_ENV)
+        )
+        os.environ.update(updates)
+        if warning:
+            emit(EventTypes.SANDBOX_TOOLING_WARNING, message=warning)
 
     async def _run(self, job: JobRequest, emit: EmitFn) -> BackendResult:
         from copilot import CopilotClient

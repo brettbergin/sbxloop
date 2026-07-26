@@ -56,6 +56,7 @@ PROBE_EXEC_ERROR_CHANNEL = "exec-error-channel"
 PROBE_CP_DIR_SEMANTICS = "cp-dir-semantics"
 PROBE_WORKSPACE_MOUNT = "workspace-mount"
 PROBE_PYTHON3_VENV = "python3-venv"
+PROBE_PAGE_SIZE = "page-size"
 PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"  # nosec B105 - probe name
 PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"  # nosec B105 - probe name
 PROBE_SECRET_VALUE_STDIN = "secret-value-stdin"  # nosec B105 - probe name
@@ -208,6 +209,37 @@ def _probe_python3_venv(ctx: ProbeContext) -> tuple[str, str]:
     return "missing", "venv/ensurepip not importable; the install ladder's apt rung is needed"
 
 
+def _probe_page_size(ctx: ProbeContext) -> tuple[str, str]:
+    """Guest page size vs the Copilot CLI's bundled search binaries (issue #122).
+
+    The bundled ripgrep behind the agent's glob/grep tools is a jemalloc
+    build compiled for 4 KiB pages; on a guest with a larger page size it
+    aborts at startup ("<jemalloc>: Unsupported system page size"). The
+    worker reroutes glob/grep to a PATH ripgrep on such guests, so the
+    verdict also reports whether that reroute has a binary to land on.
+    """
+    assert ctx.sandbox is not None
+    result = ctx.sandbox.exec(["getconf", "PAGESIZE"])
+    raw = result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
+    if not result.ok or not raw.isdigit():
+        return "unknown", f"getconf PAGESIZE failed (rc={result.returncode})"
+    page = int(raw)
+    if page == 4096:
+        return "4k-pages", "the Copilot CLI's bundled ripgrep (4 KiB jemalloc build) works"
+    if ctx.sandbox.exec(["sh", "-c", "command -v rg >/dev/null"]).ok:
+        return (
+            "non-4k-rg-fallback",
+            f"page size {page}: bundled ripgrep would abort; the worker reroutes "
+            "glob/grep to the system ripgrep (USE_BUILTIN_RIPGREP=false)",
+        )
+    return (
+        "non-4k-degraded",
+        f"page size {page} and no system ripgrep in this template: glob/grep abort "
+        "with jemalloc 'Unsupported system page size' until provisioning's "
+        "ripgrep ensure (or `apt-get install ripgrep`) succeeds",
+    )
+
+
 _VIS_PROBE_ENV = "SBXLOOP_CONFORMANCE_VIS"
 _DUP_PROBE_ENV = "SBXLOOP_CONFORMANCE_DUP"
 _PROBE_SECRET_HOST = "example.com"  # nosec B105 - hostname, not a secret
@@ -336,6 +368,18 @@ CATALOG: tuple[Probe, ...] = (
         depends="the worker install ladder (venv -> apt python3-venv -> user-site) exists "
         "because the default template lacks python3-venv",
         run=_probe_python3_venv,
+    ),
+    Probe(
+        id=PROBE_PAGE_SIZE,
+        summary="guest page size vs the Copilot CLI's bundled 4 KiB-page ripgrep",
+        tier="sandbox",
+        expected=None,  # the ripgrep reroute + provisioning ensure handle both answers
+        depends="the bundled-ripgrep page-size guard (worker sets "
+        "USE_BUILTIN_RIPGREP=false on non-4-KiB guests) and provisioning's ripgrep "
+        "ensure exist because 16 KiB-page guests abort the bundled search binary "
+        "(issue #122); a non-4k-degraded verdict means glob/grep are dead in this "
+        "template until ripgrep installs",
+        run=_probe_page_size,
     ),
     Probe(
         id=PROBE_SECRET_ENV_VISIBILITY,

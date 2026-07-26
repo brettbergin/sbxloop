@@ -42,6 +42,12 @@ def make_client(sandbox: Sandbox, bus: EventBus, **kwargs: object) -> WorkerClie
     return WorkerClient(sandbox, bus, **kwargs)  # type: ignore[arg-type]
 
 
+def script_search_fallback_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> None:
+    """Script the page-size/ripgrep probe (unscripted it would run on the
+    host, where the answer varies by machine — 16 KiB on Apple silicon)."""
+    fake_sbx.script('exec boxa sh -c test "$(getconf PAGESIZE)"', returncode=returncode)
+
+
 def agent_job(**overrides: object) -> JobRequest:
     base: dict[str, object] = {
         "job_id": "j1",
@@ -456,6 +462,7 @@ class TestInstallFallbacks:
             returncode=1,
             stderr="ModuleNotFoundError: No module named 'ensurepip'",
         )
+        script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
@@ -487,6 +494,7 @@ class TestInstallFallbacks:
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
         fake_sbx.script("exec boxa python3 -c", returncode=0)
+        script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
@@ -517,6 +525,7 @@ class TestInstallFallbacks:
             returncode=1,
             stderr="ModuleNotFoundError: No module named 'ensurepip'",
         )
+        script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=100, stderr="apt exploded")
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
@@ -531,6 +540,67 @@ class TestInstallFallbacks:
             client.install(wheel=wheel, ensure_dev_tools=True)
         assert any("dev-tools ensure failed" in r.getMessage() for r in caplog.records)
         assert any("apt exploded" in r.getMessage() for r in caplog.records)
+
+    def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
+        import sbxloop
+
+        fake_sbx.script("exec boxa python3 -c", returncode=0)
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+        fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -c",
+            stdout=f"{sbxloop.__version__}\n",
+        )
+        fake_sbx.script(
+            "exec boxa /home/agent/.sbxloop/venv/bin/python -m sbxloop_worker", returncode=64
+        )
+
+    def test_search_fallback_installs_ripgrep_on_non_4k_guest(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Probe fails (non-4-KiB pages, no rg on PATH) -> apt installs ripgrep.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_search_fallback_probe(fake_sbx, returncode=1)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True)
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert any("ripgrep" in cmd for cmd in apt_cmds), apt_cmds
+
+    def test_search_fallback_probe_ok_skips_apt(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # A 4-KiB guest (or one that already ships rg) must not touch apt.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_search_fallback_probe(fake_sbx, returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True)
+        execs = fake_sbx.invocations("exec")
+        assert not [c for c in execs if any("ripgrep" in a for a in c)]
+
+    def test_search_fallback_failure_is_nonfatal_but_loud(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_search_fallback_probe(fake_sbx, returncode=1)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=100, stderr="apt exploded")
+        self._script_happy_install(fake_sbx)
+        with caplog.at_level("WARNING"):
+            client.install(wheel=wheel, ensure_dev_tools=True)
+        assert any("search-fallback ensure failed" in r.getMessage() for r in caplog.records)
+        assert any("Unsupported system page size" in r.getMessage() for r in caplog.records)
 
     def test_install_without_flag_skips_dev_tools(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path

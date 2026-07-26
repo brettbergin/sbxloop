@@ -144,6 +144,7 @@ class WorkerClient:
             return
         if ensure_dev_tools:
             self._ensure_dev_tools(timeout)
+            self._ensure_search_fallback(timeout)
         wheel = wheel if wheel is not None else resolve_worker_wheel()
         if wheel is not None:
             staged = f"{STAGED_WHEEL_DIR}/{wheel.name}"
@@ -291,6 +292,46 @@ class WorkerClient:
                 "may fail with 'ensurepip is not available'. rc=100 usually means "
                 "apt could not reach its mirrors; check the sandbox network policy "
                 "allows the Ubuntu/Debian apt hosts: %s",
+                result.returncode,
+                _output_tail(result),
+            )
+
+    # The worker reroutes the Copilot CLI's glob/grep tools to a PATH ripgrep
+    # on non-4-KiB-page guests (USE_BUILTIN_RIPGREP=false, issue #122); this
+    # probe answers whether that reroute would have a binary to land on.
+    _SEARCH_FALLBACK_PROBE = 'test "$(getconf PAGESIZE)" = 4096 || command -v rg >/dev/null'
+
+    def _ensure_search_fallback(self, timeout: float) -> None:
+        """Best-effort: a PATH ripgrep for non-4-KiB-page guests (issue #122).
+
+        The Copilot CLI's bundled ripgrep is a jemalloc build compiled for
+        4 KiB pages; on guests with a larger page size (16 KiB is common
+        for Apple-silicon microVMs) it aborts at startup ("<jemalloc>:
+        Unsupported system page size") and the agent silently loses its
+        search tools. The worker reroutes glob/grep to the system ripgrep
+        via ``USE_BUILTIN_RIPGREP=false`` on such guests — this ensure
+        installs that ripgrep. Probe first: a 4 KiB guest, or one that
+        already ships ``rg``, needs no apt and no network at all. Never
+        fatal: the worker also warns in the transcript when the reroute
+        has no binary to land on.
+        """
+        probe = self.sandbox.exec(["sh", "-c", self._SEARCH_FALLBACK_PROBE])
+        if probe.ok:
+            return
+        result = self.sandbox.exec(
+            [
+                "sh",
+                "-c",
+                "sudo -n apt-get update -q && sudo -n apt-get install -y -q ripgrep",
+            ],
+            timeout=timeout,
+        )
+        if not result.ok:
+            logger.warning(
+                "search-fallback ensure failed (rc=%s) — this guest's page size "
+                "is not 4096 and no system ripgrep could be installed, so the "
+                "agent's glob/grep tools will abort (jemalloc 'Unsupported "
+                "system page size'): %s",
                 result.returncode,
                 _output_tail(result),
             )
