@@ -22,7 +22,9 @@ import logging
 import os
 import secrets
 import shlex
+import threading
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 
@@ -98,6 +100,9 @@ class Provisioner:
         self.post_create = post_create
         self._sbx_version: str | None = None
         self._sbx_version_known = False
+        # Serializes the version lookup and the cache file's read-modify-
+        # write: the two sandboxes provision on parallel threads (#127).
+        self._probe_lock = threading.Lock()
 
     def _record_probe(self, probe_id: str, verdict: str, detail: str = "") -> None:
         """Refresh the conformance cache from a field observation.
@@ -107,12 +112,13 @@ class Provisioner:
         free. Best-effort: recording must never affect provisioning.
         """
         try:
-            if not self._sbx_version_known:
-                self._sbx_version = self.cli.version()
-                self._sbx_version_known = True
-            record_field_verdict(
-                self.config.state_dir, self._sbx_version, probe_id, verdict, detail
-            )
+            with self._probe_lock:
+                if not self._sbx_version_known:
+                    self._sbx_version = self.cli.version()
+                    self._sbx_version_known = True
+                record_field_verdict(
+                    self.config.state_dir, self._sbx_version, probe_id, verdict, detail
+                )
         except Exception:
             logger.debug("conformance verdict recording failed", exc_info=True)
 
@@ -188,21 +194,49 @@ class Provisioner:
         specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
         created: list[Sandbox] = []
         registered_secret_rms: list[Callable[[], bool]] = []
+        # Guards the two rollback lists: the sandboxes provision on parallel
+        # threads, and a failure must still see everything the OTHER thread
+        # created so rollback stays complete.
+        rollback_lock = threading.Lock()
+
+        def provision_one(spec: SandboxSpec) -> Sandbox:
+            self.bus.emit("sandbox.provision_start", run_id, name=spec.name, role=spec.role)
+            self.cli.create(spec)
+            sandbox = Sandbox(self.cli, spec.name)
+            with rollback_lock:
+                created.append(sandbox)
+            self._apply_policy(spec)
+            rms = self._apply_secrets(spec, sandbox, tokens[spec.role])
+            with rollback_lock:
+                registered_secret_rms.extend(rms)
+            self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
+            sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
+            if self.post_create is not None:
+                self.post_create(sandbox, spec.role)
+            self.bus.emit("sandbox.ready", run_id, name=spec.name, role=spec.role)
+            return sandbox
+
         try:
             sandboxes: dict[SandboxRole, Sandbox] = {}
-            for spec in specs:
-                self.bus.emit("sandbox.provision_start", run_id, name=spec.name, role=spec.role)
-                self.cli.create(spec)
-                sandbox = Sandbox(self.cli, spec.name)
-                created.append(sandbox)
-                self._apply_policy(spec)
-                registered_secret_rms += self._apply_secrets(spec, sandbox, tokens[spec.role])
-                self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
-                sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
-                if self.post_create is not None:
-                    self.post_create(sandbox, spec.role)
-                sandboxes[spec.role] = sandbox
-                self.bus.emit("sandbox.ready", run_id, name=spec.name, role=spec.role)
+            if len(specs) == 1:
+                sandboxes[specs[0].role] = provision_one(specs[0])
+            else:
+                # The pair shares nothing but the host workspace dir, so the
+                # two microVMs boot and configure concurrently (#127). Every
+                # future is drained before any failure propagates: rollback
+                # must never race a thread still mid-provision.
+                with ThreadPoolExecutor(
+                    max_workers=len(specs), thread_name_prefix="sbxloop-provision"
+                ) as pool:
+                    futures = [(spec, pool.submit(provision_one, spec)) for spec in specs]
+                    errors: list[Exception] = []
+                    for spec, future in futures:
+                        try:
+                            sandboxes[spec.role] = future.result()
+                        except Exception as exc:
+                            errors.append(exc)
+                    if errors:
+                        raise errors[0]
             agent_workdir = self._discover_mount(run_id, sandboxes["agent"], workspace)
             mounted = agent_workdir is not None
             if agent_workdir is None:

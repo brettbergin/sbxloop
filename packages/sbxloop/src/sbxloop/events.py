@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -32,10 +33,17 @@ class EventBus:
 
     Subscriber exceptions are isolated: they are logged and swallowed so
     telemetry consumers can never fail a run.
+
+    Publishing is thread-safe: parallel provisioning/install threads emit
+    concurrently, and the lock keeps subscriber invocations serialized so
+    consumers that are not thread-safe themselves (the SQLite persister,
+    console printers) never see two events at once. Reentrant (a subscriber
+    may emit) — hooks still run synchronously on the publishing thread.
     """
 
     def __init__(self) -> None:
         self._subscribers: list[Subscriber] = []
+        self._publish_lock = threading.RLock()
 
     def subscribe(self, fn: Subscriber) -> Callable[[], None]:
         """Register a subscriber; returns an unsubscribe callable."""
@@ -51,11 +59,12 @@ class EventBus:
         return self.subscribe(hook.on_event)
 
     def publish(self, event: Event) -> None:
-        for fn in list(self._subscribers):
-            try:
-                fn(event)
-            except Exception:
-                logger.exception("event subscriber %r failed for %s", fn, event.type)
+        with self._publish_lock:
+            for fn in list(self._subscribers):
+                try:
+                    fn(event)
+                except Exception:
+                    logger.exception("event subscriber %r failed for %s", fn, event.type)
 
     def emit(
         self,

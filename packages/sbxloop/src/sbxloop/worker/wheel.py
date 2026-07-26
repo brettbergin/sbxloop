@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
@@ -28,6 +29,11 @@ from pathlib import Path
 import sbxloop
 
 logger = logging.getLogger(__name__)
+
+# lru_cache does not lock: without this, the parallel worker installs
+# (#127) would each run their own `uv build` before either result lands
+# in the cache.
+_BUILD_LOCK = threading.Lock()
 
 
 def _vendored_wheel() -> Path | None:
@@ -89,4 +95,5 @@ def resolve_worker_wheel() -> Path | None:
     wheel = _vendored_wheel()
     if wheel is not None:
         return wheel
-    return _workspace_build()
+    with _BUILD_LOCK:
+        return _workspace_build()
