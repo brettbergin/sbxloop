@@ -4,12 +4,22 @@ name: Release
 # publishes both distributions (sbxloop, sbxloop-worker) to PyPI using Trusted
 # Publishing (OIDC — no tokens). hatch-vcs derives the package versions from
 # the tag, so nothing is committed back to main.
+#
+# Every run releases the CURRENT TIP of main — never the (possibly stale)
+# commit that triggered it. Together with the concurrency group below and the
+# ancestor guard in "Compute release version", this keeps tag numeric order
+# aligned with main's history: a queued, superseded, or re-run job for an
+# older merge can no longer stamp old code with a newer version (which is how
+# v0.5.29–v0.5.32 ended up tagging out of order on 2026-07-25).
 on:
   push:
     branches: [main]
   workflow_dispatch: {}  # allow a manual release from the Actions tab
 
 # Serialize releases so two quick merges can't race on the tag / version.
+# Note GitHub keeps at most ONE pending run per group (newer pushes supersede
+# older pending runs) — that's fine, because whichever run executes releases
+# the tip of main, which contains every superseded merge.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -17,10 +27,16 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.tip.outputs.sha }}  # the exact commit the release job tags + publishes
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main       # test the tip of main, not the (possibly stale) trigger commit
           fetch-depth: 0  # hatch-vcs needs tags to resolve the version
+      - name: Record the tested commit
+        id: tip
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-packages
       - run: uv run ruff format --check .
@@ -42,6 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.check.outputs.sha }}  # release exactly what the check job tested
           fetch-depth: 0   # full history + all tags so hatch-vcs can resolve the version
 
       - name: Compute release version
@@ -53,10 +70,21 @@ jobs:
           # re-run), release that version as-is instead of minting a new tag.
           if existing="$(git describe --exact-match --tags HEAD 2>/dev/null)"; then
             echo "HEAD is already tagged as ${existing} — releasing it without re-tagging."
+            echo "proceed=true"  >> "$GITHUB_OUTPUT"
             echo "need_tag=false" >> "$GITHUB_OUTPUT"
             echo "version=${existing#v}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Refuse to mint a new tag for code already contained in an existing
+          # release: a stale queued/re-run job would otherwise stamp OLDER code
+          # with a NEWER version, breaking "higher version ⊇ more features".
+          for tag in $(git tag --list 'v[0-9]*'); do
+            if git merge-base --is-ancestor HEAD "${tag}^{commit}"; then
+              echo "HEAD is already contained in release ${tag} — skipping this release."
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
           latest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)"
           if [ -z "$latest" ]; then
             next="0.1.0"                       # first release
@@ -66,11 +94,12 @@ jobs:
             next="${major}.${minor}.$((patch + 1))"   # bump patch on every merge
           fi
           echo "Releasing v${next} (previous: ${latest:-none})"
+          echo "proceed=true"  >> "$GITHUB_OUTPUT"
           echo "need_tag=true" >> "$GITHUB_OUTPUT"
           echo "version=${next}" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
-        if: steps.ver.outputs.need_tag == 'true'
+        if: steps.ver.outputs.proceed == 'true' && steps.ver.outputs.need_tag == 'true'
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -79,18 +108,22 @@ jobs:
           git push origin "v${{ steps.ver.outputs.version }}"
 
       - uses: astral-sh/setup-uv@v5
+        if: steps.ver.outputs.proceed == 'true'
 
       - name: Build sdists + wheels
+        if: steps.ver.outputs.proceed == 'true'
         run: |
           uv build --package sbxloop-worker -o dist
           uv build --package sbxloop -o dist
 
       - name: Assert worker wheel is vendored inside the host wheel at the release version
+        if: steps.ver.outputs.proceed == 'true'
         run: |
           unzip -l "dist/sbxloop-${{ steps.ver.outputs.version }}-py3-none-any.whl" \
             | grep -F "sbxloop/_vendor/sbxloop_worker-${{ steps.ver.outputs.version }}-py3-none-any.whl"
 
       - name: Publish to PyPI
+        if: steps.ver.outputs.proceed == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
@@ -100,6 +133,7 @@ jobs:
           skip-existing: true
 
       - name: Create GitHub Release
+        if: steps.ver.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

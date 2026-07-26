@@ -7,10 +7,15 @@ publishes them to PyPI — no manual version edits, no release PRs, no tokens.
 ## How it works
 
 1. A merge lands on `main` → [`.github/workflows/release.yml`](.github/workflows/release.yml) runs.
+   The run checks out the **current tip of `main`** — not the commit that
+   triggered it — and the release job tags/publishes the exact SHA the check
+   job tested.
 2. The full check suite must pass (ruff, mypy, pytest — the gate).
 3. The workflow finds the latest `vX.Y.Z` tag and computes the next **patch**
    version (`v0.4.0` → `v0.4.1`). If `HEAD` is already tagged (a manual
-   minor/major bump, or a re-run), that version is released as-is.
+   minor/major bump, or a re-run), that version is released as-is. If `HEAD`
+   is already *contained in* an existing release tag, the run skips releasing
+   entirely rather than stamp old code with a new version.
 4. It creates and pushes the tag. [`hatch-vcs`](https://github.com/ofek/hatch-vcs)
    derives **both** package versions (`sbxloop`, `sbxloop-worker`) from that
    one tag, so the lockstep invariant holds by construction and nothing is
@@ -26,6 +31,25 @@ publishes them to PyPI — no manual version edits, no release PRs, no tokens.
 Pull requests are tested separately by [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
 across Python 3.13–3.14, so broken code never reaches `main`.
 
+## Release ordering
+
+Tag numeric order is guaranteed to match `main`'s history order — a higher
+version is always a superset of every lower one. Three mechanisms enforce
+this (added after 2026-07-25, when five same-day merges raced and
+v0.5.29–v0.5.32 tagged out of order, leaving PyPI 0.5.32 without a feature
+present in 0.5.31):
+
+- **Serialization** — a `concurrency: release` group with
+  `cancel-in-progress: false` queues runs instead of letting them race.
+  GitHub keeps at most one *pending* run per group (newer pushes supersede
+  older pending runs); that's fine because of the next point.
+- **Tip-of-main releases** — every run checks out and releases the current
+  tip of `main`, never its (possibly stale) trigger commit. A superseded
+  merge simply ships as part of the next run's release.
+- **Ancestor guard** — if the commit to release is already contained in an
+  existing `v*` tag, the run skips tagging and publishing entirely. This
+  makes late re-runs of old, failed, or cancelled runs harmless no-ops.
+
 ## Everyday use
 
 Just merge to `main`. That's it — a new patch version of both packages ships
@@ -34,9 +58,10 @@ automatically.
 ## Cutting a minor or major release
 
 The workflow only auto-bumps the **patch** segment. To move the minor or
-major, push the tag yourself and run the **Release** workflow manually from
-the Actions tab (`workflow_dispatch`) — it detects that `HEAD` is already
-tagged and publishes that exact version:
+major, tag the **tip of `main`** yourself (the workflow always releases the
+tip, so a tag on an older commit won't be picked up) and run the **Release**
+workflow manually from the Actions tab (`workflow_dispatch`) — it detects
+that `HEAD` is already tagged and publishes that exact version:
 
 ```bash
 git tag -a v0.5.0 -m "Release v0.5.0"
