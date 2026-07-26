@@ -3,6 +3,9 @@ dashboard's chat lifecycle."""
 
 from __future__ import annotations
 
+import os
+
+import pytest
 from rich.console import Console
 
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, render_event
@@ -72,6 +75,27 @@ class TestChatInput:
         assert "type to chat" in render_to_text(chat.renderable())
         chat.feed(b"do the thing")
         assert "do the thing" in render_to_text(chat.renderable())
+
+    def test_pump_drains_everything_buffered_and_reports(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # More than one os.read()'s worth queued at once (a paste, or keys
+        # typed while the loop was busy) must be absorbed in a single pump
+        # call, and pump must say it consumed input so the caller repaints.
+        read_fd, write_fd = os.pipe()
+        monkeypatch.setattr("sys.stdin", os.fdopen(read_fd, "r"))
+        chat, submitted = self.collect()
+        os.write(write_fd, b"a" * 1500 + b"\r")
+        assert chat.pump(0.5) is True
+        assert submitted == ["a" * 1500]
+
+    def test_pump_times_out_quietly_without_input(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        read_fd, _write_fd = os.pipe()
+        monkeypatch.setattr("sys.stdin", os.fdopen(read_fd, "r"))
+        chat, submitted = self.collect()
+        assert chat.pump(0.01) is False
+        assert submitted == []
+        assert chat.buffer == ""
 
 
 class TestChatRendering:

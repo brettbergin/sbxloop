@@ -272,17 +272,27 @@ class ChatInput:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved)
             self._saved = None
 
-    def pump(self, timeout: float) -> None:
-        """Wait up to ``timeout`` for keystrokes and absorb them."""
-        try:
-            ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        except (ValueError, OSError):  # pragma: no cover - stdin went away
-            return
-        if not ready:
-            return
-        data = os.read(sys.stdin.fileno(), 1024)
-        if data:
+    def pump(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for keystrokes and absorb them, then keep
+        absorbing whatever is already buffered (fast typing, pastes) without
+        waiting again. Returns True when anything was consumed so the caller
+        can repaint the input line immediately instead of on the next
+        refresh tick."""
+        consumed = False
+        wait = timeout
+        while True:
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], wait)
+            except (ValueError, OSError):  # pragma: no cover - stdin went away
+                return consumed
+            if not ready:
+                return consumed
+            data = os.read(sys.stdin.fileno(), 1024)
+            if not data:  # pragma: no cover - EOF on stdin
+                return consumed
             self.feed(data)
+            consumed = True
+            wait = 0.0
 
     def feed(self, data: bytes) -> None:
         for ch in self._decoder.decode(data):
