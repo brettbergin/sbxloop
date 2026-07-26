@@ -105,9 +105,13 @@ def render_event(event: Event) -> RenderableType | None:
         if len(content) > AGENT_MESSAGE_CLIP:
             content = content[:AGENT_MESSAGE_CLIP] + "\n\n*…truncated — see `sbxloop logs`*"
         speaker = str(data.get("agent") or "agent")
+        model = str(data.get("model") or "").strip()
+        title = f"[bold cyan]{speaker}[/]"
+        if model:
+            title += f" [dim]· {model}[/]"
         return Panel(
             Markdown(content),
-            title=f"[bold cyan]{speaker}[/] [dim]{_stamp(event)}[/]",
+            title=f"{title} [dim]{_stamp(event)}[/]",
             title_align="left",
             border_style="cyan",
             padding=(0, 1),

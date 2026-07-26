@@ -43,7 +43,7 @@ class EchoBackend:
     def _echo(self, job: JobRequest, emit: EmitFn) -> BackendResult:
         assert job.prompt is not None
         text = f"echo: {job.prompt}"
-        emit(EventTypes.AGENT_MESSAGE, content=text)
+        emit(EventTypes.AGENT_MESSAGE, content=text, model="echo")
         output_json = {"echo": job.prompt} if job.expect == "json" else None
         return BackendResult(
             output_text=text,
@@ -85,7 +85,7 @@ class EchoBackend:
             emit(scripted_event["type"], **scripted_event.get("data", {}))
         text = str(response.get("text", ""))
         if text:
-            emit(EventTypes.AGENT_MESSAGE, content=text)
+            emit(EventTypes.AGENT_MESSAGE, content=text, model="echo")
         output_json = response.get("json")
         if output_json is None and job.expect == "json":
             output_json = extract_json(text)

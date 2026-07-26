@@ -38,6 +38,10 @@ class TestAgentSession:
         assert EventTypes.AGENT_MESSAGE in types
         assert EventTypes.WORKER_RESULT in types
         assert all(e.run_id == "r1" and e.job_id == "j1" for e in events)
+        # agent.message events name the answering model so the transcript
+        # header can attribute the reply to a model slug.
+        messages = [e for e in events if e.type == EventTypes.AGENT_MESSAGE]
+        assert all(e.data.get("model") == "echo" for e in messages)
 
     def test_stdout_mirrors_event_file(self, harness: WorkerHarness) -> None:
         proc = harness.run(agent_job())

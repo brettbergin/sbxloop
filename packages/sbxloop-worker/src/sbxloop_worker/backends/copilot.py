@@ -211,12 +211,17 @@ class CopilotBackend:
 
         usage = Usage()
         final_text: list[str] = []
+        # The model slug that is actually answering, for transcript
+        # attribution on agent.message events. Seeded from the job request
+        # ("auto" means the SDK picks, so it names nothing) and refined by
+        # per-turn usage samples, which carry the model the SDK resolved to.
+        model_slug = job.model if job.model and job.model != "auto" else None
         # tool_call_id -> (tool name, displayed args), so completion events
         # can say what ran (the SDK's Complete event carries only the call id).
         tool_calls: dict[str, tuple[str | None, str | None]] = {}
 
         def on_event(event: Any) -> None:
-            nonlocal usage
+            nonlocal usage, model_slug
             data = getattr(event, "data", None)
             type_name = type(data).__name__ if data is not None else type(event).__name__
             if type_name == "AssistantMessageDeltaData":
@@ -228,7 +233,11 @@ class CopilotBackend:
                 content = getattr(data, "content", "") or ""
                 if content:
                     final_text.append(content)
-                emit(EventTypes.AGENT_MESSAGE, content=content)
+                emit(
+                    EventTypes.AGENT_MESSAGE,
+                    content=content,
+                    model=getattr(data, "model", None) or model_slug,
+                )
             elif type_name.startswith("ToolExecutionStart"):
                 tool = getattr(data, "tool_name", None) or getattr(data, "toolName", None)
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
@@ -263,6 +272,8 @@ class CopilotBackend:
                     or getattr(data, "outputTokens", None),
                 )
                 usage = usage.merged(sample)
+                if sample.model:
+                    model_slug = sample.model
                 emit(EventTypes.AGENT_USAGE, **sample.model_dump(exclude_none=True))
 
         async with CopilotClient() as client:
