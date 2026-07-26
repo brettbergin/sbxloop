@@ -1272,7 +1272,7 @@ max_revisions_per_task = 2
 max_replans_per_task = 1
 max_tasks = 20
 max_wall_clock_s = 7200.0
-per_job_timeout_s = 900.0
+per_job_timeout_s = 1800.0
 
 [limits]
 # Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
