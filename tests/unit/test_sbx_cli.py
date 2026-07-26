@@ -205,7 +205,7 @@ class TestErrors:
 class TestPolicy:
     def test_policy_allow_global_and_scoped(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
         cli.policy_allow("api.githubcopilot.com")
-        cli.policy_allow("api.github.com", sandbox="boxa")
+        cli.policy_allow(domain="api.github.com", sandbox="boxa")
         assert fake_sbx.policies() == [
             ["allow", "network", "api.githubcopilot.com"],
             ["allow", "network", "api.github.com", "--sandbox", "boxa"],
