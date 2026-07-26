@@ -165,7 +165,7 @@ class Budgets(_ConfigModel):
     max_replans_per_task: int = 1
     max_tasks: int = 20
     max_wall_clock_s: float = 7200.0
-    per_job_timeout_s: float = 900.0
+    per_job_timeout_s: float = 1800.0
 
 
 class Config(_ConfigModel):
