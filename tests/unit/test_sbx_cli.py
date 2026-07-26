@@ -211,6 +211,27 @@ class TestPolicy:
             ["allow", "network", "api.github.com", "--sandbox", "boxa"],
         ]
 
+    def test_policy_allow_batches_domains_into_one_invocation(
+        self, cli: SbxCLI, fake_sbx: FakeSbx
+    ) -> None:
+        cli.policy_allow("api.github.com", "*.githubcopilot.com", "pypi.org", sandbox="boxa")
+        assert fake_sbx.invocations("policy allow network") == [
+            [
+                "policy",
+                "allow",
+                "network",
+                "api.github.com,*.githubcopilot.com,pypi.org",
+                "--sandbox",
+                "boxa",
+            ]
+        ]
+        # the recorder expands the comma-list back into per-domain rules
+        assert ["allow", "network", "pypi.org", "--sandbox", "boxa"] in fake_sbx.policies()
+
+    def test_policy_allow_without_domains_is_a_no_op(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
+        cli.policy_allow(sandbox="boxa")
+        assert fake_sbx.policies() == []
+
     def test_policy_check_allowed(self, cli: SbxCLI) -> None:
         assert cli.policy_check("api.github.com") is True
 

@@ -84,7 +84,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-packages --python ${{ matrix.python-version }}
-      - run: uv run --python ${{ matrix.python-version }} pytest
+      - run: uv run --python ${{ matrix.python-version }} pytest --cov=sbxloop --cov=sbxloop_worker --cov-report=term-missing --cov-fail-under=85
 
   build:
     runs-on: ubuntu-latest

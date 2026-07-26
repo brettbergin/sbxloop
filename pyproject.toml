@@ -63,11 +63,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/sbxloop-worker/tests"]
 markers = ["slow: long-running packaging/build tests"]
+# Coverage is CI's job (`make test-cov`): tracing costs ~15% wall on full
+# runs, and --cov-fail-under in addopts makes every partial run (single
+# file, -k, --pdb) fail its gate.
 addopts = [
-    "--cov=sbxloop",
-    "--cov=sbxloop_worker",
-    "--cov-report=term-missing",
-    "--cov-fail-under=85",
     "-ra",
     # Engine tests are subprocess-bound (fake sbx + real workers), so the
     # suite parallelizes ~linearly. worksteal rebalances the long tail of
