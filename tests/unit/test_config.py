@@ -22,6 +22,12 @@ def test_artifacts_exclude_default_and_override(tmp_path: Path) -> None:
     assert config.artifacts.exclude == [".git", "node_modules"]
 
 
+def test_artifacts_harvest_mode_default_and_override(tmp_path: Path) -> None:
+    assert load_config(cwd=tmp_path, env={}).artifacts.harvest_mode == "per-task"
+    (tmp_path / "sbxloop.toml").write_text('[artifacts]\nharvest_mode = "final"\n')
+    assert load_config(cwd=tmp_path, env={}).artifacts.harvest_mode == "final"
+
+
 def test_artifacts_exclude_rejects_path_separators(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text('[artifacts]\nexclude = [".git/objects"]\n')
     with pytest.raises(ConfigError, match=r"artifacts\.exclude"):
