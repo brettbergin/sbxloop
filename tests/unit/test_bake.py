@@ -84,6 +84,8 @@ class TestBakeHappyPath:
         bake_template(cli, config, name=BOX)
         allows = [p for p in fake_sbx.policies() if p[:2] == ["allow", "network"]]
         assert any("api.githubcopilot.com" in p for p in allows)
+        # apt mirrors granted so the dev-tools ensure resolves during bake
+        assert any("archive.ubuntu.com" in p for p in allows)
         # templates carry software, never secrets
         assert fake_sbx.secrets() == []
 

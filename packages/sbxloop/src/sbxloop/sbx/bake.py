@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict
 import sbxloop
 from sbxloop.config import Config
 from sbxloop.errors import BakeError, SbxError, SdxloopError
+from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
@@ -101,9 +102,14 @@ def bake_template(
             role="agent",
             workspace=Path(scratch),
             template=base_template,
-            # Same allows a run's agent sandbox gets, so the wheel deps and
-            # the Copilot runtime download resolve during the bake.
-            policy_allows=[*AGENT_ALLOW_DOMAINS, *config.sandbox.extra_allow_domains],
+            # Same allows a run's agent sandbox gets, so the wheel deps, the
+            # dev-tools apt ensure, and the Copilot runtime download all
+            # resolve during the bake.
+            policy_allows=[
+                *AGENT_ALLOW_DOMAINS,
+                *PROMPT_ADVERTISED_DOMAINS,
+                *config.sandbox.extra_allow_domains,
+            ],
         )
         report(f"creating scratch sandbox {name}")
         sandbox: Sandbox | None = None

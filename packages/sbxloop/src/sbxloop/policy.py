@@ -32,17 +32,19 @@ from sbxloop.sbx.cli import SbxCLI
 
 DOMAIN_PATTERN_RE = re.compile(r"(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}")
 
-# Hosts the plan/execute prompts advertise as reachable (the user's balanced
-# preset covers PyPI and apt mirrors). A plan declaring one of these is
-# in-bounds without operator configuration — granting it per-sandbox cannot
-# expand egress beyond what the prompts already promise, and makes the
-# promise hold even under a preset that lacks the host.
+# Hosts the plan/execute prompts advertise as reachable. Granted to the
+# agent sandbox at provision time (see sbx.provision) — the promise must
+# hold even under an operator preset that lacks the host: the worker's pip
+# installs and the dev-tools apt ensure both run before any plan exists, so
+# they cannot rely on plan-declared egress. A plan declaring one of these
+# is in-bounds without operator configuration, and needs no re-grant.
 PROMPT_ADVERTISED_DOMAINS = (
     "pypi.org",
     "files.pythonhosted.org",
     "deb.debian.org",
     "security.debian.org",
     "archive.ubuntu.com",
+    "security.ubuntu.com",
     "ports.ubuntu.com",
 )
 
@@ -142,7 +144,12 @@ class EgressGranter:
         self.sandbox = sandbox
         self.allow, self.deny = effective_egress_bounds(config)
         self._granted = {
-            d.lower() for d in (*AGENT_ALLOW_DOMAINS, *config.sandbox.extra_allow_domains)
+            d.lower()
+            for d in (
+                *AGENT_ALLOW_DOMAINS,
+                *PROMPT_ADVERTISED_DOMAINS,
+                *config.sandbox.extra_allow_domains,
+            )
         }
 
     def apply(self, task_id: str, egress: list[tuple[str, str]]) -> None:

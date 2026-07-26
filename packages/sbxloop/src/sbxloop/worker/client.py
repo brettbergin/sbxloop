@@ -266,11 +266,16 @@ class WorkerClient:
         the user-site fallback — leaving python3-venv missing, so the
         AGENT's `python3 -m venv` for the project it is building dies with
         "ensurepip is not available" on every revision until the budget
-        exhausts. Install the venv/pip packages up front, unconditionally
-        (a fast no-op when the template already has them), and WARN loudly
-        on failure instead of ignoring it. Never fatal: worker installation
-        has its own ladder, and the agent may not need venvs at all.
+        exhausts. Probe first — a template that already has ensurepip and
+        pip needs no apt and no network at all — then install the venv/pip
+        packages, and WARN loudly on failure instead of ignoring it. Never
+        fatal: worker installation has its own ladder, and the agent may
+        not need venvs at all.
         """
+        probe = self.sandbox.exec(["python3", "-c", "import ensurepip, pip"])
+        if probe.ok:
+            logger.debug("dev tools already present; skipping apt ensure")
+            return
         result = self.sandbox.exec(
             [
                 "sh",
@@ -283,7 +288,9 @@ class WorkerClient:
         if not result.ok:
             logger.warning(
                 "dev-tools ensure failed (rc=%s) — the agent's own venv/pip use "
-                "may fail with 'ensurepip is not available': %s",
+                "may fail with 'ensurepip is not available'. rc=100 usually means "
+                "apt could not reach its mirrors; check the sandbox network policy "
+                "allows the Ubuntu/Debian apt hosts: %s",
                 result.returncode,
                 _output_tail(result),
             )
