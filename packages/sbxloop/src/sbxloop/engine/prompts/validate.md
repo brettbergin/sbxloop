@@ -35,4 +35,8 @@ Respond with exactly one fenced JSON block:
 
 `verdict` must be `"accept"` or `"reject"`. Reject only when an acceptance
 criterion is genuinely unmet.
+
+If your tools fail or are denied and you cannot actually inspect the result,
+do not claim verification you could not perform: report the reduced coverage
+in `issues` and only answer `"accept"` for criteria you truly checked.
 $retry_context

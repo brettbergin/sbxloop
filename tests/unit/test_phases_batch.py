@@ -105,9 +105,9 @@ class TestVerifyBatching:
 class TestScrutinizeEvidenceBatching:
     def test_evidence_rides_one_job(self) -> None:
         agent = BatchStubAgent()
-        verdict = runner(agent).scrutinize(record(), plan(), "did the work")
+        outcome = runner(agent).scrutinize(record(), plan(), "did the work")
 
-        assert verdict.verdict == "pass"
+        assert outcome.verdict.verdict == "pass"
         batches = [j for j in agent.jobs if j.kind == "shell.batch"]
         assert len(batches) == 1
         assert batches[0].commands == [command for _, command in EVIDENCE_COMMANDS]
@@ -118,8 +118,8 @@ class TestScrutinizeEvidenceBatching:
 
     def test_evidence_job_failure_is_not_fatal(self) -> None:
         agent = BatchStubAgent(batch_error=True)
-        verdict = runner(agent).scrutinize(record(), plan(), "did the work")
+        outcome = runner(agent).scrutinize(record(), plan(), "did the work")
 
-        assert verdict.verdict == "pass"
+        assert outcome.verdict.verdict == "pass"
         prompt = next(j for j in agent.jobs if j.kind == "agent.session").prompt or ""
         assert "(no evidence gathered)" in prompt

@@ -21,11 +21,12 @@ import contextlib
 import json
 import os
 import shutil
+from collections import Counter
 from typing import Any, get_args
 
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, BackendUnavailableError, EmitFn
-from sbxloop_worker.protocol import EventTypes, JobRequest, Usage
+from sbxloop_worker.protocol import EventTypes, JobRequest, SessionHealth, Usage
 
 # The SDK's permission-request ``kind`` vocabulary, field-verified against
 # github-copilot-sdk 1.0.8 (2026-07-25): ``copilot.session.PermissionRequest``
@@ -216,6 +217,37 @@ def _tool_output(data: Any) -> str | None:
     return content[-TOOL_OUTPUT_CLIP:]
 
 
+class SessionHealthTracker:
+    """Tallies permission denials and tool-call failures for one session.
+
+    A critic session that loses its inspection tooling must not look
+    identical to a thorough one (#123): the tallies ride back on the
+    JobResult so the engine can judge (and persist) how blind the session
+    actually was. Pure counters, unit-testable without the SDK.
+    """
+
+    def __init__(self) -> None:
+        self.denials: Counter[str] = Counter()
+        self.failures: Counter[str] = Counter()
+
+    def record_denial(self, kind: Any) -> None:
+        self.denials[str(kind)] += 1
+
+    def record_tool_end(self, tool: str | None, success: Any) -> None:
+        """Count a completed tool call iff it reported failure; the SDK
+        leaves ``success`` None on events that carry no such signal."""
+        if success is False:
+            self.failures[tool or "(unknown)"] += 1
+
+    def health(self) -> SessionHealth | None:
+        if not self.denials and not self.failures:
+            return None
+        return SessionHealth(
+            permission_denials=dict(self.denials),
+            tool_failures=dict(self.failures),
+        )
+
+
 def _tool_error(data: Any) -> str | None:
     """The failure reason from a ToolExecutionComplete, when present.
 
@@ -272,6 +304,7 @@ class CopilotBackend:
         from copilot import CopilotClient
 
         usage = Usage()
+        tracker = SessionHealthTracker()
         final_text: list[str] = []
         # The model slug that is actually answering, for transcript
         # attribution on agent.message events. Seeded from the job request
@@ -315,12 +348,14 @@ class CopilotBackend:
             elif type_name.startswith("ToolExecutionComplete"):
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
                 tool, args = tool_calls.get(str(call_id), (None, None))
+                success = getattr(data, "success", None)
+                tracker.record_tool_end(tool, success)
                 emit(
                     EventTypes.AGENT_TOOL_END,
                     tool_call_id=call_id,
                     tool=tool,
                     args=args,
-                    success=getattr(data, "success", None),
+                    success=success,
                     exit_code=_tool_exit_code(data),
                     output=_tool_output(data),
                     error=_tool_error(data),
@@ -339,7 +374,7 @@ class CopilotBackend:
                 emit(EventTypes.AGENT_USAGE, **sample.model_dump(exclude_none=True))
 
         async with CopilotClient() as client:
-            session = await self._open_session(client, job)
+            session = await self._open_session(client, job, emit=emit, tracker=tracker)
             try:
                 session.on(on_event)
                 assert job.prompt is not None
@@ -352,13 +387,21 @@ class CopilotBackend:
                     output_json=output_json,
                     session_id=session_id,
                     usage=usage if usage != Usage() else None,
+                    health=tracker.health(),
                 )
             finally:
                 await self._close_session(session)
 
-    async def _open_session(self, client: Any, job: JobRequest) -> Any:
+    async def _open_session(
+        self,
+        client: Any,
+        job: JobRequest,
+        *,
+        emit: EmitFn | None = None,
+        tracker: SessionHealthTracker | None = None,
+    ) -> Any:
         kwargs: dict[str, Any] = {
-            "on_permission_request": self._permission_handler(job),
+            "on_permission_request": self._permission_handler(job, emit=emit, tracker=tracker),
             "streaming": True,
         }
         if job.model and job.model != "auto":
@@ -384,7 +427,13 @@ class CopilotBackend:
             return await client.resume_session(job.resume_session_id, **kwargs)
         return await client.create_session(**kwargs)
 
-    def _permission_handler(self, job: JobRequest) -> Any:
+    def _permission_handler(
+        self,
+        job: JobRequest,
+        *,
+        emit: EmitFn | None = None,
+        tracker: SessionHealthTracker | None = None,
+    ) -> Any:
         if job.permission_mode == "auto":
             # The microVM (network policy + secret proxy) is the security
             # boundary; inside it the agent runs unattended.
@@ -397,6 +446,14 @@ class CopilotBackend:
 
             feedback = read_only_denial(request)
             if feedback is not None:
+                # Denials must leave a trace: the session's health tally and
+                # the event stream both record them, so a critic that lost
+                # capabilities is auditable after the fact (#123).
+                kind = getattr(request, "kind", None)
+                if tracker is not None:
+                    tracker.record_denial(kind)
+                if emit is not None:
+                    emit(EventTypes.AGENT_PERMISSION_DENIED, kind=str(kind), feedback=feedback)
                 return PermissionDecisionReject(feedback=feedback)
             return PermissionDecisionApproveOnce()
 

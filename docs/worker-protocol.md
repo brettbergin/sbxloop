@@ -33,16 +33,25 @@ Worker exit codes: `0` result written (including error/timeout results),
 
 ## Job kinds
 
-| kind            | fields                                                                                                                | result                                                                                                                                                              |
-| --------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `agent.session` | `prompt`, `system_message?`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage` |
-| `shell.check`   | `argv`, `cwd?`                                                                                                        | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                         |
-| `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                              | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results     |
-| `github.op`     | `op`, `params`                                                                                                        | op-specific JSON (see below)                                                                                                                                        |
+| kind            | fields                                                                                                                | result                                                                                                                                                                         |
+| --------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `agent.session` | `prompt`, `system_message?`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage`, `health?` |
+| `shell.check`   | `argv`, `cwd?`                                                                                                        | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                                    |
+| `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                              | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
+| `github.op`     | `op`, `params`                                                                                                        | op-specific JSON (see below)                                                                                                                                                   |
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
 microVM is the security boundary. `read_only` rejects shell/write requests
 and is used for critic sessions.
+
+`health` is a `SessionHealth` tally of what the session lost while it ran:
+`permission_denials` and `tool_failures`, each a `kind/tool → count` map
+(`null` when nothing was denied and nothing failed). Each denial also emits
+an `agent.permission_denied` event. The engine's degraded-critic guard
+(#123) reads it: a critic `pass`/`accept` from a session with failed tool
+calls is re-run once and, if still degraded, downgraded — denials alone
+never count as degradation (a read-only critic probing `shell` is the
+allowlist working as designed).
 
 `shell.batch` exists because every job pays a fixed round-trip cost (stage
 the job JSON, boot a cold Python under `sbx exec`, fetch the result) that
@@ -71,7 +80,8 @@ Envelope: `{v, ts, run_id, job_id?, type, data}` — one JSON object per line.
 
 - Worker: `worker.start|heartbeat|result|error|end`, `agent.message`,
   `agent.message_delta`, `agent.tool_start|tool_end`, `agent.usage`,
-  `gh.op_start|op_end`, `sandbox.resources|resources_warning`
+  `agent.permission_denied`, `gh.op_start|op_end`,
+  `sandbox.resources|resources_warning`
 - Host: `run.start|state|end`, `task.start|state|end`, `phase.start|end`,
   `sandbox.provision_start|ready|cleanup`, `worker.stdout`
 

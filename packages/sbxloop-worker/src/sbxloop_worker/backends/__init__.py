@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from sbxloop_worker.protocol import Event, JobRequest, Usage
+from sbxloop_worker.protocol import Event, JobRequest, SessionHealth, Usage
 
 # emit("agent.message", content="...") -> Event
 EmitFn = Callable[..., Event]
@@ -25,6 +25,7 @@ class BackendResult:
     output_json: dict[str, Any] | list[Any] | None = None
     session_id: str | None = None
     usage: Usage | None = None
+    health: SessionHealth | None = None
     artifacts: list[str] = field(default_factory=list)
 
 

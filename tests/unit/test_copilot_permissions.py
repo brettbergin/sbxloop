@@ -103,6 +103,39 @@ class TestReadOnlyHandler:
         decision = self._handler()(SimpleNamespace(kind="brand-new-sdk-kind"))
         assert isinstance(decision, _StubReject)
 
+    def test_denials_are_tracked_and_emitted(self, stub_copilot_rpc: None) -> None:
+        """A denied request must leave a trace (#123): the tracker tally
+        rides back on the JobResult and the event stream records the kind,
+        so a crippled critic is auditable instead of invisible."""
+        from sbxloop_worker.backends.copilot import SessionHealthTracker
+        from sbxloop_worker.protocol import Event, EventTypes
+
+        job = JobRequest(
+            job_id="j1",
+            run_id="r1",
+            kind="agent.session",
+            prompt="review",
+            permission_mode="read_only",
+        )
+        tracker = SessionHealthTracker()
+        emitted: list[tuple[str, dict[str, object]]] = []
+
+        def emit(type: str, **data: object) -> Event:
+            emitted.append((type, data))
+            return Event.now(type, "r1", job_id="j1", **data)
+
+        handler = CopilotBackend()._permission_handler(job, emit=emit, tracker=tracker)
+        handler(SimpleNamespace(kind="shell"))
+        handler(SimpleNamespace(kind="shell"))
+        handler(SimpleNamespace(kind="read"))  # allowed: no trace
+
+        health = tracker.health()
+        assert health is not None
+        assert health.permission_denials == {"shell": 2}
+        assert [t for t, _ in emitted] == [EventTypes.AGENT_PERMISSION_DENIED] * 2
+        assert emitted[0][1]["kind"] == "shell"
+        assert "read-only" in str(emitted[0][1]["feedback"])
+
 
 class TestInstalledSdkPermissionKinds:
     def test_none_when_sdk_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:

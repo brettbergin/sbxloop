@@ -308,6 +308,85 @@ class TestReviseAndVerify:
         assert "(+1 more)" in first["message"]  # both failing commands counted
 
 
+DEGRADED_HEALTH = {"tool_failures": {"grep": 3, "glob": 1}, "permission_denials": {"shell": 1}}
+DEGRADED_PASS = {"json": {"verdict": "pass"}, "health": DEGRADED_HEALTH}
+DEGRADED_ACCEPT = {"json": {"verdict": "accept"}, "health": DEGRADED_HEALTH}
+
+
+class TestDegradedCritic:
+    """A critic that lost its tooling must not green-light work (#123)."""
+
+    def test_degraded_pass_twice_is_downgraded_to_revise(self, harness: Harness) -> None:
+        # Two blind passes -> downgrade -> one revision -> healthy pass.
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                PLAN,
+                EXECUTE,
+                DEGRADED_PASS,
+                DEGRADED_PASS,  # the guard's one re-run, still blind
+                EXECUTE,
+                PASS,
+                ACCEPT,
+            ]
+        )
+        engine = harness.engine()
+        result = engine.start("blind critic must not pass")
+        assert result.state == "completed"
+        assert result.tasks[0].revisions == 1
+
+        # The downgrade is persisted on the phase row: status revise, with
+        # the session's tooling health and the downgraded marker.
+        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "scrutinize"]
+        first = json.loads(rows[0]["output_json"])
+        assert rows[0]["status"] == "revise"
+        assert first["downgraded"] is True
+        assert first["tooling_health"]["tool_failures"] == {"grep": 3, "glob": 1}
+        assert any("degraded tooling" in i["detail"] for i in first["issues"])
+        # ...and the healthy final pass carries neither marker.
+        last = json.loads(rows[-1]["output_json"])
+        assert rows[-1]["status"] == "pass"
+        assert "tooling_health" not in last and "downgraded" not in last
+
+        # The downgrade is in the live stream, not only in sqlite.
+        degraded = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "degraded"
+        ]
+        assert len(degraded) == 1
+        assert degraded[0].data["phase"] == "scrutinize"
+        assert "grep x3" in degraded[0].data["message"]
+
+    def test_degraded_pass_then_healthy_rerun_is_trusted(self, harness: Harness) -> None:
+        # A transient tool crash gets its second chance: the re-run comes
+        # back healthy and clean, so no revision is spent.
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, DEGRADED_PASS, PASS, ACCEPT])
+        result = harness.engine().start("transient tool crash")
+        assert result.state == "completed"
+        assert result.tasks[0].revisions == 0
+
+    def test_degraded_accept_twice_is_downgraded_to_reject(self, harness: Harness) -> None:
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                PLAN,
+                EXECUTE,
+                PASS,
+                DEGRADED_ACCEPT,
+                DEGRADED_ACCEPT,  # re-run, still blind -> reject -> replan
+                PLAN,
+                EXECUTE,
+                PASS,
+                ACCEPT,
+            ]
+        )
+        result = harness.engine().start("blind validator must not accept")
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 1
+        assert result.tasks[0].state == "done"
+
+
 class TestReplanAndSkip:
     def test_validate_reject_replans_then_accepts(self, harness: Harness) -> None:
         harness.script(

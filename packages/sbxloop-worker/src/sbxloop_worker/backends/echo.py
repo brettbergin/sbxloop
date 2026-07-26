@@ -8,7 +8,8 @@ multi-job engine tests can script an entire run.
 Response object shape (all fields optional):
 ``{"text": str, "json": dict|list, "session_id": str, "sleep_s": float,
 "events": [{"type": str, "data": {...}}], "fail": str,
-"files": {"relative/path": "content"}}``
+"files": {"relative/path": "content"},
+"health": {"permission_denials": {...}, "tool_failures": {...}}}``
 
 ``files`` are written relative to the worker process cwd — modelling an
 executor that produces artifacts in the run workspace.
@@ -24,7 +25,7 @@ from typing import Any
 
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, EmitFn
-from sbxloop_worker.protocol import EventTypes, JobRequest, Usage
+from sbxloop_worker.protocol import EventTypes, JobRequest, SessionHealth, Usage
 
 SCRIPT_ENV = "SBXLOOP_ECHO_SCRIPT"
 
@@ -89,9 +90,11 @@ class EchoBackend:
         output_json = response.get("json")
         if output_json is None and job.expect == "json":
             output_json = extract_json(text)
+        health = response.get("health")
         return BackendResult(
             output_text=text,
             output_json=output_json,
             session_id=str(response.get("session_id", f"echo-{job.job_id}")),
             usage=Usage(model="echo"),
+            health=SessionHealth.model_validate(health) if health is not None else None,
         )
