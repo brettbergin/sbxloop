@@ -123,6 +123,7 @@ class JobRunner:
             output_json=outcome.output_json,
             session_id=outcome.session_id,
             usage=outcome.usage,
+            health=outcome.health,
             artifacts=outcome.artifacts,
         )
 

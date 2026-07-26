@@ -149,6 +149,32 @@ class TestEchoScriptEdgeCases:
         with pytest.raises(TypeError, match="must be an object"):
             EchoBackend().run_session(agent_job(), lambda *a, **k: None)  # type: ignore[arg-type,return-value]
 
+    def test_scripted_health_rides_through_to_the_job_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Session health must survive backend -> runner -> result file, so
+        the engine's degraded-critic guard sees it (#123)."""
+        script = tmp_path / "script.json"
+        script.write_text(
+            json.dumps(
+                [
+                    {
+                        "text": "looks fine",
+                        "health": {
+                            "permission_denials": {"shell": 1},
+                            "tool_failures": {"grep": 2},
+                        },
+                    }
+                ]
+            )
+        )
+        monkeypatch.setenv("SBXLOOP_ECHO_SCRIPT", str(script))
+        result, _ = run_job(tmp_path, agent_job())
+        assert result.health is not None  # type: ignore[attr-defined]
+        assert result.health.tool_failures == {"grep": 2}  # type: ignore[attr-defined]
+        assert result.health.permission_denials == {"shell": 1}  # type: ignore[attr-defined]
+        assert result.health.degraded  # type: ignore[attr-defined]
+
 
 class TestEntrypointInProcess:
     def test_main_happy_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

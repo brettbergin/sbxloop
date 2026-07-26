@@ -10,6 +10,7 @@ from sbxloop_worker.protocol import (
     EventTypes,
     JobRequest,
     JobResult,
+    SessionHealth,
     Usage,
 )
 
@@ -129,3 +130,38 @@ class TestUsage:
     def test_merged_all_none(self) -> None:
         merged = Usage().merged(Usage())
         assert merged == Usage()
+
+
+class TestSessionHealth:
+    def test_jobresult_roundtrip_with_health(self) -> None:
+        result = JobResult(
+            job_id="j1",
+            status="ok",
+            health=SessionHealth(
+                permission_denials={"shell": 2},
+                tool_failures={"grep": 3, "glob": 1},
+            ),
+        )
+        restored = JobResult.model_validate_json(result.model_dump_json())
+        assert restored == result
+        assert restored.health is not None
+        assert restored.health.tool_failures["grep"] == 3
+
+    def test_health_defaults_none(self) -> None:
+        assert JobResult(job_id="j1", status="ok").health is None
+
+    def test_degraded_only_on_tool_failures(self) -> None:
+        # Denials alone are the read-only allowlist working as designed —
+        # they never mark the session degraded (#123).
+        assert not SessionHealth(permission_denials={"shell": 5}).degraded
+        assert SessionHealth(tool_failures={"grep": 1}).degraded
+        assert not SessionHealth().degraded
+
+    def test_summary_names_kinds_and_counts(self) -> None:
+        health = SessionHealth(
+            permission_denials={"shell": 2}, tool_failures={"grep": 3, "glob": 1}
+        )
+        summary = health.summary()
+        assert "tool failures: glob x1, grep x3" in summary
+        assert "permission denials: shell x2" in summary
+        assert SessionHealth().summary() == "healthy"

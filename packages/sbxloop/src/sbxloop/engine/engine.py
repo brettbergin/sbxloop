@@ -44,7 +44,7 @@ from sbxloop.engine.model import (
     TaskState,
     scan_artifacts,
 )
-from sbxloop.engine.phases import PhaseRunner, clip
+from sbxloop.engine.phases import CriticOutcome, PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -691,16 +691,18 @@ class LoopEngine:
         self._set_task_state(run_id, task, "scrutinizing")
 
         started = time.time()
-        verdict = phases.scrutinize(task, task.plan, executor_report)
+        outcome = phases.scrutinize(task, task.plan, executor_report)
+        verdict = outcome.verdict
         self.store.record_phase(
             run_id,
             "scrutinize",
             task_id=task.spec.id,
             attempt=task.revisions + 1,
             status=verdict.verdict,
-            output_json=verdict.model_dump_json(),
+            output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
         )
+        self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
         if verdict.verdict == "revise":
             self._register_revision(run_id, task, verdict.feedback or "scrutiny found issues")
         else:
@@ -767,16 +769,18 @@ class LoopEngine:
             self._set_task_state(run_id, task, "verifying")
             return
         started = time.time()
-        verdict = phases.validate(task, verify_results)
+        outcome = phases.validate(task, verify_results)
+        verdict = outcome.verdict
         self.store.record_phase(
             run_id,
             "validate",
             task_id=task.spec.id,
             attempt=task.replans + 1,
             status=verdict.verdict,
-            output_json=verdict.model_dump_json(),
+            output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
         )
+        self._emit_critic_degraded(run_id, task, "validate", outcome)
         if verdict.verdict == "accept":
             self._set_task_state(run_id, task, "done")
             return
@@ -789,6 +793,41 @@ class LoopEngine:
         task.plan = None
         task.revisions = 0
         self._set_task_state(run_id, task, "planning")
+
+    @staticmethod
+    def _critic_payload(outcome: CriticOutcome) -> dict[str, Any]:
+        """The phase-row payload for a critic verdict: the verdict itself
+        plus the session's tooling health and whether the guard downgraded a
+        clean verdict — degraded critic runs must be auditable after the
+        fact (#123)."""
+        payload: dict[str, Any] = outcome.verdict.model_dump()
+        if outcome.health is not None:
+            payload["tooling_health"] = outcome.health.model_dump()
+        if outcome.downgraded:
+            payload["downgraded"] = True
+        return payload
+
+    def _emit_critic_degraded(
+        self, run_id: str, task: TaskRecord, phase: str, outcome: CriticOutcome
+    ) -> None:
+        """Put a downgrade in the live stream: without this the transcript
+        shows an ordinary revise/reject and the real reason (a critic that
+        lost its tooling) only exists in the phase_attempts table."""
+        if not outcome.downgraded:
+            return
+        assert outcome.health is not None
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase=phase,
+            status="degraded",
+            message=(
+                f"critic tooling degraded ({outcome.health.summary()}); "
+                f"its clean verdict was not trusted and was downgraded to "
+                f"{outcome.verdict.verdict!r}"
+            ),
+        )
 
     def _verify_evidence(self, run_id: str, task: TaskRecord) -> str | None:
         """The task's latest committed verify-command transcript, or None.

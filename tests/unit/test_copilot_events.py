@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from sbxloop_worker.backends.copilot import (
     TOOL_ARGS_CLIP,
     TOOL_OUTPUT_CLIP,
+    SessionHealthTracker,
     _tool_args,
     _tool_exit_code,
     _tool_output,
@@ -83,3 +84,41 @@ class TestToolOutput:
 
     def test_missing_result_is_none(self) -> None:
         assert _tool_output(SimpleNamespace(result=None)) is None
+
+
+class TestSessionHealthTracker:
+    def test_clean_session_has_no_health(self) -> None:
+        assert SessionHealthTracker().health() is None
+
+    def test_failed_tool_calls_are_tallied_by_tool(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_tool_end("grep", False)
+        tracker.record_tool_end("grep", False)
+        tracker.record_tool_end("glob", False)
+        health = tracker.health()
+        assert health is not None
+        assert health.tool_failures == {"grep": 2, "glob": 1}
+        assert health.degraded
+
+    def test_successful_and_unreported_calls_do_not_count(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_tool_end("view", True)
+        tracker.record_tool_end("view", None)  # event carried no signal
+        assert tracker.health() is None
+
+    def test_unnamed_tool_failure_still_counts(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_tool_end(None, False)
+        health = tracker.health()
+        assert health is not None
+        assert health.tool_failures == {"(unknown)": 1}
+
+    def test_denials_are_tallied_but_not_degraded(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_denial("shell")
+        tracker.record_denial("shell")
+        tracker.record_denial("write")
+        health = tracker.health()
+        assert health is not None
+        assert health.permission_denials == {"shell": 2, "write": 1}
+        assert not health.degraded
