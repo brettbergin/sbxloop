@@ -33,7 +33,7 @@ from pydantic import BaseModel, ConfigDict
 
 import sbxloop
 from sbxloop.config import Config
-from sbxloop.errors import BakeError, SbxError, SdxloopError
+from sbxloop.errors import BakeError, SbxError, SbxloopError
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
@@ -138,7 +138,7 @@ def bake_template(
 
             report(f"saving template {ref}")
             cli.template_save(name, ref)
-        except SdxloopError as exc:
+        except SbxloopError as exc:
             raise BakeError(f"bake failed: {exc}") from exc
         finally:
             if sandbox is not None and not keep:

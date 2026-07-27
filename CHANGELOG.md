@@ -1,12 +1,23 @@
 # Changelog
 
-All notable changes to sdxloop are documented here. The project adheres to
-[Semantic Versioning](https://semver.org/) and both distributions (`sdxloop`,
-`sdxloop-worker`) release in lockstep.
+All notable changes to sbxloop are documented here. The project adheres to
+[Semantic Versioning](https://semver.org/) and both distributions (`sbxloop`,
+`sbxloop-worker`) release in lockstep.
 
 ## [Unreleased]
 
 ### Changed
+
+- **Leftovers from the 0.2.0 `sdxloop` → `sbxloop` rename are gone.** The
+  exception base class is now `SbxloopError` (was `SdxloopError`) across all
+  51 references — a breaking rename for anything importing
+  `sbxloop.errors.SbxloopError` directly, consistent with the no-shim
+  cutover 0.2.0 already made; it was never exported from `sbxloop.__all__`,
+  so the top-level public API is unchanged. CI's push trigger is `sbx/**`
+  (was `sdx/**`, which never matched the branch convention README
+  documents, so branch pushes silently skipped CI), and the stale
+  `.sdxloop/` ignore entry and empty state dir were removed. Pre-0.2.0
+  changelog entries keep the old name: they record what actually shipped.
 
 - **Provisioning is no longer fully serial** (issue #127). The agent and
   github sandboxes — which share nothing but the host workspace dir — now

@@ -28,7 +28,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from sbxloop.errors import SdxloopError
+from sbxloop.errors import SbxloopError
 
 # The SDK's documented auth resolution order.
 SDK_TOKEN_ENVS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
@@ -77,7 +77,7 @@ def fetch_models(timeout_s: float = 60.0) -> list[Any]:
     try:
         from copilot import CopilotClient
     except ImportError as exc:
-        raise SdxloopError(SDK_INSTALL_HINT) from exc
+        raise SbxloopError(SDK_INSTALL_HINT) from exc
 
     async def _session() -> list[Any]:
         async with CopilotClient() as client:
@@ -87,16 +87,16 @@ def fetch_models(timeout_s: float = 60.0) -> list[Any]:
     try:
         return asyncio.run(asyncio.wait_for(_session(), timeout=timeout_s))
     except TimeoutError as exc:
-        raise SdxloopError(
+        raise SbxloopError(
             f"listing models timed out after {timeout_s:.0f}s — the bundled "
             f"Copilot runtime may be unable to start or reach the API | {auth_hint()}"
         ) from exc
-    except SdxloopError:
+    except SbxloopError:
         raise
     except Exception as exc:
         # Auth failures surface as opaque SDK errors; append what the token
         # environment actually looks like (mirrors the worker backend).
-        raise SdxloopError(f"listing models failed: {exc} | {auth_hint()}") from exc
+        raise SbxloopError(f"listing models failed: {exc} | {auth_hint()}") from exc
 
 
 def _raw_dict(info: Any) -> dict[str, Any]:

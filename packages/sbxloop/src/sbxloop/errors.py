@@ -5,19 +5,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 
-class SdxloopError(Exception):
+class SbxloopError(Exception):
     """Base class for all sbxloop errors."""
 
 
-class ConfigError(SdxloopError):
+class ConfigError(SbxloopError):
     """Invalid or unloadable configuration."""
 
 
-class SecretStateError(SdxloopError):
+class SecretStateError(SbxloopError):
     """A secret registration could not be inspected or replaced."""
 
 
-class SbxError(SdxloopError):
+class SbxError(SbxloopError):
     """An sbx CLI invocation failed."""
 
     def __init__(
@@ -49,15 +49,15 @@ class SbxNotFoundError(SbxError):
     """The sbx binary is missing, or a referenced sandbox does not exist."""
 
 
-class ProvisionError(SdxloopError):
+class ProvisionError(SbxloopError):
     """Sandbox pair provisioning failed."""
 
 
-class BakeError(SdxloopError):
+class BakeError(SbxloopError):
     """Building or saving a prebaked sandbox template failed."""
 
 
-class WorkerError(SdxloopError):
+class WorkerError(SbxloopError):
     """The in-sandbox worker failed or returned an invalid result."""
 
 
@@ -65,21 +65,21 @@ class WorkerTimeoutError(WorkerError):
     """The worker exceeded its job timeout and was killed."""
 
 
-class ProtocolError(SdxloopError):
+class ProtocolError(SbxloopError):
     """Host/worker protocol violation (bad event line, missing result, ...)."""
 
 
-class GithubOpsError(SdxloopError):
+class GithubOpsError(SbxloopError):
     """A GitHub operation failed in the github-ops sandbox."""
 
 
-class DeliveryError(SdxloopError):
+class DeliveryError(SbxloopError):
     """Delivering a run's workspace as a GitHub PR failed."""
 
 
-class BudgetExceededError(SdxloopError):
+class BudgetExceededError(SbxloopError):
     """A run or task exhausted one of its budgets."""
 
 
-class StateError(SdxloopError):
+class StateError(SbxloopError):
     """Invalid state transition or corrupted persisted state."""

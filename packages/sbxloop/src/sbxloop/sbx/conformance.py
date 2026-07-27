@@ -40,7 +40,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from sbxloop.errors import SbxError, SbxNotFoundError, SdxloopError
+from sbxloop.errors import SbxError, SbxloopError, SbxNotFoundError
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
@@ -523,7 +523,7 @@ ProgressFn = Callable[[str], None]
 def _run_probe(probe: Probe, ctx: ProbeContext) -> ProbeOutcome:
     try:
         verdict, detail = probe.run(ctx)
-    except (SdxloopError, OSError) as exc:
+    except (SbxloopError, OSError) as exc:
         return ProbeOutcome(probe, VERDICT_ERROR, detail=str(exc), checked_at=time.time())
     return ProbeOutcome(probe, verdict, detail=detail, checked_at=time.time())
 

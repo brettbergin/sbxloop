@@ -26,7 +26,7 @@ from sbxloop.config import Config, load_config, load_config_with_sources, load_d
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SdxloopError
+from sbxloop.errors import SbxloopError
 from sbxloop.events import Event
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
@@ -397,7 +397,7 @@ def run(
     engine = LoopEngine(config)
     try:
         result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.start(outcome))
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]run failed:[/] {exc}")
         raise typer.Exit(2) from exc
     _finish(result, config)
@@ -417,7 +417,7 @@ def resume(
     engine = LoopEngine(config)
     try:
         result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.resume(run_id))
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]resume failed:[/] {exc}")
         raise typer.Exit(2) from exc
     # engine.config is the run's rehydrated config, which is what drove the run.
@@ -431,7 +431,7 @@ def cancel(run_id: Annotated[str, typer.Argument()]) -> None:
     engine = LoopEngine(config)
     try:
         engine.cancel(run_id)
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     console.print(f"run {run_id} cancelled")
@@ -462,7 +462,7 @@ def status(
 
     try:
         record = store.get_run(run_id)
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     console.print(f"run [bold cyan]{record.run_id}[/]  state: [bold]{record.state}[/]")
@@ -487,7 +487,7 @@ def status(
     roles: tuple[SandboxRole, ...] = ("agent", "github")
     try:
         live = {info.name for info in SbxCLI(app_name=config.app_name or None).ls()}
-    except SdxloopError:
+    except SbxloopError:
         for role in roles:
             console.print(
                 f"  {sandbox_name(run_id, role)}  [dim](liveness unknown: sbx ls failed)[/]"
@@ -581,14 +581,14 @@ def shell(
     store = _store(config)
     try:
         store.get_run(run_id)
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     cli = SbxCLI(app_name=config.app_name or None)
     name = sandbox_name(run_id, "agent" if role == "agent" else "github")
     try:
         live = any(info.name == name for info in cli.ls())
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     if not live:
@@ -617,7 +617,7 @@ def artifacts(
     store = _store(config)
     try:
         record = store.get_run(run_id)
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     target = artifacts_dir(record, config.state_dir)
@@ -685,7 +685,7 @@ def sandbox_rm(
         try:
             cli.rm(target)
             console.print(f"removed {target}")
-        except SdxloopError as exc:
+        except SbxloopError as exc:
             console.print(f"[yellow]skip {target}:[/] {exc}")
 
 
@@ -755,7 +755,7 @@ def secrets_list(
                 "\n[yellow]warnings above are pre-collision state[/] — "
                 "`sbxloop secrets clean` removes the stale entries"
             )
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
 
@@ -805,7 +805,7 @@ def secrets_clean(
             console.print("\ndry run — re-run with [cyan]--apply[/] to remove")
         if failed:
             raise typer.Exit(1)
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
 
@@ -888,7 +888,7 @@ def secrets_rotate(
                 )
             else:
                 console.print("[yellow]could not verify secret visibility[/] (see logs)")
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]rotate failed:[/] {exc}")
         raise typer.Exit(2) from exc
 
@@ -924,7 +924,7 @@ def sandbox_prune(
         verdicts = classify_sandboxes(
             cli.ls(), store, min_age_s=min_age * 3600.0, include_kept=include_kept
         )
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     if not verdicts:
@@ -959,7 +959,7 @@ def sandbox_prune(
     for v in orphans:
         try:
             remove_sandbox(cli, v.name)
-        except SdxloopError as exc:
+        except SbxloopError as exc:
             failures += 1
             console.print(f"[yellow]skip {v.name}:[/] {exc}")
             continue
@@ -976,7 +976,7 @@ def config_show() -> None:
     """Show the resolved configuration and where each value came from."""
     try:
         config, sources = load_config_with_sources()
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     table = Table(title="sbxloop configuration")
@@ -1007,7 +1007,7 @@ def config_policy() -> None:
 
     try:
         config = load_config()
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
 
@@ -1108,7 +1108,7 @@ def bake(
             keep=keep,
             progress=lambda message: console.print(f"[dim]… {message}[/dim]", highlight=False),
         )
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         console.print(f"[bold red]bake failed:[/] {exc}")
         raise typer.Exit(2) from exc
     runtime = "cached" if record.runtime_cached else "[yellow]not cached[/]"
@@ -1145,7 +1145,7 @@ def list_models(
     config = load_config()
     try:
         rows = [model_row(info) for info in fetch_models(timeout_s=timeout_s)]
-    except SdxloopError as exc:
+    except SbxloopError as exc:
         # escape(): the install hint (`sbxloop[copilot]`) and arbitrary SDK
         # error text must not be parsed as rich markup.
         console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
