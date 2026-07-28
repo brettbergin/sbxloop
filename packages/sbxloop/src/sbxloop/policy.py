@@ -75,6 +75,14 @@ BASELINE_REGISTRY_DOMAINS = (
     "index.crates.io",  # cargo sparse index
     "rubygems.org",  # gem downloads and API
     "index.rubygems.org",  # bundler's compact index — a separate host
+    "repo.maven.apache.org",  # Maven Central
+    "repo1.maven.org",  # Maven Central (the older canonical host)
+    # Gradle needs more than the registry: the plugin portal resolves
+    # `plugins { }` blocks and services.gradle.org serves the wrapper
+    # distribution `gradlew` downloads on first run. A Gradle build fails
+    # without either even when Central is reachable.
+    "plugins.gradle.org",
+    "services.gradle.org",
 )
 
 # Distro package mirrors: language-neutral infrastructure rather than any one

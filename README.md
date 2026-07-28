@@ -169,8 +169,8 @@ operator-set bounds:
 ```toml
 # sbxloop.toml
 [policy]
-allow = ["repo.maven.apache.org", "repo1.maven.org"]  # what plans MAY request
-deny  = []                                # never grantable, even if allowed
+allow = ["nexus.corp.example.com"]  # what plans MAY request
+deny  = []                          # never grantable, even if allowed
 ```
 
 Patterns are exact domains, `*.example.com` wildcards, or `*`. Empty `allow`
