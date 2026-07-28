@@ -480,7 +480,7 @@ class LoopEngine:
             return
         target = self.config.state_dir / "runs" / run_id / "artifacts"
         target.mkdir(parents=True, exist_ok=True)
-        exclude = self.config.artifacts.exclude
+        exclude = self.config.artifact_excludes
         # Build tar exclude flags: --exclude=<name> for each entry.
         exclude_args = [arg for name in exclude for arg in ("--exclude", name)]
         vm_tar = f"{SBXLOOP_DIR}/harvest.tar"
@@ -510,7 +510,7 @@ class LoopEngine:
         )
         if target is None or not target.is_dir():
             return
-        scan = scan_artifacts(target, self.config.artifacts.exclude)
+        scan = scan_artifacts(target, self.config.artifact_excludes)
         extra: dict[str, Any] = {}
         if scan.excluded:
             # Surface what the listing/delivery resolvers leave out — silent
@@ -568,7 +568,7 @@ class LoopEngine:
                 source_dir=source,
                 base=gh.deliver_base,
                 draft=gh.deliver_draft,
-                exclude=self.config.artifacts.exclude,
+                exclude=self.config.artifact_excludes,
             )
         except SbxloopError as exc:
             # Catches the whole family the delivery path can raise — not just

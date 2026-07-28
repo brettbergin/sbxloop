@@ -29,6 +29,8 @@ from pydantic import (
 
 from sbxloop.errors import ConfigError
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
+from sbxloop.toolchains import build_dirs as toolchain_build_dirs
+from sbxloop.toolchains import resolve as resolve_toolchains
 
 ENV_PREFIX = "SBXLOOP_"
 
@@ -247,6 +249,32 @@ class Config(_ConfigModel):
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
     limits: Limits = Field(default_factory=Limits)
+
+    @property
+    def artifact_excludes(self) -> list[str]:
+        """``[artifacts] exclude`` plus the selected languages' build output.
+
+        Listing, harvest and delivery all resolve their exclusions through
+        here rather than reading ``artifacts.exclude`` directly, so the two
+        can never disagree about what an artifact is.
+
+        Build output is bulky, reproducible from source, and never what the
+        user asked for — but which directory holds it is entirely a function
+        of the ecosystem, which is precisely what ``[sandbox] languages``
+        already declares. Deriving it means a Rust run stops delivering a
+        several-hundred-megabyte ``target/`` tree without anyone having to
+        remember to configure it.
+
+        Explicit ``exclude`` entries win by being kept: this only ever adds.
+        An operator who wants build output delivered anyway can select no
+        language, or use the per-run artifact commands on the raw workspace.
+        """
+        derived = toolchain_build_dirs(resolve_toolchains(list(self.sandbox.effective_languages)))
+        merged = list(self.artifacts.exclude)
+        for name in derived:
+            if name not in merged:
+                merged.append(name)
+        return merged
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

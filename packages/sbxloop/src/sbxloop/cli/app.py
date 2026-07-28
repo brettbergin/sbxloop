@@ -297,7 +297,7 @@ def _print_artifacts_summary(result: RunResult, config: Config) -> None:
     target = artifacts_dir(result, config.state_dir)
     if target is None or not target.is_dir():
         return
-    scan = scan_artifacts(target, config.artifacts.exclude)
+    scan = scan_artifacts(target, config.artifact_excludes)
     if not scan.files:
         console.print(f"\nartifacts: none produced (workspace: {target})")
         if scan.excluded_note:
@@ -634,7 +634,7 @@ def artifacts(
     if not target.is_dir():
         console.print(f"[bold red]artifacts directory is gone:[/] {target}")
         raise typer.Exit(2)
-    scan = scan_artifacts(target, config.artifacts.exclude)
+    scan = scan_artifacts(target, config.artifact_excludes)
     files = scan.files
     via = "live workspace mount" if record.mounted else "harvested copy"
     console.print(f"run [bold cyan]{run_id}[/]: {len(files)} file(s) ({via}) in [bold]{target}[/]")

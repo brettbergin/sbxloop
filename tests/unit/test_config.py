@@ -216,3 +216,35 @@ def test_limits_abort_must_exceed_warn(tmp_path: Path) -> None:
 def test_limits_must_be_percentages(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"0\.\.100"):
         load_config(cwd=tmp_path, env={"SBXLOOP_LIMITS__DISK_WARN": "150"})
+
+
+class TestArtifactExcludes:
+    """Build output is excluded per selected language (gap 10)."""
+
+    def test_default_is_unchanged_for_python(self) -> None:
+        config = Config.model_validate({})
+        # Python's build dirs join the state dirs; nothing else appears.
+        assert config.artifact_excludes[:2] == [".git", ".sbxloop"]
+        assert ".venv" in config.artifact_excludes
+        assert "node_modules" not in config.artifact_excludes
+
+    def test_selected_language_contributes_its_build_dirs(self) -> None:
+        config = Config.model_validate({"sandbox": {"languages": ["rust"]}})
+        assert "target" in config.artifact_excludes
+        assert ".venv" not in config.artifact_excludes
+
+    def test_multiple_languages_union_without_duplicates(self) -> None:
+        config = Config.model_validate({"sandbox": {"languages": ["javascript", "typescript"]}})
+        excludes = config.artifact_excludes
+        assert excludes.count("node_modules") == 1
+        assert "dist" in excludes
+
+    def test_explicit_excludes_are_kept(self) -> None:
+        config = Config.model_validate(
+            {
+                "artifacts": {"exclude": ["mine"]},
+                "sandbox": {"languages": ["rust"]},
+            }
+        )
+        assert "mine" in config.artifact_excludes
+        assert "target" in config.artifact_excludes

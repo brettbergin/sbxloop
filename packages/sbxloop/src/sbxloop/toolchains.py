@@ -40,6 +40,7 @@ __all__ = [
     "DEFAULT_LANGUAGES",
     "TOOLCHAINS",
     "Toolchain",
+    "build_dirs",
     "install_domains",
     "normalize_language",
     "resolve",
@@ -77,6 +78,12 @@ class Toolchain:
     # ``sbx.provision.build_specs``). An apt-only entry leaves this empty:
     # the distro mirrors are baseline for every run already.
     install_domains: tuple[str, ...] = ()
+    # Directory names this ecosystem's builds produce. Excluded from
+    # artifact listing, harvest and delivery when the language is
+    # selected (see ``Config.artifact_excludes``): they are bulky,
+    # reproducible from source, and never what the user asked for.
+    # Bare path components — matched at any depth, no separators.
+    build_dirs: tuple[str, ...] = ()
 
 
 PYTHON = Toolchain(
@@ -88,6 +95,17 @@ PYTHON = Toolchain(
     # "ensurepip is not available" on every revision (field failure, 0.4.0).
     probe="python3 -c 'import ensurepip, pip'",
     apt_packages=("python3-venv", "python3-pip"),
+    build_dirs=(
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        "build",
+        "dist",
+    ),
     aliases=("py", "python3"),
 )
 
@@ -109,6 +127,8 @@ CPP = Toolchain(
     # that are already in the always-reachable baseline. build-essential
     # brings gcc, g++, make, and libc headers.
     apt_packages=("build-essential", "cmake", "ninja-build", "pkg-config"),
+    # CMake's conventional out-of-source dir, plus autotools leftovers.
+    build_dirs=("build", "cmake-build-debug", "cmake-build-release", ".deps"),
     aliases=("c", "c++", "cxx", "c-cpp"),
 )
 
@@ -125,6 +145,8 @@ RUBY = Toolchain(
     # `ruby` is installed. build-essential is shared with cpp and installs
     # once thanks to the pooled apt call.
     apt_packages=("ruby-full", "ruby-dev", "bundler", "build-essential"),
+    # `bundle config path vendor/bundle` is the sandbox-friendly norm.
+    build_dirs=("vendor", ".bundle"),
     aliases=("rb",),
 )
 
@@ -178,6 +200,8 @@ JAVA = Toolchain(
     install_script=_persist_env(
         "JAVA_HOME", '$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")'
     ),
+    # Maven writes target/, Gradle writes build/ and .gradle/.
+    build_dirs=("target", "build", ".gradle"),
     aliases=("jdk", "jvm"),
 )
 
@@ -226,6 +250,7 @@ PHP = Toolchain(
     ),
     # Composer is a pinned, digest-checked phar from upstream.
     install_domains=("getcomposer.org",),
+    build_dirs=("vendor",),
 )
 
 
@@ -288,6 +313,7 @@ NODE = Toolchain(
     ),
     # Upstream Node tarballs.
     install_domains=("nodejs.org",),
+    build_dirs=("node_modules", ".npm", "dist", ".next", ".cache"),
     aliases=("js", "node", "nodejs", "javascript-node"),
 )
 
@@ -316,6 +342,7 @@ TYPESCRIPT = Toolchain(
     # package-registry baseline, but naming it here keeps the
     # dependency explicit and survives a [policy] deny audit.
     install_domains=("registry.npmjs.org",),
+    build_dirs=("node_modules", "dist", ".tsbuildinfo"),
     aliases=("ts",),
 )
 
@@ -357,6 +384,9 @@ GO = Toolchain(
     # go.dev issues the download and redirects to Google storage for
     # the tarball itself; both hosts must be reachable.
     install_domains=("go.dev", "dl.google.com"),
+    # Module and build caches normally live outside the project, but
+    # GOPATH/GOCACHE are frequently redirected into it in a sandbox.
+    build_dirs=("bin", "pkg", ".gocache", ".gomodcache"),
     aliases=("golang",),
 )
 
@@ -422,6 +452,8 @@ RUST = Toolchain(
     ),
     # rustup-init and the toolchain archives it pulls.
     install_domains=("static.rust-lang.org",),
+    # target/ routinely reaches hundreds of MB on a debug build.
+    build_dirs=("target",),
     aliases=("rs", "cargo"),
 )
 
@@ -481,6 +513,7 @@ DOTNET = Toolchain(
     ),
     # Microsoft's SDK tarball CDN.
     install_domains=("builds.dotnet.microsoft.com",),
+    build_dirs=("obj", "bin", ".nuget"),
     aliases=("csharp", "c#", "net", "dotnet-sdk"),
 )
 
@@ -540,6 +573,23 @@ def resolve(names: Sequence[str]) -> tuple[Toolchain, ...]:
         wanted.add(key)
         pending.extend(_BY_KEY[key].requires)
     return tuple(toolchain for toolchain in TOOLCHAINS if toolchain.name in wanted)
+
+
+def build_dirs(toolchains: Iterable[Toolchain]) -> tuple[str, ...]:
+    """Build-output directory names for ``toolchains``, deduped, order-stable.
+
+    Five of the language sub-issues raised this independently and none of
+    them owned it, so nothing implemented it: artifacts kept defaulting to
+    excluding only ``.git`` and ``.sbxloop``, and a Rust run harvested and
+    then DELIVERED its whole ``target/`` tree. Selecting a language is
+    exactly the signal needed to know what its build output is called.
+    """
+    names: list[str] = []
+    for toolchain in toolchains:
+        for name in toolchain.build_dirs:
+            if name not in names:
+                names.append(name)
+    return tuple(names)
 
 
 def install_domains(toolchains: Iterable[Toolchain]) -> tuple[str, ...]:
