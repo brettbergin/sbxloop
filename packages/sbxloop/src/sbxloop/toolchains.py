@@ -178,28 +178,69 @@ def _persist_env(variable: str, value_expr: str) -> str:
 # releases and would silently change the compiler under a project.
 JAVA_JDK_MAJOR = "21"
 
+# Distro Gradle lags badly and most projects ship a `gradlew` wrapper — but
+# the wrapper cannot bootstrap a project that does not exist yet, and a task
+# asked to *create* a Gradle build has nothing to run. So Gradle is
+# installed from upstream (#161/#162 asked for the explicit decision rather
+# than the code comment that stood in for it), pinned with the digest
+# upstream publishes alongside the archive.
+#
+# The zip is served from services.gradle.org, which 301s to
+# downloads.gradle.org — both hosts must be reachable, and only the first
+# was in the registry baseline.
+GRADLE_VERSION = "9.6.1"
+GRADLE_SHA256 = "9c0f7faeeb306cb14e4279a3e084ca6b596894089a0638e68a07c945a32c9e14"
+_GRADLE_ZIP = "/tmp/gradle.zip"  # nosec B108 - path inside the sandbox VM, not host tmp
+_GRADLE_HOME = "/opt/gradle"
+
+_GRADLE_INSTALL = (
+    f'curl -fsSL -o {_GRADLE_ZIP} "https://services.gradle.org/distributions'
+    f'/gradle-{GRADLE_VERSION}-bin.zip"; '
+    f"printf '%s  {_GRADLE_ZIP}\\n' '{GRADLE_SHA256}' | sha256sum -c - >/dev/null; "
+    f"sudo -n rm -rf {_GRADLE_HOME}; "
+    f"sudo -n mkdir -p {_GRADLE_HOME}; "
+    f"sudo -n unzip -q -d {_GRADLE_HOME} {_GRADLE_ZIP}; "
+    f"sudo -n ln -sf {_GRADLE_HOME}/gradle-{GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle; "
+    f"rm -f {_GRADLE_ZIP}"
+)
+
+
 JAVA = Toolchain(
     name="java",
-    wanted="java, javac, mvn, JAVA_HOME",
+    wanted="java, javac, mvn, gradle, JAVA_HOME",
     # JAVA_HOME is part of the contract (#161: many build tools read it
     # directly), but it lives in a file rather than this probe's env — the
     # probe runs under a bare `sbx exec sh -c`, which sources nothing. So
     # check that the export was recorded, not that it is currently set.
     probe=(
         "command -v javac >/dev/null && command -v mvn >/dev/null "
+        "&& command -v gradle >/dev/null "
         f"&& grep -qs '^export JAVA_HOME=' {PERSISTENT_ENV}"
     ),
     # apt for the JDK and Maven, per #161. Distro Gradle is materially
     # stale and most projects ship a `gradlew` wrapper anyway, so Gradle is
     # deliberately absent — the wrapper fetches its own distribution, which
     # is an egress question for #141 rather than a package to install.
-    apt_packages=(f"openjdk-{JAVA_JDK_MAJOR}-jdk", "maven"),
+    # unzip/curl carry the Gradle install; the JDK and Maven are apt-viable.
+    apt_packages=(
+        f"openjdk-{JAVA_JDK_MAJOR}-jdk",
+        "maven",
+        "unzip",
+        "curl",
+        "ca-certificates",
+    ),
     # Derive JAVA_HOME from the javac that apt just put on PATH rather than
     # hardcoding /usr/lib/jvm/... — the directory name embeds the distro
     # architecture (…-amd64 vs …-arm64) and would be wrong half the time.
-    install_script=_persist_env(
-        "JAVA_HOME", '$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")'
+    install_script=(
+        "set -e; "
+        + _persist_env(
+            "JAVA_HOME", '$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")'
+        )
+        + "; "
+        + _GRADLE_INSTALL
     ),
+    install_domains=("services.gradle.org", "downloads.gradle.org"),
     # Maven writes target/, Gradle writes build/ and .gradle/.
     build_dirs=("target", "build", ".gradle"),
     aliases=("jdk", "jvm"),

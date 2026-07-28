@@ -361,3 +361,33 @@ def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")
     assert "ensurepip" in python.probe
+
+
+class TestJavaGradle:
+    """Java is hybrid: apt JDK/Maven plus an upstream Gradle (gap 6)."""
+
+    def test_gradle_is_wanted_and_probed(self) -> None:
+        assert "gradle" in toolchains.JAVA.wanted
+        assert "command -v gradle" in toolchains.JAVA.probe
+
+    def test_jdk_and_maven_stay_on_apt(self) -> None:
+        assert any(p.startswith("openjdk-") for p in toolchains.JAVA.apt_packages)
+        assert "maven" in toolchains.JAVA.apt_packages
+        # unzip carries the Gradle archive; without it the install is a no-op.
+        assert "unzip" in toolchains.JAVA.apt_packages
+
+    def test_gradle_archive_is_pinned_and_digest_checked(self) -> None:
+        script = toolchains.JAVA.install_script or ""
+        assert toolchains.GRADLE_VERSION in script
+        assert toolchains.GRADLE_SHA256 in script
+        assert "sha256sum -c -" in script
+
+    def test_both_gradle_hosts_are_declared(self) -> None:
+        # services.gradle.org 301s to downloads.gradle.org; only the first
+        # was in Layer 2's registry baseline, so a partial grant would fail
+        # the download after the redirect.
+        assert "services.gradle.org" in toolchains.JAVA.install_domains
+        assert "downloads.gradle.org" in toolchains.JAVA.install_domains
+
+    def test_java_still_persists_java_home(self) -> None:
+        assert "JAVA_HOME" in (toolchains.JAVA.install_script or "")
