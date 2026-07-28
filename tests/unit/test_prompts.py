@@ -80,6 +80,7 @@ ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
         ("pom.xml", "mvn -q -B test", "./gradlew test"),
         ("pom.xml", "JAVA_HOME", "./gradlew"),
     ),
+    ("C#/.NET", (".csproj", "dotnet test", "global.json"), (".csproj", "dotnet test")),
 ]
 
 

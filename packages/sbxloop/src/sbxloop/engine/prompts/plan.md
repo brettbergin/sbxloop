@@ -96,6 +96,11 @@ and none of these is the "normal" choice.
   expects. Maven needs `-B` (batch mode) in a non-interactive sandbox or
   its progress rendering misbehaves. Verify: `mvn -q -B test`, or
   `./gradlew test`.
+- **C#/.NET** — a `.csproj` or `.sln` marks the project, `global.json` can
+  pin the SDK version, and `obj/` and `bin/` hold build output.
+  `dotnet test` restores and builds implicitly, so a separate
+  `dotnet restore` step in a verify command is usually redundant. Verify:
+  `dotnet test`.
 
 ## Response format
 
