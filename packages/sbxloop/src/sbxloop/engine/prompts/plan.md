@@ -83,6 +83,12 @@ and none of these is the "normal" choice.
   large; keep it inside the project, and expect it in whatever an
   unmounted run harvests. Unlike Go, a wrong directory fails loudly here
   rather than silently passing. Verify: `cargo test`.
+- **Ruby** — `Gemfile` and `Gemfile.lock` at the project root;
+  `bundle install` first, then run project binaries through `bundle exec`.
+  That prefix is Ruby's analogue of Python's `.venv/bin/` — a bare `rspec`
+  resolves against the system gems or is missing outright. Gems with
+  native extensions need build tooling, which apt can supply. Verify:
+  `bundle exec rspec`, or `bundle exec rake test`.
 
 ## Response format
 
