@@ -3,6 +3,7 @@
 import pytest
 
 from sbxloop.engine.prompts import bullet_list, render
+from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
 
 
 def test_render_decompose() -> None:
@@ -110,6 +111,43 @@ def test_render_all_templates_have_no_leftover_vars() -> None:
     for name, context in contexts.items():
         text = render(name, **context)
         assert "$" not in text.replace("$?", ""), f"unsubstituted var in {name}"
+
+
+def test_registry_tiers_are_injected_not_hardcoded() -> None:
+    """#141 moves registries between the tiers one language at a time; a
+    hardcoded prompt list would drift, and a drifted list is a failed run —
+    the planner either declares what needs no declaration or omits what
+    does. Both tiers must reach both prompts from policy.py."""
+    plan = render(
+        "plan",
+        outcome="o",
+        task_id="t1",
+        task_title="tt",
+        task_description="td",
+        acceptance_criteria="- c",
+        feedback="(none)",
+        user_guidance="(none)",
+    )
+    execute = render(
+        "execute",
+        outcome="o",
+        task_id="t1",
+        task_title="tt",
+        task_description="td",
+        plan_steps="- s",
+        expected_artifacts="- a",
+        feedback="(none)",
+        user_guidance="(none)",
+    )
+    for text in (plan, execute):
+        for domain in BASELINE_REGISTRY_DOMAINS:
+            assert f"`{domain}`" in text
+        for domain in WELL_KNOWN_REGISTRY_DOMAINS:
+            assert f"`{domain}`" in text
+    # The planner must be able to tell the tiers apart: the baseline is
+    # named as never-declare, the well-known set as declare-if-touched.
+    assert "never declare them" in plan
+    assert "npm" in plan.lower()
 
 
 def test_render_missing_variable_fails_loudly() -> None:

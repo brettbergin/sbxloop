@@ -159,10 +159,18 @@ All notable changes to sbxloop are documented here. The project adheres to
   Structurally, `policy.PROMPT_ADVERTISED_DOMAINS` is now the union of
   `BASELINE_REGISTRY_DOMAINS` (the language registry tier, starting with
   Python's two hosts) and `APT_MIRROR_DOMAINS` (language-neutral distro
-  infrastructure, baseline regardless). The following changes populate the
-  registry tier one language at a time. `sbxloop config policy` prints the
+  infrastructure, baseline regardless). `sbxloop config policy` prints the
   two tiers separately, so what is unconditionally reachable is legible
-  without reading the source.
+  without reading the source. Promoted into the registry tier so far:
+
+  - Python — `pypi.org`, `files.pythonhosted.org` (#145)
+  - JavaScript/Node — `registry.npmjs.org`, `registry.yarnpkg.com`, and
+    `codeload.github.com` for `github:user/repo` dependencies, whose
+    tarballs come from a different host than the clone (#148)
+
+  The plan and execute prompts no longer hardcode the tiers: both lists are
+  injected from `policy.py` at render time, so a promotion cannot leave the
+  prompts telling planners to declare a domain that needs no declaration.
 
   The promotion trades some audit granularity — a baseline registry emits no
   `policy.allow` event, because there is no grant to log — so it is bounded
