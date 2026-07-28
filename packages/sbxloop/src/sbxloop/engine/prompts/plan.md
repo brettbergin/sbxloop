@@ -101,6 +101,12 @@ and none of these is the "normal" choice.
   `dotnet test` restores and builds implicitly, so a separate
   `dotnet restore` step in a verify command is usually redundant. Verify:
   `dotnet test`.
+- **PHP** — `composer.json` at the project root; `composer install`
+  populates `vendor/`, and project binaries live in `vendor/bin/`. The
+  `./vendor/bin/...` prefix is PHP's analogue of Python's `.venv/bin/` —
+  a bare `phpunit` is not on PATH. Composer needs `--no-interaction` in a
+  non-interactive sandbox. Verify:
+  `composer install --no-interaction && ./vendor/bin/phpunit`.
 
 ## Response format
 
