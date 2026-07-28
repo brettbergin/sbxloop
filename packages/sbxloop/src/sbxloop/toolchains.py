@@ -100,10 +100,26 @@ CPP = Toolchain(
 )
 
 
+RUBY = Toolchain(
+    name="ruby",
+    wanted="ruby, gem, bundle",
+    probe=(
+        "command -v ruby >/dev/null && command -v gem >/dev/null && command -v bundle >/dev/null"
+    ),
+    # `ruby-dev` and `build-essential` are not optional in practice: gems
+    # with native extensions (nokogiri, pg, ...) fail to build without
+    # headers and a compiler, which is the common failure mode when only
+    # `ruby` is installed. build-essential is shared with cpp and installs
+    # once thanks to the pooled apt call.
+    apt_packages=("ruby-full", "ruby-dev", "bundler", "build-essential"),
+    aliases=("rb",),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP)
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140

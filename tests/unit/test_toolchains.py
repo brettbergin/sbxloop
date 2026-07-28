@@ -74,6 +74,20 @@ def test_cpp_entry_is_pure_apt() -> None:
     assert "cmake" in cpp.apt_packages
 
 
+def test_ruby_installs_native_extension_prerequisites() -> None:
+    # Only `ruby` is the classic half-install: gems with C extensions then
+    # fail to build. #158 calls this out explicitly.
+    ruby = toolchains.resolve(["ruby"])[0]
+    assert ruby.install_script is None
+    for package in ("ruby-full", "ruby-dev", "bundler", "build-essential"):
+        assert package in ruby.apt_packages
+
+
+def test_ruby_and_cpp_share_build_essential_without_duplicating_it() -> None:
+    packages = toolchains.apt_packages(toolchains.resolve(["ruby", "cpp"]))
+    assert packages.count("build-essential") == 1
+
+
 def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")
