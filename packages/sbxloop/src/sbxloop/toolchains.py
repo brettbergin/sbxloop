@@ -349,10 +349,66 @@ GO = Toolchain(
 # unlike the provision-time install above.
 
 
+# Debian/Ubuntu do ship cargo/rustc, so apt is technically available — but
+# distro Rust routinely lags stable by several releases, which breaks
+# edition- and MSRV-sensitive projects outright rather than cosmetically,
+# and rustup is the ecosystem norm nearly every Rust instruction assumes
+# (#143). rustup-init is downloaded and checksum-verified rather than piped
+# from sh.rustup.rs into a shell.
+RUSTUP_VERSION = "1.29.0"
+RUST_TOOLCHAIN = "1.97.1"
+_RUSTUP_INIT = "/tmp/rustup-init"  # nosec B108 - path inside the sandbox VM, not host tmp
+_RUSTUP_DIGESTS = {
+    "amd64": (
+        "x86_64-unknown-linux-gnu",
+        "4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10",
+    ),
+    "arm64": (
+        "aarch64-unknown-linux-gnu",
+        "9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792",
+    ),
+}
+# rustup writes its shims to ~/.cargo/bin and normally puts that on PATH by
+# editing shell profiles — which a bare `sbx exec sh -c` never sources. So
+# --no-modify-path, and link the shims into /usr/local/bin instead. Kept in
+# the agent's home rather than a system dir so `cargo install` and the
+# registry cache stay writable without sudo.
+_RUST_SHIMS = ("cargo", "rustc", "rustup", "rustfmt", "cargo-fmt", "cargo-clippy")
+
+RUST = Toolchain(
+    name="rust",
+    wanted="cargo, rustc, rustfmt, clippy",
+    # rustfmt and clippy are "the common next asks" (#143) and are what a
+    # plan's verify_commands usually reach for, so their absence is a real
+    # gap — probe for them too rather than declaring victory on cargo.
+    probe=(
+        "command -v cargo >/dev/null && command -v rustc >/dev/null "
+        "&& command -v rustfmt >/dev/null && command -v cargo-clippy >/dev/null"
+    ),
+    apt_packages=("curl", "ca-certificates", "build-essential"),
+    # --profile minimal plus the two components explicitly, rather than the
+    # default profile: exactly what #143 asks for, and it skips the large
+    # rust-docs component nothing here needs.
+    install_script=(
+        "set -e; " + _arch_dispatch(_RUSTUP_DIGESTS) + "; "
+        f'curl -fsSL -o {_RUSTUP_INIT} "https://static.rust-lang.org/rustup/archive'
+        f'/{RUSTUP_VERSION}/$arch/rustup-init"; '
+        f"printf '%s  {_RUSTUP_INIT}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+        f"chmod +x {_RUSTUP_INIT}; "
+        f"{_RUSTUP_INIT} -y --no-modify-path --profile minimal "
+        f"--component rustfmt --component clippy --default-toolchain {RUST_TOOLCHAIN}; "
+        f"for shim in {' '.join(_RUST_SHIMS)}; do "
+        'sudo -n ln -sf "$HOME/.cargo/bin/$shim" "/usr/local/bin/$shim"; done; '
+        f"rm -f {_RUSTUP_INIT}"
+    ),
+    aliases=("rs", "cargo"),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE, TYPESCRIPT, GO)
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE, TYPESCRIPT, GO, RUST)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
