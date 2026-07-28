@@ -42,6 +42,9 @@ destroyed.
     `tsconfig.json`; run anywhere else it checks nothing and still exits 0.
     A passing type-check and a passing test run are two different things —
     do both.
+  - **Go** — build and test from the directory holding `go.mod`, using
+    `./...` to cover every package; run from above the module root it
+    matches nothing and still exits 0.
 
 ## Overall outcome
 
