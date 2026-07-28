@@ -70,6 +70,13 @@ and none of these is the "normal" choice.
   no `tsconfig.json` type-checks nothing and still exits 0, so a
   subdirectory project must be entered explicitly. Verify:
   `npx tsc --noEmit && npm test`.
+- **Go** — `go.mod` marks the module root, and `./...` is the idiomatic
+  all-packages selector. The module cache and `GOCACHE` live outside the
+  project, so builds do not litter the workspace. The workspace-root
+  contract matters here in its silent form: `go test ./...` run from above
+  the module root matches no packages and exits 0, so a module one level
+  down must be entered explicitly. Verify:
+  `go build ./... && go test ./...`.
 
 ## Response format
 
