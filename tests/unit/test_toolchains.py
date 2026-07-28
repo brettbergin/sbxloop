@@ -7,6 +7,9 @@ and never raises, and apt packages pool instead of duplicating.
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from sbxloop import toolchains
@@ -86,6 +89,38 @@ def test_ruby_installs_native_extension_prerequisites() -> None:
 def test_ruby_and_cpp_share_build_essential_without_duplicating_it() -> None:
     packages = toolchains.apt_packages(toolchains.resolve(["ruby", "cpp"]))
     assert packages.count("build-essential") == 1
+
+
+def test_java_pins_the_jdk_major_rather_than_default_jdk() -> None:
+    # `default-jdk` moves between distro releases and would silently change
+    # the compiler under a project (#161).
+    java = toolchains.resolve(["java"])[0]
+    assert f"openjdk-{toolchains.JAVA_JDK_MAJOR}-jdk" in java.apt_packages
+    assert "default-jdk" not in java.apt_packages
+    assert "maven" in java.apt_packages
+
+
+def test_java_records_java_home_in_the_persistent_env() -> None:
+    # JAVA_HOME must survive into the agent's env, and the probe has to
+    # notice when it was never recorded — a bare `sh -c` sources nothing,
+    # so the probe checks the file rather than the variable.
+    java = toolchains.resolve(["java"])[0]
+    assert java.install_script is not None
+    assert toolchains.PERSISTENT_ENV in java.install_script
+    assert "JAVA_HOME" in java.probe
+    assert toolchains.PERSISTENT_ENV in java.probe
+
+
+def test_persist_env_is_idempotent(tmp_path: Path) -> None:
+    # Running the export twice must not stack duplicate lines.
+    target = tmp_path / "persistent.sh"
+    script = toolchains._persist_env("DEMO_HOME", "/opt/demo").replace(
+        toolchains.PERSISTENT_ENV, str(target)
+    )
+    script = script.replace("sudo -n tee", "tee")
+    for _ in range(2):
+        subprocess.run(["sh", "-c", script], check=True)
+    assert target.read_text() == "export DEMO_HOME=/opt/demo\n"
 
 
 def test_python_entry_matches_the_pre_140_behavior() -> None:
