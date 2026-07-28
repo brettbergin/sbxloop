@@ -112,10 +112,15 @@ and none of these is the "normal" choice.
   so the build directory is not the source directory and every later
   command must name it. There is **no per-project dependency isolation
   step** here — no venv, `node_modules`, or `vendor` equivalent — so do
-  not invent one; compilers and libraries come from apt. This is where
-  the workspace-root contract bites hardest: `ctest` run from the wrong
-  directory finds no tests and can still exit 0, so always pass
-  `--test-dir`. Verify: `cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure`.
+  not invent one; compilers and libraries come from apt, which is always
+  reachable. If the project uses Conan, declare `center.conan.io` in
+  `egress` — it is in bounds but not reachable until you do. vcpkg is
+  **not** usable unless the operator has allowed its hosts: it fetches
+  source from whatever upstream each port names, which cannot be
+  pre-approved, so prefer apt or Conan and say so in your plan rather than
+  planning a vcpkg build that will stall. This is where the workspace-root
+  contract bites hardest: `ctest` run from the wrong directory finds no
+  tests and can still exit 0, so always pass `--test-dir`. Verify: `cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure`.
 
 <!-- ecosystems:end -->
 

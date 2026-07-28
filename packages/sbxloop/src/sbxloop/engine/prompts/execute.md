@@ -70,7 +70,11 @@ destroyed.
   the build directory in every later command, including
   `ctest --test-dir build`; run elsewhere, `ctest` finds no tests and
   can still exit 0. There is no per-project isolation step to set up —
-  install compilers and libraries with apt.
+  install compilers and libraries with apt, which is always reachable.
+  Conan works only if the plan declared `center.conan.io`; vcpkg needs
+  hosts an operator must allow explicitly, so it will usually stall. If a
+  dependency is unreachable, name the blocked domain in your summary and
+  prefer an apt package rather than retrying the fetch.
 
 <!-- ecosystems:end -->
 
