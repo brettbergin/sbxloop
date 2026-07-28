@@ -35,6 +35,10 @@ All notable changes to sbxloop are documented here. The project adheres to
     A type-check-only task over vendored dependencies needs no egress at
     all, and an empty `egress` is a complete plan rather than a forgetful
     one (#151)
+  - Go — `proxy.golang.org` and `sum.golang.org` together: a reachable
+    proxy whose checksum database is blocked fails `go mod download` at
+    verification, which reads as a broken toolchain rather than a policy
+    decision (#154)
 
   The plan and execute prompts no longer hardcode the tiers: both lists are
   injected from `policy.py` at render time, so a promotion cannot leave the

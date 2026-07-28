@@ -60,6 +60,12 @@ BASELINE_REGISTRY_DOMAINS = (
     # tarballs from codeload, which is a separate host — a partial grant
     # fails only for projects that happen to use a git dep.
     "codeload.github.com",
+    "proxy.golang.org",  # Go module proxy
+    # A reachable proxy with an unreachable checksum database is worse than
+    # neither: `go mod download` fails verification rather than falling back,
+    # and the fix (GONOSUMDB/GOFLAGS) is not something a plan can discover
+    # from the error. Both hosts or nothing.
+    "sum.golang.org",
 )
 
 # Distro package mirrors: language-neutral infrastructure rather than any one
@@ -97,8 +103,6 @@ WELL_KNOWN_REGISTRY_DOMAINS = (
     "crates.io",  # cargo API
     "static.crates.io",  # crate downloads
     "index.crates.io",  # cargo sparse index
-    "proxy.golang.org",  # Go module proxy
-    "sum.golang.org",  # Go checksum database
 )
 
 
