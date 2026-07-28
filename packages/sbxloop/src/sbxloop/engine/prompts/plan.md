@@ -89,6 +89,13 @@ and none of these is the "normal" choice.
   resolves against the system gems or is missing outright. Gems with
   native extensions need build tooling, which apt can supply. Verify:
   `bundle exec rspec`, or `bundle exec rake test`.
+- **Java/JVM** — `pom.xml` (Maven) or `build.gradle` (Gradle) at the
+  project root, `JAVA_HOME` must be set, and the local artifact cache
+  lives in `~/.m2`. Prefer the wrapper when the project ships one
+  (`./mvnw`, `./gradlew`) so the build runs the version the project
+  expects. Maven needs `-B` (batch mode) in a non-interactive sandbox or
+  its progress rendering misbehaves. Verify: `mvn -q -B test`, or
+  `./gradlew test`.
 
 ## Response format
 

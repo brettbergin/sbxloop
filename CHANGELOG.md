@@ -18,7 +18,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   short reference block the model reads one entry of. Python is the first
   entry — its PEP 668 guidance is unchanged in substance, just no longer the
   framing for everyone else. Ecosystems covered so far: Python,
-  JavaScript/Node, TypeScript, Go, Rust, Ruby.
+  JavaScript/Node, TypeScript, Go, Rust, Ruby, Java/JVM.
 
 - **Leftovers from the 0.2.0 `sdxloop` → `sbxloop` rename are gone.** The
   exception base class is now `SbxloopError` (was `SdxloopError`) across all
