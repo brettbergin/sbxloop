@@ -155,6 +155,51 @@ def test_installer_entries_bring_their_own_curl() -> None:
             assert "ca-certificates" in toolchain.apt_packages, toolchain.name
 
 
+@pytest.mark.parametrize("name", ["javascript", "js", "node", "nodejs", "JavaScript-Node"])
+def test_node_is_reachable_by_every_spelling(name: str) -> None:
+    assert toolchains.normalize_language(name) == "javascript"
+
+
+def test_node_probe_checks_the_pinned_major() -> None:
+    # A template carrying an older Node would satisfy a bare `command -v
+    # node` and leave the agent with the version #147 says breaks modern
+    # `engines` constraints.
+    node = toolchains.resolve(["javascript"])[0]
+    assert f'grep -q "^v{toolchains.NODE_MAJOR}\\.' in node.probe
+
+
+def test_node_pins_a_verified_digest_per_architecture() -> None:
+    # The fleet is mixed (arm64 microVMs, amd64 CI), so one hardcoded
+    # digest would fail the checksum on half the hosts.
+    node = toolchains.resolve(["javascript"])[0]
+    assert node.install_script is not None
+    assert toolchains.NODE_VERSION in node.install_script
+    for deb_arch, (upstream, digest) in toolchains._NODE_DIGESTS.items():
+        assert f"{deb_arch}) arch={upstream}" in node.install_script
+        assert len(digest) == 64
+        assert digest in node.install_script
+    assert "sha256sum -c" in node.install_script
+
+
+def test_arch_dispatch_rejects_unknown_architectures() -> None:
+    # Downloading "whatever" for an unrecognized arch would produce a
+    # binary that cannot run; fail loudly instead.
+    script = toolchains._arch_dispatch({"amd64": ("x64", "d" * 64)})
+    ok = subprocess.run(
+        ["sh", "-c", script.replace("$(dpkg --print-architecture)", "amd64")],
+        capture_output=True,
+        text=True,
+    )
+    assert ok.returncode == 0, ok.stderr
+    bad = subprocess.run(
+        ["sh", "-c", script.replace("$(dpkg --print-architecture)", "riscv64")],
+        capture_output=True,
+        text=True,
+    )
+    assert bad.returncode == 1
+    assert "unsupported architecture" in bad.stderr
+
+
 def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")

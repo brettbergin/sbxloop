@@ -301,13 +301,14 @@ missing compiler on its first build and spending revision budget on it:
 languages = ["python"]   # the default when the key is unset
 ```
 
-| Value    | Also accepts               | Installs                                                      |
-| -------- | -------------------------- | ------------------------------------------------------------- |
-| `python` | `py`, `python3`            | `python3-venv`, `python3-pip` (apt)                           |
-| `cpp`    | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
-| `ruby`   | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)   |
-| `java`   | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
-| `php`    | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
+| Value        | Also accepts               | Installs                                                      |
+| ------------ | -------------------------- | ------------------------------------------------------------- |
+| `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt)                           |
+| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
+| `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)   |
+| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
+| `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
+| `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)         |
 
 Three rules apply to every entry. Provisioning is **probe-first** — a template
 that already ships the toolchain costs no install and no network. It is

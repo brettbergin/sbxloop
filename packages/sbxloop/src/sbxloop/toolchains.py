@@ -214,10 +214,71 @@ PHP = Toolchain(
 )
 
 
+def _arch_dispatch(cases: dict[str, tuple[str, str]]) -> str:
+    """POSIX ``case`` on the Debian arch, setting ``$arch`` and ``$sum``.
+
+    Upstream tarballs are per-architecture and so are their digests, and
+    the fleet is genuinely mixed (Apple-silicon microVMs are arm64, CI
+    runners are amd64). Hardcoding one would work on half the hosts and
+    fail the checksum on the other half, so the arch is resolved in-sandbox
+    and an unrecognized one fails loudly rather than downloading something
+    that cannot run.
+    """
+    branches = " ".join(
+        f"{deb}) arch={upstream}; sum={digest};;" for deb, (upstream, digest) in cases.items()
+    )
+    return (
+        f'case "$(dpkg --print-architecture)" in {branches} '
+        '*) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1;; esac'
+    )
+
+
+# Debian/Ubuntu stable ship a Node several majors behind current LTS, which
+# breaks packages declaring modern `engines` constraints — a functional
+# failure, not cosmetic lag (#147). So: the official tarball, pinned to an
+# exact LTS release so runs are reproducible. Digests are the upstream
+# SHASUMS256.txt entries; bumping the version means bumping both.
+NODE_VERSION = "24.18.0"
+NODE_MAJOR = NODE_VERSION.split(".")[0]
+_NODE_TARBALL = "/tmp/node.tar.xz"  # nosec B108 - path inside the sandbox VM, not host tmp
+_NODE_DIGESTS = {
+    "amd64": ("x64", "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"),
+    "arm64": ("arm64", "58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6"),
+}
+
+NODE = Toolchain(
+    name="javascript",
+    wanted=f"node {NODE_MAJOR}.x, npm, npx",
+    # Check the pinned major, not merely that node exists: a template
+    # carrying an older Node would otherwise satisfy the probe and leave
+    # the agent with the very version #147 says breaks modern `engines`.
+    probe=(
+        "command -v npm >/dev/null && command -v npx >/dev/null "
+        f'&& node -v 2>/dev/null | grep -q "^v{NODE_MAJOR}\\."'
+    ),
+    apt_packages=("curl", "ca-certificates", "xz-utils"),
+    # Extracted into /usr/local with the leading directory stripped, which
+    # also makes /usr/local npm's global prefix — so a later `npm i -g` (the
+    # TypeScript entry, or the agent itself) lands on PATH without further
+    # wiring. The three top-level doc files the tarball carries are removed
+    # rather than left loose in /usr/local.
+    install_script=(
+        "set -e; " + _arch_dispatch(_NODE_DIGESTS) + "; "
+        f'curl -fsSL -o {_NODE_TARBALL} "https://nodejs.org/dist/v{NODE_VERSION}'
+        f'/node-v{NODE_VERSION}-linux-$arch.tar.xz"; '
+        f"printf '%s  {_NODE_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+        f"sudo -n tar -xJf {_NODE_TARBALL} -C /usr/local --strip-components=1; "
+        "sudo -n rm -f /usr/local/CHANGELOG.md /usr/local/LICENSE /usr/local/README.md; "
+        f"rm -f {_NODE_TARBALL}"
+    ),
+    aliases=("js", "node", "nodejs", "javascript-node"),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP)
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
