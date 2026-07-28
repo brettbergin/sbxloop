@@ -310,7 +310,7 @@ languages = ["python"]   # the default when the key is unset
 | `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt)                           |
 | `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
 | `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)   |
-| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
+| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), Gradle (pinned), `JAVA_HOME` |
 | `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
 | `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)         |
 | `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                        |
@@ -329,33 +329,128 @@ than adding to it, so nothing is installed for a language you did not ask
 for. Heavier toolchains are better baked into a template (`sbxloop bake`)
 than downloaded per run.
 
-### Toolchains that download from upstream need egress
+### Toolchains that download from upstream
 
-The apt-only entries (`python`, `cpp`, `ruby`, `java`) work out of the box:
-apt mirrors are in the sandbox's always-reachable baseline. The rest fetch
-from a vendor or registry, and **provisioning runs before the PLAN phase**, so
-a plan's `egress` declaration is too late to help it. Until those domains are
-part of the provisioning baseline, allow them explicitly:
+The apt-only entries (`python`, `cpp`, `ruby`) need nothing extra: the distro
+mirrors are in the sandbox's always-reachable baseline. The rest fetch from a
+vendor, and **provisioning runs before the PLAN phase**, so a plan's `egress`
+declaration is too late to help them.
+
+Those vendor hosts are seeded into the sandbox automatically, gated on what
+you selected — a Python-only run carries none of them:
+
+| Language     | Reachable at provisioning time                |
+| ------------ | --------------------------------------------- |
+| `php`        | `getcomposer.org`                             |
+| `javascript` | `nodejs.org`                                  |
+| `typescript` | `nodejs.org`, `registry.npmjs.org`            |
+| `java`       | `services.gradle.org`, `downloads.gradle.org` |
+| `go`         | `go.dev`, `dl.google.com`                     |
+| `rust`       | `static.rust-lang.org`                        |
+| `dotnet`     | `builds.dotnet.microsoft.com`                 |
+
+No `extra_allow_domains` entry is needed for any of them. `[policy] deny`
+still wins: deny one of these and the sandbox is never seeded with it, which
+`sbxloop doctor` reports as a failed `language toolchains` check rather than
+leaving you to discover it mid-run.
+
+Every archive is version-pinned and checked against the digest its vendor
+publishes. Those pins live in one place — `toolchains.PINNED_RELEASES` — and
+a weekly CI job (`.github/workflows/toolchain-versions.yml`) reports when one
+falls behind upstream. Bump a version and its digest together; a version
+bumped alone fails the checksum and silently drops the toolchain.
+
+## Enabling a language, end to end
+
+Everything above in the order you actually do it. Rust as the example:
+
+**1. Select it.** This is the only required step.
 
 ```toml
 [sandbox]
-languages = ["typescript"]
-extra_allow_domains = ["nodejs.org", "registry.npmjs.org"]
+languages = ["rust"]
 ```
 
-| Language     | Needs reachable at provisioning time |
-| ------------ | ------------------------------------ |
-| `php`        | `getcomposer.org`                    |
-| `javascript` | `nodejs.org`                         |
-| `typescript` | `nodejs.org`, `registry.npmjs.org`   |
-| `go`         | `go.dev`, `dl.google.com`            |
-| `rust`       | `static.rust-lang.org`               |
-| `dotnet`     | `builds.dotnet.microsoft.com`        |
+`cargo` and `rustc` are now installed before the agent's first turn, and
+`static.rust-lang.org` is reachable during provisioning to install them.
 
-Without them the install warns and the run continues — the agent falls back to
-bootstrapping the toolchain itself, which is the behavior these entries exist
-to improve on, not a broken run. Baking the toolchain into a template
-(`sbxloop bake`) sidesteps the per-run download entirely.
+**2. Check it.** Before spending a run on it:
+
+```bash
+sbxloop doctor
+```
+
+The `language toolchains` check confirms the selection can actually
+provision. The `baked toolchains` check (when a template is configured)
+flags a template baked for a different language set.
+
+**3. Bake it, if the download is heavy.** rustup and the .NET SDK are large
+enough to be worth doing once instead of per run:
+
+```bash
+sbxloop bake
+```
+
+```toml
+[sandbox]
+template = "sbxloop-baked:latest"
+```
+
+`bake` provisions the toolchains `[sandbox] languages` selects, so bake
+*after* setting them. Change the language set later and re-bake — a stale
+template falls back to per-run installs, which `doctor` will tell you about.
+
+**4. Nothing else.** The rest is automatic:
+
+- **Dependencies** — crates.io is in the always-reachable registry baseline,
+  so `cargo build` needs no `egress` declaration. Same for npm, RubyGems,
+  Maven Central, NuGet, Packagist, the Go proxy and PyPI.
+- **Prompts** — the planner and executor receive Rust's ecosystem notes and
+  a `cargo test` verify example, and *only* Rust's. They are not told about
+  the nine ecosystems this sandbox has no toolchain for.
+- **Artifacts** — `target/` is excluded from listing, harvest and delivery,
+  so a PR does not arrive full of build output.
+
+Only reach for `[sandbox] extra_allow_domains` or `[policy] allow` when a
+project needs a host outside all of that — a private registry, say.
+
+### Private and internal registries
+
+The reachable baseline covers the public registries. An internal mirror —
+Artifactory, Nexus, a private npm or NuGet feed, a self-hosted GitLab package
+registry — is not in it, and deliberately so: sbxloop cannot know your hosts,
+and seeding unknown domains into every sandbox is the opposite of least
+privilege.
+
+Two ways in, depending on when the host is needed:
+
+**Always reachable, for every run:**
+
+```toml
+[sandbox]
+extra_allow_domains = ["artifactory.corp.example.com"]
+```
+
+Use this when the host is infrastructure — the mirror your builds always
+resolve through, or a registry a toolchain needs at provisioning time, before
+any plan exists to declare it.
+
+**Declarable by a plan, granted late and audited:**
+
+```toml
+[policy]
+allow = ["*.corp.example.com"]
+```
+
+Use this when you want the grant in the audit trail. The PLAN phase must name
+the domain in `egress` with a justification, the grant is applied at EXECUTE
+entry, and both the grant and any refusal are logged as run events
+(`sbxloop logs RUN --type policy.`). Nothing is reachable until a plan asks
+for it and the bounds allow it.
+
+`[policy] deny` overrides both, and the baseline — so denying a public
+registry genuinely removes it from the sandbox rather than merely refusing a
+redundant grant.
 
 ## Sandbox hygiene
 
