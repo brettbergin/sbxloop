@@ -1044,7 +1044,10 @@ def config_policy() -> None:
     console.print(f"distro mirrors (always reachable, no declaration): {mirrors}")
     console.print(
         "well-known registries (declarable without [policy] allow): "
-        + ", ".join(WELL_KNOWN_REGISTRY_DOMAINS)
+        + (
+            ", ".join(WELL_KNOWN_REGISTRY_DOMAINS)
+            or "(none — every supported language's registry is in the baseline above)"
+        )
     )
 
     bounds = Table(title="[policy] bounds for plan-declared grants")
