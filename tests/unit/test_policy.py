@@ -129,10 +129,38 @@ class TestBaselineTiers:
         allow, deny = effective_egress_bounds(Config())
         assert egress_rejection("repo.packagist.org", allow, deny) is None
 
-    def test_declarable_tier_may_be_empty(self) -> None:
-        # #141 promoted every supported language's registry, so this tier is
-        # empty today. The mechanism must survive that: an empty tier is a
-        # valid state, not a bug, and nothing may assume a non-empty one.
+    def test_cpp_builds_from_apt_without_any_registry(self) -> None:
+        # #171: C/C++ is the one language whose default dependency source —
+        # the distro mirrors — was already baseline. This asserts the
+        # apt-only path end to end, which is also #141's evidence that the
+        # baseline works when a language's dependencies come from it.
+        allow, deny = effective_egress_bounds(Config())
+        for domain in APT_MIRROR_DOMAINS:
+            assert egress_rejection(domain, allow, deny) is None
+            assert domain not in WELL_KNOWN_REGISTRY_DOMAINS
+
+    def test_conan_is_declarable_not_baseline(self) -> None:
+        # #171: Conan is a real registry, but C/C++ dependencies do not
+        # normally arrive through it — so it is declare-if-you-need-it
+        # rather than seeded into every sandbox. In bounds without operator
+        # configuration; still granted late and event-logged.
+        assert "center.conan.io" in WELL_KNOWN_REGISTRY_DOMAINS
+        assert "center.conan.io" not in BASELINE_REGISTRY_DOMAINS
+        allow, deny = effective_egress_bounds(Config())
+        assert egress_rejection("center.conan.io", allow, deny) is None
+
+    def test_vcpkg_is_not_in_either_tier(self) -> None:
+        # #171: vcpkg clones ports from GitHub and then fetches source
+        # tarballs from whatever upstream each port names — unbounded by
+        # construction. No fixed host set could cover it, so it stays
+        # operator [policy] allow rather than getting a partial grant that
+        # works until it doesn't.
+        both = (*BASELINE_REGISTRY_DOMAINS, *WELL_KNOWN_REGISTRY_DOMAINS)
+        assert "vcpkg.io" not in both
+
+    def test_declarable_tier_survives_being_empty(self) -> None:
+        # The tier was empty between the Ruby promotion and Conan landing;
+        # nothing may assume it is non-empty.
         assert isinstance(WELL_KNOWN_REGISTRY_DOMAINS, tuple)
         allow, deny = effective_egress_bounds(Config())
         for domain in WELL_KNOWN_REGISTRY_DOMAINS:
