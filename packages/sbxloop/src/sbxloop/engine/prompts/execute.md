@@ -32,6 +32,11 @@ destroyed.
     `pip install X` fails. Create a virtualenv first —
     `python3 -m venv .venv && .venv/bin/pip install X` — and run project
     commands through `.venv/bin/...`.
+  - **JavaScript/Node** — install from the directory holding
+    `package.json`; `node_modules/` is project-local, so nothing needs a
+    global install. `npm ci` is the reproducible install but fails without
+    a lockfile — use `npm install` when you are creating the project and no
+    lockfile exists yet.
 
 ## Overall outcome
 
