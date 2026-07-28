@@ -307,6 +307,7 @@ languages = ["python"]   # the default when the key is unset
 | `cpp`    | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
 | `ruby`   | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)   |
 | `java`   | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
+| `php`    | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
 
 Three rules apply to every entry. Provisioning is **probe-first** — a template
 that already ships the toolchain costs no install and no network. It is

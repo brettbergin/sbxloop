@@ -123,6 +123,38 @@ def test_persist_env_is_idempotent(tmp_path: Path) -> None:
     assert target.read_text() == "export DEMO_HOME=/opt/demo\n"
 
 
+def test_php_probes_extensions_not_just_the_interpreter() -> None:
+    # A bare php-cli passes `command -v php` and then fails the moment a
+    # project or Composer itself needs mbstring or zip (#167).
+    php = toolchains.resolve(["php"])[0]
+    for extension in ("mbstring", "curl", "zip", "dom"):
+        assert extension in php.probe
+    for package in ("php-cli", "php-mbstring", "php-xml", "php-curl", "php-zip"):
+        assert package in php.apt_packages
+
+
+def test_php_composer_is_pinned_and_checksum_verified() -> None:
+    # #167 asks for a pinned, verified download rather than piping the
+    # installer into the interpreter.
+    php = toolchains.resolve(["php"])[0]
+    assert php.install_script is not None
+    assert toolchains.COMPOSER_VERSION in php.install_script
+    assert toolchains.COMPOSER_SHA256 in php.install_script
+    assert "sha256sum -c" in php.install_script
+    assert "| php" not in php.install_script and "| sudo php" not in php.install_script
+    assert len(toolchains.COMPOSER_SHA256) == 64
+
+
+def test_installer_entries_bring_their_own_curl() -> None:
+    # install_script runs after the apt batch specifically so it can rely
+    # on curl/ca-certificates; an entry that curls without asking for them
+    # would work only by luck of the base image.
+    for toolchain in toolchains.TOOLCHAINS:
+        if toolchain.install_script and "curl" in toolchain.install_script:
+            assert "curl" in toolchain.apt_packages, toolchain.name
+            assert "ca-certificates" in toolchain.apt_packages, toolchain.name
+
+
 def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")
