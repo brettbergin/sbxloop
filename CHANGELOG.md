@@ -6,6 +6,28 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`[sandbox] languages` selects which language toolchains the agent
+  sandbox is provisioned with** (issue #144, layer 1 of the language-bias
+  investigation #140). `_ensure_dev_tools` apt-installed `python3-venv` and
+  `python3-pip` for the *agent's* project before its first turn — a real
+  head start, but one only Python got: a Node, Rust, or Ruby task
+  discovered its missing compiler on first failure and spent revision
+  budget bootstrapping it. That call is now one entry in a registry
+  (`sbxloop.toolchains`) selected by config rather than a hardcoded special
+  case. Semantics are the ones the 0.4.0 field failure taught us and they
+  apply to every entry: probe first (a template that already ships the
+  toolchain costs no apt call and no network), never fatal (a failure warns
+  with the toolchain named and the run continues on the agent's own
+  `sudo apt-get` escape hatch), and opt-in only. Selected apt packages are
+  pooled into a single `update && install`, so N languages is one round
+  trip. **Behavior is unchanged for existing runs**: unset means
+  `["python"]`. Setting the key replaces that default rather than adding to
+  it — this is the point, since no language should be privileged by
+  accident of implementation. Python is the only registered entry so far;
+  the other nine follow.
+
 ### Changed
 
 - **Leftovers from the 0.2.0 `sdxloop` → `sbxloop` rename are gone.** The

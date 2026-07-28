@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from sbxloop import toolchains
 from sbxloop.errors import WorkerError, WorkerTimeoutError
 from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
@@ -46,6 +47,19 @@ def script_search_fallback_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> N
     """Script the page-size/ripgrep probe (unscripted it would run on the
     host, where the answer varies by machine — 16 KiB on Apple silicon)."""
     fake_sbx.script('exec boxa sh -c test "$(getconf PAGESIZE)"', returncode=returncode)
+
+
+def script_toolchain_probe(
+    fake_sbx: FakeSbx, name: str, *, returncode: int = 0, stderr: str = ""
+) -> None:
+    """Script one language toolchain's presence probe.
+
+    Unscripted it would run on the *host*, where the answer depends on the
+    developer's machine (the test venv has ensurepip, a mac has clang) — so
+    every toolchain probe a test can reach must be pinned explicitly.
+    """
+    toolchain = toolchains.resolve([name])[0]
+    fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=returncode, stderr=stderr)
 
 
 def agent_job(**overrides: object) -> JobRequest:
@@ -457,8 +471,9 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
-        fake_sbx.script(
-            "exec boxa python3 -c",
+        script_toolchain_probe(
+            fake_sbx,
+            "python",
             returncode=1,
             stderr="ModuleNotFoundError: No module named 'ensurepip'",
         )
@@ -493,7 +508,7 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
-        fake_sbx.script("exec boxa python3 -c", returncode=0)
+        script_toolchain_probe(fake_sbx, "python", returncode=0)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
@@ -520,8 +535,9 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
-        fake_sbx.script(
-            "exec boxa python3 -c",
+        script_toolchain_probe(
+            fake_sbx,
+            "python",
             returncode=1,
             stderr="ModuleNotFoundError: No module named 'ensurepip'",
         )
@@ -541,10 +557,44 @@ class TestInstallFallbacks:
         assert any("dev-tools ensure failed" in r.getMessage() for r in caplog.records)
         assert any("apt exploded" in r.getMessage() for r in caplog.records)
 
+    def test_ensure_dev_tools_default_is_python(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # No `languages` argument -> exactly the pre-#140 behavior: the
+        # Python probe runs and nothing else is provisioned.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "python", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True)
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert apt_cmds == [
+            "exec boxa sh -c sudo -n apt-get update -q && "
+            "sudo -n apt-get install -y -q python3-venv python3-pip"
+        ]
+
+    def test_ensure_dev_tools_unselected_language_installs_nothing(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Opt-in only: an empty selection must not fall back to "install
+        # everything" — and must not even probe for what was not selected.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_search_fallback_probe(fake_sbx)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["nonesuch"])
+        assert not [c for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)]
+
     def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
         import sbxloop
 
-        fake_sbx.script("exec boxa python3 -c", returncode=0)
+        script_toolchain_probe(fake_sbx, "python", returncode=0)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(

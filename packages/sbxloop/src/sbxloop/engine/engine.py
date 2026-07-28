@@ -361,8 +361,9 @@ class LoopEngine:
         A configured template is expected to be prebaked (`sbxloop bake`):
         install() probes it and skips the ladder on success, falling back
         when stale. ensure_dev_tools is agent-only — the agent builds
-        projects in its VM (venvs, pip); the github sandbox only runs API
-        ops. Both installs always run to completion before any failure
+        projects in its VM, so it gets the `[sandbox] languages` toolchains;
+        the github sandbox only runs API ops. Both installs always run to
+        completion before any failure
         propagates, so an error never unwinds into pair teardown while the
         other install is still mid-exec.
         """
@@ -372,6 +373,7 @@ class LoopEngine:
                 agent.install,
                 extras="copilot",
                 ensure_dev_tools=True,
+                languages=self.config.sandbox.effective_languages,
                 expect_prebaked=prebaked_expected,
             )
         ]
