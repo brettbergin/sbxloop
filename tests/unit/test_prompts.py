@@ -60,6 +60,80 @@ def test_execute_and_plan_carry_environment_notes() -> None:
     assert "ONLY the fenced JSON block" in plan
 
 
+# Layer 3 (issue #142): the prompts must carry per-ecosystem environment
+# notes at parity, so no single toolchain is the one a planner pattern-matches
+# against. Each entry is (ecosystem, plan.md markers, execute.md markers);
+# one row per language sub-issue.
+ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
+    ("Python", ("PEP 668", "python3 -m venv", ".venv/bin/pytest"), ("PEP 668", ".venv/bin/")),
+]
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "plan_markers", "execute_markers"),
+    ECOSYSTEM_NOTES,
+    ids=[row[0] for row in ECOSYSTEM_NOTES],
+)
+def test_prompts_carry_ecosystem_notes(
+    ecosystem: str,
+    plan_markers: tuple[str, ...],
+    execute_markers: tuple[str, ...],
+) -> None:
+    plan = render(
+        "plan",
+        outcome="o",
+        task_id="t1",
+        task_title="T",
+        task_description="d",
+        acceptance_criteria="- c",
+        feedback="(none)",
+        user_guidance="(none)",
+    )
+    execute = render(
+        "execute",
+        outcome="o",
+        task_id="t1",
+        task_title="T",
+        task_description="d",
+        plan_steps="- s",
+        expected_artifacts="- a",
+        feedback="(none)",
+        user_guidance="(none)",
+    )
+    for text in (plan, execute):
+        assert "Ecosystem notes" in text
+        assert f"**{ecosystem}**" in text
+    for marker in plan_markers:
+        assert marker in plan, f"{ecosystem}: missing {marker!r} in plan.md"
+    for marker in execute_markers:
+        assert marker in execute, f"{ecosystem}: missing {marker!r} in execute.md"
+
+
+def test_environment_facts_lead_language_neutral() -> None:
+    """Layer 3 (#142): the environment opener must be toolchain-neutral —
+    per-ecosystem specifics belong in the Ecosystem notes block below it, not
+    in the framing every task reads."""
+    plan = render(
+        "plan",
+        outcome="o",
+        task_id="t1",
+        task_title="T",
+        task_description="d",
+        acceptance_criteria="- c",
+        feedback="(none)",
+        user_guidance="(none)",
+    )
+    opener = plan[plan.index("## Environment facts") : plan.index("Ecosystem notes")]
+    # The universal contract stays in the opener...
+    assert "workspace root" in opener
+    assert "cannot edit" in opener
+    # ...while no ecosystem gets to frame it.
+    for ecosystem_specific in ("PEP 668", ".venv", "pytest"):
+        assert ecosystem_specific not in opener, (
+            f"{ecosystem_specific!r} leaked into the language-neutral opener"
+        )
+
+
 def test_render_all_templates_have_no_leftover_vars() -> None:
     contexts = {
         "decompose": {"outcome": "o", "max_tasks": "3"},

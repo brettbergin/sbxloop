@@ -8,6 +8,17 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **The plan and execute prompts no longer teach Python as the default
+  ecosystem** (issue #142, layer 3 of the language-bias investigation).
+  Their environment sections opened on PEP 668 and virtualenvs, and the one
+  worked verify example was `.venv/bin/pytest`, so a planner had exactly one
+  ecosystem to pattern-match against. The environment facts are now
+  language-neutral (apt + sudo, egress) with the universal workspace-root
+  verify contract kept prominent, and per-ecosystem specifics moved into a
+  short reference block the model reads one entry of. Python is the first
+  entry — its PEP 668 guidance is unchanged in substance, just no longer the
+  framing for everyone else. Ecosystems covered so far: Python.
+
 - **Leftovers from the 0.2.0 `sdxloop` → `sbxloop` rename are gone.** The
   exception base class is now `SbxloopError` (was `SdxloopError`) across all
   51 references — a breaking rename for anything importing
