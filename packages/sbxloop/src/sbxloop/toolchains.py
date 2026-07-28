@@ -169,10 +169,55 @@ JAVA = Toolchain(
 )
 
 
+# Composer is not reliably packaged at a useful version, so it comes from
+# upstream — but pinned to a release and checked against that release's
+# published sha256 rather than piped into the interpreter. #167 asks for
+# exactly this. Bumping the version means bumping the digest with it; the
+# digest is published at <download url>.sha256sum.
+COMPOSER_VERSION = "2.10.2"
+COMPOSER_SHA256 = "5ee7125f8a30a34d246cefdc0bc85b8a783b28f2aec968994118512350d28027"
+_COMPOSER_PHAR = "/tmp/composer.phar"  # nosec B108 - path inside the sandbox VM, not host tmp
+
+PHP = Toolchain(
+    name="php",
+    wanted="php, composer, mbstring/xml/curl/zip extensions",
+    # Extensions matter more than the interpreter here (#167): a bare
+    # php-cli passes a `command -v php` check and then fails the moment a
+    # real project or Composer itself needs mbstring or zip. Probe for what
+    # actually has to work.
+    probe=(
+        "command -v php >/dev/null && command -v composer >/dev/null && "
+        'php -r \'exit((int)!(extension_loaded("mbstring") '
+        '&& extension_loaded("curl") && extension_loaded("zip") '
+        '&& extension_loaded("dom")));\''
+    ),
+    # apt for the interpreter and extensions. curl/ca-certificates are here
+    # for the install script below — the apt batch runs first precisely so
+    # installer-based entries can rely on them.
+    apt_packages=(
+        "php-cli",
+        "php-mbstring",
+        "php-xml",
+        "php-curl",
+        "php-zip",
+        "curl",
+        "ca-certificates",
+    ),
+    install_script=(
+        "set -e; "
+        f"curl -fsSL -o {_COMPOSER_PHAR} "
+        f"https://getcomposer.org/download/{COMPOSER_VERSION}/composer.phar; "
+        f"printf '%s  {_COMPOSER_PHAR}\\n' '{COMPOSER_SHA256}' | sha256sum -c - >/dev/null; "
+        f"sudo -n install -m 0755 {_COMPOSER_PHAR} /usr/local/bin/composer; "
+        f"rm -f {_COMPOSER_PHAR}"
+    ),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA)
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
