@@ -17,14 +17,15 @@ destroyed.
   project commands through `.venv/bin/...`.
 - If a tool or apt package is missing, you have passwordless sudo:
   `sudo apt-get install -y <package>`.
-- Network egress is allowlisted. PyPI, GitHub, apt mirrors, and any
-  domains the plan declared as `egress` are reachable; other hosts
-  (undeclared package registries, arbitrary APIs, CDNs) may not be. If a
-  download times out repeatedly, treat the host as blocked: name the exact
-  blocked domain in your summary — a re-plan can declare it, and well-known
-  registries (RubyGems, npm, crates.io, the Go proxy) are always grantable
-  — instead of retrying forever. The allowlist is operator-bounded
-  configuration, not something you can change from in here.
+- Network egress is allowlisted. GitHub, the apt mirrors, the supported
+  languages' package registries ($baseline_registries), and any domains the
+  plan declared as `egress` are reachable; other hosts (undeclared package
+  registries, arbitrary APIs, CDNs) may not be. If a download times out
+  repeatedly, treat the host as blocked: name the exact blocked domain in
+  your summary — a re-plan can declare it, and these registries are always
+  grantable: $declarable_registries — instead of retrying forever. The
+  allowlist is operator-bounded configuration, not something you can change
+  from in here.
 - After you finish, the plan's verify commands run mechanically from the
   workspace root, exactly as written — you cannot edit them. Create files
   at the paths those commands check: if verification expects

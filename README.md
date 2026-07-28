@@ -156,24 +156,28 @@ letting in-VM tooling fail confusingly on a full disk.
 
 ## Network egress: least privilege, by plan
 
-Sandboxes start with only the baseline allowlist (Copilot/GitHub hosts, PyPI,
-apt mirrors). Well-known package registries — RubyGems, npm/yarn, crates.io,
-the Go module proxy — are one notch wider: not reachable by default, but a
-plan may declare them in `egress` with no configuration, so `bundle install`
-or `npm install` works out of the box while every grant still lands in the
-audit log. Anything else the PLAN phase declares — each domain with a
-justification — is validated against operator-set bounds:
+Sandboxes start with only the baseline allowlist: the Copilot/GitHub hosts,
+the apt mirrors, and the supported languages' package registries (issue
+[#141](https://github.com/brettbergin/sbxloop/issues/141) — no language's
+build should fail for a reason another language's build never encounters).
+Well-known registries outside that set are one notch narrower: not reachable
+by default, but a plan may declare them in `egress` with no configuration,
+and every grant lands in the audit log. Anything else the PLAN phase
+declares — each domain with a justification — is validated against
+operator-set bounds:
 
 ```toml
 # sbxloop.toml
 [policy]
-allow = ["repo.maven.apache.org", "repo1.maven.org"]  # what plans MAY request
-deny  = []                                # never grantable, even if allowed
+allow = ["nexus.corp.example.com"]  # what plans MAY request
+deny  = []                          # never grantable, even if allowed
 ```
 
 Patterns are exact domains, `*.example.com` wildcards, or `*`. Empty `allow`
 (the default) means plans may only use the baseline and the well-known
-registries. In-bounds grants are
+registries. `deny` wins over everything, including the always-reachable
+baseline: a denied registry is never seeded into the sandbox in the first
+place. In-bounds grants are
 applied **grant-late** — `sbx policy allow network` runs at EXECUTE entry, so
 resumed runs re-grant on their fresh sandboxes — and every grant and refusal
 is a `policy.allow` / `policy.deny` run event, making the persisted event log
