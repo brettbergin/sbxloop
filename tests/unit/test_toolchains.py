@@ -391,3 +391,24 @@ class TestJavaGradle:
 
     def test_java_still_persists_java_home(self) -> None:
         assert "JAVA_HOME" in (toolchains.JAVA.install_script or "")
+
+
+class TestPinnedReleases:
+    """Every pinned version is discoverable in one place (gap 9)."""
+
+    def test_every_pinned_constant_matches_its_module_value(self) -> None:
+        for release in toolchains.PINNED_RELEASES:
+            assert getattr(toolchains, release.constant) == release.version, release.constant
+
+    def test_every_installer_language_is_covered(self) -> None:
+        # A toolchain that downloads from upstream pins a version; if it is
+        # not in the table, nothing will ever tell us it went stale.
+        pinned = {r.language for r in toolchains.PINNED_RELEASES}
+        installer_based = {
+            tc.name for tc in toolchains.TOOLCHAINS if tc.install_script and tc.install_domains
+        }
+        assert installer_based <= pinned, installer_based - pinned
+
+    def test_check_endpoints_are_https(self) -> None:
+        for release in toolchains.PINNED_RELEASES:
+            assert release.current_url.startswith("https://"), release.constant

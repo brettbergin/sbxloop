@@ -38,7 +38,9 @@ from dataclasses import dataclass
 
 __all__ = [
     "DEFAULT_LANGUAGES",
+    "PINNED_RELEASES",
     "TOOLCHAINS",
+    "PinnedRelease",
     "Toolchain",
     "build_dirs",
     "install_domains",
@@ -585,6 +587,100 @@ _BY_KEY: dict[str, Toolchain] = {}
 for _toolchain in TOOLCHAINS:
     for _key in (_toolchain.name, *_toolchain.aliases):
         _BY_KEY[_key] = _toolchain
+
+
+# -- pinned upstream releases -------------------------------------------
+#
+# Every version above is pinned so runs are reproducible, which means every
+# one of them goes stale. Nothing bumped or alerted on them, and a stale pin
+# fails quietly: the agent gets an old toolchain and the run merely produces
+# worse work. This table is the single place that answers "what is pinned,
+# and where does the current version come from" — `scripts/check_toolchain_versions.py`
+# reads it (a weekly CI job runs that script and reports drift).
+#
+# Bumping a version means bumping its digest with it. `digest_note` says
+# where upstream publishes the digest; entries whose archives are digest-
+# checked per-architecture keep those digests next to their toolchain.
+@dataclass(frozen=True)
+class PinnedRelease:
+    """One pinned upstream version and how to check it for drift."""
+
+    language: str
+    constant: str
+    version: str
+    #: JSON or text endpoint naming upstream's current release.
+    current_url: str
+    #: How to read the current version out of ``current_url``.
+    extract: str
+    digest_note: str
+
+
+PINNED_RELEASES: tuple[PinnedRelease, ...] = (
+    PinnedRelease(
+        "java",
+        "JAVA_JDK_MAJOR",
+        JAVA_JDK_MAJOR,
+        "https://endoflife.date/api/openjdk.json",
+        "first entry's cycle (latest LTS is what apt should track)",
+        "apt package — no digest to pin",
+    ),
+    PinnedRelease(
+        "java",
+        "GRADLE_VERSION",
+        GRADLE_VERSION,
+        "https://services.gradle.org/versions/current",
+        "the .version field",
+        "https://services.gradle.org/distributions/gradle-<v>-bin.zip.sha256",
+    ),
+    PinnedRelease(
+        "php",
+        "COMPOSER_VERSION",
+        COMPOSER_VERSION,
+        "https://getcomposer.org/versions",
+        "the .stable[0].version field",
+        "<download url>.sha256sum",
+    ),
+    PinnedRelease(
+        "javascript",
+        "NODE_VERSION",
+        NODE_VERSION,
+        "https://nodejs.org/dist/index.json",
+        "the newest entry whose .lts is not false",
+        "https://nodejs.org/dist/v<v>/SHASUMS256.txt",
+    ),
+    PinnedRelease(
+        "typescript",
+        "TYPESCRIPT_VERSION",
+        TYPESCRIPT_VERSION,
+        "https://registry.npmjs.org/typescript",
+        'the ."dist-tags".latest field',
+        "npm resolves its own integrity — no digest pinned here",
+    ),
+    PinnedRelease(
+        "go",
+        "GO_VERSION",
+        GO_VERSION,
+        "https://go.dev/dl/?mode=json",
+        "the first stable entry's .version, minus the 'go' prefix",
+        "the same endpoint's per-file .sha256",
+    ),
+    PinnedRelease(
+        "rust",
+        "RUSTUP_VERSION",
+        RUSTUP_VERSION,
+        "https://static.rust-lang.org/rustup/release-stable.toml",
+        "the version field",
+        "<archive url>.sha256",
+    ),
+    PinnedRelease(
+        "dotnet",
+        "DOTNET_SDK_VERSION",
+        DOTNET_SDK_VERSION,
+        "https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json",
+        "the newest LTS channel's .latest-sdk",
+        "the channel's releases.json .sdk.files[].hash",
+    ),
+)
 
 
 def supported_languages() -> tuple[str, ...]:

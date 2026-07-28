@@ -38,6 +38,8 @@ select = [
 "packages/*/tests/**" = ["T20"]
 # The worker communicates over stdout by design.
 "packages/sbxloop-worker/src/sbxloop_worker/**" = ["T20"]
+# Operator scripts are CLI tools whose output IS the deliverable.
+"scripts/**" = ["T20"]
 
 [tool.bandit]
 # B101: asserts here are mypy-strict type-narrowing invariants on internal
