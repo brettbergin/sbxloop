@@ -591,6 +591,46 @@ class TestInstallFallbacks:
         client.install(wheel=wheel, ensure_dev_tools=True, languages=["nonesuch"])
         assert not [c for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)]
 
+    def test_ensure_dev_tools_provisions_the_selected_language(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # C/C++ selected, Python not: the compiler toolchain is installed and
+        # python3-venv is not, which is the whole point of #140.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "cpp", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["c++"])
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert len(apt_cmds) == 1, apt_cmds
+        for package in ("build-essential", "cmake", "ninja-build", "pkg-config"):
+            assert package in apt_cmds[0]
+        assert "python3-venv" not in apt_cmds[0]
+
+    def test_ensure_dev_tools_batches_apt_across_languages(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Two apt languages must cost ONE `update && install`, not two.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "python", returncode=1)
+        script_toolchain_probe(fake_sbx, "cpp", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["python", "cpp"])
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert len(apt_cmds) == 1, apt_cmds
+        assert "python3-venv" in apt_cmds[0] and "build-essential" in apt_cmds[0]
+
     def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
         import sbxloop
 
