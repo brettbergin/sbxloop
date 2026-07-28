@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
+from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.errors import SbxError
 from sbxloop.events import EventBus, HostEventTypes
@@ -132,6 +133,32 @@ WELL_KNOWN_REGISTRY_DOMAINS: tuple[str, ...] = (
     # and belongs in operator [policy] allow.)
     "center.conan.io",
 )
+
+
+def toolchain_install_domains(languages: Iterable[str]) -> tuple[str, ...]:
+    """Vendor hosts the selected languages' toolchain installers fetch from.
+
+    A third provision-time tier, distinct from both registry tiers above:
+
+    - ``BASELINE_REGISTRY_DOMAINS`` are where a *project's dependencies*
+      come from, are the same for every run, and are unconditional.
+    - These are where the *toolchain itself* comes from — ``nodejs.org``,
+      ``go.dev``, ``static.rust-lang.org`` and friends. They are needed only
+      by the languages an operator actually selected, and only during
+      provisioning, so they are seeded per-run from ``[sandbox] languages``
+      rather than baked into the baseline for everyone.
+
+    Without this, ``[sandbox] languages = ["rust"]`` provisions a sandbox
+    whose rustup download is blocked by the sandbox's own default-deny
+    egress: the install warns, the run continues, and the agent burns
+    revision budget bootstrapping the toolchain that was supposed to be
+    ready — the exact failure Layer 1 exists to prevent.
+
+    Apt-only toolchains contribute nothing: the distro mirrors are already
+    baseline. ``[policy] deny`` still filters the result at the call site
+    (see ``baseline_allows``).
+    """
+    return toolchains.install_domains(toolchains.resolve(list(languages)))
 
 
 def valid_pattern(pattern: str, *, operator: bool = False) -> bool:

@@ -40,6 +40,7 @@ __all__ = [
     "DEFAULT_LANGUAGES",
     "TOOLCHAINS",
     "Toolchain",
+    "install_domains",
     "normalize_language",
     "resolve",
     "supported_languages",
@@ -69,6 +70,13 @@ class Toolchain:
     # probed and installed first — TypeScript needs the Node runtime present
     # before `npm i -g typescript` can mean anything.
     requires: tuple[str, ...] = ()
+    # Hosts ``install_script`` fetches from. These are seeded into the agent
+    # sandbox's egress policy at PROVISION time, gated on the selected
+    # languages, because the install runs before the PLAN phase exists to
+    # declare anything (see ``policy.toolchain_install_domains`` and
+    # ``sbx.provision.build_specs``). An apt-only entry leaves this empty:
+    # the distro mirrors are baseline for every run already.
+    install_domains: tuple[str, ...] = ()
 
 
 PYTHON = Toolchain(
@@ -216,6 +224,8 @@ PHP = Toolchain(
         f"sudo -n install -m 0755 {_COMPOSER_PHAR} /usr/local/bin/composer; "
         f"rm -f {_COMPOSER_PHAR}"
     ),
+    # Composer is a pinned, digest-checked phar from upstream.
+    install_domains=("getcomposer.org",),
 )
 
 
@@ -276,6 +286,8 @@ NODE = Toolchain(
         "sudo -n rm -f /usr/local/CHANGELOG.md /usr/local/LICENSE /usr/local/README.md; "
         f"rm -f {_NODE_TARBALL}"
     ),
+    # Upstream Node tarballs.
+    install_domains=("nodejs.org",),
     aliases=("js", "node", "nodejs", "javascript-node"),
 )
 
@@ -300,6 +312,10 @@ TYPESCRIPT = Toolchain(
     install_script=(
         f"set -e; sudo -n npm install -g --no-fund --no-audit typescript@{TYPESCRIPT_VERSION}"
     ),
+    # `npm i -g typescript` — the npm registry is already in the
+    # package-registry baseline, but naming it here keeps the
+    # dependency explicit and survives a [policy] deny audit.
+    install_domains=("registry.npmjs.org",),
     aliases=("ts",),
 )
 
@@ -338,6 +354,9 @@ GO = Toolchain(
         "sudo -n ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt; "
         f"rm -f {_GO_TARBALL}"
     ),
+    # go.dev issues the download and redirects to Google storage for
+    # the tarball itself; both hosts must be reachable.
+    install_domains=("go.dev", "dl.google.com"),
     aliases=("golang",),
 )
 
@@ -401,6 +420,8 @@ RUST = Toolchain(
         'sudo -n ln -sf "$HOME/.cargo/bin/$shim" "/usr/local/bin/$shim"; done; '
         f"rm -f {_RUSTUP_INIT}"
     ),
+    # rustup-init and the toolchain archives it pulls.
+    install_domains=("static.rust-lang.org",),
     aliases=("rs", "cargo"),
 )
 
@@ -458,6 +479,8 @@ DOTNET = Toolchain(
         + "; "
         f"rm -f {_DOTNET_TARBALL}"
     ),
+    # Microsoft's SDK tarball CDN.
+    install_domains=("builds.dotnet.microsoft.com",),
     aliases=("csharp", "c#", "net", "dotnet-sdk"),
 )
 
@@ -517,6 +540,26 @@ def resolve(names: Sequence[str]) -> tuple[Toolchain, ...]:
         wanted.add(key)
         pending.extend(_BY_KEY[key].requires)
     return tuple(toolchain for toolchain in TOOLCHAINS if toolchain.name in wanted)
+
+
+def install_domains(toolchains: Iterable[Toolchain]) -> tuple[str, ...]:
+    """Hosts the selected toolchains' installers fetch from, order-stable.
+
+    Provisioning seeds these into the agent sandbox's egress policy before
+    the first agent turn. They cannot come from plan-declared ``egress``:
+    the install runs during provisioning, and the PLAN phase that would
+    declare them has not happened yet — the ordering gap that made six of
+    the ten languages silently fall back to bootstrapping themselves.
+
+    Only the selected languages contribute, so a Python-only run does not
+    carry Node's or Rust's vendor hosts in its allow list.
+    """
+    domains: list[str] = []
+    for toolchain in toolchains:
+        for domain in toolchain.install_domains:
+            if domain not in domains:
+                domains.append(domain)
+    return tuple(domains)
 
 
 def apt_packages(toolchains: Iterable[Toolchain]) -> tuple[str, ...]:

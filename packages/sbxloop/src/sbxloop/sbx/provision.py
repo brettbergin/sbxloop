@@ -31,7 +31,11 @@ from pathlib import Path
 from sbxloop.config import Config
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
-from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
+from sbxloop.policy import (
+    PROMPT_ADVERTISED_DOMAINS,
+    baseline_allows,
+    toolchain_install_domains,
+)
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     PROBE_SECRET_ENV_VISIBILITY,
@@ -139,9 +143,21 @@ class Provisioner:
             # depend on the operator's global sbx preset. Seeded through
             # baseline_allows so [policy] deny still wins over the tier that
             # never asks for a grant.
+            #
+            # toolchain_install_domains: same ordering problem, narrower
+            # scope. The selected languages' installers fetch from vendor
+            # hosts during THIS provisioning, before a plan exists to declare
+            # them — so they are seeded too, gated on [sandbox] languages so
+            # a Python-only run carries none of Node's or Rust's hosts.
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
-                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.config.policy.deny),
+                *baseline_allows(
+                    (
+                        *PROMPT_ADVERTISED_DOMAINS,
+                        *toolchain_install_domains(self.config.sandbox.effective_languages),
+                    ),
+                    self.config.policy.deny,
+                ),
                 *extra,
             ],
             secrets=[SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)],

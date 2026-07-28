@@ -670,3 +670,71 @@ class TestConformanceRecording:
             assert pair.mounted
         finally:
             pair.cleanup()
+
+
+class TestToolchainInstallerEgress:
+    """Installer domains reach the sandbox at provision time (gap 1).
+
+    Layer 1's installers curl from vendor hosts *during provisioning* —
+    before the PLAN phase that would declare them as egress exists. Seeding
+    them is what makes `[sandbox] languages` work without the operator
+    hand-writing extra_allow_domains for six of the ten languages.
+    """
+
+    @staticmethod
+    def _agent_allows(fake_sbx: FakeSbx, tmp_path: Path, **sandbox: object) -> list[str]:
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "sandbox": sandbox, **GITHUB_ENABLED}
+        )
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
+        agent, _ = provisioner.build_specs("r1", tmp_path)
+        return list(agent.policy_allows)
+
+    def test_installer_hosts_seeded_for_selected_language(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        allows = self._agent_allows(fake_sbx, tmp_path, languages=["rust"])
+        assert "static.rust-lang.org" in allows
+
+    def test_requires_pulls_in_the_runtime_host(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        # TypeScript is installed from npm but needs Node first, so Node's
+        # vendor host has to come along or the install dies before tsc.
+        allows = self._agent_allows(fake_sbx, tmp_path, languages=["typescript"])
+        assert "nodejs.org" in allows
+        assert "registry.npmjs.org" in allows
+
+    def test_unselected_languages_contribute_nothing(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # The default (python) is apt-only: no vendor hosts at all.
+        allows = self._agent_allows(fake_sbx, tmp_path)
+        for host in (
+            "nodejs.org",
+            "go.dev",
+            "static.rust-lang.org",
+            "builds.dotnet.microsoft.com",
+            "getcomposer.org",
+        ):
+            assert host not in allows
+
+    def test_apt_only_language_adds_no_vendor_host(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        allows = self._agent_allows(fake_sbx, tmp_path, languages=["cpp", "ruby", "java"])
+        assert "deb.debian.org" in allows  # apt mirrors are baseline anyway
+        assert not [d for d in allows if d.endswith((".rs", "rust-lang.org", "nodejs.org"))]
+
+    def test_policy_deny_still_wins_over_installer_hosts(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Seeded domains are the one place a deny cannot be enforced by
+        # refusing a later grant — there is no grant. It must be filtered.
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "sandbox": {"languages": ["rust"]},
+                "policy": {"deny": ["static.rust-lang.org"]},
+                **GITHUB_ENABLED,
+            }
+        )
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
+        agent, _ = provisioner.build_specs("r1", tmp_path)
+        assert "static.rust-lang.org" not in agent.policy_allows
