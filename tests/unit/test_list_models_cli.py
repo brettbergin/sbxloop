@@ -27,7 +27,7 @@ from sbxloop.cli.models import (
     format_efforts,
     model_row,
 )
-from sbxloop.errors import SdxloopError
+from sbxloop.errors import SbxloopError
 
 runner = CliRunner()
 
@@ -128,7 +128,7 @@ def install_stub_sdk(
 class TestFetchModels:
     def test_missing_sdk_is_actionable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setitem(sys.modules, "copilot", None)  # forces ImportError
-        with pytest.raises(SdxloopError, match="github-copilot-sdk is not installed"):
+        with pytest.raises(SbxloopError, match="github-copilot-sdk is not installed"):
             fetch_models()
 
     def test_returns_sdk_models(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -140,7 +140,7 @@ class TestFetchModels:
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
         monkeypatch.delenv("GH_TOKEN", raising=False)
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        with pytest.raises(SdxloopError, match="not authenticated") as excinfo:
+        with pytest.raises(SbxloopError, match="not authenticated") as excinfo:
             fetch_models()
         assert "COPILOT_GITHUB_TOKEN" in str(excinfo.value)
 

@@ -53,7 +53,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     SbxError,
-    SdxloopError,
+    SbxloopError,
     StateError,
     WorkerError,
 )
@@ -323,7 +323,7 @@ class LoopEngine:
                         # alive here, and partial artifacts beat none.
                         self._harvest(run_id, pair)
                         self._report_artifacts(run_id, pair)
-                except SdxloopError:
+                except SbxloopError:
                     # Infra failures (install, worker, sbx) are exactly what
                     # gets diagnosed in-sandbox; decide keep before pair exit.
                     self._keep_on_failure(run_id, pair)
@@ -332,7 +332,7 @@ class LoopEngine:
                     self._deliver(run_id, outcome, pair, github)
                 else:
                     self._keep_on_failure(run_id, pair)
-        except SdxloopError:
+        except SbxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
         self._set_run_state(run_id, state)
@@ -568,7 +568,7 @@ class LoopEngine:
                 draft=gh.deliver_draft,
                 exclude=self.config.artifacts.exclude,
             )
-        except SdxloopError as exc:
+        except SbxloopError as exc:
             # Catches the whole family the delivery path can raise — not just
             # DeliveryError/GithubOpsError but WorkerError/WorkerTimeoutError/
             # SbxError from the op jobs themselves. Anything narrower lets an

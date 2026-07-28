@@ -1,17 +1,17 @@
 from sbxloop.errors import (
     BudgetExceededError,
     SbxError,
+    SbxloopError,
     SbxNotFoundError,
-    SdxloopError,
     WorkerTimeoutError,
 )
 
 
 def test_hierarchy() -> None:
     assert issubclass(SbxNotFoundError, SbxError)
-    assert issubclass(SbxError, SdxloopError)
-    assert issubclass(WorkerTimeoutError, SdxloopError)
-    assert issubclass(BudgetExceededError, SdxloopError)
+    assert issubclass(SbxError, SbxloopError)
+    assert issubclass(WorkerTimeoutError, SbxloopError)
+    assert issubclass(BudgetExceededError, SbxloopError)
 
 
 def test_sbx_error_str_includes_context() -> None:
