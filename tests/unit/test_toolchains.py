@@ -233,6 +233,34 @@ def test_typescript_install_is_pinned() -> None:
     assert f"typescript@{toolchains.TYPESCRIPT_VERSION}" in typescript.install_script
 
 
+def test_go_pins_a_verified_digest_per_architecture() -> None:
+    go = toolchains.resolve(["go"])[0]
+    assert go.install_script is not None
+    assert toolchains.GO_VERSION in go.install_script
+    for deb_arch, (upstream, digest) in toolchains._GO_DIGESTS.items():
+        assert f"{deb_arch}) arch={upstream}" in go.install_script
+        assert len(digest) == 64
+        assert digest in go.install_script
+    assert "sha256sum -c" in go.install_script
+
+
+def test_go_replaces_rather_than_overlays_a_previous_install() -> None:
+    # Extracting over an existing /usr/local/go mixes two versions into a
+    # broken tree; upstream's own instructions say to remove it first.
+    go = toolchains.resolve(["go"])[0]
+    assert go.install_script is not None
+    assert "rm -rf /usr/local/go" in go.install_script
+
+
+def test_go_does_not_pin_gotoolchain_local() -> None:
+    # Deliberate (#153): GOTOOLCHAIN=local would fail outright on a project
+    # whose go.mod demands a newer Go — the exact distro-lag failure this
+    # entry exists to avoid.
+    go = toolchains.resolve(["go"])[0]
+    assert go.install_script is not None
+    assert "GOTOOLCHAIN" not in go.install_script
+
+
 def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")

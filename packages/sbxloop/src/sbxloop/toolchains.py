@@ -304,10 +304,55 @@ TYPESCRIPT = Toolchain(
 )
 
 
+# Debian/Ubuntu ship `golang-go`, but it commonly lags upstream and Go
+# modules frequently declare a `go` directive newer than the distro build,
+# which fails the build outright (#153). Official tarball, pinned; digests
+# are upstream's own (https://go.dev/dl/?mode=json).
+GO_VERSION = "1.26.5"
+GO_SERIES = ".".join(GO_VERSION.split(".")[:2])
+_GO_TARBALL = "/tmp/go.tar.gz"  # nosec B108 - path inside the sandbox VM, not host tmp
+_GO_DIGESTS = {
+    "amd64": ("amd64", "5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"),
+    "arm64": ("arm64", "fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"),
+}
+
+GO = Toolchain(
+    name="go",
+    wanted=f"go {GO_SERIES}.x (build, test, fmt, vet)",
+    # Same reasoning as Node: check the pinned series, since accepting an
+    # older `go` would leave the agent with the stale-toolchain failure
+    # this entry exists to prevent.
+    probe=f'go version 2>/dev/null | grep -q "go{GO_SERIES}\\."',
+    apt_packages=("curl", "ca-certificates"),
+    # Upstream's documented layout: wipe any previous /usr/local/go rather
+    # than extracting over it (mixing two versions leaves a broken tree),
+    # then link the two entrypoints onto PATH. GOTOOLCHAIN is deliberately
+    # left at its default — see the note below.
+    install_script=(
+        "set -e; " + _arch_dispatch(_GO_DIGESTS) + "; "
+        f'curl -fsSL -o {_GO_TARBALL} "https://go.dev/dl/go{GO_VERSION}.linux-$arch.tar.gz"; '
+        f"printf '%s  {_GO_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+        "sudo -n rm -rf /usr/local/go; "
+        f"sudo -n tar -xzf {_GO_TARBALL} -C /usr/local; "
+        "sudo -n ln -sf /usr/local/go/bin/go /usr/local/bin/go; "
+        "sudo -n ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt; "
+        f"rm -f {_GO_TARBALL}"
+    ),
+    aliases=("golang",),
+)
+
+# #153 asks whether to pin GOTOOLCHAIN=local for reproducibility. No: a
+# project whose go.mod demands a newer Go would then fail outright, which is
+# precisely the distro-lag failure this entry exists to avoid. Left at the
+# default, Go fetches the toolchain the module asks for — and that download
+# happens during EXECUTE, where a plan CAN declare the Go proxy as egress,
+# unlike the provision-time install above.
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE, TYPESCRIPT)
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE, TYPESCRIPT, GO)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
