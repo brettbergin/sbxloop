@@ -86,6 +86,11 @@ ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
         ("composer.json", "composer install --no-interaction && ./vendor/bin/phpunit"),
         ("composer.json", "./vendor/bin/"),
     ),
+    (
+        "C/C++",
+        ("cmake -S . -B build", "ctest --test-dir build --output-on-failure"),
+        ("cmake -S . -B build", "ctest --test-dir build"),
+    ),
 ]
 
 
