@@ -237,6 +237,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   (`policy.baseline_allows`) instead of being seeded and then refused a
   redundant re-grant. Previously a `deny` on `pypi.org` left it reachable,
   because provisioning seeded it before any grant could be refused.
+
 - **The plan and execute prompts no longer teach Python as the default
   ecosystem** (issue #142, layer 3 of the language-bias investigation).
   Their environment sections opened on PEP 668 and virtualenvs, and the one

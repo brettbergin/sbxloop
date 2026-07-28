@@ -1,5 +1,7 @@
 """Prompt template rendering tests."""
 
+from typing import ClassVar
+
 import pytest
 
 from sbxloop.engine.prompts import bullet_list, render
@@ -315,7 +317,7 @@ def test_bullet_list() -> None:
 class TestEcosystemSelection:
     """Only the selected languages' ecosystem notes reach the model (gap 3)."""
 
-    CTX = {
+    CTX: ClassVar[dict[str, str]] = {
         "outcome": "o",
         "task_id": "t1",
         "task_title": "T",
