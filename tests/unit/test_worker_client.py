@@ -55,10 +55,17 @@ def script_toolchain_probe(
     """Script one language toolchain's presence probe.
 
     Unscripted it would run on the *host*, where the answer depends on the
-    developer's machine (the test venv has ensurepip, a mac has clang) — so
-    every toolchain probe a test can reach must be pinned explicitly.
+    developer's machine (the test venv has ensurepip, a mac has clang, a CI
+    runner has a global tsc) — so every toolchain probe a test can reach
+    must be pinned explicitly.
+
+    Select by exact name: ``resolve`` expands ``requires`` and returns
+    registry order, so ``resolve(["typescript"])[0]`` is *javascript* and
+    scripting "typescript" silently re-scripted Node while leaving tsc's
+    own probe reaching the host.
     """
-    toolchain = toolchains.resolve([name])[0]
+    key = toolchains.normalize_language(name)
+    toolchain = next(tc for tc in toolchains.resolve([name]) if tc.name == key)
     fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=returncode, stderr=stderr)
 
 
