@@ -49,6 +49,29 @@ def redacted_argv(argv: Sequence[str]) -> list[str]:
     return safe
 
 
+def _exec_failed_at_sbx_level(stderr: str) -> bool:
+    """Whether `sbx exec` stderr means sbx failed, not the inner command.
+
+    `exec` is the one call whose stderr belongs to somebody else's program,
+    so the generic not-found markers cannot be applied to it raw. A bare
+    "not found" is the single most common thing a shell says — `sh: dpkg:
+    command not found`, curl's `404 Not Found` — and matching it turned
+    every such failure into a raised SbxNotFoundError instead of a nonzero
+    result. That broke callers built on `result.ok`: a toolchain installer
+    probing for a binary the guest lacks aborted the whole run, defeating
+    the best-effort contract the dev-tools ensure is written to (#140).
+
+    So a missing *sandbox* has to say so — real sbx names the sandbox in
+    that message, as does the fake — while infra markers stay as they are.
+    """
+    lowered = stderr.lower()
+    if any(marker in lowered for marker in _INFRA_MARKERS):
+        return True
+    if any(marker in lowered for marker in ("no such sandbox", "unknown sandbox")):
+        return True
+    return "sandbox" in lowered and any(marker in lowered for marker in _NOT_FOUND_MARKERS)
+
+
 class SbxCLI:
     """Blocking, typed access to the sbx CLI."""
 
@@ -171,10 +194,8 @@ class SbxCLI:
         back as a nonzero ExecResult — decision points that act on a nonzero
         result must stay conservative about that ambiguity (#63)."""
         result = self.run("exec", name, *cmd, timeout=timeout, check=False)
-        if not result.ok:
-            lowered = result.stderr.lower()
-            if any(m in lowered for m in (*_NOT_FOUND_MARKERS, *_INFRA_MARKERS)):
-                raise self._error_for(result)
+        if not result.ok and _exec_failed_at_sbx_level(result.stderr):
+            raise self._error_for(result)
         return result
 
     def exec_interactive(self, name: str, cmd: Sequence[str]) -> int:
