@@ -56,6 +56,10 @@ destroyed.
     `build.gradle`, preferring `./mvnw` / `./gradlew` when the project
     ships one. `JAVA_HOME` must be set, and Maven needs `-B` so it runs
     non-interactively.
+  - **C#/.NET** — run `dotnet test` from the directory holding the
+    `.csproj` or `.sln`; it restores and builds on its own, so a separate
+    restore step is usually unnecessary. Build output lands in `obj/` and
+    `bin/`.
 
 ## Overall outcome
 
