@@ -39,6 +39,11 @@ All notable changes to sbxloop are documented here. The project adheres to
     proxy whose checksum database is blocked fails `go mod download` at
     verification, which reads as a broken toolchain rather than a policy
     decision (#154)
+  - Ruby — `rubygems.org` and `index.rubygems.org` (bundler's compact index
+    is a separate host). This was the case `policy.py` cited as motivating
+    the declarable tier in the first place — "write a Rails app"
+    bundle-installing out of the box — and it no longer depends on the plan
+    remembering (#159)
   - Rust — `crates.io`, `static.crates.io`, and `index.crates.io`. Cargo
     resolves from the sparse index, downloads from static, and talks to the
     API separately; two of the three fails mid-resolution (#156). The
@@ -48,6 +53,12 @@ All notable changes to sbxloop are documented here. The project adheres to
   The plan and execute prompts no longer hardcode the tiers: both lists are
   injected from `policy.py` at render time, so a promotion cannot leave the
   prompts telling planners to declare a domain that needs no declaration.
+
+  With every supported language promoted, `WELL_KNOWN_REGISTRY_DOMAINS` — the
+  declarable-without-configuration tier — is now empty. The mechanism stays:
+  it is the right home for a registry that is legitimate but should not be
+  reachable by default, and `sbxloop config policy` and the prompts both
+  render the empty case explicitly rather than printing a blank.
 
   The promotion trades some audit granularity — a baseline registry emits no
   `policy.allow` event, because there is no grant to log — so it is bounded

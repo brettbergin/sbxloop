@@ -73,6 +73,8 @@ BASELINE_REGISTRY_DOMAINS = (
     "crates.io",  # cargo API
     "static.crates.io",  # crate downloads
     "index.crates.io",  # cargo sparse index
+    "rubygems.org",  # gem downloads and API
+    "index.rubygems.org",  # bundler's compact index — a separate host
 )
 
 # Distro package mirrors: language-neutral infrastructure rather than any one
@@ -100,14 +102,15 @@ PROMPT_ADVERTISED_DOMAINS = (*BASELINE_REGISTRY_DOMAINS, *APT_MIRROR_DOMAINS)
 # in-bounds without any [policy] allow configuration — the audit trail #141
 # weighs the baseline against.
 #
-# #141 drains this tier into BASELINE_REGISTRY_DOMAINS one language at a
-# time; what remains is what a build reaches on purpose rather than by
-# default. Registries beyond both tiers still need operator bounds, and
-# [policy] deny wins over this list like everything else.
-WELL_KNOWN_REGISTRY_DOMAINS = (
-    "rubygems.org",  # gem downloads and API
-    "index.rubygems.org",  # bundler's compact index
-)
+# #141 drained this tier into BASELINE_REGISTRY_DOMAINS one language at a
+# time, and it is currently empty: every registry of the ten supported
+# languages earned unconditional reachability. The tier itself stays — it is
+# the right home for a registry that is legitimate but not something every
+# build should reach by default (a plan may name it, with a justification,
+# and the grant is event-logged). Registries beyond both tiers still need
+# operator bounds, and [policy] deny wins over this list like everything
+# else.
+WELL_KNOWN_REGISTRY_DOMAINS: tuple[str, ...] = ()
 
 
 def valid_pattern(pattern: str, *, operator: bool = False) -> bool:
