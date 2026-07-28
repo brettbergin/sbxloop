@@ -167,6 +167,11 @@ All notable changes to sbxloop are documented here. The project adheres to
   - JavaScript/Node — `registry.npmjs.org`, `registry.yarnpkg.com`, and
     `codeload.github.com` for `github:user/repo` dependencies, whose
     tarballs come from a different host than the clone (#148)
+  - TypeScript — no new domains: the compiler and `@types/*` packages are
+    plain npm packages, so the Node promotion covers the whole toolchain.
+    A type-check-only task over vendored dependencies needs no egress at
+    all, and an empty `egress` is a complete plan rather than a forgetful
+    one (#151)
 
   The plan and execute prompts no longer hardcode the tiers: both lists are
   injected from `policy.py` at render time, so a promotion cannot leave the

@@ -746,6 +746,16 @@ class TestPlanEgress:
         assert seeds[0][:3] == ["allow", "network", "registry.npmjs.org"]
         assert [e for e in harness.events if e.type.startswith("policy.")] == []
 
+    def test_typecheck_only_task_needs_no_egress(self, harness: Harness) -> None:
+        # #151: the minimal TypeScript case — dependencies already vendored,
+        # so the task only runs `tsc`. An empty `egress` must be a complete
+        # plan, not a plan that forgot something: no grants, no policy
+        # events, no failure.
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("type-check the project")
+        assert result.state == "completed"
+        assert [e for e in harness.events if e.type.startswith("policy.")] == []
+
     def test_out_of_bounds_egress_rejected_then_retried(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), PLAN_SAAS_API, PLAN, EXECUTE, PASS, ACCEPT])
         result = harness.engine().start("saas api denied")
