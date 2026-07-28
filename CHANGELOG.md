@@ -39,6 +39,11 @@ All notable changes to sbxloop are documented here. The project adheres to
     proxy whose checksum database is blocked fails `go mod download` at
     verification, which reads as a broken toolchain rather than a policy
     decision (#154)
+  - Rust — `crates.io`, `static.crates.io`, and `index.crates.io`. Cargo
+    resolves from the sparse index, downloads from static, and talks to the
+    API separately; two of the three fails mid-resolution (#156). The
+    `rustup` installer domains are toolchain rather than registry and stay
+    with the Layer 1 work (#143)
 
   The plan and execute prompts no longer hardcode the tiers: both lists are
   injected from `policy.py` at render time, so a promotion cannot leave the
