@@ -59,10 +59,13 @@ class PolicyConfig(_ConfigModel):
     (``sbxloop logs RUN --type policy.``). Patterns are exact domains,
     ``*.example.com`` wildcards (the domain and all subdomains), or ``*``
     (everything). Empty ``allow`` — the default — means plans may only use
-    the always-reachable baseline (Copilot/GitHub hosts, PyPI, apt mirrors)
-    plus the well-known package registries (RubyGems, npm, crates.io, the Go
-    proxy — see ``policy.WELL_KNOWN_REGISTRY_DOMAINS``), which are in-bounds
-    to declare without configuration. ``deny`` overrides all of it.
+    the always-reachable baseline (Copilot/GitHub hosts, the language
+    registry baseline in ``policy.BASELINE_REGISTRY_DOMAINS``, apt mirrors)
+    plus the well-known package registries (see
+    ``policy.WELL_KNOWN_REGISTRY_DOMAINS``), which are in-bounds to declare
+    without configuration. ``deny`` overrides all of it — including the
+    always-reachable tier, which provisioning seeds through
+    ``policy.baseline_allows`` rather than unconditionally.
     """
 
     allow: list[str] = Field(default_factory=list)
