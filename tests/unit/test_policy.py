@@ -119,6 +119,16 @@ class TestBaselineTiers:
         allow, deny = effective_egress_bounds(Config())
         assert egress_rejection("api.nuget.org", allow, deny) is None
 
+    def test_php_packagist_is_baseline(self) -> None:
+        # #168: Packagist was in neither tier. Composer also pulls many dist
+        # zips from codeload.github.com, which #148 already made baseline
+        # for npm's git dependencies — the same host, needed for the same
+        # reason by a different ecosystem.
+        for domain in ("repo.packagist.org", "packagist.org", "codeload.github.com"):
+            assert domain in BASELINE_REGISTRY_DOMAINS
+        allow, deny = effective_egress_bounds(Config())
+        assert egress_rejection("repo.packagist.org", allow, deny) is None
+
     def test_declarable_tier_may_be_empty(self) -> None:
         # #141 promoted every supported language's registry, so this tier is
         # empty today. The mechanism must survive that: an empty tier is a
