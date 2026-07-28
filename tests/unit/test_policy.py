@@ -9,7 +9,11 @@ from sbxloop.config import Config
 from sbxloop.engine.model import EgressSpec
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.policy import (
+    APT_MIRROR_DOMAINS,
+    BASELINE_REGISTRY_DOMAINS,
+    PROMPT_ADVERTISED_DOMAINS,
     EgressGranter,
+    baseline_allows,
     effective_egress_bounds,
     egress_rejection,
     pattern_covers,
@@ -52,6 +56,42 @@ class TestPatterns:
         assert not valid_pattern("pypi.org/simple")
         assert not valid_pattern("pypi.org:443")
         assert not valid_pattern("localhost")
+
+
+class TestBaselineTiers:
+    """The always-reachable tier #141 grows one language at a time."""
+
+    def test_advertised_is_registries_plus_mirrors(self) -> None:
+        # The prompts advertise exactly the two baseline tiers, so a domain
+        # can never be promoted into one without the prompts covering it.
+        assert (*BASELINE_REGISTRY_DOMAINS, *APT_MIRROR_DOMAINS) == PROMPT_ADVERTISED_DOMAINS
+
+    def test_python_registry_is_baseline(self) -> None:
+        # #145: PyPI keeps its baseline privilege — the level-up direction —
+        # and the rest of Layer 2 joins it here rather than PyPI joining the
+        # declarable tier.
+        assert "pypi.org" in BASELINE_REGISTRY_DOMAINS
+        assert "files.pythonhosted.org" in BASELINE_REGISTRY_DOMAINS
+        allow, deny = effective_egress_bounds(Config())
+        for domain in BASELINE_REGISTRY_DOMAINS:
+            assert egress_rejection(domain, allow, deny) is None
+
+    def test_baseline_allows_drops_denied_domains(self) -> None:
+        # The baseline is seeded at provision time, before any plan exists,
+        # so this filter is the only place [policy] deny can reach it.
+        kept = baseline_allows(PROMPT_ADVERTISED_DOMAINS, ["pypi.org"])
+        assert "pypi.org" not in kept
+        assert "files.pythonhosted.org" in kept
+        assert "archive.ubuntu.com" in kept
+
+    def test_baseline_allows_honors_wildcards(self) -> None:
+        assert baseline_allows(("pypi.org", "files.pythonhosted.org"), ["*.pythonhosted.org"]) == [
+            "pypi.org"
+        ]
+        assert baseline_allows(PROMPT_ADVERTISED_DOMAINS, ["*"]) == []
+
+    def test_baseline_allows_is_a_no_op_without_deny(self) -> None:
+        assert baseline_allows(PROMPT_ADVERTISED_DOMAINS, []) == list(PROMPT_ADVERTISED_DOMAINS)
 
 
 class TestBounds:
@@ -183,6 +223,26 @@ class TestEgressGranter:
         granter.apply("t1", [("archive.ubuntu.com", "apt-get for build deps")])
         assert fake_sbx.policies() == []
         assert [e for e in events if e.type.startswith("policy.")] == []
+
+    def test_baseline_registry_needs_no_grant(self, fake_sbx: FakeSbx) -> None:
+        # The parity promise: a plan may name the language registry, and it
+        # costs nothing — no grant, no event, no failure when it forgets.
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events)
+        granter.apply("t1", [("pypi.org", "pip install the deps")])
+        assert fake_sbx.policies() == []
+        assert [e for e in events if e.type.startswith("policy.")] == []
+
+    def test_denied_baseline_registry_is_refused(self, fake_sbx: FakeSbx) -> None:
+        # [policy] deny wins over the always-reachable tier: provisioning
+        # never seeded it (baseline_allows), so a declaration is refused
+        # rather than silently treated as already granted.
+        events: list[Event] = []
+        granter = self.make_granter(fake_sbx, events, policy={"deny": ["pypi.org"]})
+        granter.apply("t1", [("pypi.org", "pip install the deps")])
+        assert fake_sbx.policies() == []
+        (event,) = [e for e in events if e.type == HostEventTypes.POLICY_DENY]
+        assert event.data["domain"] == "pypi.org"
 
     def test_out_of_bounds_refused_with_deny_event(self, fake_sbx: FakeSbx) -> None:
         events: list[Event] = []

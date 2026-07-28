@@ -34,7 +34,7 @@ from pydantic import BaseModel, ConfigDict
 import sbxloop
 from sbxloop.config import Config
 from sbxloop.errors import BakeError, SbxError, SbxloopError
-from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS
+from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
@@ -107,7 +107,7 @@ def bake_template(
             # resolve during the bake.
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
-                *PROMPT_ADVERTISED_DOMAINS,
+                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, config.policy.deny),
                 *config.sandbox.extra_allow_domains,
             ],
         )

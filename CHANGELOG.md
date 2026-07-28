@@ -145,6 +145,34 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **Package-registry egress levels up rather than down** (issues #141,
+  #145). The network baseline privileged Python: `pypi.org` and
+  `files.pythonhosted.org` were unconditionally reachable while every other
+  language's registry cost a plan declaration the planner had to remember —
+  and a forgotten declaration is a failed run, not a degraded one. #145
+  settled the direction for the whole layer: promote the other registries to
+  PyPI's tier rather than demote PyPI to theirs. Demotion could not have
+  produced real parity anyway — the worker's own `pip install` runs at
+  provision time, before a plan exists to declare egress in — and it would
+  have broken every existing plan that never declared PyPI.
+
+  Structurally, `policy.PROMPT_ADVERTISED_DOMAINS` is now the union of
+  `BASELINE_REGISTRY_DOMAINS` (the language registry tier, starting with
+  Python's two hosts) and `APT_MIRROR_DOMAINS` (language-neutral distro
+  infrastructure, baseline regardless). The following changes populate the
+  registry tier one language at a time. `sbxloop config policy` prints the
+  two tiers separately, so what is unconditionally reachable is legible
+  without reading the source.
+
+  The promotion trades some audit granularity — a baseline registry emits no
+  `policy.allow` event, because there is no grant to log — so it is bounded
+  to read-only public registries for supported languages.
+  **`[policy] deny` now wins over the always-reachable tier too**: denied
+  domains are filtered out of the set provisioning seeds
+  (`policy.baseline_allows`) instead of being seeded and then refused a
+  redundant re-grant. Previously a `deny` on `pypi.org` left it reachable,
+  because provisioning seeded it before any grant could be refused.
+
 - **Leftovers from the 0.2.0 `sdxloop` → `sbxloop` rename are gone.** The
   exception base class is now `SbxloopError` (was `SdxloopError`) across all
   51 references — a breaking rename for anything importing

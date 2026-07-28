@@ -24,6 +24,7 @@ subdomain), or the operator-only ``*`` (covers everything).
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 from sbxloop.config import Config
 from sbxloop.errors import SbxError
@@ -32,15 +33,32 @@ from sbxloop.sbx.cli import SbxCLI
 
 DOMAIN_PATTERN_RE = re.compile(r"(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}")
 
-# Hosts the plan/execute prompts advertise as reachable. Granted to the
-# agent sandbox at provision time (see sbx.provision) — the promise must
-# hold even under an operator preset that lacks the host: the worker's pip
-# installs and the dev-tools apt ensure both run before any plan exists, so
-# they cannot rely on plan-declared egress. A plan declaring one of these
-# is in-bounds without operator configuration, and needs no re-grant.
-PROMPT_ADVERTISED_DOMAINS = (
-    "pypi.org",
-    "files.pythonhosted.org",
+# Package registries in the always-reachable baseline: no plan declaration,
+# no operator configuration. Issue #145 settled the direction for #141 —
+# level *up* (every supported language's registry gets the treatment PyPI
+# has always had) rather than level down (PyPI demoted to the declarable
+# tier alongside everyone else).
+#
+# Level-down could not have produced real parity: the worker's own pip
+# install and the dev-tools apt ensure run at provision time, before a plan
+# exists to declare egress in, so Python would have kept a provision-time
+# exception whatever the tiers said — while every plan that never declared
+# `pypi.org` started failing mid-EXECUTE.
+#
+# The cost is audit granularity: a baseline registry emits no `policy.allow`
+# event, because there is no grant to log. So the tier stays narrow — the
+# read-only public registry hosts of supported languages, nothing else — and
+# `[policy] deny` still overrides it, including the provision-time seeding
+# (see ``baseline_allows``).
+BASELINE_REGISTRY_DOMAINS = (
+    "pypi.org",  # PyPI API and the simple index
+    "files.pythonhosted.org",  # wheel and sdist downloads
+)
+
+# Distro package mirrors: language-neutral infrastructure rather than any one
+# ecosystem's registry — the dev-tools apt ensure needs them before a plan
+# exists — so they are baseline whatever the registry tiers do.
+APT_MIRROR_DOMAINS = (
     "deb.debian.org",
     "security.debian.org",
     "archive.ubuntu.com",
@@ -48,12 +66,23 @@ PROMPT_ADVERTISED_DOMAINS = (
     "ports.ubuntu.com",
 )
 
-# Well-known read-only package registries the prompts advertise as
-# *declarable*: unlike the always-reachable baseline above, these are granted
-# only when a plan names them in `egress` (grant-late, event-logged), but the
-# declaration is in-bounds without any [policy] allow configuration. This is
-# what lets "write a Rails app" bundle-install out of the box while keeping
-# the audit trail. Registries beyond this set still need operator bounds;
+# Hosts the plan/execute prompts advertise as reachable. Granted to the
+# agent sandbox at provision time (see sbx.provision) — the promise must
+# hold even under an operator preset that lacks the host: the worker's pip
+# installs and the dev-tools apt ensure both run before any plan exists, so
+# they cannot rely on plan-declared egress. A plan declaring one of these
+# is in-bounds without operator configuration, and needs no re-grant.
+PROMPT_ADVERTISED_DOMAINS = (*BASELINE_REGISTRY_DOMAINS, *APT_MIRROR_DOMAINS)
+
+# Package registries the prompts advertise as *declarable*: unlike the
+# always-reachable baseline above, these are granted only when a plan names
+# them in `egress` (grant-late, event-logged), but the declaration is
+# in-bounds without any [policy] allow configuration — the audit trail #141
+# weighs the baseline against.
+#
+# #141 drains this tier into BASELINE_REGISTRY_DOMAINS one language at a
+# time; what remains is what a build reaches on purpose rather than by
+# default. Registries beyond both tiers still need operator bounds, and
 # [policy] deny wins over this list like everything else.
 WELL_KNOWN_REGISTRY_DOMAINS = (
     "rubygems.org",  # gem downloads and API
@@ -91,6 +120,26 @@ def pattern_covers(pattern: str, domain: str) -> bool:
     base = pattern[2:]
     requested = domain[2:] if domain.startswith("*.") else domain
     return requested == base or requested.endswith(f".{base}")
+
+
+def baseline_allows(domains: Iterable[str], deny: Iterable[str]) -> list[str]:
+    """``domains`` minus everything ``[policy] deny`` covers.
+
+    The always-reachable tier is seeded into the sandbox at provision time,
+    before any plan exists — the one place a deny pattern cannot be enforced
+    by refusing a grant later, because there is no grant. Filtering here is
+    what keeps ``[policy] deny`` authoritative as #141 moves registries into
+    the baseline: an operator who denies one gets a sandbox that never had
+    it, not a sandbox that was seeded with it and then refused a redundant
+    re-grant.
+
+    Deliberately not applied to ``provision.AGENT_ALLOW_DOMAINS`` /
+    ``GITHUB_ALLOW_DOMAINS``: those are sbxloop's own control plane (the
+    Copilot and GitHub APIs the loop itself speaks), not task egress, and a
+    run cannot function without them.
+    """
+    patterns = list(deny)
+    return [d for d in domains if not any(pattern_covers(p, d) for p in patterns)]
 
 
 def egress_rejection(domain: str, allow: list[str], deny: list[str]) -> str | None:
@@ -147,7 +196,11 @@ class EgressGranter:
             d.lower()
             for d in (
                 *AGENT_ALLOW_DOMAINS,
-                *PROMPT_ADVERTISED_DOMAINS,
+                # what provisioning actually seeded — a denied baseline
+                # domain is not on the sandbox, so it is not "already
+                # granted" (``apply`` refuses it on the deny check first
+                # either way, but the set should describe reality).
+                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.deny),
                 *config.sandbox.extra_allow_domains,
             )
         }
