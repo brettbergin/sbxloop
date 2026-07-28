@@ -8,6 +8,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["javascript"]` provisions Node** (issue #147).
+  The official `nodejs.org` tarball rather than apt: Debian/Ubuntu stable
+  ship a Node several majors behind current LTS, which breaks packages
+  declaring modern `engines` constraints — a functional failure, not
+  cosmetic lag. Pinned to an exact LTS release and verified against the
+  upstream `SHASUMS256.txt` digest for the sandbox's architecture, resolved
+  in-sandbox so the same config works on arm64 microVMs and amd64 CI
+  runners; an unrecognized architecture fails loudly instead of downloading
+  a binary that cannot run. The probe checks the pinned **major**, not just
+  that `node` exists, so a template carrying an older Node is upgraded
+  rather than accepted. Node is extracted into `/usr/local`, which also
+  makes it npm's global prefix so `npm i -g` lands on PATH. Accepted
+  spellings: `javascript`, `js`, `node`, `nodejs`, `javascript-node`. Adds
+  a `nodejs.org` egress dependency (#141).
+
 - **`[sandbox] languages = ["php"]` provisions PHP and Composer** (issue
   #167). apt for the interpreter and — more importantly — the extensions:
   `php-cli` alone passes a `command -v php` check and then fails the moment
