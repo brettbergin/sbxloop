@@ -44,6 +44,9 @@ destroyed.
   - **Go** — build and test from the directory holding `go.mod`, using
     `./...` to cover every package; run from above the module root it
     matches nothing and still exits 0.
+  - **Rust** — run `cargo test` from the directory holding `Cargo.toml`;
+    it builds and tests in one step. `target/` grows large — leave it in
+    the project rather than building somewhere outside the workspace.
 
 ## Overall outcome
 

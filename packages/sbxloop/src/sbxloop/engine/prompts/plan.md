@@ -77,6 +77,12 @@ and none of these is the "normal" choice.
   the module root matches no packages and exits 0, so a module one level
   down must be entered explicitly. Verify:
   `go build ./... && go test ./...`.
+- **Rust** — `Cargo.toml` marks the crate or workspace root, and
+  `cargo test` builds and runs the tests in one step, so a separate build
+  step ahead of it is redundant. `target/` holds build output and gets
+  large; keep it inside the project, and expect it in whatever an
+  unmounted run harvests. Unlike Go, a wrong directory fails loudly here
+  rather than silently passing. Verify: `cargo test`.
 
 ## Response format
 
