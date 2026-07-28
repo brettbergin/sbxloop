@@ -164,52 +164,70 @@ All notable changes to sbxloop are documented here. The project adheres to
   without reading the source. Promoted into the registry tier so far:
 
   - Python — `pypi.org`, `files.pythonhosted.org` (#145)
+
   - JavaScript/Node — `registry.npmjs.org`, `registry.yarnpkg.com`, and
     `codeload.github.com` for `github:user/repo` dependencies, whose
     tarballs come from a different host than the clone (#148)
+
   - TypeScript — no new domains: the compiler and `@types/*` packages are
     plain npm packages, so the Node promotion covers the whole toolchain.
     A type-check-only task over vendored dependencies needs no egress at
     all, and an empty `egress` is a complete plan rather than a forgetful
     one (#151)
+
   - Go — `proxy.golang.org` and `sum.golang.org` together: a reachable
     proxy whose checksum database is blocked fails `go mod download` at
     verification, which reads as a broken toolchain rather than a policy
     decision (#154)
+
   - Java — `repo.maven.apache.org` and `repo1.maven.org` (Maven Central),
     plus `plugins.gradle.org` and `services.gradle.org`. Java was in
     *neither* tier: a plan could not even declare Central without operator
     configuration. Gradle needs the plugin portal and the wrapper
     distribution host as well — Central alone still fails the build (#162)
+
   - C#/.NET — `api.nuget.org` and `nuget.org`, also previously in neither
     tier. `dotnet restore` runs implicitly inside `dotnet build` and
     `dotnet test`, so an unreachable feed surfaced as a build failure
     rather than an install failure (#165)
+
   - PHP — `repo.packagist.org` and `packagist.org`, the third registry that
     was in neither tier. Composer also fetches many dist zips from
     `codeload.github.com`, already baseline since the Node promotion —
     without it, `composer install` fails only for the packages that happen
     to be served from GitHub (#168)
+
   - Ruby — `rubygems.org` and `index.rubygems.org` (bundler's compact index
     is a separate host). This was the case `policy.py` cited as motivating
     the declarable tier in the first place — "write a Rails app"
     bundle-installing out of the box — and it no longer depends on the plan
     remembering (#159)
+
   - Rust — `crates.io`, `static.crates.io`, and `index.crates.io`. Cargo
     resolves from the sparse index, downloads from static, and talks to the
     API separately; two of the three fails mid-resolution (#156). The
     `rustup` installer domains are toolchain rather than registry and stay
     with the Layer 1 work (#143)
 
+  - C/C++ — no new baseline domains. Its default dependency source is apt,
+    already baseline, and the apt-only path is now covered by tests: useful
+    evidence that the baseline works when a language's dependencies come
+    from it. Conan (`center.conan.io`) is declarable rather than seeded —
+    a real registry, but not how C/C++ dependencies normally arrive — and
+    vcpkg stays operator-configured, since it fetches source tarballs from
+    whatever upstream each port names and no fixed host set can cover that
+    (#171)
+
   The plan and execute prompts no longer hardcode the tiers: both lists are
   injected from `policy.py` at render time, so a promotion cannot leave the
   prompts telling planners to declare a domain that needs no declaration.
 
-  With every supported language promoted, `WELL_KNOWN_REGISTRY_DOMAINS` — the
-  declarable-without-configuration tier — is now empty. The mechanism stays:
-  it is the right home for a registry that is legitimate but should not be
-  reachable by default, and `sbxloop config policy` and the prompts both
-  render the empty case explicitly rather than printing a blank.
+  `WELL_KNOWN_REGISTRY_DOMAINS` — the declarable-without-configuration tier —
+  survives as the second-line case: a legitimate registry that is not how a
+  language's dependencies normally arrive, so a plan names it and the grant
+  is event-logged. Conan is its one member today. An empty tier is also a
+  supported state: `sbxloop config policy` and the prompts both render it
+  explicitly rather than printing a blank.
 
   The promotion trades some audit granularity — a baseline registry emits no
   `policy.allow` event, because there is no grant to log — so it is bounded

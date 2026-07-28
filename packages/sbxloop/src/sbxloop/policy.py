@@ -114,15 +114,24 @@ PROMPT_ADVERTISED_DOMAINS = (*BASELINE_REGISTRY_DOMAINS, *APT_MIRROR_DOMAINS)
 # in-bounds without any [policy] allow configuration — the audit trail #141
 # weighs the baseline against.
 #
-# #141 drained this tier into BASELINE_REGISTRY_DOMAINS one language at a
-# time, and it is currently empty: every registry of the ten supported
-# languages earned unconditional reachability. The tier itself stays — it is
-# the right home for a registry that is legitimate but not something every
-# build should reach by default (a plan may name it, with a justification,
-# and the grant is event-logged). Registries beyond both tiers still need
-# operator bounds, and [policy] deny wins over this list like everything
-# else.
-WELL_KNOWN_REGISTRY_DOMAINS: tuple[str, ...] = ()
+# #141 drained this tier into BASELINE_REGISTRY_DOMAINS for the ten
+# supported languages: their default dependency source is unconditional now.
+# What is left here is the second-line case — a legitimate registry that is
+# not how a language's dependencies normally arrive, so a plan should have
+# to name it (with a justification, and the grant is event-logged) rather
+# than every sandbox carrying it.
+#
+# Registries beyond both tiers still need operator bounds, and [policy] deny
+# wins over this list like everything else.
+WELL_KNOWN_REGISTRY_DOMAINS: tuple[str, ...] = (
+    # C/C++ has no default registry — its dependencies normally come from
+    # apt, which is baseline. Conan is a real registry but an opt-in one, so
+    # it is declarable rather than seeded. (vcpkg is deliberately absent:
+    # it clones ports from GitHub and then fetches source tarballs from
+    # whatever upstream each port names, which is unbounded by construction
+    # and belongs in operator [policy] allow.)
+    "center.conan.io",
+)
 
 
 def valid_pattern(pattern: str, *, operator: bool = False) -> bool:
