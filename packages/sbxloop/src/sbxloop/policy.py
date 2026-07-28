@@ -83,6 +83,8 @@ BASELINE_REGISTRY_DOMAINS = (
     # without either even when Central is reachable.
     "plugins.gradle.org",
     "services.gradle.org",
+    "api.nuget.org",  # NuGet v3 API and package downloads
+    "nuget.org",  # the gallery host clients still resolve through
 )
 
 # Distro package mirrors: language-neutral infrastructure rather than any one

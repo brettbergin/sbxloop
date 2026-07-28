@@ -44,6 +44,10 @@ All notable changes to sbxloop are documented here. The project adheres to
     *neither* tier: a plan could not even declare Central without operator
     configuration. Gradle needs the plugin portal and the wrapper
     distribution host as well — Central alone still fails the build (#162)
+  - C#/.NET — `api.nuget.org` and `nuget.org`, also previously in neither
+    tier. `dotnet restore` runs implicitly inside `dotnet build` and
+    `dotnet test`, so an unreachable feed surfaced as a build failure
+    rather than an install failure (#165)
   - Ruby — `rubygems.org` and `index.rubygems.org` (bundler's compact index
     is a separate host). This was the case `policy.py` cited as motivating
     the declarable tier in the first place — "write a Rails app"
