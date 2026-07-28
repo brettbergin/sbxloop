@@ -996,7 +996,12 @@ class TestDeliverHook:
         assert calls[0]["run_id"] == result.run_id
         assert calls[0]["outcome"] == "ship it"
         assert calls[0]["source_dir"] == result.workspace
-        assert calls[0]["exclude"] == [".git", ".sbxloop"]  # config default threaded through
+        # Config.artifact_excludes is threaded through: the configured
+        # defaults plus the selected languages' build output (gap 10),
+        # so delivery never opens a PR full of build artifacts.
+        assert calls[0]["exclude"][:2] == [".git", ".sbxloop"]
+        assert ".venv" in calls[0]["exclude"]  # default language is python
+        assert "node_modules" not in calls[0]["exclude"]
         deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
         assert [e.data for e in deliver_events] == [
             {"repo": "o/r", "pr": 3, "url": "https://github.com/o/r/pull/3"}
