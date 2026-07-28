@@ -86,6 +86,14 @@ class TestBaselineTiers:
             assert domain in BASELINE_REGISTRY_DOMAINS
             assert domain not in WELL_KNOWN_REGISTRY_DOMAINS
 
+    def test_all_three_cargo_hosts_are_baseline(self) -> None:
+        # #156: cargo splits resolution (index), download (static), and API
+        # across three hosts. Two out of three fails mid-resolution, which
+        # looks like a broken lockfile rather than a blocked host.
+        for domain in ("crates.io", "static.crates.io", "index.crates.io"):
+            assert domain in BASELINE_REGISTRY_DOMAINS
+            assert domain not in WELL_KNOWN_REGISTRY_DOMAINS
+
     def test_typescript_toolchain_resolves_from_the_baseline(self) -> None:
         # #151: TypeScript reaches the registry for more than application
         # dependencies — the compiler and every `@types/*` package come from
@@ -209,9 +217,9 @@ class TestEgressGranter:
 
     def test_grant_is_idempotent_per_domain(self, fake_sbx: FakeSbx) -> None:
         events: list[Event] = []
-        granter = self.make_granter(fake_sbx, events, policy={"allow": ["*.crates.io"]})
-        granter.apply("t1", [("static.crates.io", "cargo build")])
-        granter.apply("t2", [("static.crates.io", "cargo build again")])
+        granter = self.make_granter(fake_sbx, events, policy={"allow": ["*.example-saas.com"]})
+        granter.apply("t1", [("api.example-saas.com", "fetch the dataset")])
+        granter.apply("t2", [("api.example-saas.com", "fetch it again")])
         assert len(fake_sbx.policies()) == 1
         assert len([e for e in events if e.type == HostEventTypes.POLICY_ALLOW]) == 1
 
