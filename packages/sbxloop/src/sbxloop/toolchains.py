@@ -116,10 +116,63 @@ RUBY = Toolchain(
 )
 
 
+# sbx documents /etc/sandbox-persistent.sh as where persistent sandbox env
+# lives, and the worker loads it at startup (see
+# ``sbxloop_worker.__main__.PERSISTENT_ENV_FILE``) so the agent session and
+# its shell commands inherit it. That makes it the one place a toolchain can
+# export a variable the agent will actually see — `sbx exec sh -c` does not
+# source login profiles, so /etc/profile.d would be invisible here.
+PERSISTENT_ENV = "/etc/sandbox-persistent.sh"
+
+
+def _persist_env(variable: str, value_expr: str) -> str:
+    """Shell that appends ``export VAR=...`` to the persistent env, once.
+
+    ``value_expr`` is substituted into the shell unquoted, so it may be a
+    command substitution. The grep guard keeps a re-run from stacking
+    duplicate exports.
+    """
+    return (
+        f"grep -qs '^export {variable}=' {PERSISTENT_ENV} || "
+        f'printf "export {variable}=%s\\n" "{value_expr}" '
+        f"| sudo -n tee -a {PERSISTENT_ENV} >/dev/null"
+    )
+
+
+# Pinned rather than floating on `default-jdk`, which moves between distro
+# releases and would silently change the compiler under a project.
+JAVA_JDK_MAJOR = "21"
+
+JAVA = Toolchain(
+    name="java",
+    wanted="java, javac, mvn, JAVA_HOME",
+    # JAVA_HOME is part of the contract (#161: many build tools read it
+    # directly), but it lives in a file rather than this probe's env — the
+    # probe runs under a bare `sbx exec sh -c`, which sources nothing. So
+    # check that the export was recorded, not that it is currently set.
+    probe=(
+        "command -v javac >/dev/null && command -v mvn >/dev/null "
+        f"&& grep -qs '^export JAVA_HOME=' {PERSISTENT_ENV}"
+    ),
+    # apt for the JDK and Maven, per #161. Distro Gradle is materially
+    # stale and most projects ship a `gradlew` wrapper anyway, so Gradle is
+    # deliberately absent — the wrapper fetches its own distribution, which
+    # is an egress question for #141 rather than a package to install.
+    apt_packages=(f"openjdk-{JAVA_JDK_MAJOR}-jdk", "maven"),
+    # Derive JAVA_HOME from the javac that apt just put on PATH rather than
+    # hardcoding /usr/lib/jvm/... — the directory name embeds the distro
+    # architecture (…-amd64 vs …-arm64) and would be wrong half the time.
+    install_script=_persist_env(
+        "JAVA_HOME", '$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")'
+    ),
+    aliases=("jdk", "jvm"),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY)
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
