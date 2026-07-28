@@ -310,6 +310,7 @@ languages = ["python"]   # the default when the key is unset
 | `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
 | `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)         |
 | `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                        |
+| `go`         | `golang`                   | Go toolchain (pinned tarball from `go.dev`)                   |
 
 Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
 
@@ -341,6 +342,7 @@ extra_allow_domains = ["nodejs.org", "registry.npmjs.org"]
 | `php`        | `getcomposer.org`                    |
 | `javascript` | `nodejs.org`                         |
 | `typescript` | `nodejs.org`, `registry.npmjs.org`   |
+| `go`         | `go.dev`, `dl.google.com`            |
 
 Without them the install warns and the run continues — the agent falls back to
 bootstrapping the toolchain itself, which is the behavior these entries exist
