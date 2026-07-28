@@ -22,12 +22,18 @@ import sbxloop
 from sbxloop.config import load_config
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.policy import (
+    PROMPT_ADVERTISED_DOMAINS,
+    baseline_allows,
+    toolchain_install_domains,
+)
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
 from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, GH_TOKEN_ENVS
 from sbxloop.sbx.prune import count_orphans
 from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
+from sbxloop.toolchains import resolve as resolve_toolchains
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import SDK_PERMISSION_KINDS, installed_sdk_permission_kinds
 
@@ -294,6 +300,70 @@ def collect_checks(
                 hard=False,
             )
         )
+
+    # language toolchains: are the selected languages provisionable?
+    #
+    # The failure this catches is the quiet one. Toolchain provisioning is
+    # best-effort by contract — a blocked installer download warns and the
+    # run continues — so a misconfigured egress policy does not fail
+    # anything visibly; it just hands the agent a sandbox without the
+    # compiler it was promised and lets it burn revision budget. Diagnosis
+    # time is where that should surface.
+    languages = config.sandbox.effective_languages
+    selected = resolve_toolchains(list(languages))
+    needed = toolchain_install_domains(languages)
+    reachable = set(
+        baseline_allows(
+            (*PROMPT_ADVERTISED_DOMAINS, *needed, *config.sandbox.extra_allow_domains),
+            config.policy.deny,
+        )
+    )
+    blocked = [domain for domain in needed if domain not in reachable]
+    installer_based = [tc.name for tc in selected if tc.install_domains]
+    if blocked:
+        checks.append(
+            Check(
+                "language toolchains",
+                False,
+                f"{', '.join(languages)} selected, but [policy] deny blocks "
+                f"{', '.join(blocked)} — those toolchains cannot install at "
+                "provision time and the agent will have to bootstrap them "
+                "itself. Remove the deny entry or drop the language.",
+            )
+        )
+    else:
+        detail = f"{', '.join(languages)} selected"
+        if installer_based:
+            detail += f"; installer hosts reachable for {', '.join(installer_based)}"
+        else:
+            detail += "; all apt-based, no vendor egress needed"
+        checks.append(Check("language toolchains", True, detail))
+
+    # baked template vs. selected languages
+    record = load_bake_record(config)
+    if record is not None and config.sandbox.template:
+        baked = list(record.languages)
+        missing = [name for name in languages if name not in baked]
+        if baked and missing:
+            checks.append(
+                Check(
+                    "baked toolchains",
+                    False,
+                    f"template {record.ref} was baked for {', '.join(baked) or 'nothing'} "
+                    f"but {', '.join(missing)} is selected — provisioning will fall back to "
+                    "installing it per run. Re-bake with the current [sandbox] languages.",
+                    hard=False,
+                )
+            )
+        elif baked:
+            checks.append(
+                Check(
+                    "baked toolchains",
+                    True,
+                    f"template {record.ref} carries {', '.join(baked)}",
+                    hard=False,
+                )
+            )
 
     # worker wheel
     wheel = resolve_worker_wheel()

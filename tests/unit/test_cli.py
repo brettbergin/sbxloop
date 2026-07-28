@@ -1521,3 +1521,54 @@ class TestDoctorStatsProbe:
         assert "sandbox stats" in result.output
         # fake sbx (like real 0.35.x) has no stats command -> in-VM sampling
         assert "samples in-VM" in result.output
+
+
+class TestDoctorLanguageToolchains:
+    """doctor answers "can the selected languages actually provision?" (gap 14).
+
+    The failure this surfaces is the quiet one: toolchain provisioning is
+    best-effort, so a blocked installer host warns and the run continues —
+    the agent just silently lacks the compiler it was promised.
+    """
+
+    @staticmethod
+    def _check(env: dict[str, str], name: str = "language toolchains") -> object:
+        from sbxloop.cli.doctor import collect_checks
+
+        matches = [
+            c for c in collect_checks({"COPILOT_GITHUB_TOKEN": "t", **env}) if c.name == name
+        ]
+        return matches[0] if matches else None
+
+    def test_apt_only_languages_need_no_vendor_egress(self) -> None:
+        check = self._check({"SBXLOOP_SANDBOX__LANGUAGES": '["cpp"]'})
+        assert check.ok
+        assert "apt-based" in check.detail
+
+    def test_installer_languages_report_reachable_hosts(self) -> None:
+        check = self._check({"SBXLOOP_SANDBOX__LANGUAGES": '["rust","go"]'})
+        assert check.ok
+        assert "rust" in check.detail and "go" in check.detail
+
+    def test_denied_installer_host_fails_the_check(self) -> None:
+        check = self._check(
+            {
+                "SBXLOOP_SANDBOX__LANGUAGES": '["rust"]',
+                "SBXLOOP_POLICY__DENY": '["static.rust-lang.org"]',
+            }
+        )
+        assert not check.ok
+        assert "static.rust-lang.org" in check.detail
+        # The remedy has to be actionable, not just a diagnosis.
+        assert "Remove the deny entry" in check.detail
+
+    def test_extra_allow_domains_satisfy_the_check(self) -> None:
+        # An operator who predates the provision-time tier and hand-wrote
+        # the domain should not be told it is blocked.
+        check = self._check(
+            {
+                "SBXLOOP_SANDBOX__LANGUAGES": '["rust"]',
+                "SBXLOOP_SANDBOX__EXTRA_ALLOW_DOMAINS": '["static.rust-lang.org"]',
+            }
+        )
+        assert check.ok
