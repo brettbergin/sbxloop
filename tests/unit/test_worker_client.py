@@ -666,7 +666,10 @@ class TestInstallFallbacks:
         script_toolchain_probe(fake_sbx, "java", returncode=1)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
-        fake_sbx.script("exec boxa sh -c grep -qs", returncode=1, stderr="tee: permission denied")
+        # java's install_script is "set -e; <persist JAVA_HOME>; <install gradle>"
+        fake_sbx.script(
+            "exec boxa sh -c set -e; grep -qs", returncode=1, stderr="tee: permission denied"
+        )
         self._script_happy_install(fake_sbx)
         with caplog.at_level("WARNING"):
             client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])

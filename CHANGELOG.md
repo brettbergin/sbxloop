@@ -6,6 +6,37 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The three language-agnostic layers now compose.** Layer 1 (toolchain
+  provisioning), layer 2 (registry egress) and layer 3 (prompt guidance)
+  were built independently and left seams between them; this closes them.
+
+  The keystone: **toolchain installer domains are seeded at provision
+  time**, gated on `[sandbox] languages`. Six of the ten languages install
+  by fetching from a vendor host, and that fetch happens *before* the PLAN
+  phase that would declare it as egress — so `languages = ["rust"]`
+  provisioned a sandbox whose own rustup download its policy blocked.
+  Because the ensure is best-effort this warned rather than failed: the
+  agent silently bootstrapped the toolchain itself, which is precisely what
+  layer 1 exists to prevent. A third tier — distinct from the registry
+  baseline in being per-run and only for selected languages — makes
+  `[sandbox] languages` work without hand-written `extra_allow_domains`.
+
+  Also closed: `sbxloop bake` honors `[sandbox] languages` instead of always
+  baking Python; the prompts send only the selected ecosystems' notes rather
+  than all ten, so the model is never told about a toolchain the sandbox
+  lacks; `[artifacts] exclude` derives each language's build output
+  (`target/`, `node_modules/`, `obj/`, `vendor/`, ...) from the same
+  selection, so runs stop harvesting and *delivering* build trees; Java
+  gained Gradle, whose egress layer 2 had already provisioned; `sbxloop doctor` reports whether the selected languages can actually provision; and
+  the C/C++ prompts explain where Conan and vcpkg stand instead of leaving
+  the agent to plan a build that cannot complete.
+
+  Pinned toolchain versions gained a single documented home
+  (`toolchains.PINNED_RELEASES`) and a weekly job that reports drift — they
+  were scattered constants that nothing bumped and nothing alerted on.
+
 ### Added
 
 - **`[sandbox] languages = ["dotnet"]` provisions the .NET SDK** (issue
