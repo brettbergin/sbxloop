@@ -67,6 +67,11 @@ def test_execute_and_plan_carry_environment_notes() -> None:
 ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("Python", ("PEP 668", "python3 -m venv", ".venv/bin/pytest"), ("PEP 668", ".venv/bin/")),
     ("JavaScript/Node", ("package.json", "npm ci && npm test"), ("package.json", "npm ci")),
+    (
+        "TypeScript",
+        ("tsconfig.json", "npx tsc --noEmit && npm test"),
+        ("tsconfig.json", "tsc --noEmit"),
+    ),
 ]
 
 

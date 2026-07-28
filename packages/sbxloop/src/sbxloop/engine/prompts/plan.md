@@ -62,6 +62,14 @@ and none of these is the "normal" choice.
   outright without one — if the plan creates the project from scratch,
   either commit a lockfile or use `npm install`. Verify:
   `npm ci && npm test`.
+- **TypeScript** — `tsconfig.json` sits at the project root, and
+  type-checking is a step distinct from running tests: `npx tsc --noEmit`
+  type-checks without emitting output. Test runners vary (vitest, jest,
+  `node:test`), so read the project's scripts rather than assuming one.
+  The workspace-root contract is sharp here — `npx tsc` run where there is
+  no `tsconfig.json` type-checks nothing and still exits 0, so a
+  subdirectory project must be entered explicitly. Verify:
+  `npx tsc --noEmit && npm test`.
 
 ## Response format
 

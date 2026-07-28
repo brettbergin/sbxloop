@@ -37,6 +37,10 @@ destroyed.
     global install. `npm ci` is the reproducible install but fails without
     a lockfile — use `npm install` when you are creating the project and no
     lockfile exists yet.
+  - **TypeScript** — run `npx tsc --noEmit` from the directory holding
+    `tsconfig.json`; run anywhere else it checks nothing and still exits 0.
+    A passing type-check and a passing test run are two different things —
+    do both.
 
 ## Overall outcome
 
