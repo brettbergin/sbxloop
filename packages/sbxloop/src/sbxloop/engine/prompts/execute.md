@@ -48,6 +48,10 @@ destroyed.
   - **Rust** — run `cargo test` from the directory holding `Cargo.toml`;
     it builds and tests in one step. `target/` grows large — leave it in
     the project rather than building somewhere outside the workspace.
+  - **Ruby** — `bundle install` from the directory holding the `Gemfile`,
+    then run project binaries through `bundle exec`; a bare `rspec` gets
+    the wrong gem environment or none. Gems with native extensions may
+    need apt build tooling installed first.
 
 ## Overall outcome
 
