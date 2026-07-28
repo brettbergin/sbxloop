@@ -48,6 +48,11 @@ All notable changes to sbxloop are documented here. The project adheres to
     tier. `dotnet restore` runs implicitly inside `dotnet build` and
     `dotnet test`, so an unreachable feed surfaced as a build failure
     rather than an install failure (#165)
+  - PHP — `repo.packagist.org` and `packagist.org`, the third registry that
+    was in neither tier. Composer also fetches many dist zips from
+    `codeload.github.com`, already baseline since the Node promotion —
+    without it, `composer install` fails only for the packages that happen
+    to be served from GitHub (#168)
   - Ruby — `rubygems.org` and `index.rubygems.org` (bundler's compact index
     is a separate host). This was the case `policy.py` cited as motivating
     the declarable tier in the first place — "write a Rails app"

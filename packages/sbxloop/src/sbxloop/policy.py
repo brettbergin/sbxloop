@@ -85,6 +85,8 @@ BASELINE_REGISTRY_DOMAINS = (
     "services.gradle.org",
     "api.nuget.org",  # NuGet v3 API and package downloads
     "nuget.org",  # the gallery host clients still resolve through
+    "repo.packagist.org",  # Composer metadata and dist
+    "packagist.org",  # the canonical host Composer redirects from
 )
 
 # Distro package mirrors: language-neutral infrastructure rather than any one
