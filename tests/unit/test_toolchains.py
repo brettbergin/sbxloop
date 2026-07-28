@@ -284,7 +284,8 @@ def test_downloads_are_checksum_verified(toolchain: toolchains.Toolchain) -> Non
     script = toolchain.install_script
     if script is None or "curl" not in script:
         return
-    assert "sha256sum -c" in script, f"{toolchain.name} downloads without verifying"
+    verified = "sha256sum -c" in script or "sha512sum -c" in script
+    assert verified, f"{toolchain.name} downloads without verifying"
     # A real pipe-into-a-shell, not the `| sha256sum` that does the
     # verifying — hence the word boundary.
     piped = re.search(r"\|\s*(sudo\s+(-\S+\s+)*)?(sh|bash|python3?|php)\b", script)
@@ -309,6 +310,51 @@ def test_rust_does_not_rely_on_shell_profiles_for_path() -> None:
     assert rust.install_script is not None
     assert "--no-modify-path" in rust.install_script
     assert "/usr/local/bin" in rust.install_script
+
+
+@pytest.mark.parametrize("name", ["dotnet", "csharp", "c#", "net", "dotnet-sdk"])
+def test_dotnet_is_reachable_by_every_spelling(name: str) -> None:
+    assert toolchains.normalize_language(name) == "dotnet"
+
+
+def test_dotnet_pins_the_sdk_major_and_verifies_sha512() -> None:
+    # The .NET feed publishes sha512, not sha256 (#164 pins the SDK major
+    # because a project's global.json can demand an exact SDK).
+    dotnet = toolchains.resolve(["dotnet"])[0]
+    assert dotnet.install_script is not None
+    assert toolchains.DOTNET_SDK_VERSION in dotnet.install_script
+    assert "sha512sum -c" in dotnet.install_script
+    assert f'grep -q "^{toolchains.DOTNET_SDK_MAJOR}\\.' in dotnet.probe
+    for _deb_arch, (_upstream, digest) in toolchains._DOTNET_DIGESTS.items():
+        assert len(digest) == 128, "sha512 digests are 128 hex chars"
+        assert digest in dotnet.install_script
+
+
+def test_dotnet_records_root_and_opts_out_of_telemetry() -> None:
+    # A manual SDK install is only half-done without DOTNET_ROOT, and
+    # telemetry under default-deny egress is just a blocked request.
+    dotnet = toolchains.resolve(["dotnet"])[0]
+    assert dotnet.install_script is not None
+    assert "export DOTNET_ROOT=" in dotnet.install_script
+    assert "DOTNET_CLI_TELEMETRY_OPTOUT" in dotnet.install_script
+    assert toolchains.PERSISTENT_ENV in dotnet.probe
+
+
+def test_every_language_in_the_agreed_set_is_registered() -> None:
+    # The 10-language set from #140. A missing entry means a sub-issue
+    # silently regressed out of the registry.
+    assert set(toolchains.supported_languages()) == {
+        "python",
+        "cpp",
+        "ruby",
+        "java",
+        "php",
+        "javascript",
+        "typescript",
+        "go",
+        "rust",
+        "dotnet",
+    }
 
 
 def test_python_entry_matches_the_pre_140_behavior() -> None:

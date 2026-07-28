@@ -8,6 +8,22 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["dotnet"]` provisions the .NET SDK** (issue
+  #164), completing the ten-language set for layer 1 of #140. Availability
+  and currency of `dotnet-sdk-*` in the base Debian/Ubuntu archives varies
+  by release and is unreliable to depend on, so the SDK comes from
+  Microsoft's own builds, pinned to an LTS patch and verified against the
+  **sha512** its release metadata publishes (the .NET feed publishes sha512
+  rather than sha256). The major is pinned because a project's `global.json`
+  can demand an exact SDK and fails hard when it is absent. `DOTNET_ROOT` is
+  recorded in the persistent env — a manual, non-package SDK install is only
+  half-done without it — along with a telemetry opt-out, which under
+  default-deny egress would otherwise only ever be a blocked outbound
+  request. At roughly 220 MB the SDK is the strongest candidate in the set
+  for `sbxloop bake` rather than a per-run download. Accepted spellings:
+  `dotnet`, `csharp`, `c#`, `net`, `dotnet-sdk`. Adds a
+  `builds.dotnet.microsoft.com` egress dependency (#141).
+
 - **`[sandbox] languages = ["rust"]` provisions cargo and rustc** (issue
   #143). Debian/Ubuntu do ship `cargo`/`rustc`, but distro Rust routinely
   lags stable by several releases, which breaks edition- and MSRV-sensitive
