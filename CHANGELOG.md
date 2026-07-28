@@ -8,6 +8,15 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["cpp"]` provisions a C/C++ toolchain** (issue
+  #170). `build-essential`, `cmake`, `ninja-build`, and `pkg-config` — pure
+  apt, no installer, and no egress beyond the apt mirrors already in the
+  always-reachable baseline, which makes this the cleanest entry in the
+  Layer 1 set. Accepted spellings: `cpp`, `c`, `c++`, `cxx`, `c-cpp`. The
+  probe checks `gcc`, `g++`, `make`, `cmake`, and `pkg-config`; `ninja` and
+  `clang` are optional extras a build can do without, so a template that
+  lacks them is not reinstalled over.
+
 - **`[sandbox] languages` selects which language toolchains the agent
   sandbox is provisioned with** (issue #144, layer 1 of the language-bias
   investigation #140). `_ensure_dev_tools` apt-installed `python3-venv` and

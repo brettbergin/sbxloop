@@ -301,6 +301,11 @@ missing compiler on its first build and spending revision budget on it:
 languages = ["python"]   # the default when the key is unset
 ```
 
+| Value    | Also accepts               | Installs                                                      |
+| -------- | -------------------------- | ------------------------------------------------------------- |
+| `python` | `py`, `python3`            | `python3-venv`, `python3-pip` (apt)                           |
+| `cpp`    | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
+
 Three rules apply to every entry. Provisioning is **probe-first** — a template
 that already ships the toolchain costs no install and no network. It is
 **never fatal** — a failure warns with the toolchain named and the run
