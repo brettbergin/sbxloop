@@ -92,6 +92,22 @@ class TestBakeHappyPath:
         # templates carry software, never secrets
         assert fake_sbx.secrets() == []
 
+    def test_bake_honors_selected_languages(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Gap 2: bake baked DEFAULT_LANGUAGES (python) whatever the config
+        said, so `languages = ["rust"]` produced a Rust-free template — and
+        the README's "bake the heavy toolchains" advice could not work."""
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "sandbox": {"languages": ["rust"]}}
+        )
+        script_install(fake_sbx)
+        record = bake_template(cli, config, name=BOX)
+        assert record.languages == ["rust"]
+        # ...and the installer host it needs was reachable during the bake.
+        allows = [p for p in fake_sbx.policies() if p[:2] == ["allow", "network"]]
+        assert any("static.rust-lang.org" in p for p in allows)
+
     def test_baked_template_seeds_new_sandboxes(
         self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:

@@ -29,12 +29,16 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 import sbxloop
 from sbxloop.config import Config
 from sbxloop.errors import BakeError, SbxError, SbxloopError
-from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
+from sbxloop.policy import (
+    PROMPT_ADVERTISED_DOMAINS,
+    baseline_allows,
+    toolchain_install_domains,
+)
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
@@ -56,6 +60,10 @@ class BakeRecord(BaseModel):
     ref: str
     worker_version: str
     python: str
+    # Toolchains baked in. Defaulted so records written before the
+    # languages plumbing still load; doctor uses it to flag a template
+    # baked for a different language set than the config now selects.
+    languages: list[str] = Field(default_factory=list)
     runtime_cached: bool
     baked_at: float
 
@@ -103,11 +111,18 @@ def bake_template(
             workspace=Path(scratch),
             template=base_template,
             # Same allows a run's agent sandbox gets, so the wheel deps, the
-            # dev-tools apt ensure, and the Copilot runtime download all
-            # resolve during the bake.
+            # dev-tools apt ensure, the selected languages' toolchain
+            # installers, and the Copilot runtime download all resolve
+            # during the bake.
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
-                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, config.policy.deny),
+                *baseline_allows(
+                    (
+                        *PROMPT_ADVERTISED_DOMAINS,
+                        *toolchain_install_domains(config.sandbox.effective_languages),
+                    ),
+                    config.policy.deny,
+                ),
                 *config.sandbox.extra_allow_domains,
             ],
         )
@@ -120,7 +135,16 @@ def bake_template(
 
             report("installing the worker (full install ladder)")
             client = WorkerClient(sandbox)
-            client.install(extras="copilot", ensure_dev_tools=True)
+            # Bake the toolchains this config actually selects. Without the
+            # languages argument this fell through to DEFAULT_LANGUAGES and
+            # baked Python into every template — so `[sandbox] languages =
+            # ["rust"]` produced a template with no Rust in it, and the
+            # README's "bake the heavy toolchains" advice could not work.
+            client.install(
+                extras="copilot",
+                ensure_dev_tools=True,
+                languages=config.sandbox.effective_languages,
+            )
 
             if cache_runtime:
                 report("pre-caching the Copilot runtime")
@@ -129,6 +153,7 @@ def bake_template(
             manifest = {
                 "worker_version": sbxloop.__version__,
                 "python": client.python,
+                "languages": list(config.sandbox.effective_languages),
                 "runtime_cached": runtime_cached,
                 "baked_at": time.time(),
             }
@@ -151,6 +176,7 @@ def bake_template(
         ref=ref,
         worker_version=sbxloop.__version__,
         python=client.python,
+        languages=list(config.sandbox.effective_languages),
         runtime_cached=runtime_cached,
         baked_at=time.time(),
     )
