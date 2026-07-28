@@ -6,6 +6,143 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`[sandbox] languages = ["dotnet"]` provisions the .NET SDK** (issue
+  #164), completing the ten-language set for layer 1 of #140. Availability
+  and currency of `dotnet-sdk-*` in the base Debian/Ubuntu archives varies
+  by release and is unreliable to depend on, so the SDK comes from
+  Microsoft's own builds, pinned to an LTS patch and verified against the
+  **sha512** its release metadata publishes (the .NET feed publishes sha512
+  rather than sha256). The major is pinned because a project's `global.json`
+  can demand an exact SDK and fails hard when it is absent. `DOTNET_ROOT` is
+  recorded in the persistent env — a manual, non-package SDK install is only
+  half-done without it — along with a telemetry opt-out, which under
+  default-deny egress would otherwise only ever be a blocked outbound
+  request. At roughly 220 MB the SDK is the strongest candidate in the set
+  for `sbxloop bake` rather than a per-run download. Accepted spellings:
+  `dotnet`, `csharp`, `c#`, `net`, `dotnet-sdk`. Adds a
+  `builds.dotnet.microsoft.com` egress dependency (#141).
+
+- **`[sandbox] languages = ["rust"]` provisions cargo and rustc** (issue
+  #143). Debian/Ubuntu do ship `cargo`/`rustc`, but distro Rust routinely
+  lags stable by several releases, which breaks edition- and MSRV-sensitive
+  projects outright — and rustup is the norm nearly every Rust instruction
+  assumes. `rustup-init` is downloaded and checksum-verified per
+  architecture rather than piped from `sh.rustup.rs` into a shell, then run
+  with `--profile minimal --component rustfmt --component clippy`: the two
+  components a plan's verify commands actually reach for, without the large
+  docs component nothing here needs. rustup's usual PATH wiring edits shell
+  profiles that a bare `sbx exec sh -c` never sources, so the shims are
+  linked into `/usr/local/bin` and the toolchain stays in the agent's home
+  where `cargo install` can write to it without sudo. Adds
+  `static.rust-lang.org` as an egress dependency (#141).
+
+- **`[sandbox] languages = ["go"]` provisions the Go toolchain** (issue
+  #153). The official `go.dev` tarball rather than `golang-go`: modules
+  frequently declare a `go` directive newer than the distro build, which
+  fails the build outright. Pinned and verified against upstream's published
+  per-architecture sha256, resolved in-sandbox like the Node entry, and
+  installed by replacing `/usr/local/go` rather than extracting over it —
+  overlaying two versions leaves a broken tree. `GOTOOLCHAIN` is
+  deliberately **not** pinned to `local`: doing so would make a project
+  whose `go.mod` demands a newer Go fail outright, which is the very
+  distro-lag failure this entry avoids. Left at the default, Go fetches what
+  the module asks for during EXECUTE, where a plan can declare the Go proxy
+  as egress. Adds a `go.dev` egress dependency at provisioning time (#141).
+
+- **`[sandbox] languages = ["typescript"]` provisions `tsc` on top of Node**
+  (issue #150). Toolchain entries can now declare what they are built on,
+  and selecting one selects its requirements — TypeScript pulls in the
+  JavaScript entry and the registry order guarantees the Node runtime is
+  installed before `npm i -g typescript` runs. The compiler is pinned; a
+  project with its own `typescript` devDependency will still use that, since
+  the global install is for bootstrapping a project from nothing rather than
+  for driving any particular build pipeline. Adds a `registry.npmjs.org`
+  egress dependency on top of Node's `nodejs.org` (#141) — and because
+  provisioning runs before the PLAN phase, a plan declaration cannot satisfy
+  it; the README now documents `[sandbox] extra_allow_domains` as the way to
+  make installer-based toolchains reachable today.
+
+- **`[sandbox] languages = ["javascript"]` provisions Node** (issue #147).
+  The official `nodejs.org` tarball rather than apt: Debian/Ubuntu stable
+  ship a Node several majors behind current LTS, which breaks packages
+  declaring modern `engines` constraints — a functional failure, not
+  cosmetic lag. Pinned to an exact LTS release and verified against the
+  upstream `SHASUMS256.txt` digest for the sandbox's architecture, resolved
+  in-sandbox so the same config works on arm64 microVMs and amd64 CI
+  runners; an unrecognized architecture fails loudly instead of downloading
+  a binary that cannot run. The probe checks the pinned **major**, not just
+  that `node` exists, so a template carrying an older Node is upgraded
+  rather than accepted. Node is extracted into `/usr/local`, which also
+  makes it npm's global prefix so `npm i -g` lands on PATH. Accepted
+  spellings: `javascript`, `js`, `node`, `nodejs`, `javascript-node`. Adds
+  a `nodejs.org` egress dependency (#141).
+
+- **`[sandbox] languages = ["php"]` provisions PHP and Composer** (issue
+  #167). apt for the interpreter and — more importantly — the extensions:
+  `php-cli` alone passes a `command -v php` check and then fails the moment
+  a project or Composer itself needs mbstring or zip, so `php-mbstring`,
+  `php-xml`, `php-curl`, and `php-zip` come with it and the probe checks
+  the extensions are actually loaded rather than just that `php` exists.
+  Composer is not reliably packaged at a useful version, so it comes from
+  upstream — but as a **pinned release verified against its published
+  sha256**, not piped into the interpreter. Bumping the version means
+  bumping the digest alongside it. Adds a `getcomposer.org` egress
+  dependency (#141).
+
+- **`[sandbox] languages = ["java"]` provisions a JDK and Maven** (issue
+  #161). apt for both, pinned to `openjdk-21-jdk` rather than floating on
+  `default-jdk`, which moves between distro releases. `JAVA_HOME` is part of
+  the contract — many build tools read it directly rather than looking for
+  `java` on PATH — so the entry records it in `/etc/sandbox-persistent.sh`,
+  which the worker already loads into the environment the agent session and
+  its shell commands inherit. The value is derived from the installed
+  `javac` rather than hardcoded, since the JVM directory name embeds the
+  distro architecture. Gradle is deliberately not installed: the `gradlew`
+  wrapper is the norm and fetches its own distribution, which makes it an
+  egress question (#141) rather than a package. Accepted spellings: `java`,
+  `jdk`, `jvm`.
+
+- **`[sandbox] languages = ["ruby"]` provisions Ruby** (issue #158).
+  `ruby-full`, `ruby-dev`, `bundler`, and `build-essential` — apt only, and
+  no egress beyond the always-reachable baseline. The dev headers and
+  compiler are deliberately not optional: gems with native extensions
+  (nokogiri, pg, …) fail to build when only `ruby` is present, which is the
+  usual way a half-installed Ruby shows up. `build-essential` is shared with
+  the C/C++ entry and installs once, not twice. Projects pinning an exact
+  Ruby the distro does not carry still need `rbenv`, which is out of scope
+  here. Accepted spellings: `ruby`, `rb`.
+
+- **`[sandbox] languages = ["cpp"]` provisions a C/C++ toolchain** (issue
+  #170). `build-essential`, `cmake`, `ninja-build`, and `pkg-config` — pure
+  apt, no installer, and no egress beyond the apt mirrors already in the
+  always-reachable baseline, which makes this the cleanest entry in the
+  Layer 1 set. Accepted spellings: `cpp`, `c`, `c++`, `cxx`, `c-cpp`. The
+  probe checks `gcc`, `g++`, `make`, `cmake`, and `pkg-config`; `ninja` and
+  `clang` are optional extras a build can do without, so a template that
+  lacks them is not reinstalled over.
+
+- **`[sandbox] languages` selects which language toolchains the agent
+  sandbox is provisioned with** (issue #144, layer 1 of the language-bias
+  investigation #140). `_ensure_dev_tools` apt-installed `python3-venv` and
+  `python3-pip` for the *agent's* project before its first turn — a real
+  head start, but one only Python got: a Node, Rust, or Ruby task
+  discovered its missing compiler on first failure and spent revision
+  budget bootstrapping it. That call is now one entry in a registry
+  (`sbxloop.toolchains`) selected by config rather than a hardcoded special
+  case. Semantics are the ones the 0.4.0 field failure taught us and they
+  apply to every entry: probe first (a template that already ships the
+  toolchain costs no apt call and no network), never fatal (a failure warns
+  with the toolchain named and the run continues on the agent's own
+  `sudo apt-get` escape hatch), and opt-in only. Selected apt packages are
+  pooled into a single `update && install`, so N languages is one round
+  trip. **Behavior is unchanged for existing runs**: unset means
+  `["python"]`. Setting the key replaces that default rather than adding to
+  it — this is the point, since no language should be privileged by
+  accident of implementation. Python is the only registered entry so far;
+  the other nine follow.
+
 ### Changed
 
 - **Leftovers from the 0.2.0 `sdxloop` → `sbxloop` rename are gone.** The

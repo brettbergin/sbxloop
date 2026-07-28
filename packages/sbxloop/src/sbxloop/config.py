@@ -28,6 +28,7 @@ from pydantic import (
 )
 
 from sbxloop.errors import ConfigError
+from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
 
 ENV_PREFIX = "SBXLOOP_"
 
@@ -45,9 +46,46 @@ class _ConfigModel(BaseModel):
 
 
 class SandboxConfig(_ConfigModel):
+    """Sandbox provisioning: which template, where the workspace lives, what
+    egress every run gets, and which language toolchains the agent sandbox is
+    made dev-ready for.
+
+    ``languages`` selects entries from ``sbxloop.toolchains`` — installed
+    before the agent's first turn so it does not spend revision budget
+    bootstrapping its own compiler. Unset means ``["python"]``, which is the
+    head start Python has had since 0.4.0; setting it REPLACES that default
+    rather than adding to it, so nothing is provisioned for a language the
+    operator did not ask for. Provisioning is probe-first (a template that
+    already ships the toolchain costs nothing) and never fatal.
+    """
+
     template: str | None = None
     workspace: Path | None = None
     extra_allow_domains: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=list)
+
+    @field_validator("languages")
+    @classmethod
+    def _check_languages(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for entry in value:
+            key = normalize_language(entry)
+            if key is None:
+                bad.append(entry)
+            elif key not in normalized:
+                normalized.append(key)
+        if bad:
+            raise ValueError(
+                f"unsupported sandbox.languages entries {bad}: "
+                f"choose from {list(supported_languages())}"
+            )
+        return normalized
+
+    @property
+    def effective_languages(self) -> tuple[str, ...]:
+        """Languages to provision, applying the default for an unset list."""
+        return tuple(self.languages) or DEFAULT_LANGUAGES
 
 
 class PolicyConfig(_ConfigModel):

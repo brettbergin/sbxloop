@@ -289,6 +289,70 @@ such guests — so seeing the abort means the fallback had no `rg` to land
 on: look for a `sandbox.tooling_warning` event in `sbxloop logs`, and check
 the `page-size` probe under `sbxloop doctor --deep`.
 
+## Language toolchains
+
+The agent builds a project inside its sandbox, so whatever that project needs
+to compile has to be there. `[sandbox] languages` says which toolchains get
+installed before the agent's first turn, instead of the agent discovering a
+missing compiler on its first build and spending revision budget on it:
+
+```toml
+[sandbox]
+languages = ["python"]   # the default when the key is unset
+```
+
+| Value        | Also accepts               | Installs                                                      |
+| ------------ | -------------------------- | ------------------------------------------------------------- |
+| `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt)                           |
+| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
+| `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)   |
+| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
+| `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
+| `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)         |
+| `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                        |
+| `go`         | `golang`                   | Go toolchain (pinned tarball from `go.dev`)                   |
+| `rust`       | `rs`, `cargo`              | cargo, rustc, rustfmt, clippy (pinned rustup)                 |
+| `dotnet`     | `csharp`, `c#`, `net`      | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`    |
+
+Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
+
+Three rules apply to every entry. Provisioning is **probe-first** — a template
+that already ships the toolchain costs no install and no network. It is
+**never fatal** — a failure warns with the toolchain named and the run
+continues, since the agent has passwordless `sudo apt-get` as an escape
+hatch. And it is **opt-in** — setting `languages` replaces the default rather
+than adding to it, so nothing is installed for a language you did not ask
+for. Heavier toolchains are better baked into a template (`sbxloop bake`)
+than downloaded per run.
+
+### Toolchains that download from upstream need egress
+
+The apt-only entries (`python`, `cpp`, `ruby`, `java`) work out of the box:
+apt mirrors are in the sandbox's always-reachable baseline. The rest fetch
+from a vendor or registry, and **provisioning runs before the PLAN phase**, so
+a plan's `egress` declaration is too late to help it. Until those domains are
+part of the provisioning baseline, allow them explicitly:
+
+```toml
+[sandbox]
+languages = ["typescript"]
+extra_allow_domains = ["nodejs.org", "registry.npmjs.org"]
+```
+
+| Language     | Needs reachable at provisioning time |
+| ------------ | ------------------------------------ |
+| `php`        | `getcomposer.org`                    |
+| `javascript` | `nodejs.org`                         |
+| `typescript` | `nodejs.org`, `registry.npmjs.org`   |
+| `go`         | `go.dev`, `dl.google.com`            |
+| `rust`       | `static.rust-lang.org`               |
+| `dotnet`     | `builds.dotnet.microsoft.com`        |
+
+Without them the install warns and the run continues — the agent falls back to
+bootstrapping the toolchain itself, which is the behavior these entries exist
+to improve on, not a broken run. Baking the toolchain into a template
+(`sbxloop bake`) sidesteps the per-run download entirely.
+
 ## Sandbox hygiene
 
 Sandboxes are torn down at run end, and an in-process registry also cleans up
@@ -377,6 +441,7 @@ where it came from. The notable knobs:
 | `secret_strategy`                      | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                         |
 | `[sandbox] template`                   | unset              | Baked template ref from `sbxloop bake`.                                                                 |
 | `[sandbox] extra_allow_domains`        | `[]`               | Static egress allows applied to every run.                                                              |
+| `[sandbox] languages`                  | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                              |
 | `[policy] allow` / `deny`              | `[]`               | Bounds for plan-declared egress.                                                                        |
 | `[github] repo` / `report` / `deliver` | unset / `false`    | The GitHub integration gate and toggles.                                                                |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
