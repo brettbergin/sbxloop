@@ -34,6 +34,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **An inner command saying "not found" no longer aborts the run.**
+  `sbx exec` classified any stderr containing that substring as an
+  sbx-level failure and raised, instead of returning the nonzero result
+  its callers are written against. But `exec` is the one CLI call whose
+  stderr belongs to somebody else's program, and "not found" is the single
+  most common thing a shell says — `sh: dpkg: command not found`, curl's
+  `404 Not Found`, npm's `404 Not Found - GET`. Every best-effort probe
+  built on `result.ok` could therefore be turned into a hard failure by a
+  missing binary: the dev-tools ensure, the search-fallback ensure, and the
+  bake that runs them. A missing *sandbox* now has to say so (real sbx and
+  the fake both name the sandbox in that message); the infra markers for a
+  stopped VM or an unreachable daemon are unchanged.
+
 - **Agent glob/grep no longer die on 16 KiB-page sandboxes** (issue #122).
   The Copilot CLI's bundled ripgrep is a musl-static jemalloc build compiled
   for 4 KiB pages; on guests with a larger page size (16 KiB is common for
