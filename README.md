@@ -309,6 +309,9 @@ languages = ["python"]   # the default when the key is unset
 | `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
 | `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
 | `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)         |
+| `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                        |
+
+Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
 
 Three rules apply to every entry. Provisioning is **probe-first** — a template
 that already ships the toolchain costs no install and no network. It is
@@ -318,6 +321,31 @@ hatch. And it is **opt-in** — setting `languages` replaces the default rather
 than adding to it, so nothing is installed for a language you did not ask
 for. Heavier toolchains are better baked into a template (`sbxloop bake`)
 than downloaded per run.
+
+### Toolchains that download from upstream need egress
+
+The apt-only entries (`python`, `cpp`, `ruby`, `java`) work out of the box:
+apt mirrors are in the sandbox's always-reachable baseline. The rest fetch
+from a vendor or registry, and **provisioning runs before the PLAN phase**, so
+a plan's `egress` declaration is too late to help it. Until those domains are
+part of the provisioning baseline, allow them explicitly:
+
+```toml
+[sandbox]
+languages = ["typescript"]
+extra_allow_domains = ["nodejs.org", "registry.npmjs.org"]
+```
+
+| Language     | Needs reachable at provisioning time |
+| ------------ | ------------------------------------ |
+| `php`        | `getcomposer.org`                    |
+| `javascript` | `nodejs.org`                         |
+| `typescript` | `nodejs.org`, `registry.npmjs.org`   |
+
+Without them the install warns and the run continues — the agent falls back to
+bootstrapping the toolchain itself, which is the behavior these entries exist
+to improve on, not a broken run. Baking the toolchain into a template
+(`sbxloop bake`) sidesteps the per-run download entirely.
 
 ## Sandbox hygiene
 

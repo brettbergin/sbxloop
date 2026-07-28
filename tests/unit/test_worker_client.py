@@ -676,6 +676,29 @@ class TestInstallFallbacks:
         assert any("JAVA_HOME" in m for m in messages), messages
         assert any("tee: permission denied" in m for m in messages), messages
 
+    def test_ensure_dev_tools_installs_required_toolchains_too(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Selecting TypeScript must provision the Node runtime it is built
+        # on, and provision it FIRST — `npm i -g typescript` is meaningless
+        # before node exists.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "javascript", returncode=1)
+        script_toolchain_probe(fake_sbx, "typescript", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; case", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; sudo -n npm", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["ts"])
+        execs = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        node_idx = [i for i, c in enumerate(execs) if "nodejs.org" in c]
+        tsc_idx = [i for i, c in enumerate(execs) if "npm install -g" in c]
+        assert node_idx and tsc_idx, execs
+        assert node_idx[0] < tsc_idx[0], "the node runtime must install before tsc"
+
     def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
         import sbxloop
 

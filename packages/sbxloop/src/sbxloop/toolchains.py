@@ -64,6 +64,11 @@ class Toolchain:
     apt_packages: tuple[str, ...] = ()
     install_script: str | None = None
     aliases: tuple[str, ...] = ()
+    # Canonical names of toolchains this one is built on. Selecting an entry
+    # selects its requirements too, and registry order guarantees they are
+    # probed and installed first — TypeScript needs the Node runtime present
+    # before `npm i -g typescript` can mean anything.
+    requires: tuple[str, ...] = ()
 
 
 PYTHON = Toolchain(
@@ -275,10 +280,34 @@ NODE = Toolchain(
 )
 
 
+# There is no meaningful distro package for the TypeScript compiler — it is
+# an npm package — so this is the one entry whose install comes from a
+# package registry rather than a vendor. Pinned so a bootstrap is
+# reproducible; a project with its own `typescript` devDependency should and
+# will use that instead (#150).
+TYPESCRIPT_VERSION = "7.0.2"
+
+TYPESCRIPT = Toolchain(
+    name="typescript",
+    wanted="tsc (plus node, npm, npx)",
+    # Only tsc: the Node half is the NODE entry's probe, run first because
+    # `requires` pulls it in and registry order installs it ahead of this.
+    probe="command -v tsc >/dev/null",
+    requires=("javascript",),
+    # Node's tarball lands in /usr/local, which is npm's global prefix
+    # there, so a global install puts tsc on PATH with no extra wiring.
+    # --no-fund/--no-audit keep the provisioning log to the point.
+    install_script=(
+        f"set -e; sudo -n npm install -g --no-fund --no-audit typescript@{TYPESCRIPT_VERSION}"
+    ),
+    aliases=("ts",),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE)
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE, TYPESCRIPT)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
@@ -310,7 +339,14 @@ def resolve(names: Sequence[str]) -> tuple[Toolchain, ...]:
     where a typo gets rejected with a helpful message, and the ensure must
     never be the thing that fails a run.
     """
-    wanted = {normalize_language(name) for name in names}
+    wanted: set[str] = set()
+    pending = [normalize_language(name) for name in names]
+    while pending:
+        key = pending.pop()
+        if key is None or key in wanted:
+            continue
+        wanted.add(key)
+        pending.extend(_BY_KEY[key].requires)
     return tuple(toolchain for toolchain in TOOLCHAINS if toolchain.name in wanted)
 
 
