@@ -49,6 +49,7 @@ ignore the rest. They are reference points, not a menu of defaults: a task
 in an ecosystem not listed here follows that ecosystem's own conventions,
 and none of these is the "normal" choice.
 
+<!-- ecosystems:start -->
 - **Python** — the system Python is externally managed (PEP 668), so
   dependencies belong in a project virtualenv (`python3 -m venv .venv`) and
   commands, including your `verify_commands`, should use `.venv/bin/...`
@@ -114,6 +115,7 @@ and none of these is the "normal" choice.
   the workspace-root contract bites hardest: `ctest` run from the wrong
   directory finds no tests and can still exit 0, so always pass
   `--test-dir`. Verify: `cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure`.
+<!-- ecosystems:end -->
 
 ## Response format
 

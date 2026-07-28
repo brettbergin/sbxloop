@@ -310,3 +310,63 @@ def test_plan_and_execute_render_standing_guidance() -> None:
 def test_bullet_list() -> None:
     assert bullet_list([]) == "(none)"
     assert bullet_list(["a", "b"]) == "- a\n- b"
+
+
+class TestEcosystemSelection:
+    """Only the selected languages' ecosystem notes reach the model (gap 3)."""
+
+    CTX = {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "a",
+        "feedback": "f",
+        "user_guidance": "g",
+    }
+
+    def test_unfiltered_render_keeps_every_entry(self) -> None:
+        text = render("plan", **self.CTX)
+        assert text.count("- **") == 10
+
+    def test_selected_language_only(self) -> None:
+        text = render("plan", languages=["rust"], **self.CTX)
+        assert text.count("- **") == 1
+        assert "Cargo.toml" in text
+        # The nine ecosystems this sandbox has no toolchain for are gone —
+        # advertising them invites a plan the sandbox cannot run.
+        assert "PEP 668" not in text
+        assert "node_modules" not in text
+
+    def test_multiple_languages(self) -> None:
+        text = render("plan", languages=["python", "go"], **self.CTX)
+        assert text.count("- **") == 2
+        assert "PEP 668" in text and "go.mod" in text
+
+    def test_execute_template_is_filtered_too(self) -> None:
+        text = render(
+            "execute",
+            languages=["php"],
+            outcome="o",
+            task_id="t1",
+            task_title="T",
+            task_description="d",
+            plan_steps="- s",
+            expected_artifacts="- a",
+            feedback="f",
+            user_guidance="g",
+        )
+        assert text.count("- **") == 1
+        assert "composer" in text
+
+    def test_no_matching_entry_drops_the_block(self) -> None:
+        # Defensive: a language with no prose entry must not silently fall
+        # back to advertising all ten.
+        text = render("plan", languages=[], **self.CTX)
+        assert text.count("- **") == 0
+
+    def test_markers_never_reach_the_model(self) -> None:
+        for languages in (None, ["rust"], []):
+            text = render("plan", languages=languages, **self.CTX)
+            assert "ecosystems:start" not in text
+            assert "ecosystems:end" not in text

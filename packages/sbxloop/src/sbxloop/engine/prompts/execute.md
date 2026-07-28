@@ -29,6 +29,7 @@ destroyed.
 - Ecosystem notes — read only the entry matching this task's toolchain and
   ignore the rest. None of these is the default choice; work in the
   ecosystem the task actually calls for.
+<!-- ecosystems:start -->
   - **Python** — the system Python is externally managed (PEP 668): bare
     `pip install X` fails. Create a virtualenv first —
     `python3 -m venv .venv && .venv/bin/pip install X` — and run project
@@ -68,6 +69,7 @@ destroyed.
     `ctest --test-dir build`; run elsewhere, `ctest` finds no tests and
     can still exit 0. There is no per-project isolation step to set up —
     install compilers and libraries with apt.
+<!-- ecosystems:end -->
 
 ## Overall outcome
 

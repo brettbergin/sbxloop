@@ -172,7 +172,12 @@ class PhaseRunner:
         retry_context = preamble
         last_error: Exception | None = None
         for _ in range(2):
-            prompt = render(prompt_name, retry_context=retry_context, **context)
+            prompt = render(
+                prompt_name,
+                languages=self.config.sandbox.effective_languages,
+                retry_context=retry_context,
+                **context,
+            )
             try:
                 result = self._agent_job(
                     prompt,
@@ -291,6 +296,7 @@ class PhaseRunner:
     def execute(self, task: TaskRecord, plan: PlanModel) -> JobResult:
         prompt = render(
             "execute",
+            languages=self.config.sandbox.effective_languages,
             outcome=self.outcome,
             task_id=task.spec.id,
             task_title=task.spec.title,
