@@ -270,6 +270,11 @@ def cmd_exec(root: Path, args: list[str]) -> int:
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["SBX_FAKE_FS"] = str(fs)
+    # The fake stands in for a Linux microVM, but exec'd commands really run
+    # on the host. On macOS, bsdtar stores xattrs as AppleDouble "._name"
+    # members, so the harvest tar round-trip invents files that GNU tar in a
+    # real sandbox never produces. Suppress it so counts match the VM.
+    env["COPYFILE_DISABLE"] = "1"
     try:
         proc = subprocess.run(rewritten, cwd=home, env=env, check=False)
     except FileNotFoundError:
