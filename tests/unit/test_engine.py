@@ -17,6 +17,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.engine.engine import LoopEngine
+from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import BudgetExceededError, StateError, WorkerError
 from sbxloop.events import Event, EventBus, HostEventTypes
@@ -900,6 +901,32 @@ class TestWorkspaceExecution:
         # .git must be absent — tar excluded it before the copy
         assert not (harvested / ".git").exists()
 
+    def test_harvest_strips_dependency_trees_before_the_copy(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The point of excluding build output by default is that an
+        unmounted run never pays to copy it back — so it must be stripped by
+        tar in the VM, not merely filtered out of the host-side listing."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        execute = {
+            "text": "built it",
+            "files": {
+                "package.json": '{"name":"app"}\n',
+                "node_modules/left-pad/index.js": "module.exports = 1\n",
+                "target/release/app": "ELF\n",
+                "src/__pycache__/main.cpython-312.pyc": "\x00\n",
+            },
+        }
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        result = harness.engine().start("build the app")
+
+        assert result.state == "completed"
+        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        assert (harvested / "package.json").exists()
+        assert not (harvested / "node_modules").exists()
+        assert not (harvested / "target").exists()
+        assert not (harvested / "src" / "__pycache__").exists()
+
     def test_harvest_mode_final_skips_per_task_harvest(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -964,7 +991,8 @@ class TestDeliverHook:
         assert calls[0]["run_id"] == result.run_id
         assert calls[0]["outcome"] == "ship it"
         assert calls[0]["source_dir"] == result.workspace
-        assert calls[0]["exclude"] == [".git", ".sbxloop"]  # config default threaded through
+        # config default threaded through
+        assert calls[0]["exclude"] == list(DEFAULT_ARTIFACT_EXCLUDES)
         deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
         assert [e.data for e in deliver_events] == [
             {"repo": "o/r", "pr": 3, "url": "https://github.com/o/r/pull/3"}

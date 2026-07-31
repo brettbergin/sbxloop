@@ -1261,11 +1261,24 @@ deny = []
 # deliver_draft = false
 
 [artifacts]
-# Path components excluded from artifact listings and delivery, matched at
-# any depth (a bare name each, no slashes). The default drops only noisy
-# state dirs — dot-path artifacts like .github/ or .gitignore are kept.
-# Exclusions are counted and surfaced, never silent.
-exclude = [".git", ".sbxloop"]
+# Path components excluded from artifact listings, harvest and delivery,
+# matched at any depth (a bare name each, no slashes). Setting this replaces
+# the default list below rather than adding to it. The default drops run/VCS
+# state plus regenerable dependency and build trees — dot-path artifacts like
+# .github/ or .gitignore are kept, and so are the ambiguous generic names
+# (bin, build, dist, out, lib, vendor), which you can add if you want them
+# dropped. Exclusions are counted and surfaced, never silent.
+exclude = [
+  ".git", ".sbxloop",
+  ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
+  ".venv", "venv", "__pycache__",           # Python
+  "node_modules",                            # JavaScript / TypeScript
+  "target",                                  # Rust (cargo), Java (Maven)
+  ".gradle",                                 # Java (Gradle)
+  "obj",                                     # C# / .NET
+  ".bundle",                                 # Ruby (bundler)
+  "CMakeFiles",                              # C / C++
+]
 
 [budgets]
 max_revisions_per_task = 2
