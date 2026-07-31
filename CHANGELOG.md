@@ -8,6 +8,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["go"]` provisions the Go toolchain** (issue
+  #153). The official `go.dev` tarball rather than `golang-go`: modules
+  frequently declare a `go` directive newer than the distro build, which
+  fails the build outright. Pinned and verified against upstream's published
+  per-architecture sha256, resolved in-sandbox like the Node entry, and
+  installed by replacing `/usr/local/go` rather than extracting over it —
+  overlaying two versions leaves a broken tree. `GOTOOLCHAIN` is
+  deliberately **not** pinned to `local`: doing so would make a project
+  whose `go.mod` demands a newer Go fail outright, which is the very
+  distro-lag failure this entry avoids. Left at the default, Go fetches what
+  the module asks for during EXECUTE, where a plan can declare the Go proxy
+  as egress. Adds a `go.dev` egress dependency at provisioning time (#141).
+
 - **`[sandbox] languages = ["typescript"]` provisions `tsc` on top of Node**
   (issue #150). Toolchain entries can now declare what they are built on,
   and selecting one selects its requirements — TypeScript pulls in the
