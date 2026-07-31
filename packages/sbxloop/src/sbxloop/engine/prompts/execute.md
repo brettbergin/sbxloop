@@ -11,12 +11,8 @@ destroyed.
 
 ## Environment notes
 
-- Debian/Ubuntu VM. The system Python is externally managed (PEP 668):
-  bare `pip install X` fails. For Python dependencies create a virtualenv
-  first — `python3 -m venv .venv && .venv/bin/pip install X` — and run
-  project commands through `.venv/bin/...`.
-- If a tool or apt package is missing, you have passwordless sudo:
-  `sudo apt-get install -y <package>`.
+- Debian/Ubuntu VM. If a tool or apt package is missing, you have
+  passwordless sudo: `sudo apt-get install -y <package>`.
 - Network egress is allowlisted. GitHub, the apt mirrors, the supported
   languages' package registries ($baseline_registries), and any domains the
   plan declared as `egress` are reachable; other hosts (undeclared package
@@ -30,6 +26,13 @@ destroyed.
   workspace root, exactly as written — you cannot edit them. Create files
   at the paths those commands check: if verification expects
   `requirements.txt` at the root, do not bury it in a subdirectory.
+- Ecosystem notes — read only the entry matching this task's toolchain and
+  ignore the rest. None of these is the default choice; work in the
+  ecosystem the task actually calls for.
+  - **Python** — the system Python is externally managed (PEP 668): bare
+    `pip install X` fails. Create a virtualenv first —
+    `python3 -m venv .venv && .venv/bin/pip install X` — and run project
+    commands through `.venv/bin/...`.
 
 ## Overall outcome
 

@@ -27,20 +27,33 @@ $user_guidance
 
 ## Environment facts to plan around
 
-Debian/Ubuntu VM; the system Python is externally managed (PEP 668), so
-Python dependencies belong in a project virtualenv (`python3 -m venv .venv`)
-and commands — including your `verify_commands` — should use `.venv/bin/...`
-paths; missing apt packages can be installed with passwordless sudo; network
-egress is allowlisted (GitHub, the apt mirrors, and the supported languages'
-package registries are reachable — declare anything else in `egress`).
+Debian/Ubuntu VM. Missing apt packages can be installed with passwordless
+sudo, so a toolchain the image lacks is a step in your plan, not a blocker.
+Network egress is allowlisted (GitHub, the apt mirrors, and the supported
+languages' package registries are reachable — declare anything else in
+`egress`).
 
 `verify_commands` run mechanically from the **workspace root** — the same
 directory the executor starts in — never from a subdirectory your steps
 create. The executor cannot edit these commands, so a path mismatch is
 fatal: if the plan builds the project in a subdirectory, every verify
 command must name it explicitly (`test -f app/requirements.txt`, or
-`cd app && .venv/bin/pytest`). A bare `test -f requirements.txt` fails
-when the file lives one level down.
+`cd app && <the ecosystem's test command>`). A bare
+`test -f requirements.txt` fails when the file lives one level down. This
+bites in every ecosystem, and some fail silently rather than loudly: a test
+runner aimed at a directory holding no project can exit 0 having tested
+nothing.
+
+Ecosystem notes — read only the entry matching this task's toolchain and
+ignore the rest. They are reference points, not a menu of defaults: a task
+in an ecosystem not listed here follows that ecosystem's own conventions,
+and none of these is the "normal" choice.
+
+- **Python** — the system Python is externally managed (PEP 668), so
+  dependencies belong in a project virtualenv (`python3 -m venv .venv`) and
+  commands, including your `verify_commands`, should use `.venv/bin/...`
+  paths. Verify: `.venv/bin/pytest`, or `cd app && .venv/bin/pytest` for a
+  subdirectory build.
 
 ## Response format
 
