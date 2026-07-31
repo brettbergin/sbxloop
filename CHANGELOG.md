@@ -8,6 +8,16 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["ruby"]` provisions Ruby** (issue #158).
+  `ruby-full`, `ruby-dev`, `bundler`, and `build-essential` — apt only, and
+  no egress beyond the always-reachable baseline. The dev headers and
+  compiler are deliberately not optional: gems with native extensions
+  (nokogiri, pg, …) fail to build when only `ruby` is present, which is the
+  usual way a half-installed Ruby shows up. `build-essential` is shared with
+  the C/C++ entry and installs once, not twice. Projects pinning an exact
+  Ruby the distro does not carry still need `rbenv`, which is out of scope
+  here. Accepted spellings: `ruby`, `rb`.
+
 - **`[sandbox] languages = ["cpp"]` provisions a C/C++ toolchain** (issue
   #170). `build-essential`, `cmake`, `ninja-build`, and `pkg-config` — pure
   apt, no installer, and no egress beyond the apt mirrors already in the
