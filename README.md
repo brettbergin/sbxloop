@@ -226,6 +226,20 @@ sbxloop artifacts <run>                   # list a past run's files (--tree for 
 cat "$(sbxloop artifacts <run> --path)/fib.py"
 ```
 
+Harvest, listings and delivery all skip the same set of path components,
+matched at any depth: run/VCS state (`.git`, `.sbxloop`) plus the
+regenerable dependency and build trees of the supported languages —
+`node_modules`, `__pycache__`, `.venv`/`venv`, the Python tool caches,
+`target` (cargo/Maven), `.gradle`, `obj` (.NET), `.bundle`, `CMakeFiles`.
+They are large, reproducible from the manifests that *are* delivered, and
+nobody wants them in a `--deliver` PR diff. The ambiguous generic names —
+`bin`, `build`, `dist`, `out`, `lib`, `vendor` — are **not** excluded, since
+each is build output in one ecosystem and checked-in content in another; add
+them to `[artifacts] exclude` if your project wants them dropped. Whatever is
+excluded is always counted and reported (`12 file(s) excluded (node_modules)`)
+in run summaries, `sbxloop artifacts`, and the delivery PR body — never
+silently truncated.
+
 ## GitHub integration
 
 sbxloop has **no** GitHub capability until you configure the one repository it
@@ -448,6 +462,7 @@ where it came from. The notable knobs:
 | `[sandbox] languages`                  | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                              |
 | `[policy] allow` / `deny`              | `[]`               | Bounds for plan-declared egress.                                                                        |
 | `[github] repo` / `report` / `deliver` | unset / `false`    | The GitHub integration gate and toggles.                                                                |
+| `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
 | `[limits]`                             | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                         |
 

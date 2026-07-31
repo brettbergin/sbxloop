@@ -135,6 +135,124 @@ class TestArtifactFiles:
 
         assert tuple(ArtifactsConfig().exclude) == DEFAULT_ARTIFACT_EXCLUDES
 
+    def test_default_entries_are_unique_and_config_valid(self) -> None:
+        """Every default entry must survive the [artifacts] exclude validator
+        — a default the user cannot re-type into their own config would be a
+        latent trap."""
+        from sbxloop.config import ArtifactsConfig
+
+        assert len(set(DEFAULT_ARTIFACT_EXCLUDES)) == len(DEFAULT_ARTIFACT_EXCLUDES)
+        # Round-trips through validation unchanged.
+        echoed = ArtifactsConfig(exclude=list(DEFAULT_ARTIFACT_EXCLUDES))
+        assert tuple(echoed.exclude) == DEFAULT_ARTIFACT_EXCLUDES
+
+
+class TestDefaultBuildOutputExcludes:
+    """The default denylist covers regenerable dependency/build trees for the
+    supported languages, and deliberately leaves ambiguous generic names in."""
+
+    def make_workspace(self, tmp_path: Path, rels: list[str]) -> Path:
+        root = tmp_path / "ws"
+        for rel in rels:
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x\n")
+        return root
+
+    def test_per_language_build_output_is_excluded(self, tmp_path: Path) -> None:
+        root = self.make_workspace(
+            tmp_path,
+            [
+                "keep.txt",
+                "node_modules/left-pad/index.js",  # JS / TS
+                "src/__pycache__/main.cpython-312.pyc",  # Python
+                ".venv/lib/python3.12/site-packages/x.py",
+                "venv/bin/activate",
+                ".pytest_cache/v/cache/lastfailed",
+                ".mypy_cache/3.12/x.json",
+                ".ruff_cache/content",
+                ".tox/py312/log.txt",
+                ".nox/tests/marker",
+                "target/release/app",  # Rust (cargo) / Java (Maven)
+                ".gradle/8.5/fileHashes.bin",  # Java (Gradle)
+                "obj/Debug/net8.0/app.dll",  # C# / .NET
+                ".bundle/config",  # Ruby
+                "CMakeFiles/app.dir/main.o",  # C / C++
+            ],
+        )
+        scan = scan_artifacts(root)
+        assert [p.relative_to(root).as_posix() for p in scan.files] == ["keep.txt"]
+        assert scan.excluded_total == 14
+
+    def test_generic_names_are_deliberately_kept(self, tmp_path: Path) -> None:
+        """bin/build/dist/out/lib/vendor mean build output in one ecosystem
+        and hand-written content in the next, so they stay in the listing."""
+        rels = [
+            "bin/setup",
+            "build/release.sh",
+            "dist/app.js",
+            "out/report.txt",
+            "lib/helper.rb",
+            "vendor/github.com/pkg/errors/errors.go",
+        ]
+        root = self.make_workspace(tmp_path, rels)
+        scan = scan_artifacts(root)
+        assert [p.relative_to(root).as_posix() for p in scan.files] == sorted(rels)
+        assert scan.excluded == {}
+
+    def test_nested_dependency_dirs_are_caught(self, tmp_path: Path) -> None:
+        """Monorepo layouts bury node_modules/target several levels down."""
+        root = self.make_workspace(
+            tmp_path,
+            [
+                "packages/web/src/app.ts",
+                "packages/web/node_modules/react/index.js",
+                "packages/web/node_modules/react/lib/x.js",
+                "crates/core/src/lib.rs",
+                "crates/core/target/debug/core.rlib",
+            ],
+        )
+        scan = scan_artifacts(root)
+        assert [p.relative_to(root).as_posix() for p in scan.files] == [
+            "crates/core/src/lib.rs",
+            "packages/web/src/app.ts",
+        ]
+        assert scan.excluded == {"node_modules": 2, "target": 1}
+
+    def test_exclusions_are_surfaced_not_silent(self, tmp_path: Path) -> None:
+        """A dropped 100k-file node_modules must be visible in the note that
+        run summaries, `sbxloop artifacts` and delivery PR bodies print."""
+        root = self.make_workspace(
+            tmp_path, ["app.py", "node_modules/a/i.js", "target/debug/x", ".git/HEAD"]
+        )
+        scan = scan_artifacts(root)
+        assert scan.excluded_note == "3 file(s) excluded (.git, node_modules, target)"
+
+    def test_manifests_that_regenerate_the_tree_are_still_delivered(self, tmp_path: Path) -> None:
+        """Dropping the tree is only safe because the lockfiles/manifests it
+        is reproducible from are kept."""
+        rels = [
+            "Cargo.lock",
+            "Cargo.toml",
+            "Gemfile.lock",
+            "package-lock.json",
+            "package.json",
+            "pyproject.toml",
+            "requirements.txt",
+        ]
+        root = self.make_workspace(tmp_path, [*rels, "node_modules/a/i.js"])
+        assert [p.relative_to(root).as_posix() for p in artifact_files(root)] == sorted(rels)
+
+    def test_override_replaces_rather_than_extends(self, tmp_path: Path) -> None:
+        """A user who names their own list opts out of the defaults entirely
+        — node_modules comes back unless they keep it."""
+        root = self.make_workspace(tmp_path, ["app.py", "node_modules/a/i.js"])
+        scan = scan_artifacts(root, exclude=[".git"])
+        assert [p.relative_to(root).as_posix() for p in scan.files] == [
+            "app.py",
+            "node_modules/a/i.js",
+        ]
+
 
 class TestArtifactsDir:
     def test_mounted_run_uses_workspace(self) -> None:

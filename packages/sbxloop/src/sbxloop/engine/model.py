@@ -226,12 +226,60 @@ class RunResult(_Model):
         return self.state == "completed"
 
 
-# Path components excluded from artifact listings and delivery by default.
-# A denylist, not "anything dot-prefixed": agents legitimately produce
-# .github/workflows, .gitignore, .env.example and friends — only genuinely
-# noisy state dirs are dropped (an agent's .git would otherwise swamp
-# listings and deliveries). Overridable via [artifacts] exclude.
-DEFAULT_ARTIFACT_EXCLUDES = (".git", ".sbxloop")
+# Path components excluded from artifact listings, harvest and delivery by
+# default. A denylist, not "anything dot-prefixed": agents legitimately
+# produce .github/workflows, .gitignore, .env.example and friends — only
+# machine-generated dependency and build trees are dropped. An agent's .git
+# or node_modules would otherwise swamp listings, balloon an unmounted run's
+# harvest, and land in a delivery PR diff. Overridable via [artifacts]
+# exclude (which replaces this list wholesale).
+#
+# The list is static rather than derived from [sandbox] languages, which
+# selects what gets PRE-INSTALLED, not what the workspace ends up holding.
+# That key defaults to toolchains.DEFAULT_LANGUAGES ("python",) and setting
+# it replaces rather than extends, so deriving from it would leave every
+# non-Python default run harvesting node_modules/target/obj — the exact bug
+# this list exists to fix — and would drop __pycache__ back into listings for
+# anyone who set languages = ["rust"]. Provisioning is only a head start
+# besides: agents self-heal missing toolchains mid-run, so a Rust-configured
+# run that npm-installs a docs site still grows a node_modules. A name that
+# never occurs costs nothing to carry, so the narrowing buys nothing either.
+# Entries earn a place only if they are (i) conventionally
+# gitignored in their ecosystem and (ii) implausible as hand-written content
+# in any other. That rule deliberately keeps out the generic names —
+# "bin", "build", "dist", "out", "lib", "vendor" — which are build output in
+# one ecosystem and checked-in scripts or deps in the next; a project that
+# wants those dropped can say so in [artifacts] exclude. Exclusions are
+# always counted and surfaced, never silent (#67), so a wrong call here is
+# visible and recoverable rather than a quiet truncation.
+DEFAULT_ARTIFACT_EXCLUDES = (
+    # Run/VCS state, any ecosystem.
+    ".git",
+    ".sbxloop",
+    # Python: virtualenvs, bytecode, tool caches.
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "venv",
+    # JavaScript / TypeScript.
+    "node_modules",
+    # Rust (cargo) and Java (Maven) both name their build tree "target".
+    "target",
+    # Java (Gradle's project-local cache; "build" is deliberately kept).
+    ".gradle",
+    # C# / .NET intermediate objects ("bin" is deliberately kept — too many
+    # ecosystems check hand-written scripts into it).
+    "obj",
+    # Ruby (bundler's project-local config/cache).
+    ".bundle",
+    # C / C++ (CMake scratch; Go needs no entry — GOCACHE and the module
+    # cache live under $HOME, outside the harvested workspace).
+    "CMakeFiles",
+)
 
 
 @dataclass(frozen=True)

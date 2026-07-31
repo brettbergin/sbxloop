@@ -153,10 +153,28 @@ class ArtifactsConfig(_ConfigModel):
     """What artifact listings and delivery leave out, and how harvesting works.
 
     ``exclude`` entries are single path components matched at any depth;
-    a file is excluded when any component of its path matches. The default
-    drops only genuinely noisy state dirs (``.git``, ``.sbxloop``) — dot-path
-    artifacts like ``.github/`` or ``.gitignore`` are delivered. Exclusions
-    are always counted and surfaced, never silent.
+    a file is excluded when any component of its path matches. Setting it
+    replaces the default list wholesale rather than adding to it.
+
+    The default drops run/VCS state (``.git``, ``.sbxloop``) plus the
+    machine-generated dependency and build trees of the supported languages
+    — ``node_modules``, ``__pycache__``, ``.venv``/``venv``, ``target``,
+    ``obj``, ``.gradle``, ``.bundle``, ``CMakeFiles`` and the Python tool
+    caches. Those are regenerable, can reach hundreds of MB, and are exactly
+    what nobody wants in an ``sbxloop artifacts`` listing or a ``--deliver``
+    PR diff. Dot-path artifacts like ``.github/`` or ``.gitignore`` are still
+    delivered.
+
+    Generic names that mean build output in one ecosystem and hand-written
+    content in another — ``bin``, ``build``, ``dist``, ``out``, ``lib``,
+    ``vendor`` — are deliberately *not* excluded; add them here if your
+    project wants them dropped. Exclusions are always counted and surfaced,
+    never silent.
+
+    The list covers every supported language regardless of
+    ``[sandbox] languages``: that key governs which toolchains are
+    pre-installed, not which ones the agent ends up using, and it defaults to
+    Python alone — see ``engine.model.DEFAULT_ARTIFACT_EXCLUDES``.
 
     ``harvest_mode`` controls when unmounted-run artifacts are copied to the
     host.  ``"per-task"`` (default) copies after every task boundary plus the
@@ -166,8 +184,29 @@ class ArtifactsConfig(_ConfigModel):
     """
 
     # Mirrors engine.model.DEFAULT_ARTIFACT_EXCLUDES (kept literal here —
-    # importing engine.model from config would be a circular import).
-    exclude: list[str] = Field(default_factory=lambda: [".git", ".sbxloop"])
+    # importing engine.model from config would be a circular import). See
+    # that module for why each entry is in and why "bin"/"build"/"vendor"
+    # are out; test_config_default_mirrors_model_default pins the two.
+    exclude: list[str] = Field(
+        default_factory=lambda: [
+            ".git",
+            ".sbxloop",
+            ".mypy_cache",
+            ".nox",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            ".venv",
+            "__pycache__",
+            "venv",
+            "node_modules",
+            "target",
+            ".gradle",
+            "obj",
+            ".bundle",
+            "CMakeFiles",
+        ]
+    )
     harvest_mode: HarvestMode = "per-task"
 
     @field_validator("exclude")
