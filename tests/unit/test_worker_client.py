@@ -631,6 +631,51 @@ class TestInstallFallbacks:
         assert len(apt_cmds) == 1, apt_cmds
         assert "python3-venv" in apt_cmds[0] and "build-essential" in apt_cmds[0]
 
+    def test_ensure_dev_tools_runs_install_script_after_apt(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Java is the first entry with both paths: the JDK comes from apt,
+        # then a script records JAVA_HOME. Order matters — the script reads
+        # the javac that apt just installed.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "java", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c grep -qs", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])
+        execs = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        apt_idx = [i for i, c in enumerate(execs) if "apt-get" in c]
+        script_idx = [i for i, c in enumerate(execs) if "JAVA_HOME" in c and "grep -qs" in c]
+        assert apt_idx and script_idx, execs
+        assert apt_idx[0] < script_idx[-1], "the install script must run after the apt batch"
+        assert "openjdk" in execs[apt_idx[0]] and "maven" in execs[apt_idx[0]]
+
+    def test_ensure_dev_tools_install_script_failure_is_nonfatal_but_loud(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "java", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c grep -qs", returncode=1, stderr="tee: permission denied")
+        self._script_happy_install(fake_sbx)
+        with caplog.at_level("WARNING"):
+            client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("dev-tools ensure failed for java" in m for m in messages), messages
+        # the warning names what is now missing, not just that something broke
+        assert any("JAVA_HOME" in m for m in messages), messages
+        assert any("tee: permission denied" in m for m in messages), messages
+
     def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
         import sbxloop
 

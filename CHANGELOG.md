@@ -8,6 +8,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["java"]` provisions a JDK and Maven** (issue
+  #161). apt for both, pinned to `openjdk-21-jdk` rather than floating on
+  `default-jdk`, which moves between distro releases. `JAVA_HOME` is part of
+  the contract — many build tools read it directly rather than looking for
+  `java` on PATH — so the entry records it in `/etc/sandbox-persistent.sh`,
+  which the worker already loads into the environment the agent session and
+  its shell commands inherit. The value is derived from the installed
+  `javac` rather than hardcoded, since the JVM directory name embeds the
+  distro architecture. Gradle is deliberately not installed: the `gradlew`
+  wrapper is the norm and fetches its own distribution, which makes it an
+  egress question (#141) rather than a package. Accepted spellings: `java`,
+  `jdk`, `jvm`.
+
 - **`[sandbox] languages = ["ruby"]` provisions Ruby** (issue #158).
   `ruby-full`, `ruby-dev`, `bundler`, and `build-essential` — apt only, and
   no egress beyond the always-reachable baseline. The dev headers and
