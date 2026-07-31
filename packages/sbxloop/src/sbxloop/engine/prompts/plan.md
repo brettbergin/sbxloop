@@ -31,9 +31,8 @@ Debian/Ubuntu VM; the system Python is externally managed (PEP 668), so
 Python dependencies belong in a project virtualenv (`python3 -m venv .venv`)
 and commands — including your `verify_commands` — should use `.venv/bin/...`
 paths; missing apt packages can be installed with passwordless sudo; network
-egress is allowlisted (PyPI, GitHub, and apt mirrors are reachable — declare
-anything else in `egress`, including any package registries the task's
-toolchain will hit: RubyGems, npm/yarn, crates.io, the Go module proxy).
+egress is allowlisted (GitHub, the apt mirrors, and the supported languages'
+package registries are reachable — declare anything else in `egress`).
 
 `verify_commands` run mechanically from the **workspace root** — the same
 directory the executor starts in — never from a subdirectory your steps
@@ -60,18 +59,15 @@ Steps must be specific enough that an executor with no other context can
 follow them. Include the task's own verification ideas in `verify_commands`.
 
 `egress` declares external domains the executor will need to reach beyond
-the baseline. PyPI, GitHub, and apt mirrors are always reachable — never
-declare those. Well-known package registries are pre-approved but reachable
-ONLY when declared here, so if the toolchain will touch one, declare it:
-`rubygems.org` + `index.rubygems.org` (gem/bundler), `registry.npmjs.org`
-(npm), `registry.yarnpkg.com` (yarn), `crates.io` + `static.crates.io` +
-`index.crates.io` (cargo), `proxy.golang.org` + `sum.golang.org` (Go).
-Each entry needs a short justification; use `[]` when the
-baseline suffices (the common case). Domains only — no scheme, path, or
-port; `*.example.com` wildcards are accepted. Declarations are auto-granted
-only within an operator-set allowlist (the registries above are always in
-bounds): a request outside it fails this plan's validation, so prefer
-baseline-reachable alternatives.
+the baseline. GitHub, the apt mirrors, and these package registries are
+always reachable — never declare them: $baseline_registries. These further
+registries are pre-approved but reachable ONLY when declared here, so if the
+toolchain will touch one, declare it: $declarable_registries. Each entry
+needs a short justification; use `[]` when the baseline suffices (the common
+case). Domains only — no scheme, path, or port; `*.example.com` wildcards
+are accepted. Declarations are auto-granted only within an operator-set
+allowlist (the registries above are always in bounds): a request outside it
+fails this plan's validation, so prefer baseline-reachable alternatives.
 
 Respond with ONLY the fenced JSON block — no prose before or after it.
 $retry_context

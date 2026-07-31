@@ -53,6 +53,13 @@ DOMAIN_PATTERN_RE = re.compile(r"(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+
 BASELINE_REGISTRY_DOMAINS = (
     "pypi.org",  # PyPI API and the simple index
     "files.pythonhosted.org",  # wheel and sdist downloads
+    "registry.npmjs.org",  # npm
+    "registry.yarnpkg.com",  # yarn classic (npm mirror)
+    # Tarballs for git-hosted dependencies. github.com is already reachable
+    # for the clone, but npm and yarn fetch `github:user/repo` deps as
+    # tarballs from codeload, which is a separate host — a partial grant
+    # fails only for projects that happen to use a git dep.
+    "codeload.github.com",
 )
 
 # Distro package mirrors: language-neutral infrastructure rather than any one
@@ -87,8 +94,6 @@ PROMPT_ADVERTISED_DOMAINS = (*BASELINE_REGISTRY_DOMAINS, *APT_MIRROR_DOMAINS)
 WELL_KNOWN_REGISTRY_DOMAINS = (
     "rubygems.org",  # gem downloads and API
     "index.rubygems.org",  # bundler's compact index
-    "registry.npmjs.org",  # npm
-    "registry.yarnpkg.com",  # yarn classic (npm mirror)
     "crates.io",  # cargo API
     "static.crates.io",  # crate downloads
     "index.crates.io",  # cargo sparse index

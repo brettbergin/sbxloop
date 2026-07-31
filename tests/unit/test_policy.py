@@ -12,6 +12,7 @@ from sbxloop.policy import (
     APT_MIRROR_DOMAINS,
     BASELINE_REGISTRY_DOMAINS,
     PROMPT_ADVERTISED_DOMAINS,
+    WELL_KNOWN_REGISTRY_DOMAINS,
     EgressGranter,
     baseline_allows,
     effective_egress_bounds,
@@ -65,6 +66,17 @@ class TestBaselineTiers:
         # The prompts advertise exactly the two baseline tiers, so a domain
         # can never be promoted into one without the prompts covering it.
         assert (*BASELINE_REGISTRY_DOMAINS, *APT_MIRROR_DOMAINS) == PROMPT_ADVERTISED_DOMAINS
+
+    def test_tiers_do_not_overlap(self) -> None:
+        # A domain in both tiers would be a promotion that forgot to remove
+        # the old entry: reachable, but still advertised as declare-me.
+        assert not set(BASELINE_REGISTRY_DOMAINS) & set(WELL_KNOWN_REGISTRY_DOMAINS)
+
+    def test_node_registry_is_baseline(self) -> None:
+        # #148: npm/yarn joined PyPI's tier, so an npm build no longer fails
+        # for a reason a pip build never encounters.
+        for domain in ("registry.npmjs.org", "registry.yarnpkg.com", "codeload.github.com"):
+            assert domain in BASELINE_REGISTRY_DOMAINS
 
     def test_python_registry_is_baseline(self) -> None:
         # #145: PyPI keeps its baseline privilege — the level-up direction —
@@ -122,19 +134,10 @@ class TestBounds:
 
     def test_well_known_registries_in_bounds_by_default(self) -> None:
         # A default config (no [policy] allow) must accept plans declaring
-        # the major package registries — the "write a Rails app" case.
+        # any registry in either tier — the "write a Rails app" case, and
+        # (since #141) declaring a baseline registry redundantly.
         allow, _deny = effective_egress_bounds(Config())
-        for domain in (
-            "rubygems.org",
-            "index.rubygems.org",
-            "registry.npmjs.org",
-            "registry.yarnpkg.com",
-            "crates.io",
-            "static.crates.io",
-            "index.crates.io",
-            "proxy.golang.org",
-            "sum.golang.org",
-        ):
+        for domain in (*BASELINE_REGISTRY_DOMAINS, *WELL_KNOWN_REGISTRY_DOMAINS):
             assert egress_rejection(domain, allow, _deny) is None
 
     def test_deny_still_blocks_well_known_registry(self) -> None:
@@ -169,18 +172,18 @@ class TestEgressGranter:
 
     def test_grants_in_bounds_domain_and_emits_event(self, fake_sbx: FakeSbx) -> None:
         events: list[Event] = []
-        granter = self.make_granter(fake_sbx, events, policy={"allow": ["registry.npmjs.org"]})
-        granter.apply("t1", [("registry.npmjs.org", "npm install")])
+        granter = self.make_granter(fake_sbx, events, policy={"allow": ["api.example-saas.com"]})
+        granter.apply("t1", [("api.example-saas.com", "fetch the dataset")])
         assert [
             "allow",
             "network",
-            "registry.npmjs.org",
+            "api.example-saas.com",
             "--sandbox",
             "sbxloop-r1-agent",
         ] in fake_sbx.policies()
         (event,) = [e for e in events if e.type == HostEventTypes.POLICY_ALLOW]
-        assert event.data["domain"] == "registry.npmjs.org"
-        assert event.data["reason"] == "npm install"
+        assert event.data["domain"] == "api.example-saas.com"
+        assert event.data["reason"] == "fetch the dataset"
         assert event.data["task_id"] == "t1"
 
     def test_grant_is_idempotent_per_domain(self, fake_sbx: FakeSbx) -> None:
