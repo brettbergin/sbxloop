@@ -679,7 +679,16 @@ PLAN_NPM = {
     }
 }
 
-# npm is a well-known registry (in-bounds without config), so out-of-bounds
+PLAN_GEMS = {
+    "json": {
+        "steps": ["bundle install"],
+        "expected_artifacts": [],
+        "verify_commands": [],
+        "egress": [{"domain": "rubygems.org", "reason": "bundle install"}],
+    }
+}
+
+# Every supported language's registry is baseline (#141), so out-of-bounds
 # tests need a domain no built-in tier covers.
 PLAN_SAAS_API = {
     "json": {
@@ -695,34 +704,57 @@ class TestPlanEgress:
     """Plan-declared egress: bounded by [policy], granted just before EXECUTE."""
 
     def test_in_bounds_egress_granted_and_event_logged(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN_NPM, EXECUTE, PASS, ACCEPT])
-        result = harness.engine(policy={"allow": ["registry.npmjs.org"]}).start("npm task")
+        harness.script([taskgraph(task("t1")), PLAN_SAAS_API, EXECUTE, PASS, ACCEPT])
+        result = harness.engine(policy={"allow": ["api.example-saas.com"]}).start("saas task")
         assert result.state == "completed"
         agent = f"sbxloop-{result.run_id}-agent"
         assert [
             "allow",
             "network",
-            "registry.npmjs.org",
+            "api.example-saas.com",
             "--sandbox",
             agent,
         ] in harness.fake_sbx.policies()
         (event,) = [e for e in harness.events if e.type == "policy.allow"]
-        assert event.data["domain"] == "registry.npmjs.org"
-        assert event.data["reason"] == "npm install"
+        assert event.data["domain"] == "api.example-saas.com"
+        assert event.data["reason"] == "fetch data"
         assert event.data["task_id"] == "t1"
 
-    def test_well_known_registry_granted_without_policy_config(self, harness: Harness) -> None:
+    def test_rails_app_bundle_installs_without_a_declaration(self, harness: Harness) -> None:
+        # #159: the motivating case for the declarable tier — "write a Rails
+        # app" — now runs off the baseline. Declaring rubygems.org anyway
+        # (as PLAN_GEMS does) stays valid and costs nothing: seeded at
+        # provision time, so no grant-late call and no policy event.
+        harness.script([taskgraph(task("t1")), PLAN_GEMS, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("gem task, default policy")
+        assert result.state == "completed"
+        seeds = [c for c in harness.fake_sbx.policies() if "rubygems.org" in c]
+        assert len(seeds) == 1
+        assert [e for e in harness.events if e.type.startswith("policy.")] == []
+
+    def test_baseline_registry_needs_no_grant(self, harness: Harness) -> None:
+        # #148: an npm build must not depend on the planner remembering to
+        # declare the registry — and declaring it anyway costs nothing,
+        # because the sandbox was provisioned with it.
         harness.script([taskgraph(task("t1")), PLAN_NPM, EXECUTE, PASS, ACCEPT])
         result = harness.engine().start("npm task, default policy")
         assert result.state == "completed"
-        agent = f"sbxloop-{result.run_id}-agent"
-        assert [
-            "allow",
-            "network",
-            "registry.npmjs.org",
-            "--sandbox",
-            agent,
-        ] in harness.fake_sbx.policies()
+        # Seeded once, at provision time — not granted late at EXECUTE
+        # entry, and so not event-logged: there is no grant to log.
+        seeds = [c for c in harness.fake_sbx.policies() if "registry.npmjs.org" in c]
+        assert len(seeds) == 1
+        assert seeds[0][:3] == ["allow", "network", "registry.npmjs.org"]
+        assert [e for e in harness.events if e.type.startswith("policy.")] == []
+
+    def test_typecheck_only_task_needs_no_egress(self, harness: Harness) -> None:
+        # #151: the minimal TypeScript case — dependencies already vendored,
+        # so the task only runs `tsc`. An empty `egress` must be a complete
+        # plan, not a plan that forgot something: no grants, no policy
+        # events, no failure.
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("type-check the project")
+        assert result.state == "completed"
+        assert [e for e in harness.events if e.type.startswith("policy.")] == []
 
     def test_out_of_bounds_egress_rejected_then_retried(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), PLAN_SAAS_API, PLAN, EXECUTE, PASS, ACCEPT])

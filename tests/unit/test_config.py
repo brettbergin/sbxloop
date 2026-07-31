@@ -47,6 +47,29 @@ def test_artifacts_exclude_rejects_path_separators(tmp_path: Path) -> None:
         load_config(cwd=tmp_path, env={})
 
 
+def test_sandbox_languages_default_is_python(tmp_path: Path) -> None:
+    # Unset means "what Python has had since 0.4.0" — #140 must not change
+    # provisioning for a run that never sets the key.
+    config = load_config(cwd=tmp_path, env={})
+    assert config.sandbox.languages == []
+    assert config.sandbox.effective_languages == ("python",)
+
+
+def test_sandbox_languages_normalizes_and_dedupes(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text(
+        '[sandbox]\nlanguages = ["Python", "py", "  python3 "]\n'
+    )
+    config = load_config(cwd=tmp_path, env={})
+    assert config.sandbox.languages == ["python"]
+    assert config.sandbox.effective_languages == ("python",)
+
+
+def test_sandbox_languages_rejects_unknown(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[sandbox]\nlanguages = ["cobol"]\n')
+    with pytest.raises(ConfigError, match=r"unsupported sandbox\.languages"):
+        load_config(cwd=tmp_path, env={})
+
+
 def test_pyproject_layer(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[tool.sbxloop]\nmodel = "gpt-5"\n[tool.sbxloop.budgets]\nmax_tasks = 5\n'

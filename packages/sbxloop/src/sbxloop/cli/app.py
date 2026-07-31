@@ -1002,7 +1002,12 @@ def config_show() -> None:
 @config_app.command("policy")
 def config_policy() -> None:
     """Show the effective per-phase network egress policy."""
-    from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
+    from sbxloop.policy import (
+        APT_MIRROR_DOMAINS,
+        BASELINE_REGISTRY_DOMAINS,
+        WELL_KNOWN_REGISTRY_DOMAINS,
+        baseline_allows,
+    )
     from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, GITHUB_ALLOW_DOMAINS
 
     try:
@@ -1013,7 +1018,10 @@ def config_policy() -> None:
 
     extra = list(config.sandbox.extra_allow_domains)
     baseline = ", ".join([*AGENT_ALLOW_DOMAINS, *extra])
-    advertised = ", ".join(PROMPT_ADVERTISED_DOMAINS)
+    # What provisioning actually seeds, deny applied — an operator reading
+    # this needs the effective set, not the constant.
+    registries = ", ".join(baseline_allows(BASELINE_REGISTRY_DOMAINS, config.policy.deny))
+    mirrors = ", ".join(baseline_allows(APT_MIRROR_DOMAINS, config.policy.deny))
 
     table = Table(title="agent sandbox: effective egress per phase")
     table.add_column("phase", no_wrap=True)
@@ -1032,10 +1040,14 @@ def config_policy() -> None:
     )
     console.print(table)
     console.print(f"baseline (provisioned per-sandbox): {baseline}")
-    console.print(f"advertised by the user's balanced preset: {advertised}")
+    console.print(f"language registry baseline (always reachable, no declaration): {registries}")
+    console.print(f"distro mirrors (always reachable, no declaration): {mirrors}")
     console.print(
         "well-known registries (declarable without [policy] allow): "
-        + ", ".join(WELL_KNOWN_REGISTRY_DOMAINS)
+        + (
+            ", ".join(WELL_KNOWN_REGISTRY_DOMAINS)
+            or "(none — every supported language's registry is in the baseline above)"
+        )
     )
 
     bounds = Table(title="[policy] bounds for plan-declared grants")
@@ -1239,9 +1251,10 @@ extra_allow_domains = []
 # event (`sbxloop logs RUN --type policy.`). Patterns: exact domains,
 # "*.example.com" (the domain and all subdomains), or "*" (everything).
 # Empty `allow` (the default) means plans may only use the always-reachable
-# baseline (the Copilot/GitHub hosts, PyPI, and apt mirrors) plus the
-# well-known package registries — RubyGems, npm/yarn, crates.io, the Go
-# proxy — which plans may declare without any configuration here.
+# baseline (the Copilot/GitHub hosts, the supported languages' package
+# registries, and apt mirrors) plus the well-known package registries plans
+# may declare without any configuration here. `deny` wins over both,
+# including the always-reachable baseline.
 # See `sbxloop config policy` for the effective per-phase policy.
 allow = []
 deny = []

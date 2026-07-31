@@ -28,9 +28,11 @@ import shlex
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 
 import sbxloop
+from sbxloop import toolchains
 from sbxloop.config import Limits, WorkerTransport
 from sbxloop.errors import SbxError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
@@ -177,6 +179,7 @@ class WorkerClient:
         no_deps: bool = False,
         system_site_packages: bool = False,
         ensure_dev_tools: bool = False,
+        languages: Sequence[str] = (),
         expect_prebaked: bool = False,
     ) -> None:
         """Install sbxloop-worker into the sandbox, venv-first with fallbacks.
@@ -207,13 +210,13 @@ class WorkerClient:
 
         ``ensure_dev_tools`` additionally makes the sandbox dev-ready for
         the AGENT's own work (see _ensure_dev_tools) — the engine sets it
-        for the agent sandbox only.
+        for the agent sandbox only, passing the configured ``languages``.
         """
         if expect_prebaked and self._verify_prebaked():
             self.prebaked = True
             return
         if ensure_dev_tools:
-            self._ensure_dev_tools(timeout)
+            self._ensure_dev_tools(timeout, languages)
             self._ensure_search_fallback(timeout)
         wheel = wheel if wheel is not None else resolve_worker_wheel()
         if wheel is not None:
@@ -352,8 +355,13 @@ class WorkerClient:
         logger.info("prebaked worker %s verified; install ladder skipped", sbxloop.__version__)
         return True
 
-    def _ensure_dev_tools(self, timeout: float) -> None:
+    def _ensure_dev_tools(self, timeout: float, languages: Sequence[str] = ()) -> None:
         """Best-effort: make the sandbox dev-ready for the agent's own work.
+
+        This provisions the toolchains for ``languages`` (see
+        ``sbxloop.toolchains``) before the agent's first turn, so it does not
+        burn revision budget bootstrapping its own compiler. Empty selects
+        the default, which is Python — the case this ensure was born for.
 
         Field failure (0.4.0): templates ship a system python without
         ensurepip. The worker self-heals its OWN venv (the ladder below),
@@ -361,34 +369,65 @@ class WorkerClient:
         the user-site fallback — leaving python3-venv missing, so the
         AGENT's `python3 -m venv` for the project it is building dies with
         "ensurepip is not available" on every revision until the budget
-        exhausts. Probe first — a template that already has ensurepip and
-        pip needs no apt and no network at all — then install the venv/pip
-        packages, and WARN loudly on failure instead of ignoring it. Never
-        fatal: worker installation has its own ladder, and the agent may
-        not need venvs at all.
+        exhausts. Since #140 that is one entry in a registry rather than the
+        only ecosystem with a head start, but the semantics are the ones
+        that failure taught us:
+
+        - **Probe first.** A template that already ships a toolchain needs
+          no apt and no network at all.
+        - **Batch the apt path.** All still-missing apt packages go into one
+          ``update && install``, so N selected languages is one round trip.
+        - **Never fatal, but loud.** Warn with the toolchain named; worker
+          installation has its own ladder and the agent retains
+          ``sudo apt-get`` as an escape hatch.
         """
-        probe = self.sandbox.exec(["python3", "-c", "import ensurepip, pip"])
-        if probe.ok:
-            logger.debug("dev tools already present; skipping apt ensure")
+        selected = toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES)
+        missing = [tc for tc in selected if not self.sandbox.exec(["sh", "-c", tc.probe]).ok]
+        if not missing:
+            logger.debug("dev tools already present; skipping toolchain ensure")
             return
-        result = self.sandbox.exec(
-            [
-                "sh",
-                "-c",
-                "sudo -n apt-get update -q && "
-                "sudo -n apt-get install -y -q python3-venv python3-pip",
-            ],
-            timeout=timeout,
-        )
-        if not result.ok:
-            logger.warning(
-                "dev-tools ensure failed (rc=%s) — the agent's own venv/pip use "
-                "may fail with 'ensurepip is not available'. rc=100 usually means "
-                "apt could not reach its mirrors; check the sandbox network policy "
-                "allows the Ubuntu/Debian apt hosts: %s",
-                result.returncode,
-                _output_tail(result),
+        logger.info("provisioning agent toolchains: %s", ", ".join(tc.name for tc in missing))
+        packages = toolchains.apt_packages(missing)
+        if packages:
+            apt_for = [tc for tc in missing if tc.apt_packages]
+            result = self.sandbox.exec(
+                [
+                    "sh",
+                    "-c",
+                    "sudo -n apt-get update -q && "
+                    f"sudo -n apt-get install -y -q {' '.join(packages)}",
+                ],
+                timeout=timeout,
             )
+            if not result.ok:
+                logger.warning(
+                    "dev-tools ensure failed for %s (rc=%s) — the agent may not "
+                    "have %s and has to bootstrap them itself. rc=100 usually "
+                    "means apt could not reach its mirrors; check the sandbox "
+                    "network policy allows the Ubuntu/Debian apt hosts: %s",
+                    ", ".join(tc.name for tc in apt_for),
+                    result.returncode,
+                    "; ".join(tc.wanted for tc in apt_for),
+                    _output_tail(result),
+                )
+        for toolchain in missing:
+            if toolchain.install_script is None:
+                continue
+            result = self.sandbox.exec(
+                ["sh", "-c", toolchain.install_script],
+                timeout=timeout,
+            )
+            if not result.ok:
+                logger.warning(
+                    "dev-tools ensure failed for %s (rc=%s) — the agent may not "
+                    "have %s and has to bootstrap them itself. A blocked "
+                    "installer domain is the usual cause; check the sandbox "
+                    "network policy: %s",
+                    toolchain.name,
+                    result.returncode,
+                    toolchain.wanted,
+                    _output_tail(result),
+                )
 
     # The worker reroutes the Copilot CLI's glob/grep tools to a PATH ripgrep
     # on non-4-KiB-page guests (USE_BUILTIN_RIPGREP=false, issue #122); this

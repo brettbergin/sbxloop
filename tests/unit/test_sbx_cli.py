@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from sbxloop.errors import SbxError, SbxNotFoundError
-from sbxloop.sbx.cli import SbxCLI, redacted_argv
+from sbxloop.sbx.cli import SbxCLI, _exec_failed_at_sbx_level, redacted_argv
 from sbxloop.sbx.models import SandboxSpec, SecretSpec
 from tests.conftest import FakeSbx
 
@@ -356,3 +356,32 @@ class TestSecretSpecModel:
     def test_service_spec_rejects_host(self) -> None:
         with pytest.raises(ValueError, match="must not set host"):
             SecretSpec(kind="service", service="github", host="x")
+
+
+class TestExecFailureClassification:
+    """`sbx exec` stderr belongs to the INNER command, so ordinary shell
+    failures must come back as a nonzero result, not a raised SbxError."""
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "sh: 1: dpkg: not found",
+            "bash: cargo: command not found",
+            "curl: (22) The requested URL returned error: 404 Not Found",
+            "npm ERR! 404 Not Found - GET https://registry.npmjs.org/nope",
+        ],
+    )
+    def test_inner_command_not_found_is_not_infra(self, stderr: str) -> None:
+        assert not _exec_failed_at_sbx_level(stderr)
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            'Error: sandbox "sbxloop-r1-agent" not found',
+            "Error: no such sandbox: sbxloop-r1-agent",
+            "Error: sandbox is not running",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        ],
+    )
+    def test_sbx_level_failures_still_raise(self, stderr: str) -> None:
+        assert _exec_failed_at_sbx_level(stderr)

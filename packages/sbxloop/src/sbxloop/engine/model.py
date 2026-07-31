@@ -234,10 +234,17 @@ class RunResult(_Model):
 # harvest, and land in a delivery PR diff. Overridable via [artifacts]
 # exclude (which replaces this list wholesale).
 #
-# The list is static rather than derived from the languages a run provisions:
-# agents self-heal missing toolchains mid-run, so the workspace's actual
-# ecosystems are not knowable from config, and a name that never occurs costs
-# nothing to carry. Entries earn a place only if they are (i) conventionally
+# The list is static rather than derived from [sandbox] languages, which
+# selects what gets PRE-INSTALLED, not what the workspace ends up holding.
+# That key defaults to toolchains.DEFAULT_LANGUAGES ("python",) and setting
+# it replaces rather than extends, so deriving from it would leave every
+# non-Python default run harvesting node_modules/target/obj — the exact bug
+# this list exists to fix — and would drop __pycache__ back into listings for
+# anyone who set languages = ["rust"]. Provisioning is only a head start
+# besides: agents self-heal missing toolchains mid-run, so a Rust-configured
+# run that npm-installs a docs site still grows a node_modules. A name that
+# never occurs costs nothing to carry, so the narrowing buys nothing either.
+# Entries earn a place only if they are (i) conventionally
 # gitignored in their ecosystem and (ii) implausible as hand-written content
 # in any other. That rule deliberately keeps out the generic names —
 # "bin", "build", "dist", "out", "lib", "vendor" — which are build output in

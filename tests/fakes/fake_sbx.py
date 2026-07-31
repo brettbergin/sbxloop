@@ -270,10 +270,12 @@ def cmd_exec(root: Path, args: list[str]) -> int:
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["SBX_FAKE_FS"] = str(fs)
-    # The fake stands in for a Linux microVM, but exec'd commands really run
-    # on the host. On macOS, bsdtar stores xattrs as AppleDouble "._name"
-    # members, so the harvest tar round-trip invents files that GNU tar in a
-    # real sandbox never produces. Suppress it so counts match the VM.
+    # A real sandbox is a Linux microVM. On a macOS host, bsdtar serializes
+    # extended attributes into AppleDouble sidecars (`._name`), so the
+    # harvest tar round trip invented four extra "artifacts" that no Linux
+    # guest would ever produce — `files: 6` instead of `2`, passing in CI
+    # and failing on every developer's Mac. Disabling copyfile(3) metadata
+    # makes the host's tar/cp model the guest they stand in for.
     env["COPYFILE_DISABLE"] = "1"
     try:
         proc = subprocess.run(rewritten, cwd=home, env=env, check=False)
