@@ -63,6 +63,23 @@ class TestSpecs:
             ("api.github.com", "COPILOT_GITHUB_TOKEN")
         ]
 
+    def test_denied_baseline_domain_is_never_seeded(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # The always-reachable tier is seeded before any plan exists, so
+        # refusing a grant later cannot enforce [policy] deny against it —
+        # the domain has to be kept out of the spec (#141).
+        config = Config.model_validate({"policy": {"deny": ["pypi.org", "*.ubuntu.com"]}})
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
+        agent, _github = provisioner.build_specs("r1", tmp_path)
+        assert "pypi.org" not in agent.policy_allows
+        assert "archive.ubuntu.com" not in agent.policy_allows
+        # ...while the rest of the baseline, and sbxloop's own control
+        # plane, are untouched.
+        assert "files.pythonhosted.org" in agent.policy_allows
+        assert "deb.debian.org" in agent.policy_allows
+        assert "api.githubcopilot.com" in agent.policy_allows
+
     def test_extra_allow_domains_added(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         config = Config.model_validate(
             {"sandbox": {"extra_allow_domains": ["internal.example.com"]}}

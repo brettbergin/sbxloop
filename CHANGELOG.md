@@ -6,6 +6,143 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`[sandbox] languages = ["dotnet"]` provisions the .NET SDK** (issue
+  #164), completing the ten-language set for layer 1 of #140. Availability
+  and currency of `dotnet-sdk-*` in the base Debian/Ubuntu archives varies
+  by release and is unreliable to depend on, so the SDK comes from
+  Microsoft's own builds, pinned to an LTS patch and verified against the
+  **sha512** its release metadata publishes (the .NET feed publishes sha512
+  rather than sha256). The major is pinned because a project's `global.json`
+  can demand an exact SDK and fails hard when it is absent. `DOTNET_ROOT` is
+  recorded in the persistent env — a manual, non-package SDK install is only
+  half-done without it — along with a telemetry opt-out, which under
+  default-deny egress would otherwise only ever be a blocked outbound
+  request. At roughly 220 MB the SDK is the strongest candidate in the set
+  for `sbxloop bake` rather than a per-run download. Accepted spellings:
+  `dotnet`, `csharp`, `c#`, `net`, `dotnet-sdk`. Adds a
+  `builds.dotnet.microsoft.com` egress dependency (#141).
+
+- **`[sandbox] languages = ["rust"]` provisions cargo and rustc** (issue
+  #143). Debian/Ubuntu do ship `cargo`/`rustc`, but distro Rust routinely
+  lags stable by several releases, which breaks edition- and MSRV-sensitive
+  projects outright — and rustup is the norm nearly every Rust instruction
+  assumes. `rustup-init` is downloaded and checksum-verified per
+  architecture rather than piped from `sh.rustup.rs` into a shell, then run
+  with `--profile minimal --component rustfmt --component clippy`: the two
+  components a plan's verify commands actually reach for, without the large
+  docs component nothing here needs. rustup's usual PATH wiring edits shell
+  profiles that a bare `sbx exec sh -c` never sources, so the shims are
+  linked into `/usr/local/bin` and the toolchain stays in the agent's home
+  where `cargo install` can write to it without sudo. Adds
+  `static.rust-lang.org` as an egress dependency (#141).
+
+- **`[sandbox] languages = ["go"]` provisions the Go toolchain** (issue
+  #153). The official `go.dev` tarball rather than `golang-go`: modules
+  frequently declare a `go` directive newer than the distro build, which
+  fails the build outright. Pinned and verified against upstream's published
+  per-architecture sha256, resolved in-sandbox like the Node entry, and
+  installed by replacing `/usr/local/go` rather than extracting over it —
+  overlaying two versions leaves a broken tree. `GOTOOLCHAIN` is
+  deliberately **not** pinned to `local`: doing so would make a project
+  whose `go.mod` demands a newer Go fail outright, which is the very
+  distro-lag failure this entry avoids. Left at the default, Go fetches what
+  the module asks for during EXECUTE, where a plan can declare the Go proxy
+  as egress. Adds a `go.dev` egress dependency at provisioning time (#141).
+
+- **`[sandbox] languages = ["typescript"]` provisions `tsc` on top of Node**
+  (issue #150). Toolchain entries can now declare what they are built on,
+  and selecting one selects its requirements — TypeScript pulls in the
+  JavaScript entry and the registry order guarantees the Node runtime is
+  installed before `npm i -g typescript` runs. The compiler is pinned; a
+  project with its own `typescript` devDependency will still use that, since
+  the global install is for bootstrapping a project from nothing rather than
+  for driving any particular build pipeline. Adds a `registry.npmjs.org`
+  egress dependency on top of Node's `nodejs.org` (#141) — and because
+  provisioning runs before the PLAN phase, a plan declaration cannot satisfy
+  it; the README now documents `[sandbox] extra_allow_domains` as the way to
+  make installer-based toolchains reachable today.
+
+- **`[sandbox] languages = ["javascript"]` provisions Node** (issue #147).
+  The official `nodejs.org` tarball rather than apt: Debian/Ubuntu stable
+  ship a Node several majors behind current LTS, which breaks packages
+  declaring modern `engines` constraints — a functional failure, not
+  cosmetic lag. Pinned to an exact LTS release and verified against the
+  upstream `SHASUMS256.txt` digest for the sandbox's architecture, resolved
+  in-sandbox so the same config works on arm64 microVMs and amd64 CI
+  runners; an unrecognized architecture fails loudly instead of downloading
+  a binary that cannot run. The probe checks the pinned **major**, not just
+  that `node` exists, so a template carrying an older Node is upgraded
+  rather than accepted. Node is extracted into `/usr/local`, which also
+  makes it npm's global prefix so `npm i -g` lands on PATH. Accepted
+  spellings: `javascript`, `js`, `node`, `nodejs`, `javascript-node`. Adds
+  a `nodejs.org` egress dependency (#141).
+
+- **`[sandbox] languages = ["php"]` provisions PHP and Composer** (issue
+  #167). apt for the interpreter and — more importantly — the extensions:
+  `php-cli` alone passes a `command -v php` check and then fails the moment
+  a project or Composer itself needs mbstring or zip, so `php-mbstring`,
+  `php-xml`, `php-curl`, and `php-zip` come with it and the probe checks
+  the extensions are actually loaded rather than just that `php` exists.
+  Composer is not reliably packaged at a useful version, so it comes from
+  upstream — but as a **pinned release verified against its published
+  sha256**, not piped into the interpreter. Bumping the version means
+  bumping the digest alongside it. Adds a `getcomposer.org` egress
+  dependency (#141).
+
+- **`[sandbox] languages = ["java"]` provisions a JDK and Maven** (issue
+  #161). apt for both, pinned to `openjdk-21-jdk` rather than floating on
+  `default-jdk`, which moves between distro releases. `JAVA_HOME` is part of
+  the contract — many build tools read it directly rather than looking for
+  `java` on PATH — so the entry records it in `/etc/sandbox-persistent.sh`,
+  which the worker already loads into the environment the agent session and
+  its shell commands inherit. The value is derived from the installed
+  `javac` rather than hardcoded, since the JVM directory name embeds the
+  distro architecture. Gradle is deliberately not installed: the `gradlew`
+  wrapper is the norm and fetches its own distribution, which makes it an
+  egress question (#141) rather than a package. Accepted spellings: `java`,
+  `jdk`, `jvm`.
+
+- **`[sandbox] languages = ["ruby"]` provisions Ruby** (issue #158).
+  `ruby-full`, `ruby-dev`, `bundler`, and `build-essential` — apt only, and
+  no egress beyond the always-reachable baseline. The dev headers and
+  compiler are deliberately not optional: gems with native extensions
+  (nokogiri, pg, …) fail to build when only `ruby` is present, which is the
+  usual way a half-installed Ruby shows up. `build-essential` is shared with
+  the C/C++ entry and installs once, not twice. Projects pinning an exact
+  Ruby the distro does not carry still need `rbenv`, which is out of scope
+  here. Accepted spellings: `ruby`, `rb`.
+
+- **`[sandbox] languages = ["cpp"]` provisions a C/C++ toolchain** (issue
+  #170). `build-essential`, `cmake`, `ninja-build`, and `pkg-config` — pure
+  apt, no installer, and no egress beyond the apt mirrors already in the
+  always-reachable baseline, which makes this the cleanest entry in the
+  Layer 1 set. Accepted spellings: `cpp`, `c`, `c++`, `cxx`, `c-cpp`. The
+  probe checks `gcc`, `g++`, `make`, `cmake`, and `pkg-config`; `ninja` and
+  `clang` are optional extras a build can do without, so a template that
+  lacks them is not reinstalled over.
+
+- **`[sandbox] languages` selects which language toolchains the agent
+  sandbox is provisioned with** (issue #144, layer 1 of the language-bias
+  investigation #140). `_ensure_dev_tools` apt-installed `python3-venv` and
+  `python3-pip` for the *agent's* project before its first turn — a real
+  head start, but one only Python got: a Node, Rust, or Ruby task
+  discovered its missing compiler on first failure and spent revision
+  budget bootstrapping it. That call is now one entry in a registry
+  (`sbxloop.toolchains`) selected by config rather than a hardcoded special
+  case. Semantics are the ones the 0.4.0 field failure taught us and they
+  apply to every entry: probe first (a template that already ships the
+  toolchain costs no apt call and no network), never fatal (a failure warns
+  with the toolchain named and the run continues on the agent's own
+  `sudo apt-get` escape hatch), and opt-in only. Selected apt packages are
+  pooled into a single `update && install`, so N languages is one round
+  trip. **Behavior is unchanged for existing runs**: unset means
+  `["python"]`. Setting the key replaces that default rather than adding to
+  it — this is the point, since no language should be privileged by
+  accident of implementation. Python is the only registered entry so far;
+  the other nine follow.
+
 ### Changed
 
 - **The plan and execute prompts no longer teach Python as the default
@@ -18,6 +155,99 @@ All notable changes to sbxloop are documented here. The project adheres to
   short reference block the model reads one entry of. Python is the first
   entry — its PEP 668 guidance is unchanged in substance, just no longer the
   framing for everyone else. Ecosystems covered so far: Python.
+
+- **Package-registry egress levels up rather than down** (issues #141,
+  #145). The network baseline privileged Python: `pypi.org` and
+  `files.pythonhosted.org` were unconditionally reachable while every other
+  language's registry cost a plan declaration the planner had to remember —
+  and a forgotten declaration is a failed run, not a degraded one. #145
+  settled the direction for the whole layer: promote the other registries to
+  PyPI's tier rather than demote PyPI to theirs. Demotion could not have
+  produced real parity anyway — the worker's own `pip install` runs at
+  provision time, before a plan exists to declare egress in — and it would
+  have broken every existing plan that never declared PyPI.
+
+  Structurally, `policy.PROMPT_ADVERTISED_DOMAINS` is now the union of
+  `BASELINE_REGISTRY_DOMAINS` (the language registry tier, starting with
+  Python's two hosts) and `APT_MIRROR_DOMAINS` (language-neutral distro
+  infrastructure, baseline regardless). `sbxloop config policy` prints the
+  two tiers separately, so what is unconditionally reachable is legible
+  without reading the source. Promoted into the registry tier so far:
+
+  - Python — `pypi.org`, `files.pythonhosted.org` (#145)
+
+  - JavaScript/Node — `registry.npmjs.org`, `registry.yarnpkg.com`, and
+    `codeload.github.com` for `github:user/repo` dependencies, whose
+    tarballs come from a different host than the clone (#148)
+
+  - TypeScript — no new domains: the compiler and `@types/*` packages are
+    plain npm packages, so the Node promotion covers the whole toolchain.
+    A type-check-only task over vendored dependencies needs no egress at
+    all, and an empty `egress` is a complete plan rather than a forgetful
+    one (#151)
+
+  - Go — `proxy.golang.org` and `sum.golang.org` together: a reachable
+    proxy whose checksum database is blocked fails `go mod download` at
+    verification, which reads as a broken toolchain rather than a policy
+    decision (#154)
+
+  - Java — `repo.maven.apache.org` and `repo1.maven.org` (Maven Central),
+    plus `plugins.gradle.org` and `services.gradle.org`. Java was in
+    *neither* tier: a plan could not even declare Central without operator
+    configuration. Gradle needs the plugin portal and the wrapper
+    distribution host as well — Central alone still fails the build (#162)
+
+  - C#/.NET — `api.nuget.org` and `nuget.org`, also previously in neither
+    tier. `dotnet restore` runs implicitly inside `dotnet build` and
+    `dotnet test`, so an unreachable feed surfaced as a build failure
+    rather than an install failure (#165)
+
+  - PHP — `repo.packagist.org` and `packagist.org`, the third registry that
+    was in neither tier. Composer also fetches many dist zips from
+    `codeload.github.com`, already baseline since the Node promotion —
+    without it, `composer install` fails only for the packages that happen
+    to be served from GitHub (#168)
+
+  - Ruby — `rubygems.org` and `index.rubygems.org` (bundler's compact index
+    is a separate host). This was the case `policy.py` cited as motivating
+    the declarable tier in the first place — "write a Rails app"
+    bundle-installing out of the box — and it no longer depends on the plan
+    remembering (#159)
+
+  - Rust — `crates.io`, `static.crates.io`, and `index.crates.io`. Cargo
+    resolves from the sparse index, downloads from static, and talks to the
+    API separately; two of the three fails mid-resolution (#156). The
+    `rustup` installer domains are toolchain rather than registry and stay
+    with the Layer 1 work (#143)
+
+  - C/C++ — no new baseline domains. Its default dependency source is apt,
+    already baseline, and the apt-only path is now covered by tests: useful
+    evidence that the baseline works when a language's dependencies come
+    from it. Conan (`center.conan.io`) is declarable rather than seeded —
+    a real registry, but not how C/C++ dependencies normally arrive — and
+    vcpkg stays operator-configured, since it fetches source tarballs from
+    whatever upstream each port names and no fixed host set can cover that
+    (#171)
+
+  The plan and execute prompts no longer hardcode the tiers: both lists are
+  injected from `policy.py` at render time, so a promotion cannot leave the
+  prompts telling planners to declare a domain that needs no declaration.
+
+  `WELL_KNOWN_REGISTRY_DOMAINS` — the declarable-without-configuration tier —
+  survives as the second-line case: a legitimate registry that is not how a
+  language's dependencies normally arrive, so a plan names it and the grant
+  is event-logged. Conan is its one member today. An empty tier is also a
+  supported state: `sbxloop config policy` and the prompts both render it
+  explicitly rather than printing a blank.
+
+  The promotion trades some audit granularity — a baseline registry emits no
+  `policy.allow` event, because there is no grant to log — so it is bounded
+  to read-only public registries for supported languages.
+  **`[policy] deny` now wins over the always-reachable tier too**: denied
+  domains are filtered out of the set provisioning seeds
+  (`policy.baseline_allows`) instead of being seeded and then refused a
+  redundant re-grant. Previously a `deny` on `pypi.org` left it reachable,
+  because provisioning seeded it before any grant could be refused.
 
 - **Leftovers from the 0.2.0 `sdxloop` → `sbxloop` rename are gone.** The
   exception base class is now `SbxloopError` (was `SdxloopError`) across all
