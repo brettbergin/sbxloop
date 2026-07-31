@@ -106,6 +106,14 @@ and none of these is the "normal" choice.
   a bare `phpunit` is not on PATH. Composer needs `--no-interaction` in a
   non-interactive sandbox. Verify:
   `composer install --no-interaction && ./vendor/bin/phpunit`.
+- **C/C++** — out-of-source builds are the norm (`cmake -S . -B build`),
+  so the build directory is not the source directory and every later
+  command must name it. There is **no per-project dependency isolation
+  step** here — no venv, `node_modules`, or `vendor` equivalent — so do
+  not invent one; compilers and libraries come from apt. This is where
+  the workspace-root contract bites hardest: `ctest` run from the wrong
+  directory finds no tests and can still exit 0, so always pass
+  `--test-dir`. Verify: `cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure`.
 
 ## Response format
 

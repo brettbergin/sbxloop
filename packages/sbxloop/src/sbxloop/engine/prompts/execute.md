@@ -63,6 +63,11 @@ destroyed.
   - **PHP** — `composer install --no-interaction` from the directory
     holding `composer.json`, then run project binaries out of
     `./vendor/bin/`; a bare `phpunit` is not on PATH.
+  - **C/C++** — configure out-of-source (`cmake -S . -B build`) and name
+    the build directory in every later command, including
+    `ctest --test-dir build`; run elsewhere, `ctest` finds no tests and
+    can still exit 0. There is no per-project isolation step to set up —
+    install compilers and libraries with apt.
 
 ## Overall outcome
 
