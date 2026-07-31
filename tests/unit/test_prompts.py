@@ -73,6 +73,7 @@ ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
         ("tsconfig.json", "npx tsc --noEmit && npm test"),
         ("tsconfig.json", "tsc --noEmit"),
     ),
+    ("Go", ("go.mod", "go build ./... && go test ./..."), ("go.mod", "./...")),
 ]
 
 
