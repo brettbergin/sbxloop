@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["rust"]` provisions cargo and rustc** (issue
+  #143). Debian/Ubuntu do ship `cargo`/`rustc`, but distro Rust routinely
+  lags stable by several releases, which breaks edition- and MSRV-sensitive
+  projects outright — and rustup is the norm nearly every Rust instruction
+  assumes. `rustup-init` is downloaded and checksum-verified per
+  architecture rather than piped from `sh.rustup.rs` into a shell, then run
+  with `--profile minimal --component rustfmt --component clippy`: the two
+  components a plan's verify commands actually reach for, without the large
+  docs component nothing here needs. rustup's usual PATH wiring edits shell
+  profiles that a bare `sbx exec sh -c` never sources, so the shims are
+  linked into `/usr/local/bin` and the toolchain stays in the agent's home
+  where `cargo install` can write to it without sudo. Adds
+  `static.rust-lang.org` as an egress dependency (#141).
+
 - **`[sandbox] languages = ["go"]` provisions the Go toolchain** (issue
   #153). The official `go.dev` tarball rather than `golang-go`: modules
   frequently declare a `go` directive newer than the distro build, which

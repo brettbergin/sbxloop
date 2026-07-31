@@ -7,6 +7,7 @@ and never raises, and apt packages pool instead of duplicating.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -259,6 +260,55 @@ def test_go_does_not_pin_gotoolchain_local() -> None:
     go = toolchains.resolve(["go"])[0]
     assert go.install_script is not None
     assert "GOTOOLCHAIN" not in go.install_script
+
+
+@pytest.mark.parametrize("toolchain", toolchains.TOOLCHAINS, ids=lambda t: t.name)
+def test_probe_and_install_script_are_valid_shell(toolchain: toolchains.Toolchain) -> None:
+    """Every entry is shell that ``sh -c`` must be able to parse.
+
+    These strings are assembled with f-strings and nested quoting, and a
+    syntax error would only ever surface in-sandbox as a confusing warning
+    on somebody's real run. ``sh -n`` parses without executing.
+    """
+    for label, script in (("probe", toolchain.probe), ("install", toolchain.install_script)):
+        if script is None:
+            continue
+        result = subprocess.run(["sh", "-n", "-c", script], capture_output=True, text=True)
+        assert result.returncode == 0, f"{toolchain.name} {label}: {result.stderr}"
+
+
+@pytest.mark.parametrize("toolchain", toolchains.TOOLCHAINS, ids=lambda t: t.name)
+def test_downloads_are_checksum_verified(toolchain: toolchains.Toolchain) -> None:
+    # Anything fetched from the network must be pinned and verified — no
+    # curl-into-a-shell, no unchecked tarball.
+    script = toolchain.install_script
+    if script is None or "curl" not in script:
+        return
+    assert "sha256sum -c" in script, f"{toolchain.name} downloads without verifying"
+    # A real pipe-into-a-shell, not the `| sha256sum` that does the
+    # verifying — hence the word boundary.
+    piped = re.search(r"\|\s*(sudo\s+(-\S+\s+)*)?(sh|bash|python3?|php)\b", script)
+    assert piped is None, f"{toolchain.name} pipes a download into an interpreter: {piped}"
+
+
+def test_rust_installs_rustfmt_and_clippy_without_the_docs_profile() -> None:
+    # #143: minimal profile unless clippy/rustfmt are needed — they are, so
+    # request them explicitly rather than pulling the whole default profile.
+    rust = toolchains.resolve(["rust"])[0]
+    assert rust.install_script is not None
+    assert "--profile minimal" in rust.install_script
+    assert "--component rustfmt" in rust.install_script
+    assert "--component clippy" in rust.install_script
+    assert f"--default-toolchain {toolchains.RUST_TOOLCHAIN}" in rust.install_script
+
+
+def test_rust_does_not_rely_on_shell_profiles_for_path() -> None:
+    # rustup's default PATH wiring edits shell profiles, which a bare
+    # `sbx exec sh -c` never sources.
+    rust = toolchains.resolve(["rust"])[0]
+    assert rust.install_script is not None
+    assert "--no-modify-path" in rust.install_script
+    assert "/usr/local/bin" in rust.install_script
 
 
 def test_python_entry_matches_the_pre_140_behavior() -> None:
