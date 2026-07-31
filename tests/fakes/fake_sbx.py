@@ -270,6 +270,13 @@ def cmd_exec(root: Path, args: list[str]) -> int:
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["SBX_FAKE_FS"] = str(fs)
+    # A real sandbox is a Linux microVM. The fake runs commands on the host,
+    # so on macOS `tar -c` serializes each file's extended attributes as an
+    # AppleDouble `._name` member (macOS stamps com.apple.provenance on every
+    # new file). bsdtar hides those on read, but the host-side harvest
+    # extracts with Python's tarfile, which materializes them — the artifact
+    # harvest would carry files that no Linux VM could ever produce.
+    env["COPYFILE_DISABLE"] = "1"
     try:
         proc = subprocess.run(rewritten, cwd=home, env=env, check=False)
     except FileNotFoundError:
