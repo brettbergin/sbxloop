@@ -55,11 +55,27 @@ def script_toolchain_probe(
     """Script one language toolchain's presence probe.
 
     Unscripted it would run on the *host*, where the answer depends on the
-    developer's machine (the test venv has ensurepip, a mac has clang) — so
-    every toolchain probe a test can reach must be pinned explicitly.
+    machine: the test venv has ensurepip, a mac has clang, and the CI
+    runners ship a global `tsc`. So every toolchain probe a test can reach
+    must be pinned explicitly — including the probes of any toolchain a
+    selection pulls in via ``requires``.
+
+    Looked up by canonical name rather than ``resolve(...)[0]``: resolve
+    also returns requirements, so for "typescript" the first element is
+    *javascript*, and scripting that instead left the real tsc probe to run
+    against the host.
     """
-    toolchain = toolchains.resolve([name])[0]
+    key = toolchains.normalize_language(name)
+    assert key is not None, f"unknown toolchain {name!r}"
+    toolchain = next(t for t in toolchains.TOOLCHAINS if t.name == key)
     fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=returncode, stderr=stderr)
+
+
+def script_probes_for(fake_sbx: FakeSbx, languages: list[str], *, returncode: int = 1) -> None:
+    """Script every probe a ``languages`` selection will run, requirements
+    included — the safe way to set up a test that passes ``languages=``."""
+    for toolchain in toolchains.resolve(languages):
+        script_toolchain_probe(fake_sbx, toolchain.name, returncode=returncode)
 
 
 def agent_job(**overrides: object) -> JobRequest:
@@ -685,8 +701,7 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
-        script_toolchain_probe(fake_sbx, "javascript", returncode=1)
-        script_toolchain_probe(fake_sbx, "typescript", returncode=1)
+        script_probes_for(fake_sbx, ["ts"])
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
         fake_sbx.script("exec boxa sh -c set -e; case", returncode=0)
