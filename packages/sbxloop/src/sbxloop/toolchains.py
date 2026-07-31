@@ -405,10 +405,78 @@ RUST = Toolchain(
 )
 
 
+# Availability and currency of `dotnet-sdk-*` in the base Debian/Ubuntu
+# archives varies by release and is unreliable to depend on (#164), so the
+# SDK comes from Microsoft's own builds — pinned to an LTS patch and
+# verified against the sha512 its release metadata publishes (the .NET feed
+# publishes sha512 rather than sha256, hence the different checksum tool).
+DOTNET_SDK_VERSION = "10.0.302"
+DOTNET_SDK_MAJOR = DOTNET_SDK_VERSION.split(".")[0]
+DOTNET_ROOT = "/usr/local/dotnet"
+_DOTNET_TARBALL = "/tmp/dotnet-sdk.tar.gz"  # nosec B108 - inside the sandbox VM, not host tmp
+_DOTNET_DIGESTS = {
+    "amd64": (
+        "x64",
+        "10069bec8783596484a610332f090d562802a41b9b40e3327a5a5688b572e10c"
+        "296ae300f940d40461f23c157ed1b0843c2f8e6b3f20d8d8d9d83432d8143bac",
+    ),
+    "arm64": (
+        "arm64",
+        "9e409c14e00686d661c78fa4dd9ad0e4dcf695c328bd5ff777d05b4a9c34b42c"
+        "f89b12573b92e9fb2f565dbe12016b4835f77c7d9a42b55a7494df21634cd5d6",
+    ),
+}
+
+DOTNET = Toolchain(
+    name="dotnet",
+    wanted=f"dotnet SDK {DOTNET_SDK_MAJOR}.x, DOTNET_ROOT",
+    # Pinned major, plus the DOTNET_ROOT export: a manual (non-package) SDK
+    # install is only half-done without it, and like JAVA_HOME it lives in
+    # a file this probe's bare shell never sources.
+    probe=(
+        f'dotnet --list-sdks 2>/dev/null | grep -q "^{DOTNET_SDK_MAJOR}\\." '
+        f"&& grep -qs '^export DOTNET_ROOT=' {PERSISTENT_ENV}"
+    ),
+    # libicu-dev is the version-agnostic way to get the ICU runtime the SDK
+    # needs for globalization; naming libicuNN directly would pin us to one
+    # Ubuntu release.
+    apt_packages=("curl", "ca-certificates", "libicu-dev"),
+    install_script=(
+        "set -e; " + _arch_dispatch(_DOTNET_DIGESTS) + "; "
+        f'curl -fsSL -o {_DOTNET_TARBALL} "https://builds.dotnet.microsoft.com/dotnet'
+        f'/Sdk/{DOTNET_SDK_VERSION}/dotnet-sdk-{DOTNET_SDK_VERSION}-linux-$arch.tar.gz"; '
+        f"printf '%s  {_DOTNET_TARBALL}\\n' \"$sum\" | sha512sum -c - >/dev/null; "
+        f"sudo -n rm -rf {DOTNET_ROOT}; sudo -n mkdir -p {DOTNET_ROOT}; "
+        f"sudo -n tar -xzf {_DOTNET_TARBALL} -C {DOTNET_ROOT}; "
+        f"sudo -n ln -sf {DOTNET_ROOT}/dotnet /usr/local/bin/dotnet; "
+        + _persist_env("DOTNET_ROOT", DOTNET_ROOT)
+        + "; "
+        # Telemetry would only ever be a blocked outbound request under a
+        # default-deny egress policy; opting out keeps the noise out of the
+        # agent's build logs.
+        + _persist_env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        + "; "
+        f"rm -f {_DOTNET_TARBALL}"
+    ),
+    aliases=("csharp", "c#", "net", "dotnet-sdk"),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP, RUBY, JAVA, PHP, NODE, TYPESCRIPT, GO, RUST)
+TOOLCHAINS: tuple[Toolchain, ...] = (
+    PYTHON,
+    CPP,
+    RUBY,
+    JAVA,
+    PHP,
+    NODE,
+    TYPESCRIPT,
+    GO,
+    RUST,
+    DOTNET,
+)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
