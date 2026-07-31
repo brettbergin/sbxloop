@@ -289,6 +289,27 @@ such guests — so seeing the abort means the fallback had no `rg` to land
 on: look for a `sandbox.tooling_warning` event in `sbxloop logs`, and check
 the `page-size` probe under `sbxloop doctor --deep`.
 
+## Language toolchains
+
+The agent builds a project inside its sandbox, so whatever that project needs
+to compile has to be there. `[sandbox] languages` says which toolchains get
+installed before the agent's first turn, instead of the agent discovering a
+missing compiler on its first build and spending revision budget on it:
+
+```toml
+[sandbox]
+languages = ["python"]   # the default when the key is unset
+```
+
+Three rules apply to every entry. Provisioning is **probe-first** — a template
+that already ships the toolchain costs no install and no network. It is
+**never fatal** — a failure warns with the toolchain named and the run
+continues, since the agent has passwordless `sudo apt-get` as an escape
+hatch. And it is **opt-in** — setting `languages` replaces the default rather
+than adding to it, so nothing is installed for a language you did not ask
+for. Heavier toolchains are better baked into a template (`sbxloop bake`)
+than downloaded per run.
+
 ## Sandbox hygiene
 
 Sandboxes are torn down at run end, and an in-process registry also cleans up
@@ -377,6 +398,7 @@ where it came from. The notable knobs:
 | `secret_strategy`                      | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                         |
 | `[sandbox] template`                   | unset              | Baked template ref from `sbxloop bake`.                                                                 |
 | `[sandbox] extra_allow_domains`        | `[]`               | Static egress allows applied to every run.                                                              |
+| `[sandbox] languages`                  | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                              |
 | `[policy] allow` / `deny`              | `[]`               | Bounds for plan-declared egress.                                                                        |
 | `[github] repo` / `report` / `deliver` | unset / `false`    | The GitHub integration gate and toggles.                                                                |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
