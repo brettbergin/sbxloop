@@ -109,6 +109,16 @@ class TestBaselineTiers:
         allow, deny = effective_egress_bounds(Config())
         assert egress_rejection("repo.maven.apache.org", allow, deny) is None
 
+    def test_dotnet_nuget_is_baseline(self) -> None:
+        # #165: NuGet was in neither tier. It matters more than most because
+        # `dotnet restore` runs implicitly inside `dotnet build` and
+        # `dotnet test` — the failure surfaces at build time rather than at
+        # an obvious install step.
+        for domain in ("api.nuget.org", "nuget.org"):
+            assert domain in BASELINE_REGISTRY_DOMAINS
+        allow, deny = effective_egress_bounds(Config())
+        assert egress_rejection("api.nuget.org", allow, deny) is None
+
     def test_declarable_tier_may_be_empty(self) -> None:
         # #141 promoted every supported language's registry, so this tier is
         # empty today. The mechanism must survive that: an empty tier is a
