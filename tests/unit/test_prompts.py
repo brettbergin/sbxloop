@@ -76,6 +76,11 @@ ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("Go", ("go.mod", "go build ./... && go test ./..."), ("go.mod", "./...")),
     ("Rust", ("Cargo.toml", "cargo test", "target/"), ("Cargo.toml", "cargo test")),
     ("Ruby", ("Gemfile", "bundle exec rspec"), ("Gemfile", "bundle exec")),
+    (
+        "Java/JVM",
+        ("pom.xml", "mvn -q -B test", "./gradlew test"),
+        ("pom.xml", "JAVA_HOME", "./gradlew"),
+    ),
 ]
 
 

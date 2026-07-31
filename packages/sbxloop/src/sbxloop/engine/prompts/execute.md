@@ -52,6 +52,10 @@ destroyed.
     then run project binaries through `bundle exec`; a bare `rspec` gets
     the wrong gem environment or none. Gems with native extensions may
     need apt build tooling installed first.
+  - **Java/JVM** — build from the directory holding `pom.xml` or
+    `build.gradle`, preferring `./mvnw` / `./gradlew` when the project
+    ships one. `JAVA_HOME` must be set, and Maven needs `-B` so it runs
+    non-interactively.
 
 ## Overall outcome
 
