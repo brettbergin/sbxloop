@@ -60,6 +60,9 @@ destroyed.
     `.csproj` or `.sln`; it restores and builds on its own, so a separate
     restore step is usually unnecessary. Build output lands in `obj/` and
     `bin/`.
+  - **PHP** — `composer install --no-interaction` from the directory
+    holding `composer.json`, then run project binaries out of
+    `./vendor/bin/`; a bare `phpunit` is not on PATH.
 
 ## Overall outcome
 

@@ -82,6 +82,11 @@ ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
         ("pom.xml", "JAVA_HOME", "./gradlew"),
     ),
     ("C#/.NET", (".csproj", "dotnet test", "global.json"), (".csproj", "dotnet test")),
+    (
+        "PHP",
+        ("composer.json", "composer install --no-interaction && ./vendor/bin/phpunit"),
+        ("composer.json", "./vendor/bin/"),
+    ),
 ]
 
 
