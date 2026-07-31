@@ -78,6 +78,19 @@ class TestBaselineTiers:
         for domain in ("registry.npmjs.org", "registry.yarnpkg.com", "codeload.github.com"):
             assert domain in BASELINE_REGISTRY_DOMAINS
 
+    def test_typescript_toolchain_resolves_from_the_baseline(self) -> None:
+        # #151: TypeScript reaches the registry for more than application
+        # dependencies — the compiler and every `@types/*` package come from
+        # there too. All of it is npm, so the #148 promotion covers it; this
+        # asserts the coverage rather than assuming it, and fails loudly if
+        # a later change moves npm back out of the baseline.
+        allow, deny = effective_egress_bounds(Config())
+        assert "registry.npmjs.org" in BASELINE_REGISTRY_DOMAINS
+        # tsc, @types/*, ts-node, and friends are all plain npm packages:
+        # one reachable host covers the whole toolchain.
+        assert egress_rejection("registry.npmjs.org", allow, deny) is None
+        assert "registry.npmjs.org" not in WELL_KNOWN_REGISTRY_DOMAINS
+
     def test_python_registry_is_baseline(self) -> None:
         # #145: PyPI keeps its baseline privilege — the level-up direction —
         # and the rest of Layer 2 joins it here rather than PyPI joining the
