@@ -66,6 +66,13 @@ BASELINE_REGISTRY_DOMAINS = (
     # and the fix (GONOSUMDB/GOFLAGS) is not something a plan can discover
     # from the error. Both hosts or nothing.
     "sum.golang.org",
+    # Cargo splits its work across three hosts and needs all of them: the
+    # sparse index resolves versions, static serves the .crate files, and
+    # the API backs `cargo publish`/`cargo search`. A partial grant fails
+    # mid-resolution, which reads as a broken lockfile rather than a policy.
+    "crates.io",  # cargo API
+    "static.crates.io",  # crate downloads
+    "index.crates.io",  # cargo sparse index
 )
 
 # Distro package mirrors: language-neutral infrastructure rather than any one
@@ -100,9 +107,6 @@ PROMPT_ADVERTISED_DOMAINS = (*BASELINE_REGISTRY_DOMAINS, *APT_MIRROR_DOMAINS)
 WELL_KNOWN_REGISTRY_DOMAINS = (
     "rubygems.org",  # gem downloads and API
     "index.rubygems.org",  # bundler's compact index
-    "crates.io",  # cargo API
-    "static.crates.io",  # crate downloads
-    "index.crates.io",  # cargo sparse index
 )
 
 
