@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from sbxloop import toolchains
 from sbxloop.errors import WorkerError, WorkerTimeoutError
 from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
@@ -46,6 +47,35 @@ def script_search_fallback_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> N
     """Script the page-size/ripgrep probe (unscripted it would run on the
     host, where the answer varies by machine — 16 KiB on Apple silicon)."""
     fake_sbx.script('exec boxa sh -c test "$(getconf PAGESIZE)"', returncode=returncode)
+
+
+def script_toolchain_probe(
+    fake_sbx: FakeSbx, name: str, *, returncode: int = 0, stderr: str = ""
+) -> None:
+    """Script one language toolchain's presence probe.
+
+    Unscripted it would run on the *host*, where the answer depends on the
+    machine: the test venv has ensurepip, a mac has clang, and the CI
+    runners ship a global `tsc`. So every toolchain probe a test can reach
+    must be pinned explicitly — including the probes of any toolchain a
+    selection pulls in via ``requires``.
+
+    Looked up by canonical name rather than ``resolve(...)[0]``: resolve
+    also returns requirements, so for "typescript" the first element is
+    *javascript*, and scripting that instead left the real tsc probe to run
+    against the host.
+    """
+    key = toolchains.normalize_language(name)
+    assert key is not None, f"unknown toolchain {name!r}"
+    toolchain = next(t for t in toolchains.TOOLCHAINS if t.name == key)
+    fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=returncode, stderr=stderr)
+
+
+def script_probes_for(fake_sbx: FakeSbx, languages: list[str], *, returncode: int = 1) -> None:
+    """Script every probe a ``languages`` selection will run, requirements
+    included — the safe way to set up a test that passes ``languages=``."""
+    for toolchain in toolchains.resolve(languages):
+        script_toolchain_probe(fake_sbx, toolchain.name, returncode=returncode)
 
 
 def agent_job(**overrides: object) -> JobRequest:
@@ -457,8 +487,9 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
-        fake_sbx.script(
-            "exec boxa python3 -c",
+        script_toolchain_probe(
+            fake_sbx,
+            "python",
             returncode=1,
             stderr="ModuleNotFoundError: No module named 'ensurepip'",
         )
@@ -493,7 +524,7 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
-        fake_sbx.script("exec boxa python3 -c", returncode=0)
+        script_toolchain_probe(fake_sbx, "python", returncode=0)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
@@ -520,8 +551,9 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
-        fake_sbx.script(
-            "exec boxa python3 -c",
+        script_toolchain_probe(
+            fake_sbx,
+            "python",
             returncode=1,
             stderr="ModuleNotFoundError: No module named 'ensurepip'",
         )
@@ -541,10 +573,151 @@ class TestInstallFallbacks:
         assert any("dev-tools ensure failed" in r.getMessage() for r in caplog.records)
         assert any("apt exploded" in r.getMessage() for r in caplog.records)
 
+    def test_ensure_dev_tools_default_is_python(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # No `languages` argument -> exactly the pre-#140 behavior: the
+        # Python probe runs and nothing else is provisioned.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "python", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True)
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert apt_cmds == [
+            "exec boxa sh -c sudo -n apt-get update -q && "
+            "sudo -n apt-get install -y -q python3-venv python3-pip"
+        ]
+
+    def test_ensure_dev_tools_unselected_language_installs_nothing(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Opt-in only: an empty selection must not fall back to "install
+        # everything" — and must not even probe for what was not selected.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_search_fallback_probe(fake_sbx)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["nonesuch"])
+        assert not [c for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)]
+
+    def test_ensure_dev_tools_provisions_the_selected_language(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # C/C++ selected, Python not: the compiler toolchain is installed and
+        # python3-venv is not, which is the whole point of #140.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "cpp", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["c++"])
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert len(apt_cmds) == 1, apt_cmds
+        for package in ("build-essential", "cmake", "ninja-build", "pkg-config"):
+            assert package in apt_cmds[0]
+        assert "python3-venv" not in apt_cmds[0]
+
+    def test_ensure_dev_tools_batches_apt_across_languages(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Two apt languages must cost ONE `update && install`, not two.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "python", returncode=1)
+        script_toolchain_probe(fake_sbx, "cpp", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["python", "cpp"])
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert len(apt_cmds) == 1, apt_cmds
+        assert "python3-venv" in apt_cmds[0] and "build-essential" in apt_cmds[0]
+
+    def test_ensure_dev_tools_runs_install_script_after_apt(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Java is the first entry with both paths: the JDK comes from apt,
+        # then a script records JAVA_HOME. Order matters — the script reads
+        # the javac that apt just installed.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "java", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c grep -qs", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])
+        execs = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        apt_idx = [i for i, c in enumerate(execs) if "apt-get" in c]
+        script_idx = [i for i, c in enumerate(execs) if "JAVA_HOME" in c and "grep -qs" in c]
+        assert apt_idx and script_idx, execs
+        assert apt_idx[0] < script_idx[-1], "the install script must run after the apt batch"
+        assert "openjdk" in execs[apt_idx[0]] and "maven" in execs[apt_idx[0]]
+
+    def test_ensure_dev_tools_install_script_failure_is_nonfatal_but_loud(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_toolchain_probe(fake_sbx, "java", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c grep -qs", returncode=1, stderr="tee: permission denied")
+        self._script_happy_install(fake_sbx)
+        with caplog.at_level("WARNING"):
+            client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("dev-tools ensure failed for java" in m for m in messages), messages
+        # the warning names what is now missing, not just that something broke
+        assert any("JAVA_HOME" in m for m in messages), messages
+        assert any("tee: permission denied" in m for m in messages), messages
+
+    def test_ensure_dev_tools_installs_required_toolchains_too(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Selecting TypeScript must provision the Node runtime it is built
+        # on, and provision it FIRST — `npm i -g typescript` is meaningless
+        # before node exists.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_probes_for(fake_sbx, ["ts"])
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; case", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; sudo -n npm", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["ts"])
+        execs = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        node_idx = [i for i, c in enumerate(execs) if "nodejs.org" in c]
+        tsc_idx = [i for i, c in enumerate(execs) if "npm install -g" in c]
+        assert node_idx and tsc_idx, execs
+        assert node_idx[0] < tsc_idx[0], "the node runtime must install before tsc"
+
     def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
         import sbxloop
 
-        fake_sbx.script("exec boxa python3 -c", returncode=0)
+        script_toolchain_probe(fake_sbx, "python", returncode=0)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(

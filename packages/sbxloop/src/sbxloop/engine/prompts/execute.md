@@ -11,24 +11,63 @@ destroyed.
 
 ## Environment notes
 
-- Debian/Ubuntu VM. The system Python is externally managed (PEP 668):
-  bare `pip install X` fails. For Python dependencies create a virtualenv
-  first — `python3 -m venv .venv && .venv/bin/pip install X` — and run
-  project commands through `.venv/bin/...`.
-- If a tool or apt package is missing, you have passwordless sudo:
-  `sudo apt-get install -y <package>`.
-- Network egress is allowlisted. PyPI, GitHub, apt mirrors, and any
-  domains the plan declared as `egress` are reachable; other hosts
-  (undeclared package registries, arbitrary APIs, CDNs) may not be. If a
-  download times out repeatedly, treat the host as blocked: name the exact
-  blocked domain in your summary — a re-plan can declare it, and well-known
-  registries (RubyGems, npm, crates.io, the Go proxy) are always grantable
-  — instead of retrying forever. The allowlist is operator-bounded
-  configuration, not something you can change from in here.
+- Debian/Ubuntu VM. If a tool or apt package is missing, you have
+  passwordless sudo: `sudo apt-get install -y <package>`.
+- Network egress is allowlisted. GitHub, the apt mirrors, the supported
+  languages' package registries ($baseline_registries), and any domains the
+  plan declared as `egress` are reachable; other hosts (undeclared package
+  registries, arbitrary APIs, CDNs) may not be. If a download times out
+  repeatedly, treat the host as blocked: name the exact blocked domain in
+  your summary — a re-plan can declare it, and these registries are always
+  grantable: $declarable_registries — instead of retrying forever. The
+  allowlist is operator-bounded configuration, not something you can change
+  from in here.
 - After you finish, the plan's verify commands run mechanically from the
   workspace root, exactly as written — you cannot edit them. Create files
   at the paths those commands check: if verification expects
   `requirements.txt` at the root, do not bury it in a subdirectory.
+- Ecosystem notes — read only the entry matching this task's toolchain and
+  ignore the rest. None of these is the default choice; work in the
+  ecosystem the task actually calls for.
+  - **Python** — the system Python is externally managed (PEP 668): bare
+    `pip install X` fails. Create a virtualenv first —
+    `python3 -m venv .venv && .venv/bin/pip install X` — and run project
+    commands through `.venv/bin/...`.
+  - **JavaScript/Node** — install from the directory holding
+    `package.json`; `node_modules/` is project-local, so nothing needs a
+    global install. `npm ci` is the reproducible install but fails without
+    a lockfile — use `npm install` when you are creating the project and no
+    lockfile exists yet.
+  - **TypeScript** — run `npx tsc --noEmit` from the directory holding
+    `tsconfig.json`; run anywhere else it checks nothing and still exits 0.
+    A passing type-check and a passing test run are two different things —
+    do both.
+  - **Go** — build and test from the directory holding `go.mod`, using
+    `./...` to cover every package; run from above the module root it
+    matches nothing and still exits 0.
+  - **Rust** — run `cargo test` from the directory holding `Cargo.toml`;
+    it builds and tests in one step. `target/` grows large — leave it in
+    the project rather than building somewhere outside the workspace.
+  - **Ruby** — `bundle install` from the directory holding the `Gemfile`,
+    then run project binaries through `bundle exec`; a bare `rspec` gets
+    the wrong gem environment or none. Gems with native extensions may
+    need apt build tooling installed first.
+  - **Java/JVM** — build from the directory holding `pom.xml` or
+    `build.gradle`, preferring `./mvnw` / `./gradlew` when the project
+    ships one. `JAVA_HOME` must be set, and Maven needs `-B` so it runs
+    non-interactively.
+  - **C#/.NET** — run `dotnet test` from the directory holding the
+    `.csproj` or `.sln`; it restores and builds on its own, so a separate
+    restore step is usually unnecessary. Build output lands in `obj/` and
+    `bin/`.
+  - **PHP** — `composer install --no-interaction` from the directory
+    holding `composer.json`, then run project binaries out of
+    `./vendor/bin/`; a bare `phpunit` is not on PATH.
+  - **C/C++** — configure out-of-source (`cmake -S . -B build`) and name
+    the build directory in every later command, including
+    `ctest --test-dir build`; run elsewhere, `ctest` finds no tests and
+    can still exit 0. There is no per-project isolation step to set up —
+    install compilers and libraries with apt.
 
 ## Overall outcome
 
