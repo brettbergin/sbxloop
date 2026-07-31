@@ -178,3 +178,115 @@ jobs:
         run: |
           uv run sbxloop sandbox rm --all || true
           sbx --app-name sbxloop-e2e logout --yes || true
+
+  # QA matrix (post-#140 stack): the installer-based toolchains have only
+  # ever been exercised against the fake sandbox, where their install
+  # scripts do not actually run. This is the first place
+  # `curl | sha256sum -c | tar` meets a real microVM — and the only place
+  # that proves the provision-time installer egress works, since a blocked
+  # vendor host degrades to a WARNING by design and is therefore invisible
+  # to every other check. Covers all five installer languages (typescript
+  # shares the javascript entry via `requires`); the apt-only entries are
+  # covered by the e2e job's dev-tools ensure.
+  #
+  # NOTE: against main as of v0.5.77 the vendor hosts below are in no
+  # egress tier, so a red probe here is the expected live confirmation of
+  # the provisioning egress gap unless extra_allow_domains is seeded (the
+  # fix lives on sbx/language-agnostic-integration).
+  toolchains:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            probe: cargo --version
+            host: static.rust-lang.org
+          - language: javascript
+            probe: node --version
+            host: nodejs.org
+          - language: go
+            probe: go version
+            host: go.dev
+          - language: dotnet
+            probe: dotnet --list-sdks
+            host: builds.dotnet.microsoft.com
+          - language: php
+            probe: composer --version
+            host: getcomposer.org
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-packages
+
+      - name: Enable KVM and user namespaces
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install sbx
+        run: |
+          set -euo pipefail
+          url=$(curl -fsSL https://api.github.com/repos/docker/sbx-releases/releases/latest \
+            | uv run --no-project python -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and 'x86_64' in a['name'] and a['name'].endswith('.tar.gz')]; print(assets[0])")
+          echo "downloading $url"
+          curl -fsSL -o /tmp/sbx.tar.gz "$url"
+          mkdir -p /tmp/docker-sbx && tar -xzf /tmp/sbx.tar.gz -C /tmp/docker-sbx --strip-components=1
+          sudo PREFIX="$SBX_INSTALL_DIR" /tmp/docker-sbx/install.sh
+          echo "$SBX_INSTALL_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Start keyring (Secret Service for sbx credential storage)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gnome-keyring dbus-x11
+          echo 'DBUS_SESSION_BUS_ADDRESS='$(dbus-daemon --session --fork --print-address) >> "$GITHUB_ENV"
+
+      - name: sbx login
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo -n "" | gnome-keyring-daemon --unlock --components=secrets || true
+          printf '%s' "$DOCKERHUB_TOKEN" | sbx --app-name sbxloop-e2e login --username "$DOCKERHUB_USERNAME" --password-stdin
+          sbx --app-name sbxloop-e2e version
+
+      - name: sbx policy init balanced
+        run: sbx --app-name sbxloop-e2e policy init balanced
+
+      # bake provisions a scratch sandbox, applies the policy the run would
+      # get, and runs the toolchain ensure — the whole provision-time path,
+      # with no Copilot token and no agent needed.
+      - name: Bake a template with ${{ matrix.language }}
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+          SBXLOOP_SANDBOX__LANGUAGES: '["${{ matrix.language }}"]'
+        run: |
+          uv run sbxloop bake --ref "sbxloop-e2e-${{ matrix.language }}:latest" --no-runtime-cache 2>&1 | tee bake.out
+          if grep -qi "dev-tools ensure failed" bake.out; then
+            echo "::error::${{ matrix.language }} toolchain install failed during provisioning — \
+          most likely ${{ matrix.host }} was not reachable. The ensure is best-effort, so this \
+          would otherwise be a silent warning and the agent would bootstrap the toolchain itself."
+            exit 1
+          fi
+
+      # The install is best-effort, so a green bake is not proof. Ask the
+      # baked template directly.
+      - name: Assert the toolchain is present in the template
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+        run: |
+          box="e2e-toolchain-${{ matrix.language }}-$RANDOM"
+          mkdir -p /tmp/e2e-ws
+          sbx --app-name sbxloop-e2e create --name="$box" --template "sbxloop-e2e-${{ matrix.language }}:latest" agent /tmp/e2e-ws
+          trap 'sbx --app-name sbxloop-e2e rm "$box" || true' EXIT
+          sbx --app-name sbxloop-e2e exec "$box" sh -lc '${{ matrix.probe }}'
+
+      - name: Cleanup
+        if: always()
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+        run: |
+          uv run sbxloop sandbox rm --all || true
+          sbx --app-name sbxloop-e2e logout --yes || true
