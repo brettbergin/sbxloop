@@ -8,6 +8,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["php"]` provisions PHP and Composer** (issue
+  #167). apt for the interpreter and — more importantly — the extensions:
+  `php-cli` alone passes a `command -v php` check and then fails the moment
+  a project or Composer itself needs mbstring or zip, so `php-mbstring`,
+  `php-xml`, `php-curl`, and `php-zip` come with it and the probe checks
+  the extensions are actually loaded rather than just that `php` exists.
+  Composer is not reliably packaged at a useful version, so it comes from
+  upstream — but as a **pinned release verified against its published
+  sha256**, not piped into the interpreter. Bumping the version means
+  bumping the digest alongside it. Adds a `getcomposer.org` egress
+  dependency (#141).
+
 - **`[sandbox] languages = ["java"]` provisions a JDK and Maven** (issue
   #161). apt for both, pinned to `openjdk-21-jdk` rather than floating on
   `default-jdk`, which moves between distro releases. `JAVA_HOME` is part of
