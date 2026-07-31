@@ -61,6 +61,19 @@ def test_apt_packages_pools_without_duplicates() -> None:
         assert set(toolchain.apt_packages) <= set(packages)
 
 
+@pytest.mark.parametrize("name", ["cpp", "c", "C++", "cxx", "c-cpp"])
+def test_cpp_is_reachable_by_every_spelling(name: str) -> None:
+    assert toolchains.normalize_language(name) == "cpp"
+
+
+def test_cpp_entry_is_pure_apt() -> None:
+    # #170's whole claim is that C/C++ needs no installer and no new egress.
+    cpp = toolchains.resolve(["cpp"])[0]
+    assert cpp.install_script is None
+    assert "build-essential" in cpp.apt_packages
+    assert "cmake" in cpp.apt_packages
+
+
 def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")

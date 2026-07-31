@@ -79,9 +79,31 @@ PYTHON = Toolchain(
 )
 
 
+CPP = Toolchain(
+    name="cpp",
+    wanted="gcc, g++, make, cmake, ninja, pkg-config",
+    # Probe the tools a build actually needs, not everything installed:
+    # ninja is optional (cmake falls back to make) and clang is a second
+    # compiler, so requiring them here would reinstall on templates that
+    # are already perfectly usable.
+    probe=(
+        "command -v gcc >/dev/null && command -v g++ >/dev/null "
+        "&& command -v make >/dev/null && command -v cmake >/dev/null "
+        "&& command -v pkg-config >/dev/null"
+    ),
+    # The cleanest case in the set: all current and complete in
+    # Debian/Ubuntu, so no installer and no egress beyond the apt mirrors
+    # that are already in the always-reachable baseline. build-essential
+    # brings gcc, g++, make, and libc headers.
+    apt_packages=("build-essential", "cmake", "ninja-build", "pkg-config"),
+    aliases=("c", "c++", "cxx", "c-cpp"),
+)
+
+
 # Registry order is the install order, and the order packages appear in the
-# batched apt call — keep it stable so the command is reproducible.
-TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON,)
+# batched apt call — keep it stable so the command is reproducible. New
+# languages append; nothing depends on the position of an existing entry.
+TOOLCHAINS: tuple[Toolchain, ...] = (PYTHON, CPP)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
