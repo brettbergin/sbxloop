@@ -55,11 +55,27 @@ def script_toolchain_probe(
     """Script one language toolchain's presence probe.
 
     Unscripted it would run on the *host*, where the answer depends on the
-    developer's machine (the test venv has ensurepip, a mac has clang) — so
-    every toolchain probe a test can reach must be pinned explicitly.
+    machine: the test venv has ensurepip, a mac has clang, and the CI
+    runners ship a global `tsc`. So every toolchain probe a test can reach
+    must be pinned explicitly — including the probes of any toolchain a
+    selection pulls in via ``requires``.
+
+    Looked up by canonical name rather than ``resolve(...)[0]``: resolve
+    also returns requirements, so for "typescript" the first element is
+    *javascript*, and scripting that instead left the real tsc probe to run
+    against the host.
     """
-    toolchain = toolchains.resolve([name])[0]
+    key = toolchains.normalize_language(name)
+    assert key is not None, f"unknown toolchain {name!r}"
+    toolchain = next(t for t in toolchains.TOOLCHAINS if t.name == key)
     fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=returncode, stderr=stderr)
+
+
+def script_probes_for(fake_sbx: FakeSbx, languages: list[str], *, returncode: int = 1) -> None:
+    """Script every probe a ``languages`` selection will run, requirements
+    included — the safe way to set up a test that passes ``languages=``."""
+    for toolchain in toolchains.resolve(languages):
+        script_toolchain_probe(fake_sbx, toolchain.name, returncode=returncode)
 
 
 def agent_job(**overrides: object) -> JobRequest:
@@ -675,6 +691,28 @@ class TestInstallFallbacks:
         # the warning names what is now missing, not just that something broke
         assert any("JAVA_HOME" in m for m in messages), messages
         assert any("tee: permission denied" in m for m in messages), messages
+
+    def test_ensure_dev_tools_installs_required_toolchains_too(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # Selecting TypeScript must provision the Node runtime it is built
+        # on, and provision it FIRST — `npm i -g typescript` is meaningless
+        # before node exists.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_probes_for(fake_sbx, ["ts"])
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; case", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; sudo -n npm", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["ts"])
+        execs = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        node_idx = [i for i, c in enumerate(execs) if "nodejs.org" in c]
+        tsc_idx = [i for i, c in enumerate(execs) if "npm install -g" in c]
+        assert node_idx and tsc_idx, execs
+        assert node_idx[0] < tsc_idx[0], "the node runtime must install before tsc"
 
     def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
         import sbxloop

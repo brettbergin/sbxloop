@@ -200,6 +200,39 @@ def test_arch_dispatch_rejects_unknown_architectures() -> None:
     assert "unsupported architecture" in bad.stderr
 
 
+def test_typescript_pulls_in_the_node_runtime_first() -> None:
+    # #150: resolve the Node runtime in the JS entry and treat this as the
+    # tsc layer on top. Order matters — `npm i -g typescript` is meaningless
+    # before node exists.
+    resolved = [toolchain.name for toolchain in toolchains.resolve(["typescript"])]
+    assert resolved == ["javascript", "typescript"]
+
+
+def test_requires_are_canonical_and_resolvable() -> None:
+    names = {toolchain.name for toolchain in toolchains.TOOLCHAINS}
+    for toolchain in toolchains.TOOLCHAINS:
+        for required in toolchain.requires:
+            assert required in names, f"{toolchain.name} requires unknown {required}"
+            assert toolchains.normalize_language(required) == required
+
+
+def test_requires_are_installed_before_their_dependents() -> None:
+    # Registry order IS install order, so a requirement appearing later in
+    # the tuple would silently install after the entry that needs it.
+    position = {toolchain.name: i for i, toolchain in enumerate(toolchains.TOOLCHAINS)}
+    for toolchain in toolchains.TOOLCHAINS:
+        for required in toolchain.requires:
+            assert position[required] < position[toolchain.name], (
+                f"{required} must precede {toolchain.name} in TOOLCHAINS"
+            )
+
+
+def test_typescript_install_is_pinned() -> None:
+    typescript = toolchains.resolve(["typescript"])[1]
+    assert typescript.install_script is not None
+    assert f"typescript@{toolchains.TYPESCRIPT_VERSION}" in typescript.install_script
+
+
 def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")

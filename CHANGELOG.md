@@ -8,6 +8,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`[sandbox] languages = ["typescript"]` provisions `tsc` on top of Node**
+  (issue #150). Toolchain entries can now declare what they are built on,
+  and selecting one selects its requirements — TypeScript pulls in the
+  JavaScript entry and the registry order guarantees the Node runtime is
+  installed before `npm i -g typescript` runs. The compiler is pinned; a
+  project with its own `typescript` devDependency will still use that, since
+  the global install is for bootstrapping a project from nothing rather than
+  for driving any particular build pipeline. Adds a `registry.npmjs.org`
+  egress dependency on top of Node's `nodejs.org` (#141) — and because
+  provisioning runs before the PLAN phase, a plan declaration cannot satisfy
+  it; the README now documents `[sandbox] extra_allow_domains` as the way to
+  make installer-based toolchains reachable today.
+
 - **`[sandbox] languages = ["javascript"]` provisions Node** (issue #147).
   The official `nodejs.org` tarball rather than apt: Debian/Ubuntu stable
   ship a Node several majors behind current LTS, which breaks packages
