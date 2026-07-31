@@ -94,6 +94,21 @@ class TestBaselineTiers:
         for domain in ("rubygems.org", "index.rubygems.org"):
             assert domain in BASELINE_REGISTRY_DOMAINS
 
+    def test_java_needs_maven_central_and_gradle(self) -> None:
+        # #162: Java was in neither tier — a plan could not even declare
+        # Maven Central without operator configuration. Gradle needs the
+        # plugin portal and the wrapper distribution host on top of the
+        # registry; Central alone still fails the build.
+        for domain in (
+            "repo.maven.apache.org",
+            "repo1.maven.org",
+            "plugins.gradle.org",
+            "services.gradle.org",
+        ):
+            assert domain in BASELINE_REGISTRY_DOMAINS
+        allow, deny = effective_egress_bounds(Config())
+        assert egress_rejection("repo.maven.apache.org", allow, deny) is None
+
     def test_declarable_tier_may_be_empty(self) -> None:
         # #141 promoted every supported language's registry, so this tier is
         # empty today. The mechanism must survive that: an empty tier is a

@@ -176,6 +176,11 @@ All notable changes to sbxloop are documented here. The project adheres to
     proxy whose checksum database is blocked fails `go mod download` at
     verification, which reads as a broken toolchain rather than a policy
     decision (#154)
+  - Java — `repo.maven.apache.org` and `repo1.maven.org` (Maven Central),
+    plus `plugins.gradle.org` and `services.gradle.org`. Java was in
+    *neither* tier: a plan could not even declare Central without operator
+    configuration. Gradle needs the plugin portal and the wrapper
+    distribution host as well — Central alone still fails the build (#162)
   - Ruby — `rubygems.org` and `index.rubygems.org` (bundler's compact index
     is a separate host). This was the case `policy.py` cited as motivating
     the declarable tier in the first place — "write a Rails app"
