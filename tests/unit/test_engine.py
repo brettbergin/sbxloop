@@ -687,7 +687,7 @@ PLAN_GEMS = {
     }
 }
 
-# npm and RubyGems are both in-bounds without config, so out-of-bounds
+# Every supported language's registry is baseline (#141), so out-of-bounds
 # tests need a domain no built-in tier covers.
 PLAN_SAAS_API = {
     "json": {
@@ -719,18 +719,17 @@ class TestPlanEgress:
         assert event.data["reason"] == "fetch data"
         assert event.data["task_id"] == "t1"
 
-    def test_well_known_registry_granted_without_policy_config(self, harness: Harness) -> None:
+    def test_rails_app_bundle_installs_without_a_declaration(self, harness: Harness) -> None:
+        # #159: the motivating case for the declarable tier — "write a Rails
+        # app" — now runs off the baseline. Declaring rubygems.org anyway
+        # (as PLAN_GEMS does) stays valid and costs nothing: seeded at
+        # provision time, so no grant-late call and no policy event.
         harness.script([taskgraph(task("t1")), PLAN_GEMS, EXECUTE, PASS, ACCEPT])
         result = harness.engine().start("gem task, default policy")
         assert result.state == "completed"
-        agent = f"sbxloop-{result.run_id}-agent"
-        assert [
-            "allow",
-            "network",
-            "rubygems.org",
-            "--sandbox",
-            agent,
-        ] in harness.fake_sbx.policies()
+        seeds = [c for c in harness.fake_sbx.policies() if "rubygems.org" in c]
+        assert len(seeds) == 1
+        assert [e for e in harness.events if e.type.startswith("policy.")] == []
 
     def test_baseline_registry_needs_no_grant(self, harness: Harness) -> None:
         # #148: an npm build must not depend on the planner remembering to

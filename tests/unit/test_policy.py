@@ -86,6 +86,23 @@ class TestBaselineTiers:
             assert domain in BASELINE_REGISTRY_DOMAINS
             assert domain not in WELL_KNOWN_REGISTRY_DOMAINS
 
+    def test_ruby_registry_hosts_are_baseline(self) -> None:
+        # #159: the case policy.py itself cited as motivating the declarable
+        # tier — "write a Rails app" bundle-installing out of the box. It no
+        # longer needs the plan to remember. Both hosts: bundler's compact
+        # index is a different host from gem downloads.
+        for domain in ("rubygems.org", "index.rubygems.org"):
+            assert domain in BASELINE_REGISTRY_DOMAINS
+
+    def test_declarable_tier_may_be_empty(self) -> None:
+        # #141 promoted every supported language's registry, so this tier is
+        # empty today. The mechanism must survive that: an empty tier is a
+        # valid state, not a bug, and nothing may assume a non-empty one.
+        assert isinstance(WELL_KNOWN_REGISTRY_DOMAINS, tuple)
+        allow, deny = effective_egress_bounds(Config())
+        for domain in WELL_KNOWN_REGISTRY_DOMAINS:
+            assert egress_rejection(domain, allow, deny) is None
+
     def test_all_three_cargo_hosts_are_baseline(self) -> None:
         # #156: cargo splits resolution (index), download (static), and API
         # across three hosts. Two out of three fails mid-resolution, which
@@ -169,11 +186,13 @@ class TestBounds:
         for domain in (*BASELINE_REGISTRY_DOMAINS, *WELL_KNOWN_REGISTRY_DOMAINS):
             assert egress_rejection(domain, allow, _deny) is None
 
-    def test_deny_still_blocks_well_known_registry(self) -> None:
-        config = Config.model_validate({"policy": {"deny": ["rubygems.org"]}})
-        allow, deny = effective_egress_bounds(config)
-        reason = egress_rejection("rubygems.org", allow, deny)
-        assert reason is not None and "deny" in reason
+    def test_deny_still_blocks_any_in_bounds_registry(self) -> None:
+        # Whichever tier a registry sits in, [policy] deny outranks it.
+        for domain in (*BASELINE_REGISTRY_DOMAINS, *WELL_KNOWN_REGISTRY_DOMAINS):
+            config = Config.model_validate({"policy": {"deny": [domain]}})
+            allow, deny = effective_egress_bounds(config)
+            reason = egress_rejection(domain, allow, deny)
+            assert reason is not None and "deny" in reason
 
 
 class TestEgressSpec:
@@ -224,21 +243,26 @@ class TestEgressGranter:
         assert len([e for e in events if e.type == HostEventTypes.POLICY_ALLOW]) == 1
 
     def test_well_known_registry_granted_without_operator_config(self, fake_sbx: FakeSbx) -> None:
-        # Registries are declarable-not-baseline: in bounds with a default
-        # config, but still granted via `sbx policy allow` (and event-logged)
-        # rather than pre-seeded.
+        # The declarable tier is in bounds with a default config, but still
+        # granted via `sbx policy allow` (and event-logged) rather than
+        # pre-seeded. #141 emptied the tier — every supported language's
+        # registry is baseline now — so this exercises whatever is in it,
+        # and comes back to life when something lands there again.
+        if not WELL_KNOWN_REGISTRY_DOMAINS:
+            pytest.skip("declarable tier is empty (#141 promoted every registry)")
+        domain = WELL_KNOWN_REGISTRY_DOMAINS[0]
         events: list[Event] = []
         granter = self.make_granter(fake_sbx, events)
-        granter.apply("t1", [("rubygems.org", "bundle install for the Rails app")])
+        granter.apply("t1", [(domain, "the toolchain needs it")])
         assert [
             "allow",
             "network",
-            "rubygems.org",
+            domain,
             "--sandbox",
             "sbxloop-r1-agent",
         ] in fake_sbx.policies()
         (event,) = [e for e in events if e.type == HostEventTypes.POLICY_ALLOW]
-        assert event.data["domain"] == "rubygems.org"
+        assert event.data["domain"] == domain
 
     def test_baseline_domain_needs_no_grant(self, fake_sbx: FakeSbx) -> None:
         events: list[Event] = []
