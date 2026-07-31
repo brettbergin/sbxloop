@@ -78,6 +78,14 @@ class TestBaselineTiers:
         for domain in ("registry.npmjs.org", "registry.yarnpkg.com", "codeload.github.com"):
             assert domain in BASELINE_REGISTRY_DOMAINS
 
+    def test_go_module_proxy_and_checksum_db_are_both_baseline(self) -> None:
+        # #154: the pair matters. A reachable proxy with an unreachable
+        # checksum database fails `go mod download` at verification — a
+        # confusing partial failure, not a graceful degradation.
+        for domain in ("proxy.golang.org", "sum.golang.org"):
+            assert domain in BASELINE_REGISTRY_DOMAINS
+            assert domain not in WELL_KNOWN_REGISTRY_DOMAINS
+
     def test_typescript_toolchain_resolves_from_the_baseline(self) -> None:
         # #151: TypeScript reaches the registry for more than application
         # dependencies — the compiler and every `@types/*` package come from
