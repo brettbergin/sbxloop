@@ -137,6 +137,29 @@ class TestReadOnlyHandler:
         assert emitted[0][1]["kind"] == "write"
         assert "read-only" in str(emitted[0][1]["feedback"])
 
+    def test_denied_request_call_id_shields_its_failure_echo(self, stub_copilot_rpc: None) -> None:
+        """The handler must thread request.tool_call_id into the tracker so
+        the rejected call's success=False completion event is not tallied
+        as a tool failure (which would degrade the critic on every denial)."""
+        from sbxloop_worker.backends.copilot import SessionHealthTracker
+
+        job = JobRequest(
+            job_id="j1",
+            run_id="r1",
+            kind="agent.session",
+            prompt="review",
+            permission_mode="read_only",
+        )
+        tracker = SessionHealthTracker()
+        handler = CopilotBackend()._permission_handler(job, tracker=tracker)
+        handler(SimpleNamespace(kind="write", tool_call_id="call-7"))
+        tracker.record_tool_end("write_file", False, tool_call_id="call-7")
+
+        health = tracker.health()
+        assert health is not None
+        assert health.permission_denials == {"write": 1}
+        assert health.tool_failures == {}
+
 
 class TestInstalledSdkPermissionKinds:
     def test_none_when_sdk_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:

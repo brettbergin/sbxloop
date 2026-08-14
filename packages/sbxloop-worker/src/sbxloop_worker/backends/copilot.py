@@ -29,15 +29,17 @@ from sbxloop_worker.backends import BackendResult, BackendUnavailableError, Emit
 from sbxloop_worker.protocol import EventTypes, JobRequest, SessionHealth, Usage
 
 # The SDK's permission-request ``kind`` vocabulary, field-verified against
-# github-copilot-sdk 1.0.8 (2026-07-25): ``copilot.session.PermissionRequest``
+# github-copilot-sdk 1.0.9 (2026-08-13): ``copilot.session.PermissionRequest``
 # is a union of request dataclasses, each carrying its wire discriminator as
 # a ``kind`` ClassVar (the same strings the SDK's ``_load_PermissionRequest``
-# switch matches on). ``sbxloop doctor`` compares the installed SDK against
-# this snapshot so vocabulary drift on an SDK bump is surfaced there instead
-# of as a silently degraded critic in the field.
+# switch matches on; 1.0.9 added ``factory`` — subagent fan-out — and every
+# request class carries a ``tool_call_id``). ``sbxloop doctor`` compares the
+# installed SDK against this snapshot so vocabulary drift on an SDK bump is
+# surfaced there instead of as a silently degraded critic in the field.
 SDK_PERMISSION_KINDS = frozenset(
     {
         "shell",
+        "factory",
         "write",
         "read",
         "mcp",
@@ -231,13 +233,26 @@ class SessionHealthTracker:
     def __init__(self) -> None:
         self.denials: Counter[str] = Counter()
         self.failures: Counter[str] = Counter()
+        self._denied_calls: set[str] = set()
 
-    def record_denial(self, kind: Any) -> None:
+    def record_denial(self, kind: Any, tool_call_id: Any = None) -> None:
         self.denials[str(kind)] += 1
+        if tool_call_id:
+            self._denied_calls.add(str(tool_call_id))
 
-    def record_tool_end(self, tool: str | None, success: Any) -> None:
+    def record_tool_end(self, tool: str | None, success: Any, tool_call_id: Any = None) -> None:
         """Count a completed tool call iff it reported failure; the SDK
-        leaves ``success`` None on events that carry no such signal."""
+        leaves ``success`` None on events that carry no such signal.
+
+        A call whose permission request we rejected also completes with
+        ``success=False`` — that echo must not count as a tool failure, or
+        every denial would trip the degraded-critic guard the denial carve-out
+        exists to avoid (the field failure behind run raa2g67kw). Every
+        PermissionRequest carries the ``tool_call_id`` of the call it gates,
+        so denials are excluded by exact id, never by heuristics."""
+        if tool_call_id and str(tool_call_id) in self._denied_calls:
+            self._denied_calls.discard(str(tool_call_id))
+            return
         if success is False:
             self.failures[tool or "(unknown)"] += 1
 
@@ -351,7 +366,7 @@ class CopilotBackend:
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
                 tool, args = tool_calls.get(str(call_id), (None, None))
                 success = getattr(data, "success", None)
-                tracker.record_tool_end(tool, success)
+                tracker.record_tool_end(tool, success, tool_call_id=call_id)
                 emit(
                     EventTypes.AGENT_TOOL_END,
                     tool_call_id=call_id,
@@ -453,7 +468,7 @@ class CopilotBackend:
                 # capabilities is auditable after the fact (#123).
                 kind = getattr(request, "kind", None)
                 if tracker is not None:
-                    tracker.record_denial(kind)
+                    tracker.record_denial(kind, tool_call_id=getattr(request, "tool_call_id", None))
                 if emit is not None:
                     emit(EventTypes.AGENT_PERMISSION_DENIED, kind=str(kind), feedback=feedback)
                 return PermissionDecisionReject(feedback=feedback)
