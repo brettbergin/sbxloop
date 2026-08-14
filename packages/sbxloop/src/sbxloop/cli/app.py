@@ -370,6 +370,22 @@ def run(
             help="Open the delivery PR as a draft.",
         ),
     ] = None,
+    create_repo: Annotated[
+        bool | None,
+        typer.Option(
+            "--create-repo/--no-create-repo",
+            help="Create the --repo repository if it does not exist (private "
+            "unless --create-public). Without this, a missing repo fails the "
+            "run up front.",
+        ),
+    ] = None,
+    create_public: Annotated[
+        bool | None,
+        typer.Option(
+            "--create-public/--no-create-public",
+            help="Make a repository created via --create-repo public.",
+        ),
+    ] = None,
     model: Annotated[str | None, typer.Option("--model", help="Copilot model id.")] = None,
     keep_sandboxes: Annotated[
         bool | None,
@@ -409,6 +425,8 @@ def run(
             ("deliver", deliver),
             ("deliver_base", deliver_base),
             ("deliver_draft", deliver_draft),
+            ("create_repo", create_repo),
+            ("create_public", create_public),
         )
         if value is not None
     }
@@ -1317,6 +1335,10 @@ deny = []
 # deliver = false
 # deliver_base = "main"   # base branch; unset uses the repo's default
 # deliver_draft = false
+# Create `repo` when it does not exist (probed up front, so a typo'd repo
+# fails the run before any work; needs a token allowed to create repos).
+# create_repo = false
+# create_public = false   # created repos are private unless flipped
 
 [artifacts]
 # Path components excluded from artifact listings, harvest and delivery,

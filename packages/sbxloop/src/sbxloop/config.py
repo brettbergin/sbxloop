@@ -136,6 +136,12 @@ class GithubConfig(_ConfigModel):
     deliver: bool = False
     deliver_base: str | None = None  # base branch; None → the repo's default
     deliver_draft: bool = False
+    # Create `repo` when it does not exist (probed right after provisioning,
+    # so a missing repo fails the run before any work). Opt-in so a typo'd
+    # repo errors instead of silently delivering into a fresh repository;
+    # needs a token that may create repositories for the owner.
+    create_repo: bool = False
+    create_public: bool = False  # created repositories are private by default
 
     @field_validator("repo")
     @classmethod

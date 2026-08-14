@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from sbxloop.deliver import branch_name, deliver_workspace
-from sbxloop.errors import DeliveryError
+from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
+from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import PrRef
 
 
@@ -276,3 +276,125 @@ class TestDeliverWorkspace:
             source_dir=make_workspace(tmp_path),
         )
         assert len(ops.pr_kwargs["title"]) <= 72
+
+
+class MissingRepoOps(StubOps):
+    """repo_get 404s until a creation POST lands."""
+
+    def __init__(self, login: str = "me") -> None:
+        super().__init__()
+        self.exists = False
+        self.login = login
+
+    def repo_get(self, repo: str) -> dict[str, Any]:
+        self.repo_get_calls.append(repo)
+        if not self.exists:
+            raise GithubOpsError("github op repo.get failed: GET /repos -> HTTP 404: Not Found")
+        return {"default_branch": "main"}
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        if method == "GET" and path == "/user":
+            self.raw_calls.append((method, path, body))
+            return {"login": self.login}
+        if method == "POST" and (path == "/user/repos" or path.startswith("/orgs/")):
+            self.raw_calls.append((method, path, body))
+            self.exists = True
+            return {"full_name": path}
+        return super().raw(method, path, body)
+
+
+class TestEnsureRepository:
+    def test_existing_repo_is_left_alone(self) -> None:
+        ops = StubOps()
+        assert ensure_repository(ops, "o/r") is False  # type: ignore[arg-type]
+        assert ops.raw_calls == []
+
+    def test_missing_repo_without_create_refuses(self) -> None:
+        ops = MissingRepoOps()
+        with pytest.raises(DeliveryError, match="--create-repo"):
+            ensure_repository(ops, "me/proj")  # type: ignore[arg-type]
+        # refusal happens before any mutating call
+        assert all(method != "POST" for method, _, _ in ops.raw_calls)
+
+    def test_missing_repo_created_under_user(self) -> None:
+        # owner match is case-insensitive (GitHub logins are)
+        ops = MissingRepoOps(login="Me")
+        assert ensure_repository(ops, "me/proj", create=True) is True  # type: ignore[arg-type]
+        posts = [call for call in ops.raw_calls if call[0] == "POST"]
+        assert posts == [
+            ("POST", "/user/repos", {"name": "proj", "private": True, "auto_init": True})
+        ]
+
+    def test_missing_repo_created_under_org(self) -> None:
+        ops = MissingRepoOps(login="me")
+        assert ensure_repository(ops, "acme/proj", create=True) is True  # type: ignore[arg-type]
+        posts = [call for call in ops.raw_calls if call[0] == "POST"]
+        assert posts and posts[0][1] == "/orgs/acme/repos"
+
+    def test_create_public_flips_private(self) -> None:
+        ops = MissingRepoOps()
+        ensure_repository(ops, "me/proj", create=True, public=True)  # type: ignore[arg-type]
+        body = next(call[2] for call in ops.raw_calls if call[0] == "POST")
+        assert body is not None and body["private"] is False
+
+    def test_non_404_probe_errors_propagate(self) -> None:
+        class ForbiddenOps(StubOps):
+            def repo_get(self, repo: str) -> dict[str, Any]:
+                raise GithubOpsError("GET /repos -> HTTP 403: rate limited")
+
+        with pytest.raises(GithubOpsError, match="403"):
+            ensure_repository(ForbiddenOps(), "o/r", create=True)  # type: ignore[arg-type]
+
+
+class TestEmptyRepoBootstrap:
+    def test_missing_base_ref_bootstraps_then_delivers(self, tmp_path: Path) -> None:
+        """An existing-but-empty repo (default branch named, no ref behind
+        it) gets one contents-API commit, then the normal PR path runs."""
+
+        class EmptyRepoOps(StubOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.bootstrapped = False
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
+                    self.raw_calls.append((method, path, body))
+                    raise GithubOpsError("GET ref -> HTTP 404: Not Found")
+                if method == "PUT" and path.endswith("/contents/README.md"):
+                    self.raw_calls.append((method, path, body))
+                    self.bootstrapped = True
+                    return {"content": {"path": "README.md"}}
+                return super().raw(method, path, body)
+
+        ops = EmptyRepoOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r9",
+            outcome="fresh project",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr.number == 7
+        puts = [call for call in ops.raw_calls if call[0] == "PUT"]
+        assert len(puts) == 1
+        assert puts[0][2] is not None and puts[0][2]["branch"] == "main"
+        # the bootstrap README round-trips as valid base64
+        base64.b64decode(puts[0][2]["content"])
+
+    def test_missing_base_ref_error_still_loud_when_bootstrap_fails(self, tmp_path: Path) -> None:
+        class BrokenOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/git/ref/heads/" in path:
+                    raise GithubOpsError("GET ref -> HTTP 404: Not Found")
+                if method == "PUT" and path.endswith("/contents/README.md"):
+                    raise GithubOpsError("PUT contents -> HTTP 403: token lacks contents:write")
+                return super().raw(method, path, body)
+
+        with pytest.raises(GithubOpsError, match="403"):
+            deliver_workspace(
+                BrokenOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r9",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )

@@ -258,10 +258,23 @@ report = false           # post run progress as a tracking issue (or `--report`)
 deliver = false          # PR the run's artifacts to the repo (or `--deliver`)
 deliver_base = ""        # base branch for delivery PRs (or `--deliver-base`)
 deliver_draft = false    # open delivery PRs as drafts (or `--deliver-draft`)
+create_repo = false      # create the repo if missing (or `--create-repo`)
+create_public = false    # created repos are private unless flipped (or `--create-public`)
 ```
 
 CLI flags win over the toml, so `--repo` can also redirect a configured setup
 at a different repository for one run.
+
+The repository is probed right after provisioning, so a missing or typo'd
+`--repo` fails the run up front instead of after the work is done. For a
+fresh project, add `--create-repo` and sbxloop creates it (private by
+default, `--create-public` to flip) with an initial commit, then delivers
+the artifacts as a normal reviewable PR — creation is opt-in precisely so a
+typo'd repo name errors instead of silently landing in a brand-new
+repository. Creating repos needs a token allowed to do so for that owner;
+the per-repo minimal token suffices for everything else. An
+existing-but-empty repository (no commits yet) is also handled: delivery
+bootstraps the initial commit itself.
 
 With `repo` set, runs provision the github-ops sandbox and require a second
 PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with
