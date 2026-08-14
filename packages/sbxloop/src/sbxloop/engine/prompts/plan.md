@@ -44,6 +44,18 @@ bites in every ecosystem, and some fail silently rather than loudly: a test
 runner aimed at a directory holding no project can exit 0 having tested
 nothing.
 
+Verify commands must also be **self-contained**: each one starts whatever it
+probes and tears it down before exiting, never depending on a process the
+executor left running. A command like `curl localhost:5000 | grep -q 200`
+only passes if a server happens to still be alive at verify time — but
+acceptance criteria that (rightly) require servers to be stopped after
+testing then contradict it, and the task whipsaws between "verify fails,
+server is down" and "reviewer rejects, server was left running" until its
+revision budget is gone. For anything long-running, write the verify command
+as start → probe → kill in one line, e.g.
+`<start the server> & sleep 2; if curl -fsS localhost:5000; then <kill the server>; else <kill the server>; exit 1; fi` — and keep acceptance
+criteria consistent with commands that boot their own quarry.
+
 Ecosystem notes — read only the entry matching this task's toolchain and
 ignore the rest. They are reference points, not a menu of defaults: a task
 in an ecosystem not listed here follows that ecosystem's own conventions,

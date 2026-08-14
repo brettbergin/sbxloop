@@ -19,6 +19,7 @@ from sbxloop_worker.backends.copilot import (
     _tool_args,
     _tool_exit_code,
     _tool_output,
+    tool_refusal,
 )
 
 
@@ -162,3 +163,58 @@ class TestSessionHealthTracker:
         health = tracker.health()
         assert health is not None
         assert health.tool_failures == {"write_file": 1}
+
+    def test_validator_refusals_are_tallied_but_not_degraded(self) -> None:
+        """The CLI validator declining a command (e.g. `kill $(cat pid)`)
+        is policy, not lost tooling — it must not distrust the verdict of a
+        critic that rephrased and carried on (field failure retn41aa6)."""
+        tracker = SessionHealthTracker()
+        tracker.record_tool_end("bash", False, tool_call_id="c1", refused=True)
+        tracker.record_tool_end("bash", False, tool_call_id="c2", refused=True)
+        health = tracker.health()
+        assert health is not None
+        assert health.tool_refusals == {"bash": 2}
+        assert health.tool_failures == {}
+        assert not health.degraded
+
+    def test_refused_flag_only_matters_on_failure(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_tool_end("bash", True, tool_call_id="c1", refused=True)
+        tracker.record_tool_end("bash", None, tool_call_id="c2", refused=True)
+        assert tracker.health() is None
+
+    def test_denial_shield_takes_precedence_over_refusal(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_denial("shell", tool_call_id="c1")
+        tracker.record_tool_end("bash", False, tool_call_id="c1", refused=True)
+        health = tracker.health()
+        assert health is not None
+        assert health.permission_denials == {"shell": 1}
+        assert health.tool_refusals == {}
+        assert health.tool_failures == {}
+
+    def test_summary_includes_refusals(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_tool_end("bash", False, refused=True)
+        health = tracker.health()
+        assert health is not None
+        assert "tool refusals: bash x1" in health.summary()
+
+
+class TestToolRefusal:
+    def test_the_kill_validator_message_is_a_refusal(self) -> None:
+        message = (
+            "Command not executed. The 'kill' command must specify at least "
+            "one numeric PID. Usage: kill <PID> or kill -9 <PID>"
+        )
+        assert tool_refusal(message, None)
+        assert tool_refusal(None, message)
+
+    def test_ordinary_failure_text_is_not_a_refusal(self) -> None:
+        assert not tool_refusal("command exited with code 1", "grep: no matches")
+        assert not tool_refusal(None, None)
+
+    def test_refusal_prefix_mid_text_does_not_match(self) -> None:
+        # Command output that merely *mentions* the phrase (e.g. a grep over
+        # logs) must not be classified as a refusal.
+        assert not tool_refusal(None, "found: Command not executed. in daemon.log")

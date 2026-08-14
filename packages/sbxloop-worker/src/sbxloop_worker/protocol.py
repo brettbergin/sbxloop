@@ -66,21 +66,27 @@ class SessionHealth(ProtocolModel):
 
     ``permission_denials`` maps a denied permission kind to how many times it
     was rejected — expected in read-only sessions (the allowlist doing its
-    job), but worth an audit trail. ``tool_failures`` maps a tool name to how
-    many of its calls failed; failures mean the session could not run its
-    intended inspection, which is what the engine's degraded-critic guard
-    reacts to (#123): a critic that lost its tooling must not emit a clean
-    verdict as if it had verified anything.
+    job), but worth an audit trail. ``tool_refusals`` maps a tool name to how
+    many of its calls the Copilot CLI's own command validator declined to run
+    (e.g. ``kill`` without a literal numeric PID) — like denials, these are
+    policy at work, and the agent can rephrase and retry. ``tool_failures``
+    maps a tool name to how many of its calls actually ran and failed;
+    failures mean the session could not run its intended inspection, which is
+    what the engine's degraded-critic guard reacts to (#123): a critic that
+    lost its tooling must not emit a clean verdict as if it had verified
+    anything.
     """
 
     permission_denials: dict[str, int] = Field(default_factory=dict)
     tool_failures: dict[str, int] = Field(default_factory=dict)
+    tool_refusals: dict[str, int] = Field(default_factory=dict)
 
     @property
     def degraded(self) -> bool:
-        """True when the session lost tooling it tried to use. Denials do
-        not count: a read-only critic probing ``write`` is the barrier
-        working as designed, not a broken session."""
+        """True when the session lost tooling it tried to use. Denials and
+        validator refusals do not count: a read-only critic probing ``write``,
+        or having a ``kill $(cat pid)`` declined by the CLI's validator, is
+        policy working as designed, not a broken session."""
         return bool(self.tool_failures)
 
     def summary(self) -> str:
@@ -94,6 +100,8 @@ class SessionHealth(ProtocolModel):
             parts.append(f"tool failures: {tally(self.tool_failures)}")
         if self.permission_denials:
             parts.append(f"permission denials: {tally(self.permission_denials)}")
+        if self.tool_refusals:
+            parts.append(f"tool refusals: {tally(self.tool_refusals)}")
         return "; ".join(parts) or "healthy"
 
 
