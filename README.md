@@ -138,21 +138,21 @@ letting in-VM tooling fail confusingly on a full disk.
 
 ## CLI reference
 
-| Command                               | What it does                                                                                                   |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `sbxloop run "OUTCOME"`               | Start a run. Options: `--report`, `--deliver`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`. |
-| `sbxloop resume RUN`                  | Re-provision sandboxes and continue a checkpointed run under its persisted config.                             |
-| `sbxloop cancel RUN`                  | Cancel an in-flight run.                                                                                       |
-| `sbxloop status [RUN]`                | List runs, or show one run's task/phase detail.                                                                |
-| `sbxloop logs RUN`                    | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.           |
-| `sbxloop artifacts RUN`               | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).     |
-| `sbxloop shell RUN`                   | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command. |
-| `sbxloop init`                        | Write a commented starter `sbxloop.toml` (`--force` overwrites).                                               |
-| `sbxloop bake`                        | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                            |
-| `sbxloop doctor [--deep]`             | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                    |
-| `sbxloop sandbox ls\|rm\|prune`       | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                             |
-| `sbxloop secrets list\|clean\|rotate` | Manage the sbx custom-secret registrations sbxloop owns.                                                       |
-| `sbxloop config show\|policy`         | Resolved configuration with per-key sources; the effective egress policy.                                      |
+| Command                               | What it does                                                                                                                                                  |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop run "OUTCOME"`               | Start a run. Options: `--repo`, `--report`, `--deliver`, `--deliver-base`, `--deliver-draft`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`. |
+| `sbxloop resume RUN`                  | Re-provision sandboxes and continue a checkpointed run under its persisted config.                                                                            |
+| `sbxloop cancel RUN`                  | Cancel an in-flight run.                                                                                                                                      |
+| `sbxloop status [RUN]`                | List runs, or show one run's task/phase detail.                                                                                                               |
+| `sbxloop logs RUN`                    | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                          |
+| `sbxloop artifacts RUN`               | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                    |
+| `sbxloop shell RUN`                   | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                |
+| `sbxloop init`                        | Write a commented starter `sbxloop.toml` (`--force` overwrites).                                                                                              |
+| `sbxloop bake`                        | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                           |
+| `sbxloop doctor [--deep]`             | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                   |
+| `sbxloop sandbox ls\|rm\|prune`       | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                            |
+| `sbxloop secrets list\|clean\|rotate` | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                      |
+| `sbxloop config show\|policy`         | Resolved configuration with per-key sources; the effective egress policy.                                                                                     |
 
 ## Network egress: least privilege, by plan
 
@@ -242,18 +242,26 @@ silently truncated.
 
 ## GitHub integration
 
-sbxloop has **no** GitHub capability until you configure the one repository it
-may work with:
+sbxloop has **no** GitHub capability until you name the one repository it
+may work with — either per run on the command line:
+
+```console
+$ sbxloop run "build the thing" --repo you/your-repo --deliver
+```
+
+or persistently in `sbxloop.toml`:
 
 ```toml
-# sbxloop.toml
 [github]
 repo = "you/your-repo"   # the ONE repo sbxloop may act on
 report = false           # post run progress as a tracking issue (or `--report`)
 deliver = false          # PR the run's artifacts to the repo (or `--deliver`)
-deliver_base = ""        # base branch for delivery PRs (default: repo default)
-deliver_draft = false    # open delivery PRs as drafts
+deliver_base = ""        # base branch for delivery PRs (or `--deliver-base`)
+deliver_draft = false    # open delivery PRs as drafts (or `--deliver-draft`)
 ```
+
+CLI flags win over the toml, so `--repo` can also redirect a configured setup
+at a different repository for one run.
 
 With `repo` set, runs provision the github-ops sandbox and require a second
 PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with
