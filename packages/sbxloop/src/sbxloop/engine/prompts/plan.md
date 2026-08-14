@@ -53,8 +53,7 @@ testing then contradict it, and the task whipsaws between "verify fails,
 server is down" and "reviewer rejects, server was left running" until its
 revision budget is gone. For anything long-running, write the verify command
 as start → probe → kill in one line, e.g.
-`<start the server> & sleep 2; if curl -fsS localhost:5000; then
-<kill the server>; else <kill the server>; exit 1; fi` — and keep acceptance
+`<start the server> & sleep 2; if curl -fsS localhost:5000; then <kill the server>; else <kill the server>; exit 1; fi` — and keep acceptance
 criteria consistent with commands that boot their own quarry.
 
 Ecosystem notes — read only the entry matching this task's toolchain and

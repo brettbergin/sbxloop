@@ -53,8 +53,7 @@ engine's degraded-critic guard (#123) reads it: a critic `pass`/`accept`
 from a session with failed tool calls is re-run once and, if still
 degraded, downgraded. Denials never count as degradation (a read-only
 critic probing `write` is the allowlist working as designed), and neither
-do refusals — completions whose error/output starts with `Command not
-executed.`, the Copilot CLI's own validator declining to run a command
+do refusals — completions whose error/output starts with `Command not executed.`, the Copilot CLI's own validator declining to run a command
 (e.g. `kill` without a literal numeric PID); the agent can rephrase and
 retry, so nothing was lost.
 
