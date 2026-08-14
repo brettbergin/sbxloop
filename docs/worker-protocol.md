@@ -41,17 +41,22 @@ Worker exit codes: `0` result written (including error/timeout results),
 | `github.op`     | `op`, `params`                                                                                                        | op-specific JSON (see below)                                                                                                                                                   |
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
-microVM is the security boundary. `read_only` rejects shell/write requests
+microVM is the security boundary. `read_only` allows only `read`, `url`, and
+`shell` requests (everything else, including unknown kinds, fails closed)
 and is used for critic sessions.
 
 `health` is a `SessionHealth` tally of what the session lost while it ran:
-`permission_denials` and `tool_failures`, each a `kind/tool → count` map
-(`null` when nothing was denied and nothing failed). Each denial also emits
-an `agent.permission_denied` event. The engine's degraded-critic guard
-(#123) reads it: a critic `pass`/`accept` from a session with failed tool
-calls is re-run once and, if still degraded, downgraded — denials alone
-never count as degradation (a read-only critic probing `write` is the
-allowlist working as designed).
+`permission_denials`, `tool_failures`, and `tool_refusals`, each a
+`kind/tool → count` map (`null` when nothing was denied, refused, or
+failed). Each denial also emits an `agent.permission_denied` event. The
+engine's degraded-critic guard (#123) reads it: a critic `pass`/`accept`
+from a session with failed tool calls is re-run once and, if still
+degraded, downgraded. Denials never count as degradation (a read-only
+critic probing `write` is the allowlist working as designed), and neither
+do refusals — completions whose error/output starts with `Command not
+executed.`, the Copilot CLI's own validator declining to run a command
+(e.g. `kill` without a literal numeric PID); the agent can rephrase and
+retry, so nothing was lost.
 
 `shell.batch` exists because every job pays a fixed round-trip cost (stage
 the job JSON, boot a cold Python under `sbx exec`, fetch the result) that

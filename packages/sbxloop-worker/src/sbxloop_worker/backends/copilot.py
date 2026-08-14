@@ -221,8 +221,27 @@ def _tool_output(data: Any) -> str | None:
     return content[-TOOL_OUTPUT_CLIP:]
 
 
+# The Copilot CLI's built-in command validator declines to run some commands
+# outright and reports the refusal as a failed tool call with this prefix
+# (observed on 1.0.9: `kill` without a literal numeric PID, e.g.
+# ``kill $(cat server.pid)``). Nothing is broken — the agent can rephrase and
+# retry, and does — so counting these as tool failures would degrade a critic
+# every time it cleans up a server process (field failure retn41aa6).
+_REFUSAL_PREFIX = "Command not executed."
+
+
+def tool_refusal(error: str | None, output: str | None) -> bool:
+    """Whether a failed tool end is the CLI validator declining to execute
+    the command, as opposed to the command running and failing."""
+    return any(
+        isinstance(text, str) and text.lstrip().startswith(_REFUSAL_PREFIX)
+        for text in (error, output)
+    )
+
+
 class SessionHealthTracker:
-    """Tallies permission denials and tool-call failures for one session.
+    """Tallies permission denials, validator refusals, and tool-call
+    failures for one session.
 
     A critic session that loses its inspection tooling must not look
     identical to a thorough one (#123): the tallies ride back on the
@@ -233,6 +252,7 @@ class SessionHealthTracker:
     def __init__(self) -> None:
         self.denials: Counter[str] = Counter()
         self.failures: Counter[str] = Counter()
+        self.refusals: Counter[str] = Counter()
         self._denied_calls: set[str] = set()
 
     def record_denial(self, kind: Any, tool_call_id: Any = None) -> None:
@@ -240,7 +260,14 @@ class SessionHealthTracker:
         if tool_call_id:
             self._denied_calls.add(str(tool_call_id))
 
-    def record_tool_end(self, tool: str | None, success: Any, tool_call_id: Any = None) -> None:
+    def record_tool_end(
+        self,
+        tool: str | None,
+        success: Any,
+        tool_call_id: Any = None,
+        *,
+        refused: bool = False,
+    ) -> None:
         """Count a completed tool call iff it reported failure; the SDK
         leaves ``success`` None on events that carry no such signal.
 
@@ -249,19 +276,27 @@ class SessionHealthTracker:
         every denial would trip the degraded-critic guard the denial carve-out
         exists to avoid (the field failure behind run raa2g67kw). Every
         PermissionRequest carries the ``tool_call_id`` of the call it gates,
-        so denials are excluded by exact id, never by heuristics."""
+        so denials are excluded by exact id, never by heuristics.
+
+        ``refused`` marks the CLI validator declining to execute the command
+        (see :func:`tool_refusal`) — policy, not lost tooling, so it lands in
+        its own non-degrading tally."""
         if tool_call_id and str(tool_call_id) in self._denied_calls:
             self._denied_calls.discard(str(tool_call_id))
             return
         if success is False:
-            self.failures[tool or "(unknown)"] += 1
+            if refused:
+                self.refusals[tool or "(unknown)"] += 1
+            else:
+                self.failures[tool or "(unknown)"] += 1
 
     def health(self) -> SessionHealth | None:
-        if not self.denials and not self.failures:
+        if not self.denials and not self.failures and not self.refusals:
             return None
         return SessionHealth(
             permission_denials=dict(self.denials),
             tool_failures=dict(self.failures),
+            tool_refusals=dict(self.refusals),
         )
 
 
@@ -366,7 +401,14 @@ class CopilotBackend:
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
                 tool, args = tool_calls.get(str(call_id), (None, None))
                 success = getattr(data, "success", None)
-                tracker.record_tool_end(tool, success, tool_call_id=call_id)
+                output = _tool_output(data)
+                error = _tool_error(data)
+                tracker.record_tool_end(
+                    tool,
+                    success,
+                    tool_call_id=call_id,
+                    refused=tool_refusal(error, output),
+                )
                 emit(
                     EventTypes.AGENT_TOOL_END,
                     tool_call_id=call_id,
@@ -374,8 +416,8 @@ class CopilotBackend:
                     args=args,
                     success=success,
                     exit_code=_tool_exit_code(data),
-                    output=_tool_output(data),
-                    error=_tool_error(data),
+                    output=output,
+                    error=error,
                 )
             elif type_name == "AssistantUsageData":
                 sample = Usage(
