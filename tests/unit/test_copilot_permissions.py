@@ -89,12 +89,13 @@ class TestReadOnlyHandler:
         )
         return CopilotBackend()._permission_handler(job)
 
-    def test_read_is_approved_once(self, stub_copilot_rpc: None) -> None:
-        decision = self._handler()(SimpleNamespace(kind="read"))
-        assert isinstance(decision, _StubApproveOnce)
+    def test_read_and_shell_are_approved_once(self, stub_copilot_rpc: None) -> None:
+        for kind in ("read", "shell"):
+            decision = self._handler()(SimpleNamespace(kind=kind))
+            assert isinstance(decision, _StubApproveOnce)
 
-    def test_shell_and_write_are_rejected(self, stub_copilot_rpc: None) -> None:
-        for kind in ("shell", "write"):
+    def test_write_and_mcp_are_rejected(self, stub_copilot_rpc: None) -> None:
+        for kind in ("write", "mcp"):
             decision = self._handler()(SimpleNamespace(kind=kind))
             assert isinstance(decision, _StubReject)
             assert decision.feedback is not None and repr(kind) in decision.feedback
@@ -125,16 +126,39 @@ class TestReadOnlyHandler:
             return Event.now(type, "r1", job_id="j1", **data)
 
         handler = CopilotBackend()._permission_handler(job, emit=emit, tracker=tracker)
-        handler(SimpleNamespace(kind="shell"))
-        handler(SimpleNamespace(kind="shell"))
+        handler(SimpleNamespace(kind="write"))
+        handler(SimpleNamespace(kind="write"))
         handler(SimpleNamespace(kind="read"))  # allowed: no trace
 
         health = tracker.health()
         assert health is not None
-        assert health.permission_denials == {"shell": 2}
+        assert health.permission_denials == {"write": 2}
         assert [t for t, _ in emitted] == [EventTypes.AGENT_PERMISSION_DENIED] * 2
-        assert emitted[0][1]["kind"] == "shell"
+        assert emitted[0][1]["kind"] == "write"
         assert "read-only" in str(emitted[0][1]["feedback"])
+
+    def test_denied_request_call_id_shields_its_failure_echo(self, stub_copilot_rpc: None) -> None:
+        """The handler must thread request.tool_call_id into the tracker so
+        the rejected call's success=False completion event is not tallied
+        as a tool failure (which would degrade the critic on every denial)."""
+        from sbxloop_worker.backends.copilot import SessionHealthTracker
+
+        job = JobRequest(
+            job_id="j1",
+            run_id="r1",
+            kind="agent.session",
+            prompt="review",
+            permission_mode="read_only",
+        )
+        tracker = SessionHealthTracker()
+        handler = CopilotBackend()._permission_handler(job, tracker=tracker)
+        handler(SimpleNamespace(kind="write", tool_call_id="call-7"))
+        tracker.record_tool_end("write_file", False, tool_call_id="call-7")
+
+        health = tracker.health()
+        assert health is not None
+        assert health.permission_denials == {"write": 1}
+        assert health.tool_failures == {}
 
 
 class TestInstalledSdkPermissionKinds:

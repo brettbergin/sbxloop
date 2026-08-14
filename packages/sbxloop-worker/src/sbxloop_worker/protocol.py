@@ -79,7 +79,7 @@ class SessionHealth(ProtocolModel):
     @property
     def degraded(self) -> bool:
         """True when the session lost tooling it tried to use. Denials do
-        not count: a read-only critic probing ``shell`` is the barrier
+        not count: a read-only critic probing ``write`` is the barrier
         working as designed, not a broken session."""
         return bool(self.tool_failures)
 

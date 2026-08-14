@@ -122,3 +122,43 @@ class TestSessionHealthTracker:
         assert health is not None
         assert health.permission_denials == {"shell": 2, "write": 1}
         assert not health.degraded
+
+    def test_denied_call_failure_echo_is_not_a_tool_failure(self) -> None:
+        """A rejected permission's tool call also completes with
+        success=False; counting that echo made every denial degrade the
+        critic (field failure raa2g67kw)."""
+        tracker = SessionHealthTracker()
+        tracker.record_denial("write", tool_call_id="call-1")
+        tracker.record_tool_end("write_file", False, tool_call_id="call-1")
+        health = tracker.health()
+        assert health is not None
+        assert health.permission_denials == {"write": 1}
+        assert health.tool_failures == {}
+        assert not health.degraded
+
+    def test_genuine_failure_alongside_a_denial_still_counts(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_denial("write", tool_call_id="call-1")
+        tracker.record_tool_end("grep", False, tool_call_id="call-2")  # unrelated
+        tracker.record_tool_end("write_file", False, tool_call_id="call-1")  # echo
+        health = tracker.health()
+        assert health is not None
+        assert health.tool_failures == {"grep": 1}
+        assert health.degraded
+
+    def test_denied_call_echo_is_excluded_only_once(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_denial("write", tool_call_id="call-1")
+        tracker.record_tool_end("write_file", False, tool_call_id="call-1")
+        tracker.record_tool_end("write_file", False, tool_call_id="call-1")
+        health = tracker.health()
+        assert health is not None
+        assert health.tool_failures == {"write_file": 1}
+
+    def test_denial_without_call_id_does_not_swallow_failures(self) -> None:
+        tracker = SessionHealthTracker()
+        tracker.record_denial("write")
+        tracker.record_tool_end("write_file", False, tool_call_id="call-9")
+        health = tracker.health()
+        assert health is not None
+        assert health.tool_failures == {"write_file": 1}
