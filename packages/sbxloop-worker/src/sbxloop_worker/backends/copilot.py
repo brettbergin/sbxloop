@@ -53,13 +53,15 @@ SDK_PERMISSION_KINDS = frozenset(
 # The read-only critic barrier (SCRUTINIZE/VALIDATE sessions) is an allowlist
 # with default-deny: an unknown or novel kind fails closed, so the worst case
 # is the critic losing a read capability and saying so — never the critic
-# silently editing the work under review. Of the verified vocabulary only
-# these are reads: ``read`` (workspace files) and ``url`` (web fetches, which
-# cannot mutate the workspace and stay inside the sandbox network policy).
-# Everything else mutates state (shell, write, memory, extension-management)
-# or has unbounded effect (mcp, custom-tool, hook,
-# extension-permission-access).
-READ_ONLY_ALLOWED_KINDS = frozenset({"read", "url"})
+# silently editing the work under review. ``read`` (workspace files) and
+# ``url`` (web fetches, which cannot mutate the workspace and stay inside the
+# sandbox network policy) are true reads. ``shell`` is allowed so the critic
+# can run inspection commands (ls, grep, interpreter version probes); this
+# trades away the hard mutation guarantee — a shell can edit the workspace —
+# and relies on the session prompt to keep the critic hands-off. Everything
+# else mutates state (write, memory, extension-management) or has unbounded
+# effect (mcp, custom-tool, hook, extension-permission-access).
+READ_ONLY_ALLOWED_KINDS = frozenset({"read", "url", "shell"})
 
 _TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
 

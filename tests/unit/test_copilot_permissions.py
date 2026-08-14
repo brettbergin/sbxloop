@@ -89,12 +89,13 @@ class TestReadOnlyHandler:
         )
         return CopilotBackend()._permission_handler(job)
 
-    def test_read_is_approved_once(self, stub_copilot_rpc: None) -> None:
-        decision = self._handler()(SimpleNamespace(kind="read"))
-        assert isinstance(decision, _StubApproveOnce)
+    def test_read_and_shell_are_approved_once(self, stub_copilot_rpc: None) -> None:
+        for kind in ("read", "shell"):
+            decision = self._handler()(SimpleNamespace(kind=kind))
+            assert isinstance(decision, _StubApproveOnce)
 
-    def test_shell_and_write_are_rejected(self, stub_copilot_rpc: None) -> None:
-        for kind in ("shell", "write"):
+    def test_write_and_mcp_are_rejected(self, stub_copilot_rpc: None) -> None:
+        for kind in ("write", "mcp"):
             decision = self._handler()(SimpleNamespace(kind=kind))
             assert isinstance(decision, _StubReject)
             assert decision.feedback is not None and repr(kind) in decision.feedback
@@ -125,15 +126,15 @@ class TestReadOnlyHandler:
             return Event.now(type, "r1", job_id="j1", **data)
 
         handler = CopilotBackend()._permission_handler(job, emit=emit, tracker=tracker)
-        handler(SimpleNamespace(kind="shell"))
-        handler(SimpleNamespace(kind="shell"))
+        handler(SimpleNamespace(kind="write"))
+        handler(SimpleNamespace(kind="write"))
         handler(SimpleNamespace(kind="read"))  # allowed: no trace
 
         health = tracker.health()
         assert health is not None
-        assert health.permission_denials == {"shell": 2}
+        assert health.permission_denials == {"write": 2}
         assert [t for t, _ in emitted] == [EventTypes.AGENT_PERMISSION_DENIED] * 2
-        assert emitted[0][1]["kind"] == "shell"
+        assert emitted[0][1]["kind"] == "write"
         assert "read-only" in str(emitted[0][1]["feedback"])
 
 

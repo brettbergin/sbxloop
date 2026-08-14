@@ -50,7 +50,7 @@ and is used for critic sessions.
 an `agent.permission_denied` event. The engine's degraded-critic guard
 (#123) reads it: a critic `pass`/`accept` from a session with failed tool
 calls is re-run once and, if still degraded, downgraded — denials alone
-never count as degradation (a read-only critic probing `shell` is the
+never count as degradation (a read-only critic probing `write` is the
 allowlist working as designed).
 
 `shell.batch` exists because every job pays a fixed round-trip cost (stage
