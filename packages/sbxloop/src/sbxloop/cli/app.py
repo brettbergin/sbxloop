@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.live import Live
 from rich.markup import escape as rich_escape
@@ -22,7 +23,13 @@ from rich.tree import Tree
 import sbxloop
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
-from sbxloop.config import Config, load_config, load_config_with_sources, load_dotenv_file
+from sbxloop.config import (
+    Config,
+    GithubConfig,
+    load_config,
+    load_config_with_sources,
+    load_dotenv_file,
+)
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
@@ -326,18 +333,41 @@ def _finish(result: RunResult, config: Config) -> None:
 @app.command()
 def run(
     outcome: Annotated[str, typer.Argument(help="The outcome to achieve.")],
+    repo: Annotated[
+        str | None,
+        typer.Option(
+            "--repo",
+            help='GitHub repository ("owner/name") for --report/--deliver, '
+            "overriding [github].repo from sbxloop.toml.",
+        ),
+    ] = None,
     report: Annotated[
         bool | None,
         typer.Option(
             "--report/--no-report",
-            help="Post run progress to the configured [github].repo.",
+            help="Post run progress to the GitHub repository (--repo or [github].repo).",
         ),
     ] = None,
     deliver: Annotated[
         bool | None,
         typer.Option(
             "--deliver/--no-deliver",
-            help="Publish the completed run's artifacts as a PR to the configured [github].repo.",
+            help="Publish the completed run's artifacts as a PR to the GitHub "
+            "repository (--repo or [github].repo).",
+        ),
+    ] = None,
+    deliver_base: Annotated[
+        str | None,
+        typer.Option(
+            "--deliver-base",
+            help="Base branch for the delivery PR (default: the repo's default branch).",
+        ),
+    ] = None,
+    deliver_draft: Annotated[
+        bool | None,
+        typer.Option(
+            "--deliver-draft/--no-deliver-draft",
+            help="Open the delivery PR as a draft.",
         ),
     ] = None,
     model: Annotated[str | None, typer.Option("--model", help="Copilot model id.")] = None,
@@ -371,14 +401,26 @@ def run(
         keep_sandboxes=keep_sandboxes,
         keep_on_failure=keep_on_failure,
     )
-    if report is not None:
-        config = config.model_copy(
-            update={"github": config.github.model_copy(update={"report": report})}
+    github_overrides = {
+        key: value
+        for key, value in (
+            ("repo", repo),
+            ("report", report),
+            ("deliver", deliver),
+            ("deliver_base", deliver_base),
+            ("deliver_draft", deliver_draft),
         )
-    if deliver is not None:
-        config = config.model_copy(
-            update={"github": config.github.model_copy(update={"deliver": deliver})}
-        )
+        if value is not None
+    }
+    if github_overrides:
+        # model_copy skips validation, so rebuild the section instead: an
+        # ill-formed --repo must fail here, not as a mid-run GitHub error.
+        try:
+            github = GithubConfig.model_validate({**config.github.model_dump(), **github_overrides})
+        except ValidationError as exc:
+            console.print(f"[bold red]invalid GitHub option:[/] {exc.errors()[0]['msg']}")
+            raise typer.Exit(2) from exc
+        config = config.model_copy(update={"github": github})
     wanted = [
         feature
         for feature, enabled in (
@@ -390,8 +432,9 @@ def run(
     if wanted and not config.github.enabled:
         console.print(
             f"[bold red]GitHub integration is not configured.[/] {', '.join(wanted)} "
-            'needs a repository: set [cyan]\\[github] repo = "owner/repo"[/] in '
-            "sbxloop.toml (see `sbxloop init`), then re-run."
+            "needs a repository: pass [cyan]--repo owner/repo[/] or set "
+            '[cyan]\\[github] repo = "owner/repo"[/] in sbxloop.toml '
+            "(see `sbxloop init`), then re-run."
         )
         raise typer.Exit(2)
     engine = LoopEngine(config)
@@ -1263,7 +1306,9 @@ deny = []
 # The GitHub integration. Unset (the default) disables GitHub entirely:
 # no github sandbox is provisioned, GH_TOKEN is not required, and
 # repo-facing features refuse to run. Set `repo` to the ONE repository
-# sbxloop may work with; the toggles below act on it.
+# sbxloop may work with; the toggles below act on it. Everything here can
+# also be set per run (`sbxloop run --repo owner/repo --deliver ...`), and
+# the flags win over this file.
 # repo = "you/your-repo"
 # Post run progress (issues/comments) to the configured repo.
 # report = false

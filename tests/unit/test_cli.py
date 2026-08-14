@@ -990,6 +990,102 @@ class TestRunCommand:
         result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver"])
         assert result.exit_code == 2
         assert "GitHub integration is not configured" in result.output
+        assert "--repo" in result.output  # the flag is offered as the quick fix
+        assert fake_sbx.invocations("create") == []
+
+    def _delivery_env(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """A scripted single-task run with delivery stubbed out; returns the
+        (repos, kwargs) each delivery call was made with."""
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import PrRef
+
+        repos: list[str] = []
+        calls: list[dict[str, Any]] = []
+
+        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
+            repos.append(repo)
+            calls.append(kwargs)
+            return PrRef(number=8, url="https://github.com/o/r/pull/8")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        self.make_run_env(
+            workdir,
+            monkeypatch,
+            [
+                {
+                    "json": {
+                        "tasks": [
+                            {
+                                "id": "t1",
+                                "title": "Only task",
+                                "description": "",
+                                "depends_on": [],
+                                "acceptance_criteria": ["works"],
+                                "verify_commands": ["true"],
+                            }
+                        ]
+                    }
+                },
+                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
+                {"text": "did it", "files": {"hello.txt": "hi"}},
+                {"json": {"verdict": "pass"}},
+                {"json": {"verdict": "accept"}},
+            ],
+        )
+        return repos, calls
+
+    def test_run_repo_flag_enables_github_without_config(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--repo alone satisfies the GitHub gate — no sbxloop.toml needed."""
+        repos, _ = self._delivery_env(workdir, monkeypatch)
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver", "--repo", "o/cli"])
+        assert result.exit_code == 0, result.output
+        assert repos == ["o/cli"]
+
+    def test_run_repo_flag_overrides_configured_repo(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repos, _ = self._delivery_env(workdir, monkeypatch)
+        monkeypatch.setenv("SBXLOOP_GITHUB__REPO", "o/toml")
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver", "--repo", "o/cli"])
+        assert result.exit_code == 0, result.output
+        assert repos == ["o/cli"]
+
+    def test_run_deliver_base_and_draft_flags_are_forwarded(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, calls = self._delivery_env(workdir, monkeypatch)
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "ship it",
+                "--no-tui",
+                "--deliver",
+                "--repo",
+                "o/cli",
+                "--deliver-base",
+                "develop",
+                "--deliver-draft",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert calls and calls[0]["base"] == "develop"
+        assert calls[0]["draft"] is True
+
+    def test_run_malformed_repo_flag_refused_up_front(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, [])
+        result = runner.invoke(
+            app, ["run", "ship it", "--no-tui", "--deliver", "--repo", "not-a-repo"]
+        )
+        assert result.exit_code == 2
+        assert "invalid GitHub option" in result.output
+        assert "Traceback" not in result.output
         assert fake_sbx.invocations("create") == []
 
     def test_run_failure_exit_code(
