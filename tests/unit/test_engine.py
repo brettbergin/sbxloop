@@ -1013,6 +1013,7 @@ class TestDeliverHook:
             return PrRef(number=3, url="https://github.com/o/r/pull/3")
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
         execute = {"text": "done", "files": {"hello.txt": "hi"}}
         harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
         result = self.deliver_engine(harness).start("ship it")
@@ -1040,6 +1041,7 @@ class TestDeliverHook:
             raise DeliveryError("boom")
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         result = self.deliver_engine(harness).start("ship it")
 
@@ -1065,6 +1067,7 @@ class TestDeliverHook:
                 raise _exc
 
             monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+            monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
             harness.script([taskgraph(task("t1")), *HAPPY_TASK])
             harness.events.clear()
             result = self.deliver_engine(harness).start(f"ship {type(exc).__name__}")
@@ -1083,6 +1086,7 @@ class TestDeliverHook:
             raise AssertionError("must not deliver a failed run")
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
         # execute passes but validate rejects until replan budget exhausts
         harness.script(
             [taskgraph(task("t1")), PLAN, EXECUTE, PASS, REJECT, PLAN, EXECUTE, PASS, REJECT]
@@ -1100,6 +1104,7 @@ class TestDeliverHook:
             raise AssertionError("must not deliver without a configured repo")
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         result = harness.engine().start("plain run")
         assert result.state == "completed"

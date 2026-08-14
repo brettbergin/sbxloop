@@ -952,6 +952,7 @@ class TestRunCommand:
             return PrRef(number=8, url="https://github.com/o/r/pull/8")
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
         self.make_run_env(
             workdir,
             monkeypatch,
@@ -1010,6 +1011,7 @@ class TestRunCommand:
             return PrRef(number=8, url="https://github.com/o/r/pull/8")
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
         self.make_run_env(
             workdir,
             monkeypatch,
@@ -1053,6 +1055,35 @@ class TestRunCommand:
         result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver", "--repo", "o/cli"])
         assert result.exit_code == 0, result.output
         assert repos == ["o/cli"]
+
+    def test_run_create_repo_flags_reach_the_probe(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+
+        self._delivery_env(workdir, monkeypatch)
+        seen: dict[str, Any] = {}
+
+        def fake_ensure(ops: Any, repo: str, *, create: bool = False, public: bool = False) -> bool:
+            seen.update(repo=repo, create=create, public=public)
+            return True
+
+        monkeypatch.setattr(engine_mod, "ensure_repository", fake_ensure)
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "ship it",
+                "--no-tui",
+                "--deliver",
+                "--repo",
+                "o/new",
+                "--create-repo",
+                "--create-public",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert seen == {"repo": "o/new", "create": True, "public": True}
 
     def test_run_deliver_base_and_draft_flags_are_forwarded(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

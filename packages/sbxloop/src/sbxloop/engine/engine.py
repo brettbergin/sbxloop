@@ -37,7 +37,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 
 from sbxloop.config import Config, _flatten, load_config, load_dotenv_file
-from sbxloop.deliver import deliver_workspace
+from sbxloop.deliver import deliver_workspace, ensure_repository
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
@@ -299,6 +299,7 @@ class LoopEngine:
                     )
                     if self.install_workers:
                         self._install_workers(run_id, pair, agent, github)
+                    self._ensure_delivery_repo(run_id, github)
                     reporter, detach = self._attach_reporter(github, run_id, outcome)
                     try:
                         phases = PhaseRunner(
@@ -536,6 +537,26 @@ class LoopEngine:
             mounted=pair.mounted,
             **extra,
         )
+
+    def _ensure_delivery_repo(self, run_id: str, github: WorkerClient | None) -> None:
+        """Probe (and, when allowed, create) the delivery repo up front.
+
+        Runs right after worker install so a missing or typo'd repository
+        fails the run before any planning or execution happens, not after
+        the work is done. A creation is surfaced as a run.deliver event so
+        the transcript records where the artifacts will land.
+        """
+        gh = self.config.github
+        if not gh.deliver or not gh.repo or github is None:
+            return
+        created = ensure_repository(
+            GithubOps(github, run_id),
+            gh.repo,
+            create=gh.create_repo,
+            public=gh.create_public,
+        )
+        if created:
+            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=gh.repo, created=True)
 
     def _deliver(
         self, run_id: str, outcome: str, pair: SandboxPair, github: WorkerClient | None

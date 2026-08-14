@@ -15,7 +15,11 @@ real-sbx e2e workflow exercises it. Known e2e-validation items:
 - TODO(e2e): branch-name collisions (re-delivering the same run id — the
   refs POST will 422; decide between force-update and suffixing)
 - TODO(e2e): executable permission bits (every file is committed 100644)
-- TODO(e2e): empty repositories (no base ref to branch from)
+- TODO(e2e): empty repositories — handled in code (contents-API bootstrap
+  commit when the base ref is missing) but not yet exercised against real
+  GitHub
+- TODO(e2e): repository creation (`ensure_repository` with create=True;
+  org-owned targets in particular)
 
 Blob creation is batched (#66): the whole file manifest ships to the github
 sandbox as ``blobs.create_many`` jobs — chunked only by payload size, so a
@@ -32,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, ArtifactScan, scan_artifacts
-from sbxloop.errors import DeliveryError
+from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import GithubOps, PrRef
 
 FILE_MODE = "100644"
@@ -47,6 +51,46 @@ BLOB_BATCH_MAX_B64_BYTES = 4 * 1024 * 1024
 
 def branch_name(run_id: str) -> str:
     return f"sbxloop/{run_id}"
+
+
+def _is_missing(exc: GithubOpsError) -> bool:
+    """Whether an op failure was a 404 (the worker folds the HTTP status
+    into the error message; there is no structured status channel)."""
+    return "HTTP 404" in str(exc)
+
+
+def ensure_repository(
+    ops: GithubOps, repo: str, *, create: bool = False, public: bool = False
+) -> bool:
+    """Probe the delivery repository; create it when explicitly allowed.
+
+    Returns True when the repository was created. Creation is opt-in
+    (``create``) rather than automatic on 404 so a typo'd ``--repo`` fails
+    loudly instead of silently delivering into a brand-new repository. New
+    repositories are private unless ``public``, and ``auto_init`` so the
+    default branch exists and the normal PR delivery path applies unchanged.
+    """
+    try:
+        ops.repo_get(repo)
+        return False
+    except GithubOpsError as exc:
+        if not _is_missing(exc):
+            raise
+    if not create:
+        raise DeliveryError(
+            f"repository {repo} does not exist — create it first, or pass "
+            "--create-repo (config: [github] create_repo = true) to have "
+            "sbxloop create it"
+        )
+    owner, name = repo.split("/", 1)
+    user = ops.raw("GET", "/user")
+    login = str(user.get("login", "")) if isinstance(user, dict) else ""
+    body = {"name": name, "private": not public, "auto_init": True}
+    if login.lower() == owner.lower():
+        ops.raw("POST", "/user/repos", body)
+    else:
+        ops.raw("POST", f"/orgs/{owner}/repos", body)
+    return True
 
 
 def deliver_workspace(
@@ -68,7 +112,16 @@ def deliver_workspace(
 
     if base is None:
         base = str(ops.repo_get(repo).get("default_branch") or "main")
-    base_sha = _base_commit_sha(ops, repo, base)
+    try:
+        base_sha = _base_commit_sha(ops, repo, base)
+    except GithubOpsError as exc:
+        # An existing-but-empty repository has a default branch name and no
+        # ref behind it; bootstrap an initial commit so the normal PR path
+        # (branch off base, open a PR against it) applies unchanged.
+        if not _is_missing(exc):
+            raise
+        _bootstrap_empty_repo(ops, repo, base, run_id=run_id, outcome=outcome)
+        base_sha = _base_commit_sha(ops, repo, base)
     base_tree = _commit_tree_sha(ops, repo, base_sha)
 
     shas = _create_blobs(ops, repo, source_dir, files)
@@ -107,6 +160,28 @@ def deliver_workspace(
         title=_title(outcome),
         body=_body(run_id, outcome, source_dir, scan),
         draft=draft,
+    )
+
+
+def _bootstrap_empty_repo(
+    ops: GithubOps, repo: str, base: str, *, run_id: str, outcome: str
+) -> None:
+    """Give an empty repository its initial commit on ``base``.
+
+    The contents API is the one endpoint that works with no ref to build
+    on — the PUT creates the branch and its first commit together. The
+    README it writes is superseded by the delivery PR whenever the
+    workspace ships its own.
+    """
+    readme = f"# {repo.split('/', 1)[1]}\n\nInitialized by sbxloop run {run_id}.\n"
+    ops.raw(
+        "PUT",
+        f"/repos/{repo}/contents/README.md",
+        {
+            "message": f"sbxloop run {run_id}: initialize repository\n\nOutcome: {outcome}",
+            "content": base64.b64encode(readme.encode()).decode(),
+            "branch": base,
+        },
     )
 
 
