@@ -135,8 +135,16 @@ def _probe_ls_columns(ctx: ProbeContext) -> tuple[str, str]:
     stdout = ctx.cli.run("ls").stdout
     lines = [line for line in stdout.splitlines() if line.strip()]
     header = lines[0].strip() if lines else ""
-    have = {cell.lower() for cell in _CELL_SPLIT.split(header)} if header else set()
-    missing = [col for col in ("name", "agent", "status", "workspace") if col not in have]
+    if not header or header.lower().startswith("no sandboxes"):
+        # An empty listing has no header row to inspect (0.38 prints "No
+        # sandboxes found."); parse_ls returns [] for it either way, so this
+        # is not drift evidence — the column check waits for a real listing.
+        return "expected-columns", f"empty sandbox list ({header!r}) — no header to check"
+    have = {cell.lower() for cell in _CELL_SPLIT.split(header)}
+    missing = [col for col in ("agent", "status", "workspace") if col not in have]
+    if not {"name", "sandbox"} & have:
+        # NAME on 0.35.x, renamed to SANDBOX in 0.38 — parse_ls accepts both.
+        missing.insert(0, "name|sandbox")
     if missing:
         return f"drifted({','.join(missing)})", f"header: {header!r}"
     return "expected-columns", f"header: {header!r}"
@@ -183,22 +191,18 @@ def _probe_cp_dir_semantics(ctx: ProbeContext) -> tuple[str, str]:
 
 def _probe_workspace_mount(ctx: ProbeContext) -> tuple[str, str]:
     assert ctx.sandbox is not None and ctx.workspace is not None
-    from sbxloop.sbx.provision import MOUNT_SEARCH_MAXDEPTH, MOUNT_SEARCH_ROOTS
+    from sbxloop.sbx.provision import mount_probe_command, mount_search_roots
 
     marker = f".sbxloop-conformance-{_secrets.token_hex(8)}"
     (ctx.workspace / marker).write_text("")
     try:
-        command = (
-            f"find -L {' '.join(MOUNT_SEARCH_ROOTS)} "
-            f"-maxdepth {MOUNT_SEARCH_MAXDEPTH} -name {marker} -print 2>/dev/null | head -1"
-        )
-        result = ctx.sandbox.exec(["sh", "-c", command])
+        result = ctx.sandbox.exec(["sh", "-c", mount_probe_command(ctx.workspace, marker)])
         hit = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
     finally:
         (ctx.workspace / marker).unlink(missing_ok=True)
     if hit.endswith(f"/{marker}"):
         return "discoverable", f"workspace mounted at {hit[: -len(f'/{marker}')] or '/'}"
-    return "not-found", f"marker not found under {', '.join(MOUNT_SEARCH_ROOTS)}"
+    return "not-found", f"marker not found under {', '.join(mount_search_roots(ctx.workspace))}"
 
 
 def _probe_python3_venv(ctx: ProbeContext) -> tuple[str, str]:
@@ -317,7 +321,7 @@ CATALOG: tuple[Probe, ...] = (
     ),
     Probe(
         id=PROBE_LS_COLUMNS,
-        summary="`sbx ls` header carries the NAME/AGENT/STATUS/WORKSPACE columns",
+        summary="`sbx ls` header carries the NAME|SANDBOX/AGENT/STATUS/WORKSPACE columns",
         tier="cheap",
         expected="expected-columns",
         depends="parse_ls (sandbox listing, `sandbox rm --all`, pair cleanup)",

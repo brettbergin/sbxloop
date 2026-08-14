@@ -65,7 +65,7 @@ class TestLifecycle:
             cli.rm("ghost")
 
     def test_version(self, cli: SbxCLI) -> None:
-        assert cli.version() == "0.35.0"
+        assert cli.version() == "0.38.0"
 
 
 class TestExec:
@@ -194,7 +194,7 @@ class TestErrors:
     def test_fail_next_is_once(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
         fake_sbx.fail_next("version", returncode=1, stderr="flake")
         assert cli.run("version", check=False).returncode == 1
-        assert cli.version() == "0.35.0"
+        assert cli.version() == "0.38.0"
 
     def test_check_false_returns_result(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
         fake_sbx.fail_next("ls", returncode=3, stderr="x")

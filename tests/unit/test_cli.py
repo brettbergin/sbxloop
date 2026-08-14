@@ -550,7 +550,7 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor", "--deep"])
         assert result.exit_code == 0, result.output
         assert "DRIFT" not in result.output
-        cached = load_verdicts(workdir / ".sbxloop", "0.35.0")
+        cached = load_verdicts(workdir / ".sbxloop", "0.38.0")
         assert set(cached) == {probe.id for probe in CATALOG}
         # the scratch sandbox is gone afterwards
         assert not list((fake_sbx.state / "sandboxes").iterdir())
@@ -572,7 +572,7 @@ class TestDoctor:
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
         save_verdicts(
             workdir / ".sbxloop",
-            "0.35.0",
+            "0.38.0",
             {
                 PROBE_SECRET_ENV_VISIBILITY: ProbeRecord(
                     verdict="visible-under-exec", checked_at=time_module.time()
@@ -1519,5 +1519,5 @@ class TestDoctorStatsProbe:
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0
         assert "sandbox stats" in result.output
-        # fake sbx (like real 0.35.x) has no stats command -> in-VM sampling
+        # fake sbx has no stats command -> in-VM sampling (real 0.38 has one)
         assert "samples in-VM" in result.output

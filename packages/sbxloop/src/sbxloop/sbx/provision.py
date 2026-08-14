@@ -76,6 +76,36 @@ GITHUB_ALLOW_DOMAINS = (
 MOUNT_SEARCH_ROOTS = ("/workspace", "/home/agent", "/mnt", "/host", "/root")
 MOUNT_SEARCH_MAXDEPTH = 4
 
+
+def mount_search_roots(workspace: Path | None) -> tuple[str, ...]:
+    """The in-VM roots to search for the workspace mount, most likely first.
+
+    sbx 0.38 mounts the host workspace at its own host absolute path inside
+    the VM (identity mount, field-verified on 0.38.0), so the workspace path
+    itself is probed first; the 0.35-era candidate roots remain as fallback.
+    """
+    if workspace is None:
+        return MOUNT_SEARCH_ROOTS
+    return (str(workspace), *MOUNT_SEARCH_ROOTS)
+
+
+def mount_probe_command(workspace: Path | None, marker: str) -> str:
+    """One bounded in-VM marker search over the candidate mount roots.
+
+    Roots are existence-filtered before the ``find`` and the command always
+    exits 0 on a clean answer: on sbx 0.38 most candidate roots don't exist
+    in the VM, and a bare ``find`` over missing roots exits nonzero — which
+    would misclassify every clean "not mounted" answer as a broken probe
+    (the probe="answered" vs probe="error" split, #63).
+    """
+    roots = " ".join(shlex.quote(root) for root in mount_search_roots(workspace))
+    return (
+        f'set --; for r in {roots}; do [ -e "$r" ] && set -- "$@" "$r"; done; '
+        f'[ $# -eq 0 ] || find -L "$@" -maxdepth {MOUNT_SEARCH_MAXDEPTH} '
+        f"-name {marker} -print 2>/dev/null | head -1; :"
+    )
+
+
 PostCreate = Callable[[Sandbox, SandboxRole], None]
 
 
@@ -433,11 +463,7 @@ class Provisioner:
             return None
         probe_error = ""
         try:
-            command = (
-                f"find -L {' '.join(MOUNT_SEARCH_ROOTS)} "
-                f"-maxdepth {MOUNT_SEARCH_MAXDEPTH} -name {marker} -print 2>/dev/null"
-                " | head -1"
-            )
+            command = mount_probe_command(workspace, marker)
             result = sandbox.exec(["sh", "-c", command])
             hit = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
             if not result.ok:
