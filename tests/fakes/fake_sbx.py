@@ -30,9 +30,12 @@ import sys
 import time
 from pathlib import Path
 
-VERSION_OUTPUT = "sbx version 0.35.0\n"
+VERSION_OUTPUT = "sbx version 0.38.0\n"
 
-LS_COLUMNS = ("NAME", "AGENT", "STATUS", "WORKSPACE")
+# sbx 0.38 renamed NAME to SANDBOX and added PORTS, which is empty for
+# sandboxes with no exposed ports — modeled here so parse_ls's offset-based
+# column assignment is exercised against the field shape.
+LS_COLUMNS = ("SANDBOX", "AGENT", "STATUS", "PORTS", "WORKSPACE")
 
 
 def state_dir() -> Path:
@@ -198,10 +201,12 @@ def cmd_create(root: Path, args: list[str]) -> int:
         shutil.copytree(saved / "fs", fs, symlinks=True)
     (fs / "home/agent").mkdir(parents=True, exist_ok=True)
     (fs / "etc").mkdir(parents=True, exist_ok=True)
-    # Model the sbx workspace mount: /workspace inside the sandbox is the
-    # host workspace directory (symlink — writes propagate live, exactly
-    # like a real mount). SBX_FAKE_NO_MOUNT disables it so tests can force
-    # discovery failure / harvest mode.
+    # Model the 0.35-era /workspace mount as a symlink to the host workspace
+    # (writes propagate live, exactly like a real mount). The 0.38 identity
+    # mount needs no modeling here — exec runs on the host, so the workspace
+    # is visible at its own path already (cmd_exec hides it under
+    # SBX_FAKE_NO_MOUNT). The symlink stays because worker tests exercise
+    # canonical /workspace cwds through rewrite_abs.
     if not os.environ.get("SBX_FAKE_NO_MOUNT") and Path(workspace).is_dir():
         # A template snapshot may carry the bake sandbox's stale mount link.
         if (fs / "workspace").is_symlink():
@@ -263,6 +268,15 @@ def cmd_exec(root: Path, args: list[str]) -> int:
         return 2
     fs = path / "fs"
     rewritten = [rewrite_abs(fs, c) for c in cmd]
+    # sbx 0.38 mounts the workspace at its own host path inside the VM
+    # (identity mount). The fake's exec runs on the host, so that path is
+    # visible "for free"; under SBX_FAKE_NO_MOUNT redirect it to a
+    # nonexistent fs-internal path so tests can still force harvest mode.
+    if os.environ.get("SBX_FAKE_NO_MOUNT"):
+        workspace = meta.get("workspace") or ""
+        if workspace:
+            unmounted = str(fs / "unmounted" / workspace.lstrip("/"))
+            rewritten = [c.replace(workspace, unmounted) for c in rewritten]
     if rewritten[0] == "pkill":
         return fake_pkill(fs, rewritten[1:])
     home = fs / "home/agent"
@@ -333,9 +347,14 @@ def cmd_ls(root: Path) -> int:
                     path.name,
                     meta.get("agent", ""),
                     meta.get("status", ""),
+                    "",  # PORTS: empty unless ports are exposed (the common case)
                     meta.get("workspace", ""),
                 )
             )
+    if not rows:
+        # field-observed 0.38 empty state: no header row at all
+        print("No sandboxes found.")
+        return 0
     widths = [
         max([len(col)] + [len(str(row[i])) for row in rows]) + 2 for i, col in enumerate(LS_COLUMNS)
     ]

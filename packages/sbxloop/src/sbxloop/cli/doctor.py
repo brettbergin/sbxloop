@@ -31,7 +31,7 @@ from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import SDK_PERMISSION_KINDS, installed_sdk_permission_kinds
 
-TESTED_SBX_SERIES = "0.35"
+TESTED_SBX_SERIES = "0.38"
 
 
 @dataclass
@@ -163,7 +163,7 @@ def collect_checks(
                 "consider filing an issue to prefer host-side stats"
                 if stats_available
                 else "no host-side `sbx stats`; resource telemetry samples in-VM "
-                f"on the worker heartbeat (expected on {TESTED_SBX_SERIES}.x)",
+                "on the worker heartbeat",
                 hard=False,
             )
         )

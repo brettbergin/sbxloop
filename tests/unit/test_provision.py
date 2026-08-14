@@ -613,7 +613,7 @@ class TestMountDiscovery:
         from sbxloop.sbx.conformance import PROBE_WORKSPACE_MOUNT, load_verdicts
 
         # sbx-level failure of the find probe must degrade, not abort the run
-        fake_sbx.script("exec sbxloop-r1-agent sh -c find", returncode=1, stderr="not found")
+        fake_sbx.script("exec sbxloop-r1-agent sh -c set --", returncode=1, stderr="not found")
         bus = EventBus()
         events: list[Event] = []
         bus.subscribe(events.append)
@@ -628,7 +628,7 @@ class TestMountDiscovery:
             assert [e.data["probe"] for e in mount_events] == ["error"]
             # and the infra failure did not clobber the conformance cache
             # with a bogus "not-found" verdict
-            assert PROBE_WORKSPACE_MOUNT not in load_verdicts(tmp_path / "state", "0.35.0")
+            assert PROBE_WORKSPACE_MOUNT not in load_verdicts(tmp_path / "state", "0.38.0")
         finally:
             pair.cleanup()
 
@@ -647,7 +647,7 @@ class TestConformanceRecording:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         pair = provisioner.ensure_pair("r1")
         try:
-            cached = load_verdicts(tmp_path / "state", "0.35.0")
+            cached = load_verdicts(tmp_path / "state", "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "invisible-under-exec"
             assert cached[PROBE_SECRET_ENV_VISIBILITY].source == "provision"
             assert cached[PROBE_WORKSPACE_MOUNT].verdict == "discoverable"
