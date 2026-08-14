@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           url=$(curl -fsSL https://api.github.com/repos/docker/sbx-releases/releases/latest \
-            | uv run --no-project python -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and 'x86_64' in a['name'] and a['name'].endswith('.tar.gz')]; print(assets[0])")
+            | uv run --no-project python -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and ('amd64' in a['name'] or 'x86_64' in a['name']) and a['name'].endswith('.tar.gz')]; print(assets[0])")
           echo "downloading $url"
           curl -fsSL -o /tmp/sbx.tar.gz "$url"
           mkdir -p /tmp/docker-sbx && tar -xzf /tmp/sbx.tar.gz -C /tmp/docker-sbx --strip-components=1

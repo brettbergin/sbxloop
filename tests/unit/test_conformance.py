@@ -29,7 +29,7 @@ from sbxloop.sbx.conformance import (
 from sbxloop.sbx.secretstate import parsed_scope
 from tests.conftest import FakeSbx
 
-FAKE_VERSION = "0.35.0"
+FAKE_VERSION = "0.38.0"
 
 
 def make_cli(fake_sbx: FakeSbx) -> SbxCLI:
