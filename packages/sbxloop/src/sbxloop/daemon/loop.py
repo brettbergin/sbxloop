@@ -30,10 +30,12 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RESUMABLE_RUN_STATES, TERMINAL_RUN_STATES, RunResult
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxloopError, StateError
+from sbxloop.errors import SbxError, SbxloopError, StateError
 from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.sandbox import Sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -500,9 +502,25 @@ class DaemonLoop:
                     if last
                     else f"recovery: resuming {item.run_id} for {item.item_id}"
                 )
+                # A dead process leaves its microVMs alive; resume
+                # re-provisions under the same names and `sbx create` refuses
+                # a name that exists (field: SIGKILL mid-run → 'sandbox
+                # already exists' on the very next start).
+                self._remove_stale_run_sandboxes(item.run_id)
                 self._dispatch(item, source, resume_run_id=item.run_id)
             else:
                 self.dstore.mark_requeued_unstarted(item.item_id, now)
+
+    def _remove_stale_run_sandboxes(self, run_id: str) -> None:
+        if self.sbx is None:
+            return
+        for role in ("agent", "github"):
+            name = sandbox_name(run_id, role)
+            try:
+                Sandbox(self.sbx, name).rm()
+                self._notify(f"recovery: removed stale sandbox {name}")
+            except SbxError:
+                pass  # not there — the common case
 
     def _result_from_record(self, run_id: str) -> RunResult:
         record = self.store.get_run(run_id)

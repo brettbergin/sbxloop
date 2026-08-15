@@ -310,6 +310,28 @@ class TestShutdownAndRecovery:
         item = h.dstore.get("inbox:a.md")
         assert item is not None and item.state == "done" and item.attempts == 1
 
+    def test_recover_removes_stale_run_sandboxes_before_resume(self, tmp_path: Path) -> None:
+        """A killed process leaves its microVMs alive; resume re-provisions
+        under the same names and sbx refuses an existing name (field
+        failure r6pgvatsd)."""
+        h = Harness(tmp_path)
+        removed: list[str] = []
+
+        class FakeSbx:
+            def rm(self, name: str, **kwargs: Any) -> None:
+                removed.append(name)
+
+        h.loop.sbx = FakeSbx()  # type: ignore[assignment]
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_live", now=2.0)
+        h.store.create_run("r_live", "x")
+        h.store.set_run_state("r_live", "running")
+        h.outcomes = ["completed"]
+        h.loop.recover()
+        assert removed == ["sbxloop-r_live-agent", "sbxloop-r_live-github"]
+        assert h.runs == [("r_live", True)]
+
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 3}}
