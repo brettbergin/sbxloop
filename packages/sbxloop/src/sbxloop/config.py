@@ -39,6 +39,7 @@ RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
 WorkerTransport = Literal["stream", "poll"]
 SecretStrategy = Literal["proxy", "plain-env"]
 HarvestMode = Literal["per-task", "final"]
+WorkspaceIsolation = Literal["auto", "clone", "in-place"]
 
 
 class _ConfigModel(BaseModel):
@@ -57,10 +58,20 @@ class SandboxConfig(_ConfigModel):
     rather than adding to it, so nothing is provisioned for a language the
     operator did not ask for. Provisioning is probe-first (a template that
     already ships the toolchain costs nothing) and never fatal.
+
+    ``workspace_isolation`` governs what happens when ``workspace`` points
+    at an existing git checkout. ``auto`` (default): each run works in a
+    self-contained per-run clone on branch ``sbxloop/<run_id>``, leaving the
+    checkout and its branches untouched; a dirty source tree refuses the run
+    (uncommitted changes would silently not travel). ``clone``: same
+    isolation, but a dirty tree proceeds from committed HEAD with a warning,
+    and a non-git workspace is an error. ``in-place``: pre-isolation
+    behavior — runs mutate the workspace directly, no git involved.
     """
 
     template: str | None = None
     workspace: Path | None = None
+    workspace_isolation: WorkspaceIsolation = "auto"
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
 

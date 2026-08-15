@@ -38,6 +38,7 @@ from typing import Any
 from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, ArtifactScan, scan_artifacts
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import GithubOps, PrRef
+from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
 
 FILE_MODE = "100644"
 BODY_FILE_LIST_CAP = 50
@@ -47,10 +48,6 @@ TITLE_CLIP = 72
 # bounds the staged file size; a single oversized file still gets its own
 # chunk rather than failing.
 BLOB_BATCH_MAX_B64_BYTES = 4 * 1024 * 1024
-
-
-def branch_name(run_id: str) -> str:
-    return f"sbxloop/{run_id}"
 
 
 def _is_missing(exc: GithubOpsError) -> bool:

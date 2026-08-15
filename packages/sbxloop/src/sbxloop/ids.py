@@ -20,6 +20,11 @@ def new_run_id() -> str:
     return "r" + _token(8)
 
 
+def branch_name(run_id: str) -> str:
+    """The run's git branch, shared by workspace clones and PR delivery."""
+    return f"sbxloop/{run_id}"
+
+
 def is_run_id(value: str) -> bool:
     return _RUN_ID_RE.fullmatch(value) is not None
 

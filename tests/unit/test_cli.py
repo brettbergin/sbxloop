@@ -1229,6 +1229,62 @@ class TestArtifactsTree:
         assert _human_size(3 * 1024**3) == "3072.0 MB"
 
 
+class TestWorkspaceCloneSummary:
+    """The finish summary restates where an isolated run's results live,
+    mined from the persisted sandbox.workspace_clone event."""
+
+    def _summary(self, tmp_path: Path, *, mounted: bool) -> str:
+        import sbxloop.cli.app as app_mod
+        from sbxloop.config import Config
+        from sbxloop.engine.model import RunResult
+
+        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        store = StateStore(config.state_dir / "state.db")
+        store.create_run("r1", "improve the project")
+        store.append_event(
+            Event.now(
+                "sandbox.workspace_clone",
+                "r1",
+                source="/home/me/proj",
+                target="/state/runs/r1/workspace",
+                commit="a" * 40,
+                branch="sbxloop/r1",
+                dirty=False,
+                reused=False,
+                message="cloned",
+            )
+        )
+        result = RunResult(run_id="r1", state="completed", mounted=mounted)
+        with app_mod.console.capture() as capture:
+            app_mod._print_workspace_clone_summary(result, config)
+        return capture.get()
+
+    def test_mounted_run_prints_fetch_hint(self, tmp_path: Path) -> None:
+        text = self._summary(tmp_path, mounted=True)
+        assert "cloned from /home/me/proj" in text
+        assert "HEAD aaaaaaaaaaaa" in text
+        assert "branch sbxloop/r1" in text
+        assert "git fetch /state/runs/r1/workspace sbxloop/r1" in text
+
+    def test_unmounted_run_warns_uncommitted_harvest(self, tmp_path: Path) -> None:
+        text = self._summary(tmp_path, mounted=False)
+        assert "harvested changes are uncommitted" in text
+        assert "git fetch" not in text
+
+    def test_run_without_clone_prints_nothing(self, tmp_path: Path) -> None:
+        import sbxloop.cli.app as app_mod
+        from sbxloop.config import Config
+        from sbxloop.engine.model import RunResult
+
+        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        StateStore(config.state_dir / "state.db").create_run("r1", "x")
+        with app_mod.console.capture() as capture:
+            app_mod._print_workspace_clone_summary(
+                RunResult(run_id="r1", state="completed"), config
+            )
+        assert capture.get() == ""
+
+
 class TestDashboard:
     def test_pinned_status_renders_run_and_tasks(self) -> None:
         from rich.console import Console

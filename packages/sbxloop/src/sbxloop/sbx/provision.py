@@ -28,9 +28,11 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 
+from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
+from sbxloop.ids import branch_name
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
@@ -211,12 +213,110 @@ class Provisioner:
     # -- provisioning ------------------------------------------------------
 
     def ensure_pair(self, run_id: str, workspace: Path | None = None) -> SandboxPair:
-        workspace = workspace or self.config.sandbox.workspace
-        if workspace is None:
-            workspace = self.config.state_dir / "runs" / run_id / "workspace"
-        workspace = workspace.resolve()
+        if workspace is not None:
+            # An explicit workspace is authoritative: it is either the
+            # resume pin from the runs table (which must be reused in place
+            # so the relocation check holds and agent work survives) or an
+            # embedder's deliberate choice. Isolation applies only to
+            # config-sourced workspaces on fresh runs.
+            workspace = workspace.resolve()
+        else:
+            workspace = self._resolve_workspace(run_id)
         workspace.mkdir(parents=True, exist_ok=True)
+        return self._provision_pair(run_id, workspace)
 
+    def _resolve_workspace(self, run_id: str) -> Path:
+        """Where this fresh run works: the per-run dir, the configured
+        workspace, or — when that workspace is a git checkout — a per-run
+        clone of it, so runs never disturb the checkout's branch setup.
+        """
+        clone_dir = (self.config.state_dir / "runs" / run_id / "workspace").resolve()
+        mode = self.config.sandbox.workspace_isolation
+        source = self.config.sandbox.workspace
+        if source is None:
+            if mode == "clone":
+                raise ProvisionError(
+                    "workspace_isolation = 'clone' requires [sandbox] workspace "
+                    "to point at a git checkout"
+                )
+            return clone_dir
+        source = source.resolve()
+        if mode == "in-place" or source == clone_dir:
+            return source
+        git = hostgit.find_git()
+        if git is None:
+            if mode == "clone":
+                raise ProvisionError("workspace_isolation = 'clone' but no git binary is on PATH")
+            logger.debug("no git binary on PATH; workspace %s used in place", source)
+            return source
+        root = hostgit.repo_toplevel(source)
+        if root is None:
+            if mode == "clone":
+                raise ProvisionError(
+                    f"workspace_isolation = 'clone' but {source} is not a git repository"
+                )
+            return source
+        if root != source:
+            raise ProvisionError(
+                f"workspace {source} is inside a git checkout (root {root}) but is "
+                "not its root; clone isolation cannot isolate a subtree — point "
+                "[sandbox] workspace at the repo root, or set "
+                "workspace_isolation = 'in-place' to keep mutating it directly"
+            )
+        if hostgit.head_commit(source) is None:
+            raise ProvisionError(
+                f"workspace {source} is a git repository with no commits; commit "
+                "something first, or set workspace_isolation = 'in-place'"
+            )
+        dirty = hostgit.is_dirty(source)
+        if dirty and mode == "auto":
+            raise ProvisionError(
+                f"workspace {source} has uncommitted changes; sbxloop isolates "
+                "runs in a clone of committed HEAD, which would silently exclude "
+                "them. Commit or stash them, or set [sandbox] "
+                "workspace_isolation = 'clone' to run from HEAD anyway, or "
+                "'in-place' to run directly in the checkout"
+            )
+        return self._clone_workspace(run_id, source, clone_dir, dirty=dirty)
+
+    def _clone_workspace(self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool) -> Path:
+        branch = branch_name(run_id)
+        if (clone_dir / ".git").exists():
+            # A run that crashed after cloning but before the workspace pin
+            # landed re-enters this path on resume; never re-clone over
+            # whatever work is already in the clone.
+            self.bus.emit(
+                "sandbox.workspace_clone",
+                run_id,
+                source=str(source),
+                target=str(clone_dir),
+                commit=hostgit.head_commit(clone_dir),
+                branch=branch,
+                dirty=False,
+                reused=True,
+                message=f"reusing existing run clone at {clone_dir}",
+            )
+            return clone_dir
+        clone_dir.parent.mkdir(parents=True, exist_ok=True)
+        sha = hostgit.clone_for_run(source, clone_dir, branch)
+        message = f"cloned {source} at {sha[:12]} onto branch {branch}"
+        if dirty:
+            message += " — source tree has uncommitted changes; they are NOT in the run workspace"
+            logger.warning("workspace %s is dirty; %s", source, message)
+        self.bus.emit(
+            "sandbox.workspace_clone",
+            run_id,
+            source=str(source),
+            target=str(clone_dir),
+            commit=sha,
+            branch=branch,
+            dirty=dirty,
+            reused=False,
+            message=message,
+        )
+        return clone_dir
+
+    def _provision_pair(self, run_id: str, workspace: Path) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
         # no GitHub capability at all — and one less microVM to boot.

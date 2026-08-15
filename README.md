@@ -210,6 +210,28 @@ chat turn is a persisted event (`sbxloop logs <run> --type chat.`), and
 `--no-chat` disables the input entirely. With `--no-tui`, plain line input on
 stdin does the same job.
 
+## Working against an existing checkout
+
+Point `[sandbox] workspace` at a project and runs execute on that code. When
+the workspace is a **git checkout**, each run is isolated in a per-run clone
+(`workspace_isolation = "auto"`, the default): the run works in
+`.sbxloop/runs/<run>/workspace` on branch `sbxloop/<run>`, and your checkout —
+its working tree, branches, HEAD — is never touched. Pull the results back
+with the command the finish summary prints:
+
+```bash
+git fetch .sbxloop/runs/<run>/workspace sbxloop/<run>
+```
+
+Dirty-tree rules: `auto` **refuses to start** when the checkout has
+uncommitted changes (a clone takes committed HEAD, so they would silently not
+travel — commit or stash first). `workspace_isolation = "clone"` isolates the
+same way but proceeds from HEAD with a warning; `"in-place"` skips isolation
+entirely and mutates the workspace directly. Clones hardlink git objects on
+the same filesystem, so isolation is cheap; the working tree itself is
+copied. If the agent commits inside the VM it needs `git config user.name` /
+`user.email` — agents typically set these themselves.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory
@@ -481,6 +503,8 @@ where it came from. The notable knobs:
 | `keep_sandboxes` / `keep_on_failure`   | `false`            | Sandbox retention for debugging (see above).                                                            |
 | `secret_strategy`                      | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                         |
 | `[sandbox] template`                   | unset              | Baked template ref from `sbxloop bake`.                                                                 |
+| `[sandbox] workspace`                  | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                 |
+| `[sandbox] workspace_isolation`        | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                 |
 | `[sandbox] extra_allow_domains`        | `[]`               | Static egress allows applied to every run.                                                              |
 | `[sandbox] languages`                  | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                              |
 | `[policy] allow` / `deny`              | `[]`               | Bounds for plan-declared egress.                                                                        |
