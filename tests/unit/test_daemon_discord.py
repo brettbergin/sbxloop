@@ -355,6 +355,29 @@ class TestBridge:
         finally:
             bridge.close()
 
+    def test_plain_control_channel_message_gets_steering_hint(self, tmp_path: Path) -> None:
+        """Field: both of Brett's steering attempts landed in the control
+        channel, not the run's thread. A plain message there must answer
+        with where to type, naming the live run's thread."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            # nothing running: generic hint
+            bridge._handle_message(FakeMessage("hello there", control))
+            assert wait_for(lambda: any("Nothing is running" in s for s in control.sent))
+            # live run: hint names its thread
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            engine = FakeEngine()
+            bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread_id = bridge.dstore.discord_thread("r1")[1]  # type: ignore[index]
+            bridge._handle_message(FakeMessage("also add a docstring", control))
+            assert wait_for(lambda: any(f"<#{thread_id}>" in s and "r1" in s for s in control.sent))
+            assert engine.posted == []  # never treated as steering
+        finally:
+            bridge.close()
+
     def test_daemon_events_go_to_control_channel(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()

@@ -319,8 +319,16 @@ class DiscordBridge:
         text = str(getattr(message, "content", "") or "").strip()
         channel = getattr(message, "channel", None)
         channel_id = getattr(channel, "id", None)
-        if channel_id == self.discord.channel_id and text.startswith(self.discord.command_prefix):
-            self._schedule(self._command(message, text[len(self.discord.command_prefix) :].strip()))
+        if channel_id == self.discord.channel_id:
+            if text.startswith(self.discord.command_prefix):
+                self._schedule(
+                    self._command(message, text[len(self.discord.command_prefix) :].strip())
+                )
+            elif text:
+                # A plain message in the control channel is almost always
+                # someone trying to steer (field: "hello there" in the
+                # channel while a run was live). Point them at the thread.
+                self._schedule(self._hint_where_to_steer(message))
             return
         if channel_id is None:
             return
@@ -340,6 +348,26 @@ class DiscordBridge:
         with self._lock:
             self._pending[mid] = _Pending(thread_id, int(getattr(message, "id", 0)))
         self._schedule(self._react(message, "⏳"))
+
+    async def _hint_where_to_steer(self, message: Any) -> None:
+        with self._lock:
+            run_id = self._active_run
+            item = self._active_item
+        if run_id is not None and item is not None:
+            known = self.dstore.discord_thread(run_id)
+            where = f"<#{known[1]}>" if known else f"the thread for `{run_id}`"
+            text = (
+                f"To steer the running agent, type inside its thread: {where} "
+                f"(`{run_id}` — {_one_line(item.title, 80)}). Daemon commands start with "
+                f"`{self.discord.command_prefix}` (try `{self.discord.command_prefix} status`)."
+            )
+        else:
+            text = (
+                "Nothing is running right now. Steering happens inside a run's thread once "
+                f"one starts; daemon commands start with `{self.discord.command_prefix}` "
+                f"(try `{self.discord.command_prefix} status`)."
+            )
+        await self._send(message.channel, text)
 
     async def _command(self, message: Any, cmd: str) -> None:
         loop = self.loop_ref
