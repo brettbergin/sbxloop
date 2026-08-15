@@ -556,14 +556,16 @@ class DiscordBridge:
             raise DaemonError(INSTALL_HINT) from exc
         intents = discordpy.Intents.default()
         intents.message_content = True
-        client = discordpy.Client(intents=intents)
+        client: Any = discordpy.Client(intents=intents)
 
-        @client.event
         async def on_ready() -> None:
             logger.info("discord bridge connected as %s", client.user)
 
-        @client.event
         async def on_message(message: Any) -> None:
             bridge._handle_message(message)
 
+        # discord.py's `@client.event` registers by function name; calling it
+        # directly is the same registration without an untyped decorator.
+        client.event(on_ready)
+        client.event(on_message)
         return client
