@@ -295,6 +295,25 @@ def collect_checks(
             )
         )
 
+    # daemon's Discord bridge (only when configured)
+    if config.discord.enabled:
+        problems: list[str] = []
+        try:
+            import discord as _discordpy  # noqa: F401
+        except ImportError:
+            problems.append("discord.py missing (pip install 'sbxloop[discord]')")
+        if not env.get("DISCORD_BOT_TOKEN"):
+            problems.append("DISCORD_BOT_TOKEN not set")
+        checks.append(
+            Check(
+                "discord bridge",
+                not problems,
+                f"channel {config.discord.channel_id}: "
+                + ("; ".join(problems) if problems else "extra installed, token present"),
+                hard=False,
+            )
+        )
+
     # worker wheel
     wheel = resolve_worker_wheel()
     checks.append(

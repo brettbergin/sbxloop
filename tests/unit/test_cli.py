@@ -354,6 +354,58 @@ class TestShellCommand:
         assert result.exit_code == 7
 
 
+class TestDaemonCommand:
+    def test_no_sources_exits_2(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SBXLOOP_DAEMON__INBOX_DIR", "")
+        result = runner.invoke(app, ["daemon"])
+        assert result.exit_code == 2
+        assert "no work sources" in result.output
+
+    def test_backlog_github_without_repo_exits_2(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--backlog", "github"])
+        assert result.exit_code == 2
+        assert "needs a GitHub repository" in result.output
+
+    def test_bad_backlog_value_exits_2(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--backlog", "yolo"])
+        assert result.exit_code == 2
+        assert "invalid daemon option" in result.output
+
+    def test_dry_run_lists_inbox_candidates_without_claiming(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import os
+        import time
+
+        pending = workdir / "inbox" / "pending"
+        pending.mkdir(parents=True)
+        f = pending / "thing.md"
+        f.write_text("# Do the thing\n\nbody\n")
+        old = time.time() - 60
+        os.utime(f, (old, old))
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert "inbox:thing.md" in result.output and "Do the thing" in result.output
+        assert f.exists()  # not claimed
+
+    def test_discord_configured_without_token_exits_2(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(
+            app, ["daemon", "--inbox", "inbox", "--discord-channel", "123", "--once"]
+        )
+        assert result.exit_code == 2
+        assert "DISCORD_BOT_TOKEN" in result.output
+
+    def test_once_runs_a_tick_and_exits(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "tick:" in result.output and "no_work" in result.output
+
+
 class TestDoctor:
     def test_doctor_with_fake_sbx_and_tokens(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

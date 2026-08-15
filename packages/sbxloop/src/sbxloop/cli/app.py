@@ -25,6 +25,8 @@ from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import (
     Config,
+    DaemonConfig,
+    DiscordConfig,
     GithubConfig,
     load_config,
     load_config_with_sources,
@@ -34,7 +36,7 @@ from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
-from sbxloop.events import Event, HostEventTypes
+from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
@@ -1205,6 +1207,155 @@ def init(
 
 
 @app.command()
+def daemon(
+    repo: Annotated[
+        str | None,
+        typer.Option("--repo", help='GitHub repository ("owner/name") to poll for labeled issues.'),
+    ] = None,
+    inbox: Annotated[
+        str | None,
+        typer.Option("--inbox", help='Inbox directory of .md work files ("" disables).'),
+    ] = None,
+    backlog: Annotated[
+        str | None,
+        typer.Option("--backlog", help="Where agent-filed follow-up work goes: github|inbox|off."),
+    ] = None,
+    max_runs_per_day: Annotated[
+        int | None, typer.Option("--max-runs-per-day", help="Rolling 24h run cap.")
+    ] = None,
+    poll_interval: Annotated[
+        float | None, typer.Option("--poll-interval", help="Seconds between polls.")
+    ] = None,
+    discord_channel: Annotated[
+        int | None,
+        typer.Option("--discord-channel", help="Discord control channel id (enables the bridge)."),
+    ] = None,
+    once: Annotated[
+        bool, typer.Option("--once", help="Recover, run one tick, exit (cron / smoke tests).")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Poll and print candidates; claim and run nothing.")
+    ] = False,
+) -> None:
+    """Run the always-on outer loop: discover work (labeled GitHub issues,
+    inbox files), run each item through the inner loop, report back, and
+    mirror the chronology to Discord."""
+    import logging
+
+    from sbxloop.daemon.discord import DiscordBridge
+    from sbxloop.daemon.github import DaemonGithub
+    from sbxloop.daemon.loop import DaemonLoop
+    from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels, InboxSource, WorkSource
+    from sbxloop.daemon.store import DaemonStore
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    config = load_config()
+    daemon_overrides = {
+        k: v
+        for k, v in (
+            ("inbox_dir", inbox),
+            ("backlog", backlog),
+            ("max_runs_per_day", max_runs_per_day),
+            ("poll_interval_s", poll_interval),
+        )
+        if v is not None
+    }
+    try:
+        if daemon_overrides:
+            daemon_cfg = DaemonConfig.model_validate(
+                {**config.daemon.model_dump(), **daemon_overrides}
+            )
+            config = config.model_copy(update={"daemon": daemon_cfg})
+        if repo is not None:
+            github_cfg = GithubConfig.model_validate({**config.github.model_dump(), "repo": repo})
+            config = config.model_copy(update={"github": github_cfg})
+        if discord_channel is not None:
+            discord_cfg = DiscordConfig.model_validate(
+                {**config.discord.model_dump(), "channel_id": discord_channel}
+            )
+            config = config.model_copy(update={"discord": discord_cfg})
+    except ValidationError as exc:
+        console.print(f"[bold red]invalid daemon option:[/] {exc.errors()[0]['msg']}")
+        raise typer.Exit(2) from exc
+
+    github_active = config.github.enabled
+    inbox_active = bool(config.daemon.inbox_dir)
+    if not github_active and not inbox_active:
+        console.print(
+            "[bold red]no work sources:[/] set [cyan]--repo owner/name[/] (or "
+            "[cyan]\\[github] repo[/]) to poll issues, and/or an inbox directory "
+            "([cyan]--inbox DIR[/] / [cyan]\\[daemon] inbox_dir[/])."
+        )
+        raise typer.Exit(2)
+    if config.daemon.backlog == "github" and not github_active:
+        console.print("[bold red]--backlog github needs a GitHub repository[/] (--repo).")
+        raise typer.Exit(2)
+
+    store = _store(config)
+    dstore = DaemonStore(config.state_dir / "state.db")
+    sbx = SbxCLI(app_name=config.app_name or None)
+    bus = EventBus()
+    bus.subscribe(plain_printer(console))
+    sources: list[WorkSource] = []
+    github: DaemonGithub | None = None
+    if inbox_active:
+        sources.append(InboxSource(Path(config.daemon.inbox_dir)))
+    if github_active:
+        assert config.github.repo is not None
+        github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
+        github.remove_stale()
+        labels = GitHubLabels(
+            config.daemon.trigger_label,
+            config.daemon.in_progress_label,
+            config.daemon.failed_label,
+            config.daemon.backlog_label,
+        )
+        sources.append(GitHubIssueSource(github.ops, config.github.repo, labels))
+
+    if dry_run:
+        for source in sources:
+            for item in source.poll():
+                console.print(
+                    f"[cyan]{item.item_id}[/]  {item.title}" + (f"  {item.url}" if item.url else "")
+                )
+        if github is not None:
+            github.close()
+        raise typer.Exit(0)
+
+    loop = DaemonLoop(config, store=store, dstore=dstore, sources=sources, sbx=sbx)
+    bridge: DiscordBridge | None = None
+    if config.discord.enabled:
+        try:
+            bridge = DiscordBridge(config, dstore, loop_ref=loop)
+            bridge.start()
+        except SbxloopError as exc:
+            console.print(f"[bold red]discord bridge:[/] {exc}")
+            raise typer.Exit(2) from exc
+        loop.frontend = bridge
+
+    cleanup_registry.install_handlers()
+    cleanup_registry.set_quiesce(loop.quiesce)
+    try:
+        loop.recover()
+        if once:
+            result = loop.tick()
+            console.print(f"tick: {result}")
+        else:
+            loop.run_forever()
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]daemon interrupted[/]")
+    finally:
+        cleanup_registry.set_quiesce(None)
+        if bridge is not None:
+            bridge.close()
+        if github is not None:
+            github.close()
+        dstore.close()
+
+
+@app.command()
 def bake(
     ref: Annotated[
         str, typer.Option("--ref", help="Template reference to save (name:tag).")
@@ -1448,6 +1599,44 @@ per_job_timeout_s = 1800.0
 disk_warn = 85.0
 disk_abort = 95.0
 mem_warn = 90.0
+
+[daemon]
+# `sbxloop daemon` — the always-on outer loop. Discovers work and runs each
+# item as a full inner-loop run, fully autonomously: a labeled issue in the
+# [github] repo or a .md file in the inbox starts a run on its own, so the
+# guardrails below are what stand between a mislabeled issue and your budget.
+# inbox_dir = ".sbxloop/inbox"     # "" disables the inbox source
+# poll_interval_s = 60.0
+# trigger_label = "sbxloop:run"    # issue label that queues work
+# in_progress_label = "sbxloop:in-progress"
+# failed_label = "sbxloop:failed"
+# backlog_label = "sbxloop:backlog"
+# max_runs_per_day = 12            # rolling 24h window, persisted across restarts
+# max_attempts_per_item = 2
+# retry_backoff_s = 900.0          # times the attempt number
+# max_consecutive_failures = 3     # circuit breaker ...
+# breaker_cooldown_s = 3600.0      # ... and how long it stays open
+# shutdown_grace_s = 60.0          # keep below systemd TimeoutStopSec
+# Agent-filed follow-up work (.sbxloop/backlog/*.md in the run workspace):
+# "github" files issues with backlog_label, "inbox" writes to inbox/triage/,
+# "off" ignores it. Filed items wait for a human unless auto-trigger is on.
+# backlog = "off"
+# backlog_max_per_run = 5
+# backlog_auto_trigger = false
+# deliver_draft = true             # autonomous PRs arrive as drafts
+
+[discord]
+# The daemon's human channel: a gateway bot posts each run's chronology
+# (agent messages, tool lines, issue/PR links) into a thread under a control
+# channel and relays replies typed in the thread to the running agent as
+# steering. Needs `pip install 'sbxloop[discord]'` and DISCORD_BOT_TOKEN in
+# the environment / .env (never here). Anyone who can post in the channel can
+# steer — restrict the channel. Unset channel_id = Discord off.
+# channel_id = 123456789012345678
+# command_prefix = "!sbx"          # !sbx status|pause|resume|cancel|queue
+# thread_per_run = true
+# chronology_level = "normal"      # quiet | normal | verbose
+# max_message_chars = 1900
 """
 
 
