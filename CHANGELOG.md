@@ -6,6 +6,79 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-15
+
+Rollup release: everything below shipped incrementally as the auto-released
+v0.2.1–v0.5.86 patch series; v0.6.0 marks the point where the GitHub
+integration and existing-checkout workflows were completed and field-verified
+end to end.
+
+### Added
+
+- **Per-run workspace isolation for existing git checkouts** (#216, #218).
+  When `[sandbox] workspace` points at a git checkout, each run works in a
+  self-contained per-run clone on branch `sbxloop/<run_id>` — the checkout's
+  working tree, branches, and HEAD are never touched. New
+  `[sandbox] workspace_isolation = auto|clone|in-place` (default `auto`):
+  `auto` refuses a dirty source tree up front (uncommitted changes would
+  silently not travel; sbxloop's own `.sbxloop` state dir is exempt),
+  `clone` proceeds from committed HEAD with a warning, `in-place` is the
+  old behavior. The finish summary prints where the results live and the
+  `git fetch <clone> sbxloop/<run>` command to pull them back. Host-side
+  git goes through GitPython (new dependency, host package only).
+
+- **Verify commands are mechanically validated against toolchain
+  conventions** (#217, #218) at both decompose and plan acceptance: bare
+  `python`/`pip`/`pytest` (use `.venv/bin/...`), bare `rspec`/`rake` (use
+  `bundle exec`), bare `phpunit` (use `./vendor/bin/`), and any
+  `sudo`/`apt` are rejected with the remedy quoted, costing one JSON retry
+  instead of a revision cycle plus an in-VM workaround. Go, Rust, .NET,
+  Node, Java, and C/C++ commands are correctly bare and deliberately
+  unrestricted. Prompts additionally require verify commands to be
+  self-contained — start what they probe, tear it down, never depend on a
+  process the executor left running (#212).
+
+- **The GitHub integration is fully drivable from the run command**:
+  `--repo owner/name` (overriding `[github].repo`, validated up front),
+  `--deliver-base`, `--deliver-draft` (#213), and `--create-repo` /
+  `--create-public` (#214) — the delivery repository is probed right after
+  provisioning (fail fast on typos, before any work), created on demand
+  when explicitly allowed, and an existing-but-empty repository is
+  bootstrapped with an initial commit so delivery always lands as a normal
+  reviewable PR (#214, #219).
+
+- **Run outcomes are surfaced, not buried in scrollback** (#215): the
+  finish summary gains a `github:` section (repository, created-this-run
+  marker, tracking issue, delivery PR or failure) and completed runs close
+  their tracking issue (`state_reason: completed`); failed runs leave it
+  open as the thing still needing a human.
+
+- **Read-only critic sessions may run shell** (#211): `shell` joins the
+  critic allowlist so scrutinize/validate sessions can run inspection
+  commands directly; everything else, including unknown SDK permission
+  kinds, still fails closed.
+
+- **Artifact excludes accept glob patterns** and `*.egg-info` joins the
+  defaults (#215) — pip's project-named metadata directory was shipping in
+  delivery PRs and no exact component name could catch it.
+
+### Fixed
+
+- **Permission denials and CLI validator refusals no longer masquerade as
+  degraded critic tooling** (#211, #212): a rejected call's `success=False`
+  completion echo is shielded by its `tool_call_id`, and "Command not
+  executed" validator refusals land in a separate non-degrading
+  `tool_refusals` tally — previously every denial or refusal downgraded a
+  clean critic verdict until the revision budget died.
+
+- **Empty-repository delivery** failed against real GitHub (#219): the ref
+  lookup answers HTTP 409 "Git Repository is empty.", not the 404 the
+  bootstrap listened for. Both now trigger the bootstrap.
+
+- **sbxloop's own state directory no longer trips the isolation dirty
+  refusal** (#218): any command run from inside a checkout drops a relative
+  `.sbxloop` there, which is run state, not user content.
+
 ### Added
 
 - **`[sandbox] languages = ["dotnet"]` provisions the .NET SDK** (issue
