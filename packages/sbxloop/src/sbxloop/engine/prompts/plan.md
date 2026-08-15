@@ -70,8 +70,12 @@ and none of these is the "normal" choice.
 - **Python** — the system Python is externally managed (PEP 668), so
   dependencies belong in a project virtualenv (`python3 -m venv .venv`) and
   commands, including your `verify_commands`, should use `.venv/bin/...`
-  paths. Verify: `.venv/bin/pytest`, or `cd app && .venv/bin/pytest` for a
-  subdirectory build.
+  paths. Create the venv and install dependencies in your **steps**, never
+  in a verify command — verify commands run after execution and may assume
+  the venv your steps built, and a `python3 -m venv ... && ...` verify
+  command is rejected outright (there is no compliant way to bootstrap a
+  venv from inside one). Verify: `.venv/bin/pytest`, or
+  `cd app && .venv/bin/pytest` for a subdirectory build.
 - **JavaScript/Node** — `package.json` and its lockfile sit at the project
   root, and `node_modules/` is local to the project, so no global-install
   workaround is needed. Prefer `npm ci` over `npm install` for a

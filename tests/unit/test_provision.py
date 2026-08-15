@@ -402,6 +402,29 @@ class TestWorkspaceIsolation:
         finally:
             pair.cleanup()
 
+    def test_stray_state_dirs_do_not_trip_the_dirty_refusal(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Running any sbxloop command from inside the checkout drops a
+        relative .sbxloop there; the tool's own state (under the default
+        name or this run's configured state-dir name) must be invisible to
+        isolation (field failure r5a1d9m9c)."""
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        (source / ".sbxloop").mkdir()
+        (source / ".sbxloop" / "state.db").write_text("db\n")
+        (source / "state").mkdir()  # this run's state_dir is named "state"
+        (source / "state" / "junk").write_text("x\n")
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert (pair.workspace / ".git").is_dir()
+            (event,) = clone_events(events)
+            assert event.data["dirty"] is False
+        finally:
+            pair.cleanup()
+
     def test_auto_dirty_refuses_before_provisioning(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:

@@ -77,6 +77,22 @@ class TestDirtyAndHead:
         (root / "new.txt").write_text("x\n")
         assert hostgit.is_dirty(root) is True
 
+    def test_ignored_names_do_not_count(self, tmp_path: Path) -> None:
+        """sbxloop's own state dir dropped inside a checkout is run state,
+        not user content (field failure r5a1d9m9c)."""
+        root = make_repo(tmp_path)
+        (root / ".sbxloop").mkdir()
+        (root / ".sbxloop" / "state.db").write_text("db\n")
+        assert hostgit.is_dirty(root) is True  # counted without ignore
+        assert hostgit.is_dirty(root, ignore=[".sbxloop"]) is False
+
+    def test_real_changes_still_count_alongside_ignored_names(self, tmp_path: Path) -> None:
+        root = make_repo(tmp_path)
+        (root / ".sbxloop").mkdir()
+        (root / ".sbxloop" / "state.db").write_text("db\n")
+        (root / "hello.txt").write_text("changed\n")
+        assert hostgit.is_dirty(root, ignore=[".sbxloop"]) is True
+
     def test_head_commit_sha(self, tmp_path: Path) -> None:
         sha = hostgit.head_commit(make_repo(tmp_path))
         assert sha is not None and len(sha) == 40
