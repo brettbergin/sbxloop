@@ -196,6 +196,19 @@ class DaemonLoop:
         discovered = self._discover(now)
         item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s)
         if item is None:
+            # Say WHY there is nothing to run: a queue full of items sitting
+            # in retry backoff reads as "no work" otherwise (field: --once
+            # after a failed attempt printed no_work with no explanation).
+            waiting = self.dstore.queued()
+            if waiting:
+                soonest = min(
+                    max(0.0, w.attempts * self.config.daemon.retry_backoff_s - (now - w.updated_at))
+                    for w in waiting
+                )
+                return TickResult(
+                    discovered=discovered,
+                    idle_reason=f"backoff ({len(waiting)} queued; next eligible in {soonest:.0f}s)",
+                )
             return TickResult(discovered=discovered, idle_reason="no_work")
         source = self._source_for(item)
         if source is None:

@@ -156,8 +156,9 @@ class TestTick:
         assert h.loop.tick().outcome == "retry"
         assert h.dstore.get("inbox:a.md").state == "queued"  # type: ignore[union-attr]
         assert ("retry", 1) in h.source.calls
-        # backoff not elapsed → no dispatch
-        assert h.loop.tick().idle_reason == "no_work"
+        # backoff not elapsed → no dispatch, and the idle reason says so
+        reason = h.loop.tick().idle_reason
+        assert reason is not None and reason.startswith("backoff (1 queued")
         h.clock.t += 11
         assert h.loop.tick().outcome == "abandoned"
         assert h.dstore.get("inbox:a.md").state == "abandoned"  # type: ignore[union-attr]

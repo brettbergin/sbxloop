@@ -186,6 +186,9 @@ class DiscordBridge:
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._loop_up = threading.Event()
+        self._stop_evt: asyncio.Event | None = None
+        # Channel access failures are reported once, not on every flush.
+        self._channel_error_logged = False
         # run_id -> per-run state; only the in-flight run has an unsubscribe
         # (run_id, payload): payload is an Event, None (ensure-thread sentinel),
         # a daemon-event string, or a ("__finished__", ...) tuple.
@@ -198,7 +201,7 @@ class DiscordBridge:
 
     # -- lifecycle ------------------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, *, connect_wait_s: float = 15.0) -> None:
         if not self.token:
             raise DaemonError(
                 f"[discord] is configured but {TOKEN_ENV} is not set; export it (or put it "
@@ -212,34 +215,66 @@ class DiscordBridge:
         # The asyncio loop exists only once the thread runs; callers may
         # schedule work immediately after start(), so wait for it.
         self._loop_up.wait(timeout=10)
+        # Give the gateway a moment to connect so a short-lived process
+        # (--once) can still post; a slow or failed connect never blocks
+        # the daemon — the pump waits for readiness on its own.
+        self._ready.wait(timeout=connect_wait_s)
 
     def close(self) -> None:
-        if self._aloop is not None and self.client is not None:
-            try:
-                fut = asyncio.run_coroutine_threadsafe(self.client.close(), self._aloop)
-                fut.result(timeout=10)
-            except Exception:
-                logger.debug("discord close failed", exc_info=True)
+        """Ask the bridge thread to shut down and wait for it. The client is
+        closed *inside* its own loop (``_amain``) so aiohttp's connector
+        teardown completes before the loop is torn down."""
+        if self._aloop is not None and not self._aloop.is_closed():
+            self._aloop.call_soon_threadsafe(self._stop_event_set)
         if self._thread is not None:
-            self._thread.join(timeout=15)
+            self._thread.join(timeout=20)
+
+    def _stop_event_set(self) -> None:
+        if self._stop_evt is not None:
+            self._stop_evt.set()
 
     def _thread_main(self) -> None:
         self._aloop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._aloop)
+        self._stop_evt = asyncio.Event()
         self._loop_up.set()
         try:
             self._aloop.run_until_complete(self._amain())
         except Exception:
             logger.warning("discord bridge stopped", exc_info=True)
         finally:
+            # Let cancelled tasks (aiohttp connector, gateway) finish
+            # unwinding before the loop goes away — otherwise asyncio logs
+            # "Task was destroyed but it is pending" for each of them.
+            pending = [t for t in asyncio.all_tasks(self._aloop) if not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._aloop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._aloop.run_until_complete(self._aloop.shutdown_asyncgens())
             self._aloop.close()
 
     async def _amain(self) -> None:
+        assert self._stop_evt is not None
         pump = asyncio.ensure_future(self._pump())
+        gateway = asyncio.ensure_future(self.client.start(self.token))
+        stopper = asyncio.ensure_future(self._stop_evt.wait())
         try:
-            await self.client.start(self.token)
+            done, _ = await asyncio.wait({gateway, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if gateway in done and (exc := gateway.exception()) is not None:
+                # Login/gateway failure: the daemon keeps running without
+                # Discord; say why once, at warning level, without a dump.
+                logger.warning("discord bridge could not connect: %s", exc)
         finally:
             pump.cancel()
+            stopper.cancel()
+            try:
+                await self.client.close()
+            except Exception:
+                logger.debug("discord client close failed", exc_info=True)
+            if not gateway.done():
+                gateway.cancel()
+            await asyncio.gather(pump, stopper, gateway, return_exceptions=True)
 
     # -- Frontend protocol (called from daemon threads) --------------------------
 
@@ -481,8 +516,31 @@ class DiscordBridge:
             logger.debug("discord: dropped work scheduled before the loop was up")
 
     async def _channel(self) -> Any:
+        """The control channel, or None when the bot cannot reach it.
+
+        Discord's 404 (wrong id) and 403 (bot not invited / no View Channel)
+        are configuration problems, not transient faults: report the cause
+        once with the fix, then stay quiet — the daemon keeps working and
+        the transcript is not buried under a stack trace per flush.
+        """
         cid = self.discord.channel_id
-        return self.client.get_channel(cid) or await self.client.fetch_channel(cid)
+        channel = self.client.get_channel(cid)
+        if channel is not None:
+            return channel
+        try:
+            return await self.client.fetch_channel(cid)
+        except Exception as exc:
+            if not self._channel_error_logged:
+                self._channel_error_logged = True
+                logger.warning(
+                    "discord: cannot access channel %s (%s) — check [discord] channel_id "
+                    "(right-click the channel → Copy Channel ID) and that the bot is "
+                    "invited to the server with View Channel on it; chronology is off "
+                    "until the daemon restarts",
+                    cid,
+                    exc,
+                )
+            return None
 
     async def _send(self, target: Any, text: str) -> Any:
         try:
@@ -492,10 +550,9 @@ class DiscordBridge:
             return None
 
     async def _send_channel(self, text: str) -> None:
-        try:
-            await self._send(await self._channel(), text)
-        except Exception:
-            logger.warning("discord: control-channel send failed", exc_info=True)
+        channel = await self._channel()
+        if channel is not None:
+            await self._send(channel, text)
 
     async def _react(self, message: Any, emoji: str) -> None:
         try:
@@ -522,6 +579,8 @@ class DiscordBridge:
             return None
         try:
             channel = await self._channel()
+            if channel is None:
+                return None
             headline = await channel.send(headline_text(item, run_id))
             if self.discord.thread_per_run:
                 thread = await headline.create_thread(name=_clip(f"{run_id} · {item.title}", 90))
@@ -541,6 +600,8 @@ class DiscordBridge:
             return
         try:
             channel = await self._channel()
+            if channel is None:
+                return
             msg = await channel.fetch_message(known[2])
             await msg.edit(content=text)
         except Exception:
