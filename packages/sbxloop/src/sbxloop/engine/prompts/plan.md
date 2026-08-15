@@ -68,7 +68,12 @@ for escape sequences becomes literal text under sh, so a grep for an escape
 code never matches), and the executor cannot fix a broken check. Write
 portable shell: `[ ]` not `[[ ]]`, `printf` for escape sequences, pipes
 instead of here-strings, `.` instead of `source`. Bashisms are rejected
-mechanically.
+mechanically. And prefer to verify *behavior* through the project's test
+runner rather than shell pipelines: asserting on bytes, escape sequences,
+exact whitespace, or exit codes is trivial and exact inside a test file
+(`assert "\x1b[31m" in captured.out`) and fragile as a `grep`/`od`
+one-liner — a wrong-but-runnable check burns revisions the executor cannot
+fix. The verify command then is just the test runner.
 
 Ecosystem notes — read only the entry matching this task's toolchain and
 ignore the rest. They are reference points, not a menu of defaults: a task
