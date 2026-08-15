@@ -34,7 +34,7 @@ from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
-from sbxloop.events import Event
+from sbxloop.events import Event, HostEventTypes
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
@@ -317,11 +317,51 @@ def _print_artifacts_summary(result: RunResult, config: Config) -> None:
         console.print(f"  [dim]{scan.excluded_note}[/]")
 
 
+def _print_github_summary(result: RunResult, config: Config) -> None:
+    """What the run did on GitHub, mined from its persisted event stream.
+
+    The run.deliver/run.report lines scroll away with the transcript; the
+    repo, tracking issue, and delivery PR are the outputs the user actually
+    came for, so the finish summary restates them (#67-adjacent: outcomes
+    must be surfaced, never left implicit in scrollback).
+    """
+    created = False
+    repo: str | None = None
+    issue_line: str | None = None
+    deliver_line: str | None = None
+    try:
+        events = list(_store(config).events(result.run_id, type_prefix="run."))
+    except SbxloopError:
+        return
+    for _seq, event in events:
+        data = event.data
+        if event.type == HostEventTypes.RUN_DELIVER:
+            repo = str(data.get("repo") or repo or "")
+            if data.get("created"):
+                created = True
+            elif data.get("error"):
+                deliver_line = f"delivery [bold red]failed[/]: {data['error']}"
+            elif data.get("url"):
+                deliver_line = f"delivered: PR [bold]#{data.get('pr')}[/]  {data['url']}"
+        elif event.type == HostEventTypes.RUN_REPORT:
+            repo = str(data.get("repo") or repo or "")
+            issue_line = f"tracking issue: [bold]#{data.get('issue')}[/]  {data.get('url')}"
+    if not repo:
+        return
+    suffix = " [dim](created this run)[/]" if created else ""
+    console.print(f"\ngithub: [bold]{repo}[/]{suffix}")
+    if issue_line:
+        console.print(f"  {issue_line}")
+    if deliver_line:
+        console.print(f"  {deliver_line}")
+
+
 def _finish(result: RunResult, config: Config) -> None:
     style = "green" if result.succeeded else "red"
     console.print(f"\nrun [bold cyan]{result.run_id}[/] finished: [bold {style}]{result.state}[/]")
     for task in result.tasks:
         console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
+    _print_github_summary(result, config)
     _print_artifacts_summary(result, config)
     if result.kept_sandboxes:
         console.print(f"\n[bold yellow]sandboxes kept:[/] {', '.join(result.kept_sandboxes)}")
@@ -1351,7 +1391,7 @@ deny = []
 exclude = [
   ".git", ".sbxloop",
   ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
-  ".venv", "venv", "__pycache__",           # Python
+  ".venv", "venv", "__pycache__", "*.egg-info",   # Python (globs allowed)
   "node_modules",                            # JavaScript / TypeScript
   "target",                                  # Rust (cargo), Java (Maven)
   ".gradle",                                 # Java (Gradle)

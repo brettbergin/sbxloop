@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 from collections.abc import Sequence
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
@@ -256,13 +257,16 @@ DEFAULT_ARTIFACT_EXCLUDES = (
     # Run/VCS state, any ecosystem.
     ".git",
     ".sbxloop",
-    # Python: virtualenvs, bytecode, tool caches.
+    # Python: virtualenvs, bytecode, tool caches, packaging metadata (the
+    # egg-info directory is named after the project, so only a glob can
+    # catch it).
     ".mypy_cache",
     ".nox",
     ".pytest_cache",
     ".ruff_cache",
     ".tox",
     ".venv",
+    "*.egg-info",
     "__pycache__",
     "venv",
     # JavaScript / TypeScript.
@@ -305,19 +309,42 @@ class ArtifactScan:
 def scan_artifacts(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES) -> ArtifactScan:
     """Regular files under root, sorted for stable output, partitioned into
     kept files and per-entry counts of files whose path contains an excluded
-    component (at any depth, so vendored nested .git dirs are caught too)."""
-    names = frozenset(exclude)
+    component (at any depth, so vendored nested .git dirs are caught too).
+
+    Entries containing a glob metacharacter match components via fnmatch
+    (``*.egg-info`` — dynamically named directories that no exact name can
+    cover); the exclusion tally reports the pattern, not each matched name.
+    """
+    names = frozenset(entry for entry in exclude if not _is_glob(entry))
+    patterns = [entry for entry in exclude if _is_glob(entry)]
     files: list[Path] = []
     excluded: dict[str, int] = {}
     for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
-        hit = next((part for part in p.relative_to(root).parts if part in names), None)
+        hit = next(
+            (
+                match
+                for part in p.relative_to(root).parts
+                if (match := _exclusion_hit(part, names, patterns)) is not None
+            ),
+            None,
+        )
         if hit is None:
             files.append(p)
         else:
             excluded[hit] = excluded.get(hit, 0) + 1
     return ArtifactScan(files=files, excluded=excluded)
+
+
+def _is_glob(entry: str) -> bool:
+    return any(ch in entry for ch in "*?[")
+
+
+def _exclusion_hit(part: str, names: frozenset[str], patterns: Sequence[str]) -> str | None:
+    if part in names:
+        return part
+    return next((pattern for pattern in patterns if fnmatch.fnmatch(part, pattern)), None)
 
 
 def artifact_files(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES) -> list[Path]:

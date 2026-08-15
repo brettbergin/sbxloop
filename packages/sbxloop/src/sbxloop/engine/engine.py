@@ -466,6 +466,16 @@ class LoopEngine:
         hook = GithubReporterHook(GithubOps(github, run_id), gh.repo)
         detach = self.bus.attach_hook(hook)
         hook.open_run(run_id, outcome)
+        if hook.issue is not None:
+            # Persisted so the finish summary (and any later reader of the
+            # event stream) can point at the tracking issue.
+            self.bus.emit(
+                HostEventTypes.RUN_REPORT,
+                run_id,
+                repo=gh.repo,
+                issue=hook.issue.number,
+                url=hook.issue.url,
+            )
         return hook, detach
 
     def _harvest(self, run_id: str, pair: SandboxPair) -> None:
