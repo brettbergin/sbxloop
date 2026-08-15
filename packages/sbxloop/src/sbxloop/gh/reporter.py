@@ -42,7 +42,13 @@ class GithubReporterHook:
             logger.warning("github reporting: opening tracking issue failed", exc_info=True)
 
     def close_run(self, run_id: str, state: str) -> None:
-        """Post the final summary comment; call before sandbox teardown."""
+        """Post the final summary comment; call before sandbox teardown.
+
+        A completed run also closes its issue — the record is finished, and
+        an ever-growing pile of open "sbxloop run ..." issues drowns the
+        signal. A failed (or interrupted-then-abandoned) run leaves its
+        issue open as the thing that still needs a human; resume reuses it.
+        """
         if self.issue is None:
             return
         summary = "\n".join(self._task_lines) or "_no tasks were executed_"
@@ -52,6 +58,12 @@ class GithubReporterHook:
                 self.issue.number,
                 f"Run `{run_id}` finished: **{state}**\n\n{summary}",
             )
+            if state == "completed":
+                self.ops.raw(
+                    "PATCH",
+                    f"/repos/{self.repo}/issues/{self.issue.number}",
+                    {"state": "closed", "state_reason": "completed"},
+                )
         except Exception:
             logger.warning("github reporting: final summary failed", exc_info=True)
 

@@ -128,6 +128,43 @@ class TestArtifactFiles:
         assert scan.excluded == {}
         assert scan.excluded_note is None
 
+    def test_egg_info_glob_excluded_by_default(self, tmp_path: Path) -> None:
+        """pip build metadata is named after the project — every project's
+        differently — so only the *.egg-info glob can catch it."""
+        root = self.make_workspace(tmp_path)
+        egg = root / "src" / "samplepkg.egg-info"
+        egg.mkdir()
+        (egg / "PKG-INFO").write_text("Metadata-Version: 2.1\n")
+        (egg / "SOURCES.txt").write_text("src/main.py\n")
+        scan = scan_artifacts(root)
+        assert all(".egg-info" not in p.as_posix() for p in scan.files)
+        # tallied under the pattern, not each matched directory name
+        assert scan.excluded == {".git": 2, "*.egg-info": 2}
+
+    def test_glob_matches_component_not_substring(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        root.mkdir()
+        # a FILE merely mentioning egg-info in its name is kept: the glob
+        # matches whole path components only when the component matches
+        (root / "notes-about.egg-information.txt").write_text("keep\n")
+        (root / "kept.egg-info.bak").write_text("keep\n")
+        scan = scan_artifacts(root, exclude=["*.egg-info"])
+        assert [p.name for p in scan.files] == [
+            "kept.egg-info.bak",
+            "notes-about.egg-information.txt",
+        ]
+        assert scan.excluded == {}
+
+    def test_custom_glob_entries_work(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        (root / "cache-a").mkdir(parents=True)
+        (root / "cache-a" / "x").write_text("x")
+        (root / "keep").mkdir()
+        (root / "keep" / "y").write_text("y")
+        scan = scan_artifacts(root, exclude=["cache-*"])
+        assert [p.relative_to(root).as_posix() for p in scan.files] == ["keep/y"]
+        assert scan.excluded == {"cache-*": 1}
+
     def test_config_default_mirrors_model_default(self) -> None:
         # config.py keeps a literal copy (importing engine.model there would
         # be circular); this pins the two against drift.

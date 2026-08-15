@@ -127,6 +127,7 @@ class RecordingOps:
         self.created: list[tuple[str, str]] = []
         self.comments: list[tuple[int, str]] = []
         self.searches: list[str] = []
+        self.raw_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.existing_issues = existing_issues or []
 
     def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> IssueRef:
@@ -140,6 +141,10 @@ class RecordingOps:
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         self.searches.append(query)
         return self.existing_issues
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        self.raw_calls.append((method, path, body))
+        return {}
 
 
 class TestGithubReporterHook:
@@ -170,6 +175,17 @@ class TestGithubReporterHook:
         final = ops.comments[2][1]
         assert "finished: **completed**" in final
         assert "`t1` first" in final
+        # a completed run closes its tracking issue
+        assert ops.raw_calls == [
+            ("PATCH", "/repos/o/r/issues/42", {"state": "closed", "state_reason": "completed"})
+        ]
+
+    def test_failed_run_leaves_the_issue_open(self) -> None:
+        hook, ops, _bus = self.make()
+        hook.open_run("r1", "do the thing")
+        hook.close_run("r1", "failed")
+        assert any("finished: **failed**" in body for _n, body in ops.comments)
+        assert ops.raw_calls == []
 
     def test_resume_reuses_existing_tracking_issue(self) -> None:
         hook, ops, _bus = self.make(

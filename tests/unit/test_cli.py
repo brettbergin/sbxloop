@@ -983,6 +983,10 @@ class TestRunCommand:
         assert delivered == ["o/r"]
         assert "run.deliver" in result.output
         assert "pull/8" in result.output
+        # the finish summary restates the GitHub outcome (it must not live
+        # only in scrollback)
+        assert "github: o/r" in result.output
+        assert "delivered: PR #8" in result.output
 
     def test_run_deliver_refused_without_github_config(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -1084,6 +1088,9 @@ class TestRunCommand:
         )
         assert result.exit_code == 0, result.output
         assert seen == {"repo": "o/new", "create": True, "public": True}
+        # creation is restated in the finish summary
+        assert "github: o/new" in result.output
+        assert "created this run" in result.output
 
     def test_run_deliver_base_and_draft_flags_are_forwarded(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

@@ -229,8 +229,10 @@ cat "$(sbxloop artifacts <run> --path)/fib.py"
 Harvest, listings and delivery all skip the same set of path components,
 matched at any depth: run/VCS state (`.git`, `.sbxloop`) plus the
 regenerable dependency and build trees of the supported languages —
-`node_modules`, `__pycache__`, `.venv`/`venv`, the Python tool caches,
-`target` (cargo/Maven), `.gradle`, `obj` (.NET), `.bundle`, `CMakeFiles`.
+`node_modules`, `__pycache__`, `.venv`/`venv`, `*.egg-info`, the Python
+tool caches, `target` (cargo/Maven), `.gradle`, `obj` (.NET), `.bundle`,
+`CMakeFiles`. Entries may use glob patterns, matched against whole path
+components (`*.egg-info` catches pip's project-named metadata directory).
 They are large, reproducible from the manifests that *are* delivered, and
 nobody wants them in a `--deliver` PR diff. The ambiguous generic names —
 `bin`, `build`, `dist`, `out`, `lib`, `vendor` — are **not** excluded, since

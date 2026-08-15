@@ -159,8 +159,9 @@ class ArtifactsConfig(_ConfigModel):
     """What artifact listings and delivery leave out, and how harvesting works.
 
     ``exclude`` entries are single path components matched at any depth;
-    a file is excluded when any component of its path matches. Setting it
-    replaces the default list wholesale rather than adding to it.
+    a file is excluded when any component of its path matches. Entries with
+    glob metacharacters match components via fnmatch (``*.egg-info``).
+    Setting it replaces the default list wholesale rather than adding to it.
 
     The default drops run/VCS state (``.git``, ``.sbxloop``) plus the
     machine-generated dependency and build trees of the supported languages
@@ -203,6 +204,7 @@ class ArtifactsConfig(_ConfigModel):
             ".ruff_cache",
             ".tox",
             ".venv",
+            "*.egg-info",
             "__pycache__",
             "venv",
             "node_modules",
