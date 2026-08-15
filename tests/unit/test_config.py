@@ -106,6 +106,14 @@ def test_env_overrides_everything(tmp_path: Path) -> None:
     assert config.github.enabled
 
 
+def test_workspace_isolation_default_and_validation(tmp_path: Path) -> None:
+    assert load_config(cwd=tmp_path, env={}).sandbox.workspace_isolation == "auto"
+    config = load_config(cwd=tmp_path, env={"SBXLOOP_SANDBOX__WORKSPACE_ISOLATION": "clone"})
+    assert config.sandbox.workspace_isolation == "clone"
+    with pytest.raises(ConfigError):
+        load_config(cwd=tmp_path, env={"SBXLOOP_SANDBOX__WORKSPACE_ISOLATION": "yolo"})
+
+
 def test_sources_tracking(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text('[tool.sbxloop]\nmodel = "gpt-5"\n')
     (tmp_path / "sbxloop.toml").write_text("keep_sandboxes = true\n")

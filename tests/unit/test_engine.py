@@ -633,6 +633,46 @@ class TestResume:
         assert len(drift) == 1
         assert "sandbox.workspace" in drift[0].data["message"]
 
+    def test_run_with_git_workspace_pins_clone(self, harness: Harness) -> None:
+        """An isolated run works in the per-run clone and pins IT, and the
+        source checkout's working tree stays byte-identical."""
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(harness.tmp_path)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(sandbox={"workspace": str(source)})
+        result = engine.start("improve the project")
+
+        assert result.state == "completed"
+        clone_dir = (harness.tmp_path / "state" / "runs" / result.run_id / "workspace").resolve()
+        assert result.workspace == clone_dir
+        assert engine.store.get_run(result.run_id).workspace == clone_dir
+        assert (source / "hello.txt").read_text() == "hi\n"
+        assert not (source / ".git" / "refs" / "heads" / "sbxloop").exists()
+
+    def test_resume_isolated_run_reuses_clone(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(harness.tmp_path)
+        run_id = self._crashed_run(harness, sandbox={"workspace": str(source)})
+        engine = harness.engine()
+        pinned = engine.store.get_run(run_id).workspace
+        assert pinned is not None and pinned.name == "workspace"
+        sentinel = pinned / "agent-work.txt"
+        sentinel.write_text("precious\n")
+
+        harness.script([EXECUTE, PASS, ACCEPT])
+        result = harness.engine().resume(run_id)
+        assert result.state == "completed"
+        assert result.workspace == pinned
+        assert sentinel.read_text() == "precious\n"
+        fresh_clones = [
+            e
+            for e in harness.events
+            if e.type == "sandbox.workspace_clone" and not e.data.get("reused")
+        ]
+        assert len(fresh_clones) == 1  # only the original run cloned
+
     def test_resume_legacy_row_still_pins_workspace_from_run_row(self, harness: Harness) -> None:
         # Rows created before config persistence carry config_json '{}'.
         # Rehydration has nothing to adopt, but the workspace must still

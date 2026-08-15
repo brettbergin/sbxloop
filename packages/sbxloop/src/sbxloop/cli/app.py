@@ -356,6 +356,28 @@ def _print_github_summary(result: RunResult, config: Config) -> None:
         console.print(f"  {deliver_line}")
 
 
+def _print_workspace_clone_summary(result: RunResult, config: Config) -> None:
+    """Where an isolated run's results live, mined from the persisted
+    sandbox.workspace_clone event — the transcript line scrolls away, and
+    "how do I get the changes back into my checkout" is the first question
+    an isolated run raises."""
+    try:
+        events = list(_store(config).events(result.run_id, type_prefix="sandbox.workspace_clone"))
+    except SbxloopError:
+        return
+    if not events:
+        return
+    data = events[-1][1].data
+    source, target, branch = data.get("source"), data.get("target"), data.get("branch")
+    commit = str(data.get("commit") or "")
+    console.print(f"\nworkspace: cloned from [bold]{source}[/] (HEAD {commit[:12]})")
+    if result.mounted:
+        console.print(f"  results are on branch [bold]{branch}[/] in {target}")
+        console.print(f"  fetch into your checkout: [cyan]git fetch {target} {branch}[/]")
+    else:
+        console.print(f"  harvested changes are uncommitted in {target} (branch {branch})")
+
+
 def _finish(result: RunResult, config: Config) -> None:
     style = "green" if result.succeeded else "red"
     console.print(f"\nrun [bold cyan]{result.run_id}[/] finished: [bold {style}]{result.state}[/]")
@@ -363,6 +385,7 @@ def _finish(result: RunResult, config: Config) -> None:
         console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
     _print_github_summary(result, config)
     _print_artifacts_summary(result, config)
+    _print_workspace_clone_summary(result, config)
     if result.kept_sandboxes:
         console.print(f"\n[bold yellow]sandboxes kept:[/] {', '.join(result.kept_sandboxes)}")
         console.print(f"  inspect: [cyan]sbxloop shell {result.run_id}[/] (--role github)")
@@ -1341,6 +1364,16 @@ secret_strategy = "proxy"
 # `sbxloop bake` builds one with the worker preinstalled, cutting the
 # per-run install out of provisioning.
 # template = "sbxloop-baked:latest"
+# Where runs execute. Unset (the default) gives every run a fresh directory
+# under state_dir. Point it at an existing project to work on that code.
+# workspace = "path/to/checkout"
+# When `workspace` is a git checkout: "auto" (default) isolates each run in
+# a per-run clone on branch sbxloop/<run_id> — the checkout and its branches
+# are never touched, and a dirty tree refuses the run (uncommitted changes
+# would silently not travel). "clone" also isolates but runs from committed
+# HEAD even when dirty (and requires a git workspace). "in-place" mutates
+# the workspace directly (the pre-0.6 behavior).
+# workspace_isolation = "auto"
 # Extra network allow rules applied to both sandboxes.
 extra_allow_domains = []
 

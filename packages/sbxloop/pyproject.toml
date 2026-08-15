@@ -24,6 +24,7 @@ dependencies = [
     # (hatch_build.py) adds the exact lockstep pin `sbxloop-worker==X.Y.Z`
     # to the wheel metadata at build time.
     "sbxloop-worker",
+    "gitpython>=3.1.59",
 ]
 
 [project.optional-dependencies]

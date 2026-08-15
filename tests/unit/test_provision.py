@@ -349,6 +349,214 @@ class TestEnsurePair:
             pair.cleanup()
 
 
+def make_isolation_provisioner(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    workspace: Path | None,
+    isolation: str = "auto",
+) -> tuple[Provisioner, list[Event]]:
+    sandbox: dict[str, str] = {"workspace_isolation": isolation}
+    if workspace is not None:
+        sandbox["workspace"] = str(workspace)
+    config = Config.model_validate(
+        {"state_dir": str(tmp_path / "state"), "sandbox": sandbox, **GITHUB_ENABLED}
+    )
+    bus = EventBus()
+    events: list[Event] = []
+    bus.subscribe(events.append)
+    return make_provisioner(fake_sbx, tmp_path, config=config, bus=bus), events
+
+
+def clone_events(events: list[Event]) -> list[Event]:
+    return [e for e in events if e.type == "sandbox.workspace_clone"]
+
+
+class TestWorkspaceIsolation:
+    """Runs against a git-checkout workspace work in a per-run clone; the
+    checkout's working tree and branches are never disturbed."""
+
+    def test_auto_clones_git_workspace(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        clone_dir = (tmp_path / "state" / "runs" / "r1" / "workspace").resolve()
+
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.workspace == clone_dir
+            assert (clone_dir / ".git").is_dir()
+            assert (clone_dir / "hello.txt").read_text() == "hi\n"
+            head = (clone_dir / ".git" / "HEAD").read_text().strip()
+            assert head.endswith("refs/heads/sbxloop/r1")
+            assert fake_sbx.meta(pair.agent.name)["workspace"] == str(clone_dir)
+            # the source checkout is untouched
+            assert not (source / ".git" / "refs" / "heads" / "sbxloop").exists()
+            (event,) = clone_events(events)
+            assert event.data["source"] == str(source.resolve())
+            assert event.data["target"] == str(clone_dir)
+            assert event.data["branch"] == "sbxloop/r1"
+            assert event.data["dirty"] is False
+            assert event.data["reused"] is False
+            assert len(str(event.data["commit"])) == 40
+        finally:
+            pair.cleanup()
+
+    def test_auto_dirty_refuses_before_provisioning(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        (source / "uncommitted.txt").write_text("x\n")
+        provisioner, _events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+
+        with pytest.raises(ProvisionError, match="Commit or stash"):
+            provisioner.ensure_pair("r1")
+        assert fake_sbx.invocations("create") == []
+        assert not (tmp_path / "state" / "runs" / "r1" / "workspace").exists()
+
+    def test_auto_non_git_workspace_stays_in_place(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        source = tmp_path / "plain-ws"
+        source.mkdir()
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.workspace == source.resolve()
+            assert clone_events(events) == []
+        finally:
+            pair.cleanup()
+
+    def test_auto_default_workspace_unchanged(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, None)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.workspace == (tmp_path / "state" / "runs" / "r1" / "workspace").resolve()
+            assert clone_events(events) == []
+        finally:
+            pair.cleanup()
+
+    def test_auto_subdir_of_checkout_refuses(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        sub = source / "sub"
+        sub.mkdir()
+        provisioner, _events = make_isolation_provisioner(fake_sbx, tmp_path, sub)
+        with pytest.raises(ProvisionError, match="not its root"):
+            provisioner.ensure_pair("r1")
+
+    def test_auto_unborn_head_refuses(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        import subprocess
+
+        source = tmp_path / "empty-repo"
+        source.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=source, check=True, capture_output=True)
+        provisioner, _events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        with pytest.raises(ProvisionError, match="no commits"):
+            provisioner.ensure_pair("r1")
+
+    def test_in_place_never_touches_git(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        (source / "uncommitted.txt").write_text("x\n")  # dirty is fine in-place
+        provisioner, events = make_isolation_provisioner(
+            fake_sbx, tmp_path, source, isolation="in-place"
+        )
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.workspace == source.resolve()
+            assert clone_events(events) == []
+        finally:
+            pair.cleanup()
+
+    def test_clone_mode_dirty_proceeds_from_head(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        (source / "uncommitted.txt").write_text("x\n")
+        provisioner, events = make_isolation_provisioner(
+            fake_sbx, tmp_path, source, isolation="clone"
+        )
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert not (pair.workspace / "uncommitted.txt").exists()
+            (event,) = clone_events(events)
+            assert event.data["dirty"] is True
+            assert "NOT in the run workspace" in event.data["message"]
+        finally:
+            pair.cleanup()
+
+    def test_clone_mode_non_git_errors(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        source = tmp_path / "plain"
+        source.mkdir()
+        provisioner, _events = make_isolation_provisioner(
+            fake_sbx, tmp_path, source, isolation="clone"
+        )
+        with pytest.raises(ProvisionError, match="not a git repository"):
+            provisioner.ensure_pair("r1")
+
+    def test_clone_mode_without_workspace_errors(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner, _events = make_isolation_provisioner(
+            fake_sbx, tmp_path, None, isolation="clone"
+        )
+        with pytest.raises(ProvisionError, match="requires \\[sandbox\\] workspace"):
+            provisioner.ensure_pair("r1")
+
+    def test_existing_clone_reused_not_recloned(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        """Crash-before-pin resume re-enters isolation with no workspace arg;
+        the run's existing clone (and any agent work in it) must survive."""
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        pair = provisioner.ensure_pair("r1")
+        pair.cleanup()
+        sentinel = pair.workspace / "agent-work.txt"
+        sentinel.write_text("precious\n")
+
+        pair2 = provisioner.ensure_pair("r1")
+        try:
+            assert pair2.workspace == pair.workspace
+            assert sentinel.read_text() == "precious\n"
+            first, second = clone_events(events)
+            assert first.data["reused"] is False
+            assert second.data["reused"] is True
+        finally:
+            pair2.cleanup()
+
+    def test_workspace_arg_bypasses_isolation(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        """The explicit arg is the resume pin: it must be used in place even
+        when it is a git checkout and isolation is on."""
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, None)
+        pair = provisioner.ensure_pair("r1", workspace=source)
+        try:
+            assert pair.workspace == source.resolve()
+            assert clone_events(events) == []
+        finally:
+            pair.cleanup()
+
+    def test_auto_without_git_binary_falls_back_in_place(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.hostgit as hostgit_mod
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        monkeypatch.setattr(hostgit_mod, "find_git", lambda: None)
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.workspace == source.resolve()
+            assert clone_events(events) == []
+        finally:
+            pair.cleanup()
+
+
 class TestSecretIdempotency:
     def secret_state(self, fake_sbx: FakeSbx) -> dict[str, dict[str, str]]:
         import json
