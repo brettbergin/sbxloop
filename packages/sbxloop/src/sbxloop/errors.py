@@ -83,3 +83,8 @@ class BudgetExceededError(SbxloopError):
 
 class StateError(SbxloopError):
     """Invalid state transition or corrupted persisted state."""
+
+
+class DaemonError(SbxloopError):
+    """The daemon could not start or continue (misconfiguration, no work
+    sources, an unrecoverable ops sandbox)."""
