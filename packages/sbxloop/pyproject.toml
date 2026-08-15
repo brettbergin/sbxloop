@@ -31,6 +31,9 @@ dependencies = [
 # Host-side SDK access for `sbxloop list-models` (agent sessions get the SDK
 # inside the sandbox via sbxloop-worker[copilot]; runs never need this extra).
 copilot = ["github-copilot-sdk>=1.0.8"]
+# `sbxloop daemon`'s Discord bridge (chronology + steering); the daemon runs
+# without it when [discord] is unset.
+discord = ["discord.py>=2.3"]
 
 [project.scripts]
 sbxloop = "sbxloop.cli.app:main"
