@@ -356,10 +356,19 @@ class TestEmptyRepoBootstrap:
                 super().__init__()
                 self.bootstrapped = False
 
+            # The exact worker-shaped error real GitHub produces for an
+            # empty repo — field-verified on run rgwp5z40x (it is a 409,
+            # NOT a 404; the stub used 404 and the field disagreed).
+            error = (
+                "github op raw.api failed: GithubOpError: gh api GET "
+                "/repos/o/r/git/ref/heads/main failed (rc=1): gh: Git "
+                "Repository is empty. (HTTP 409)"
+            )
+
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
                     self.raw_calls.append((method, path, body))
-                    raise GithubOpsError("GET ref -> HTTP 404: Not Found")
+                    raise GithubOpsError(self.error)
                 if method == "PUT" and path.endswith("/contents/README.md"):
                     self.raw_calls.append((method, path, body))
                     self.bootstrapped = True
@@ -381,11 +390,53 @@ class TestEmptyRepoBootstrap:
         # the bootstrap README round-trips as valid base64
         base64.b64decode(puts[0][2]["content"])
 
+    def test_404_missing_ref_also_bootstraps(self, tmp_path: Path) -> None:
+        """An explicit `base` naming a branch that does not exist yet gets
+        the 404 shape; it means the same thing (no base to build on)."""
+
+        class MissingRefOps(StubOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.bootstrapped = False
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
+                    raise GithubOpsError("GET ref -> HTTP 404: Not Found")
+                if method == "PUT" and path.endswith("/contents/README.md"):
+                    self.bootstrapped = True
+                    return {"content": {"path": "README.md"}}
+                return super().raw(method, path, body)
+
+        pr = deliver_workspace(
+            MissingRefOps(),  # type: ignore[arg-type]
+            "o/r",
+            run_id="r9",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr.number == 7
+
+    def test_unrelated_ref_errors_still_raise(self, tmp_path: Path) -> None:
+        class ForbiddenRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/git/ref/heads/" in path:
+                    raise GithubOpsError("GET ref -> HTTP 403: rate limited")
+                return super().raw(method, path, body)
+
+        with pytest.raises(GithubOpsError, match="403"):
+            deliver_workspace(
+                ForbiddenRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r9",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+
     def test_missing_base_ref_error_still_loud_when_bootstrap_fails(self, tmp_path: Path) -> None:
         class BrokenOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "GET" and "/git/ref/heads/" in path:
-                    raise GithubOpsError("GET ref -> HTTP 404: Not Found")
+                    raise GithubOpsError("gh: Git Repository is empty. (HTTP 409)")
                 if method == "PUT" and path.endswith("/contents/README.md"):
                     raise GithubOpsError("PUT contents -> HTTP 403: token lacks contents:write")
                 return super().raw(method, path, body)

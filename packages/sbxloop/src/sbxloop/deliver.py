@@ -56,6 +56,18 @@ def _is_missing(exc: GithubOpsError) -> bool:
     return "HTTP 404" in str(exc)
 
 
+def _is_empty_repo(exc: GithubOpsError) -> bool:
+    """Whether a ref lookup failed because the repository has no commits.
+
+    Field-verified (run rgwp5z40x): real GitHub answers
+    ``GET /repos/.../git/ref/heads/<base>`` on an empty repository with
+    **HTTP 409 "Git Repository is empty."** — not the 404 a missing ref on
+    a non-empty repository gets. Both mean "no base to build on".
+    """
+    text = str(exc)
+    return "HTTP 409" in text and "empty" in text.lower()
+
+
 def ensure_repository(
     ops: GithubOps, repo: str, *, create: bool = False, public: bool = False
 ) -> bool:
@@ -114,8 +126,11 @@ def deliver_workspace(
     except GithubOpsError as exc:
         # An existing-but-empty repository has a default branch name and no
         # ref behind it; bootstrap an initial commit so the normal PR path
-        # (branch off base, open a PR against it) applies unchanged.
-        if not _is_missing(exc):
+        # (branch off base, open a PR against it) applies unchanged. GitHub
+        # reports the empty-repo case as HTTP 409, and a missing ref on a
+        # non-empty repo (unusual explicit `base`) as HTTP 404 — both mean
+        # "no base to build on".
+        if not (_is_missing(exc) or _is_empty_repo(exc)):
             raise
         _bootstrap_empty_repo(ops, repo, base, run_id=run_id, outcome=outcome)
         base_sha = _base_commit_sha(ops, repo, base)
