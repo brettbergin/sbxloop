@@ -409,6 +409,60 @@ class Provisioner:
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
 
+    def github_only_spec(self, name: str, workspace: Path) -> SandboxSpec:
+        """A github-role spec that is not tied to a run — the daemon's
+        long-lived polling/ops sandbox. Mirrors the pair's github spec."""
+        return SandboxSpec(
+            name=name,
+            role="github",
+            workspace=workspace,
+            template=self.config.sandbox.template,
+            policy_allows=[*GITHUB_ALLOW_DOMAINS, *self.config.sandbox.extra_allow_domains],
+            secrets=[SecretSpec(kind="service", service="github")],
+        )
+
+    def ensure_github_only(self, name: str, workspace: Path) -> Sandbox:
+        """Provision one github-role sandbox (GH_TOKEN only) outside any run.
+
+        The daemon polls issues and drives label/comment lifecycle from
+        here, keeping the credential split intact: the host still never
+        holds the PAT. Same fail-fast/rollback discipline as the pair —
+        token check before any microVM, sandbox + registered secrets
+        removed on failure.
+        """
+        token = self.gh_token()
+        spec = self.github_only_spec(name, workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        label = f"daemon:{name}"
+        created: Sandbox | None = None
+        registered_secret_rms: list[Callable[[], bool]] = []
+        try:
+            self.bus.emit("sandbox.provision_start", label, name=spec.name, role=spec.role)
+            self.cli.create(spec)
+            created = Sandbox(self.cli, spec.name)
+            self._apply_policy(spec)
+            registered_secret_rms.extend(self._apply_secrets(spec, created, token))
+            self._verify_secret_env(label, spec, created, token)
+            created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
+            if self.post_create is not None:
+                self.post_create(created, spec.role)
+            self.bus.emit("sandbox.ready", label, name=spec.name, role=spec.role)
+            return created
+        except Exception as exc:
+            if created is not None:
+                try:
+                    created.rm()
+                except SbxError:
+                    logger.warning("rollback: failed to remove %s", created.name, exc_info=True)
+            for rm in registered_secret_rms:
+                try:
+                    rm()
+                except SbxError:
+                    logger.warning("rollback: failed to remove a registered secret", exc_info=True)
+            if isinstance(exc, ProvisionError):
+                raise
+            raise ProvisionError(f"provisioning {name} failed: {exc}") from exc
+
     def _apply_policy(self, spec: SandboxSpec) -> None:
         self.cli.policy_allow(*spec.policy_allows, sandbox=spec.name)
 
