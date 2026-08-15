@@ -62,6 +62,14 @@ dependency prefixes described in the notes below are enforced mechanically,
 so a verify command that invokes an interpreter or test runner bare where
 its ecosystem requires a project-local prefix is rejected outright.
 
+Verify commands run under POSIX `sh -c`, **not bash**. Bash-only syntax does
+not error there — it silently means something else (bash's ANSI-C quoting
+for escape sequences becomes literal text under sh, so a grep for an escape
+code never matches), and the executor cannot fix a broken check. Write
+portable shell: `[ ]` not `[[ ]]`, `printf` for escape sequences, pipes
+instead of here-strings, `.` instead of `source`. Bashisms are rejected
+mechanically.
+
 Ecosystem notes — read only the entry matching this task's toolchain and
 ignore the rest. They are reference points, not a menu of defaults: a task
 in an ecosystem not listed here follows that ecosystem's own conventions,

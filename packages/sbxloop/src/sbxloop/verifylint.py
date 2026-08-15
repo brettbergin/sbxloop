@@ -81,6 +81,44 @@ MUTATING_COMMANDS = frozenset({"sudo", "apt", "apt-get", "dnf", "yum", "apk"})
 _SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\||\$\(|`|\n")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+# Verify commands run under `sh -c` (POSIX sh, dash on Debian), NOT bash.
+# Bash-only syntax does not error there — it silently means something else:
+# `grep -q $'\033[31m'` searches for the literal text "$\033[31m" and never
+# matches. Field failure re59gj4vq: correct code, unrunnable check, revisions
+# burned in a verify→execute→scrutinize-pass→verify loop the executor cannot
+# escape because it may not edit the command. Each entry: (regex, what it is,
+# the portable rewrite).
+_BASHISMS: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (
+        re.compile(r"\$'"),
+        "ANSI-C quoting `$'...'`",
+        "use `printf` for escapes, e.g. `printf '\\033[31m'` or "
+        "`grep -q \"$(printf '\\033')\\[31m\"`",
+    ),
+    (re.compile(r"\[\["), "`[[ ... ]]`", "use POSIX `[ ... ]` / `test`"),
+    (re.compile(r"<<<"), "here-string `<<<`", "pipe with `printf '%s' ... |` instead"),
+    (
+        re.compile(r"\bdeclare\b|\blocal\b|\bsource\b"),
+        "`declare`/`local`/`source`",
+        "POSIX: plain assignment and `.`",
+    ),
+    (
+        re.compile(r"\bpushd\b|\bpopd\b"),
+        "`pushd`/`popd`",
+        "use `cd` in a subshell: `(cd dir && ...)`",
+    ),
+)
+
+
+def bashisms(command: str) -> list[str]:
+    """Portable-shell violations in one verify command (empty = clean)."""
+    return [
+        f"uses {what} — verify commands run under POSIX `sh -c`, where this is not "
+        f"bash syntax and silently means something else; {rewrite}"
+        for pattern, what, rewrite in _BASHISMS
+        if pattern.search(command)
+    ]
+
 
 def command_heads(command: str) -> list[str]:
     """The command-position words of a shell command line.
@@ -115,6 +153,8 @@ def lint_verify_commands(commands: Sequence[str], languages: Sequence[str]) -> l
     rules = [LANGUAGE_RULES[lang] for lang in languages if lang in LANGUAGE_RULES]
     problems: list[str] = []
     for command in commands:
+        for problem in bashisms(command):
+            problems.append(f"verify command `{command}` {problem}")
         for head in command_heads(command):
             if head in MUTATING_COMMANDS:
                 problems.append(
