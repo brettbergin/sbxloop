@@ -187,6 +187,7 @@ class DiscordBridge:
         self._ready = threading.Event()
         self._loop_up = threading.Event()
         self._stop_evt: asyncio.Event | None = None
+        self._gateway_ready = threading.Event()
         # Channel access failures are reported once, not on every flush.
         self._channel_error_logged = False
         # run_id -> per-run state; only the in-flight run has an unsubscribe
@@ -503,10 +504,21 @@ class DiscordBridge:
     # -- discord primitives -----------------------------------------------------------
 
     async def _wait_ready(self) -> None:
-        wait = getattr(self.client, "wait_until_ready", None)
-        if wait is not None:
-            await wait()
+        """Block the pump until the gateway is up.
+
+        Not ``client.wait_until_ready()``: discord.py creates the event that
+        waits on *inside* ``client.start()`` → ``login()``, so a coroutine
+        that awaits it before the client has started can park forever
+        (field failure: bridge connected, pump never posted). ``on_ready``
+        sets our own event; the fake client in tests does the same.
+        """
+        while not self._gateway_ready.is_set():
+            await asyncio.sleep(0.1)
         self._ready.set()
+
+    def mark_ready(self) -> None:
+        """Called from the client's on_ready handler (any thread)."""
+        self._gateway_ready.set()
 
     def _schedule(self, coro: Any) -> None:
         if self._aloop is not None:
@@ -621,6 +633,7 @@ class DiscordBridge:
 
         async def on_ready() -> None:
             logger.info("discord bridge connected as %s", client.user)
+            bridge.mark_ready()
 
         async def on_message(message: Any) -> None:
             bridge._handle_message(message)

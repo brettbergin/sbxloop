@@ -139,9 +139,15 @@ class FakeChannel:
 
 
 class FakeClient:
+    """Mirrors the real client's readiness contract: ready is signalled from
+    within start() (like on_ready), never before — so a pump that waits on
+    the wrong thing parks forever here too (regression for the field bug
+    where wait_until_ready() was awaited before client.start())."""
+
     def __init__(self, control_id: int = 42) -> None:
         self.channels: dict[int, FakeChannel] = {control_id: FakeChannel(self, control_id)}
         self.closed = False
+        self.bridge: DiscordBridge | None = None
 
     def get_channel(self, cid: int) -> FakeChannel | None:
         return self.channels.get(cid)
@@ -149,10 +155,9 @@ class FakeClient:
     async def fetch_channel(self, cid: int) -> FakeChannel:
         return self.channels[cid]
 
-    async def wait_until_ready(self) -> None:
-        return None
-
     async def start(self, token: str) -> None:
+        if self.bridge is not None:
+            self.bridge.mark_ready()
         while not self.closed:
             await asyncio.sleep(0.05)
 
@@ -206,9 +211,12 @@ def make_bridge(
     dstore = DaemonStore(config.state_dir / "state.db")
     client = FakeClient(channel_id)
     floop = FakeLoop(dstore)
-    bridge = DiscordBridge(
-        config, dstore, loop_ref=floop, client_factory=lambda b: client, token="tok"
-    )
+
+    def factory(b: DiscordBridge) -> FakeClient:
+        client.bridge = b
+        return client
+
+    bridge = DiscordBridge(config, dstore, loop_ref=floop, client_factory=factory, token="tok")
     return bridge, client, floop
 
 
