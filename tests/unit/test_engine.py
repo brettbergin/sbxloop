@@ -809,6 +809,45 @@ class TestPlanEgress:
             harness.engine().start("insists on the saas api")
 
 
+class TestVerifyCommandLint:
+    """Bare-interpreter verify commands are rejected at JSON acceptance —
+    one retry with the rule quoted, never a revision cycle plus an in-VM
+    apt workaround (field failure r12ygfd7t)."""
+
+    def test_decomposer_bare_python_rejected_then_retried(self, harness: Harness) -> None:
+        bad_graph = taskgraph(task("t1", verify=["python -m pytest test_app.py -q"]))
+        good_graph = taskgraph(task("t1", verify=["true"]))
+        harness.script([bad_graph, good_graph, *HAPPY_TASK])
+        result = harness.engine().start("add a flag")
+        assert result.state == "completed"
+
+    def test_decomposer_bare_python_twice_fails(self, harness: Harness) -> None:
+        bad_graph = taskgraph(task("t1", verify=["python app.py"]))
+        harness.script([bad_graph, bad_graph])
+        with pytest.raises(WorkerError, match="invalid output twice"):
+            harness.engine().start("insists on bare python")
+
+    def test_planner_sudo_rejected_then_retried(self, harness: Harness) -> None:
+        bad_plan = {
+            "json": {
+                "steps": ["do"],
+                "expected_artifacts": [],
+                "verify_commands": ["sudo apt-get install -y jq && test -f out.json"],
+            }
+        }
+        harness.script([taskgraph(task("t1")), bad_plan, PLAN, EXECUTE, PASS, ACCEPT])
+        result = harness.engine().start("no sudo in verify")
+        assert result.state == "completed"
+
+    def test_compliant_commands_accepted_first_try(self, harness: Harness) -> None:
+        # `test -d` trips no rules; the graph is accepted with no retry
+        # (the script would run dry if a retry were consumed).
+        graph = taskgraph(task("t1", verify=["test -d ."]))
+        harness.script([graph, *HAPPY_TASK])
+        result = harness.engine().start("clean commands")
+        assert result.state == "completed"
+
+
 class TestKeepOnFailure:
     def test_failed_run_keeps_pair_and_marks_db(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), PLAN, EXECUTE, REVISE])

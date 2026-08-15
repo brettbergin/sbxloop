@@ -56,6 +56,12 @@ as start → probe → kill in one line, e.g.
 `<start the server> & sleep 2; if curl -fsS localhost:5000; then <kill the server>; else <kill the server>; exit 1; fi` — and keep acceptance
 criteria consistent with commands that boot their own quarry.
 
+Verify commands must never modify the environment — no `sudo`, no `apt`:
+anything that needs installing is an execution step. The per-ecosystem
+dependency prefixes described in the notes below are enforced mechanically,
+so a verify command that invokes an interpreter or test runner bare where
+its ecosystem requires a project-local prefix is rejected outright.
+
 Ecosystem notes — read only the entry matching this task's toolchain and
 ignore the rest. They are reference points, not a menu of defaults: a task
 in an ecosystem not listed here follows that ecosystem's own conventions,
