@@ -21,6 +21,16 @@ $outcome
   down before exiting — and acceptance criteria must not contradict them
   (criteria demanding a server be stopped are incompatible with a verify
   command that curls it and expects it alive).
+- Verify commands must follow the sandbox's toolchain conventions — these
+  are enforced mechanically and violations are rejected. Python: use the
+  project virtualenv's paths (`.venv/bin/python`, `.venv/bin/pytest`),
+  never bare `python`/`pip`/`pytest` — the system Python is externally
+  managed with no project dependencies, and unversioned `python` does not
+  exist. Ruby: `bundle exec rspec`, never bare `rspec`/`rake`. PHP:
+  `./vendor/bin/phpunit`, never bare `phpunit`. Go/Rust/.NET/Node commands
+  are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
+  Never `sudo` or `apt` in a verify command: verification checks the work,
+  it does not build the environment.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
 

@@ -29,6 +29,7 @@ from sbxloop.engine.model import Issue, PlanModel, SteerVerdict, TaskGraph, Task
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
+from sbxloop.verifylint import lint_verify_commands
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
@@ -243,8 +244,29 @@ class PhaseRunner:
                 "outcome": self.outcome,
                 "max_tasks": str(self.config.budgets.max_tasks),
             },
+            check=self._check_taskgraph_verify_commands,
         )
         return graph
+
+    def _check_taskgraph_verify_commands(self, graph: TaskGraph) -> None:
+        """Reject task verify commands that violate toolchain conventions.
+
+        The executor cannot edit verify commands, so a bare `python -m
+        pytest` from the decomposer costs a revision cycle plus an in-VM
+        workaround at verify time (field failure r12ygfd7t); rejecting at
+        JSON acceptance costs one retry with the rule quoted.
+        """
+        languages = self.config.sandbox.effective_languages
+        problems = [
+            f"- task {task.id}: {message}"
+            for task in graph.tasks
+            for message in lint_verify_commands(task.verify_commands, languages)
+        ]
+        if problems:
+            raise ValueError(
+                "verify commands violate the sandbox's toolchain conventions:\n"
+                + "\n".join(problems)
+            )
 
     def plan(self, task: TaskRecord) -> PlanModel:
         plan, _ = self._agent_json(
@@ -259,9 +281,21 @@ class PhaseRunner:
                 "feedback": task.last_feedback or "(none — first attempt)",
                 "user_guidance": self._guidance(),
             },
-            check=self._check_plan_egress,
+            check=self._check_plan,
         )
         return plan
+
+    def _check_plan(self, plan: PlanModel) -> None:
+        """Semantic plan validation: egress bounds + verify-command lint."""
+        self._check_plan_egress(plan)
+        problems = lint_verify_commands(
+            plan.verify_commands, self.config.sandbox.effective_languages
+        )
+        if problems:
+            raise ValueError(
+                "verify commands violate the sandbox's toolchain conventions:\n"
+                + "\n".join(f"- {message}" for message in problems)
+            )
 
     def _check_plan_egress(self, plan: PlanModel) -> None:
         """Reject plans declaring egress outside the operator's bounds.
