@@ -58,11 +58,6 @@ CREATE TABLE IF NOT EXISTS daemon_discord_threads (
 );
 """
 
-_ITEM_COLUMNS = (
-    "item_id, source, source_key, title, body, url, state, attempts, claimed, "
-    "run_id, last_error, created_at, updated_at"
-)
-
 
 def _row_to_item(row: sqlite3.Row) -> WorkItem:
     return WorkItem(
@@ -123,7 +118,8 @@ class DaemonStore:
                     "DELETE FROM daemon_work_items WHERE item_id = ?", (row["item_id"],)
                 )
             self._conn.execute(
-                f"INSERT INTO daemon_work_items ({_ITEM_COLUMNS}) "
+                "INSERT INTO daemon_work_items (item_id, source, source_key, title, body, "
+                "url, state, attempts, claimed, run_id, last_error, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?)",
                 (
                     item.item_id,
@@ -141,7 +137,7 @@ class DaemonStore:
 
     def get(self, item_id: str) -> WorkItem | None:
         row = self._conn.execute(
-            f"SELECT {_ITEM_COLUMNS} FROM daemon_work_items WHERE item_id = ?", (item_id,)
+            "SELECT * FROM daemon_work_items WHERE item_id = ?", (item_id,)
         ).fetchone()
         return _row_to_item(row) if row else None
 
@@ -149,8 +145,7 @@ class DaemonStore:
         """Oldest queued item whose retry backoff (attempts * backoff) has
         elapsed since its last update."""
         for row in self._conn.execute(
-            f"SELECT {_ITEM_COLUMNS} FROM daemon_work_items "
-            "WHERE state = 'queued' ORDER BY created_at ASC"
+            "SELECT * FROM daemon_work_items WHERE state = 'queued' ORDER BY created_at ASC"
         ):
             item = _row_to_item(row)
             if item.attempts == 0 or now - item.updated_at >= item.attempts * backoff_s:
@@ -161,17 +156,14 @@ class DaemonStore:
         return [
             _row_to_item(row)
             for row in self._conn.execute(
-                f"SELECT {_ITEM_COLUMNS} FROM daemon_work_items "
-                "WHERE state = 'queued' ORDER BY created_at ASC"
+                "SELECT * FROM daemon_work_items WHERE state = 'queued' ORDER BY created_at ASC"
             )
         ]
 
     def running_items(self) -> list[WorkItem]:
         return [
             _row_to_item(row)
-            for row in self._conn.execute(
-                f"SELECT {_ITEM_COLUMNS} FROM daemon_work_items WHERE state = 'running'"
-            )
+            for row in self._conn.execute("SELECT * FROM daemon_work_items WHERE state = 'running'")
         ]
 
     def mark_claimed(self, item_id: str, now: float) -> None:
@@ -209,10 +201,13 @@ class DaemonStore:
         self._update(item_id, now, state="queued", run_id=None)
 
     def _update(self, item_id: str, now: float, **fields: object) -> None:
+        # Column names come from this module's own keyword calls, never from
+        # input; every value is a bound parameter.
         assignments = ", ".join(f"{name} = ?" for name in fields)
         with self._lock:
             self._conn.execute(
-                f"UPDATE daemon_work_items SET {assignments}, updated_at = ? WHERE item_id = ?",
+                f"UPDATE daemon_work_items SET {assignments}, updated_at = ? "  # nosec B608
+                "WHERE item_id = ?",
                 (*fields.values(), now, item_id),
             )
             self._conn.commit()

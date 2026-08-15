@@ -1,0 +1,26 @@
+[Unit]
+Description=sbxloop daemon — autonomous outer loop over labeled issues and inbox files
+Documentation=https://github.com/brettbergin/sbxloop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The project directory: sbxloop.toml, .env (COPILOT_GITHUB_TOKEN, GH_TOKEN,
+# DISCORD_BOT_TOKEN), and the .sbxloop/ state dir live here. Tokens are
+# loaded from .env by sbxloop itself, so no EnvironmentFile is needed.
+WorkingDirectory=%h/sbxloop-runner
+ExecStart=%h/.local/bin/sbxloop daemon
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+# Must exceed [daemon].shutdown_grace_s (default 60) plus sandbox teardown.
+# An interrupted run is resumable by design; the daemon recovers it on the
+# next start, so a long stop wait buys nothing.
+TimeoutStopSec=120
+KillMode=mixed
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

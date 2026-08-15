@@ -44,7 +44,7 @@ from sbxloop.events import Event, EventBus, HostEventTypes
 
 logger = logging.getLogger(__name__)
 
-TOKEN_ENV = "DISCORD_BOT_TOKEN"
+TOKEN_ENV = "DISCORD_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 INSTALL_HINT = (
     "discord.py is not installed on this host — install it with "
     "`pip install 'sbxloop[discord]'` to enable the daemon's Discord bridge"
