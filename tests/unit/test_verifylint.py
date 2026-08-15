@@ -49,6 +49,18 @@ class TestPythonRules:
         problems = lint_verify_commands(["cd app && python -m pytest"], ["python"])
         assert len(problems) == 1
 
+    def test_venv_bootstrap_feedback_says_move_setup_to_steps(self) -> None:
+        """`python3 -m venv .venv && .venv/bin/pytest` has no compliant
+        rewrite that keeps the setup half — the feedback must say the fix
+        is moving setup into execution steps, or the model retries with
+        the same shape and the run dies (field failure rhf9svssb)."""
+        (problem,) = lint_verify_commands(
+            ["python3 -m venv .venv && .venv/bin/pip install -q pytest && .venv/bin/pytest -q"],
+            ["python"],
+        )
+        assert "execution steps" in problem
+        assert ".venv/bin/pytest -q` alone" in problem
+
     def test_python_rules_inactive_for_other_languages(self) -> None:
         # a Go-only run may legitimately mention python in, say, a grep
         assert lint_verify_commands(["python tool.py"], ["go"]) == []

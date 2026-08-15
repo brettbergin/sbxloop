@@ -268,7 +268,14 @@ class Provisioner:
                 f"workspace {source} is a git repository with no commits; commit "
                 "something first, or set workspace_isolation = 'in-place'"
             )
-        dirty = hostgit.is_dirty(source)
+        # The tool's own state directory is run state, not user content:
+        # any sbxloop command run from inside the checkout drops a relative
+        # ".sbxloop" there, and that must not trip the isolation refusal.
+        # Both the configured state-dir name and the default are ignored —
+        # a different invocation with default config may have dropped the
+        # default name even when this run's state_dir points elsewhere.
+        ignore = {self.config.state_dir.name, ".sbxloop"}
+        dirty = hostgit.is_dirty(source, ignore=sorted(ignore))
         if dirty and mode == "auto":
             raise ProvisionError(
                 f"workspace {source} has uncommitted changes; sbxloop isolates "
