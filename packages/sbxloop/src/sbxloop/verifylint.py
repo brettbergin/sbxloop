@@ -47,8 +47,12 @@ LANGUAGE_RULES: dict[str, LanguageRule] = {
         remedy=(
             "use the project virtualenv's paths (.venv/bin/python, "
             ".venv/bin/pip, .venv/bin/pytest): the sandbox's system Python "
-            "is externally managed (PEP 668) and has no project dependencies "
-            "— and `python` (unversioned) does not exist on Debian at all"
+            "is externally managed (PEP 668) and has no project dependencies, "
+            "and `python` (unversioned) does not exist on Debian at all. If "
+            "this command was creating the venv or installing packages, move "
+            "that into the plan's execution steps — verify commands run after "
+            "execution and may assume the environment the steps built, so "
+            "`.venv/bin/pytest -q` alone is the right shape"
         ),
     ),
     "ruby": LanguageRule(

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
@@ -55,15 +56,21 @@ def head_commit(repo_path: Path) -> str | None:
         return None
 
 
-def is_dirty(repo_path: Path) -> bool:
+def is_dirty(repo_path: Path, *, ignore: Sequence[str] = ()) -> bool:
     """Whether the checkout has uncommitted changes.
 
     Untracked files count: a clone takes committed HEAD, so anything this
-    reports would silently not travel into the run workspace.
+    reports would silently not travel into the run workspace. ``ignore``
+    names top-level entries excluded from the check — sbxloop's own state
+    directory must never trip the isolation refusal (running any sbxloop
+    command from inside a checkout drops a relative ``.sbxloop`` there,
+    which is run state, not user content — field failure r5a1d9m9c).
     """
     try:
         with Repo(repo_path) as repo:
-            return repo.is_dirty(untracked_files=True)
+            pathspecs = [f":!{name}" for name in ignore]
+            output = repo.git.status("--porcelain", "--", *pathspecs)
+            return bool(output.strip())
     except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError) as exc:
         raise ProvisionError(f"git status failed in {repo_path}: {exc}") from exc
 
