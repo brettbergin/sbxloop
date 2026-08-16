@@ -21,6 +21,7 @@ Variables: $outcome, $task_id, $task_title, $task_description,
 $acceptance_criteria, $verify_results; $retry_context (defaulted by
 render()).
 -->
+
 # Validate a task against its acceptance criteria (read-only)
 
 You are the final acceptance gate in an automated engineering loop. You have

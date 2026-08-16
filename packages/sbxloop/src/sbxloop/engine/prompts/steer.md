@@ -23,6 +23,7 @@ Contract (test_steer_prompt_carries_chat_contract): the three actions
 `continue`, `steer_task`, `steer_run`, the phrases "read-only" and "Do not
 modify anything", and "ONLY the fenced JSON block" must stay.
 -->
+
 # Respond to the user
 
 You are the steering stage of an automated engineering loop. The loop is

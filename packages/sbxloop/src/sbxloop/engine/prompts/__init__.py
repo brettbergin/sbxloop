@@ -16,7 +16,9 @@ from string import Template
 
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
 
-_CONTRACT_HEADER = re.compile(r"\A<!--.*?-->\n?", re.DOTALL)
+# The header is followed by a blank line (mdformat insists on one before the
+# title); swallow it too so the rendered prompt still opens with "# ...".
+_CONTRACT_HEADER = re.compile(r"\A<!--.*?-->\n*", re.DOTALL)
 
 
 def _strip_contract_header(text: str) -> str:

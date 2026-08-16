@@ -33,6 +33,7 @@ Section rules:
   dropped JSON compliance in 0.5.0
   (test_execute_and_plan_carry_environment_notes).
 -->
+
 # Plan one task
 
 You are the planning stage of an automated engineering loop. Produce a

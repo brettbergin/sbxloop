@@ -19,6 +19,7 @@ tests/unit/test_prompts.py):
 
 Variables: $outcome, $max_tasks; $retry_context (defaulted to "" by render()).
 -->
+
 # Decompose an outcome into a task graph
 
 You are the planning stage of an automated engineering loop running inside an

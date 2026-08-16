@@ -231,6 +231,20 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
 }
 
 
+def test_render_contexts_cover_every_template_on_disk() -> None:
+    """RENDER_CONTEXTS is the "every template" universe for the tests below;
+    if a new prompts/*.md ships without an entry, those tests silently
+    skip it. Discover the resources so the omission fails loudly."""
+    on_disk = {
+        path.name.removesuffix(".md")
+        for path in resources.files(prompts).iterdir()
+        if path.name.endswith(".md")
+    }
+    assert on_disk == set(RENDER_CONTEXTS), (
+        "add a RENDER_CONTEXTS entry for every prompts/*.md template"
+    )
+
+
 def test_render_all_templates_have_no_leftover_vars() -> None:
     for name, context in RENDER_CONTEXTS.items():
         text = render(name, **context)
