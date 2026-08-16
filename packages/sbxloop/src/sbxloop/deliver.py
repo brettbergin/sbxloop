@@ -73,10 +73,18 @@ BLOB_BATCH_MAX_B64_BYTES = 4 * 1024 * 1024
 STATUS_MARKER = {"added": "A", "modified": "M", "deleted": "D"}
 
 
+def _has_status(exc: GithubOpsError, status: int) -> bool:
+    """Structured status first; message grep only for a worker that predates
+    ``ErrorInfo.http_status`` (lockstep versioning makes that window brief,
+    but a mid-upgrade daemon still runs the old worker for one cycle)."""
+    if exc.http_status is not None:
+        return exc.http_status == status
+    return f"HTTP {status}" in str(exc)
+
+
 def _is_missing(exc: GithubOpsError) -> bool:
-    """Whether an op failure was a 404 (the worker folds the HTTP status
-    into the error message; there is no structured status channel)."""
-    return "HTTP 404" in str(exc)
+    """Whether an op failure was a 404."""
+    return _has_status(exc, 404)
 
 
 def _is_empty_repo(exc: GithubOpsError) -> bool:
@@ -87,8 +95,7 @@ def _is_empty_repo(exc: GithubOpsError) -> bool:
     **HTTP 409 "Git Repository is empty."** — not the 404 a missing ref on
     a non-empty repository gets. Both mean "no base to build on".
     """
-    text = str(exc)
-    return "HTTP 409" in text and "empty" in text.lower()
+    return _has_status(exc, 409)
 
 
 def _is_ref_collision(exc: GithubOpsError) -> bool:

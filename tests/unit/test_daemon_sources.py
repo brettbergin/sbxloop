@@ -215,6 +215,21 @@ class TestGitHubSource:
         # no claim comment was posted for a failed claim
         assert not any("claimed" in body for _, body in ops.comments)
 
+    def test_claim_tolerates_structured_404_on_trigger_removal(self) -> None:
+        """#221: an already-absent trigger label is signalled by http_status,
+        not by "HTTP 404" appearing in the message."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        original_raw = ops.raw
+
+        def raw(method: str, path: str, body: object = None) -> object:
+            if method == "DELETE" and path.endswith("sbxloop%3Arun"):
+                raise GithubOpsError("label already gone", http_status=404)
+            return original_raw(method, path, body)
+
+        ops.raw = raw  # type: ignore[method-assign]
+        item = self.make(ops).poll()[0]
+        assert self.make(ops).claim(item) is True
+
     def test_claim_comment_failure_does_not_unclaim(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})
         ops.fail_on = {"COMMENT"}

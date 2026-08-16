@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -34,7 +35,32 @@ JsonValue = dict[str, Any] | list[Any]
 
 
 class GithubOpError(RuntimeError):
-    """A GitHub operation failed (bad op, transport error, HTTP error)."""
+    """A GitHub operation failed (bad op, transport error, HTTP error).
+
+    ``http_status`` is set when the failure was an HTTP response so the host
+    can branch on ``== 404`` / ``== 409`` instead of grepping the message.
+    Field failure (run rgwp5z40x, #219): the empty-repo bootstrap listened
+    for "HTTP 404" because the stubs said so; real GitHub answered 409 via a
+    gh-CLI wording nobody had modelled. A structured status survives message
+    rewording on either transport.
+    """
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
+# gh prints HTTP failures as ``gh: <message> (HTTP 409)``; the bare form
+# covers gh versions/paths that omit the parentheses. Only 3-digit codes.
+_GH_HTTP_STATUS = re.compile(r"\(HTTP (\d{3})\)|\bHTTP (\d{3})\b")
+
+
+def parse_gh_http_status(stderr: str) -> int | None:
+    """Extract the HTTP status ``gh api`` reports on stderr, if any."""
+    match = _GH_HTTP_STATUS.search(stderr)
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2))
 
 
 class Transport(Protocol):
@@ -65,9 +91,10 @@ class GhCliTransport:
             argv, capture_output=True, text=True, input=stdin, timeout=120, check=False
         )
         if proc.returncode != 0:
+            stderr = proc.stderr.strip()[:2000]
             raise GithubOpError(
-                f"gh api {method} {path} failed (rc={proc.returncode}): "
-                f"{proc.stderr.strip()[:2000]}"
+                f"gh api {method} {path} failed (rc={proc.returncode}): {stderr}",
+                http_status=parse_gh_http_status(stderr),
             )
         if not proc.stdout.strip():
             return {}
@@ -109,7 +136,9 @@ class RestTransport:
                 raw = response.read().decode()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]
-            raise GithubOpError(f"{method} {url} -> HTTP {exc.code}: {detail}") from exc
+            raise GithubOpError(
+                f"{method} {url} -> HTTP {exc.code}: {detail}", http_status=exc.code
+            ) from exc
         except urllib.error.URLError as exc:
             raise GithubOpError(f"{method} {url} failed: {exc.reason}") from exc
         if not raw.strip():
@@ -261,7 +290,8 @@ def _blobs_create_many(t: Transport, p: dict[str, Any], progress: ProgressFn | N
             # Name the failing file: this message rides the JobResult error all
             # the way into the host's run.deliver event.
             raise GithubOpError(
-                f"blob create failed for {path!r} (file {index + 1}/{total}): {exc}"
+                f"blob create failed for {path!r} (file {index + 1}/{total}): {exc}",
+                http_status=exc.http_status,
             ) from exc
         sha = data.get("sha") if isinstance(data, dict) else None
         if not sha:

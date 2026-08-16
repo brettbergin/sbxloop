@@ -87,8 +87,25 @@ class TestGithubOpsFacade:
 
     def test_error_result_raises(self) -> None:
         ops, _ = make_ops({"issue.create": "FAIL"})
-        with pytest.raises(GithubOpsError, match="HTTP 403"):
+        with pytest.raises(GithubOpsError, match="HTTP 403") as info:
             ops.issue_create("o/r", "T")
+        # No structured status from the stub -> host field stays unset
+        # (callers then fall back to message matching, see deliver tests).
+        assert info.value.http_status is None
+
+    def test_error_http_status_is_carried_onto_host_error(self) -> None:
+        class StatusClient(StubWorkerClient):
+            def submit(self, job: JobRequest) -> JobResult:
+                return JobResult(
+                    job_id=job.job_id,
+                    status="error",
+                    error=ErrorInfo(type="GithubOpError", message="empty", http_status=409),
+                )
+
+        ops = GithubOps(StatusClient({}), "r1")  # type: ignore[arg-type]
+        with pytest.raises(GithubOpsError) as info:
+            ops.repo_get("o/r")
+        assert info.value.http_status == 409
 
     def test_blobs_create_many_maps_paths_and_scales_timeout(self) -> None:
         ops, client = make_ops(

@@ -347,6 +347,31 @@ class TestEnsureRepository:
         with pytest.raises(GithubOpsError, match="403"):
             ensure_repository(ForbiddenOps(), "o/r", create=True)  # type: ignore[arg-type]
 
+    def test_structured_status_wins_over_message_wording(self) -> None:
+        """#221: a worker that reports http_status is believed even when the
+        message happens to mention another code (a 500 whose body quotes
+        '404' must not be mistaken for a missing repo)."""
+
+        class MisleadingOps(StubOps):
+            def repo_get(self, repo: str) -> dict[str, Any]:
+                raise GithubOpsError(
+                    "GET /repos -> HTTP 500: upstream said HTTP 404", http_status=500
+                )
+
+        with pytest.raises(GithubOpsError, match="500"):
+            ensure_repository(MisleadingOps(), "o/r", create=True)  # type: ignore[arg-type]
+
+    def test_structured_404_without_wording_still_means_missing(self) -> None:
+        class TerseMissingOps(MissingRepoOps):
+            def repo_get(self, repo: str) -> dict[str, Any]:
+                self.repo_get_calls.append(repo)
+                if not self.exists:
+                    raise GithubOpsError("repo.get failed", http_status=404)
+                return {"default_branch": "main"}
+
+        ops = TerseMissingOps()
+        assert ensure_repository(ops, "me/proj", create=True) is True  # type: ignore[arg-type]
+
 
 class TestEmptyRepoBootstrap:
     def test_missing_base_ref_bootstraps_then_delivers(self, tmp_path: Path) -> None:
@@ -391,6 +416,35 @@ class TestEmptyRepoBootstrap:
         assert puts[0][2] is not None and puts[0][2]["branch"] == "main"
         # the bootstrap README round-trips as valid base64
         base64.b64decode(puts[0][2]["content"])
+
+    def test_structured_409_bootstraps_regardless_of_wording(self, tmp_path: Path) -> None:
+        """#221: the empty-repo decision keys off ``http_status == 409``, so a
+        gh rewording (or the urllib transport's different phrasing) no longer
+        breaks delivery the way run rgwp5z40x did."""
+
+        class TerseEmptyOps(StubOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.bootstrapped = False
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
+                    raise GithubOpsError("ref lookup failed", http_status=409)
+                if method == "PUT" and path.endswith("/contents/README.md"):
+                    self.bootstrapped = True
+                    self.raw_calls.append((method, path, body))
+                    return {"content": {"path": "README.md"}}
+                return super().raw(method, path, body)
+
+        ops = TerseEmptyOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r9",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert any(m == "PUT" and p.endswith("/contents/README.md") for m, p, _ in ops.raw_calls)
 
     def test_404_missing_ref_also_bootstraps(self, tmp_path: Path) -> None:
         """An explicit `base` naming a branch that does not exist yet gets

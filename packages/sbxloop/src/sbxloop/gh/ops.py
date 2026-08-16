@@ -52,7 +52,8 @@ class GithubOps:
         if result.status != "ok":
             assert result.error is not None
             raise GithubOpsError(
-                f"github op {op} failed: {result.error.type}: {result.error.message}"
+                f"github op {op} failed: {result.error.type}: {result.error.message}",
+                http_status=result.error.http_status,
             )
         return result.output_json
 

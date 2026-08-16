@@ -34,6 +34,16 @@ All notable changes to sbxloop are documented here. The project adheres to
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
 
+- GitHub op failures carry the HTTP status as a structured field (#221):
+  worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken
+  from `urllib` `HTTPError.code`), `ErrorInfo.http_status` on the JobResult
+  envelope, and host `GithubOpsError.http_status`. The empty-repo bootstrap
+  (`409`), missing-repo probe (`404`) and already-absent trigger label
+  (`404`) now compare status codes instead of grepping gh's prose — the
+  wording-mismatch that broke delivery on run rgwp5z40x (fixed in #219) can
+  no longer recur. Message matching remains only as a fallback for a worker
+  that predates the field.
+
 ### Fixed
 
 - Artifact listings, harvest reports and `--deliver` PRs now honour the
