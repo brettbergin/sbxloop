@@ -141,11 +141,37 @@ class Issue(_Model):
 
 
 class Verdict(_Model):
-    """Critic output: scrutinize uses pass/revise, validate uses accept/reject."""
+    """Critic output: scrutinize uses pass/revise, validate uses accept/reject.
+
+    ``verify_suspect`` is the scrutinizer's ruling on the *check* rather
+    than the work (#231): a verify command can be portable and runnable and
+    still assert the wrong thing (field failure r567rsm4e — an ``od``
+    column layout that never matches). The executor cannot edit verify
+    commands and the mechanical verify phase has no opinion, so the
+    scrutinizer — which sees the failing command next to the passing code
+    — is the only stage placed to say "this check itself is wrong". The
+    engine turns a ``pass`` + ``verify_suspect`` into an immediate replan
+    instead of letting revisions burn against a check no revision can fix.
+    """
 
     verdict: Literal["pass", "revise", "accept", "reject"]
     issues: list[Issue] = Field(default_factory=list)
     feedback: str = ""
+    verify_suspect: bool = False
+    verify_suspect_reason: str = ""
+
+    @model_validator(mode="after")
+    def _check_verify_suspect(self) -> Verdict:
+        # The reason is the whole payload: it is what the planner is told
+        # about why the old check was wrong. A bare flag would spend a
+        # replan on "no reason given", so it is retried like a steer
+        # without guidance.
+        if self.verify_suspect and not self.verify_suspect_reason.strip():
+            raise ValueError(
+                "`verify_suspect: true` requires a non-empty `verify_suspect_reason` "
+                "saying concretely what the check asserts wrongly"
+            )
+        return self
 
 
 SteerAction = Literal["continue", "steer_task", "steer_run"]

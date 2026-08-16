@@ -1,7 +1,10 @@
 """Prompt template rendering tests."""
 
+from importlib import resources
+
 import pytest
 
+from sbxloop.engine import prompts
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
 
@@ -11,6 +14,15 @@ def test_render_decompose() -> None:
     assert "Build the thing" in text
     assert "At most 5 tasks" in text
     assert "$outcome" not in text
+
+
+def test_decompose_states_the_uv_project_convention() -> None:
+    # #250: the decomposer writes verify commands too, and the lint holds
+    # them to the uv convention when a lockfile is present — so the rule
+    # has to be stated where the decomposer reads it, not only in plan.md.
+    text = render("decompose", outcome="o", max_tasks="5")
+    assert "uv.lock" in text
+    assert "uv run pytest" in text
 
 
 def test_execute_and_plan_carry_environment_notes() -> None:
@@ -67,6 +79,12 @@ def test_execute_and_plan_carry_environment_notes() -> None:
 # one row per language sub-issue.
 ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("Python", ("PEP 668", "python3 -m venv", ".venv/bin/pytest"), ("PEP 668", ".venv/bin/")),
+    # #250: the uv-projects note rides inside the Python block of every prompt.
+    (
+        "uv projects",
+        ("uv.lock", "uv sync", "uv run pytest -q"),
+        ("uv.lock", "uv sync", "uv run"),
+    ),
     ("JavaScript/Node", ("package.json", "npm ci && npm test"), ("package.json", "npm ci")),
     (
         "TypeScript",
@@ -160,56 +178,101 @@ def test_environment_facts_lead_language_neutral() -> None:
         )
 
 
-def test_render_all_templates_have_no_leftover_vars() -> None:
-    contexts = {
-        "decompose": {"outcome": "o", "max_tasks": "3"},
-        "plan": {
-            "outcome": "o",
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "acceptance_criteria": "- c",
-            "feedback": "f",
-            "user_guidance": "g",
-        },
-        "execute": {
-            "outcome": "o",
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "plan_steps": "- s",
-            "expected_artifacts": "- a",
-            "feedback": "f",
-            "user_guidance": "g",
-        },
-        "scrutinize": {
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "acceptance_criteria": "- c",
-            "plan_steps": "- s",
-            "executor_report": "r",
-            "evidence": "e",
-        },
-        "validate": {
-            "outcome": "o",
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "acceptance_criteria": "- c",
-            "verify_results": "v",
-        },
-        "steer": {
-            "outcome": "o",
-            "tasks_summary": "- t1 [executing] T",
-            "current_task": "Task t1: T",
-            "user_guidance": "(none)",
-            "user_message": "how is it going?",
-        },
+# One full context per template. Kept in sync with the header comment at the
+# top of each prompts/*.md — that header is where an editor learns which
+# variables a template takes (#225).
+RENDER_CONTEXTS: dict[str, dict[str, str]] = {
+    "decompose": {"outcome": "o", "max_tasks": "3"},
+    "plan": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "- c",
+        "feedback": "f",
+        "user_guidance": "g",
+    },
+    "execute": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "plan_steps": "- s",
+        "expected_artifacts": "- a",
+        "feedback": "f",
+        "user_guidance": "g",
+    },
+    "scrutinize": {
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "- c",
+        "plan_steps": "- s",
+        "prior_feedback": "f",
+        "executor_report": "r",
+        "evidence": "e",
+        "verify_commands": "- true",
+    },
+    "validate": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "- c",
+        "verify_results": "v",
+    },
+    "steer": {
+        "outcome": "o",
+        "tasks_summary": "- t1 [executing] T",
+        "current_task": "Task t1: T",
+        "user_guidance": "(none)",
+        "user_message": "how is it going?",
+    },
+}
+
+
+def test_render_contexts_cover_every_template_on_disk() -> None:
+    """RENDER_CONTEXTS is the "every template" universe for the tests below;
+    if a new prompts/*.md ships without an entry, those tests silently
+    skip it. Discover the resources so the omission fails loudly."""
+    on_disk = {
+        path.name.removesuffix(".md")
+        for path in resources.files(prompts).iterdir()
+        if path.name.endswith(".md")
     }
-    for name, context in contexts.items():
+    assert on_disk == set(RENDER_CONTEXTS), (
+        "add a RENDER_CONTEXTS entry for every prompts/*.md template"
+    )
+
+
+def test_render_all_templates_have_no_leftover_vars() -> None:
+    for name, context in RENDER_CONTEXTS.items():
         text = render(name, **context)
         assert "$" not in text.replace("$?", ""), f"unsubstituted var in {name}"
+
+
+def test_every_template_opens_with_contract_header() -> None:
+    """#225: the rules above are enforced by this file but were discoverable
+    only by breaking them. Each template must carry the contract in an
+    HTML comment header naming the file's variables, so a new one cannot
+    ship without one."""
+    for name, context in RENDER_CONTEXTS.items():
+        source = (resources.files(prompts) / f"{name}.md").read_text()
+        assert source.startswith("<!--\n"), f"{name}.md lacks the contract header"
+        header = source[: source.index("-->")]
+        assert "string.Template" in header
+        assert "$$" in header, f"{name}.md header must state the $-escaping rule"
+        for var in context:
+            assert f"${var}" in header, f"{name}.md header does not list ${var}"
+
+
+def test_contract_header_never_reaches_the_model() -> None:
+    """The header is written for editors, not the agent: it must cost no
+    tokens and must not be readable as instructions."""
+    for name, context in RENDER_CONTEXTS.items():
+        text = render(name, **context)
+        assert "<!--" not in text, f"{name}: header leaked into the rendered prompt"
+        assert text.startswith("# "), f"{name}: rendered prompt must open with its title"
 
 
 def test_registry_tiers_are_injected_not_hardcoded() -> None:

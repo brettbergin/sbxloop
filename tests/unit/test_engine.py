@@ -46,6 +46,13 @@ PLAN = {"json": {"steps": ["do the work"], "expected_artifacts": [], "verify_com
 EXECUTE = {"text": "work complete, files changed"}
 PASS = {"json": {"verdict": "pass"}}
 REVISE = {"json": {"verdict": "revise", "feedback": "missed an edge case"}}
+PASS_SUSPECT = {
+    "json": {
+        "verdict": "pass",
+        "verify_suspect": True,
+        "verify_suspect_reason": "greps for an od column layout od never prints",
+    }
+}
 ACCEPT = {"json": {"verdict": "accept"}}
 REJECT = {"json": {"verdict": "reject", "feedback": "criterion 1 unmet"}}
 
@@ -79,7 +86,9 @@ class Harness:
         # Resource guardrails default OFF in the harness: the real worker
         # samples the host filesystem here, so default thresholds would make
         # tests depend on how full the developer's disk is.
-        limits = config_overrides.pop("limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0})
+        limits = config_overrides.pop(
+            "limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0, "mem_abort": 0}
+        )
         config = Config.model_validate(
             {
                 "state_dir": str(self.state_dir),
@@ -282,6 +291,158 @@ class TestReviseAndVerify:
         assert result.state == "failed"
         assert result.tasks[0].state == "failed"
         assert result.tasks[0].revisions == 3
+
+    def test_verify_suspect_after_verify_failure_replans_immediately(
+        self, harness: Harness
+    ) -> None:
+        # Field failure (r567rsm4e, #231): a runnable verify command that
+        # asserts the wrong thing. Once verify has failed and the scrutinizer
+        # passes the work while flagging the check, the replan is spent now
+        # — no further revisions, no second verify run of the wrong check.
+        bad_plan = {
+            "json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": ["exit 1"]}
+        }
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                bad_plan,
+                EXECUTE,
+                PASS,  # verify fails -> revision 1
+                EXECUTE,
+                PASS_SUSPECT,  # work fine, check wrong -> replan now
+                PLAN,  # fresh plan drops the wrong check
+                EXECUTE,
+                PASS,
+                ACCEPT,
+            ]
+        )
+        engine = harness.engine()
+        result = engine.start("wrong check replans early")
+        assert result.state == "completed"
+        assert result.tasks[0].state == "done"
+        assert result.tasks[0].replans == 1
+        phases = [row["phase"] for row in engine.store.phase_attempts(result.run_id)]
+        assert phases.count("verify") == 2  # the wrong check ran once, the fixed one once
+        assert phases.count("execute") == 3  # not the full revision budget
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is True
+        assert "od column layout" in events[0].data["message"]
+
+    def test_verify_suspect_before_verify_ran_is_ignored(self, harness: Harness) -> None:
+        # A speculative flag on a check that has never failed must not cost
+        # a replan on a fine plan: verify runs (and here passes) as usual.
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS_SUSPECT, ACCEPT])
+        result = harness.engine().start("speculative flag")
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 0
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "before it has failed" in events[0].data["message"]
+
+    def test_verify_suspect_evidence_ignores_lookalike_critic_feedback(
+        self, harness: Harness
+    ) -> None:
+        # Provenance comes from the persisted verify attempt, not from the
+        # feedback text: a critic's `revise` that happens to open with the
+        # verify-failure wording must not make a later flag look
+        # verify-triggered when VERIFY has never run.
+        spoof = {
+            "json": {
+                "verdict": "revise",
+                "feedback": "verify command failed: `grep -q x out.txt` (exit 1) -- fix it",
+            }
+        }
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, spoof, EXECUTE, PASS_SUSPECT, ACCEPT])
+        result = harness.engine().start("spoofed evidence")
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 0
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "before it has failed" in events[0].data["message"]
+
+    def test_verify_suspect_with_revise_is_surfaced_not_honored(self, harness: Harness) -> None:
+        # `revise` + verify_suspect: the work is not done either, so the
+        # revision comes first; the ruling is still put in the live stream
+        # rather than swallowed by the revise branch.
+        revise_suspect = {
+            "json": {
+                "verdict": "revise",
+                "feedback": "missing the CLI flag",
+                "verify_suspect": True,
+                "verify_suspect_reason": "asserts a column od never prints",
+            }
+        }
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["exit 1"])),
+                PLAN,
+                EXECUTE,
+                PASS,  # verify fails -> revision 1
+                EXECUTE,
+                revise_suspect,  # revision 2: flag surfaced, revision registered
+                EXECUTE,
+                PASS,  # verify fails -> revision 3
+                EXECUTE,
+                PASS,
+            ]
+        )
+        result = harness.engine(budgets={"max_replans_per_task": 0}).start("revise first")
+        assert result.state == "failed"
+        assert result.tasks[0].replans == 0
+        assert result.tasks[0].revisions == 3
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "revisions first" in events[0].data["message"]
+
+    def test_verify_suspect_without_replan_budget_verifies_anyway(self, harness: Harness) -> None:
+        # No replan budget: the flag is surfaced but the loop stays bounded
+        # by the ordinary revision path.
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["exit 1"])),
+                PLAN,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS_SUSPECT,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS,
+            ]
+        )
+        result = harness.engine(budgets={"max_replans_per_task": 0}).start("no budget")
+        assert result.state == "failed"
+        assert result.tasks[0].replans == 0
+        assert result.tasks[0].revisions == 3
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "no replan budget" in events[0].data["message"]
 
     def test_verify_failure_surfaces_in_event_stream(self, harness: Harness) -> None:
         # Field failure (rv4zfdb1m): the transcript jumped verifying -> failed
@@ -649,6 +810,26 @@ class TestResume:
         assert engine.store.get_run(result.run_id).workspace == clone_dir
         assert (source / "hello.txt").read_text() == "hi\n"
         assert not (source / ".git" / "refs" / "heads" / "sbxloop").exists()
+
+    def test_phase_runner_sees_the_run_workspace(self, harness: Harness) -> None:
+        # #250: the verify-command lint keys on the host workspace (a
+        # `uv.lock` there flips the Python convention), so the runner must
+        # be handed the run's actual workspace path, not left blind.
+        from sbxloop.engine.phases import PhaseRunner
+
+        captured: dict[str, PhaseRunner] = {}
+        original_init = PhaseRunner.__init__
+
+        def spy_init(self: PhaseRunner, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            captured["phases"] = self
+
+        harness.monkeypatch.setattr(PhaseRunner, "__init__", spy_init)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("improve the project")
+        assert result.state == "completed"
+        assert captured["phases"].workspace == result.workspace
+        assert result.workspace is not None
 
     def test_resume_isolated_run_reuses_clone(self, harness: Harness) -> None:
         from tests.unit.test_hostgit import make_repo
@@ -1435,6 +1616,23 @@ class TestResourceGuardrail:
         assert result.state == "failed"
         assert [t.state for t in result.tasks] == ["failed"]
         assert "sandbox disk exhausted" in (result.tasks[0].last_feedback or "")
+
+    def test_mem_abort_reason_names_memory(self, harness: Harness) -> None:
+        # #253: /proc/meminfo is Linux-only, so the memory sample is injected
+        # the way _track_resources would record it from a worker event.
+        engine = harness.engine(limits={"disk_warn": 0, "disk_abort": 95.0, "mem_abort": 97.0})
+        engine._last_resources["agent"] = {
+            "level": "abort",
+            "disk_used_pct": 40.0,
+            "mem_used_pct": 98.2,
+        }
+        reason = engine._resource_abort_reason()
+        assert reason is not None
+        assert reason.startswith("sandbox memory exhausted: 98.2%")
+        assert "limits.mem_abort=97.0%" in reason
+        # Disk is named when it is the one that tripped (both crossing).
+        engine._last_resources["agent"]["disk_used_pct"] = 99.0
+        assert (engine._resource_abort_reason() or "").startswith("sandbox disk exhausted")
 
     def test_disk_warn_never_fails_tasks(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])

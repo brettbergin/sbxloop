@@ -64,9 +64,13 @@ _SMOKE_BASE = "/tmp/sbxloop-smoke"  # nosec B108 - path inside the sandbox VM, n
 # the install ladder, same as any other probe failure). argv:
 # manifest_path expected_version default_python smoke_base. Emits exactly one
 # JSON verdict line on stdout; the host maps stages onto the same decisions
-# and log messages the serial probes produced.
+# and log messages the serial probes produced. The "ok" verdict also reports
+# whether the baseline tooling (git, #252) is on PATH: a template baked before
+# git joined the baseline passes every worker check and would otherwise skip
+# the ensure that installs it, so the host tops it up from this one answer
+# instead of paying a separate probe round trip.
 _PREBAKE_PROBE = """\
-import json, subprocess, sys
+import json, shutil, subprocess, sys
 
 manifest_path, expected, default_python, smoke_base = sys.argv[1:5]
 
@@ -122,7 +126,7 @@ smoke = run(
 )
 if smoke is None or smoke.returncode != 64:
     emit("smoke-failed", rc=smoke.returncode if smoke else -1, output=tail(smoke))
-emit("ok", python=python)
+emit("ok", python=python, git=shutil.which("git") is not None)
 """
 
 logger = logging.getLogger(__name__)
@@ -157,6 +161,9 @@ class WorkerClient:
         # Set by install(): True when a prebaked template carried a working
         # worker and the install ladder was skipped entirely.
         self.prebaked = False
+        # Baseline tools the prebake probe found absent (see _PREBAKE_PROBE);
+        # install() tops them up after a successful verification.
+        self._prebake_missing: list[toolchains.Toolchain] = []
         # Sandbox role for enriching resource telemetry (the worker doesn't
         # know which sandbox it lives in), and guardrail thresholds to pass
         # through to the worker's heartbeat sampler.
@@ -214,6 +221,8 @@ class WorkerClient:
         """
         if expect_prebaked and self._verify_prebaked():
             self.prebaked = True
+            if ensure_dev_tools and self._prebake_missing:
+                self._provision_toolchains(self._prebake_missing, timeout)
             return
         if ensure_dev_tools:
             self._ensure_dev_tools(timeout, languages)
@@ -352,6 +361,10 @@ class WorkerClient:
             )
             return False
         self.python = python
+        # Fail closed: anything but an explicit True costs one best-effort
+        # apt call, whereas trusting a malformed answer leaves the agent
+        # without git for the whole run (#252).
+        self._prebake_missing = [] if verdict.get("git") is True else [toolchains.GIT]
         logger.info("prebaked worker %s verified; install ladder skipped", sbxloop.__version__)
         return True
 
@@ -362,6 +375,9 @@ class WorkerClient:
         ``sbxloop.toolchains``) before the agent's first turn, so it does not
         burn revision budget bootstrapping its own compiler. Empty selects
         the default, which is Python — the case this ensure was born for.
+        ``toolchains.BASELINE_TOOLS`` (git, #252) is provisioned on top of
+        whatever was selected: a project's tests shell out to git whatever
+        its language, so it is not an opt-in.
 
         Field failure (0.4.0): templates ship a system python without
         ensurepip. The worker self-heals its OWN venv (the ladder below),
@@ -381,11 +397,22 @@ class WorkerClient:
           installation has its own ladder and the agent retains
           ``sudo apt-get`` as an escape hatch.
         """
-        selected = toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES)
+        selected = (
+            *toolchains.BASELINE_TOOLS,
+            *toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES),
+        )
         missing = [tc for tc in selected if not self.sandbox.exec(["sh", "-c", tc.probe]).ok]
         if not missing:
             logger.debug("dev tools already present; skipping toolchain ensure")
             return
+        self._provision_toolchains(missing, timeout)
+
+    def _provision_toolchains(
+        self, missing: Sequence[toolchains.Toolchain], timeout: float
+    ) -> None:
+        """Install already-probed-missing toolchains: one pooled apt call,
+        then each entry's install script. Best-effort and loud, see
+        ``_ensure_dev_tools``."""
         logger.info("provisioning agent toolchains: %s", ", ".join(tc.name for tc in missing))
         packages = toolchains.apt_packages(missing)
         if packages:
@@ -560,6 +587,8 @@ class WorkerClient:
                 str(self.limits.disk_abort),
                 "--mem-warn",
                 str(self.limits.mem_warn),
+                "--mem-abort",
+                str(self.limits.mem_abort),
             ]
         # sbx injects secrets through the sandbox session/profile machinery;
         # a bare exec'd process may not see them. Run the worker under a

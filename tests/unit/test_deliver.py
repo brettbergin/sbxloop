@@ -13,6 +13,7 @@ from sbxloop import hostgit
 from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import PrRef
+from tests.fakes.github_errors import github_error
 
 
 class StubOps:
@@ -621,11 +622,7 @@ class TestRedeliveryCollisions:
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
                     self.raw_calls.append((method, path, body))
-                    raise GithubOpsError(
-                        "github op raw.api failed: GithubOpError: gh api POST "
-                        "/repos/o/r/git/refs failed (rc=1): gh: Reference already "
-                        "exists (HTTP 422)"
-                    )
+                    raise github_error("ref_exists_422")
                 if method == "PATCH" and "/git/refs/heads/" in path:
                     self.raw_calls.append((method, path, body))
                     return {"ref": path}
@@ -660,11 +657,7 @@ class TestRedeliveryCollisions:
                 return super().raw(method, path, body)
 
             def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
-                raise GithubOpsError(
-                    "github op pr.create failed: GithubOpError: POST .../pulls -> HTTP 422: "
-                    '{"message":"Validation Failed","errors":[{"message":"A pull request '
-                    'already exists for o:sbxloop/r42."}]}'
-                )
+                raise github_error("pr_exists_422")
 
         ops = PrExistsOps()
         pr = deliver_workspace(
@@ -688,7 +681,7 @@ class TestRedeliveryCollisions:
                 return super().raw(method, path, body)
 
             def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
-                raise GithubOpsError("HTTP 422: A pull request already exists for o:sbxloop/r42.")
+                raise github_error("pr_exists_422")
 
         with pytest.raises(GithubOpsError, match="already exists"):
             deliver_workspace(

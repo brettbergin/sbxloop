@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from typer.testing import CliRunner
 
 import sbxloop
 from sbxloop.cli.app import app
+from sbxloop.cli.doctor import Check
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
 from sbxloop_worker.protocol import Event as ProtocolEvent
@@ -538,6 +540,42 @@ class TestDoctor:
         assert "sbx binary" in result.output
         assert "FAIL" not in result.output
 
+    def test_doctor_hints_at_legacy_relative_state_dir(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#224: a ``./.sbxloop`` from the former relative default is
+        silently ignored once state_dir defaults to ``~/.sbxloop``; doctor
+        must say so (soft) — unless the operator opted in explicitly."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.setenv("HOME", str(workdir / "home"))
+        (workdir / ".sbxloop").mkdir()
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output  # warn, not FAIL
+        assert "legacy state dir" in result.output
+        # rich folds the detail column, so check the remedy text unwrapped
+        from sbxloop.cli.doctor import collect_checks
+
+        (legacy,) = [c for c in collect_checks(dict(os.environ)) if c.name == "legacy state dir"]
+        assert not legacy.ok and not legacy.hard
+        assert 'state_dir = ".sbxloop"' in legacy.detail
+
+        (workdir / "sbxloop.toml").write_text('state_dir = ".sbxloop"\n')
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "legacy state dir" not in result.output
+
+    def test_doctor_no_legacy_hint_when_default_is_here(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # HOME == cwd (autouse fixture): ./.sbxloop *is* the default state dir.
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        (workdir / ".sbxloop").mkdir()
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "legacy state dir" not in result.output
+
     def test_doctor_fails_without_tokens(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -569,20 +607,60 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "FAIL" in result.output
 
-    def _bake_record(self, workdir: Path, *, worker_version: str, ref: str) -> None:
+    def _bake_record(
+        self, workdir: Path, *, worker_version: str, ref: str, git: bool | None = None
+    ) -> None:
         state = workdir / ".sbxloop"
         state.mkdir(exist_ok=True)
-        (state / "bake.json").write_text(
-            json.dumps(
-                {
-                    "ref": ref,
-                    "worker_version": worker_version,
-                    "python": "/home/agent/.sbxloop/venv/bin/python",
-                    "runtime_cached": True,
-                    "baked_at": 0.0,
-                }
-            )
+        record: dict[str, object] = {
+            "ref": ref,
+            "worker_version": worker_version,
+            "python": "/home/agent/.sbxloop/venv/bin/python",
+            "runtime_cached": True,
+            "baked_at": 0.0,
+        }
+        if git is not None:
+            record["git"] = git
+        (state / "bake.json").write_text(json.dumps(record))
+
+    def _git_row(self, workdir: Path, fake_sbx: FakeSbx, git: bool | None) -> Check:
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        self._bake_record(
+            workdir, worker_version=sbxloop.__version__, ref="sbxloop-baked:latest", git=git
         )
+        checks = collect_checks(
+            {"COPILOT_GITHUB_TOKEN": "tok", "SBXLOOP_SANDBOX__TEMPLATE": "sbxloop-baked:latest"},
+            cli=SbxCLI(binary=str(fake_sbx.binary)),
+        )
+        return {c.name: c for c in checks}["git in template"]
+
+    def test_doctor_git_in_template_ok_when_baked_with_git(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # #252: git is baseline agent tooling; a bake that captured it means
+        # no per-run apt top-up.
+        row = self._git_row(workdir, fake_sbx, git=True)
+        assert row.ok and "git on PATH" in row.detail
+
+    def test_doctor_git_in_template_missing_is_soft_warn(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # Missing git is a warn, not a FAIL: provisioning still probes and
+        # apt-installs it per run, so the run is not lost — only slower.
+        row = self._git_row(workdir, fake_sbx, git=False)
+        assert not row.ok and not row.hard
+        assert "sbxloop bake" in row.detail
+
+    def test_doctor_git_in_template_unrecorded_by_older_bake(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # Records written before the field existed still load; the row says
+        # "not recorded" rather than inventing a verdict.
+        row = self._git_row(workdir, fake_sbx, git=None)
+        assert row.ok and not row.hard
+        assert "not recorded" in row.detail
 
     def test_doctor_template_fresh_and_listed(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -756,6 +834,24 @@ class TestDoctor:
         assert "sbx drift" in result.output
         # drift warns loudly but does not fail an otherwise-ready host
         assert result.exit_code == 0, result.output
+        # ...unless the caller asked for the CI gate (#226)
+        gated = runner.invoke(app, ["doctor", "--fail-on-drift"])
+        assert gated.exit_code == 1, gated.output
+        assert "conformance gate failed" in gated.output
+
+    def test_doctor_fail_on_drift_rejects_unprobed_sbx_version(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A never-deep-probed sbx build is not a passing grade for the gate:
+        that is exactly the state a fresh sbx release lands in."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor", "--fail-on-drift"])
+        assert result.exit_code == 1, result.output
+        assert "conformance gate failed" in result.output
+        # a deep run answers every probe against the fake and the gate opens
+        deep = runner.invoke(app, ["doctor", "--deep", "--fail-on-drift"])
+        assert deep.exit_code == 0, deep.output
+        assert runner.invoke(app, ["doctor", "--fail-on-drift"]).exit_code == 0
 
 
 class TestBakeCommand:

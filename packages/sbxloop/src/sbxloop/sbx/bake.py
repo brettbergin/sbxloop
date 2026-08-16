@@ -32,6 +32,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 import sbxloop
+from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.errors import BakeError, SbxError, SbxloopError
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
@@ -58,6 +59,10 @@ class BakeRecord(BaseModel):
     python: str
     runtime_cached: bool
     baked_at: float
+    # Whether git was on PATH when the template was saved (#252). Optional so
+    # records written before the field existed still load; None reads as
+    # "not recorded" in doctor rather than as a failure.
+    git: bool | None = None
 
 
 def bake_record_path(config: Config) -> Path:
@@ -96,6 +101,7 @@ def bake_template(
     report = progress or (lambda _message: None)
     name = name or f"sbxloop-bake-{secrets.token_hex(4)}"
     runtime_cached = False
+    git_present = False
     with tempfile.TemporaryDirectory(prefix="sbxloop-bake-") as scratch:
         spec = SandboxSpec(
             name=name,
@@ -126,6 +132,11 @@ def bake_template(
                 report("pre-caching the Copilot runtime")
                 runtime_cached = _cache_copilot_runtime(sandbox, client.python)
 
+            # The dev-tools ensure above installs git best-effort; record
+            # what actually landed so doctor can say whether runs will pay
+            # an apt top-up on every provision.
+            git_present = sandbox.exec(["sh", "-c", toolchains.GIT.probe]).ok
+
             manifest = {
                 "worker_version": sbxloop.__version__,
                 "python": client.python,
@@ -153,6 +164,7 @@ def bake_template(
         python=client.python,
         runtime_cached=runtime_cached,
         baked_at=time.time(),
+        git=git_present,
     )
     path = bake_record_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)

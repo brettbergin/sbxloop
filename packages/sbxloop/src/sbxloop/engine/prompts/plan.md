@@ -1,3 +1,39 @@
+<!--
+Template contract (docs/architecture.md, "Prompt templates"; enforced by
+tests/unit/test_prompts.py):
+- This file is a Python string.Template. `$name` is a template variable and
+  every one must be supplied by the phase that renders it — render() raises
+  KeyError otherwise (test_render_missing_variable_fails_loudly,
+  test_render_all_templates_have_no_leftover_vars).
+- A bare `$` anywhere else breaks rendering (ValueError, or KeyError for
+  `$word`). Shell examples must not use `$PID`, `$!`, `$HOME`, `$(...)`,
+  `$1`… — write them without shell variables (a plan.md one-liner with
+  `$PID` broke 89 tests in two waves during #212). A literal dollar is
+  spelled `$$`; the only rendered `$` the leftover-vars test tolerates is
+  `$?` (source spelling `$$?`), so no other literal dollar may reach the
+  rendered prompt.
+- Braces need no escaping (the reason for string.Template over str.format),
+  so JSON examples are pasted verbatim.
+- This comment block is stripped by sbxloop.engine.prompts.render before the
+  prompt reaches the model; everything below it is sent verbatim.
+
+Variables: $outcome, $task_id, $task_title, $task_description,
+$acceptance_criteria, $feedback, $user_guidance; $retry_context (defaulted
+by render()); $baseline_registries and $declarable_registries are injected
+from policy.py, never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
+Section rules:
+- Everything from "## Environment facts" up to "Ecosystem notes" is the
+  language-neutral opener: `PEP 668`, `.venv` and `pytest` are asserted
+  absent there — ecosystem specifics go under the matching **Ecosystem**
+  bullet (test_environment_facts_lead_language_neutral, #142). "workspace
+  root" and "cannot edit" must stay in the opener.
+- Each ECOSYSTEM_NOTES row must keep its markers
+  (test_prompts_carry_ecosystem_notes).
+- "## Response format" must come LAST, after Environment facts — burying it
+  dropped JSON compliance in 0.5.0
+  (test_execute_and_plan_carry_environment_notes).
+-->
+
 # Plan one task
 
 You are the planning stage of an automated engineering loop. Produce a
@@ -90,6 +126,13 @@ and none of these is the "normal" choice.
   command is rejected outright (there is no compliant way to bootstrap a
   venv from inside one). Verify: `.venv/bin/pytest`, or
   `cd app && .venv/bin/pytest` for a subdirectory build.
+  **uv projects** — if the workspace has a `uv.lock` (often a uv workspace
+  with several members and a `requires-python` pin), do not build a venv by
+  hand: `uv` and a managed Python 3.13 are on PATH, so `uv sync --all-packages` in your **steps** builds the locked environment, and
+  every command including `verify_commands` runs through it as `uv run …`
+  (`uv run pytest -q`, `uv run ruff check .`). With a lockfile present,
+  `.venv/bin/...` and bare `pytest` verify commands are rejected; `uv run`
+  is the shape.
 - **JavaScript/Node** — `package.json` and its lockfile sit at the project
   root, and `node_modules/` is local to the project, so no global-install
   workaround is needed. Prefer `npm ci` over `npm install` for a

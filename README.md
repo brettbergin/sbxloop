@@ -489,20 +489,28 @@ missing compiler on its first build and spending revision budget on it:
 languages = ["python"]   # the default when the key is unset
 ```
 
-| Value        | Also accepts               | Installs                                                      |
-| ------------ | -------------------------- | ------------------------------------------------------------- |
-| `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt)                           |
-| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
-| `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)   |
-| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
-| `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
-| `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)         |
-| `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                        |
-| `go`         | `golang`                   | Go toolchain (pinned tarball from `go.dev`)                   |
-| `rust`       | `rs`, `cargo`              | cargo, rustc, rustfmt, clippy (pinned rustup)                 |
-| `dotnet`     | `csharp`, `c#`, `net`      | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`    |
+| Value        | Also accepts               | Installs                                                         |
+| ------------ | -------------------------- | ---------------------------------------------------------------- |
+| `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 (pinned) |
+| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)    |
+| `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)      |
+| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                |
+| `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)       |
+| `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)            |
+| `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                           |
+| `go`         | `golang`                   | Go toolchain (pinned tarball from `go.dev`)                      |
+| `rust`       | `rs`, `cargo`              | cargo, rustc, rustfmt, clippy (pinned rustup)                    |
+| `dotnet`     | `csharp`, `c#`, `net`      | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`       |
 
 Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
+
+The `python` entry is uv-aware: when the workspace carries a `uv.lock`, the
+prompts steer the agent to `uv sync` / `uv run …` instead of a hand-made
+`.venv`, and the verify-command lint requires `uv run` heads there (a
+`.venv/bin/pytest` beside a lockfile does not carry a uv workspace's own
+members). Without a lockfile the `.venv/bin/…` convention is unchanged.
+`sbxloop doctor --deep` reports the template's own `python3` against the
+pinned series in the `python-version` row.
 
 Three rules apply to every entry. Provisioning is **probe-first** — a template
 that already ships the toolchain costs no install and no network. It is
@@ -515,11 +523,15 @@ than downloaded per run.
 
 ### Toolchains that download from upstream need egress
 
-The apt-only entries (`python`, `cpp`, `ruby`, `java`) work out of the box:
-apt mirrors are in the sandbox's always-reachable baseline. The rest fetch
-from a vendor or registry, and **provisioning runs before the PLAN phase**, so
-a plan's `egress` declaration is too late to help it. Until those domains are
-part of the provisioning baseline, allow them explicitly:
+The apt-only entries (`cpp`, `ruby`, `java`) work out of the box: apt mirrors
+are in the sandbox's always-reachable baseline. So does `python`: its `uv`
+release and the uv-managed Python 3.13 are both GitHub release assets
+(`github.com`, redirecting to `release-assets.githubusercontent.com`), and
+both hosts are in the agent sandbox's provisioning-time allowlist. The rest
+fetch from a vendor or registry, and
+**provisioning runs before the PLAN phase**, so a plan's `egress` declaration
+is too late to help it. Until those domains are part of the provisioning
+baseline, allow them explicitly:
 
 ```toml
 [sandbox]
@@ -612,8 +624,12 @@ live-sandbox verdicts from the cache; `sbxloop doctor --deep` boots one
 scratch sandbox for the full suite. When an sbx upgrade flips a verdict that
 sbxloop's behavior depends on, doctor warns loudly and names the dependent
 behavior. Ordinary runs feed the same cache, so verdicts stay fresh for free.
-Doctor also checks the installed Copilot SDK's permission-kind vocabulary
-against the field-verified snapshot backing the read-only critic barrier.
+`sbxloop doctor --fail-on-drift` turns that warning into an exit code (any
+drifted, errored, or unprobed probe fails) — the CI e2e lane uses it, and the
+scheduled `sbx-conformance` workflow runs it against the newest sbx release
+ahead of adoption. Doctor also checks the installed Copilot SDK's
+permission-kind vocabulary against the field-verified snapshot backing the
+read-only critic barrier.
 
 ### Secret registration hygiene
 
@@ -636,9 +652,11 @@ secret or registrations owned by other tools.
 ## Configuration
 
 Configuration resolves, in order, from `SBXLOOP_*` environment variables,
-`sbxloop.toml`, and `pyproject.toml [tool.sbxloop]`. `sbxloop init` writes a
-commented starter file; `sbxloop config show` prints every resolved value and
-where it came from. The notable knobs:
+`./sbxloop.toml`, `pyproject.toml [tool.sbxloop]`, and a user-level
+`~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) for settings
+that follow you rather than the checkout. `sbxloop init` writes a commented
+starter file; `sbxloop config show` prints every resolved value and where it
+came from. The notable knobs:
 
 | Key                                    | Default            | Meaning                                                                                                 |
 | -------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
@@ -656,9 +674,29 @@ where it came from. The notable knobs:
 | `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
 | `[limits]`                             | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                         |
-| `[daemon] workspace_isolation`         | `clone`            | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).        |
-| `[daemon] refresh_workspace`           | `true`             | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                         |
-| `[daemon] state_dir`                   | unset              | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above).   |
+
+test failure.
+exhausted" error instead of letting an in-VM OOM surface as an inexplicable
+memory transiently) fails the task with an explicit "sandbox memory
+a warning; `mem_abort` (off by default, because a parallel test run spikes
+Memory pressure is instead made visible through `[limits]`: `mem_warn` emits
+memory flags, so the microVM is whatever size sbx gives every sandbox.
+sbxloop does not size the sandbox: `sbx create` is called without CPU or
+
+pytest run's first traceback and its failure summary both survive.
+critic keeps the first 2 KB and the last 4 KB of each command, so a long
+a starting point (4 h wall clock, tool cap 80). Verify output handed to the
+clock. [`contrib/presets/large-repo.toml`](contrib/presets/large-repo.toml) is
+minutes of test time, and 20 tasks × 3 attempts × verify presses on the wall
+packages to orient in — wants more headroom: one verify pass alone can be
+small greenfield project. A large existing repo — thousands of tests, several
+The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
+
+### Sizing budgets for a larger repository
+
+| `[daemon] workspace_isolation` | `clone` | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning). |
+| `[daemon] refresh_workspace` | `true` | `git fetch` + fast-forward the workspace checkout before each fresh daemon run. |
+| `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
 
 ## Repository layout
 

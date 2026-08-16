@@ -20,6 +20,7 @@ Session strategy per phase (a deliberate design decision):
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
 
 from pydantic import BaseModel
@@ -29,7 +30,7 @@ from sbxloop.engine.model import Issue, PlanModel, SteerVerdict, TaskGraph, Task
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
-from sbxloop.verifylint import lint_verify_commands
+from sbxloop.verifylint import UV_LOCKFILE, lint_verify_commands
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
@@ -40,6 +41,19 @@ EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 OUTPUT_CLIP = 6_000
+# Verify output keeps head + tail (#253): a pytest run over hundreds of
+# tests prints the failing assertions in the middle/top of its output and
+# only a "N failed" summary at the bottom, so a tail-only clip handed the
+# critic a summary with no assertion text. The head is the first failure's
+# traceback; the tail is the summary and the last failure.
+VERIFY_HEAD_CLIP = 2_000
+VERIFY_TAIL_CLIP = 4_000
+
+# Every verify failure fed back to the executor starts with this; the
+# engine counts occurrences to headline "N more" in the live stream. It is
+# a display convention only — provenance decisions read the persisted
+# verify attempt, never this text (critic feedback is agent-authored).
+VERIFY_FAILURE_PREFIX = "verify command failed:"
 
 # Persona label per phase prompt: stamped onto the job's agent.* events (via
 # WorkerClient.submit) so the transcript header says WHO is responding
@@ -84,6 +98,18 @@ def clip(text: str | None, limit: int = OUTPUT_CLIP) -> str:
     return f"...(clipped)...\n{text[-limit:]}"
 
 
+def clip_head_tail(
+    text: str | None, head: int = VERIFY_HEAD_CLIP, tail: int = VERIFY_TAIL_CLIP
+) -> str:
+    """Keep the first ``head`` and last ``tail`` characters, eliding the
+    middle with a marker that says how much was dropped."""
+    text = text or ""
+    if len(text) <= head + tail:
+        return text
+    dropped = len(text) - head - tail
+    return f"{text[:head]}\n...(clipped {dropped} chars)...\n{text[-tail:]}"
+
+
 class PhaseRunner:
     """Runs the six phases for one run against the agent sandbox's worker."""
 
@@ -95,6 +121,7 @@ class PhaseRunner:
         outcome: str,
         *,
         workdir: str | None = None,
+        workspace: Path | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
@@ -104,6 +131,14 @@ class PhaseRunner:
         # discovered workspace mount, or the harvest dir. Evidence and verify
         # commands must run where the executor wrote its files.
         self.workdir = workdir
+        # The host-side workspace directory (the run's clone), consulted for
+        # project-shape facts the verify-command lint keys on — a `uv.lock`
+        # at the root flips the Python convention (#250). Host-side because
+        # the lint runs at JSON acceptance, where a round trip into the VM
+        # per retry would cost more than the check is worth; the workspace
+        # is mounted identically in the common case, and an unmounted run
+        # still starts from this clone.
+        self.workspace = workspace
         # Standing chat guidance (steer_run verdicts), injected into every
         # later plan/execute prompt. The engine appends live entries and
         # replays persisted ones on resume.
@@ -114,6 +149,19 @@ class PhaseRunner:
 
     def _guidance(self) -> str:
         return bullet_list(self.user_guidance)
+
+    def _lint_verify_commands(self, commands: Sequence[str]) -> list[str]:
+        """Verify-command lint under this run's toolchains and project shape.
+
+        Re-checks the lockfile every time rather than once at construction:
+        on a mounted workspace the executor may have created ``uv.lock`` in
+        an earlier task, and later plans should be held to the convention
+        the workspace now has.
+        """
+        uv_project = self.workspace is not None and (self.workspace / UV_LOCKFILE).is_file()
+        return lint_verify_commands(
+            commands, self.config.sandbox.effective_languages, uv_project=uv_project
+        )
 
     # -- job plumbing ------------------------------------------------------
 
@@ -257,11 +305,10 @@ class PhaseRunner:
         workaround at verify time (field failure r12ygfd7t); rejecting at
         JSON acceptance costs one retry with the rule quoted.
         """
-        languages = self.config.sandbox.effective_languages
         problems = [
             f"- task {task.id}: {message}"
             for task in graph.tasks
-            for message in lint_verify_commands(task.verify_commands, languages)
+            for message in self._lint_verify_commands(task.verify_commands)
         ]
         if problems:
             raise ValueError(
@@ -289,9 +336,7 @@ class PhaseRunner:
     def _check_plan(self, plan: PlanModel) -> None:
         """Semantic plan validation: egress bounds + verify-command lint."""
         self._check_plan_egress(plan)
-        problems = lint_verify_commands(
-            plan.verify_commands, self.config.sandbox.effective_languages
-        )
+        problems = self._lint_verify_commands(plan.verify_commands)
         if problems:
             raise ValueError(
                 "verify commands violate the sandbox's toolchain conventions:\n"
@@ -377,6 +422,13 @@ class PhaseRunner:
         )
         return verdict
 
+    @staticmethod
+    def verify_commands(task: TaskRecord, plan: PlanModel) -> list[str]:
+        """The exact command list VERIFY will run: spec-level checks first,
+        then the plan's, deduplicated. Shown to the scrutinizer verbatim so
+        it judges the same checks the mechanical phase runs (#231)."""
+        return list(dict.fromkeys(task.spec.verify_commands + plan.verify_commands))
+
     def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> CriticOutcome:
         try:
             evidence = self.shell_batch([command for _, command in EVIDENCE_COMMANDS])
@@ -396,8 +448,12 @@ class PhaseRunner:
                 "task_description": task.spec.description or "(no further description)",
                 "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
                 "plan_steps": bullet_list(plan.steps),
+                "prior_feedback": clip(task.last_feedback) or "(none — first attempt)",
                 "executor_report": clip(executor_report) or "(executor produced no report)",
                 "evidence": "\n\n".join(evidence_parts) or "(no evidence gathered)",
+                "verify_commands": bullet_list(
+                    self.verify_commands(task, plan), empty="(no verify commands)"
+                ),
             },
             allowed=("pass", "revise"),
         )
@@ -482,15 +538,16 @@ class PhaseRunner:
 
     def verify(self, task: TaskRecord, plan: PlanModel) -> VerifyOutcome:
         """Run every verify command; the transcript rides on the outcome."""
-        commands = list(dict.fromkeys(task.spec.verify_commands + plan.verify_commands))
+        commands = self.verify_commands(task, plan)
         failures: list[str] = []
         results: list[str] = []
         for result in self.shell_batch(commands) if commands else []:
-            output = clip(result.output, 1_500)
+            output = clip_head_tail(result.output)
             results.append(f"$ {result.command}\n(exit {result.exit_code})\n{output}")
             if result.exit_code != 0:
                 failures.append(
-                    f"verify command failed: `{result.command}` (exit {result.exit_code})\n{output}"
+                    f"{VERIFY_FAILURE_PREFIX} `{result.command}` "
+                    f"(exit {result.exit_code})\n{output}"
                 )
         return VerifyOutcome(
             passed=not failures,

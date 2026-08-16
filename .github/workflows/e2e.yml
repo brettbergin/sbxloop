@@ -17,6 +17,9 @@ on:
 
 env:
   SBX_INSTALL_DIR: /home/runner/.docker/sbx
+  # state_dir defaults to ~/.sbxloop; the steps below read the run's
+  # state.db / runs/ from the checkout, so pin state to the workspace.
+  SBXLOOP_STATE_DIR: .sbxloop
 
 jobs:
   e2e:
@@ -73,20 +76,18 @@ jobs:
       # The full sbx conformance suite against the real sbx binary: every
       # field-learned assumption (secret visibility under exec, cp dir
       # semantics, workspace mount discovery, ...) probed in a live scratch
-      # sandbox. Drift against the verdicts this codebase was built for is
-      # surfaced as a workflow warning — the release-gate question is
-      # tracked in #52.
+      # sandbox. Drift against the verdicts this codebase was built for
+      # FAILS the lane (#226): the 0.38 ls/mount changes (#210) were exactly
+      # the kind of drift a warning line lets through. The scheduled
+      # sbx-conformance workflow runs the same gate against the newest sbx
+      # release ahead of adoption.
       - name: sbx conformance suite (doctor --deep)
         if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
         env:
           SBXLOOP_APP_NAME: sbxloop-e2e
           COPILOT_GITHUB_TOKEN: ${{ secrets.E2E_COPILOT_GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.E2E_GH_TOKEN }}
-        run: |
-          uv run sbxloop doctor --deep | tee doctor-deep.out
-          if grep -q "sbx drift" doctor-deep.out; then
-            echo "::warning::sbx conformance drift detected — see the doctor --deep output above"
-          fi
+        run: uv run sbxloop doctor --deep --fail-on-drift
 
       - name: Smoke run
         if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
@@ -103,9 +104,9 @@ jobs:
       # First real-sbx confirmation of workspace mount/harvest mode: the file
       # the agent writes must land on the HOST and be discoverable. Also the
       # validation point for Copilot working_directory and sbx cp directory
-      # semantics (see TODO(e2e) markers in provision.py / engine.py /
-      # deliver.py) — the harvest and os.chdir fallbacks stay until this
-      # passes.
+      # semantics (this step's name is what a `TODO(e2e "...")` marker in
+      # the source may cite — see tests/unit/test_e2e_markers.py) — the
+      # harvest and os.chdir fallbacks stay until this passes.
       - name: Assert artifacts landed on the host
         if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
         env:
@@ -172,6 +173,39 @@ jobs:
           batch_progress = [e for e in events if e["type"] == "gh.op_progress"]
           assert batch_progress, "no gh.op_progress events — blob batching not exercised"
           EOF
+
+      # Record-and-replay feed for the GitHub error fixture (#226): every
+      # worker-shaped GitHub error string a real run produced, so a unit
+      # stub never has to invent one (the 404-vs-409 empty-repo bug, #219).
+      # Promote entries into tests/fixtures/github_field_errors.json by hand,
+      # with the run id as provenance.
+      - name: Capture GitHub error shapes
+        if: ${{ always() && vars.E2E_SMOKE_ENABLED == 'true' }}
+        run: |
+          uv run --no-project python - <<'EOF'
+          import json, sqlite3, pathlib
+
+          path = pathlib.Path(".sbxloop/state.db")
+          captured = []
+          if path.exists():
+              db = sqlite3.connect(path)
+              rows = db.execute(
+                  "SELECT run_id, type, data_json FROM events WHERE data_json LIKE '%HTTP %' ORDER BY seq"
+              ).fetchall()
+              for run_id, kind, data_json in rows:
+                  data = json.loads(data_json)
+                  error = data.get("error") or data.get("message")
+                  if isinstance(error, str) and "HTTP " in error:
+                      captured.append({"run_id": run_id, "event": kind, "message": error})
+          pathlib.Path("github-error-shapes.json").write_text(json.dumps(captured, indent=2) + "\n")
+          print(f"captured {len(captured)} GitHub error shape(s)")
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && vars.E2E_SMOKE_ENABLED == 'true' }}
+        with:
+          name: github-error-shapes
+          path: github-error-shapes.json
+          if-no-files-found: ignore
 
       - name: Cleanup
         if: always()

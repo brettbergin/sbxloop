@@ -7,7 +7,10 @@ Failure semantics:
   skipped and the run continues, finishing ``failed`` if any task failed.
   One exception: revisions exhausted by *verify-command* failures spend a
   replan first when budget remains — the executor cannot edit verify
-  commands, so only a fresh plan can unstick a broken check.
+  commands, so only a fresh plan can unstick a broken check. The faster
+  route out (#231): when the scrutinizer passes the work after a verify
+  failure and flags the *check itself* as wrong (``verify_suspect``), the
+  replan is spent immediately instead of after the revisions burn.
 - Infrastructure errors (worker/sbx crashes) propagate after state is
   persisted — equivalent to a kill. ``resume()`` re-provisions a fresh
   sandbox pair (sandboxes are cattle; the workspace and SQLite state
@@ -46,10 +49,11 @@ from sbxloop.engine.model import (
     SteerVerdict,
     TaskRecord,
     TaskState,
+    Verdict,
     artifacts_dir,
     scan_artifacts,
 )
-from sbxloop.engine.phases import CriticOutcome, PhaseRunner, clip
+from sbxloop.engine.phases import VERIFY_FAILURE_PREFIX, CriticOutcome, PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -484,7 +488,12 @@ class LoopEngine:
                     reporter, detach = self._attach_reporter(github, run_id, outcome)
                     try:
                         phases = PhaseRunner(
-                            agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                            agent,
+                            self.config,
+                            run_id,
+                            outcome,
+                            workdir=pair.agent_workdir,
+                            workspace=pair.workspace,
                         )
                         # Replay persisted chat guidance (steer_run verdicts)
                         # so a resumed run keeps the direction the user set.
@@ -978,11 +987,105 @@ class LoopEngine:
             started_at=started,
         )
         self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
+        if self._replan_suspect_verify(run_id, task, verdict):
+            return
         if verdict.verdict == "revise":
             self._register_revision(run_id, task, verdict.feedback or "scrutiny found issues")
+            return
+        task.last_feedback = ""
+        self._set_task_state(run_id, task, "verifying")
+
+    def _last_verify_failure(self, run_id: str, task: TaskRecord) -> str | None:
+        """The verify feedback that triggered the revision now under review,
+        or None if that revision was not verify-triggered.
+
+        Read from the persisted verify attempt rather than
+        ``task.last_feedback``: feedback text is agent-authored (a critic's
+        ``revise`` may open with anything, including the verify-failure
+        wording), so only the phase ledger can say what actually ran. The
+        attempt numbers line up because verify runs at attempt ``revisions
+        + 1`` and a failure bumps ``revisions`` before the next execute — so
+        the last verify is the trigger iff its attempt equals the current
+        revision count. A replan resets revisions to 0, which no verify
+        attempt can match, so the old plan's failures do not carry over.
+        """
+        row = self.store.latest_phase_attempt(run_id, task.spec.id, "verify")
+        if row is None or row["status"] != "failed" or row["attempt"] != task.revisions:
+            return None
+        try:
+            feedback = json.loads(row["output_json"] or "{}").get("feedback")
+        except ValueError:
+            return None
+        return feedback if isinstance(feedback, str) else None
+
+    def _replan_suspect_verify(self, run_id: str, task: TaskRecord, verdict: Verdict) -> bool:
+        """Spend a replan now when the scrutinizer passed the work but ruled
+        the verify command itself wrong (#231). Returns True if the task was
+        sent back to planning.
+
+        Field failure r567rsm4e: a portable, runnable check asserting an
+        ``od`` column layout that never matches — correct code, wrong check,
+        130+ executor tool calls across revisions before verify exhaustion
+        finally replanned (#94). The scrutinizer is the one stage that sees
+        the failing command next to the passing code, so its ruling is the
+        earliest point the loop can act.
+
+        The ruling is only honored on a ``pass`` — a ``revise`` means the
+        work is not done either, and the executor's fix comes first — and
+        only when backed by evidence: the revision being reviewed was itself
+        triggered by a verify failure (read from the persisted verify
+        attempt, not from feedback text), so a speculative flag on a check
+        that has never run cannot cost a replan on a fine plan; and only
+        within the replan budget, since a task that has no replans left can
+        only fail bounded, not loop. Either way the ruling is put in the
+        live stream: silently ignoring a critic's finding is the
+        transcript-only failure #94 already fixed once.
+        """
+        if not verdict.verify_suspect:
+            return False
+        reason = verdict.verify_suspect_reason
+        failure = self._last_verify_failure(run_id, task)
+        budget = task.replans < self.config.budgets.max_replans_per_task
+        honored = verdict.verdict == "pass" and failure is not None and budget
+        if honored:
+            message = f"scrutinizer passed the work but ruled the verify command wrong: {reason}"
+        elif verdict.verdict != "pass":
+            message = (
+                "scrutinizer flagged the verify command as wrong but asked for "
+                f"revisions first; the work is revised before the check is judged: {reason}"
+            )
+        elif failure is None:
+            message = (
+                "scrutinizer flagged the verify command as wrong before it has "
+                f"failed; ignored until verify runs: {reason}"
+            )
         else:
-            task.last_feedback = ""
-            self._set_task_state(run_id, task, "verifying")
+            message = (
+                "scrutinizer flagged the verify command as wrong but no replan "
+                f"budget remains; verifying anyway: {reason}"
+            )
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="scrutinize",
+            status="verify_suspect",
+            honored=honored,
+            message=message,
+        )
+        if not honored:
+            return False
+        task.replans += 1
+        task.plan = None
+        task.revisions = 0
+        task.last_feedback = (
+            "the reviewer judged the work correct and the verify command itself "
+            f"wrong: {reason}\n\nWrite a plan whose verify_commands check what "
+            "the task actually requires — prefer the project's test runner over "
+            "shell pipelines. The failing check was:\n\n" + (failure or "")
+        )
+        self._set_task_state(run_id, task, "planning")
+        return True
 
     def _phase_verify(
         self,
@@ -1014,7 +1117,7 @@ class LoopEngine:
         # Put the failing command in the live stream: without this the
         # transcript jumps verifying -> failed and the reason only exists
         # in the phase_attempts table.
-        failure_count = feedback.count("verify command failed:")
+        failure_count = feedback.count(VERIFY_FAILURE_PREFIX)
         first_line = feedback.splitlines()[0] if feedback else "verify failed"
         self.bus.emit(
             HostEventTypes.PHASE_END,
@@ -1249,15 +1352,23 @@ class LoopEngine:
 
     def _resource_abort_reason(self) -> str | None:
         """Non-None when the agent sandbox's last resource sample crossed
-        the disk_abort threshold (the worker classifies; the level rides on
-        the event)."""
+        an abort threshold (the worker classifies; the level rides on the
+        event). Names the resource that tripped so an OOM-bound task is not
+        diagnosed as a full disk (#253)."""
         sample = self._last_resources.get("agent")
-        if sample and sample.get("level") == "abort":
+        if not sample or sample.get("level") != "abort":
+            return None
+        limits = self.config.limits
+        disk = sample.get("disk_used_pct")
+        if isinstance(disk, (int, float)) and limits.disk_abort > 0 and disk >= limits.disk_abort:
             return (
-                f"sandbox disk exhausted: {sample.get('disk_used_pct')}% of the workspace "
-                f"filesystem is used (limits.disk_abort={self.config.limits.disk_abort}%)"
+                f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
+                f"(limits.disk_abort={limits.disk_abort}%)"
             )
-        return None
+        return (
+            f"sandbox memory exhausted: {sample.get('mem_used_pct')}% of memory is used "
+            f"(limits.mem_abort={limits.mem_abort}%)"
+        )
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
         if self._cancel_event.is_set():

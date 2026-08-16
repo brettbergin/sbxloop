@@ -59,19 +59,23 @@ def classify_level(
     disk_warn: float = 0.0,
     disk_abort: float = 0.0,
     mem_warn: float = 0.0,
+    mem_abort: float = 0.0,
 ) -> str:
     """Guardrail level for a sample: "ok", "warn", or "abort".
 
     A threshold of 0 (the worker default when the host passes none) disables
-    that guardrail. Only disk has an abort level — memory pressure warns.
+    that guardrail. Memory abort is opt-in on the host side (#253) because
+    a parallel test run spikes MemAvailable transiently; the worker just
+    classifies whatever thresholds it is handed.
     """
     disk = sample.get("disk_used_pct")
-    if isinstance(disk, (int, float)):
-        if disk_abort > 0 and disk >= disk_abort:
-            return "abort"
-        if disk_warn > 0 and disk >= disk_warn:
-            return "warn"
     mem = sample.get("mem_used_pct")
+    if isinstance(disk, (int, float)) and disk_abort > 0 and disk >= disk_abort:
+        return "abort"
+    if isinstance(mem, (int, float)) and mem_abort > 0 and mem >= mem_abort:
+        return "abort"
+    if isinstance(disk, (int, float)) and disk_warn > 0 and disk >= disk_warn:
+        return "warn"
     if isinstance(mem, (int, float)) and mem_warn > 0 and mem >= mem_warn:
         return "warn"
     return "ok"

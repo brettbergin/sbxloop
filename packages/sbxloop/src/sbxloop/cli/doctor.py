@@ -14,12 +14,13 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
 import sbxloop
-from sbxloop.config import load_config
+from sbxloop.config import load_config, load_config_with_sources
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.bake import load_bake_record
@@ -59,7 +60,7 @@ def collect_checks(
     cli: SbxCLI | None = None,
     progress: ProgressFn | None = None,
 ) -> list[Check]:
-    config = load_config(env=env)
+    config, sources = load_config_with_sources(env=env)
     cli = cli or SbxCLI(app_name=config.app_name or None)
     checks: list[Check] = []
     report = progress or (lambda _message: None)
@@ -187,6 +188,23 @@ def collect_checks(
                     hard=False,
                 )
             )
+            # git is baseline agent tooling (#252): a template without it
+            # costs an apt top-up on every provision, and loses git outright
+            # wherever apt is unreachable — worth a row, never a hard fail.
+            if record.git is None:
+                git_detail = (
+                    "not recorded by this bake (older sbxloop) — provisioning probes and "
+                    "installs git per run; re-run `sbxloop bake` to carry it in the template"
+                )
+            elif record.git:
+                git_detail = "git on PATH in the baked template"
+            else:
+                git_detail = (
+                    "git missing from the baked template — provisioning tries an apt "
+                    "install per run; check the apt mirrors are reachable and re-run "
+                    "`sbxloop bake`"
+                )
+            checks.append(Check("git in template", record.git is not False, git_detail, hard=False))
         else:
             checks.append(
                 Check(
@@ -335,7 +353,34 @@ def collect_checks(
     except OSError as exc:
         checks.append(Check("state dir", False, f"not writable: {exc}"))
 
+    legacy = _legacy_state_dir(config.state_dir, sources)
+    if legacy is not None:
+        checks.append(
+            Check(
+                "legacy state dir",
+                False,
+                f"{legacy} exists but state_dir is unconfigured, so runs, "
+                f"status and logs now use {config.state_dir}; set "
+                'state_dir = ".sbxloop" in sbxloop.toml to keep project-scoped '
+                "state, or move it to the new location",
+                hard=False,
+            )
+        )
+
     return checks
+
+
+def _legacy_state_dir(state_dir: Path, sources: dict[str, str]) -> Path | None:
+    """A ``./.sbxloop`` left by the former relative default that
+    an unconfigured run would now silently ignore. Only reported when the
+    default is in effect and points elsewhere: an explicit relative
+    ``state_dir = ".sbxloop"`` is the supported project-scoped opt-in."""
+    if sources.get("state_dir") != "default":
+        return None
+    candidate = Path.cwd() / ".sbxloop"
+    if not candidate.is_dir() or candidate.resolve() == state_dir.resolve():
+        return None
+    return candidate
 
 
 def _clean(detail: str, limit: int = 300) -> str:
@@ -393,7 +438,22 @@ def render_conformance(console: Console, report: ConformanceReport) -> None:
         console.print(f"[bold yellow]{report.deep_run_hint}[/]", highlight=False)
 
 
-def run_doctor(console: Console, env: dict[str, str] | None = None, *, deep: bool = False) -> bool:
+def run_doctor(
+    console: Console,
+    env: dict[str, str] | None = None,
+    *,
+    deep: bool = False,
+    fail_on_drift: bool = False,
+) -> bool:
+    """Run the host checks and the conformance suite; return readiness.
+
+    ``fail_on_drift`` turns the conformance verdicts into a gate: any drift,
+    probe error, unprobed seam, or a suite that could not run makes the
+    result False. Interactive doctor keeps drift as a loud warning (the
+    dependent code paths probe-don't-assume at runtime, so runs may still
+    work); CI lanes whose whole job is catching sbx drift ahead of a field
+    failure pass the flag (#226).
+    """
     import os
 
     env = dict(os.environ) if env is None else env
@@ -419,7 +479,7 @@ def run_doctor(console: Console, env: dict[str, str] | None = None, *, deep: boo
     sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
     if not sbx_present:
         console.print("[dim]sbx conformance skipped: no usable sbx binary[/]", highlight=False)
-        return ready
+        return ready and not fail_on_drift
     try:
         report = run_conformance(
             cli,
@@ -430,9 +490,17 @@ def run_doctor(console: Console, env: dict[str, str] | None = None, *, deep: boo
         )
     except SbxError as exc:
         console.print(f"[yellow]sbx conformance suite failed to run:[/] {_clean(str(exc))}")
-        return ready
+        return ready and not fail_on_drift
     render_conformance(console, report)
-    # Drift is a loud warning, not a failure: the dependent code paths all
-    # probe-don't-assume at runtime, so runs may still work \u2014 but the verdict
-    # snapshot above is exactly what a bug report should include.
+    # By default drift is a loud warning, not a failure: the dependent code
+    # paths all probe-don't-assume at runtime, so runs may still work \u2014 but
+    # the verdict snapshot above is exactly what a bug report should include.
+    if fail_on_drift and report.unverified:
+        console.print(
+            f"[bold red]sbx conformance gate failed:[/] {len(report.unverified)} probe(s) "
+            f"drifted, errored, or are unprobed under sbx {report.version or '(unknown)'} "
+            "(--fail-on-drift)",
+            highlight=False,
+        )
+        return False
     return ready

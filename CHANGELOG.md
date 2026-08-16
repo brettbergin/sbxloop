@@ -40,6 +40,19 @@ All notable changes to sbxloop are documented here. The project adheres to
   previous stream-everything behaviour is `"verbose"`; the full stream stays
   in `sbxloop logs`.
 
+### Changed
+
+- `state_dir` now defaults to the per-user `~/.sbxloop` instead of the
+  relative `.sbxloop` (#224). The old default meant "wherever the shell was
+  standing": `sbxloop status`/`logs` showed an empty world from any other
+  directory, and a run started from inside a checkout dropped a state dir into
+  it (field run `r5a1d9m9c`; #218 patched the dirty-probe symptom). A relative
+  `state_dir` remains the explicit opt-in for project-scoped state and is now
+  anchored at the config's directory; `~` expands. **Migration:** an existing
+  `./.sbxloop` keeps working when `state_dir = ".sbxloop"` is set in
+  `sbxloop.toml` (or moved to `~/.sbxloop`); `sbxloop doctor` warns when an
+  unconfigured run finds a legacy `./.sbxloop` it would otherwise ignore.
+
 ### Added
 
 - `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed
@@ -92,6 +105,35 @@ All notable changes to sbxloop are documented here. The project adheres to
   source as "`<user>` via sbxloop daemon ctl". The bridge still ignores
   bot-authored messages by design.
 
+- The scrutinizer now judges the verify commands as well as the work (#231):
+  its prompt carries the exact command list VERIFY will run and the feedback
+  the executor was addressing, and its verdict gains `verify_suspect` /
+  `verify_suspect_reason` (a flag without a reason is rejected and retried).
+  When a revision was triggered by a verify failure (read from the persisted
+  verify attempt, not from feedback text) and the scrutinizer passes the
+  work while ruling the check itself wrong,
+  the engine spends a replan immediately — the planner is told why the old
+  check was wrong — instead of burning the remaining revisions against a
+  check the executor cannot edit (field failure r567rsm4e: a portable,
+  runnable `od | grep` check asserting a column layout `od` never prints).
+  A speculative flag on a check that has not failed yet, or one raised with
+  no replan budget left, is surfaced but not acted on. Every ruling is a
+  `phase.end` event (`status=verify_suspect`, `honored`), shown in the
+  Discord bridge and the transcript.
+
+- `~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) is read as
+  the lowest-precedence config layer, below `pyproject.toml [tool.sbxloop]`,
+  for settings that follow the operator rather than the checkout (`model`,
+  `app_name`, `[discord]`). `sbxloop config show` reports it as
+  `user config`.
+
+- Every engine prompt template (`engine/prompts/*.md`) now opens with an HTML
+  comment stating its contract — `string.Template` syntax, the `$`-escaping
+  rule, the variables it takes, and which test guards which section — and
+  `docs/architecture.md` gains a "Prompt templates" paragraph. `render()`
+  strips the header before the prompt reaches the model, so rendered prompts
+  are byte-identical to before (#225).
+
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
   boundaries (fences re-opened with their language) instead of clipped;
@@ -103,6 +145,56 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+
+- Tighter drift loop around the fake sbx and the GitHub stubs (#226):
+  `sbxloop doctor --fail-on-drift` exits 1 when any conformance probe
+  drifted, errored, or is unprobed for the installed sbx build; the e2e lane
+  uses it instead of a workflow warning, and a new scheduled
+  `sbx-conformance` workflow runs the deep suite against the newest sbx
+  release ahead of adoption with a rolling verdict cache (cross-version flips
+  reported). Unit stubs now replay worker-shaped GitHub error strings from
+  `tests/fixtures/github_field_errors.json` (field-recorded entries name
+  their run; synthetic ones are marked as such) and a guard test rejects
+  inline `HTTP 404`/`409` literals in unit tests, so the 404-for-empty-repo
+  stub of #219 cannot recur; the e2e workflow uploads every GitHub error
+  string a real run produced for promotion into the fixture. Every
+  `TODO(e2e ...)` marker must now cite an issue or an e2e step name
+  (`tests/unit/test_e2e_markers.py`).
+
+- `git` is now baseline agent tooling, provisioned on every agent sandbox
+  independent of `[sandbox] languages` (#252): the dev-tools ensure probes
+  `command -v git` and installs it in the same pooled apt call as the selected
+  toolchains; a prebaked template that lacks it is topped up from the single
+  prebake probe. `sbxloop bake` records whether git landed and `sbxloop doctor`
+  shows a soft "git in template" row.
+
+- **uv-aware Python toolchain** (#250). The `python` toolchain now installs
+  `uv` from its pinned, checksum-verified GitHub release (per-arch digests,
+  like Node/Go) and a uv-managed Python 3.13 (`python3.13` linked onto PATH),
+  and its probe checks the interpreter series rather than mere presence —
+  uv-workspace repos declaring `requires-python >= 3.13` (sbxloop's own
+  included) previously failed at `uv sync` because the sandbox had neither.
+  The plan/execute/decompose prompts carry a "uv projects" note per Python
+  block (`uv.lock` present → `uv sync --all-packages` in steps, `uv run …`
+  to verify), and the verify-command lint requires `uv run` heads when the
+  workspace root has a `uv.lock` (bare `pytest` and `.venv/bin/…` are both
+  rejected with the uv remedy; without a lockfile `.venv/bin/…` is
+  unchanged). `astral.sh` (uv's installer host) joins the declarable
+  registries, and `release-assets.githubusercontent.com` (where GitHub
+  release-asset downloads redirect) joins the agent sandbox's provisioning
+  allowlist so both downloads actually complete. `sbxloop doctor --deep`
+  gains a `python-version` conformance row reporting the template's own
+  `python3` against the pinned series.
+
+- Budgets and resources for larger repositories (#253): verify output handed
+  to the critic keeps the first 2 KB and the last 4 KB of each command
+  (previously the last 1.5 KB only, so a long pytest run's failure summary
+  arrived without any assertion text); new `[limits] mem_abort` threshold
+  (off by default) fails the task with an explicit "sandbox memory exhausted"
+  error the way `disk_abort` does for disk, instead of an in-VM OOM surfacing
+  as a confusing test failure; `contrib/presets/large-repo.toml` documents a
+  4 h wall clock / 80 tool-call preset and the fact that sbxloop passes no
+  CPU/memory sizing to `sbx create`.
 
 - Daemon guardrails now cover recovery, restarts and multi-daemon setups
   (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted

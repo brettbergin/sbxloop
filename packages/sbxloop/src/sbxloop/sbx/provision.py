@@ -64,6 +64,10 @@ AGENT_ALLOW_DOMAINS = (
     "api.github.com",
     "github.com",
     "objects.githubusercontent.com",  # copilot CLI runtime downloads
+    # GitHub release-asset downloads (`github.com/<org>/<repo>/releases/download/…`)
+    # answer with a redirect here; the Python toolchain's uv tarball and its
+    # uv-managed interpreter both come that way at provision time (#250).
+    "release-assets.githubusercontent.com",
     "raw.githubusercontent.com",
 )
 GITHUB_ALLOW_DOMAINS = (

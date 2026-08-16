@@ -1850,15 +1850,25 @@ def doctor(
             "scratch sandbox) and refresh the version-keyed verdict cache.",
         ),
     ] = False,
+    fail_on_drift: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-drift",
+            help="Exit 1 when any sbx conformance probe drifted, errored, or is "
+            "unprobed for the installed sbx version (CI gate; drift is otherwise "
+            "a warning).",
+        ),
+    ] = False,
 ) -> None:
     """Check that this host is ready to run sbxloop."""
-    ok = run_doctor(console, deep=deep)
+    ok = run_doctor(console, deep=deep, fail_on_drift=fail_on_drift)
     raise typer.Exit(0 if ok else 1)
 
 
 DEFAULT_CONFIG_TOML = """\
 # sbxloop configuration. Every key is optional; these are the defaults.
-# Precedence: SBXLOOP_* env vars > this file > pyproject [tool.sbxloop].
+# Precedence: SBXLOOP_* env vars > this file > pyproject [tool.sbxloop]
+# > ~/.config/sbxloop/sbxloop.toml (user-level defaults).
 
 # Copilot model for agent sessions ("auto" lets the SDK choose).
 model = "auto"
@@ -1867,8 +1877,10 @@ model = "auto"
 # If set, that isolated state needs its own `sbx --app-name <name> login`
 # and `sbx --app-name <name> policy init balanced`.
 app_name = ""
-# Where run state (SQLite) and per-run workspaces live.
-state_dir = ".sbxloop"
+# Where run state (SQLite) and per-run workspaces live. Per-user by default
+# so status/logs see the same runs from any directory; a relative path
+# (e.g. ".sbxloop") scopes state to this project instead.
+state_dir = "~/.sbxloop"
 # Keep sandboxes around after a run (for debugging).
 keep_sandboxes = false
 # Keep the pair alive only when a run fails; inspect with `sbxloop shell <run>`.
@@ -1953,6 +1965,9 @@ exclude = [
 ]
 
 [budgets]
+# Sized for a small greenfield project. A large existing repo (thousands of
+# tests, a multi-package tree to orient in) wants a bigger wall clock and
+# tool cap — see contrib/presets/large-repo.toml.
 max_revisions_per_task = 2
 max_replans_per_task = 1
 max_tasks = 20
@@ -1964,10 +1979,12 @@ max_tool_calls_per_phase = 40   # 0 = unbounded; past it the agent is told to wr
 # Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
 # the worker heartbeat and shown as a gauge in the TUI status panel.
 # Crossing disk_abort fails the current task with an explicit
-# "sandbox disk exhausted" error.
+# "sandbox disk exhausted" error; mem_abort does the same for memory (off by
+# default: a parallel test run legitimately spikes memory for a heartbeat).
 disk_warn = 85.0
 disk_abort = 95.0
 mem_warn = 90.0
+mem_abort = 0.0
 
 [daemon]
 # `sbxloop daemon` — the always-on outer loop. Discovers work and runs each

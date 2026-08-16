@@ -149,6 +149,17 @@ class TestBaselineTiers:
         allow, deny = effective_egress_bounds(Config())
         assert egress_rejection("center.conan.io", allow, deny) is None
 
+    def test_uv_installer_host_is_declarable_not_baseline(self) -> None:
+        # #250: astral.sh was in neither tier, so a plan naming uv's own
+        # installer was refused outright. Provisioning installs uv from its
+        # GitHub release, so the host is a declare-if-needed second line
+        # (it serves a curl-into-shell installer, not a package registry)
+        # rather than something every sandbox carries.
+        assert "astral.sh" in WELL_KNOWN_REGISTRY_DOMAINS
+        assert "astral.sh" not in BASELINE_REGISTRY_DOMAINS
+        allow, deny = effective_egress_bounds(Config())
+        assert egress_rejection("astral.sh", allow, deny) is None
+
     def test_vcpkg_is_not_in_either_tier(self) -> None:
         # #171: vcpkg clones ports from GitHub and then fetches source
         # tarballs from whatever upstream each port names — unbounded by

@@ -1,7 +1,16 @@
 """Configuration loading with layered precedence.
 
 Precedence (highest wins): ``SBXLOOP_*`` environment variables >
-``./sbxloop.toml`` > ``pyproject.toml [tool.sbxloop]`` > built-in defaults.
+``./sbxloop.toml`` > ``pyproject.toml [tool.sbxloop]`` >
+``~/.config/sbxloop/sbxloop.toml`` (``$XDG_CONFIG_HOME`` honoured) >
+built-in defaults.
+
+The user-level file is the lowest layer so a project can always override it;
+it exists for settings that follow the operator rather than the checkout
+(``model``, ``app_name``, ``[discord]``). It is located from the *env mapping*
+handed to the loader — never from ``os.environ`` behind the caller's back — so
+hermetic callers (tests, embedders passing ``env={}``) never read the real
+home directory.
 
 Nested keys use ``__`` in environment variables, e.g.
 ``SBXLOOP_BUDGETS__MAX_TASKS=5``. Values are parsed as TOML scalars where
@@ -250,26 +259,35 @@ class Limits(_ConfigModel):
     Thresholds are percent-used of the workspace filesystem / memory; 0
     disables a guardrail. Crossing a warn threshold emits a prominent
     ``sandbox.resources_warning`` event and escalates the TUI gauge;
-    crossing ``disk_abort`` fails the current task with an explicit
-    "sandbox disk exhausted" error instead of letting in-VM tooling fail
-    confusingly on a full disk.
+    crossing ``disk_abort`` / ``mem_abort`` fails the current task with an
+    explicit "sandbox disk/memory exhausted" error instead of letting in-VM
+    tooling fail confusingly on a full disk or under the OOM killer.
+
+    ``mem_abort`` is off by default (#253): sbxloop cannot size the microVM,
+    and a healthy parallel test run on a large repo legitimately spikes
+    MemAvailable for a heartbeat or two — pressure that resolves itself,
+    unlike a full disk. Opt in when an in-VM OOM has been surfacing as a
+    confusing test failure.
     """
 
     disk_warn: float = 85.0
     disk_abort: float = 95.0
     mem_warn: float = 90.0
+    mem_abort: float = 0.0
 
     @model_validator(mode="after")
     def _check_thresholds(self) -> Limits:
-        for name in ("disk_warn", "disk_abort", "mem_warn"):
+        for name in ("disk_warn", "disk_abort", "mem_warn", "mem_abort"):
             value = getattr(self, name)
             if value < 0 or value > 100:
                 raise ValueError(f"limits.{name} must be a percentage in 0..100, got {value}")
-        if 0 < self.disk_abort <= self.disk_warn:
-            raise ValueError(
-                f"limits.disk_abort ({self.disk_abort}) must be greater than "
-                f"limits.disk_warn ({self.disk_warn})"
-            )
+        for warn, abort in (("disk_warn", "disk_abort"), ("mem_warn", "mem_abort")):
+            warn_value, abort_value = getattr(self, warn), getattr(self, abort)
+            if 0 < abort_value <= warn_value:
+                raise ValueError(
+                    f"limits.{abort} ({abort_value}) must be greater than "
+                    f"limits.{warn} ({warn_value})"
+                )
         return self
 
 
@@ -428,6 +446,42 @@ class DiscordConfig(_ConfigModel):
         return self.channel_id is not None
 
 
+USER_CONFIG_SUBPATH = Path("sbxloop") / "sbxloop.toml"
+
+
+def default_state_dir() -> Path:
+    """``~/.sbxloop`` — one per user, wherever the shell happens to stand.
+
+    The default used to be the *relative* ``.sbxloop``, i.e. "cwd at the
+    time": ``sbxloop status`` from another directory showed an empty world,
+    and any command run from inside a checkout dropped a state dir into it
+    (field run ``r5a1d9m9c`` — the isolation probe then refused the next run
+    as dirty). Project-scoped state remains available by setting a relative
+    ``state_dir`` explicitly.
+    """
+    return Path.home() / ".sbxloop"
+
+
+def _home_dir(env: Mapping[str, str]) -> Path:
+    """The home the *loader* should trust: ``env["HOME"]`` when the mapping
+    names one, else the process home. Keeps the default ``state_dir`` and
+    ``~`` expansion consistent with ``user_config_path`` for hermetic
+    callers (``env={"HOME": ...}``), which would otherwise read the user
+    config from the mapped home but resolve state into the real one."""
+    home = env.get("HOME")
+    return Path(home) if home else Path.home()
+
+
+def _expand_home(value: str, home: Path) -> str:
+    """``expanduser`` against an explicit ``home`` (bare ``~`` and ``~/…``
+    only; ``~user`` is left to the field validator)."""
+    if value == "~":
+        return str(home)
+    if value.startswith("~/"):
+        return str(home / value[2:])
+    return value
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # sbx --app-name. Empty (the default) shares the user's normal sbx
@@ -435,7 +489,9 @@ class Config(_ConfigModel):
     # apply directly. Setting a name isolates sbxloop state, but the isolated
     # app-state needs its own `sbx --app-name <name> login` and policy init.
     app_name: str = ""
-    state_dir: Path = Path(".sbxloop")
+    # A relative value is anchored at the config discovery root (the cwd
+    # ``load_config`` was given), not at the process cwd at first use.
+    state_dir: Path = Field(default_factory=default_state_dir)
     keep_sandboxes: bool = False
     # Keep the pair alive only when a run fails, so the evidence (worker
     # stderr, install leftovers, workspace state) survives for
@@ -457,6 +513,13 @@ class Config(_ConfigModel):
     limits: Limits = Field(default_factory=Limits)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
+
+    @field_validator("state_dir", mode="after")
+    @classmethod
+    def _expand_home(cls, value: Path) -> Path:
+        # `state_dir = "~/.sbxloop"` in TOML must mean the home directory,
+        # not a literal "~" directory under the project.
+        return value.expanduser()
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -482,6 +545,25 @@ def _pyproject_layer(cwd: Path) -> dict[str, Any]:
 def _sbxloop_toml_layer(cwd: Path) -> dict[str, Any]:
     path = cwd / "sbxloop.toml"
     if not path.is_file():
+        return {}
+    return _read_toml(path)
+
+
+def user_config_path(env: Mapping[str, str]) -> Path | None:
+    """``$XDG_CONFIG_HOME/sbxloop/sbxloop.toml`` (``~/.config/...`` when
+    unset), or None when ``env`` names neither — the hermetic case."""
+    xdg = env.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / USER_CONFIG_SUBPATH
+    home = env.get("HOME")
+    if home:
+        return Path(home) / ".config" / USER_CONFIG_SUBPATH
+    return None
+
+
+def _user_config_layer(env: Mapping[str, str]) -> dict[str, Any]:
+    path = user_config_path(env)
+    if path is None or not path.is_file():
         return {}
     return _read_toml(path)
 
@@ -562,6 +644,7 @@ def load_config_with_sources(
     env = os.environ if env is None else env
 
     layers: list[tuple[str, dict[str, Any]]] = [
+        ("user config", _user_config_layer(env)),
         ("pyproject.toml", _pyproject_layer(cwd)),
         ("sbxloop.toml", _sbxloop_toml_layer(cwd)),
         ("env", _env_layer(env)),
@@ -574,10 +657,25 @@ def load_config_with_sources(
         for dotted in _flatten(layer):
             sources[dotted] = name
 
+    # Resolve the home-relative parts of ``state_dir`` against the loader's
+    # HOME (not the process environment) before validation, so ``env`` fully
+    # determines where state lands.
+    home = _home_dir(env)
+    if "state_dir" not in merged:
+        merged["state_dir"] = str(home / ".sbxloop")
+    elif isinstance(merged["state_dir"], str):
+        merged["state_dir"] = _expand_home(merged["state_dir"], home)
+
     try:
         config = Config.model_validate(merged)
     except ValidationError as exc:
         raise ConfigError(f"invalid sbxloop configuration: {exc}") from exc
+
+    if not config.state_dir.is_absolute():
+        # An explicit relative state_dir means project-scoped state: pin it
+        # to the directory the config was discovered in so its meaning
+        # cannot drift with a later chdir.
+        config = config.model_copy(update={"state_dir": cwd / config.state_dir})
 
     for dotted in _flatten(config.model_dump()):
         sources.setdefault(dotted, "default")

@@ -822,6 +822,13 @@ def format_for_discord(
             return [line(f"✗ **{phase}**{where}" + (f" — {msg}" if msg else ""))]
         if status == "degraded":
             return [line(f"⚠ **{phase} degraded**{where}" + (f" — {msg}" if msg else ""))]
+        if status == "verify_suspect":
+            # A critic ruling the *check* wrong (#231) is a course change a
+            # human steering the run should see: it either spends a replan
+            # or explains why it did not.
+            return [
+                line(f"🔎 **{phase} suspects the check**{where}" + (f" — {msg}" if msg else ""))
+            ]
         if verbose and msg:
             return [line(f"· {phase}{where} — {msg}")]
         return []
