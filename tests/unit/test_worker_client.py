@@ -592,6 +592,9 @@ class TestInstallFallbacks:
         script_toolchain_probe(fake_sbx, "python", returncode=1)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        # The uv + managed-Python install script (#250) runs after apt; the
+        # fake would otherwise execute it on the host, where dpkg is absent.
+        fake_sbx.script("exec boxa sh -c set -e; case", returncode=0)
         self._script_happy_install(fake_sbx)
         client.install(wheel=wheel, ensure_dev_tools=True)
         apt_cmds = [
@@ -599,8 +602,14 @@ class TestInstallFallbacks:
         ]
         assert apt_cmds == [
             "exec boxa sh -c sudo -n apt-get update -q && "
-            "sudo -n apt-get install -y -q python3-venv python3-pip"
+            "sudo -n apt-get install -y -q python3-venv python3-pip curl ca-certificates"
         ]
+        scripts = [
+            " ".join(c)
+            for c in fake_sbx.invocations("exec")
+            if any("uv python install" in a for a in c)
+        ]
+        assert len(scripts) == 1 and "python3.13" in scripts[0], scripts
 
     def test_ensure_dev_tools_installs_git_as_baseline(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
