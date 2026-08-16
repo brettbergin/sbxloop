@@ -395,11 +395,14 @@ class GitHubIssueSource:
             lines = _cancel_lines(report)
             if not report.requeued:
                 # Neither failed nor triggered: the human decides what
-                # happens next, so no label speaks for them. Re-adding the
-                # trigger label or `!sbx requeue` runs it again fresh.
+                # happens next, so no label speaks for them. `!sbx requeue`
+                # is the reliable way back: re-adding the trigger label to an
+                # unchanged issue is deduplicated by the store (same source
+                # key, same content), so say so instead of promising it.
                 lines.append(
-                    f"To run it again from scratch, re-add `{self.labels.trigger}` "
-                    f"or `!sbx requeue {item.item_id}` in Discord."
+                    f"To run it again from scratch: `!sbx requeue {item.item_id}` in Discord "
+                    f"(re-adding `{self.labels.trigger}` only re-runs it if the issue was "
+                    "edited — an unchanged issue is deduplicated)."
                 )
             self._comment(ops, n, "\n".join(lines))
             if not report.requeued:
