@@ -284,6 +284,24 @@ reset and a **fresh plan** — not a resume of the plan that failed; and
 next dispatch starts over (attempts and backoff kept). The same controls are
 `!sbx items|abandon|retry|requeue` on Discord.
 
+**Workspace posture for unattended runs.** Point `[sandbox] workspace` at a
+**dedicated clone nobody edits** (`git clone <repo> ~/sbxloop-runner/src`),
+not the checkout you work in. Before each fresh run the daemon
+`git fetch`es that clone and fast-forwards its branch to `origin` — never a
+merge or rebase; a diverged branch or a colliding local edit is left alone
+and logged — so runs start from current `origin/<branch>` rather than a
+stale local HEAD (`[daemon] refresh_workspace`). Daemon runs use `clone`
+isolation regardless of `[sandbox] workspace_isolation` (`[daemon] workspace_isolation`, default `clone`): a dirty tree proceeds from committed
+HEAD with a warning, because `auto`'s refusal has no human present to answer
+it. Per-run clones point their `origin` at the source's origin URL (metadata
+only; no credentials leave the host). And the daemon keeps its state
+**outside the workspace** at an absolute path — `[daemon] state_dir`, else
+an explicitly configured `state_dir`, else a pre-existing legacy
+`./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`
+(`~/.local/state/…`) — so a checkout never accretes one full clone per run.
+The daemon prints the resolved location at start; `sbxloop status`/`logs`
+from the runner directory need `SBXLOOP_STATE_DIR` pointed at it.
+
 ### Discord: chronology out, steering in
 
 With `pip install 'sbxloop[discord]'`, `DISCORD_BOT_TOKEN` in the
@@ -623,6 +641,9 @@ where it came from. The notable knobs:
 | `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
 | `[limits]`                             | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                         |
+| `[daemon] workspace_isolation`         | `clone`            | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).        |
+| `[daemon] refresh_workspace`           | `true`             | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                         |
+| `[daemon] state_dir`                   | unset              | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above).   |
 
 ## Repository layout
 

@@ -24,6 +24,9 @@ runner = CliRunner()
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
+    # The daemon anchors its default state dir under XDG state home (#255);
+    # keep that inside tmp so tests never touch the real ~/.local/state.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     return tmp_path
 
 
@@ -414,6 +417,36 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
         assert result.exit_code == 0, result.output
         assert "tick:" in result.output and "no_work" in result.output
+
+    def test_state_dir_defaults_outside_cwd_and_is_announced(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        """#255: daemon state is anchored to XDG state home, not a relative
+        .sbxloop that would nest run clones inside the workspace checkout."""
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        expected = (workdir / "xdg-state" / "sbxloop" / workdir.name).resolve()
+        assert (expected / "state.db").is_file()
+        assert not (workdir / ".sbxloop" / "state.db").exists()
+        assert "state dir:" in result.output and str(expected) in result.output.replace("\n", "")
+
+    def test_legacy_state_dir_keeps_being_used(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        seed_store(workdir)  # an existing ./.sbxloop/state.db from before the change
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "legacy" in result.output
+        assert not (workdir / "xdg-state").exists()
+
+    def test_explicit_daemon_state_dir_wins(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBXLOOP_DAEMON__STATE_DIR", str(workdir / "elsewhere"))
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        assert (workdir / "elsewhere" / "state.db").is_file()
 
 
 class TestDaemonItemControls:

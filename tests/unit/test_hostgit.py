@@ -7,6 +7,7 @@ independent of the code under test.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -347,3 +348,153 @@ class TestResolveDiffBase:
         plain = tmp_path / "plain"
         plain.mkdir()
         assert hostgit.resolve_diff_base(plain, None) is None
+def make_upstream_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """A bare 'origin' plus a checkout cloned from it — the daemon's
+    dedicated-clone layout — so refresh has a real remote to fetch from."""
+    seed = make_repo(tmp_path, "seed")
+    upstream = tmp_path / "upstream.git"
+    git("clone", "--bare", "-q", str(seed), str(upstream), cwd=tmp_path)
+    checkout = tmp_path / "checkout"
+    git("clone", "-q", str(upstream), str(checkout), cwd=tmp_path)
+    return upstream, checkout
+
+
+def push_upstream_commit(tmp_path: Path, upstream: Path, name: str = "pusher") -> str:
+    """Advance origin/main from a *different* clone, like a teammate merging."""
+    other = tmp_path / name
+    git("clone", "-q", str(upstream), str(other), cwd=tmp_path)
+    (other / f"{name}.txt").write_text("more\n")
+    git("add", ".", cwd=other)
+    git("commit", "-q", "-m", f"{name} change", cwd=other)
+    git("push", "-q", "origin", "main", cwd=other)
+    return hostgit.head_commit(other) or ""
+
+
+class TestOriginUrl:
+    def test_clone_reports_its_origin(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        assert hostgit.origin_url(checkout) == str(upstream)
+
+    def test_repo_without_origin_is_none(self, tmp_path: Path) -> None:
+        assert hostgit.origin_url(make_repo(tmp_path)) is None
+
+    def test_not_a_repo_is_none(self, tmp_path: Path) -> None:
+        assert hostgit.origin_url(tmp_path / "nope") is None
+
+
+class TestClonePointsOriginAtSourceOrigin:
+    def test_run_clone_origin_is_the_upstream_url_not_the_host_path(self, tmp_path: Path) -> None:
+        """#255: `git remote -v` in a run workspace should name the real
+        remote, not a host path that is meaningless inside the VM."""
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        target = tmp_path / "state" / "runs" / "r1" / "workspace"
+        target.parent.mkdir(parents=True)
+        hostgit.clone_for_run(checkout, target, "sbxloop/r1")
+        assert hostgit.origin_url(target) == str(upstream)
+        assert (target / "hello.txt").read_text() == "hi\n"
+
+    def test_source_without_origin_keeps_default_path_origin(self, tmp_path: Path) -> None:
+        source = make_repo(tmp_path)
+        target = tmp_path / "ws"
+        hostgit.clone_for_run(source, target, "sbxloop/r1")
+        assert hostgit.origin_url(target) == str(source)
+
+
+class TestRefreshFromOrigin:
+    def test_up_to_date_is_a_no_op(self, tmp_path: Path) -> None:
+        _upstream, checkout = make_upstream_and_clone(tmp_path)
+        before = hostgit.head_commit(checkout)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is False
+        assert result.before == result.after == before
+        assert "up to date" in result.message
+
+    def test_fast_forwards_to_new_upstream_commit(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        stale = hostgit.head_commit(checkout)
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is True
+        assert (result.before, result.after) == (stale, new_sha)
+        assert hostgit.head_commit(checkout) == new_sha
+        assert (checkout / "pusher.txt").exists()
+        assert "fast-forwarded main" in result.message
+
+    def test_diverged_local_branch_is_left_alone(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        (checkout / "local.txt").write_text("mine\n")
+        git("add", ".", cwd=checkout)
+        git("commit", "-q", "-m", "local", cwd=checkout)
+        local = hostgit.head_commit(checkout)
+        push_upstream_commit(tmp_path, upstream)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is False
+        assert hostgit.head_commit(checkout) == local
+        assert "diverged" in result.message
+
+    def test_colliding_local_edit_blocks_ff_without_damage(self, tmp_path: Path) -> None:
+        """A dirty tree whose edits overlap the update: git refuses the
+        fast-forward; the edit survives and the run proceeds from old HEAD."""
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        other = tmp_path / "editor"
+        git("clone", "-q", str(upstream), str(other), cwd=tmp_path)
+        (other / "hello.txt").write_text("upstream edit\n")
+        git("commit", "-q", "-am", "edit hello", cwd=other)
+        git("push", "-q", "origin", "main", cwd=other)
+        (checkout / "hello.txt").write_text("local uncommitted edit\n")
+        stale = hostgit.head_commit(checkout)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is False
+        assert hostgit.head_commit(checkout) == stale
+        assert (checkout / "hello.txt").read_text() == "local uncommitted edit\n"
+        assert "could not fast-forward" in result.message
+
+    def test_unrelated_dirty_edit_does_not_block_ff(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        (checkout / "scratch.txt").write_text("wip\n")
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is True
+        assert hostgit.head_commit(checkout) == new_sha
+        assert (checkout / "scratch.txt").read_text() == "wip\n"
+
+    def test_no_origin_remote_reports_and_leaves_repo(self, tmp_path: Path) -> None:
+        source = make_repo(tmp_path)
+        result = hostgit.refresh_from_origin(source)
+        assert result.advanced is False
+        assert "no origin remote" in result.message
+
+    def test_branch_without_upstream_falls_back_to_same_name(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        git("branch", "--unset-upstream", cwd=checkout)
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is True
+        assert hostgit.head_commit(checkout) == new_sha
+
+    def test_branch_with_no_remote_counterpart_is_left(self, tmp_path: Path) -> None:
+        _upstream, checkout = make_upstream_and_clone(tmp_path)
+        git("checkout", "-q", "-b", "feature", cwd=checkout)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is False
+        assert "no origin branch" in result.message
+
+    def test_detached_head_fetches_only(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        sha = hostgit.head_commit(checkout) or ""
+        git("checkout", "-q", "--detach", sha, cwd=checkout)
+        push_upstream_commit(tmp_path, upstream)
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is False
+        assert hostgit.head_commit(checkout) == sha
+        assert "detached HEAD" in result.message
+
+    def test_unreachable_origin_raises_provision_error(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        shutil.rmtree(upstream)
+        with pytest.raises(ProvisionError, match="git fetch origin failed"):
+            hostgit.refresh_from_origin(checkout)
+
+    def test_not_a_repo_raises_provision_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ProvisionError, match="cannot refresh"):
+            hostgit.refresh_from_origin(tmp_path / "nope")

@@ -1419,12 +1419,20 @@ def daemon(
     from sbxloop.daemon.discord import DiscordBridge
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.loop import DaemonLoop
+    from sbxloop.daemon.paths import resolve_state_dir
     from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels, InboxSource, WorkSource
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    config = load_config()
+    config, config_sources = load_config_with_sources()
+    # The daemon's state lives at an absolute path outside the workspace
+    # (#255): a relative `.sbxloop` inside the checkout it works on would
+    # accrete a per-run clone there forever.
+    state_choice = resolve_state_dir(
+        config, config_sources, cwd=Path.cwd(), env=os.environ, home=Path.home()
+    )
+    config = config.model_copy(update={"state_dir": state_choice.path})
     daemon_overrides = {
         k: v
         for k, v in (
@@ -1466,6 +1474,9 @@ def daemon(
         console.print("[bold red]--backlog github needs a GitHub repository[/] (--repo).")
         raise typer.Exit(2)
 
+    # Say where the state went: with the anchored default, `sbxloop status`
+    # in the runner dir shows nothing unless SBXLOOP_STATE_DIR points here.
+    console.print(f"state dir: [cyan]{config.state_dir}[/] ({state_choice.reason})")
     store = _store(config)
     dstore = DaemonStore(config.state_dir / "state.db")
     sbx = SbxCLI(app_name=config.app_name or None)
@@ -1930,6 +1941,17 @@ mem_warn = 90.0
 # Retention for .sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
 # swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
 # prune_runs_after_days = 14
+# Unattended workspace posture. Point [sandbox] workspace at a dedicated clone
+# nobody edits; before each run the daemon `git fetch`es it and fast-forwards
+# to origin (never merges/rebases), and daemon runs use `clone` isolation so a
+# dirty tree proceeds from HEAD with a warning instead of `auto`'s refusal.
+# workspace_isolation = "clone"    # clone | auto | in-place, for daemon runs
+# refresh_workspace = true
+# Daemon state lives OUTSIDE the workspace, at an absolute path. Unset:
+# $XDG_STATE_HOME/sbxloop/<runner-dir-name> (~/.local/state/...), unless the
+# top-level state_dir is set or a legacy ./.sbxloop/state.db already exists.
+# `sbxloop status`/`logs` need SBXLOOP_STATE_DIR pointed there.
+# state_dir = "~/.local/state/sbxloop/my-project"
 
 [discord]
 # The daemon's human channel: a gateway bot posts each run's chronology

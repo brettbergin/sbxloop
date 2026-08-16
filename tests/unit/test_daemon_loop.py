@@ -6,6 +6,7 @@ StateStore run on a tmp db so persistence paths are exercised for real.
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop
 from sbxloop.daemon.model import RunReport, WorkItem
@@ -21,6 +23,7 @@ from sbxloop.engine.model import RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
+from tests.unit.test_hostgit import make_repo, make_upstream_and_clone, push_upstream_commit
 
 
 class FakeSource:
@@ -1106,3 +1109,111 @@ class TestOperatorItemControls:
         h.loop.requeue_item("inbox:a.md")  # same for an unpin
         assert removed == ["sbxloop-r_dead2-agent", "sbxloop-r_dead2-github"]
         assert h.dstore.unsettled_runs() == []
+
+
+class RecordingFrontend:
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def daemon_event(self, text: str) -> None:
+        self.seen.append(text)
+
+    def run_started(self, *a: Any) -> None: ...
+    def run_finished(self, *a: Any) -> None: ...
+
+
+class TestWorkspacePosture:
+    """#255: unattended runs answer the dirty-tree question by config and
+    start from a fetch-refreshed checkout. Real git repos in tmp_path (the
+    hostgit test helpers) so the fast-forward is exercised for real."""
+
+    @staticmethod
+    def _config(tmp_path: Path, workspace: Path, **daemon: Any) -> Config:
+        return Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "sandbox": {"workspace": str(workspace)},
+                "daemon": daemon,
+            }
+        )
+
+    def test_git_checkout_workspace_gets_clone_isolation_by_default(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path, self._config(tmp_path, make_repo(tmp_path)))
+        assert h.config.sandbox.workspace_isolation == "auto"
+        assert h.loop._item_config(inbox_item()).sandbox.workspace_isolation == "clone"
+
+    def test_daemon_isolation_knob_governs_daemon_runs(self, tmp_path: Path) -> None:
+        cfg = self._config(tmp_path, make_repo(tmp_path), workspace_isolation="in-place")
+        h = Harness(tmp_path, cfg)
+        assert h.loop._item_config(inbox_item()).sandbox.workspace_isolation == "in-place"
+
+    def test_plain_directory_workspace_is_not_forced_to_clone(self, tmp_path: Path) -> None:
+        """`clone` on a non-git dir is a provisioning error; a plain dir must
+        keep `auto`'s in-place fallback or every daemon run would fail."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        h = Harness(tmp_path, self._config(tmp_path, plain))
+        assert h.loop._item_config(inbox_item()).sandbox.workspace_isolation == "auto"
+
+    def test_no_workspace_leaves_sandbox_config_alone(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        assert h.loop._item_config(inbox_item()).sandbox == h.config.sandbox
+
+    def test_fresh_dispatch_fast_forwards_the_checkout(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        h = Harness(tmp_path, self._config(tmp_path, checkout))
+        h.source.items = [inbox_item()]
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        assert h.loop.tick().outcome == "done"
+        assert hostgit.head_commit(checkout) == new_sha
+        assert any("refreshed workspace" in t and "fast-forwarded main" in t for t in front.seen)
+
+    def test_refresh_disabled_leaves_checkout_stale(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        stale = hostgit.head_commit(checkout)
+        h = Harness(tmp_path, self._config(tmp_path, checkout, refresh_workspace=False))
+        h.source.items = [inbox_item()]
+        push_upstream_commit(tmp_path, upstream)
+        assert h.loop.tick().outcome == "done"
+        assert hostgit.head_commit(checkout) == stale
+
+    def test_in_place_daemon_runs_are_not_refreshed(self, tmp_path: Path) -> None:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        stale = hostgit.head_commit(checkout)
+        cfg = self._config(tmp_path, checkout, workspace_isolation="in-place")
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item()]
+        push_upstream_commit(tmp_path, upstream)
+        assert h.loop.tick().outcome == "done"
+        assert hostgit.head_commit(checkout) == stale
+
+    def test_failed_fetch_warns_and_still_runs(self, tmp_path: Path) -> None:
+        """Network down must not fail every issue: warn, run from local HEAD."""
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        shutil.rmtree(upstream)
+        h = Harness(tmp_path, self._config(tmp_path, checkout))
+        h.source.items = [inbox_item()]
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        assert h.loop.tick().outcome == "done"
+        assert len(h.runs) == 1
+        assert any("workspace refresh failed" in t for t in front.seen)
+
+    def test_resume_does_not_refresh(self, tmp_path: Path) -> None:
+        """A resumed run is pinned to its existing clone; the source is
+        left alone (moving it would change nothing for that run)."""
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        stale = hostgit.head_commit(checkout)
+        h = Harness(tmp_path, self._config(tmp_path, checkout))
+        h.dstore.upsert_new(inbox_item(), h.clock())
+        h.dstore.mark_claimed("inbox:a.md", h.clock())
+        h.dstore.mark_running("inbox:a.md", "rres", h.clock())
+        h.store.create_run("rres", "outcome")
+        h.store.set_run_state("rres", "running")
+        push_upstream_commit(tmp_path, upstream)
+        h.loop.recover()  # queues the resume with the run pinned; tick runs it
+        assert h.loop.tick().outcome == "done"
+        assert h.runs == [("rres", True)]
+        assert hostgit.head_commit(checkout) == stale

@@ -21,9 +21,11 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
-from sbxloop.config import Config, GithubConfig
+from sbxloop import hostgit
+from sbxloop.config import Config, GithubConfig, SandboxConfig
 from sbxloop.daemon.backlog import BACKLOG_INSTRUCTIONS, collect_backlog
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.sources import WorkSource
@@ -31,7 +33,13 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RESUMABLE_RUN_STATES, TERMINAL_RUN_STATES, RunResult
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import RunCancelledError, SbxError, SbxloopError, StateError
+from sbxloop.errors import (
+    ProvisionError,
+    RunCancelledError,
+    SbxError,
+    SbxloopError,
+    StateError,
+)
 from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ids import new_run_id
@@ -496,6 +504,9 @@ class DaemonLoop:
             self.dstore.mark_running(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
             source.report_started(item, run_id)
+            # Fresh runs only: a resumed run is pinned to the clone it
+            # already has, so moving the source would change nothing.
+            self._refresh_workspace()
         else:
             self.dstore.mark_resuming(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
@@ -732,7 +743,58 @@ class DaemonLoop:
                     "create_repo": False,
                 }
             )
-        return self.config.model_copy(update={"github": gh, "keep_on_failure": False})
+        update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
+        sandbox = self.config.sandbox
+        if (
+            self._workspace_checkout() is not None
+            and sandbox.workspace_isolation != self.config.daemon.workspace_isolation
+        ):
+            # Unattended runs answer the dirty-tree question by config
+            # (#255): `auto`'s refusal has no human to act on it and would
+            # fail every issue while someone has uncommitted work in the
+            # checkout. Only a git checkout gets the override — for a plain
+            # directory `auto` already means in-place, and forcing `clone`
+            # there would turn every run into a provisioning error.
+            update["sandbox"] = SandboxConfig.model_validate(
+                {
+                    **sandbox.model_dump(),
+                    "workspace_isolation": self.config.daemon.workspace_isolation,
+                }
+            )
+        return self.config.model_copy(update=update)
+
+    def _workspace_checkout(self) -> Path | None:
+        """The configured workspace when it is the root of a git checkout
+        (the only case isolation, and the fetch refresh, apply to)."""
+        source = self.config.sandbox.workspace
+        if source is None or hostgit.find_git() is None:
+            return None
+        source = source.resolve()
+        return source if hostgit.repo_toplevel(source) == source else None
+
+    def _refresh_workspace(self) -> None:
+        """Fetch + fast-forward the source checkout so the run's clone starts
+        from current ``origin/<branch>`` (#255). Never fatal: a stale HEAD
+        is still a run, a failed fetch (network blip, remote gone) is a
+        warning in the chronology, not a failed issue."""
+        if not self.config.daemon.refresh_workspace:
+            return
+        if self.config.daemon.workspace_isolation == "in-place":
+            # In-place runs mutate the checkout directly; fast-forwarding
+            # under a tree the previous run edited is not ours to do.
+            return
+        source = self._workspace_checkout()
+        if source is None:
+            return
+        try:
+            result = hostgit.refresh_from_origin(source)
+        except ProvisionError as exc:
+            self._notify(f"⚠ workspace refresh failed; running from local HEAD: {exc}")
+            return
+        if result.advanced:
+            self._notify(f"refreshed workspace: {result.message}")
+        else:
+            logger.info("workspace refresh: %s", result.message)
 
     def outcome_text(self, item: WorkItem) -> str:
         parts = [item.title.strip()]

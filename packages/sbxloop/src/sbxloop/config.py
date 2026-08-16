@@ -315,9 +315,27 @@ class DaemonConfig(_ConfigModel):
     tracking issues — set both to false there: the source issue gets the
     summary comment plus ``delivered_label`` and stays open for the human
     who merges the PR.
+
+    Unattended runs need a different workspace posture from a one-shot
+    ``sbxloop run`` (#255). ``workspace_isolation`` replaces the
+    ``[sandbox]`` setting for daemon runs whenever ``[sandbox] workspace``
+    is a git checkout: the default ``clone`` proceeds from committed HEAD
+    with a warning where ``auto`` would refuse a dirty tree — a refusal no
+    human is present to answer, which would otherwise fail every issue
+    while someone has uncommitted work in that checkout. ``refresh_workspace``
+    fetches and fast-forwards the checkout before each fresh run so runs
+    start from current ``origin/<branch>`` rather than a stale local HEAD.
+    ``state_dir`` anchors the daemon's state to an absolute path outside the
+    workspace; unset resolves to ``$XDG_STATE_HOME/sbxloop/<project>``
+    (``~/.local/state/...``) unless the top-level ``state_dir`` was set
+    explicitly or a legacy ``./.sbxloop/state.db`` already exists — see
+    :func:`sbxloop.daemon.paths.resolve_state_dir`.
     """
 
     inbox_dir: str = ".sbxloop/inbox"  # "" disables the inbox source
+    workspace_isolation: WorkspaceIsolation = "clone"
+    refresh_workspace: bool = True
+    state_dir: Path | None = None
     # Must be positive: Event.wait(<= 0) returns immediately and the loop spins.
     poll_interval_s: float = Field(default=60.0, gt=0)
     trigger_label: str = "sbxloop:run"

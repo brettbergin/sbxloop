@@ -119,17 +119,26 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     assert config.daemon.trigger_label == "sbxloop:run"
     assert config.daemon.backlog == "off"
     assert config.daemon.max_runs_per_day == 12
+    # #255: unattended posture — clone isolation, fetch refresh, no state
+    # dir pin (resolved by daemon.paths at startup).
+    assert config.daemon.workspace_isolation == "clone"
+    assert config.daemon.refresh_workspace is True
+    assert config.daemon.state_dir is None
     assert config.discord.enabled is False
     over = load_config(
         cwd=tmp_path,
         env={
             "SBXLOOP_DAEMON__MAX_RUNS_PER_DAY": "3",
             "SBXLOOP_DAEMON__BACKLOG": "github",
+            "SBXLOOP_DAEMON__WORKSPACE_ISOLATION": "in-place",
+            "SBXLOOP_DAEMON__STATE_DIR": "/var/lib/sbxloop",
             "SBXLOOP_DISCORD__CHANNEL_ID": "123456789",
         },
     )
     assert over.daemon.max_runs_per_day == 3
     assert over.daemon.backlog == "github"
+    assert over.daemon.workspace_isolation == "in-place"
+    assert over.daemon.state_dir == Path("/var/lib/sbxloop")
     assert over.discord.enabled is True and over.discord.channel_id == 123456789
     assert config.daemon.close_on_success is True and config.daemon.tracking_issue is True
     assert config.daemon.delivered_label == "sbxloop:delivered"
