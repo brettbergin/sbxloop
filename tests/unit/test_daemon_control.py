@@ -109,6 +109,16 @@ class TestDispatch:
         assert reply.text == usage("sbxloop daemon ctl")
         assert "sbxloop daemon ctl status|pause|resume|cancel [--retry]|queue|items|" in reply.text
 
+    def test_cancel_rejects_unknown_arguments(self, tmp_path: Path) -> None:
+        # A typo (`--rety`) must not silently become a terminal no-retry
+        # cancel: the two outcomes differ materially.
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "cancel --rety", prefix="sbxloop daemon ctl")
+        assert not reply.ok and reply.known
+        assert "unknown cancel argument" in reply.text and "--rety" in reply.text
+        assert "sbxloop daemon ctl cancel [--retry]" in reply.text
+        assert floop.cancel_calls == []
+
     def test_cancel_with_nothing_running_is_not_ok(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))
         floop.cancel_current = lambda *a, **k: False  # type: ignore[method-assign]
@@ -208,6 +218,32 @@ class TestControlQueue:
             assert reply["ok"] is False and "before the daemon started" in reply["text"]
         finally:
             server.close()
+
+    def test_request_stamped_before_start_is_refused_even_if_seen_later(
+        self, tmp_path: Path
+    ) -> None:
+        # The start-up scan cannot see a request whose client paused between
+        # writing its temp file and the atomic rename; the timestamp is what
+        # keeps a pre-start `pause`/`cancel` from firing at boot.
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.start()
+        server.close()
+        ctl_dir = tmp_path / CTL_SUBDIR
+        (ctl_dir / "1.000000-late.json").write_text(
+            json.dumps({"cmd": "pause", "submitted_at": server._started_at - 1})
+        )
+        (ctl_dir / "2.000000-unstamped.json").write_text(json.dumps({"cmd": "pause"}))
+        assert server.serve_once() == 2
+        assert not floop.paused
+        for name in ("1.000000-late", "2.000000-unstamped"):
+            reply = json.loads((ctl_dir / f"{name}.reply.json").read_text())
+            assert reply["ok"] is False and "before the daemon started" in reply["text"]
+        # A request stamped after start is served as usual.
+        (ctl_dir / "3.000000-fresh.json").write_text(
+            json.dumps({"cmd": "pause", "submitted_at": time.time()})
+        )
+        assert server.serve_once() == 1 and floop.paused
 
     def test_a_crashing_command_answers_with_an_error_and_keeps_serving(
         self, tmp_path: Path
@@ -312,6 +348,20 @@ class TestDaemonCtlCommand:
         finally:
             release.set()
             server.close()
+
+    def test_control_server_starts_only_after_recovery(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An `abandon` served while recover() is still settling the item it
+        # snapshotted would be overwritten by recovery's own verdict, so
+        # requests stay refused-as-stale until recovery is done.
+        order: list[str] = []
+        monkeypatch.setattr(DaemonLoop, "recover", lambda self: order.append("recover"))
+        monkeypatch.setattr(ControlServer, "start", lambda self: order.append("ctl.start"))
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        assert order == ["recover", "ctl.start"]
 
     def test_daemon_group_still_runs_the_loop_bare(self, workdir: Path) -> None:
         # `daemon` became a group so `ctl` could hang off it; the bare

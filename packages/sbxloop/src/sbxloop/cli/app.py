@@ -1540,11 +1540,15 @@ def daemon(
         loop.frontend = bridge
 
     ctl = ControlServer(loop, config.state_dir)
-    ctl.start()
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
     try:
         loop.recover()
+        # Only now: an `abandon`/`requeue` served while recover() is still
+        # settling the item it snapshotted would be overwritten by recovery's
+        # own verdict. Requests submitted before this point are refused as
+        # stale, never executed.
+        ctl.start()
         if once:
             result = loop.tick()
             console.print(f"tick: {result}")

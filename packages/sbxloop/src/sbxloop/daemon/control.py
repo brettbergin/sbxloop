@@ -273,9 +273,16 @@ class ControlServer:
         self.poll_s = poll_s
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Wall clock at start(): a request stamped earlier is refused even
+        # if it only becomes visible later (client paused between writing
+        # its temp file and the atomic rename), so the stale-command
+        # guarantee does not hinge on the request being listed by the
+        # start-up scan.
+        self._started_at = 0.0
 
     def start(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._started_at = time.time()
         self._refuse_stale()
         self._thread = threading.Thread(target=self._main, name="sbxloop-daemon-ctl", daemon=True)
         self._thread.start()
@@ -297,19 +304,25 @@ class ControlServer:
             and not p.name.endswith((_REPLY_SUFFIX, _CLAIMED_SUFFIX))
         ]
 
+    _STALE = CommandReply(
+        "ignored: this request was submitted before the daemon started; resend it.", ok=False
+    )
+
     def _refuse_stale(self) -> None:
         # A claim left by a daemon that died mid-command: its client has long
         # since reported "pending"; nothing to answer, nothing to replay.
         for p in self.dir.glob(f"*{_CLAIMED_SUFFIX}"):
             p.unlink(missing_ok=True)
         for request in self._requests():
-            self._answer(
-                request,
-                CommandReply(
-                    "ignored: this request was submitted before the daemon started; resend it.",
-                    ok=False,
-                ),
-            )
+            self._answer(request, self._STALE)
+
+    def _is_stale(self, payload: dict[str, Any]) -> bool:
+        # No stamp (hand-written file) counts as stale: executing a command
+        # of unknown age at boot is the surprise this guard exists to stop.
+        try:
+            return float(payload.get("submitted_at", 0.0)) < self._started_at
+        except (TypeError, ValueError):
+            return True
 
     def _main(self) -> None:
         while not self._stop.is_set():
@@ -330,6 +343,10 @@ class ControlServer:
                 continue
             request = claimed
             cmd = str(payload.get("cmd", ""))
+            if self._is_stale(payload):
+                self._answer(request, self._STALE)
+                served += 1
+                continue
             try:
                 reply = dispatch(
                     self.loop,
