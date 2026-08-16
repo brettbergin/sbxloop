@@ -631,7 +631,7 @@ class TestInstallFallbacks:
         ]
         assert apt_cmds == [
             "exec boxa sh -c sudo -n apt-get update -q && "
-            "sudo -n apt-get install -y -q git python3-venv python3-pip"
+            "sudo -n apt-get install -y -q git python3-venv python3-pip curl ca-certificates"
         ]
 
     def test_ensure_dev_tools_git_probe_success_installs_nothing(
