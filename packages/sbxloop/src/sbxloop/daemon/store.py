@@ -112,6 +112,10 @@ class DaemonStore:
             if column not in existing:
                 self._conn.execute(ddl)
         self._conn.commit()
+        # One connection shared by the daemon, bridge and CLI threads:
+        # sqlite3 rejects concurrent use of a connection from two threads
+        # ("bad parameter or other API misuse"), so EVERY statement — reads
+        # included — runs under this lock.
         self._lock = threading.RLock()
 
     def close(self) -> None:
@@ -159,39 +163,45 @@ class DaemonStore:
             return True
 
     def get(self, item_id: str) -> WorkItem | None:
-        row = self._conn.execute(
-            "SELECT * FROM daemon_work_items WHERE item_id = ?", (item_id,)
-        ).fetchone()
-        return _row_to_item(row) if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM daemon_work_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            return _row_to_item(row) if row else None
 
     def next_queued(self, now: float, backoff_s: float) -> WorkItem | None:
         """Oldest queued item whose retry backoff (attempts * backoff) has
         elapsed since its last update. Ties on ``created_at`` (a batch
         upserted with one ``now``) break on insertion order (rowid), so
         dispatch is genuinely FIFO."""
-        for row in self._conn.execute(
-            "SELECT * FROM daemon_work_items WHERE state = 'queued' "
-            "ORDER BY created_at ASC, rowid ASC"
-        ):
-            item = _row_to_item(row)
-            if item.attempts == 0 or now - item.updated_at >= item.attempts * backoff_s:
-                return item
-        return None
-
-    def queued(self) -> list[WorkItem]:
-        return [
-            _row_to_item(row)
+        with self._lock:
             for row in self._conn.execute(
                 "SELECT * FROM daemon_work_items WHERE state = 'queued' "
                 "ORDER BY created_at ASC, rowid ASC"
-            )
-        ]
+            ):
+                item = _row_to_item(row)
+                if item.attempts == 0 or now - item.updated_at >= item.attempts * backoff_s:
+                    return item
+            return None
+
+    def queued(self) -> list[WorkItem]:
+        with self._lock:
+            return [
+                _row_to_item(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM daemon_work_items WHERE state = 'queued' "
+                    "ORDER BY created_at ASC, rowid ASC"
+                )
+            ]
 
     def running_items(self) -> list[WorkItem]:
-        return [
-            _row_to_item(row)
-            for row in self._conn.execute("SELECT * FROM daemon_work_items WHERE state = 'running'")
-        ]
+        with self._lock:
+            return [
+                _row_to_item(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM daemon_work_items WHERE state = 'running'"
+                )
+            ]
 
     def mark_claimed(self, item_id: str, now: float) -> None:
         self._update(item_id, now, claimed=1)
@@ -250,10 +260,11 @@ class DaemonStore:
     # -- run ledger ------------------------------------------------------------
 
     def runs_started_since(self, ts: float) -> int:
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM daemon_runs WHERE started_at >= ?", (ts,)
-        ).fetchone()
-        return int(row["n"])
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_runs WHERE started_at >= ?", (ts,)
+            ).fetchone()
+            return int(row["n"])
 
     def finish_ledger(self, run_id: str, result: str, now: float) -> None:
         with self._lock:
@@ -266,10 +277,11 @@ class DaemonStore:
     # -- backlog dedup ---------------------------------------------------------
 
     def backlog_seen(self, fingerprint: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM daemon_backlog_filed WHERE fingerprint = ?", (fingerprint,)
-        ).fetchone()
-        return row is not None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM daemon_backlog_filed WHERE fingerprint = ?", (fingerprint,)
+            ).fetchone()
+            return row is not None
 
     def backlog_record(self, fingerprint: str, run_id: str, filed_as: str, now: float) -> None:
         with self._lock:
@@ -283,16 +295,17 @@ class DaemonStore:
     # -- discord threads -------------------------------------------------------
 
     def discord_thread(self, run_id: str) -> DiscordThread | None:
-        row = self._conn.execute(
-            "SELECT channel_id, thread_id, headline_id, status_id FROM daemon_discord_threads "
-            "WHERE run_id = ?",
-            (run_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return DiscordThread(
-            int(row["channel_id"]), int(row["thread_id"]), row["headline_id"], row["status_id"]
-        )
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT channel_id, thread_id, headline_id, status_id FROM daemon_discord_threads "
+                "WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return DiscordThread(
+                int(row["channel_id"]), int(row["thread_id"]), row["headline_id"], row["status_id"]
+            )
 
     def set_discord_status_id(self, run_id: str, status_id: int | None) -> None:
         with self._lock:
@@ -303,10 +316,11 @@ class DaemonStore:
             self._conn.commit()
 
     def run_for_thread(self, thread_id: int) -> str | None:
-        row = self._conn.execute(
-            "SELECT run_id FROM daemon_discord_threads WHERE thread_id = ?", (thread_id,)
-        ).fetchone()
-        return str(row["run_id"]) if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT run_id FROM daemon_discord_threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            return str(row["run_id"]) if row else None
 
     def record_discord_thread(
         self, run_id: str, channel_id: int, thread_id: int, headline_id: int | None
