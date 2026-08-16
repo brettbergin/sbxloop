@@ -268,10 +268,18 @@ a systemd user service with [`contrib/systemd/`](contrib/systemd/).
 
 With `pip install 'sbxloop[discord]'`, `DISCORD_BOT_TOKEN` in the
 environment, and `[discord] channel_id` set, a gateway bot posts a headline
-per run in the control channel and streams that run's chronology into a
-thread under it — agent messages with persona attribution, tool lines,
-issue and PR links, verdicts, and a finished summary (the headline is edited
-to ✅/❌/⚠). **Type in a run's thread to steer that run**: your message is
+card per run in the control channel (source, run id, branch, tracking
+issue, PR, task tally — colour follows the state) and streams that run's
+chronology into a thread under it, in Discord's own formatting: agent
+messages as Markdown with persona attribution, split at paragraph and
+code-fence boundaries instead of clipped; consecutive tool calls batched
+into one code block with failures marked; one **status line edited in
+place** as tasks progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
+and branch as links; verify failures, worker errors, denied permissions and
+refused egress called out; and a finished report card (the headline turns
+✅/❌/⚠). Mentions are always disabled, so model output can never ping the
+channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
+`chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — the ⏳ reaction turns ✅
 when the reply lands). `!sbx status|pause|resume|cancel|queue` in the

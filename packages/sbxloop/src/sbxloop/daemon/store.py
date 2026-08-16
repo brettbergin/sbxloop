@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
+from typing import NamedTuple
 
 from sbxloop.daemon.model import ItemState, WorkItem
 
@@ -54,9 +55,25 @@ CREATE TABLE IF NOT EXISTS daemon_discord_threads (
     run_id      TEXT PRIMARY KEY,
     channel_id  INTEGER NOT NULL,
     thread_id   INTEGER NOT NULL,
-    headline_id INTEGER
+    headline_id INTEGER,
+    status_id   INTEGER
 );
 """
+
+# Columns added after a table first shipped; applied idempotently at open
+# (same pattern as engine/store.py's runs migrations).
+_DISCORD_MIGRATIONS = (
+    ("status_id", "ALTER TABLE daemon_discord_threads ADD COLUMN status_id INTEGER"),
+)
+
+
+class DiscordThread(NamedTuple):
+    """Where a run lives on Discord (persisted so a restart re-attaches)."""
+
+    channel_id: int
+    thread_id: int
+    headline_id: int | None
+    status_id: int | None
 
 
 def _row_to_item(row: sqlite3.Row) -> WorkItem:
@@ -88,6 +105,12 @@ class DaemonStore:
         # flight; wait for it instead of failing on SQLITE_BUSY.
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(daemon_discord_threads)")
+        }
+        for column, ddl in _DISCORD_MIGRATIONS:
+            if column not in existing:
+                self._conn.execute(ddl)
         self._conn.commit()
         self._lock = threading.RLock()
 
@@ -259,15 +282,25 @@ class DaemonStore:
 
     # -- discord threads -------------------------------------------------------
 
-    def discord_thread(self, run_id: str) -> tuple[int, int, int | None] | None:
+    def discord_thread(self, run_id: str) -> DiscordThread | None:
         row = self._conn.execute(
-            "SELECT channel_id, thread_id, headline_id FROM daemon_discord_threads "
+            "SELECT channel_id, thread_id, headline_id, status_id FROM daemon_discord_threads "
             "WHERE run_id = ?",
             (run_id,),
         ).fetchone()
         if row is None:
             return None
-        return (int(row["channel_id"]), int(row["thread_id"]), row["headline_id"])
+        return DiscordThread(
+            int(row["channel_id"]), int(row["thread_id"]), row["headline_id"], row["status_id"]
+        )
+
+    def set_discord_status_id(self, run_id: str, status_id: int | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_discord_threads SET status_id = ? WHERE run_id = ?",
+                (status_id, run_id),
+            )
+            self._conn.commit()
 
     def run_for_thread(self, thread_id: int) -> str | None:
         row = self._conn.execute(

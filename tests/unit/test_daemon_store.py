@@ -131,7 +131,9 @@ class TestLedgerBacklogThreads:
         store = DaemonStore(tmp_path / "state.db")
         assert store.discord_thread("r1") is None
         store.record_discord_thread("r1", channel_id=11, thread_id=22, headline_id=33)
-        assert store.discord_thread("r1") == (11, 22, 33)
+        assert store.discord_thread("r1") == (11, 22, 33, None)
+        store.set_discord_status_id("r1", 44)
+        assert store.discord_thread("r1").status_id == 44  # type: ignore[union-attr]
         assert store.run_for_thread(22) == "r1"
         assert store.run_for_thread(99) is None
 
