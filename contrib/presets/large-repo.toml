@@ -6,8 +6,11 @@
 # 3 attempts x verify presses on a 2 h wall clock; 40 tool calls is thin for
 # orienting in a multi-package tree before touching anything.
 #
-# Copy the sections you want into your sbxloop.toml (or `[tool.sbxloop]` in
-# pyproject.toml). Nothing here changes the sandbox's CPU/memory: sbxloop
+# Copy the sections you want into your sbxloop.toml as written. In
+# pyproject.toml the loader reads only the `[tool.sbxloop]` table, so the
+# same sections must be spelled `[tool.sbxloop.budgets]` and
+# `[tool.sbxloop.limits]` there — a top-level `[budgets]` in pyproject.toml
+# is silently ignored. Nothing here changes the sandbox's CPU/memory: sbxloop
 # passes no sizing flags to `sbx create` — the microVM is whatever size sbx
 # gives every sandbox — so the [limits] section is how memory pressure is
 # made visible instead of surfacing as a confusing test failure.

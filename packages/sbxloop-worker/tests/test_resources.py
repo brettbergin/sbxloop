@@ -206,6 +206,38 @@ class TestRunnerTelemetry:
         warnings = [e for e in events if e.type == EventTypes.SANDBOX_RESOURCES_WARNING]
         assert warnings and warnings[0].data["level"] == "abort"
 
+    def test_disk_replaces_latched_memory_abort_on_later_sample(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Memory trips first (latched), then a later heartbeat sees disk
+        # over its threshold too: the documented "disk wins" rule applies
+        # across samples, not only within one.
+        samples = iter(
+            [
+                {"disk_used_pct": 10.0, "mem_used_pct": 99.0},
+                {"disk_used_pct": 99.0, "mem_used_pct": 99.0},
+                {"disk_used_pct": 10.0, "mem_used_pct": 99.0},
+            ]
+        )
+        monkeypatch.setattr(runner_mod, "sample_resources", lambda path=".": next(samples))
+        job_runner = JobRunner(
+            failing_job(),
+            events_path=tmp_path / "events.jsonl",
+            result_path=tmp_path / "result.json",
+            heartbeat_s=3600.0,
+            backend_name="echo",
+            disk_abort=95.0,
+            mem_abort=97.0,
+        )
+        with runner_mod.EventWriter(tmp_path / "events.jsonl", "r1", "j1") as writer:
+            job_runner._sample_and_emit(writer)
+            assert "sandbox memory exhausted" in (job_runner._resource_abort or "")
+            job_runner._sample_and_emit(writer)
+            assert "sandbox disk exhausted" in (job_runner._resource_abort or "")
+            # Once disk is the diagnosis a memory-only sample does not demote it.
+            job_runner._sample_and_emit(writer)
+            assert "sandbox disk exhausted" in (job_runner._resource_abort or "")
+
     def test_disk_named_when_both_abort_thresholds_trip(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -271,16 +271,35 @@ class JobRunner:
                 message=self._level_message(level, sample),
                 **sample,
             )
-        if level == "abort" and self._resource_abort is None:
-            self._resource_abort = self._level_message(level, sample)
+        if level == "abort":
+            self._latch_abort(sample)
         self._resource_level = level
+
+    def _latch_abort(self, sample: dict[str, object]) -> None:
+        """Remember the abort diagnosis that rewrites a failed result.
+
+        The first abort sample latches; a later sample only replaces it when
+        disk has since crossed its threshold and the latched diagnosis was
+        memory. Disk wins because it is the non-transient resource — a run
+        that first spiked memory and then filled the filesystem failed for
+        the disk, and reporting "memory exhausted" would send the operator
+        chasing the wrong cause."""
+        message = self._level_message("abort", sample)
+        if self._resource_abort is None or (
+            self._disk_tripped(sample) and not self._resource_abort.startswith("sandbox disk")
+        ):
+            self._resource_abort = message
+
+    def _disk_tripped(self, sample: dict[str, object]) -> bool:
+        disk = sample.get("disk_used_pct")
+        return isinstance(disk, (int, float)) and self.disk_abort > 0 and disk >= self.disk_abort
 
     def _level_message(self, level: str, sample: dict[str, object]) -> str:
         disk = sample.get("disk_used_pct")
         mem = sample.get("mem_used_pct")
         if level == "abort":
             # Disk wins when both tripped: it is the non-transient one.
-            if isinstance(disk, (int, float)) and self.disk_abort > 0 and disk >= self.disk_abort:
+            if self._disk_tripped(sample):
                 return (
                     f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
                     f"(disk_abort threshold: {self.disk_abort}%)"
