@@ -278,6 +278,99 @@ class Budgets(_ConfigModel):
     per_job_timeout_s: float = 1800.0
 
 
+BacklogMode = Literal["off", "github", "inbox"]
+
+
+class DaemonConfig(_ConfigModel):
+    """``sbxloop daemon`` — the always-on outer loop.
+
+    The daemon discovers work (GitHub issues carrying ``trigger_label`` in
+    the configured repo, and ``.md`` files in ``inbox_dir``), runs each item
+    as a full inner-loop run, and reports back to the source. It is fully
+    autonomous — a label or a file alone starts a run — so the spend
+    guardrails here are the only thing standing between a mislabeled issue
+    and an empty Copilot budget: a rolling daily run cap, a per-item retry
+    cap, and a consecutive-failure circuit breaker.
+
+    ``backlog`` lets the inner agent file follow-up work it discovers
+    (written to ``.sbxloop/backlog/*.md`` in the run workspace) into either
+    source. Agent-filed items land in triage (the ``backlog_label`` / the
+    inbox ``triage/`` dir) and never run until a human promotes them, unless
+    ``backlog_auto_trigger`` is set — a self-feeding queue is the failure
+    mode that flag guards.
+    """
+
+    inbox_dir: str = ".sbxloop/inbox"  # "" disables the inbox source
+    # Must be positive: Event.wait(<= 0) returns immediately and the loop spins.
+    poll_interval_s: float = Field(default=60.0, gt=0)
+    trigger_label: str = "sbxloop:run"
+    in_progress_label: str = "sbxloop:in-progress"
+    failed_label: str = "sbxloop:failed"
+    backlog_label: str = "sbxloop:backlog"
+    max_runs_per_day: int = 12
+    max_attempts_per_item: int = 2
+    retry_backoff_s: float = 900.0
+    max_consecutive_failures: int = 3
+    breaker_cooldown_s: float = 3600.0
+    # Keep below the service manager's stop timeout. Cancellation is honored
+    # only at task-phase boundaries and interrupted runs are resumable, so
+    # this is a courtesy wait, not a correctness requirement.
+    shutdown_grace_s: float = 60.0
+    backlog: BacklogMode = "off"
+    backlog_max_per_run: int = 5
+    backlog_auto_trigger: bool = False
+    # Autonomous PRs arrive as drafts unless the operator says otherwise.
+    deliver_draft: bool = True
+
+    @model_validator(mode="after")
+    def _check(self) -> DaemonConfig:
+        labels = [
+            self.trigger_label,
+            self.in_progress_label,
+            self.failed_label,
+            self.backlog_label,
+        ]
+        if any(not label.strip() for label in labels):
+            raise ValueError("daemon labels must be non-empty")
+        # GitHub label names are case-insensitive: "sbxloop:run" and
+        # "SBXLOOP:RUN" are the same label, so they cannot mark two states.
+        if len({label.strip().casefold() for label in labels}) != len(labels):
+            raise ValueError("daemon labels must be distinct (case-insensitively)")
+        for name in (
+            "max_runs_per_day",
+            "max_attempts_per_item",
+            "max_consecutive_failures",
+            "backlog_max_per_run",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"daemon.{name} must be >= 1")
+        return self
+
+
+ChronologyLevel = Literal["quiet", "normal", "verbose"]
+
+
+class DiscordConfig(_ConfigModel):
+    """The daemon's human channel: a gateway bot posting each run's
+    chronology (agent messages, tool lines, issue/PR links) into a thread
+    under a control channel, and relaying replies typed in that thread to
+    the running agent as steering. Unset ``channel_id`` disables it. The bot
+    token comes from ``DISCORD_BOT_TOKEN`` in the environment / .env, never
+    from this file. Anyone who can post in the channel can steer — restrict
+    the channel accordingly."""
+
+    channel_id: int | None = None
+    command_prefix: str = "!sbx"
+    thread_per_run: bool = True
+    chronology_level: ChronologyLevel = "normal"
+    # Discord's hard cap is 2000; leave headroom for wrappers.
+    max_message_chars: int = Field(default=1900, ge=200, le=2000)
+
+    @property
+    def enabled(self) -> bool:
+        return self.channel_id is not None
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # sbx --app-name. Empty (the default) shares the user's normal sbx
@@ -305,6 +398,8 @@ class Config(_ConfigModel):
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
     limits: Limits = Field(default_factory=Limits)
+    daemon: DaemonConfig = Field(default_factory=DaemonConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

@@ -111,6 +111,77 @@ class TestMutationRules:
         assert lint_verify_commands(["npm ci && npm test"], ["javascript"]) == []
 
 
+class TestBashisms:
+    """Verify commands run under `sh -c`; bash-only syntax silently means
+    something else there (field failure re59gj4vq: `grep -q $'\\033[31m'`
+    matched nothing under sh, and the executor could not escape the
+    verify→revise loop because it may not edit the command)."""
+
+    def test_ansi_c_quoting_flagged_with_printf_rewrite(self) -> None:
+        (problem,) = lint_verify_commands(
+            [".venv/bin/python app.py --color red | grep -q $'\\033[31m'"], ["python"]
+        )
+        assert "ANSI-C quoting" in problem and "`sh -c`" in problem
+        assert "printf" in problem
+
+    def test_other_bashisms_flagged(self) -> None:
+        for cmd in (
+            "[[ -f app.py ]]",
+            'grep x <<< "$out"',
+            "pushd app && make",
+            "source .venv/bin/activate && pytest",
+            "cd app && declare -a xs",
+        ):
+            assert lint_verify_commands([cmd], ["go"]), cmd
+
+    def test_bashism_words_as_data_are_not_flagged(self) -> None:
+        """Command-like bashisms count only in command position, operator-like
+        ones only outside quotes — a portable command that merely *mentions*
+        them as data must not be rejected (review: grep -F 'source' file,
+        test -f source/output, printf '%s' '[[literal]]')."""
+        assert (
+            lint_verify_commands(
+                [
+                    "grep -F 'source' file",
+                    "test -f source/output",
+                    "printf '%s' '[[literal]]'",
+                    "echo '<<<'",
+                    'echo "cost is $x"',
+                    "grep -c local README.md",
+                ],
+                ["python", "go"],
+            )
+            == []
+        )
+
+    def test_feedback_distinguishes_silent_from_loud_failure(self) -> None:
+        (ansi,) = lint_verify_commands(["grep -q $'\\033'"], ["go"])
+        assert "silently reinterprets" in ansi
+        (loud,) = lint_verify_commands(["[[ -f x ]]"], ["go"])
+        assert "unknown command" in loud
+        (syntax,) = lint_verify_commands(['grep x <<< "$y"'], ["go"])
+        assert "syntax error" in syntax
+
+    def test_portable_commands_clean(self) -> None:
+        assert (
+            lint_verify_commands(
+                [
+                    "test -f app.py",
+                    "[ -f app.py ] && echo ok",
+                    "printf '%s\\n' hi | grep -q hi",
+                    ".venv/bin/pytest -q",
+                    "cd app && go test ./...",
+                ],
+                ["python", "go"],
+            )
+            == []
+        )
+
+    def test_bashism_and_bare_python_both_reported(self) -> None:
+        problems = lint_verify_commands(["python -c 'x' | grep -q $'\\033'"], ["python"])
+        assert len(problems) == 2
+
+
 class TestMultiLanguageRuns:
     def test_rules_union_across_configured_languages(self) -> None:
         problems = lint_verify_commands(

@@ -371,6 +371,57 @@ def clone_events(events: list[Event]) -> list[Event]:
     return [e for e in events if e.type == "sandbox.workspace_clone"]
 
 
+class TestGithubOnly:
+    """The daemon's long-lived github-ops sandbox: one github-role microVM
+    outside any run, same fail-fast/rollback discipline as the pair."""
+
+    def test_creates_one_github_sandbox_by_name(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        sandbox = provisioner.ensure_github_only("sbxloop-daemon-github", tmp_path / "ws")
+        try:
+            assert sandbox.name == "sbxloop-daemon-github"
+            created = [c[1].removeprefix("--name=") for c in fake_sbx.invocations("create")]
+            assert created == ["sbxloop-daemon-github"]
+            assert fake_sbx.meta(sandbox.name)["workspace"] == str((tmp_path / "ws").resolve())
+            allows = fake_sbx.policies()
+            assert any("uploads.github.com" in c for c in allows)
+            assert not any("api.githubcopilot.com" in c for c in allows)
+        finally:
+            sandbox.rm()
+
+    def test_missing_gh_token_fails_before_create(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path, env={"COPILOT_GITHUB_TOKEN": "x"})
+        with pytest.raises(ProvisionError, match="GH_TOKEN"):
+            provisioner.ensure_github_only("sbxloop-daemon-github", tmp_path / "ws")
+        assert fake_sbx.invocations("create") == []
+
+    def test_failure_after_create_rolls_back(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        fake_sbx.fail_next("policy allow", returncode=1, stderr="policy exploded")
+        with pytest.raises(ProvisionError):
+            provisioner.ensure_github_only("sbxloop-daemon-github", tmp_path / "ws")
+        assert fake_sbx.invocations("rm") != []
+
+    def test_post_create_failure_rolls_back_sandbox_and_secrets(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """The daemon installs its worker via post_create so an install
+        failure gets the same sandbox+secret rollback as any provisioning
+        failure (review: previously only the sandbox was removed)."""
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+
+        def boom(sandbox: object, role: str) -> None:
+            raise RuntimeError("worker install exploded")
+
+        with pytest.raises(ProvisionError, match="worker install exploded"):
+            provisioner.ensure_github_only(
+                "sbxloop-daemon-github", tmp_path / "ws", post_create=boom
+            )
+        assert fake_sbx.invocations("rm") != []
+        # secrets registered for the sandbox were unregistered again
+        assert not any("sbxloop-daemon-github" in s for s in fake_sbx.secrets())
+
+
 class TestWorkspaceIsolation:
     """Runs against a git-checkout workspace work in a per-run clone; the
     checkout's working tree and branches are never disturbed."""

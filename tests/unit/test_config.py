@@ -114,6 +114,45 @@ def test_workspace_isolation_default_and_validation(tmp_path: Path) -> None:
         load_config(cwd=tmp_path, env={"SBXLOOP_SANDBOX__WORKSPACE_ISOLATION": "yolo"})
 
 
+def test_daemon_and_discord_sections(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.trigger_label == "sbxloop:run"
+    assert config.daemon.backlog == "off"
+    assert config.daemon.max_runs_per_day == 12
+    assert config.discord.enabled is False
+    over = load_config(
+        cwd=tmp_path,
+        env={
+            "SBXLOOP_DAEMON__MAX_RUNS_PER_DAY": "3",
+            "SBXLOOP_DAEMON__BACKLOG": "github",
+            "SBXLOOP_DISCORD__CHANNEL_ID": "123456789",
+        },
+    )
+    assert over.daemon.max_runs_per_day == 3
+    assert over.daemon.backlog == "github"
+    assert over.discord.enabled is True and over.discord.channel_id == 123456789
+    (tmp_path / "sbxloop.toml").write_text(
+        '[daemon]\ntrigger_label = "x"\nin_progress_label = "x"\n'
+    )
+    with pytest.raises(ConfigError, match="distinct"):
+        load_config(cwd=tmp_path, env={})
+    # GitHub labels are case-insensitive: differing only by case is a collision
+    (tmp_path / "sbxloop.toml").write_text(
+        '[daemon]\ntrigger_label = "sbxloop:run"\nfailed_label = "SBXLOOP:RUN"\n'
+    )
+    with pytest.raises(ConfigError, match="case-insensitively"):
+        load_config(cwd=tmp_path, env={})
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\nbacklog = "yolo"\n')
+    with pytest.raises(ConfigError):
+        load_config(cwd=tmp_path, env={})
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\nmax_runs_per_day = 0\n")
+    with pytest.raises(ConfigError, match="max_runs_per_day"):
+        load_config(cwd=tmp_path, env={})
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\npoll_interval_s = 0\n")
+    with pytest.raises(ConfigError, match="poll_interval_s"):
+        load_config(cwd=tmp_path, env={})
+
+
 def test_sources_tracking(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text('[tool.sbxloop]\nmodel = "gpt-5"\n')
     (tmp_path / "sbxloop.toml").write_text("keep_sandboxes = true\n")

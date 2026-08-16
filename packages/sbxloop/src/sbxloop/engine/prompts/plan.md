@@ -62,6 +62,20 @@ dependency prefixes described in the notes below are enforced mechanically,
 so a verify command that invokes an interpreter or test runner bare where
 its ecosystem requires a project-local prefix is rejected outright.
 
+Verify commands run under POSIX `sh -c`, **not bash**, and the executor
+cannot fix a broken check. Bash-only syntax fails there in one of two ways:
+bash's ANSI-C quoting for escape sequences is *silently reinterpreted* as
+literal text (a grep for an escape code never matches, and nothing says
+why), while `[[ ]]`, `source`, `declare`/`local`, `pushd`/`popd` fail as
+unknown commands and here-strings are a syntax error. Write portable shell:
+`[ ]` not `[[ ]]`, `printf` for escape sequences, pipes instead of
+here-strings, `.` instead of `source`. Bashisms are rejected mechanically. And prefer to verify *behavior* through the project's test
+runner rather than shell pipelines: asserting on bytes, escape sequences,
+exact whitespace, or exit codes is trivial and exact inside a test file
+(`assert "\x1b[31m" in captured.out`) and fragile as a `grep`/`od`
+one-liner — a wrong-but-runnable check burns revisions the executor cannot
+fix. The verify command then is just the test runner.
+
 Ecosystem notes — read only the entry matching this task's toolchain and
 ignore the rest. They are reference points, not a menu of defaults: a task
 in an ecosystem not listed here follows that ecosystem's own conventions,
