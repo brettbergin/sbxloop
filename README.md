@@ -334,8 +334,11 @@ its attempt budget reset. Anyone who can post in the channel
 can steer — that is the boundary to set. The bot ignores messages from bots
 (itself included), so scripts drive the daemon with `sbxloop daemon ctl <verb>`
 instead — the same verbs through the same dispatcher, no Discord needed; a
-request nobody answers within `--timeout` is withdrawn, so a stale `cancel`
-never fires when the daemon starts later.
+request no daemon picks up within `--timeout` (30s) is withdrawn, so a stale
+`cancel` never fires when the daemon starts later. Timing out is not "not
+executed": once the daemon has taken a request it keeps running (item verbs
+cross the ops sandbox), and `ctl` reports it as pending (exit 1) rather than
+absent (exit 2).
 
 Bot setup, once: create an application in the Discord Developer Portal, add
 a bot, enable the **Message Content** privileged intent, copy the token, and

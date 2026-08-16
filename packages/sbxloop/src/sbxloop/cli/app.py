@@ -33,6 +33,7 @@ from sbxloop.config import (
     load_config_with_sources,
     load_dotenv_file,
 )
+from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
@@ -1688,8 +1689,14 @@ def daemon_ctl(
         ),
     ],
     timeout: Annotated[
-        float, typer.Option("--timeout", help="Seconds to wait for the daemon's reply.")
-    ] = 10.0,
+        float,
+        typer.Option(
+            "--timeout",
+            help="Seconds to wait for the daemon's reply. A request no daemon picks up in "
+            "time is withdrawn (exit 2); one the daemon has already taken keeps "
+            "executing and is reported as pending (exit 1).",
+        ),
+    ] = DEFAULT_TIMEOUT_S,
 ) -> None:
     """Send a command to the daemon running against this state_dir — the
     programmatic twin of Discord's `!sbx`, for scripts, cron and remote
@@ -1704,6 +1711,9 @@ def daemon_ctl(
             f"[cyan]sbxloop daemon[/] running with state dir {state_dir}?"
         )
         raise typer.Exit(2)
+    if reply.pending:
+        console.print(f"pending: {plain(reply.text)}", markup=False, highlight=False)
+        raise typer.Exit(1)
     console.print(plain(reply.text), markup=False, highlight=False)
     if not reply.ok:
         raise typer.Exit(1)

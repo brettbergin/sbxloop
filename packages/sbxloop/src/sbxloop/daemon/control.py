@@ -57,6 +57,11 @@ ITEM_COMMANDS: frozenset[str] = frozenset({"abandon", "retry", "requeue"})
 
 CTL_SUBDIR = Path("daemon") / "ctl"
 _REQUEST_SUFFIX = ".json"
+# A request the server has taken but not yet answered. The rename is atomic,
+# so a client that times out learns exactly which side owns the command:
+# request still there -> withdraw it; gone -> the daemon is executing it and
+# a withdrawal would be a lie (the abandon of a GitHub item still lands).
+_CLAIMED_SUFFIX = ".claimed.json"
 _REPLY_SUFFIX = ".reply.json"
 # A reply nobody collected (client killed mid-wait) is swept after this.
 _REPLY_TTL_S = 300.0
@@ -71,6 +76,15 @@ class CommandReply(NamedTuple):
     ok: bool = True
     status: dict[str, Any] | None = None
     known: bool = True  # False: the verb was not recognised (text is the usage line)
+    # True: the daemon took the request but had not answered when the client
+    # stopped waiting — the command is executing, its outcome is unknown.
+    pending: bool = False
+
+
+# Item verbs talk to GitHub through the ops sandbox (#229): a live `abandon`
+# was measured in seconds, so a one-digit wait made a healthy daemon look
+# absent. 30s covers a cold ops-sandbox exec with margin.
+DEFAULT_TIMEOUT_S = 30.0
 
 
 def usage(prefix: str) -> str:
@@ -195,10 +209,13 @@ class ControlClient:
     def __init__(self, state_dir: Path) -> None:
         self.dir = state_dir / CTL_SUBDIR
 
-    def submit(self, cmd: str, *, timeout_s: float = 10.0) -> CommandReply | None:
-        """Returns None when no daemon answered within ``timeout_s``. The
-        request is withdrawn on timeout so a daemon started later does not
-        act on it — see the module docstring."""
+    def submit(self, cmd: str, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> CommandReply | None:
+        """Returns None when no daemon *took* the request within
+        ``timeout_s`` — it is withdrawn so a daemon started later does not
+        act on it (module docstring). Returns a ``pending`` reply when the
+        daemon claimed it but had not answered in time: the command is
+        running (item verbs cross the ops sandbox) and cannot be withdrawn,
+        so the caller must not report "not executed"."""
         self.dir.mkdir(parents=True, exist_ok=True)
         # Time-prefixed so the server serves requests in submission order.
         req_id = f"{time.time():.6f}-{uuid.uuid4().hex[:8]}"
@@ -224,7 +241,21 @@ class ControlClient:
                     reply.unlink(missing_ok=True)
                 return CommandReply(str(data.get("text", "")), bool(data.get("ok", True)))
             time.sleep(0.05)
-        request.unlink(missing_ok=True)
+        try:
+            request.unlink()
+        except FileNotFoundError:
+            # Claimed (or already answered between our last poll and now).
+            if reply.exists():
+                data = json.loads(reply.read_text())
+                reply.unlink(missing_ok=True)
+                return CommandReply(str(data.get("text", "")), bool(data.get("ok", True)))
+            return CommandReply(
+                f"the daemon took `{cmd}` but has not answered within {timeout_s:g}s; "
+                "it is still executing (item verbs go through the ops sandbox) — "
+                "check `sbxloop daemon ctl items`.",
+                ok=False,
+                pending=True,
+            )
         return None
 
 
@@ -262,10 +293,15 @@ class ControlServer:
         return [
             p
             for p in names
-            if p.name.endswith(_REQUEST_SUFFIX) and not p.name.endswith(_REPLY_SUFFIX)
+            if p.name.endswith(_REQUEST_SUFFIX)
+            and not p.name.endswith((_REPLY_SUFFIX, _CLAIMED_SUFFIX))
         ]
 
     def _refuse_stale(self) -> None:
+        # A claim left by a daemon that died mid-command: its client has long
+        # since reported "pending"; nothing to answer, nothing to replay.
+        for p in self.dir.glob(f"*{_CLAIMED_SUFFIX}"):
+            p.unlink(missing_ok=True)
         for request in self._requests():
             self._answer(
                 request,
@@ -284,11 +320,15 @@ class ControlServer:
         """Answer every pending request; returns how many were served."""
         served = 0
         for request in self._requests():
+            claimed = request.with_name(request.name[: -len(_REQUEST_SUFFIX)] + _CLAIMED_SUFFIX)
             try:
-                payload = json.loads(request.read_text())
+                request.rename(claimed)
+                payload = json.loads(claimed.read_text())
             except (OSError, ValueError):
-                # Half-written or withdrawn between listing and reading.
+                # Withdrawn between listing and claiming, or half-written.
+                claimed.unlink(missing_ok=True)
                 continue
+            request = claimed
             cmd = str(payload.get("cmd", ""))
             try:
                 reply = dispatch(
@@ -306,7 +346,8 @@ class ControlServer:
         return served
 
     def _answer(self, request: Path, reply: CommandReply) -> None:
-        reply_path = request.with_name(request.name[: -len(_REQUEST_SUFFIX)] + _REPLY_SUFFIX)
+        stem = request.name.removesuffix(_CLAIMED_SUFFIX).removesuffix(_REQUEST_SUFFIX)
+        reply_path = request.with_name(stem + _REPLY_SUFFIX)
         _write_atomic(reply_path, {"ok": reply.ok, "text": reply.text, "answered_at": time.time()})
         request.unlink(missing_ok=True)
 

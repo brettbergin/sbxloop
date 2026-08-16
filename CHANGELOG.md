@@ -64,7 +64,9 @@ All notable changes to sbxloop are documented here. The project adheres to
   — a local control surface for the running daemon (#232). Requests go
   through a file queue in the daemon's `state_dir/daemon/ctl/`, served by a
   daemon thread so `cancel` lands mid-run; a request that predates the
-  daemon's start is refused, and one nobody answers is withdrawn. Discord's
+  daemon's start is refused, one no daemon picks up within `--timeout` is
+  withdrawn, and one the daemon has already taken but not answered is
+  reported as pending — the command still executes. Discord's
   `!sbx` and `ctl` share one command dispatcher (`sbxloop.daemon.control`),
   so the two surfaces cannot drift; a ctl cancel/retry is attributed on the
   source as "`<user>` via sbxloop daemon ctl". The bridge still ignores

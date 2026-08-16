@@ -152,6 +152,49 @@ class TestControlQueue:
         assert client.submit("cancel", timeout_s=0.1) is None
         assert list((tmp_path / CTL_SUBDIR).iterdir()) == []
 
+    def test_slow_command_the_daemon_took_is_reported_pending_not_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """Item verbs cross the ops sandbox (seconds): a client that gives up
+        while the daemon is mid-command must say so — the abandon still
+        lands, so "no reply from the daemon" would send the operator to
+        check whether the daemon is even running."""
+        floop = FakeLoop(_dstore(tmp_path))
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_pause() -> None:
+            entered.set()
+            release.wait(5)
+            floop.paused = True
+
+        floop.pause = slow_pause  # type: ignore[method-assign]
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.start()
+        try:
+            reply = ControlClient(tmp_path).submit("pause", timeout_s=0.3)
+            assert entered.is_set()
+            assert reply is not None and reply.pending and not reply.ok
+            assert "still executing" in reply.text
+            # Not withdrawn: the daemon owns it, and the command completes.
+            release.set()
+            deadline = time.time() + 5
+            while not floop.paused and time.time() < deadline:
+                time.sleep(0.01)
+            assert floop.paused
+        finally:
+            release.set()
+            server.close()
+
+    def test_withdrawn_request_is_never_claimed(self, tmp_path: Path) -> None:
+        # The claim is an atomic rename, so a request the client already
+        # withdrew cannot be half-executed; only a still-present one runs.
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        client = ControlClient(tmp_path)
+        assert client.submit("pause", timeout_s=0.05) is None
+        assert server.serve_once() == 0 and not floop.paused
+
     def test_requests_predating_the_daemon_are_refused_not_executed(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))
         ctl_dir = tmp_path / CTL_SUBDIR
@@ -251,6 +294,23 @@ class TestDaemonCtlCommand:
             assert result.exit_code == 1
             assert "commands: sbxloop daemon ctl status|pause" in result.output
         finally:
+            server.close()
+
+    def test_pending_reply_exits_1_and_says_so(self, workdir: Path) -> None:
+        state_dir = daemon_state(workdir)
+        floop = FakeLoop(_dstore(state_dir))
+        release = threading.Event()
+        floop.pause = lambda: release.wait(5)  # type: ignore[method-assign]
+        server = ControlServer(floop, state_dir, poll_s=0.02)
+        server.start()
+        try:
+            result = runner.invoke(app, ["daemon", "ctl", "pause", "--timeout", "0.3"])
+            assert result.exit_code == 1, result.output
+            out = " ".join(result.output.split())  # rich wraps the long line at 80 cols
+            assert "pending: the daemon took pause" in out and "still executing" in out
+            assert "no reply from the daemon" not in out
+        finally:
+            release.set()
             server.close()
 
     def test_daemon_group_still_runs_the_loop_bare(self, workdir: Path) -> None:
