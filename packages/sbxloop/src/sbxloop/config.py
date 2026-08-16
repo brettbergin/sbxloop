@@ -362,7 +362,8 @@ class DiscordConfig(_ConfigModel):
     command_prefix: str = "!sbx"
     thread_per_run: bool = True
     chronology_level: ChronologyLevel = "normal"
-    max_message_chars: int = 1900
+    # Discord's hard cap is 2000; leave headroom for wrappers.
+    max_message_chars: int = Field(default=1900, ge=200, le=2000)
 
     @property
     def enabled(self) -> bool:

@@ -58,8 +58,16 @@ COALESCE_WINDOW_S = 2.0
 # -- formatting (pure) ---------------------------------------------------------------
 
 
+# Discord's hard cap per message; _clip never returns more than this even
+# if a caller passes a nonsense limit.
+DISCORD_MAX_MESSAGE = 2000
+
+
 def _clip(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    limit = max(1, min(int(limit), DISCORD_MAX_MESSAGE))
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…" if limit > 1 else "…"
 
 
 def _one_line(text: str, limit: int = 160) -> str:
@@ -188,6 +196,7 @@ class DiscordBridge:
         self._loop_up = threading.Event()
         self._stop_evt: asyncio.Event | None = None
         self._gateway_ready = threading.Event()
+        self._degraded = False
         # Channel access failures are reported once, not on every flush.
         self._channel_error_logged = False
         # run_id -> per-run state; only the in-flight run has an unsubscribe
@@ -262,10 +271,22 @@ class DiscordBridge:
         stopper = asyncio.ensure_future(self._stop_evt.wait())
         try:
             done, _ = await asyncio.wait({gateway, stopper}, return_when=asyncio.FIRST_COMPLETED)
-            if gateway in done and (exc := gateway.exception()) is not None:
-                # Login/gateway failure: the daemon keeps running without
-                # Discord; say why once, at warning level, without a dump.
-                logger.warning("discord bridge could not connect: %s", exc)
+            if gateway in done and not self._stop_evt.is_set():
+                # Login/gateway failure (bad token, network): the daemon
+                # keeps running without Discord. Say why once, then stay
+                # alive in DRAINING mode until close() — the loop keeps
+                # enqueuing events via the bus subscription, and something
+                # must consume them or the queue grows for the rest of the
+                # process (review). The pump drops events while degraded.
+                exc = gateway.exception()
+                logger.warning(
+                    "discord bridge could not connect (%s); chronology is off until the "
+                    "daemon restarts",
+                    exc if exc is not None else "gateway exited",
+                )
+                self._degraded = True
+                self._gateway_ready.set()  # unblock the pump so it drains
+                await stopper
         finally:
             pump.cancel()
             stopper.cancel()
@@ -424,6 +445,15 @@ class DiscordBridge:
 
     async def _pump(self) -> None:
         await self._wait_ready()
+        if self._degraded:
+            # Consume forever so the queue stays bounded; nothing to send to.
+            while True:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self._events.get, True, COALESCE_WINDOW_S
+                    )
+                except queue.Empty:
+                    continue
         buffer: list[str] = []
         buffer_run: str | None = None
         last_flush = asyncio.get_event_loop().time()

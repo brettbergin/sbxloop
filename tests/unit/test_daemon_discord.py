@@ -23,6 +23,19 @@ def ev(type: str, **data: Any) -> Event:
     return Event.now(type, "r1", **data)
 
 
+class TestClip:
+    def test_clamps_bad_limits(self) -> None:
+        from sbxloop.daemon.discord import DISCORD_MAX_MESSAGE, _clip
+
+        # review: limit <= 0 or absurdly large must never yield an over-cap
+        # string that Discord rejects
+        assert _clip("hello", 0) == "…"
+        assert _clip("hello", -5) == "…"
+        assert len(_clip("x" * 5000, 10_000)) == DISCORD_MAX_MESSAGE
+        assert _clip("hi", 2) == "hi"
+        assert _clip("hello", 2) == "h…"
+
+
 class TestFormat:
     def test_agent_message_carries_attribution_and_clips(self) -> None:
         text = format_for_discord(
@@ -377,6 +390,32 @@ class TestBridge:
             assert engine.posted == []  # never treated as steering
         finally:
             bridge.close()
+
+    def test_gateway_failure_keeps_thread_alive_and_drains_queue(self, tmp_path: Path) -> None:
+        """Review: if the gateway task exits (bad token / network), the
+        bridge thread used to end while the loop kept enqueuing events —
+        unbounded growth. Now it stays alive in degraded mode and drains."""
+        bridge, client, _ = make_bridge(tmp_path)
+
+        async def failing_start(token: str) -> None:
+            raise RuntimeError("401 Unauthorized: bad token")
+
+        client.start = failing_start  # type: ignore[method-assign]
+        bridge.start(connect_wait_s=2.0)
+        try:
+            assert bridge._thread is not None and bridge._thread.is_alive()
+            assert wait_for(lambda: bridge._degraded)
+            # events keep flowing in from a run and must be consumed
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            for _ in range(200):
+                bus.emit("agent.tool_start", "r1", tool="bash", args="ls")
+            assert wait_for(lambda: bridge._events.qsize() < 50, timeout=10)
+            assert bridge._thread.is_alive()
+        finally:
+            bridge.close()
+        assert bridge._thread is not None and not bridge._thread.is_alive()
 
     def test_daemon_events_go_to_control_channel(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
