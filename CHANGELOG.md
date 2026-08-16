@@ -103,6 +103,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+
 - `git` is now baseline agent tooling, provisioned on every agent sandbox
   independent of `[sandbox] languages` (#252): the dev-tools ensure probes
   `command -v git` and installs it in the same pooled apt call as the selected
