@@ -1517,6 +1517,7 @@ def daemon(
                 labels,
                 on_failure=github.note_failure,
                 close_on_success=config.daemon.close_on_success,
+                tool_repo=config.daemon.tool_repo,
             )
         )
 
@@ -2011,6 +2012,9 @@ mem_abort = 0.0
 # postmortems = true             # file a post-mortem audit when a patch item fails
 # postmortems_per_day = 3
 # audits = false                 # open .github/sbxloop/audits/*.md charters on schedule
+# review_deliveries = true       # audit each PR the loop delivers (defects → backlog)
+# reviews_per_day = 5
+# tool_repo = "brettbergin/sbxloop"  # findings ABOUT sbxloop go here, never to the project
 # audit_dir = ".github/sbxloop/audits"
 # What a delivered run does to the tracker. Defaults are task-queue
 # semantics: close the source issue (the PR is the reviewable object) and

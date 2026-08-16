@@ -27,7 +27,13 @@ from typing import Any, NamedTuple, Protocol
 from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
 from sbxloop.daemon.audits import audit_marker, due_charters, issue_body, load_charters
-from sbxloop.daemon.backlog import AUDIT_INSTRUCTIONS, BACKLOG_INSTRUCTIONS, collect_backlog
+from sbxloop.daemon.backlog import (
+    AUDIT_INSTRUCTIONS,
+    BACKLOG_INSTRUCTIONS,
+    ToolFindings,
+    collect_backlog,
+    collect_tool_findings,
+)
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.postmortem import build_dossier
 from sbxloop.daemon.sources import WorkSource
@@ -643,7 +649,10 @@ class DaemonLoop:
         report = self._report(run_id, result)
         if result is not None and report.succeeded:
             filed = self._collect_backlog(run_id, source)
-            report = report._replace(filed=tuple(filed))
+            tool = self._collect_tool_findings(run_id, source)
+            report = report._replace(
+                filed=tuple(filed), tool_filed=tuple(tool.filed), tool_noted=tuple(tool.unfiled)
+            )
             self.dstore.mark_done(item.item_id, now)
             self.dstore.finish_ledger(run_id, "done", now)
             self._set_breaker(None, 0)
@@ -654,6 +663,7 @@ class DaemonLoop:
                 + (f" · PR {report.delivery[1]}" if report.delivery else "")
                 + (f" · filed {len(report.filed)} finding(s)" if item.kind == "audit" else "")
             )
+            self._file_review(item, run_id, report)
             return "done"
         if result is not None and result.state == "completed" and report.delivery_error:
             # Work done, PR failed: a human must look; retrying would redo the work.
@@ -905,6 +915,50 @@ class DaemonLoop:
                 self._notify(f"🔎 scheduled audit filed: {charter.title} → {ref}")
             except Exception:
                 logger.warning("scheduled audit %s could not be filed", charter.name, exc_info=True)
+
+    def _collect_tool_findings(self, run_id: str, source: WorkSource) -> ToolFindings:
+        """Findings addressed to the tool: filed upstream when tool_repo is
+        set, otherwise noted for the closing comment. Never the project's."""
+        if self.config.daemon.backlog == "off":
+            return ToolFindings([], [])
+        target = next((s for s in self.sources if s.name == self.config.daemon.backlog), None)
+        if target is None:
+            return ToolFindings([], [])
+        try:
+            return collect_tool_findings(
+                self.store.get_run(run_id),
+                dstore=self.dstore,
+                source=target,
+                max_items=self.config.daemon.backlog_max_per_run,
+                now=self.clock(),
+            )
+        except SbxloopError:
+            logger.warning("tool-finding collection failed for %s", run_id, exc_info=True)
+            return ToolFindings([], [])
+
+    def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> None:
+        """The loop evaluating the code it just wrote: after a patch item
+        delivers a PR, open a review audit of that PR. Once per run, patch
+        items only (an audit has no PR), capped per rolling day, best-effort."""
+        daemon = self.config.daemon
+        if not daemon.review_deliveries or item.kind != "patch" or report.delivery is None:
+            return
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "file_review"):
+            return
+        now = self.clock()
+        try:
+            if self.dstore.review_filed(run_id):
+                return
+            if self.dstore.reviews_since(now - DAY_S) >= daemon.reviews_per_day:
+                logger.info("delivery review for %s skipped: daily cap reached", run_id)
+                return
+            number, url = report.delivery
+            ref = github.file_review(item, number, url, run_id)
+            self.dstore.record_review(run_id, number, ref, now)
+            self._notify(f"🔎 review audit filed for PR #{number}: {ref}")
+        except Exception:
+            logger.warning("delivery review for %s could not be filed", run_id, exc_info=True)
 
     def _file_postmortem(self, item: WorkItem, run_id: str, reason: str) -> None:
         """Turn the daemon's own failure into a discovery-lane charter.

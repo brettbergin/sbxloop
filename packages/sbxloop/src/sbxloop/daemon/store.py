@@ -75,6 +75,13 @@ CREATE TABLE IF NOT EXISTS daemon_postmortems (
     filed_at   REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS daemon_reviews (
+    run_id     TEXT PRIMARY KEY,
+    pr_number  INTEGER NOT NULL,
+    filed_as   TEXT NOT NULL,
+    filed_at   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS daemon_audits (
     name       TEXT PRIMARY KEY,
     filed_as   TEXT NOT NULL,
@@ -630,6 +637,33 @@ class DaemonStore:
                 "INSERT OR IGNORE INTO daemon_postmortems (run_id, item_id, filed_as, filed_at) "
                 "VALUES (?, ?, ?, ?)",
                 (run_id, item_id, filed_as, now),
+            )
+            self._conn.commit()
+
+    # -- delivery reviews (discovery lane) ---------------------------------------
+
+    def review_filed(self, run_id: str) -> bool:
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM daemon_reviews WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is not None
+            )
+
+    def reviews_since(self, ts: float) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_reviews WHERE filed_at >= ?", (ts,)
+            ).fetchone()
+            return int(row["n"])
+
+    def record_review(self, run_id: str, pr_number: int, filed_as: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_reviews (run_id, pr_number, filed_as, filed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, pr_number, filed_as, now),
             )
             self._conn.commit()
 

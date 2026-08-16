@@ -139,6 +139,7 @@ class RecordingOps:
         self.raw_calls: list[tuple[str, str, Any]] = []
         self.comments: list[tuple[int, str]] = []
         self.created: list[tuple[str, list[str] | None]] = []
+        self.created_in: list[str] = []  # repo each issue_create targeted
         self.fail_on: set[str] = set()
         # Comments as GitHub lists them (ascending), events per issue; a
         # claim test scripts a rival's claim comment here.
@@ -202,6 +203,7 @@ class RecordingOps:
 
     def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> IssueRef:
         self.created.append((title, labels))
+        self.created_in.append(repo)
         return IssueRef(number=77, url="https://x/issues/77")
 
 
@@ -269,6 +271,31 @@ class TestGitHubSource:
         src2 = GitHubIssueSource(lambda: ops2, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
         src2.report_success(src2.poll()[0], report())
         assert not any(m == "PATCH" for m, _, _ in ops2.raw_calls)
+
+    def test_review_and_tool_filing_shapes(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        src = GitHubIssueSource(  # type: ignore[arg-type]
+            lambda: ops, "o/r", LABELS, host="db", tool_repo="brettbergin/sbxloop"
+        )
+        item = src.poll()[0]
+        ref = src.file_review(item, 9, "https://x/pull/9", "r1")
+        assert ref.startswith("gh:")
+        title, labels = ops.created[-1]
+        assert title.startswith("review: PR #9 — Issue 4 (run r1)") and labels == ["sbxloop:audit"]
+        up = src.file_tool_backlog("Planner nests sh -c", "evidence", "r1")
+        assert up is not None and up.startswith("brettbergin/sbxloop#")
+        # the upstream issue was created in the TOOL repo, not the project's
+        assert ops.created_in[-1] == "brettbergin/sbxloop" and ops.created_in[-2] == "o/r"
+        none = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        assert none.file_tool_backlog("x", "y", "r1") is None
+        # closing comment names upstream refs and noted-only titles
+        src.report_success(
+            item,
+            report(tool_filed=("brettbergin/sbxloop#12",), tool_noted=("Prompt says X",)),
+        )
+        joined = "\n".join(b for _, b in ops.comments)
+        assert "Filed upstream (about sbxloop itself): brettbergin/sbxloop#12" in joined
+        assert "noted but not filed here" in joined and "Prompt says X" in joined
 
     def test_audit_with_no_findings_says_so(self) -> None:
         ops = RecordingOps({"5": issue(5, "sbxloop:audit")})

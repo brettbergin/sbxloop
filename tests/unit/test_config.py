@@ -151,6 +151,10 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text('[daemon]\ndelivered_label = "sbxloop:failed"\n')
     with pytest.raises(ConfigError, match="distinct"):
         load_config(cwd=tmp_path, env={})
+    # tool_repo must be owner/name
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\ntool_repo = "not a repo"\n')
+    with pytest.raises(ConfigError, match="owner/name"):
+        load_config(cwd=tmp_path, env={})
     # so does the discovery lane's audit_label
     (tmp_path / "sbxloop.toml").write_text('[daemon]\naudit_label = "sbxloop:run"\n')
     with pytest.raises(ConfigError, match="distinct"):

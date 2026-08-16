@@ -291,6 +291,16 @@ sbxloop's own repo carries four (verify-lint vs. prompts, daemon guardrails,
 e2e markers, test flakes); every finding they produce is one more
 `sbxloop:backlog` issue for a human to promote or close.
 
+Two more things close the loop. Every PR the daemon delivers gets a
+**review audit** (`[daemon] review_deliveries`): a fresh run reads the source
+issue and the diff as a skeptical maintainer and files defects, missing
+tests and scope drift as backlog issues — sbxloop evaluating the code
+sbxloop wrote. And findings *about the tool itself* — the planner wrote a
+bad verify command, a prompt misled the agent, delivery mishandled a case —
+are never dumped on the project's tracker: the audit contract routes them
+to `.sbxloop/backlog/tool/`, and `[daemon] tool_repo = "brettbergin/sbxloop"`
+files them upstream (unset: they are noted in the closing comment only).
+
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
 an interrupted run (SIGTERM, crash) is resumed on the next start — through

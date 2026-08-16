@@ -376,6 +376,15 @@ class DaemonConfig(_ConfigModel):
     # operator flipping this on.
     audits: bool = False
     audit_dir: Path = Path(".github/sbxloop/audits")
+    # After a run delivers a PR, open a review audit of that PR — the loop
+    # evaluating the code it just wrote (defects, missing edge cases, scope
+    # drift) and filing findings for a human to promote.
+    review_deliveries: bool = True
+    reviews_per_day: int = 5
+    # Where findings ABOUT THE TOOL (sbxloop's planner, prompts, lint,
+    # delivery) go — the tool's own tracker, never the project's. Unset:
+    # such findings are only noted in the closing comment.
+    tool_repo: str | None = None
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
@@ -423,9 +432,12 @@ class DaemonConfig(_ConfigModel):
             "max_consecutive_failures",
             "backlog_max_per_run",
             "postmortems_per_day",
+            "reviews_per_day",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"daemon.{name} must be >= 1")
+        if self.tool_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", self.tool_repo):
+            raise ValueError(f"daemon.tool_repo must be owner/name, got {self.tool_repo!r}")
         return self
 
 

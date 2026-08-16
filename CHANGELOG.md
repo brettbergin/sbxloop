@@ -40,6 +40,18 @@ All notable changes to sbxloop are documented here. The project adheres to
   created within the interval counts), the store is a cache; broken charters
   are reported once and skipped. sbxloop's own repo ships four:
   verify-lint-vs-prompts, daemon-guardrails, e2e-markers, test-flakes.
+- **Delivery reviews** (`[daemon] review_deliveries`, default on): after a
+  patch item delivers a PR, the daemon opens `review: PR #N` as an audit
+  charter — the loop evaluating the code it just wrote (defects, missing
+  edge cases, scope drift, unjustified claims) and filing findings for a
+  human to promote. Once per run, `reviews_per_day` (5) cap.
+- **Findings about the tool are routed, never dumped on the project.** The
+  audit contract asks the agent to put findings about sbxloop itself
+  (planner, prompts, lint, delivery, daemon) under
+  `.sbxloop/backlog/tool/`; with `[daemon] tool_repo = "owner/sbxloop"`
+  they are filed upstream (`RunReport.tool_filed`, named in the closing
+  comment), otherwise only noted in the comment (`tool_noted`) — the
+  project's tracker never receives issues about the tool that ran on it.
 
 ## [0.7.0] — 2026-08-16
 

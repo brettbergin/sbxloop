@@ -180,3 +180,51 @@ class TestFiling:
         h.source.items = [inbox_item()]
         h.outcomes = ["failed"]
         h.loop.tick()  # must not raise
+
+
+class ReviewingSource(GithubLikeSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reviews: list[tuple[str, int, str]] = []
+
+    def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
+        self.reviews.append((item.item_id, pr_number, run_id))
+        return f"gh:{800 + len(self.reviews)}"
+
+
+def reviewing_harness(tmp_path: Path, **daemon: Any) -> Harness:
+    h = github_harness(tmp_path, **daemon)
+    h.source = ReviewingSource()
+    h.loop.sources = [h.source]
+    return h
+
+
+class TestDeliveryReviews:
+    """The loop evaluating the code it wrote: a delivered PR gets a review
+    audit — once per run, patch items only, capped per day."""
+
+    def test_delivered_patch_files_one_review(self, tmp_path: Path) -> None:
+        h = reviewing_harness(tmp_path)
+        h.source.items = [gh_item()]
+        assert h.loop.tick().outcome == "done"
+        assert h.source.reviews == [("gh:4", 9, h.runs[0][0])]  # type: ignore[attr-defined]
+        run_id = h.runs[0][0]
+        assert h.dstore.review_filed(run_id)
+        report = next(c[1] for c in h.source.calls if c[0] == "success")
+        h.loop._file_review(gh_item(), run_id, report)  # never twice
+        assert len(h.source.reviews) == 1  # type: ignore[attr-defined]
+
+    def test_not_for_audits_no_delivery_or_disabled_and_capped(self, tmp_path: Path) -> None:
+        h = reviewing_harness(tmp_path)
+        h.source.items = [gh_item(kind="audit")]
+        h.loop.tick()
+        assert h.source.reviews == []  # type: ignore[attr-defined]  # audits have no PR
+        h2 = reviewing_harness(tmp_path / "b", review_deliveries=False)
+        h2.source.items = [gh_item()]
+        h2.loop.tick()
+        assert h2.source.reviews == []  # type: ignore[attr-defined]
+        h3 = reviewing_harness(tmp_path / "c", reviews_per_day=1)
+        h3.dstore.record_review("earlier", 1, "gh:1", h3.clock.t)
+        h3.source.items = [gh_item()]
+        h3.loop.tick()
+        assert h3.source.reviews == []  # type: ignore[attr-defined]

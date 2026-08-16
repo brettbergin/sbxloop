@@ -69,6 +69,10 @@ class RunReport(NamedTuple):
     requeued: bool = False
     # Backlog issues the run filed (``gh:<n>`` refs) — an audit's deliverable.
     filed: tuple[str, ...] = ()
+    # Findings addressed to sbxloop itself: filed upstream (``[daemon]
+    # tool_repo``) as refs, or merely noted by title in the closing comment.
+    tool_filed: tuple[str, ...] = ()
+    tool_noted: tuple[str, ...] = ()
 
     @property
     def succeeded(self) -> bool:

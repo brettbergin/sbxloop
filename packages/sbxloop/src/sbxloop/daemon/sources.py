@@ -93,6 +93,13 @@ def _report_lines(report: RunReport) -> list[str]:
     if report.filed:
         refs = ", ".join(f"#{ref.split(':', 1)[1]}" if ":" in ref else ref for ref in report.filed)
         lines.append(f"Filed: {refs}")
+    if report.tool_filed:
+        lines.append(f"Filed upstream (about sbxloop itself): {', '.join(report.tool_filed)}")
+    if report.tool_noted:
+        lines.append(
+            "Findings about sbxloop itself, noted but not filed here (set `[daemon] "
+            "tool_repo` to route them upstream): " + "; ".join(report.tool_noted)
+        )
     if report.workspace:
         lines.append(f"Workspace: `{report.workspace}`")
     return lines
@@ -280,12 +287,16 @@ class GitHubIssueSource:
         host: str | None = None,
         on_failure: Callable[[BaseException], object] | None = None,
         close_on_success: bool = True,
+        tool_repo: str | None = None,
     ) -> None:
         self._ops = ops
         self.repo = repo
         self.labels = labels
         self.host = host or socket.gethostname()
         self.close_on_success = close_on_success
+        # Findings ABOUT sbxloop go to its own tracker (never the project's);
+        # unset means "note them in the closing comment only".
+        self.tool_repo = tool_repo
         # Told about every failed op (``DaemonGithub.note_failure``) so a
         # dead sandbox gets replaced; the source itself never retries.
         self._on_failure = on_failure
@@ -654,6 +665,43 @@ class GitHubIssueSource:
             f"post-mortem: {' '.join(item.title.split())[:80]} (run {run_id})",
             f"{dossier}\n\n{postmortem_marker(run_id)}\n---\nFiled by the sbxloop daemon "
             f"after `{item.item_id}` failed (run `{run_id}`).",
+            labels=[self.labels.audit],
+        )
+        return f"gh:{ref.number}"
+
+    def file_tool_backlog(self, title: str, body: str, origin_run_id: str) -> str | None:
+        """A finding about the TOOL, filed to ``tool_repo`` (None → caller notes it)."""
+        if not self.tool_repo:
+            return None
+        ref = self._ops().issue_create(
+            self.tool_repo,
+            title,
+            f"{body}\n\n---\nFiled by sbxloop run `{origin_run_id}` while working on "
+            f"`{self.repo}` (a finding about the tool, routed upstream).",
+            labels=[self.labels.backlog],
+        )
+        return f"{self.tool_repo}#{ref.number}"
+
+    def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
+        """Open a review of a PR the loop just delivered, as an audit charter:
+        the loop evaluating the code it wrote."""
+        body = (
+            f"# Review: PR #{pr_number} (delivered by run `{run_id}` for {item.item_id})\n\n"
+            f"PR: {pr_url}\nSource issue: {item.url or item.source_key}\n\n"
+            "Charter: review this PR as a skeptical maintainer. Read the source issue and the "
+            "full diff (`gh pr diff` / `gh pr view` are available; the workspace is a fresh "
+            "clone — check out the PR's branch to run its tests). Look for: defects and "
+            "wrong behaviour, missing edge cases and tests, scope drift from the issue, "
+            "unjustified claims in the PR body, style that contradicts the repository's "
+            "conventions, and anything a reviewer would block on. Each real problem is one "
+            "finding with Evidence (file:line in the diff), Repro, Proposal, Size, Kind. If "
+            "the PR is fine, say so and file nothing — a clean review is a valid result.\n\n"
+            f"<!-- sbxloop-review {run_id} -->"
+        )
+        ref = self._ops().issue_create(
+            self.repo,
+            f"review: PR #{pr_number} — {' '.join(item.title.split())[:70]} (run {run_id})",
+            body,
             labels=[self.labels.audit],
         )
         return f"gh:{ref.number}"
