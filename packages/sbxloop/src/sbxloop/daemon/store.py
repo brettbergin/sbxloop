@@ -304,8 +304,11 @@ class DaemonStore:
         ``!sbx cancel --retry``). The attempt budget and retry backoff exist
         to bound *autonomous* churn, so a human decision starts both over:
         attempts reset to zero and the item is eligible on the next tick.
-        The daily run cap still applies."""
-        self._update(item_id, now, state="queued", attempts=0, last_error=reason[:2000])
+        The daily run cap still applies. The run is unpinned: a re-queued
+        item runs fresh, never resumes the cancelled/failed run (#254)."""
+        self._update(
+            item_id, now, state="queued", attempts=0, run_id=None, last_error=reason[:2000]
+        )
 
     def mark_requeued_unstarted(self, item_id: str, now: float) -> None:
         """Crash between claim and start: back to the queue, claim kept."""

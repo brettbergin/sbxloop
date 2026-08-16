@@ -111,6 +111,9 @@ class TestQueueAndAttempts:
         store.requeue("gh:7", "re-queued by op", now=5.0)
         got = store.get("gh:7")
         assert got is not None and got.state == "queued" and got.attempts == 0
+        # Cancel keeps the run for `sbxloop resume`; a re-queue runs fresh, so
+        # the pin must go or the next tick would resume the cancelled run.
+        assert got.run_id is None
         # A human's re-queue is eligible right away, no failure backoff.
         assert store.next_queued(now=5.0, backoff_s=900) is not None
 
