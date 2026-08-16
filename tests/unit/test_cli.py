@@ -291,6 +291,19 @@ class TestConfigAndInit:
         forced = runner.invoke(app, ["init", "--force"])
         assert forced.exit_code == 0
 
+    def test_init_template_documents_tracker_knobs(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["init"])
+        assert result.exit_code == 0
+        text = (workdir / "sbxloop.toml").read_text()
+        assert "close_on_success" in text
+        assert "tracking_issue" in text
+
+        from sbxloop.config import load_config
+
+        config = load_config(cwd=workdir, env={})
+        assert config.daemon.close_on_success is True
+        assert config.daemon.tracking_issue is True
+
 
 class TestSandboxCommands:
     def test_sandbox_ls_filters_sbxloop(self, workdir: Path, fake_sbx: FakeSbx) -> None:

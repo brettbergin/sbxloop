@@ -2003,8 +2003,8 @@ mem_abort = 0.0
 # open a per-run tracking issue. For a design/discussion tracker set both
 # false: the source issue gets the summary + delivered_label and stays open
 # until a human merges the PR, and no extra tracking issue is opened.
-# close_on_success = true
-# tracking_issue = true
+# close_on_success = true         # false leaves the issue open for a human to close on merge
+# tracking_issue = true           # false skips the per-run tracking issue
 # max_runs_per_day = 12           # rolling 24h window, persisted across restarts
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
