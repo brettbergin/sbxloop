@@ -91,6 +91,16 @@ class TestInbox:
         assert (root / "failed" / "b.md").exists()
         assert "kaboom" in (root / "failed" / "b.result.md").read_text()
 
+    def test_abandoned_while_unclaimed_moves_the_pending_file(self, tmp_path: Path) -> None:
+        """#229: an operator abandons an item that was never claimed; the
+        file is still in pending/ and must not be left looking like work."""
+        src, root = self.make(tmp_path)
+        self._drop(root, "c.md", "# C\n", mtime=1.0)
+        item = src.poll()[0]
+        src.report_abandoned(item, "abandoned by operator")
+        assert (root / "failed" / "c.md").exists() and not (root / "pending" / "c.md").exists()
+        assert src.poll() == []
+
     def test_cancelled_lands_in_failed_with_resume_hint_and_requeue_undoes_it(
         self, tmp_path: Path
     ) -> None:
@@ -406,7 +416,7 @@ class TestGitHubSource:
 
     def test_abandoned_adds_failed_label_with_retrigger_hint(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
-        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x", claimed=True)
         self.make(ops).report_abandoned(item, "budget exhausted")
         assert (
             "POST",
@@ -414,6 +424,22 @@ class TestGitHubSource:
             {"labels": ["sbxloop:failed"]},
         ) in ops.raw_calls
         assert any("re-adding `sbxloop:run`" in body for _, body in ops.comments)
+        # Claimed: the trigger label already went with the claim; not touched.
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun", None) not in ops.raw_calls
+
+    def test_abandoned_while_unclaimed_drops_the_trigger_label(self) -> None:
+        """#229: an operator abandons an item that was never claimed (still
+        queued). The trigger label is what is on the issue; left there the
+        issue reads as work to do and "re-add the trigger" is a no-op."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x", claimed=False)
+        self.make(ops).report_abandoned(item, "abandoned by operator")
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun", None) in ops.raw_calls
+        assert (
+            "POST",
+            "/repos/o/r/issues/4/labels",
+            {"labels": ["sbxloop:failed"]},
+        ) in ops.raw_calls
 
     def test_cancelled_removes_in_progress_and_leaves_trigger_to_a_human(self) -> None:
         """#246: a cancel is neither failure nor trigger — the issue is left

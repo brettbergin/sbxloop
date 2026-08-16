@@ -271,8 +271,8 @@ before it counts as a failed attempt. Ship it as a systemd user service with
 Individual items are steerable from another shell without stopping the
 daemon: `sbxloop daemon items` lists them (state, attempts, pinned run, last
 error); `sbxloop daemon abandon <item> [--reason …]` gives one up (a live
-daemon cancels its in-flight run and tells the issue/inbox file; with no
-daemon running, the next daemon start reports it and closes the dead run);
+daemon cancels its in-flight run and tells the issue/inbox file — the report
+is owed on the row and paid by the next tick or the next daemon start, once);
 `sbxloop daemon retry <item>` re-queues an abandoned or cancelled item with attempts
 reset and a **fresh plan** — not a resume of the plan that failed; and
 `sbxloop daemon requeue <item>` drops a running item's pinned run so its

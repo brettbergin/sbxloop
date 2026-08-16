@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS daemon_work_items (
     last_error  TEXT,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
+    pending_report TEXT,
     UNIQUE(source, source_key)
 );
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);
@@ -77,8 +78,18 @@ CREATE TABLE IF NOT EXISTS daemon_discord_threads (
 
 # Columns added after a table first shipped; applied idempotently at open
 # (same pattern as engine/store.py's runs migrations).
-_DISCORD_MIGRATIONS = (
-    ("status_id", "ALTER TABLE daemon_discord_threads ADD COLUMN status_id INTEGER"),
+_MIGRATIONS = (
+    (
+        "daemon_discord_threads",
+        "status_id",
+        "ALTER TABLE daemon_discord_threads ADD COLUMN status_id INTEGER",
+    ),
+    # #229: an operator decision (abandon / retry) the source has not heard yet.
+    (
+        "daemon_work_items",
+        "pending_report",
+        "ALTER TABLE daemon_work_items ADD COLUMN pending_report TEXT",
+    ),
 )
 
 
@@ -106,6 +117,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         last_error=row["last_error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        pending_report=row["pending_report"],
     )
 
 
@@ -120,10 +132,8 @@ class DaemonStore:
         # flight; wait for it instead of failing on SQLITE_BUSY.
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
-        existing = {
-            row["name"] for row in self._conn.execute("PRAGMA table_info(daemon_discord_threads)")
-        }
-        for column, ddl in _DISCORD_MIGRATIONS:
+        for table, column, ddl in _MIGRATIONS:
+            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 self._conn.execute(ddl)
         self._conn.commit()
@@ -251,12 +261,19 @@ class DaemonStore:
         """Operator abandon: queued/running → abandoned. ``run_id`` is kept
         so the ledger and ``sbxloop logs`` still tie the item to the run
         that made the operator give up on it; the loop treats
-        "abandoned while pinned to my run" as its cue to cancel that run."""
-        item = self._require(item_id)
-        if item.state in ("done", "abandoned", "cancelled"):
-            raise ValueError(f"{item_id} is already {item.state}")
-        self._update(item_id, now, state="abandoned", last_error=reason[:2000])
-        return self._require(item_id)
+        "abandoned while pinned to my run" as its cue to cancel that run.
+        The source is owed a report (``pending_report``): whoever delivers
+        it — the loop's settle path, recovery, or the tick sweep after a
+        row-only CLI abandon — clears the debt."""
+        return self._transition(
+            item_id,
+            now,
+            ("queued", "running", "failed"),
+            lambda item: f"{item_id} is already {item.state}",
+            state="abandoned",
+            last_error=reason[:2000],
+            pending_report="abandoned",
+        )
 
     def retry(self, item_id: str, now: float, reason: str | None = None) -> WorkItem:
         """Operator retry: an abandoned, cancelled or backoff-waiting item
@@ -269,35 +286,92 @@ class DaemonStore:
         The source-side claim is kept: re-claiming would fail (the inbox
         file / trigger label moved when it was first claimed). ``reason``
         (e.g. "re-queued by X") is kept as ``last_error`` for the audit
-        trail in ``items``; without one the old error is cleared."""
-        item = self._require(item_id)
-        if item.state not in ("abandoned", "cancelled", "queued"):
-            raise ValueError(
-                f"{item_id} is {item.state}; only abandoned, cancelled or queued items can be "
-                "retried" + (" (abandon it first)" if item.state == "running" else "")
-            )
-        self._update(
+        trail in ``items``; without one the old error is cleared. The source
+        is owed a ``requeued`` report (GitHub: re-claim, drop the failed
+        label; inbox: move the file back out of failed/)."""
+        return self._transition(
             item_id,
             now,
+            ("abandoned", "cancelled", "queued"),
+            lambda item: (
+                f"{item_id} is {item.state}; only abandoned, cancelled or queued items can be "
+                "retried" + (" (abandon it first)" if item.state == "running" else "")
+            ),
             state="queued",
             attempts=0,
             run_id=None,
             last_error=reason[:2000] if reason else None,
+            pending_report="requeued",
         )
-        return self._require(item_id)
 
     def requeue(self, item_id: str, now: float) -> WorkItem:
         """Operator requeue: a running (or queued) item loses its pinned run
         and goes back to the queue with its attempt count intact — the
-        next dispatch starts a fresh run rather than resuming."""
-        item = self._require(item_id)
-        if item.state not in ("running", "queued"):
-            raise ValueError(
+        next dispatch starts a fresh run rather than resuming. The source
+        hears nothing: the item is still claimed and still work."""
+        return self._transition(
+            item_id,
+            now,
+            ("running", "queued"),
+            lambda item: (
                 f"{item_id} is {item.state}; only running or queued items can be requeued"
                 + (" (use retry)" if item.state in ("abandoned", "cancelled") else "")
+            ),
+            state="queued",
+            run_id=None,
+        )
+
+    def _transition(
+        self,
+        item_id: str,
+        now: float,
+        allowed: tuple[str, ...],
+        refuse: Callable[[WorkItem], str],
+        **fields: object,
+    ) -> WorkItem:
+        """One conditional statement (``WHERE state IN (...)``) instead of a
+        read-then-write: the CLI runs in another process, so a daemon that
+        settles the item as done between the two must not have its verdict
+        overwritten by a command issued on stale state. No row updated →
+        re-read and refuse with the state that is actually there."""
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        marks = ", ".join("?" for _ in allowed)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE daemon_work_items SET {assignments}, updated_at = ? "  # nosec B608
+                f"WHERE item_id = ? AND state IN ({marks})",
+                (*fields.values(), now, item_id, *allowed),
             )
-        self._update(item_id, now, state="queued", run_id=None)
-        return self._require(item_id)
+            self._conn.commit()
+            if cursor.rowcount == 1:
+                return self._require(item_id)
+            raise ValueError(refuse(self._require(item_id)))
+
+    def pending_reports(self) -> list[WorkItem]:
+        """Items whose operator decision (abandon / retry) the source has
+        not been told about yet, oldest decision first."""
+        with self._lock:
+            return [
+                _row_to_item(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM daemon_work_items WHERE pending_report IS NOT NULL "
+                    "ORDER BY updated_at ASC, rowid ASC"
+                )
+            ]
+
+    def take_pending_report(self, item_id: str) -> bool:
+        """Claim the item's owed report for delivery; False if there was
+        none (or another thread already took it). Not ``_update``: this is
+        not an item change and must not move ``updated_at``, the
+        retry-backoff clock."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE daemon_work_items SET pending_report = NULL "
+                "WHERE item_id = ? AND pending_report IS NOT NULL",
+                (item_id,),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def _require(self, item_id: str) -> WorkItem:
         item = self.get(item_id)

@@ -181,11 +181,11 @@ class DaemonLoop:
             self._notify(f"abandoning {item_id}: cancelling its run {fresh.run_id}")
             return fresh
         if fresh.run_id is not None:
-            self.dstore.finish_ledger(fresh.run_id, "abandoned", now)
-        source = self._source_for(fresh)
-        if source is not None:
-            source.report_abandoned(fresh, why)
-        self._notify(f"❌ {item_id} abandoned by operator: {why}")
+            # A pinned run that is not the one in flight is dead (a pending
+            # resume): its microVMs and secrets would otherwise outlive the
+            # ledger row that recovery uses to find them.
+            self._close_dead_run(fresh.run_id, "abandoned", now)
+        self._deliver_report(fresh)
         return fresh
 
     def retry_item(self, item_id: str, by: str | None = None) -> WorkItem:
@@ -195,10 +195,7 @@ class DaemonLoop:
         label)."""
         who = by or "operator"
         fresh = self.dstore.retry(item_id, self.clock(), f"re-queued by {who}")
-        source = self._source_for(fresh)
-        if source is not None:
-            source.report_requeued(fresh, who)
-        self._notify(f"↻ {item_id} re-queued by {who} (attempts reset)")
+        self._deliver_report(fresh, by=who)
         return fresh
 
     def requeue_item(self, item_id: str) -> WorkItem:
@@ -211,11 +208,51 @@ class DaemonLoop:
         if self._cancel_if_current(item_id):
             self._notify(f"requeue: {item_id} — cancelling its run {pinned}")
         elif pinned is not None:
-            self.dstore.finish_ledger(pinned, "requeued", now)
+            self._close_dead_run(pinned, "requeued", now)
             self._notify(f"requeue: {item_id} unpinned from {pinned}")
         else:
             self._notify(f"requeue: {item_id} re-queued")
         return fresh
+
+    def _close_dead_run(self, run_id: str, result: str, now: float) -> None:
+        """A pinned run that will never be resumed: drop its sandboxes and
+        secrets first (so an interruption here leaves the ledger open for
+        recovery to finish the job), then close its ledger row."""
+        self._remove_stale_run_sandboxes(run_id)
+        self.dstore.finish_ledger(run_id, result, now)
+
+    def _deliver_pending_reports(self) -> None:
+        """Tell the sources about operator decisions they have not heard:
+        ``sbxloop daemon abandon|retry`` runs in another process and can
+        only flip the row, so an abandoned-while-queued item or a retried
+        one would otherwise stay in the inbox's ``pending/``/``failed/`` (or
+        keep GitHub's trigger/failed label) forever. Runs at the top of
+        every tick and after recovery; the in-flight item is not here (its
+        settle path delivers, once the run is really down)."""
+        for item in self.dstore.pending_reports():
+            self._deliver_report(item)
+
+    def _deliver_report(self, item: WorkItem, *, by: str | None = None) -> None:
+        """Deliver ``item.pending_report`` to its source, exactly once: the
+        debt is taken atomically first, so a Discord command on the bridge
+        thread and the tick sweep on the loop thread cannot both report."""
+        kind = item.pending_report
+        source = self._source_for(item)
+        if kind is None or source is None:
+            # No source (not configured this start): nothing to tell, and
+            # the debt stays on the row for a start that has one.
+            return
+        if not self.dstore.take_pending_report(item.item_id):
+            return
+        if kind == "abandoned":
+            why = item.last_error or "abandoned by operator"
+            source.report_abandoned(item, why)
+            self._notify(f"❌ {item.item_id} abandoned by operator: {why}")
+        else:
+            # A row-only retry records who asked as its last_error.
+            who = by or (item.last_error or "").removeprefix("re-queued by ") or "operator"
+            source.report_requeued(item, who)
+            self._notify(f"↻ {item.item_id} re-queued by {who} (attempts reset)")
 
     def _cancel_if_current(self, item_id: str) -> bool:
         with self._current_lock:
@@ -284,6 +321,9 @@ class DaemonLoop:
 
     def tick(self) -> TickResult:
         now = self.clock()
+        # Before the gates: an operator decision made from another process
+        # reaches its source even while paused or with the breaker open.
+        self._deliver_pending_reports()
         if self._paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -514,11 +554,9 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         if fresh.state == "abandoned":
-            why = fresh.last_error or "abandoned by operator"
             self.dstore.finish_ledger(run_id, "abandoned", now)
-            source.report_abandoned(fresh, why)
+            self._deliver_report(fresh)
             self._frontend_finished(item, report)
-            self._notify(f"❌ {item.item_id} abandoned by operator: {why}")
             return "abandoned"
         self.dstore.finish_ledger(run_id, "requeued", now)
         self._frontend_finished(item, report)
@@ -608,6 +646,8 @@ class DaemonLoop:
         if cancel.retry:
             # cancelled → queued is the same transition `!sbx retry` makes.
             self.dstore.retry(item.item_id, now, reason)
+            # report_cancelled(requeued=True) below is the source-side report.
+            self.dstore.take_pending_report(item.item_id)
             self._notify(f"⏹ {item.item_id} {reason}; re-queued to run again fresh")
         else:
             self._notify(
@@ -784,28 +824,26 @@ class DaemonLoop:
         running/pinned after a clean shutdown). The source was never told,
         the run's ledger row is still open (or ``interrupted``) and its
         microVMs still exist. Finish that work here so the abandon reaches
-        the issue / inbox file exactly once, on the next daemon start."""
+        the issue / inbox file exactly once, on the next daemon start. The
+        source report itself is the row's ``pending_report`` debt, paid by
+        :meth:`_deliver_pending_reports` right after (and by every tick —
+        an abandoned-while-queued item has no run to find here)."""
         for run_id, item_id in self.dstore.unsettled_runs():
             item = self.dstore.get(item_id)
             if item is None:
                 continue
             now = self.clock()
             if item.state == "abandoned" and item.run_id == run_id:
-                why = item.last_error or "abandoned by operator"
-                self.dstore.finish_ledger(run_id, "abandoned", now)
-                self._remove_stale_run_sandboxes(run_id)
-                source = self._source_for(item)
-                if source is not None:
-                    source.report_abandoned(item, why)
-                self._notify(f"recovery: ❌ {item_id} abandoned offline by operator: {why}")
+                self._close_dead_run(run_id, "abandoned", now)
+                self._notify(f"recovery: {item_id} abandoned offline; run {run_id} closed")
             elif item.state == "queued" and item.run_id != run_id:
                 # Requeued (unpinned) offline: the run is dead and will not be
                 # resumed — close its ledger and drop its sandboxes.
-                self.dstore.finish_ledger(run_id, "requeued", now)
-                self._remove_stale_run_sandboxes(run_id)
+                self._close_dead_run(run_id, "requeued", now)
                 self._notify(f"recovery: {item_id} requeued offline; run {run_id} closed")
             # A queued item still pinned to this run is a pending resume; a
             # running one was reconciled above.
+        self._deliver_pending_reports()
 
     def _remove_stale_run_sandboxes(self, run_id: str) -> None:
         """A dead process leaves the run's microVMs — and their secret

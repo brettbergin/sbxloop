@@ -1021,3 +1021,73 @@ class TestOperatorItemControls:
         h.clock.t += 10_000
         assert h.loop.tick().outcome == "done"
         assert h.runs[0][0] != "r_old" and h.runs[0][1] is False
+
+    def test_cli_retry_of_abandoned_item_reaches_the_source_before_dispatch(
+        self, tmp_path: Path
+    ) -> None:
+        """A row-only `sbxloop daemon retry` (other process) cannot call
+        report_requeued, so the inbox file would stay under failed/ and the
+        GitHub issue would keep its failed label. The row carries the debt;
+        the next tick pays it before the fresh dispatch — once."""
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item()]
+        h.outcomes = ["failed"]
+        assert h.loop.tick().outcome == "abandoned"
+        h.dstore.retry("inbox:a.md", h.clock(), "re-queued by operator (CLI)")  # CLI, row only
+        assert h.loop.tick().outcome == "done"
+        kinds = [c[0] for c in h.source.calls]
+        assert kinds == ["claim", "started", "abandoned", "requeued", "started", "success"]
+        assert h.source.calls[3] == ("requeued", "operator (CLI)")
+        assert h.dstore.get("inbox:a.md").pending_report is None  # type: ignore[union-attr]
+
+    def test_cli_abandon_of_queued_item_reaches_the_source(self, tmp_path: Path) -> None:
+        """An item abandoned from the CLI while merely queued has no run in
+        flight to override and no ledger row for recovery to find; the tick
+        sweep still delivers the abandon (paused or not), exactly once."""
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.abandon("inbox:a.md", "not worth it", 2.0)  # CLI, row only
+        h.loop.pause()
+        assert h.loop.tick().idle_kind == "paused"
+        assert h.source.calls == [("abandoned", "not worth it")]
+        h.loop.unpause()
+        assert h.loop.tick().idle_kind == "no_work"
+        h.loop.recover()
+        assert len(h.source.calls) == 1
+
+    def test_loop_abandon_of_pending_resume_removes_its_sandboxes(self, tmp_path: Path) -> None:
+        """A Discord abandon of an item queued for resume closes the dead
+        run's ledger — after which recovery no longer sees it — so its
+        microVMs and secrets must go now or leak for good."""
+        h = Harness(tmp_path)
+        removed: list[str] = []
+
+        class FakeSbx:
+            def stop(self, name: str) -> None: ...
+
+            def rm(self, name: str, **kwargs: Any) -> None:
+                removed.append(name)
+
+            def secret_rm(self, **kwargs: Any) -> bool:
+                return True
+
+        h.loop.sbx = FakeSbx()  # type: ignore[assignment]
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_dead", now=2.0)
+        h.dstore.finish_ledger("r_dead", "interrupted", 3.0)
+        h.dstore.mark_resume_pending("inbox:a.md", 4.0)
+        h.loop.abandon_item("inbox:a.md", "never mind")
+        assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
+        assert h.source.calls == [("abandoned", "never mind")]
+        removed.clear()
+        h.dstore.retry("inbox:a.md", 5.0)
+        h.dstore.mark_running("inbox:a.md", "r_dead2", now=6.0)
+        h.dstore.finish_ledger("r_dead2", "interrupted", 7.0)
+        h.dstore.mark_resume_pending("inbox:a.md", 8.0)
+        h.loop.requeue_item("inbox:a.md")  # same for an unpin
+        assert removed == ["sbxloop-r_dead2-agent", "sbxloop-r_dead2-github"]
+        assert h.dstore.unsettled_runs() == []

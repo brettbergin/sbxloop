@@ -13,6 +13,9 @@ ItemSource = Literal["github", "inbox"]
 # it is terminal for the daemon (no retry, no breaker count) while the run
 # itself stays resumable from the CLI.
 ItemState = Literal["queued", "running", "done", "failed", "abandoned", "cancelled"]
+# An operator decision the source has not been told about yet: the row-only
+# CLI (another process) cannot report, so the loop owes and delivers it.
+PendingReport = Literal["abandoned", "requeued"]
 
 
 class WorkItem(BaseModel):
@@ -39,6 +42,7 @@ class WorkItem(BaseModel):
     last_error: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+    pending_report: PendingReport | None = None
 
 
 class RunReport(NamedTuple):

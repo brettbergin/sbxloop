@@ -279,3 +279,45 @@ class TestOperatorControls:
         assert [i.item_id for i in store.items(["abandoned"])] == ["gh:2"]
         assert [i.item_id for i in store.items(["queued", "abandoned"])] == ["gh:1", "gh:2"]
         assert store.items(["done"]) == []
+
+    def test_transitions_are_conditional_against_a_concurrent_settle(self, tmp_path: Path) -> None:
+        """The CLI is another process: a daemon settling the item on its own
+        connection must win. The state check and the update are one
+        statement (``WHERE state IN``), so a command based on a stale view
+        is refused with the state that is actually there and never
+        overwrites the verdict."""
+        store = DaemonStore(tmp_path / "state.db")
+        other = DaemonStore(tmp_path / "state.db")  # the daemon's connection
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        stale = store.get("gh:7")
+        assert stale is not None and stale.state == "running"  # what the CLI saw
+        other.mark_done("gh:7", now=3.0)  # the daemon settles it meanwhile
+        with pytest.raises(ValueError, match="already done"):
+            store.abandon("gh:7", "stale", now=4.0)
+        with pytest.raises(ValueError, match="is done"):
+            store.requeue("gh:7", now=4.0)
+        with pytest.raises(ValueError, match="is done"):
+            store.retry("gh:7", now=4.0)
+        assert other.get("gh:7").state == "done"  # type: ignore[union-attr]
+        other.close()
+
+    def test_abandon_and_retry_owe_the_source_a_report(self, tmp_path: Path) -> None:
+        """A row-only CLI abandon/retry cannot report; the row carries the
+        debt until the loop pays it, once."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        assert store.pending_reports() == []
+        assert store.abandon("gh:7", "nope", now=2.0).pending_report == "abandoned"
+        assert [i.item_id for i in store.pending_reports()] == ["gh:7"]
+        assert store.take_pending_report("gh:7") is True
+        assert store.take_pending_report("gh:7") is False  # paid: exactly once
+        assert store.pending_reports() == []
+        assert store.retry("gh:7", now=3.0).pending_report == "requeued"
+        assert store.get("gh:7").updated_at == 3.0  # type: ignore[union-attr]
+        store.take_pending_report("gh:7")
+        # delivery is not an item change: the backoff clock does not move
+        assert store.get("gh:7").updated_at == 3.0  # type: ignore[union-attr]
+        # requeue (unpin) tells the source nothing
+        store.mark_running("gh:7", "r1", now=4.0)
+        assert store.requeue("gh:7", now=5.0).pending_report is None

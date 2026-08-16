@@ -165,7 +165,12 @@ class InboxSource:
         return None
 
     def _finish(self, item: WorkItem, sub: str, lines: list[str]) -> None:
+        # An item abandoned by an operator while still queued was never
+        # claimed, so its file is still in pending/; left there it would
+        # look like work still waiting, with its result note filed elsewhere.
         src = self._dir("running") / item.source_key
+        if not src.exists():
+            src = self._dir("pending") / item.source_key
         dst = self._dir(sub) / item.source_key
         try:
             if src.exists():
@@ -495,6 +500,11 @@ class GitHubIssueSource:
                 f"`{self.labels.failed}` and re-adding `{self.labels.trigger}`.",
             )
             self._remove_label(ops, n, self.labels.in_progress)
+            if not item.claimed:
+                # Abandoned while still queued: the trigger label is what
+                # is on the issue, and left there it would keep the item
+                # polling as work (and make "re-add the trigger" a no-op).
+                self._remove_label(ops, n, self.labels.trigger)
             self._add_label(ops, n, self.labels.failed)
 
         self._guard("abandon report", go)

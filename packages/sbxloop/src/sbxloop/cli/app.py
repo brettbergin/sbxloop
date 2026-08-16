@@ -1461,9 +1461,9 @@ def _daemon_store() -> DaemonStore:
 
 _ITEM_CONTROL_NOTE = (
     "[dim]a live daemon notices the change within a second: an in-flight run for "
-    "this item is cancelled and the source (issue / inbox file) is told; with no "
-    "daemon running, the next daemon start reports it and closes the dead run. "
-    "The item's next dispatch, if any, starts a fresh run.[/]"
+    "this item is cancelled and the source (issue / inbox file) is told on its next "
+    "tick; with no daemon running, the next daemon start reports it and closes the "
+    "dead run. The item's next dispatch, if any, starts a fresh run.[/]"
 )
 
 
