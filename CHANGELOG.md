@@ -128,6 +128,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   allowlist so both downloads actually complete. `sbxloop doctor --deep`
   gains a `python-version` conformance row reporting the template's own
   `python3` against the pinned series.
+
 - Budgets and resources for larger repositories (#253): verify output handed
   to the critic keeps the first 2 KB and the last 4 KB of each command
   (previously the last 1.5 KB only, so a long pytest run's failure summary
