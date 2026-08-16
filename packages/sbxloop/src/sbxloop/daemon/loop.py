@@ -682,7 +682,10 @@ class DaemonLoop:
             gh = GithubConfig.model_validate(
                 {
                     **gh.model_dump(),
-                    "report": True,
+                    # The per-run tracking issue is redundant when the source
+                    # issue already is one (#251); the summary comment there
+                    # carries the same information.
+                    "report": self.config.daemon.tracking_issue,
                     "deliver": True,
                     "deliver_draft": self.config.daemon.deliver_draft,
                     "create_repo": False,

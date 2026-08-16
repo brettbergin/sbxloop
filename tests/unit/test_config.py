@@ -131,9 +131,15 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     assert over.daemon.max_runs_per_day == 3
     assert over.daemon.backlog == "github"
     assert over.discord.enabled is True and over.discord.channel_id == 123456789
+    assert config.daemon.close_on_success is True and config.daemon.tracking_issue is True
+    assert config.daemon.delivered_label == "sbxloop:delivered"
     (tmp_path / "sbxloop.toml").write_text(
         '[daemon]\ntrigger_label = "x"\nin_progress_label = "x"\n'
     )
+    with pytest.raises(ConfigError, match="distinct"):
+        load_config(cwd=tmp_path, env={})
+    # delivered_label takes part in the lifecycle-label distinctness check
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\ndelivered_label = "sbxloop:failed"\n')
     with pytest.raises(ConfigError, match="distinct"):
         load_config(cwd=tmp_path, env={})
     # GitHub labels are case-insensitive: differing only by case is a collision

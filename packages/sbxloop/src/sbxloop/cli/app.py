@@ -1400,10 +1400,15 @@ def daemon(
             config.daemon.in_progress_label,
             config.daemon.failed_label,
             config.daemon.backlog_label,
+            config.daemon.delivered_label,
         )
         sources.append(
             GitHubIssueSource(
-                github.ops, config.github.repo, labels, on_failure=github.note_failure
+                github.ops,
+                config.github.repo,
+                labels,
+                on_failure=github.note_failure,
+                close_on_success=config.daemon.close_on_success,
             )
         )
 
@@ -1816,7 +1821,15 @@ mem_warn = 90.0
 # in_progress_label = "sbxloop:in-progress"
 # failed_label = "sbxloop:failed"
 # backlog_label = "sbxloop:backlog"
-# max_runs_per_day = 12            # rolling 24h window, persisted across restarts
+# delivered_label = "sbxloop:delivered"
+# What a delivered run does to the tracker. Defaults are task-queue
+# semantics: close the source issue (the PR is the reviewable object) and
+# open a per-run tracking issue. For a design/discussion tracker set both
+# false: the source issue gets the summary + delivered_label and stays open
+# until a human merges the PR, and no extra tracking issue is opened.
+# close_on_success = true
+# tracking_issue = true
+# max_runs_per_day = 12           # rolling 24h window, persisted across restarts
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
 # retry_backoff_s = 900.0          # times the attempt number

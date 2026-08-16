@@ -246,7 +246,11 @@ work came from, and keeps going. Two work sources, usable together:
   reporting and delivery forced on (PRs arrive as **drafts** by default),
   and on success comments the summary + PR link and **closes** the issue —
   the PR is now the reviewable object. Failures retry with backoff, then
-  land in `sbxloop:failed` with re-trigger instructions.
+  land in `sbxloop:failed` with re-trigger instructions. For a tracker whose
+  issues are design items rather than tasks, `close_on_success = false` in
+  `[daemon]` leaves the issue open with `sbxloop:delivered` for the human
+  who merges the PR, and `tracking_issue = false` skips the per-run tracking
+  issue (the summary comment on the source issue carries the same info).
 - **Inbox files**: drop a `.md` (first `# heading` = title) into
   `<inbox>/pending/`; it moves through `running/` to `done/` or `failed/`
   with a `<name>.result.md` beside it.

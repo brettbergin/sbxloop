@@ -402,6 +402,37 @@ class TestGitHubSource:
             {"state": "closed", "state_reason": "completed"},
         ) in ops.raw_calls
 
+    def test_success_without_close_leaves_open_with_delivered_label(self) -> None:
+        """Design-tracker semantics (#251): a draft PR is not a resolution,
+        so the source issue stays open for the human who merges it."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
+        src.report_success(item, report())
+        assert not any(m == "PATCH" for m, _, _ in ops.raw_calls)
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Ain-progress", None) in ops.raw_calls
+        assert (
+            "POST",
+            "/repos/o/r/issues/4/labels",
+            {"labels": ["sbxloop:delivered"]},
+        ) in ops.raw_calls
+        body = ops.comments[-1][1]
+        assert "pull/9" in body and "Leaving this issue open" in body
+
+    def test_claim_clears_stale_delivered_label_when_not_closing(self) -> None:
+        """A rejected PR's issue gets re-triggered; the delivered label from
+        the previous run must not survive into the new one."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:delivered")})
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
+        item = src.poll()[0]
+        assert src.claim(item) is True
+        deletes = [p for m, p, _ in ops.raw_calls if m == "DELETE"]
+        assert "/repos/o/r/issues/4/labels/sbxloop%3Adelivered" in deletes
+        # default (closing) mode never touches the delivered label
+        ops2 = RecordingOps({"4": issue(4, "sbxloop:run")})
+        assert self.make(ops2).claim(item) is True
+        assert not any("delivered" in p for m, p, _ in ops2.raw_calls if m == "DELETE")
+
     def test_delivery_failure_leaves_open_with_failed_label(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
         item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")

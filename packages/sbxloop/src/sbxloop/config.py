@@ -305,6 +305,16 @@ class DaemonConfig(_ConfigModel):
     inbox ``triage/`` dir) and never run until a human promotes them, unless
     ``backlog_auto_trigger`` is set — a self-feeding queue is the failure
     mode that flag guards.
+
+    ``close_on_success`` / ``tracking_issue`` shape how loudly a delivered
+    run touches the issue tracker. The defaults suit a task queue where the
+    PR is the reviewable object: close the source issue, open a per-run
+    tracking issue. Pointed at a repo whose issues are design/discussion
+    items (sbxloop's own tracker, #251) that auto-closes a design issue the
+    moment a *draft* PR appears and doubles issue volume with self-closing
+    tracking issues — set both to false there: the source issue gets the
+    summary comment plus ``delivered_label`` and stays open for the human
+    who merges the PR.
     """
 
     inbox_dir: str = ".sbxloop/inbox"  # "" disables the inbox source
@@ -314,6 +324,9 @@ class DaemonConfig(_ConfigModel):
     in_progress_label: str = "sbxloop:in-progress"
     failed_label: str = "sbxloop:failed"
     backlog_label: str = "sbxloop:backlog"
+    delivered_label: str = "sbxloop:delivered"
+    close_on_success: bool = True
+    tracking_issue: bool = True
     max_runs_per_day: int = 12
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a
@@ -340,6 +353,7 @@ class DaemonConfig(_ConfigModel):
             self.in_progress_label,
             self.failed_label,
             self.backlog_label,
+            self.delivered_label,
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")

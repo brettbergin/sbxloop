@@ -263,6 +263,21 @@ class TestOutcomeAndConfig:
         inbox = h.loop._item_config(inbox_item())
         assert inbox.github.deliver is False and inbox.keep_on_failure is False
 
+    def test_item_config_skips_tracking_issue_when_disabled(self, tmp_path: Path) -> None:
+        """tracking_issue=false (#251): the source issue already is the
+        tracker, so no per-run issue — delivery stays forced on."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r", "report": True},
+                "daemon": {"tracking_issue": False},
+            }
+        )
+        gh = Harness(tmp_path, cfg).loop._item_config(
+            WorkItem(item_id="gh:1", source="github", source_key="1", title="x")
+        )
+        assert gh.github.report is False and gh.github.deliver is True
+
 
 class TestOperatorCancel:
     """#246: a Discord `!sbx cancel` was settled as a failed attempt — retried

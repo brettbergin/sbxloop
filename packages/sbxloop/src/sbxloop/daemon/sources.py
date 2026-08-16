@@ -229,11 +229,19 @@ class InboxSource:
 
 
 class GitHubLabels:
-    def __init__(self, trigger: str, in_progress: str, failed: str, backlog: str) -> None:
+    def __init__(
+        self,
+        trigger: str,
+        in_progress: str,
+        failed: str,
+        backlog: str,
+        delivered: str = "sbxloop:delivered",
+    ) -> None:
         self.trigger = trigger
         self.in_progress = in_progress
         self.failed = failed
         self.backlog = backlog
+        self.delivered = delivered
 
 
 class GitHubIssueSource:
@@ -242,6 +250,11 @@ class GitHubIssueSource:
     ``ops`` is a zero-arg provider (``DaemonGithub.ops``) rather than a
     fixed :class:`GithubOps`: the daemon may re-provision its sandbox at
     any time and the source must follow.
+
+    ``close_on_success`` decides what "delivered" does to the source issue:
+    close it (task-queue semantics — the PR is now the reviewable object) or
+    leave it open with ``labels.delivered`` so a human closes it once the
+    PR merges (design-tracker semantics, #251).
     """
 
     name = "github"
@@ -254,11 +267,13 @@ class GitHubIssueSource:
         *,
         host: str | None = None,
         on_failure: Callable[[BaseException], object] | None = None,
+        close_on_success: bool = True,
     ) -> None:
         self._ops = ops
         self.repo = repo
         self.labels = labels
         self.host = host or socket.gethostname()
+        self.close_on_success = close_on_success
         # Told about every failed op (``DaemonGithub.note_failure``) so a
         # dead sandbox gets replaced; the source itself never retries.
         self._on_failure = on_failure
@@ -393,6 +408,14 @@ class GitHubIssueSource:
                 )
             self._delete_comment_quietly(number, comment_id)
             return False
+        if not self.close_on_success:
+            # A re-triggered issue may still carry the delivered label from a
+            # rejected PR; it is stale the moment a new run is claimed.
+            # Best-effort — a leftover label must not un-claim.
+            self._guard(
+                "clear delivered label",
+                lambda ops: self._remove_label(ops, number, self.labels.delivered),
+            )
         return True
 
     def _trigger_epoch(self, ops: GithubOps, number: str) -> str:
@@ -458,9 +481,23 @@ class GitHubIssueSource:
     def report_success(self, item: WorkItem, report: RunReport) -> None:
         def go(ops: GithubOps) -> None:
             n = item.source_key
-            self._comment(ops, n, "\n".join(_report_lines(report)))
+            lines = _report_lines(report)
+            if not self.close_on_success:
+                lines.append(
+                    "Leaving this issue open (`close_on_success = false`); close it "
+                    "once the PR is merged or rejected."
+                )
+            self._comment(ops, n, "\n".join(lines))
             self._remove_label(ops, n, self.labels.in_progress)
-            ops.raw("PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"})
+            if self.close_on_success:
+                ops.raw(
+                    "PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"}
+                )
+            else:
+                # Delivered is added *after* in-progress is removed so a
+                # failure between the two leaves the issue merely un-labeled,
+                # never carrying two lifecycle labels at once.
+                self._add_label(ops, n, self.labels.delivered)
 
         self._guard("success report", go)
 
