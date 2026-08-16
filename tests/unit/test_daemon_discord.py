@@ -23,6 +23,26 @@ def ev(type: str, **data: Any) -> Event:
     return Event.now(type, "r1", **data)
 
 
+class FakeEmbed:
+    """Stands in for discord.Embed so the bridge's embed plumbing is
+    exercised whether or not discord.py is installed (CI syncs without the
+    extra)."""
+
+    def __init__(self, spec: Any) -> None:
+        self.spec = spec
+        self.fields = [
+            type("F", (), {"name": n, "value": v, "inline": i})() for n, v, i in spec.fields
+        ]
+
+
+@pytest.fixture(autouse=True)
+def _discord_adapters_without_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sbxloop.daemon import discord as bridge_module
+
+    monkeypatch.setattr(bridge_module, "_to_embed", lambda spec: FakeEmbed(spec.clamped()))
+    monkeypatch.setattr(bridge_module, "_allowed_mentions_none", lambda: "none")
+
+
 class TestClip:
     def test_clamps_bad_limits(self) -> None:
         from sbxloop.daemon.discord import DISCORD_MAX_MESSAGE, _clip
@@ -507,9 +527,9 @@ class TestBridge:
             assert wait_for(lambda: getattr(headline, "edits", 0) >= 2)
             # the edited card lists the branch and PR (embed converted when discord.py present)
             embed = headline.embed
-            if embed is not None:
-                names = [f.name for f in embed.fields]
-                assert "Branch" in names and "PR" in names
+            assert embed is not None
+            names = [f.name for f in embed.fields]
+            assert "Branch" in names and "PR" in names
         finally:
             bridge.close()
 

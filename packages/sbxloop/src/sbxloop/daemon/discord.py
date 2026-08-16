@@ -733,7 +733,8 @@ class DiscordBridge:
                 try:
                     return await target.send(fallback, **kwargs)
                 except Exception:
-                    pass
+                    logger.warning("discord: text-only retry failed too", exc_info=True)
+                    return None
             logger.warning("discord: send failed", exc_info=True)
             return None
 
