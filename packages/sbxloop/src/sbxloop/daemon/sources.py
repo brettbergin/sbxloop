@@ -619,6 +619,30 @@ class GitHubIssueSource:
 
         self._guard("requeue report", go)
 
+    def audit_issue_state(self, title: str, since_iso: str) -> tuple[bool, bool]:
+        """(an OPEN issue with this exact title exists, one was CREATED since
+        ``since_iso``) — GitHub is the source of truth for the schedule, so a
+        wiped state dir cannot double-file and a still-open audit is never
+        re-opened on top of itself. Raises on GitHub failure (caller skips)."""
+        ops = self._ops()
+        quoted = title.replace('"', "")
+        opened = ops.search_issues(
+            f'repo:{self.repo} is:issue is:open label:"{self.labels.audit}" "{quoted}" in:title',
+            per_page=5,
+        )
+        recent = ops.search_issues(
+            f'repo:{self.repo} is:issue "{quoted}" in:title created:>={since_iso}', per_page=5
+        )
+
+        def exact(rows: list[dict[str, Any]]) -> bool:
+            return any(str(r.get("title") or "") == title for r in rows)
+
+        return exact(opened), exact(recent)
+
+    def file_audit(self, title: str, body: str) -> str:
+        ref = self._ops().issue_create(self.repo, title, body, labels=[self.labels.audit])
+        return f"gh:{ref.number}"
+
     def file_postmortem(self, item: WorkItem, dossier: str, run_id: str) -> str:
         """Open a post-mortem as an audit-lane charter and return its ref.
 

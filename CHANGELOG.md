@@ -33,6 +33,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   and the `SBXLOOP_STATE_DIR=… sbxloop logs <run>` line — so the discovery
   lane turns its own failures into evidenced findings. Once per run, never
   for audit items (no recursion), `postmortems_per_day` (3) cap.
+- **Scheduled area audits, charters versioned in the repo** (`[daemon] audits = true`, `audit_dir = ".github/sbxloop/audits"`): each
+  `<name>.md` with front-matter `every: 7d` (and optional `enabled`) is a
+  charter the daemon opens as an `audit: <name>` issue when due. GitHub is
+  the schedule's source of truth (a still-open audit is never re-filed; one
+  created within the interval counts), the store is a cache; broken charters
+  are reported once and skipped. sbxloop's own repo ships four:
+  verify-lint-vs-prompts, daemon-guardrails, e2e-markers, test-flakes.
 
 ## [0.7.0] — 2026-08-16
 

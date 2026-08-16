@@ -26,6 +26,7 @@ from typing import Any, NamedTuple, Protocol
 
 from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
+from sbxloop.daemon.audits import audit_marker, due_charters, issue_body, load_charters
 from sbxloop.daemon.backlog import AUDIT_INSTRUCTIONS, BACKLOG_INSTRUCTIONS, collect_backlog
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.postmortem import build_dossier
@@ -119,6 +120,7 @@ class DaemonLoop:
         self._runner = runner or self._default_runner
         self._stop = threading.Event()
         self._paused = False
+        self._audit_problems_seen: set[str] = set()
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
         self._cancel_request: CancelRequest | None = None
@@ -347,6 +349,7 @@ class DaemonLoop:
                     f"daily run cap reached ({started_today}/{cap}); idling until the window rolls"
                 )
             return TickResult(idle_kind="daily_cap")
+        self._schedule_audits(now)
         discovered = self._discover(now)
         item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s)
         if item is None:
@@ -863,6 +866,46 @@ class DaemonLoop:
         workspace = str(result.workspace) if result is not None and result.workspace else None
         return RunReport(run_id, state, summary, tracking, delivery, delivery_error, workspace)
 
+    def _schedule_audits(self, now: float) -> None:
+        """Open due charters from the checkout's ``audit_dir`` as audit issues.
+
+        Runs after the pause/breaker/cap gates (a stressed daemon does not
+        add work for itself) and before discovery, so a freshly filed audit
+        is picked up in the same tick. GitHub is the schedule's source of
+        truth (a still-open audit is never re-filed; one created within the
+        interval counts as filed) with the store as a cache; a GitHub
+        hiccup skips this tick, never raises."""
+        daemon = self.config.daemon
+        if not daemon.audits:
+            return
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "file_audit"):
+            return
+        checkout = self._workspace_checkout()
+        if checkout is None:
+            return
+        charters, problems = load_charters(checkout, daemon.audit_dir)
+        for problem in problems:
+            if problem not in self._audit_problems_seen:
+                self._audit_problems_seen.add(problem)
+                self._notify(f"⚠ audit charter skipped: {problem}")
+        for charter in due_charters(charters, self.dstore.audit_last_filed(), now):
+            try:
+                since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - charter.every_s))
+                is_open, filed_recently = github.audit_issue_state(charter.title, since)
+                if is_open or filed_recently:
+                    # Someone (or a previous process) already filed it: sync
+                    # the cache so we stop asking GitHub every tick.
+                    self.dstore.record_audit(charter.name, "gh:existing", now)
+                    continue
+                ref = github.file_audit(
+                    charter.title, issue_body(charter, audit_marker(charter.name))
+                )
+                self.dstore.record_audit(charter.name, ref, now)
+                self._notify(f"🔎 scheduled audit filed: {charter.title} → {ref}")
+            except Exception:
+                logger.warning("scheduled audit %s could not be filed", charter.name, exc_info=True)
+
     def _file_postmortem(self, item: WorkItem, run_id: str, reason: str) -> None:
         """Turn the daemon's own failure into a discovery-lane charter.
 
@@ -873,7 +916,7 @@ class DaemonLoop:
         daemon = self.config.daemon
         if not daemon.postmortems or item.kind != "patch":
             return
-        github = next((s for s in self.sources if s.name == "github"), None)
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
         if github is None or not hasattr(github, "file_postmortem"):
             return
         now = self.clock()

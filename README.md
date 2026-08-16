@@ -283,6 +283,13 @@ transcript, the failure events, all in the issue body, because the auditor
 works in a fresh clone and cannot read the daemon's state — so the loop's own
 failures become findings too (`[daemon] postmortems`, capped per day, never
 for audit items).
+And with `[daemon] audits = true`, **charters versioned in the repository**
+(`.github/sbxloop/audits/<name>.md`, front-matter `every: 7d`) are opened as
+`audit: <name>` issues on schedule — reviewed like code, visible as issues,
+deduplicated against GitHub itself so a fresh state dir cannot double-file.
+sbxloop's own repo carries four (verify-lint vs. prompts, daemon guardrails,
+e2e markers, test flakes); every finding they produce is one more
+`sbxloop:backlog` issue for a human to promote or close.
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;

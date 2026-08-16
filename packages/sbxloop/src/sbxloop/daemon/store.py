@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS daemon_postmortems (
     filed_at   REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS daemon_audits (
+    name       TEXT PRIMARY KEY,
+    filed_as   TEXT NOT NULL,
+    filed_at   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS daemon_discord_threads (
     run_id      TEXT PRIMARY KEY,
     channel_id  INTEGER NOT NULL,
@@ -624,6 +630,23 @@ class DaemonStore:
                 "INSERT OR IGNORE INTO daemon_postmortems (run_id, item_id, filed_as, filed_at) "
                 "VALUES (?, ?, ?, ?)",
                 (run_id, item_id, filed_as, now),
+            )
+            self._conn.commit()
+
+    # -- scheduled audits (discovery lane) -------------------------------------
+
+    def audit_last_filed(self) -> dict[str, float]:
+        with self._lock:
+            return {
+                str(r["name"]): float(r["filed_at"])
+                for r in self._conn.execute("SELECT name, filed_at FROM daemon_audits")
+            }
+
+    def record_audit(self, name: str, filed_as: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO daemon_audits (name, filed_as, filed_at) VALUES (?, ?, ?)",
+                (name, filed_as, now),
             )
             self._conn.commit()
 

@@ -370,6 +370,12 @@ class DaemonConfig(_ConfigModel):
     # Never for audit items (no recursion); capped per rolling day.
     postmortems: bool = True
     postmortems_per_day: int = 3
+    # Scheduled area audits: charters versioned in the target repo under
+    # ``audit_dir`` (front-matter `every: 7d`), opened as audit issues when
+    # due. Off by default — a repo opts in by carrying charters AND the
+    # operator flipping this on.
+    audits: bool = False
+    audit_dir: Path = Path(".github/sbxloop/audits")
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
