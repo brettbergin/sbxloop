@@ -21,6 +21,11 @@ from pathlib import Path
 AUDIT_DIR = Path(".github") / "sbxloop" / "audits"
 AUDIT_TITLE_PREFIX = "audit: "
 _FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
+# Preferred metadata form: an HTML comment. Invisible on GitHub and left
+# alone by every Markdown formatter (mdformat rewrote a `---` YAML block
+# into a thematic break + an H2 the first time the charters shipped, and
+# the daemon then saw no metadata at all).
+_COMMENT_META = re.compile(r"\A\s*<!--\s*sbxloop(?:-audit)?\s*:?\s*(.*?)\s*-->\s*\n?", re.S)
 _EVERY = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([dhm])\s*$", re.I)
 _UNIT_S = {"d": 86_400.0, "h": 3_600.0, "m": 60.0}
 _NAME_OK = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -49,21 +54,35 @@ def parse_every(text: str) -> float:
 
 
 def parse_charter(path: Path, rel: str | None = None) -> Charter:
-    """One charter file. Front-matter keys: ``every`` (required), ``enabled``
-    (default true). The name is the file stem, which also keys the schedule
-    and the issue title — keep it stable."""
+    """One charter file. Metadata keys: ``every`` (required), ``enabled``
+    (default true), given as ``<!-- sbxloop: every=7d -->`` on the first line
+    (preferred) or a ``---`` front-matter block. The name is the file stem,
+    which also keys the schedule and the issue title — keep it stable."""
     name = path.stem
     if not _NAME_OK.match(name):
         raise ValueError(f"charter file name {name!r} must be lowercase [a-z0-9._-]")
     text = path.read_text(encoding="utf-8")
-    m = _FRONT_MATTER.match(text)
-    if not m:
-        raise ValueError(f"{path}: missing front-matter (--- every: 7d ---)")
     meta: dict[str, str] = {}
-    for line in m.group(1).splitlines():
-        if ":" in line:
-            key, _, value = line.partition(":")
-            meta[key.strip().lower()] = value.strip().strip("'\"")
+    m = _COMMENT_META.match(text)
+    if m:
+        # `<!-- sbxloop: every=7d enabled=false -->` (also `key: value`)
+        for token in re.split(r"[\s,;]+", m.group(1).strip()):
+            if not token:
+                continue
+            key, sep, value = token.partition("=") if "=" in token else token.partition(":")
+            if sep:
+                meta[key.strip().lower()] = value.strip().strip("'\"")
+    else:
+        m = _FRONT_MATTER.match(text)
+        if not m:
+            raise ValueError(
+                f"{path}: missing metadata — start the file with "
+                "`<!-- sbxloop: every=7d -->` (or a --- every: 7d --- front-matter block)"
+            )
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                meta[key.strip().lower()] = value.strip().strip("'\"")
     if "every" not in meta:
         raise ValueError(f"{path}: front-matter needs `every: <interval>`")
     body = text[m.end() :].strip()

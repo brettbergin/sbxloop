@@ -1,6 +1,4 @@
-______________________________________________________________________
-
-## every: 7d
+<!-- sbxloop: every=7d -->
 
 # Audit: test flakes and timing assumptions
 

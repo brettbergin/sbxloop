@@ -1,6 +1,4 @@
-______________________________________________________________________
-
-## every: 7d
+<!-- sbxloop: every=7d -->
 
 # Audit: verify-lint vs. the prompts
 
