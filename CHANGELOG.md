@@ -98,6 +98,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   re-queue clears the label.
   `tracking_issue = false` skips the per-run tracking issue for GitHub items,
   whose source issue already carries the run's summary comment.
+
 - **Run-directory retention** (#233). Every run leaves
   `<state_dir>/runs/<run>/` behind (the workspace clone under isolation plus
   harvested artifacts) and nothing removed them; an always-on daemon accreted
