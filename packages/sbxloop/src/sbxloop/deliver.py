@@ -28,19 +28,19 @@ real-sbx e2e workflow exercises it. Known e2e-validation items (each marker
 names the open issue or e2e step that will retire it — the audit in
 ``tests/unit/test_e2e_markers.py`` fails on a marker without one, #226):
 
-- TODO(e2e): branch-name collisions — handled in code (a 422 on the refs
+- TODO(e2e #223): branch-name collisions — handled in code (a 422 on the refs
   POST force-updates the existing ``sbxloop/<run>`` branch, and a 422 on
   the PR create reuses the open PR for that head), because ``sbxloop
   deliver <run>`` re-runs delivery against a repository a prior partial
   attempt may already have touched (#223) — but the 422 shapes are taken
   from the GitHub API docs, not yet observed in the field
-- TODO(e2e): ``sha: null`` deletions and ``100755``/``120000`` modes in
+- TODO(e2e #248): ``sha: null`` deletions and ``100755``/``120000`` modes in
   the git-diff tree against real GitHub (documented Git Data API
   behavior, not yet exercised end to end)
-- TODO(e2e): empty repositories — handled in code (contents-API bootstrap
+- TODO(e2e #256): empty repositories — handled in code (contents-API bootstrap
   commit when the base ref is missing) but not yet exercised against real
   GitHub
-- TODO(e2e): repository creation (`ensure_repository` with create=True;
+- TODO(e2e #256): repository creation (`ensure_repository` with create=True;
   org-owned targets in particular)
 
 Blob creation is batched (#66): the whole file manifest ships to the github
