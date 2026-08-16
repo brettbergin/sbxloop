@@ -86,7 +86,8 @@ def collect_backlog(
         filed.append(ref)
     if skipped:
         logger.warning(
-            "backlog: run %s produced %d item(s) beyond the per-run cap of %d; not filed",
+            "backlog: run %s produced %d item(s) beyond the per-run cap of %d; deferred "
+            "(not fingerprint-recorded, so the next collection pass files them)",
             run.run_id,
             skipped,
             max_items,

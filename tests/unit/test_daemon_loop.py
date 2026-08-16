@@ -7,6 +7,7 @@ StateStore run on a tmp db so persistence paths are exercised for real.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import WorkerError
+from sbxloop.errors import StateError, WorkerError
 from sbxloop.events import Event, EventBus
 
 
@@ -281,6 +282,65 @@ class TestShutdownAndRecovery:
         t.join(5)
         assert h.dstore.get("inbox:a.md").state == "running"  # type: ignore[union-attr]
         assert h.loop.current is None
+
+    def test_genuine_failure_after_stop_requested_still_settles(self, tmp_path: Path) -> None:
+        """Review: stop-requested + any exception was treated as 'interrupted',
+        masking real failures and leaving the item running. Only a run whose
+        persisted state is still resumable is interrupted; a run that
+        actually failed settles as a failure."""
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item()]
+        started = threading.Event()
+
+        def failing_runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            started.set()
+            # stop gets requested while we run...
+            while not h.loop.stopping:
+                time.sleep(0.01)
+            # ...and then the run FAILS for real (terminal persisted state)
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "failed")
+            raise WorkerError("worker exploded, not a cancel")
+
+        h.loop._runner = failing_runner
+        t = threading.Thread(target=h.loop.tick)
+        t.start()
+        assert started.wait(5)
+        h.loop.request_stop()
+        t.join(5)
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "abandoned"  # settled, not left running
+        assert any(c[0] == "abandoned" for c in h.source.calls)
+
+    def test_cancel_at_boundary_after_stop_is_interrupted(self, tmp_path: Path) -> None:
+        """The genuine shutdown case: the run stays resumable (non-terminal
+        persisted state) so the item is left running for recovery."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        started = threading.Event()
+
+        def cancelled_runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            started.set()
+            while not h.loop.stopping:
+                time.sleep(0.01)
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "running")  # still resumable
+            raise StateError("run cancelled at phase boundary")
+
+        h.loop._runner = cancelled_runner
+        t = threading.Thread(target=h.loop.tick)
+        t.start()
+        assert started.wait(5)
+        h.loop.request_stop()
+        t.join(5)
+        assert h.dstore.get("inbox:a.md").state == "running"  # type: ignore[union-attr]
 
     def test_recover_completed_run_settles(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)

@@ -24,7 +24,7 @@ from typing import Any, Protocol
 
 from sbxloop.config import Config, GithubConfig
 from sbxloop.daemon.backlog import BACKLOG_INSTRUCTIONS, collect_backlog
-from sbxloop.daemon.model import RunReport, TickResult, WorkItem
+from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
@@ -183,9 +183,9 @@ class DaemonLoop:
     def tick(self) -> TickResult:
         now = self.clock()
         if self._paused:
-            return TickResult(idle_reason="paused")
+            return TickResult(idle_kind="paused")
         if self._breaker_open(now):
-            return TickResult(idle_reason="breaker")
+            return TickResult(idle_kind="breaker")
         started_today = self.dstore.runs_started_since(now - DAY_S)
         if started_today >= self.config.daemon.max_runs_per_day:
             if now - self._last_cap_log > 3600:
@@ -194,7 +194,7 @@ class DaemonLoop:
                 self._notify(
                     f"daily run cap reached ({started_today}/{cap}); idling until the window rolls"
                 )
-            return TickResult(idle_reason="daily_cap")
+            return TickResult(idle_kind="daily_cap")
         discovered = self._discover(now)
         item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s)
         if item is None:
@@ -209,13 +209,14 @@ class DaemonLoop:
                 )
                 return TickResult(
                     discovered=discovered,
-                    idle_reason=f"backoff ({len(waiting)} queued; next eligible in {soonest:.0f}s)",
+                    idle_kind="backoff",
+                    idle_detail=f"{len(waiting)} queued; next eligible in {soonest:.0f}s",
                 )
-            return TickResult(discovered=discovered, idle_reason="no_work")
+            return TickResult(discovered=discovered, idle_kind="no_work")
         source = self._source_for(item)
         if source is None:
             self.dstore.mark_failed(item.item_id, "no source for item", now, requeue=False)
-            return TickResult(discovered=discovered, idle_reason="no_work")
+            return TickResult(discovered=discovered, idle_kind="no_work")
         if not item.claimed:
             if not source.claim(item):
                 self.dstore.mark_failed(item.item_id, "claim failed", now, requeue=False)
@@ -248,7 +249,9 @@ class DaemonLoop:
 
     # -- dispatch ----------------------------------------------------------------------
 
-    def _dispatch(self, item: WorkItem, source: WorkSource, *, resume_run_id: str | None) -> str:
+    def _dispatch(
+        self, item: WorkItem, source: WorkSource, *, resume_run_id: str | None
+    ) -> TickOutcome:
         """Run one item (fresh, or resuming its interrupted run) and settle it."""
         now = self.clock()
         run_id = resume_run_id or new_run_id()
@@ -293,14 +296,30 @@ class DaemonLoop:
         with self._current_lock:
             self._current = None
 
-        if self._stop.is_set() and "result" not in result_box:
-            # Interrupted by shutdown: leave the item running for recovery.
+        error = result_box.get("error")
+        if self._stop.is_set() and "result" not in result_box and self._run_is_resumable(run_id):
+            # Interrupted by shutdown at a phase boundary: the persisted run
+            # is still resumable, so leave the item running for recovery.
+            # A run that actually FAILED after stop was requested has a
+            # terminal persisted state and settles like any failure below —
+            # shutdown must not mask genuine errors as "interrupted".
             self.dstore.finish_ledger(run_id, "interrupted", self.clock())
             return "interrupted"
-        error = result_box.get("error")
         if error is not None and not isinstance(error, SbxloopError | StateError):
             logger.error("run %s crashed", run_id, exc_info=error)
         return self._settle(item, source, run_id, result_box.get("result"), error)
+
+    def _run_is_resumable(self, run_id: str) -> bool:
+        """Whether the run was left mid-flight (interrupted) rather than
+        finished. Note RESUMABLE_RUN_STATES includes 'failed' (a failed run
+        may be resumed by an operator); an *interruption* is specifically a
+        non-terminal state."""
+        try:
+            return self.store.get_run(run_id).state not in TERMINAL_RUN_STATES
+        except SbxloopError:
+            # No persisted run yet (died before create_run): nothing to
+            # resume, but nothing failed either — recovery re-queues it.
+            return True
 
     def _settle(
         self,
@@ -309,7 +328,7 @@ class DaemonLoop:
         run_id: str,
         result: RunResult | None,
         error: BaseException | None,
-    ) -> str:
+    ) -> TickOutcome:
         now = self.clock()
         report = self._report(run_id, result)
         if result is not None and report.succeeded:
@@ -343,7 +362,7 @@ class DaemonLoop:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=True)
             source.report_retry(item, reason, attempts_left)
             self._notify(f"❌ {item.item_id} failed ({reason}); {attempts_left} attempt(s) left")
-            outcome = "retry"
+            outcome: TickOutcome = "retry"
         else:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=False)
             source.report_abandoned(item, reason)
