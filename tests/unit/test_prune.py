@@ -170,6 +170,34 @@ class TestPruneCommand:
         assert fake_sbx.invocations("stop")
         assert fake_sbx.invocations("rm")
 
+    def test_force_removes_run_sandbox_secrets_too(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        """``sbx rm`` leaves secret registrations behind; a later provision
+        under the same name (daemon resume) cannot replace them and the
+        agent boots with the proxy sentinel (field failure rgn9ccjam).
+        Prune must take the registrations with the sandbox — verified by
+        re-registering afterwards, which real sbx (and the fake) refuse
+        while a registration lingers."""
+        self.seed(workdir, fake_sbx, "rabc12345", "failed")
+        cli = SbxCLI(binary=str(fake_sbx.binary))
+        cli.secret_set_custom(
+            host="api.github.com",
+            env="COPILOT_GITHUB_TOKEN",
+            value="ghp_x",
+            sandbox="sbxloop-rabc12345-agent",
+        )
+        cli.secret_set("github", sandbox="sbxloop-rabc12345-github", token="ghp_y")
+        result = runner.invoke(app, ["sandbox", "prune", "--min-age", "0", "--force"])
+        assert result.exit_code == 0, result.output
+        assert cli.ls() == []
+        # Both registrations are gone: re-registering succeeds.
+        cli.secret_set_custom(
+            host="api.github.com",
+            env="COPILOT_GITHUB_TOKEN",
+            value="ghp_x",
+            sandbox="sbxloop-rabc12345-agent",
+        )
+        cli.secret_set("github", sandbox="sbxloop-rabc12345-github", token="ghp_y")
+
     def test_recent_run_not_pruned(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         self.seed(workdir, fake_sbx, "rabc12345", "failed")
         result = runner.invoke(app, ["sandbox", "prune", "--force"])  # default 1h min-age

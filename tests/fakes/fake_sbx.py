@@ -397,7 +397,9 @@ def _parse_flags(args: list[str]) -> tuple[list[str], dict[str, str]]:
     flags: dict[str, str] = {}
     i = 0
     while i < len(args):
-        if args[i].startswith("--"):
+        if args[i] == "-f":
+            i += 1  # bare short flag: takes no value, is not a positional
+        elif args[i].startswith("--"):
             flags[args[i][2:]] = args[i + 1] if i + 1 < len(args) else ""
             i += 2
         else:
@@ -477,20 +479,30 @@ def cmd_secret(root: Path, args: list[str], stdin: str) -> int:
             svc_scope, service = key.split("|", 1)
             print(f"{svc_scope}  service  {service}  -")
     elif sub == "rm":
-        scope = positional[0]
-        if "env" in flags:
+        # Mirrors sbx 0.38: scope via --sandbox (positional deprecated but
+        # still honored); env-only selection rejected; WITHOUT -f the CLI
+        # prompts and, non-interactively, prints "Cancelled" and exits 0
+        # having removed nothing; "not found" also exits 0.
+        scope = flags.get("sandbox") or (positional[0] if len(positional) > 1 else "-g")
+        if "env" in flags and "host" not in flags and "placeholder" not in flags:
+            print("ERROR: --placeholder or --host is required", file=sys.stderr)
+            code = 1
+        elif "-f" not in rest and "--force" not in rest:
+            print("Delete selected secret? (y/N): Cancelled")
+        elif "env" in flags:
             env = flags["env"]
             entry = state["custom"].get(env)
             if entry is None or entry["scope"] != scope:
-                print("Error: secret not found", file=sys.stderr)
-                code = 1
+                print(f'No custom secret found for env "{env}" in scope "{scope}"')
             else:
                 del state["custom"][env]
+                print(f'Deleted 1 custom secret(s) for env "{env}" in scope "{scope}"')
         else:
-            key = f"{scope}|{positional[1]}"
-            if state["service"].pop(key, None) is None:
-                print("Error: secret not found", file=sys.stderr)
-                code = 1
+            service = next(p for p in positional if p != scope)
+            if state["service"].pop(f"{scope}|{service}", None) is None:
+                print(f'No secret found for service "{service}" in scope "{scope}"')
+            else:
+                print(f'Deleted secret for service "{service}" in scope "{scope}"')
     state_path.write_text(json.dumps(state))
     return code
 

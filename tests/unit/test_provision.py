@@ -335,8 +335,8 @@ class TestEnsurePair:
         # a fresh attempt provisions without needing any collision recovery
         rm_calls_before = len(fake_sbx.invocations("secret rm"))
         pair = provisioner.ensure_pair("r2")
-        pair.cleanup()
         assert len(fake_sbx.invocations("secret rm")) == rm_calls_before
+        pair.cleanup()
 
     def test_explicit_workspace_wins(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
@@ -638,6 +638,21 @@ class TestSecretIdempotency:
         path = fake_sbx.state / "secrets-state.json"
         return json.loads(path.read_text()) if path.is_file() else {"service": {}, "custom": {}}
 
+    def test_cleanup_unregisters_the_pair_secrets(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        """``sbx rm`` leaves the sandbox-scoped registrations behind; on db
+        every run leaked one COPILOT_GITHUB_TOKEN and one github entry
+        until pair cleanup started removing them (field failure
+        rgn9ccjam)."""
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        state = self.secret_state(fake_sbx)
+        assert "COPILOT_GITHUB_TOKEN" in state["custom"]
+        assert any(k.startswith("sbxloop-r1-github|") for k in state["service"])
+        pair.cleanup()
+        state = self.secret_state(fake_sbx)
+        assert state["custom"] == {}
+        assert not any(k.startswith("sbxloop-r1-") for k in state["service"])
+
     def test_reprovision_replaces_secret_owned_by_old_scope(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
@@ -656,7 +671,12 @@ class TestSecretIdempotency:
             assert entry["value"] == "github_pat_copilot"
             # the rm targeted the OLD run's scope, parsed from the error
             rms = [s["args"] for s in fake_sbx.secrets() if s["args"][0] == "rm"]
-            assert any(a[1] == "sbxloop-r1-agent" for a in rms)
+            assert any(
+                "--sandbox" in a and a[a.index("--sandbox") + 1] == "sbxloop-r1-agent" for a in rms
+            )
+            # every removal is forced: without -f sbx 0.38 prompts, cancels
+            # non-interactively, and exits 0 having removed nothing
+            assert all("-f" in a for a in rms)
         finally:
             pair.cleanup()
 
@@ -681,9 +701,12 @@ class TestSecretIdempotency:
         self, fake_sbx: FakeSbx, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
-        provisioner.ensure_pair("r1").cleanup()
-        # every rm is rejected (simulating an sbx build without custom rm)
+        first = provisioner.ensure_pair("r1")
+        # every rm is rejected (simulating an sbx build without custom rm):
+        # r1's cleanup then leaves its registrations behind, and r2 must
+        # cope with the collision without dying
         fake_sbx.script("secret rm", returncode=1, stderr="unknown command")
+        first.cleanup()
         import logging
 
         with caplog.at_level(logging.WARNING):

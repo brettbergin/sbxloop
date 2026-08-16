@@ -42,7 +42,12 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
-from sbxloop.sbx.prune import classify_sandboxes, format_age, remove_sandbox
+from sbxloop.sbx.prune import (
+    classify_sandboxes,
+    format_age,
+    remove_run_sandbox,
+    remove_sandbox,
+)
 from sbxloop.sbx.secretstate import (
     COPILOT_TOKEN_ENV,
     SANDBOX_SCOPE_PREFIX,
@@ -1084,7 +1089,13 @@ def sandbox_prune(
     failures = 0
     for v in orphans:
         try:
-            remove_sandbox(cli, v.name)
+            if v.role in ("agent", "github"):
+                # A pruned run sandbox takes its secret registrations with
+                # it; otherwise a later run under the same name (resume)
+                # cannot replace them and comes up with the proxy sentinel.
+                remove_run_sandbox(cli, v.name, v.role)  # type: ignore[arg-type]
+            else:
+                remove_sandbox(cli, v.name)
         except SbxloopError as exc:
             failures += 1
             console.print(f"[yellow]skip {v.name}:[/] {exc}")

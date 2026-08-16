@@ -336,9 +336,20 @@ class SbxCLI:
         existing secret, so provisioning removes and re-sets. Removal syntax
         for custom secrets is not a stable documented API, hence best-effort
         (callers keep the existing value when removal is rejected).
+
+        ``-f`` is load-bearing: sbx 0.38 asks "Delete selected secret?
+        (y/N)" and, with no TTY, prints "Cancelled" and exits 0 — the
+        removal silently does nothing while looking accepted (field
+        failure rgn9ccjam: every run leaked its registrations, and a
+        daemon resume then could not replace the stale one). Scope goes
+        via ``--sandbox``; the positional form is deprecated in 0.38.
+        "No secret found" also exits 0, so the exit code alone cannot tell
+        removed from absent: the return value is "something was actually
+        deleted" — sbx 0.38 says ``Deleted ...``; a silent exit 0 (older
+        sbx) is trusted. Callers that ladder through candidate scopes
+        depend on this to keep trying instead of stopping at a no-op.
         """
-        scope = [sandbox] if sandbox else ["-g"]
-        args = ["secret", "rm", *scope]
+        args = ["secret", "rm"]
         if service:
             args.append(service)
         else:
@@ -346,4 +357,8 @@ class SbxCLI:
             if host:
                 args += ["--host", host]
             args += ["--env", env]
-        return self.run(*args, check=False).ok
+        if sandbox:
+            args += ["--sandbox", sandbox]
+        args.append("-f")
+        result = self.run(*args, check=False)
+        return result.ok and (not result.stdout.strip() or "Deleted" in result.stdout)
