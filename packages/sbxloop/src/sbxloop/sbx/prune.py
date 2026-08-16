@@ -23,7 +23,8 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, StateError
 from sbxloop.ids import is_run_id
 from sbxloop.sbx.cli import SbxCLI
-from sbxloop.sbx.models import SandboxInfo
+from sbxloop.sbx.models import SandboxInfo, SandboxRole
+from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV, COPILOT_TOKEN_HOST
 
 # A run in one of these states has already had (or never needed) its
 # teardown: any of its sandboxes still present are leaked. "failed" is safe
@@ -184,6 +185,33 @@ def remove_sandbox(cli: SbxCLI, name: str) -> None:
     with contextlib.suppress(SbxError):
         cli.stop(name)
     cli.rm(name, force=True)
+
+
+def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole) -> None:
+    """Best-effort: unregister the secrets provisioning bound to ``name``.
+
+    ``sbx rm`` removes the microVM but not the secret registrations keyed
+    by its name. Left behind, they poison the next provision under the same
+    name: replace-on-exists cannot replace, keeps the stale entry, and the
+    agent sandbox ends up with the proxy sentinel instead of a usable token
+    (field failure rgn9ccjam — a daemon recovery resumed a killed run and
+    the Copilot SDK got 401). Agent sandboxes carry the Copilot custom
+    secret; github sandboxes the built-in ``github`` service secret.
+    """
+    with contextlib.suppress(SbxError):
+        if role == "agent":
+            cli.secret_rm(host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV, sandbox=name)
+        else:
+            cli.secret_rm(service="github", sandbox=name)
+
+
+def remove_run_sandbox(cli: SbxCLI, name: str, role: SandboxRole) -> None:
+    """Remove a run's sandbox AND its registered secrets — the pair that a
+    dead process leaves behind and a re-provision under the same name
+    trips over. Sandbox removal errors propagate; secret removal is
+    best-effort (registration syntax is not a stable sbx API)."""
+    remove_sandbox(cli, name)
+    remove_run_sandbox_secrets(cli, name, role)
 
 
 def count_orphans(cli: SbxCLI, store: StateStore) -> int:

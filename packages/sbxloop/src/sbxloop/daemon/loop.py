@@ -35,7 +35,7 @@ from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
-from sbxloop.sbx.sandbox import Sandbox
+from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -531,15 +531,22 @@ class DaemonLoop:
                 self.dstore.mark_requeued_unstarted(item.item_id, now)
 
     def _remove_stale_run_sandboxes(self, run_id: str) -> None:
+        """A dead process leaves the run's microVMs — and their secret
+        registrations — behind. Both must go before resume re-provisions
+        under the same names: a lingering secret cannot be replaced, so the
+        agent would come up holding the proxy sentinel and the Copilot SDK
+        401s (field failure rgn9ccjam)."""
         if self.sbx is None:
             return
         for role in ("agent", "github"):
             name = sandbox_name(run_id, role)
             try:
-                Sandbox(self.sbx, name).rm()
-                self._notify(f"recovery: removed stale sandbox {name}")
+                remove_run_sandbox(self.sbx, name, role)
+                self._notify(f"recovery: removed stale sandbox {name} (and its secrets)")
             except SbxError:
-                pass  # not there — the common case
+                # No such sandbox — the common case — but a secret may
+                # still linger from a rollback race; clearing it is cheap.
+                remove_run_sandbox_secrets(self.sbx, name, role)
 
     def _result_from_record(self, run_id: str) -> RunResult:
         record = self.store.get_run(run_id)

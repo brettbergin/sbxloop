@@ -22,6 +22,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from sbxloop.sbx.models import SandboxRole
+from sbxloop.sbx.prune import remove_run_sandbox_secrets
 from sbxloop.sbx.sandbox import WORK_DIR, Sandbox
 
 logger = logging.getLogger(__name__)
@@ -68,12 +70,22 @@ class SandboxPair:
             self.cleanup()
 
     def cleanup(self) -> None:
-        """Stop and remove the pair's sandboxes. Idempotent, best-effort each."""
+        """Stop and remove the pair's sandboxes and their secret registrations.
+        Idempotent, best-effort each.
+
+        ``sbx rm`` does not unregister the secrets scoped to the sandbox's
+        name; left behind they accrete per run and block a later provision
+        under the same name (daemon resume) from replacing them.
+        """
         if self._cleaned:
             return
         self._cleaned = True
         cleanup_registry.unregister(self)
-        for sandbox in (self.agent, self.github):
+        roles: tuple[tuple[Sandbox | None, SandboxRole], ...] = (
+            (self.agent, "agent"),
+            (self.github, "github"),
+        )
+        for sandbox, role in roles:
             if sandbox is None:
                 continue
             try:
@@ -84,6 +96,10 @@ class SandboxPair:
                 sandbox.rm()
             except Exception:
                 logger.warning("failed to remove sandbox %s", sandbox.name, exc_info=True)
+            try:
+                remove_run_sandbox_secrets(sandbox.cli, sandbox.name, role)
+            except Exception:
+                logger.warning("failed to remove secrets of %s", sandbox.name, exc_info=True)
 
 
 class CleanupRegistry:

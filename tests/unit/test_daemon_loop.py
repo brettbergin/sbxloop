@@ -19,7 +19,7 @@ from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import StateError, WorkerError
+from sbxloop.errors import SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
 
 
@@ -370,16 +370,28 @@ class TestShutdownAndRecovery:
         item = h.dstore.get("inbox:a.md")
         assert item is not None and item.state == "done" and item.attempts == 1
 
-    def test_recover_removes_stale_run_sandboxes_before_resume(self, tmp_path: Path) -> None:
+    def test_recover_removes_stale_run_sandboxes_and_secrets_before_resume(
+        self, tmp_path: Path
+    ) -> None:
         """A killed process leaves its microVMs alive; resume re-provisions
         under the same names and sbx refuses an existing name (field
-        failure r6pgvatsd)."""
+        failure r6pgvatsd). Removing the sandbox alone is not enough: the
+        secret registrations survive ``sbx rm``, the re-provision cannot
+        replace them, and the agent boots with the proxy sentinel — Copilot
+        SDK 401 (field failure rgn9ccjam). Both must go."""
         h = Harness(tmp_path)
-        removed: list[str] = []
+        calls: list[tuple[str, Any]] = []
 
         class FakeSbx:
+            def stop(self, name: str) -> None:
+                calls.append(("stop", name))
+
             def rm(self, name: str, **kwargs: Any) -> None:
-                removed.append(name)
+                calls.append(("rm", name))
+
+            def secret_rm(self, **kwargs: Any) -> bool:
+                calls.append(("secret_rm", kwargs))
+                return True
 
         h.loop.sbx = FakeSbx()  # type: ignore[assignment]
         h.dstore.upsert_new(inbox_item(), now=1.0)
@@ -389,7 +401,44 @@ class TestShutdownAndRecovery:
         h.store.set_run_state("r_live", "running")
         h.outcomes = ["completed"]
         h.loop.recover()
-        assert removed == ["sbxloop-r_live-agent", "sbxloop-r_live-github"]
+        agent, gh = "sbxloop-r_live-agent", "sbxloop-r_live-github"
+        assert [c for c in calls if c[0] == "rm"] == [("rm", agent), ("rm", gh)]
+        secret_calls = [c[1] for c in calls if c[0] == "secret_rm"]
+        # Agent: the Copilot custom secret (host+env — sbx rejects env-only
+        # selection); github: the built-in service secret.
+        assert secret_calls == [
+            {"host": "api.github.com", "env": "COPILOT_GITHUB_TOKEN", "sandbox": agent},
+            {"service": "github", "sandbox": gh},
+        ]
+        assert h.runs == [("r_live", True)]
+
+    def test_recover_clears_secrets_even_when_sandbox_is_gone(self, tmp_path: Path) -> None:
+        """The common case: the sandbox was already torn down but its
+        secret registration lingered (rollback race). Recovery still
+        clears the registration so resume can provision cleanly."""
+        h = Harness(tmp_path)
+        calls: list[tuple[str, Any]] = []
+
+        class FakeSbx:
+            def stop(self, name: str) -> None:
+                raise SbxError("no such sandbox")
+
+            def rm(self, name: str, **kwargs: Any) -> None:
+                raise SbxError("no such sandbox")
+
+            def secret_rm(self, **kwargs: Any) -> bool:
+                calls.append(("secret_rm", kwargs))
+                return False
+
+        h.loop.sbx = FakeSbx()  # type: ignore[assignment]
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_live", now=2.0)
+        h.store.create_run("r_live", "x")
+        h.store.set_run_state("r_live", "running")
+        h.outcomes = ["completed"]
+        h.loop.recover()
+        assert len(calls) == 2
         assert h.runs == [("r_live", True)]
 
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
