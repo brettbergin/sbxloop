@@ -124,5 +124,7 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     default state dir — the same place the old relative default landed.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Path.home() reads USERPROFILE on Windows, so pin it too.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     return tmp_path

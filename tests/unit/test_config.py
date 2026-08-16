@@ -334,6 +334,19 @@ class TestStateDirDefault:
         env = {"SBXLOOP_STATE_DIR": str(tmp_path / "explicit")}
         assert load_config(cwd=tmp_path, env=env).state_dir == tmp_path / "explicit"
 
+    def test_mapped_home_governs_default_and_tilde(self, tmp_path: Path) -> None:
+        # A hermetic caller's env HOME must decide state_dir the same way it
+        # decides the user-config path; the process HOME (tmp_path here)
+        # must not leak in.
+        home = tmp_path / "mapped"
+        project = tmp_path / "proj"
+        project.mkdir()
+        env = {"HOME": str(home)}
+        assert load_config(cwd=project, env=env).state_dir == home / ".sbxloop"
+        (project / "sbxloop.toml").write_text('state_dir = "~/elsewhere"\n')
+        assert load_config(cwd=project, env=env).state_dir == home / "elsewhere"
+        assert load_config(cwd=project, env={**env, "SBXLOOP_STATE_DIR": "~"}).state_dir == home
+
 
 class TestUserConfigLayer:
     """``~/.config/sbxloop/sbxloop.toml`` is the lowest layer: it carries

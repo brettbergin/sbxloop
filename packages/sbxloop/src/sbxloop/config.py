@@ -462,6 +462,26 @@ def default_state_dir() -> Path:
     return Path.home() / ".sbxloop"
 
 
+def _home_dir(env: Mapping[str, str]) -> Path:
+    """The home the *loader* should trust: ``env["HOME"]`` when the mapping
+    names one, else the process home. Keeps the default ``state_dir`` and
+    ``~`` expansion consistent with ``user_config_path`` for hermetic
+    callers (``env={"HOME": ...}``), which would otherwise read the user
+    config from the mapped home but resolve state into the real one."""
+    home = env.get("HOME")
+    return Path(home) if home else Path.home()
+
+
+def _expand_home(value: str, home: Path) -> str:
+    """``expanduser`` against an explicit ``home`` (bare ``~`` and ``~/…``
+    only; ``~user`` is left to the field validator)."""
+    if value == "~":
+        return str(home)
+    if value.startswith("~/"):
+        return str(home / value[2:])
+    return value
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # sbx --app-name. Empty (the default) shares the user's normal sbx
@@ -636,6 +656,15 @@ def load_config_with_sources(
         merged = _deep_merge(merged, layer)
         for dotted in _flatten(layer):
             sources[dotted] = name
+
+    # Resolve the home-relative parts of ``state_dir`` against the loader's
+    # HOME (not the process environment) before validation, so ``env`` fully
+    # determines where state lands.
+    home = _home_dir(env)
+    if "state_dir" not in merged:
+        merged["state_dir"] = str(home / ".sbxloop")
+    elif isinstance(merged["state_dir"], str):
+        merged["state_dir"] = _expand_home(merged["state_dir"], home)
 
     try:
         config = Config.model_validate(merged)
