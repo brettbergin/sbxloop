@@ -121,11 +121,34 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
     ``info/exclude`` anyway. Never searches parent directories — a harvest
     dir under a checkout's ``.sbxloop/`` would otherwise inherit that
     checkout's rules and see *itself* as ignored, dropping everything.
+
+    The in-place mode opens a ``.git`` the sandbox agent could write to
+    (the clone is mounted into the VM), so its config is untrusted:
+    ``core.fsmonitor`` names a hook git runs while scanning the work tree,
+    which would turn this scan into host code execution. It is forced off
+    on the command line, which outranks every config file. Nothing else
+    ``ls-files`` consults can execute code (no hooks, filters, or pager
+    with captured output).
+
+    ``root`` is made absolute first: unmounted artifact roots derive from
+    the relative default ``state_dir`` (``.sbxloop/runs/...``), and git
+    resolves ``GIT_WORK_TREE`` against its cwd -- which is ``root`` -- so
+    a relative value would point at ``root/root`` and ignore nothing.
     """
     git = find_git()
     if git is None:
         return None
-    argv = [git, "ls-files", "--others", "--ignored", "--exclude-per-directory=.gitignore", "-z"]
+    root = root.absolute()
+    argv = [
+        git,
+        "-c",
+        "core.fsmonitor=false",
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-per-directory=.gitignore",
+        "-z",
+    ]
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     if (root / ".git").exists():
         try:

@@ -179,6 +179,33 @@ class TestGitignoredFiles:
         touch(root, "app.py", "dist/a.whl")
         assert hostgit.gitignored_files(root) == frozenset()
 
+    def test_relative_root_resolves_against_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unmounted artifact roots come from the relative default state_dir;
+        GIT_WORK_TREE must not be resolved beneath root itself."""
+        root = tmp_path / ".sbxloop" / "runs" / "r1" / "artifacts"
+        root.mkdir(parents=True)
+        (root / ".gitignore").write_text("dist/\n")
+        touch(root, "dist/a.whl", "m.py")
+        monkeypatch.chdir(tmp_path)
+        rel = Path(".sbxloop") / "runs" / "r1" / "artifacts"
+        assert hostgit.gitignored_files(rel) == {"dist/a.whl"}
+
+    def test_checkout_config_cannot_run_an_fsmonitor_hook(self, tmp_path: Path) -> None:
+        """The agent can write the clone's .git/config; a core.fsmonitor hook
+        there must not execute on the host during the scan."""
+        root = make_repo(tmp_path)
+        marker = tmp_path / "pwned"
+        hook = tmp_path / "hook.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        git("config", "core.fsmonitor", str(hook), cwd=root)
+        (root / ".gitignore").write_text("dist/\n")
+        touch(root, "dist/a.whl", "m.py")
+        assert hostgit.gitignored_files(root) == {"dist/a.whl"}
+        assert not marker.exists()
+
     def test_no_git_binary_is_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
         assert hostgit.gitignored_files(tmp_path) is None
