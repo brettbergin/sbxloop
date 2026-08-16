@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import socket
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -386,10 +387,11 @@ class ToolBatcher:
 
 # -- tool digest (normal level) -----------------------------------------------------------
 
-# A burst is "repetitive" when its last REPETITION_WINDOW commands share a
-# head token and read as near-copies of one another (mean pairwise
-# similarity >= REPETITION_RATIO). Sized on the field shape: the re59gj4vq
-# spiral was runs of `grep`/`od` variants differing in a flag or a path.
+# A burst is "repetitive" when its trailing commands share a head token and
+# every REPETITION_WINDOW-sized slice of them reads as near-copies of one
+# another (mean adjacent-pair similarity >= REPETITION_RATIO). Sized on the
+# field shape: the re59gj4vq spiral was runs of `grep`/`od` variants
+# differing in a flag or a path.
 REPETITION_WINDOW = 6
 REPETITION_RATIO = 0.6
 DIGEST_LAST_CLIP = 100
@@ -405,26 +407,55 @@ def _head(args: str) -> str:
     return ""
 
 
+class RepetitionDetector:
+    """Trailing-run detector for near-identical commands, fed one call at a
+    time so a burst of any length costs O(window) memory.
+
+    A call extends the current run when it has the same tool and head word
+    as the previous one. The run is *repetitive* once it holds ``window``
+    calls and every trailing ``window``-sized slice of it has a mean
+    adjacent-pair similarity >= ``ratio``; ``streak`` is how many trailing
+    calls satisfy that (0 while it does not). A slice whose mean dips below
+    the threshold ends the streak but not the run — the next qualifying
+    slice starts a fresh ``window``-long streak.
+    """
+
+    def __init__(self, *, window: int = REPETITION_WINDOW, ratio: float = REPETITION_RATIO) -> None:
+        self.window = window
+        self.ratio = ratio
+        self.streak = 0
+        self._head: tuple[str, str] | None = None
+        self._prev: str | None = None
+        self._ratios: deque[float] = deque(maxlen=max(window - 1, 1))
+
+    def add(self, tool: str, args: str) -> int:
+        from difflib import SequenceMatcher  # local: keep import cost off the hot path
+
+        head = (tool, _head(args))
+        if head != self._head:
+            self._head, self._prev, self.streak = head, args, 0
+            self._ratios.clear()
+            return self.streak
+        assert self._prev is not None
+        self._ratios.append(SequenceMatcher(None, self._prev, args).ratio())
+        self._prev = args
+        if len(self._ratios) < self.window - 1:
+            return self.streak  # the run is shorter than a window
+        if sum(self._ratios) / len(self._ratios) >= self.ratio:
+            self.streak = self.streak + 1 if self.streak else self.window
+        else:
+            self.streak = 0
+        return self.streak
+
+
 def repetitive_streak(commands: list[tuple[str, str]], *, window: int = REPETITION_WINDOW) -> int:
     """How many trailing ``(tool, args)`` calls are near-identical to one
     another (same tool, same head word, similar text); 0 if fewer than
-    ``window`` are."""
-    if len(commands) < window:
-        return 0
-    from difflib import SequenceMatcher  # local: keep import cost off the hot path
-
-    tool, args = commands[-1]
-    head = (tool, _head(args))
-    n = 0
-    prev: str | None = None
-    for t, a in reversed(commands):
-        if (t, _head(a)) != head:
-            break
-        if prev is not None and SequenceMatcher(None, prev, a).ratio() < REPETITION_RATIO:
-            break
-        prev = a
-        n += 1
-    return n if n >= window else 0
+    ``window`` are. Batch form of :class:`RepetitionDetector`."""
+    det = RepetitionDetector(window=window)
+    for tool, args in commands:
+        det.add(tool, args)
+    return det.streak
 
 
 class ToolDigest:
@@ -450,7 +481,7 @@ class ToolDigest:
         self.failed = 0
         self.by_tool: dict[str, int] = {}
         self.last: tuple[str, str] | None = None
-        self.commands: list[tuple[str, str]] = []
+        self._repetition = RepetitionDetector()
         self._dirty = False
 
     def __len__(self) -> int:
@@ -462,14 +493,15 @@ class ToolDigest:
 
     @property
     def repetitive(self) -> int:
-        return repetitive_streak(self.commands)
+        return self._repetition.streak
 
     def add_start(self, tool: str, args: str) -> None:
         self.count += 1
         self.by_tool[tool] = self.by_tool.get(tool, 0) + 1
         self.last = (tool, " ".join(str(args or "").split()))
-        # Repetition needs a bounded tail only; the count is what grows.
-        self.commands = [*self.commands[-(REPETITION_WINDOW * 2) :], self.last]
+        # Fed incrementally so a 200-call spiral still reports a 200-long
+        # streak (a bounded tail would cap it and never collapse the line).
+        self._repetition.add(*self.last)
         self._dirty = True
 
     def add_end(

@@ -275,6 +275,35 @@ class TestToolDigest:
         assert repetitive_streak(different_tool) == 0
         assert repetitive_streak(prefixed[:3]) == 0
 
+    def test_long_spiral_collapses_past_the_bounded_tail(self) -> None:
+        # The digest used to keep only a bounded tail of commands, so a 17-call
+        # spiral capped the streak at 13 and never rendered as "x17 similar".
+        d = ToolDigest()
+        for i in range(17):
+            d.add_start("bash", f"grep -n 'exit {i}' /tmp/out | od -c")
+        assert d.repetitive == 17
+        assert d.render().startswith("⚙ bash x17 similar commands — last:")
+        assert "the last 17 bash calls are near-identical" in d.render()
+
+    def test_streak_uses_the_window_mean_not_every_adjacent_pair(self) -> None:
+        # One dissimilar neighbour inside an otherwise near-identical window
+        # does not veto it: the mean over the six-command window is what counts.
+        run = [("bash", f"grep -n 'exit {i}' /tmp/out") for i in range(5)]
+        run.append(("bash", "grep -rIl --include='*.py' 'zzzzzzzzzzzzzzzzzzzzzz' /somewhere/else"))
+        run.extend(("bash", f"grep -n 'exit {i}' /tmp/out") for i in range(5, 9))
+        assert repetitive_streak(run) == 10
+        # ...whereas a run that drifts one flag at a time can keep every adjacent
+        # pair similar while the window's mean falls under the threshold.
+        drift = [("bash", "a" * 6 + "b" * (2 * i)) for i in range(1, 12)]
+        assert repetitive_streak(drift) == 0
+        # a slice whose mean fails ends the streak (0, not the run length); once a
+        # later slice qualifies again the streak restarts from that window rather
+        # than reaching back over the break.
+        same = [("bash", "grep -n 'x' f")] * 6
+        unrelated = [("bash", f"grep {c * 60}") for c in "qzy"]
+        assert repetitive_streak(same + unrelated) == 0
+        assert repetitive_streak(same + unrelated + same) == 8  # < len(run) == 15
+
 
 class TestToolBatcher:
     def test_batch_renders_one_block_and_marks_failures(self) -> None:
