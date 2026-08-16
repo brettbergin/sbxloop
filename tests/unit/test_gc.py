@@ -3,6 +3,7 @@ daemon's periodic sweep."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -352,6 +353,21 @@ class TestCli:
         assert result.exit_code == 0
         assert "no run directories" in result.output
 
-    def test_gc_in_help(self) -> None:
+    def test_gc_in_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Wide terminal so rich does not wrap the command's help line.
+        monkeypatch.setenv("COLUMNS", "300")
         result = runner.invoke(app, ["--help"])
-        assert "gc" in result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert re.search(r"\bgc\s+Remove old run directories", plain), plain
+
+    def test_gc_table_shows_foreign_dir_as_unknown(self, workdir: Path) -> None:
+        # A runs/<id>/ directory with no state-DB row: the table must
+        # render the missing state/age rather than crash, and keep it.
+        state_dir = workdir / ".sbxloop"
+        StateStore(state_dir / "state.db")
+        (state_dir / "runs" / "rforeign1").mkdir(parents=True)
+        result = runner.invoke(app, ["gc"])
+        assert result.exit_code == 0, result.output
+        assert "rforeign1" in result.output
+        assert "unknown" in result.output and "keep" in result.output
+        assert (state_dir / "runs" / "rforeign1").exists()
