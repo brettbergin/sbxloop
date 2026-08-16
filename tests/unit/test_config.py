@@ -148,6 +148,9 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text("[daemon]\nmax_runs_per_day = 0\n")
     with pytest.raises(ConfigError, match="max_runs_per_day"):
         load_config(cwd=tmp_path, env={})
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\npoll_interval_s = 0\n")
+    with pytest.raises(ConfigError, match="poll_interval_s"):
+        load_config(cwd=tmp_path, env={})
 
 
 def test_sources_tracking(tmp_path: Path) -> None:

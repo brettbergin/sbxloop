@@ -301,7 +301,8 @@ class DaemonConfig(_ConfigModel):
     """
 
     inbox_dir: str = ".sbxloop/inbox"  # "" disables the inbox source
-    poll_interval_s: float = 60.0
+    # Must be positive: Event.wait(<= 0) returns immediately and the loop spins.
+    poll_interval_s: float = Field(default=60.0, gt=0)
     trigger_label: str = "sbxloop:run"
     in_progress_label: str = "sbxloop:in-progress"
     failed_label: str = "sbxloop:failed"

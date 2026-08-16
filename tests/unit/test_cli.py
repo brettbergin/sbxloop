@@ -366,6 +366,15 @@ class TestDaemonCommand:
         assert result.exit_code == 2
         assert "needs a GitHub repository" in result.output
 
+    def test_nonpositive_poll_interval_exits_2(self, workdir: Path) -> None:
+        # review: Event.wait(<= 0) returns immediately → the loop would spin
+        for value in ("0", "-5"):
+            result = runner.invoke(
+                app, ["daemon", "--inbox", "inbox", "--poll-interval", value, "--once"]
+            )
+            assert result.exit_code == 2, result.output
+            assert "invalid daemon option" in result.output
+
     def test_bad_backlog_value_exits_2(self, workdir: Path) -> None:
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--backlog", "yolo"])
         assert result.exit_code == 2
