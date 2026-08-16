@@ -142,6 +142,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sbxloop run "OUTCOME"`               | Start a run. Options: `--repo`, `--report`, `--deliver`, `--deliver-base`, `--deliver-draft`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`.                                                                                         |
 | `sbxloop daemon`                      | The always-on outer loop: poll labeled issues + an inbox dir, run each item, report back, mirror to Discord. Options: `--repo`, `--inbox`, `--backlog`, `--discord-channel`, `--once`, `--dry-run`.                                                   |
+| `sbxloop daemon ctl CMD`              | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as Discord's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                    |
 | `sbxloop resume RUN`                  | Re-provision sandboxes and continue a checkpointed run under its persisted config.                                                                                                                                                                    |
 | `sbxloop deliver RUN`                 | Deliver (or re-deliver) a completed run's artifacts as a PR from a github-ops sandbox alone — the retry path when end-of-run delivery failed. Options: `--repo`, `--deliver-base`, `--deliver-draft`, `--create-repo`, `--create-public`, `--report`. |
 | `sbxloop cancel RUN`                  | Cancel an in-flight run.                                                                                                                                                                                                                              |
@@ -330,7 +331,11 @@ retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
 on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run
 instead, and `!sbx retry <item>` reruns any cancelled or abandoned item with
 its attempt budget reset. Anyone who can post in the channel
-can steer — that is the boundary to set.
+can steer — that is the boundary to set. The bot ignores messages from bots
+(itself included), so scripts drive the daemon with `sbxloop daemon ctl <verb>`
+instead — the same verbs through the same dispatcher, no Discord needed; a
+request nobody answers within `--timeout` is withdrawn, so a stale `cancel`
+never fires when the daemon starts later.
 
 Bot setup, once: create an application in the Discord Developer Portal, add
 a bot, enable the **Message Content** privileged intent, copy the token, and

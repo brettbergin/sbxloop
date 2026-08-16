@@ -74,8 +74,9 @@ secrets_app = typer.Typer(
     help="Manage the sbx custom-secret registrations sbxloop owns.", no_args_is_help=True
 )
 # `sbxloop daemon` runs the loop; `sbxloop daemon items|abandon|retry|requeue`
-# are the operator's item controls (#229), so the group's callback IS the
-# daemon and only defers when a subcommand was named.
+# are the operator's item controls (#229) and `sbxloop daemon ctl` drives a
+# running daemon (#232), so the group's callback IS the daemon and only
+# defers when a subcommand was named.
 daemon_app = typer.Typer(invoke_without_command=True)
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(config_app, name="config")
@@ -1411,11 +1412,13 @@ def daemon(
     """Run the always-on outer loop: discover work (labeled GitHub issues,
     inbox files), run each item through the inner loop, report back, and
     mirror the chronology to Discord. Subcommands inspect and steer
-    individual work items."""
+    individual work items; `sbxloop daemon ctl CMD` talks to the running
+    daemon instead."""
     if ctx.invoked_subcommand is not None:
         return
     import logging
 
+    from sbxloop.daemon.control import ControlServer
     from sbxloop.daemon.discord import DiscordBridge
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.loop import DaemonLoop
@@ -1535,6 +1538,8 @@ def daemon(
             raise typer.Exit(2) from exc
         loop.frontend = bridge
 
+    ctl = ControlServer(loop, config.state_dir)
+    ctl.start()
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
     try:
@@ -1548,6 +1553,7 @@ def daemon(
         console.print("\n[bold yellow]daemon interrupted[/]")
     finally:
         cleanup_registry.set_quiesce(None)
+        ctl.close()
         if bridge is not None:
             bridge.close()
         if github is not None:
@@ -1555,15 +1561,19 @@ def daemon(
         dstore.close()
 
 
-def _daemon_store() -> DaemonStore:
+def _daemon_state_dir() -> Path:
     # Same resolution as `sbxloop daemon` itself (#255): with the anchored
-    # default the daemon's queue is not under the runner dir's `.sbxloop`,
-    # so the item controls must follow the daemon's rule, not `_store`'s.
+    # default the daemon's queue and control queue are not under the runner
+    # dir's `.sbxloop`, so the operator commands must follow the daemon's
+    # rule, not `_store`'s.
     from sbxloop.daemon.paths import resolve_state_dir
 
     config, sources = load_config_with_sources()
-    choice = resolve_state_dir(config, sources, cwd=Path.cwd(), env=os.environ, home=Path.home())
-    return DaemonStore(choice.path / "state.db")
+    return resolve_state_dir(config, sources, cwd=Path.cwd(), env=os.environ, home=Path.home()).path
+
+
+def _daemon_store() -> DaemonStore:
+    return DaemonStore(_daemon_state_dir() / "state.db")
 
 
 _ITEM_CONTROL_NOTE = (
@@ -1664,6 +1674,39 @@ def _item_control(action: str, item_id: str, reason: str | None) -> None:
         highlight=False,
     )
     console.print(_ITEM_CONTROL_NOTE, highlight=False)
+
+
+# `--retry` belongs to the daemon's `cancel` verb, not to this command: pass
+# unknown options through as words so the CLI and Discord spell it the same.
+@daemon_app.command("ctl", context_settings={"ignore_unknown_options": True})
+def daemon_ctl(
+    command: Annotated[
+        list[str],
+        typer.Argument(
+            help="status | pause | resume | cancel [--retry] | queue | items | abandon <item> "
+            "[reason] | retry <item> | requeue <item> (the Discord !sbx verbs)."
+        ),
+    ],
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="Seconds to wait for the daemon's reply.")
+    ] = 10.0,
+) -> None:
+    """Send a command to the daemon running against this state_dir — the
+    programmatic twin of Discord's `!sbx`, for scripts, cron and remote
+    operators (the bot ignores its own messages by design)."""
+    from sbxloop.daemon.control import ControlClient, plain
+
+    state_dir = _daemon_state_dir()
+    reply = ControlClient(state_dir).submit(" ".join(command), timeout_s=timeout)
+    if reply is None:
+        console.print(
+            f"[bold red]no reply from the daemon[/] within {timeout:g}s — is "
+            f"[cyan]sbxloop daemon[/] running with state dir {state_dir}?"
+        )
+        raise typer.Exit(2)
+    console.print(plain(reply.text), markup=False, highlight=False)
+    if not reply.ok:
+        raise typer.Exit(1)
 
 
 @app.command()

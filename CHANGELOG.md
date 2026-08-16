@@ -60,6 +60,16 @@ All notable changes to sbxloop are documented here. The project adheres to
   abandoned by poking `DaemonStore` from Python, and recovery would have
   resumed the doomed plan.
 
+- `sbxloop daemon ctl <status|pause|resume|cancel [--retry]|queue|items|abandon|retry|requeue>`
+  — a local control surface for the running daemon (#232). Requests go
+  through a file queue in the daemon's `state_dir/daemon/ctl/`, served by a
+  daemon thread so `cancel` lands mid-run; a request that predates the
+  daemon's start is refused, and one nobody answers is withdrawn. Discord's
+  `!sbx` and `ctl` share one command dispatcher (`sbxloop.daemon.control`),
+  so the two surfaces cannot drift; a ctl cancel/retry is attributed on the
+  source as "`<user>` via sbxloop daemon ctl". The bridge still ignores
+  bot-authored messages by design.
+
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
   boundaries (fences re-opened with their language) instead of clipped;

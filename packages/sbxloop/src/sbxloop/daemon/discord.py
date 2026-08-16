@@ -27,6 +27,7 @@ steer — that is the operator's boundary to set.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import queue
@@ -35,6 +36,7 @@ from collections.abc import Callable
 from typing import Any
 
 from sbxloop.config import Config
+from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
 from sbxloop.daemon.discord_format import (
     DISCORD_MAX_MESSAGE,
     Chunk,
@@ -50,8 +52,6 @@ from sbxloop.daemon.discord_format import (
     format_for_discord,
     headline_embed,
     headline_text,
-    items_lines,
-    queue_lines,
     status_embed,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
@@ -341,100 +341,29 @@ class DiscordBridge:
         if loop is None:
             await self._send(channel, "daemon loop not attached")
             return
+        prefix = self.discord.command_prefix
+        # Same dispatcher as `sbxloop daemon ctl` (#232): Discord only adds
+        # the author attribution and the rendering — the status embed, and
+        # the steering hint on the usage line.
         word = (cmd.split() or [""])[0].lower()
-        if word == "status":
-            s = loop.status()
-            cur = s["current"]
-            lines = [
-                f"**current:** {cur['run_id']} — {cur['title']}" if cur else "**current:** idle",
-                f"**queued:** {s['queued']} · **runs today:** "
-                f"{s['runs_today']}/{s['max_runs_per_day']}"
-                f" (resumes {s.get('resumes_today', 0)})",
-                f"**breaker:** {'open' if s['breaker_open'] else 'closed'} · "
-                f"**paused:** {s['paused']}",
-            ]
-            await self._send(channel, "\n".join(lines), embed=status_embed(s))
-        elif word == "pause":
-            loop.pause()
-            await self._send(channel, "paused — the current run finishes; nothing new is claimed.")
-        elif word in ("resume", "unpause"):
-            loop.unpause()
-            await self._send(channel, "resumed.")
-        elif word == "cancel":
-            # Attributed to the Discord author: the item is settled as
-            # cancelled (no retry, no breaker count) unless --retry asks for
-            # a fresh run.
-            args = cmd.split()[1:]
-            unknown = [a for a in args if a != "--retry"]
-            if unknown:
-                # A typo (`--rety`) must not silently become a terminal
-                # no-retry cancel: the two outcomes differ materially.
-                await self._send(
-                    channel,
-                    f"unknown cancel argument {code(' '.join(unknown))}; usage: "
-                    f"`{self.discord.command_prefix} cancel [--retry]`",
-                )
-                return
-            retry = "--retry" in args
-            ok = loop.cancel_current(_author_name(message), retry=retry)
-            if not ok:
-                await self._send(channel, "nothing is running.")
-            elif retry:
-                await self._send(
-                    channel,
-                    "cancel requested — honored at the next task boundary; the item will be "
-                    "re-queued and run again fresh.",
-                )
-            else:
-                await self._send(
-                    channel,
-                    "cancel requested — honored at the next task boundary; the item settles as "
-                    "cancelled (no retry) and the run stays resumable.",
-                )
-        elif word == "queue":
-            await self._send(channel, queue_lines(loop.dstore.queued()), suppress_embeds=True)
-        elif word == "items":
-            await self._send(channel, items_lines(loop.dstore.items()), suppress_embeds=True)
-        elif word in ("abandon", "retry", "requeue"):
+        by = _author_name(message)
+        if word in ITEM_COMMANDS:
             # Abandoning a queued GitHub item reports through the ops
             # sandbox — seconds, not milliseconds — so keep it off the
             # gateway's event loop.
             reply = await asyncio.get_event_loop().run_in_executor(
-                None, self._item_command, loop, word, cmd.split()[1:], _author_name(message)
+                None, functools.partial(dispatch, loop, cmd, prefix=prefix, by=by)
             )
-            await self._send(channel, reply)
         else:
+            reply = dispatch(loop, cmd, prefix=prefix, by=by)
+        if reply.status is not None:
+            await self._send(channel, reply.text, embed=status_embed(reply.status))
+        elif not reply.known:
             await self._send(
-                channel,
-                f"commands: `{self.discord.command_prefix} status|pause|resume|"
-                "cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|"
-                "requeue <item>` — or type in a run's thread to steer that run.",
+                channel, f"{reply.text} — or type in a run's thread to steer that run."
             )
-
-    @staticmethod
-    def _item_command(loop: Any, word: str, args: list[str], by: str) -> str:
-        """`!sbx abandon|retry|requeue <item_id> [reason…]` → reply text.
-        Item ids are the daemon's own (`gh:12`, `inbox:x.md`); the store
-        rejects bad transitions with a message worth showing verbatim. A
-        retry is attributed to the Discord author on the source."""
-        if not args:
-            return f"usage: {word} <item_id>" + (" [reason]" if word == "abandon" else "")
-        item_id = args[0]
-        try:
-            if word == "abandon":
-                item = loop.abandon_item(item_id, " ".join(args[1:]) or None)
-                return (
-                    f"{code(item_id)} abandoned"
-                    + (f" (its run {code(item.run_id)} will not resume)" if item.run_id else "")
-                    + "."
-                )
-            if word == "retry":
-                loop.retry_item(item_id, by)
-                return f"{code(item_id)} re-queued with attempts reset (fresh plan)."
-            loop.requeue_item(item_id)
-            return f"{code(item_id)} re-queued; its next dispatch starts a fresh run."
-        except (KeyError, ValueError) as exc:
-            return f"{word} failed: {exc.args[0] if exc.args else exc}"
+        else:
+            await self._send(channel, reply.text, suppress_embeds=True)
 
     # -- pump: queue -> discord (discord thread) -------------------------------------
 
