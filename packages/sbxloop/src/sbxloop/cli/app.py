@@ -1850,9 +1850,18 @@ def doctor(
             "scratch sandbox) and refresh the version-keyed verdict cache.",
         ),
     ] = False,
+    fail_on_drift: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-drift",
+            help="Exit 1 when any sbx conformance probe drifted, errored, or is "
+            "unprobed for the installed sbx version (CI gate; drift is otherwise "
+            "a warning).",
+        ),
+    ] = False,
 ) -> None:
     """Check that this host is ready to run sbxloop."""
-    ok = run_doctor(console, deep=deep)
+    ok = run_doctor(console, deep=deep, fail_on_drift=fail_on_drift)
     raise typer.Exit(0 if ok else 1)
 
 

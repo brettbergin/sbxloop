@@ -1,0 +1,59 @@
+{
+  "_about": [
+    "Worker-shaped GithubOps error strings the unit stubs must load verbatim (#226).",
+    "Production branches on these strings (deliver._is_missing / _is_empty_repo,",
+    "GithubIssueSource label cleanup), and the stub that modeled the empty-repo",
+    "answer as a 404 shipped a bootstrap that never fired against real GitHub's",
+    "409 (#219). Every entry carries provenance so a shape reality never produced",
+    "cannot masquerade as verified:",
+    "  provenance=field     captured verbatim from a real run (record the run id)",
+    "  provenance=synthetic built from the worker transport's own format string,",
+    "                       NOT yet observed in the field - promote it when a run",
+    "                       produces the real line (see the e2e workflow's",
+    "                       'Capture GitHub error shapes' step).",
+    "'expect' pins how the production predicates classify the message; the",
+    "guard test in tests/unit/test_github_field_errors.py evaluates it."
+  ],
+  "errors": {
+    "empty_repo_ref_409": {
+      "message": "github op raw.api failed: GithubOpError: gh api GET /repos/o/r/git/ref/heads/main failed (rc=1): gh: Git Repository is empty. (HTTP 409)",
+      "status": 409,
+      "provenance": "field",
+      "observed": "run rgwp5z40x (2026-08, PR #219): GET git/ref/heads/<default_branch> on an empty repository; repo slug replaced with o/r",
+      "expect": {
+        "deliver.is_missing": false,
+        "deliver.is_empty_repo": true
+      }
+    },
+    "ref_missing_404": {
+      "message": "github op raw.api failed: GithubOpError: gh api GET /repos/o/r/git/ref/heads/topic failed (rc=1): gh: Not Found (HTTP 404)",
+      "status": 404,
+      "provenance": "synthetic",
+      "observed": "not yet captured: an explicit deliver_base naming a branch that does not exist on a non-empty repository",
+      "expect": {
+        "deliver.is_missing": true,
+        "deliver.is_empty_repo": false
+      }
+    },
+    "repo_missing_404": {
+      "message": "github op repo.get failed: GithubOpError: gh api GET /repos/o/r failed (rc=1): gh: Not Found (HTTP 404)",
+      "status": 404,
+      "provenance": "synthetic",
+      "observed": "not yet captured: repo.get against a repository that does not exist (ensure_repository create path)",
+      "expect": {
+        "deliver.is_missing": true,
+        "deliver.is_empty_repo": false
+      }
+    },
+    "label_missing_404": {
+      "message": "github op raw.api failed: GithubOpError: gh api DELETE /repos/o/r/issues/7/labels/sbxloop failed (rc=1): gh: Label does not exist (HTTP 404)",
+      "status": 404,
+      "provenance": "synthetic",
+      "observed": "not yet captured: removing a label an operator already removed by hand (daemon GithubIssueSource)",
+      "expect": {
+        "deliver.is_missing": true,
+        "deliver.is_empty_repo": false
+      }
+    }
+  }
+}

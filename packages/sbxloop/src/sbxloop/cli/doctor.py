@@ -438,7 +438,22 @@ def render_conformance(console: Console, report: ConformanceReport) -> None:
         console.print(f"[bold yellow]{report.deep_run_hint}[/]", highlight=False)
 
 
-def run_doctor(console: Console, env: dict[str, str] | None = None, *, deep: bool = False) -> bool:
+def run_doctor(
+    console: Console,
+    env: dict[str, str] | None = None,
+    *,
+    deep: bool = False,
+    fail_on_drift: bool = False,
+) -> bool:
+    """Run the host checks and the conformance suite; return readiness.
+
+    ``fail_on_drift`` turns the conformance verdicts into a gate: any drift,
+    probe error, unprobed seam, or a suite that could not run makes the
+    result False. Interactive doctor keeps drift as a loud warning (the
+    dependent code paths probe-don't-assume at runtime, so runs may still
+    work); CI lanes whose whole job is catching sbx drift ahead of a field
+    failure pass the flag (#226).
+    """
     import os
 
     env = dict(os.environ) if env is None else env
@@ -464,7 +479,7 @@ def run_doctor(console: Console, env: dict[str, str] | None = None, *, deep: boo
     sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
     if not sbx_present:
         console.print("[dim]sbx conformance skipped: no usable sbx binary[/]", highlight=False)
-        return ready
+        return ready and not fail_on_drift
     try:
         report = run_conformance(
             cli,
@@ -475,9 +490,17 @@ def run_doctor(console: Console, env: dict[str, str] | None = None, *, deep: boo
         )
     except SbxError as exc:
         console.print(f"[yellow]sbx conformance suite failed to run:[/] {_clean(str(exc))}")
-        return ready
+        return ready and not fail_on_drift
     render_conformance(console, report)
-    # Drift is a loud warning, not a failure: the dependent code paths all
-    # probe-don't-assume at runtime, so runs may still work \u2014 but the verdict
-    # snapshot above is exactly what a bug report should include.
+    # By default drift is a loud warning, not a failure: the dependent code
+    # paths all probe-don't-assume at runtime, so runs may still work \u2014 but
+    # the verdict snapshot above is exactly what a bug report should include.
+    if fail_on_drift and report.unverified:
+        console.print(
+            f"[bold red]sbx conformance gate failed:[/] {len(report.unverified)} probe(s) "
+            f"drifted, errored, or are unprobed under sbx {report.version or '(unknown)'} "
+            "(--fail-on-drift)",
+            highlight=False,
+        )
+        return False
     return ready

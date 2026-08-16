@@ -624,8 +624,12 @@ live-sandbox verdicts from the cache; `sbxloop doctor --deep` boots one
 scratch sandbox for the full suite. When an sbx upgrade flips a verdict that
 sbxloop's behavior depends on, doctor warns loudly and names the dependent
 behavior. Ordinary runs feed the same cache, so verdicts stay fresh for free.
-Doctor also checks the installed Copilot SDK's permission-kind vocabulary
-against the field-verified snapshot backing the read-only critic barrier.
+`sbxloop doctor --fail-on-drift` turns that warning into an exit code (any
+drifted, errored, or unprobed probe fails) — the CI e2e lane uses it, and the
+scheduled `sbx-conformance` workflow runs it against the newest sbx release
+ahead of adoption. Doctor also checks the installed Copilot SDK's
+permission-kind vocabulary against the field-verified snapshot backing the
+read-only critic barrier.
 
 ### Secret registration hygiene
 

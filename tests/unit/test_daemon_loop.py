@@ -23,6 +23,7 @@ from sbxloop.engine.model import RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
+from tests.fakes.github_errors import field_error
 from tests.unit.test_hostgit import make_repo, make_upstream_and_clone, push_upstream_commit
 
 
@@ -116,7 +117,9 @@ class Harness:
         self.store.set_run_state(run_id, state)
         if kind == "deliver_fail":
             self.store.append_event(
-                Event.now("run.deliver", run_id, repo="o/r", error="HTTP 409 empty")
+                Event.now(
+                    "run.deliver", run_id, repo="o/r", error=field_error("empty_repo_ref_409")
+                )
             )
         elif kind == "completed":
             self.store.append_event(Event.now("run.report", run_id, repo="o/r", issue=5, url="u5"))

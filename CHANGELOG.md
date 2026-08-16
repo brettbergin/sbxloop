@@ -139,6 +139,21 @@ All notable changes to sbxloop are documented here. The project adheres to
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
 
+- Tighter drift loop around the fake sbx and the GitHub stubs (#226):
+  `sbxloop doctor --fail-on-drift` exits 1 when any conformance probe
+  drifted, errored, or is unprobed for the installed sbx build; the e2e lane
+  uses it instead of a workflow warning, and a new scheduled
+  `sbx-conformance` workflow runs the deep suite against the newest sbx
+  release ahead of adoption with a rolling verdict cache (cross-version flips
+  reported). Unit stubs now replay worker-shaped GitHub error strings from
+  `tests/fixtures/github_field_errors.json` (field-recorded entries name
+  their run; synthetic ones are marked as such) and a guard test rejects
+  inline `HTTP 404`/`409` literals in unit tests, so the 404-for-empty-repo
+  stub of #219 cannot recur; the e2e workflow uploads every GitHub error
+  string a real run produced for promotion into the fixture. Every
+  `TODO(e2e ...)` marker must now cite an issue or an e2e step name
+  (`tests/unit/test_e2e_markers.py`).
+
 - `git` is now baseline agent tooling, provisioned on every agent sandbox
   independent of `[sandbox] languages` (#252): the dev-tools ensure probes
   `command -v git` and installs it in the same pooled apt call as the selected

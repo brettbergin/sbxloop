@@ -70,6 +70,8 @@ class TestDeepRun:
             assert outcome.matches_expected, (outcome.probe.id, outcome.verdict, outcome.detail)
         assert report.drifted == []
         assert report.deep_run_hint is None
+        # ...and the CI gate (`doctor --fail-on-drift`) has nothing to say
+        assert report.unverified == []
 
     def test_deep_run_removes_scratch_sandbox_and_secrets(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -240,6 +242,11 @@ class TestShallowRun:
         assert outcomes[PROBE_SECRET_ENV_VISIBILITY].source == "unprobed"
         assert report.deep_run_hint is not None
         assert "doctor --deep" in report.deep_run_hint
+        # unprobed seams are exactly what the drift gate must refuse (#226)
+        assert any(
+            reason.startswith(f"{PROBE_SECRET_ENV_VISIBILITY}: unprobed")
+            for reason in report.unverified
+        )
         # no sandbox was ever created
         assert make_cli(fake_sbx).ls() == []
 

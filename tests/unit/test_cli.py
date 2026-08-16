@@ -834,6 +834,24 @@ class TestDoctor:
         assert "sbx drift" in result.output
         # drift warns loudly but does not fail an otherwise-ready host
         assert result.exit_code == 0, result.output
+        # ...unless the caller asked for the CI gate (#226)
+        gated = runner.invoke(app, ["doctor", "--fail-on-drift"])
+        assert gated.exit_code == 1, gated.output
+        assert "conformance gate failed" in gated.output
+
+    def test_doctor_fail_on_drift_rejects_unprobed_sbx_version(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A never-deep-probed sbx build is not a passing grade for the gate:
+        that is exactly the state a fresh sbx release lands in."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor", "--fail-on-drift"])
+        assert result.exit_code == 1, result.output
+        assert "conformance gate failed" in result.output
+        # a deep run answers every probe against the fake and the gate opens
+        deep = runner.invoke(app, ["doctor", "--deep", "--fail-on-drift"])
+        assert deep.exit_code == 0, deep.output
+        assert runner.invoke(app, ["doctor", "--fail-on-drift"]).exit_code == 0
 
 
 class TestBakeCommand:

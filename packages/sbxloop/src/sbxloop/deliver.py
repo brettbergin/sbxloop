@@ -24,7 +24,9 @@ Two ways of building that tree (#248):
 Scaffold status: this is a real, unit-tested code path (stubbed GithubOps),
 but per the project pattern — unverified external behaviors get a seam and
 an e2e check, never a confident default — it is NOT field-proven until the
-real-sbx e2e workflow exercises it. Known e2e-validation items:
+real-sbx e2e workflow exercises it. Known e2e-validation items (each marker
+names the open issue or e2e step that will retire it — the audit in
+``tests/unit/test_e2e_markers.py`` fails on a marker without one, #226):
 
 - TODO(e2e): branch-name collisions — handled in code (a 422 on the refs
   POST force-updates the existing ``sbxloop/<run>`` branch, and a 422 on

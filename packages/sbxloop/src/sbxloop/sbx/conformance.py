@@ -573,6 +573,27 @@ class ConformanceReport:
     def drifted(self) -> list[ProbeOutcome]:
         return [o for o in self.outcomes if o.drifts]
 
+    @property
+    def unverified(self) -> list[str]:
+        """Why this report cannot vouch for the installed sbx build.
+
+        One line per drifted, errored, or unprobed probe; empty means every
+        catalog entry answered as this codebase expects. This is the
+        ``doctor --fail-on-drift`` gate: CI's e2e lane and the scheduled
+        sbx-release probe fail on it instead of warning, because a warning
+        buried in a workflow log is exactly the signal 0.38's ``ls`` rename
+        and mount change slipped past (#210, #226).
+        """
+        reasons: list[str] = []
+        for outcome in self.outcomes:
+            if outcome.source == "unprobed":
+                reasons.append(f"{outcome.probe.id}: unprobed under sbx {self.version}")
+            elif outcome.is_error:
+                reasons.append(f"{outcome.probe.id}: probe error: {outcome.detail}")
+            else:
+                reasons.extend(f"{outcome.probe.id}: {drift}" for drift in outcome.drifts)
+        return reasons
+
 
 ProgressFn = Callable[[str], None]
 
