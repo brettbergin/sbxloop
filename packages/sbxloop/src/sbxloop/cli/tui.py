@@ -137,6 +137,13 @@ def render_event(event: Event) -> RenderableType | None:
         start.overflow = "fold"
         return start
 
+    if event.type == EventTypes.AGENT_TOOL_CAP:
+        return Text(
+            f"{_stamp(event)}  ⛔ tool-call ceiling ({data.get('cap')}) reached — "
+            "further calls are turned away; the agent was told to wrap up and report",
+            style="yellow",
+        )
+
     if event.type == EventTypes.AGENT_TOOL_END:
         tool = data.get("tool") or "tool"
         success = data.get("success")

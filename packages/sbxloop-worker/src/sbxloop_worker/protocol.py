@@ -80,6 +80,10 @@ class SessionHealth(ProtocolModel):
     permission_denials: dict[str, int] = Field(default_factory=dict)
     tool_failures: dict[str, int] = Field(default_factory=dict)
     tool_refusals: dict[str, int] = Field(default_factory=dict)
+    # Tool calls the per-phase ceiling turned away (#228). Bounded spend,
+    # not lost tooling — a separate tally so it never reads as degraded.
+    tool_calls: int = 0
+    tool_cap_denials: int = 0
 
     @property
     def degraded(self) -> bool:
@@ -102,6 +106,11 @@ class SessionHealth(ProtocolModel):
             parts.append(f"permission denials: {tally(self.permission_denials)}")
         if self.tool_refusals:
             parts.append(f"tool refusals: {tally(self.tool_refusals)}")
+        if self.tool_cap_denials:
+            parts.append(
+                f"tool-call ceiling hit: {self.tool_cap_denials} call(s) turned away "
+                f"after {self.tool_calls - self.tool_cap_denials}"
+            )
         return "; ".join(parts) or "healthy"
 
 
@@ -133,6 +142,9 @@ class JobRequest(ProtocolModel):
     resume_session_id: str | None = None
     permission_mode: PermissionMode = "auto"
     expect: ExpectMode = "text"
+    # Per-phase tool-call ceiling (#228): calls past it are turned away with
+    # an in-session nudge to stop investigating and report. None = unbounded.
+    max_tool_calls: int | None = None
 
     # kind == "shell.check"
     argv: list[str] | None = None
@@ -265,6 +277,9 @@ class EventTypes:
     AGENT_TOOL_END = "agent.tool_end"
     AGENT_USAGE = "agent.usage"
     AGENT_PERMISSION_DENIED = "agent.permission_denied"
+    # The per-phase tool-call ceiling was reached; further calls are turned
+    # away with a nudge (#228). Emitted once per session.
+    AGENT_TOOL_CAP = "agent.tool_cap"
 
     GH_OP_START = "gh.op_start"
     GH_OP_PROGRESS = "gh.op_progress"

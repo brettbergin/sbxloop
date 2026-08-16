@@ -95,6 +95,18 @@ for all remaining work and your changes must honor them:
 
 $user_guidance
 
+## Budget your investigation
+
+Tool calls in this phase are capped; past the cap they are turned away and
+you are told to wrap up. Once you have established a fact, do not keep
+re-establishing it with variations of the same command. In particular, if a
+verify command keeps failing while your code is demonstrably correct — the
+command relies on shell features the mechanical `sh -c` runner lacks, checks
+the wrong path, or contradicts the task — stop debugging shell semantics:
+say so plainly in your summary ("the verify command itself appears incorrect
+because …") so the loop can re-plan it. A clear report reaches the planner
+faster than another round of experiments.
+
 ## When you are done
 
 Finish with a short summary of what you changed, listing the files you

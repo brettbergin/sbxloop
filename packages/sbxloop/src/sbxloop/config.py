@@ -276,6 +276,10 @@ class Budgets(_ConfigModel):
     max_tasks: int = 20
     max_wall_clock_s: float = 7200.0
     per_job_timeout_s: float = 1800.0
+    # Per-phase tool-call ceiling (#228): an agent session past this many
+    # tool calls has further calls turned away with a nudge to stop
+    # investigating and report. 0 disables.
+    max_tool_calls_per_phase: int = Field(default=40, ge=0)
 
 
 BacklogMode = Literal["off", "github", "inbox"]
