@@ -1601,6 +1601,7 @@ max_replans_per_task = 1
 max_tasks = 20
 max_wall_clock_s = 7200.0
 per_job_timeout_s = 1800.0
+max_tool_calls_per_phase = 40   # 0 = unbounded; past it the agent is told to wrap up
 
 [limits]
 # Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on

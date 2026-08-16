@@ -239,6 +239,47 @@ def tool_refusal(error: str | None, output: str | None) -> bool:
     )
 
 
+class ToolCallGovernor:
+    """Per-session tool-call ceiling (#228).
+
+    Field failure re59gj4vq: an executor that had established a fact kept
+    re-establishing it — 30+ near-identical bash calls per phase against a
+    check it could not fix — until the job timeout. Nothing bounded that
+    but ``per_job_timeout_s``. This bounds it: the first ``cap`` calls are
+    approved; every call after that is turned away with a nudge (as the
+    tool's own feedback, so the model reads it in-session) telling it to
+    stop investigating and report what it has. Pure counters, testable
+    without the SDK.
+    """
+
+    def __init__(self, cap: int | None) -> None:
+        self.cap = cap if cap and cap > 0 else None
+        self.calls = 0
+        self.denied = 0
+
+    def decide(self) -> str | None:
+        """None to approve this call; the nudge text to turn it away."""
+        self.calls += 1
+        if self.cap is None or self.calls <= self.cap:
+            return None
+        self.denied += 1
+        return self.nudge()
+
+    @property
+    def tripped(self) -> bool:
+        return self.cap is not None and self.calls > self.cap
+
+    def nudge(self) -> str:
+        assert self.cap is not None
+        return (
+            f"Tool-call ceiling reached: you have made {self.cap} tool calls in this phase "
+            f"and further calls are not executed. Stop investigating now. Summarize what you "
+            f"have established, state plainly anything you could not resolve (for example a "
+            f"verify command that appears incorrect or unrunnable), and finish with your best "
+            f"result in the required output format."
+        )
+
+
 class SessionHealthTracker:
     """Tallies permission denials, validator refusals, and tool-call
     failures for one session.
@@ -290,13 +331,17 @@ class SessionHealthTracker:
             else:
                 self.failures[tool or "(unknown)"] += 1
 
-    def health(self) -> SessionHealth | None:
-        if not self.denials and not self.failures and not self.refusals:
+    def health(self, governor: ToolCallGovernor | None = None) -> SessionHealth | None:
+        calls = governor.calls if governor is not None else 0
+        capped = governor.denied if governor is not None else 0
+        if not self.denials and not self.failures and not self.refusals and not capped:
             return None
         return SessionHealth(
             permission_denials=dict(self.denials),
             tool_failures=dict(self.failures),
             tool_refusals=dict(self.refusals),
+            tool_calls=calls,
+            tool_cap_denials=capped,
         )
 
 
@@ -357,6 +402,7 @@ class CopilotBackend:
 
         usage = Usage()
         tracker = SessionHealthTracker()
+        governor = ToolCallGovernor(job.max_tool_calls)
         final_text: list[str] = []
         # The model slug that is actually answering, for transcript
         # attribution on agent.message events. Seeded from the job request
@@ -433,7 +479,9 @@ class CopilotBackend:
                 emit(EventTypes.AGENT_USAGE, **sample.model_dump(exclude_none=True))
 
         async with CopilotClient() as client:
-            session = await self._open_session(client, job, emit=emit, tracker=tracker)
+            session = await self._open_session(
+                client, job, emit=emit, tracker=tracker, governor=governor
+            )
             try:
                 session.on(on_event)
                 assert job.prompt is not None
@@ -446,7 +494,7 @@ class CopilotBackend:
                     output_json=output_json,
                     session_id=session_id,
                     usage=usage if usage != Usage() else None,
-                    health=tracker.health(),
+                    health=tracker.health(governor),
                 )
             finally:
                 await self._close_session(session)
@@ -458,9 +506,12 @@ class CopilotBackend:
         *,
         emit: EmitFn | None = None,
         tracker: SessionHealthTracker | None = None,
+        governor: ToolCallGovernor | None = None,
     ) -> Any:
         kwargs: dict[str, Any] = {
-            "on_permission_request": self._permission_handler(job, emit=emit, tracker=tracker),
+            "on_permission_request": self._permission_handler(
+                job, emit=emit, tracker=tracker, governor=governor
+            ),
             "streaming": True,
         }
         if job.model and job.model != "auto":
@@ -492,17 +543,50 @@ class CopilotBackend:
         *,
         emit: EmitFn | None = None,
         tracker: SessionHealthTracker | None = None,
+        governor: ToolCallGovernor | None = None,
     ) -> Any:
+        governor = governor or ToolCallGovernor(job.max_tool_calls)
+
+        def capped(request: Any) -> Any:
+            """The ceiling's decision for this call, or None to fall through.
+            Turned-away calls are tallied separately from policy denials so
+            they never read as a degraded session."""
+            nudge = governor.decide()
+            if nudge is None:
+                return None
+            from copilot.rpc import PermissionDecisionReject
+
+            if governor.denied == 1 and emit is not None:
+                emit(
+                    EventTypes.AGENT_TOOL_CAP,
+                    cap=governor.cap,
+                    calls=governor.calls,
+                    tool=getattr(request, "kind", None),
+                )
+            return PermissionDecisionReject(feedback=nudge)
+
         if job.permission_mode == "auto":
             # The microVM (network policy + secret proxy) is the security
-            # boundary; inside it the agent runs unattended.
-            from copilot.session import PermissionHandler
+            # boundary; inside it the agent runs unattended — only the
+            # tool-call ceiling stands between it and a forensic spiral.
+            if governor.cap is None:
+                from copilot.session import PermissionHandler
 
-            return PermissionHandler.approve_all
+                return PermissionHandler.approve_all
+
+            def auto_handler(request: Any, invocation: Any = None) -> Any:
+                from copilot.rpc import PermissionDecisionApproveOnce
+
+                return capped(request) or PermissionDecisionApproveOnce()
+
+            return auto_handler
 
         def read_only_handler(request: Any, invocation: Any = None) -> Any:
             from copilot.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 
+            decision = capped(request)
+            if decision is not None:
+                return decision
             feedback = read_only_denial(request)
             if feedback is not None:
                 # Denials must leave a trace: the session's health tally and

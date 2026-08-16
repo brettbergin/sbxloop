@@ -187,3 +187,91 @@ class TestInstalledSdkPermissionKinds:
         monkeypatch.setitem(sys.modules, "copilot", package)
         monkeypatch.setitem(sys.modules, "copilot.session", session)
         assert installed_sdk_permission_kinds() == frozenset({"shell", "read"})
+
+
+class TestToolCallCeiling:
+    """The per-phase tool-call ceiling (#228): the first ``cap`` calls go
+    through; every later call is turned away with an in-session nudge, in
+    both permission modes, tallied separately from policy denials."""
+
+    def _job(self, mode: str, cap: int | None) -> JobRequest:
+        return JobRequest(
+            job_id="j1",
+            run_id="r1",
+            kind="agent.session",
+            prompt="do",
+            permission_mode=mode,  # type: ignore[arg-type]
+            max_tool_calls=cap,
+        )
+
+    def test_governor_is_pure(self) -> None:
+        from sbxloop_worker.backends.copilot import ToolCallGovernor
+
+        g = ToolCallGovernor(3)
+        assert [g.decide() for _ in range(3)] == [None, None, None]
+        assert not g.tripped
+        nudge = g.decide()
+        assert nudge is not None and "3 tool calls" in nudge and "Stop investigating" in nudge
+        assert g.tripped and g.calls == 4 and g.denied == 1
+        assert ToolCallGovernor(None).decide() is None
+        assert ToolCallGovernor(0).cap is None  # 0 = unbounded
+
+    def test_auto_mode_approves_until_the_cap_then_nudges(self, stub_copilot_rpc: None) -> None:
+        from sbxloop_worker.backends.copilot import SessionHealthTracker, ToolCallGovernor
+        from sbxloop_worker.protocol import Event, EventTypes
+
+        emitted: list[tuple[str, dict[str, object]]] = []
+
+        def emit(type: str, **data: object) -> Event:
+            emitted.append((type, data))
+            return Event.now(type, "r1", job_id="j1", **data)
+
+        tracker = SessionHealthTracker()
+        governor = ToolCallGovernor(2)
+        handler = CopilotBackend()._permission_handler(
+            self._job("auto", 2), emit=emit, tracker=tracker, governor=governor
+        )
+        assert isinstance(handler(SimpleNamespace(kind="shell")), _StubApproveOnce)
+        assert isinstance(handler(SimpleNamespace(kind="write")), _StubApproveOnce)
+        third = handler(SimpleNamespace(kind="shell"))
+        fourth = handler(SimpleNamespace(kind="shell"))
+        assert isinstance(third, _StubReject) and isinstance(fourth, _StubReject)
+        assert third.feedback and "ceiling" in third.feedback.lower()
+        # emitted once, on the first turned-away call
+        caps = [d for t, d in emitted if t == EventTypes.AGENT_TOOL_CAP]
+        assert caps == [{"cap": 2, "calls": 3, "tool": "shell"}]
+        # tallied as ceiling denials, not policy denials — never "degraded"
+        health = tracker.health(governor)
+        assert health is not None
+        assert health.tool_cap_denials == 2 and health.tool_calls == 4
+        assert health.permission_denials == {} and not health.degraded
+        assert "tool-call ceiling hit: 2 call(s) turned away after 2" in health.summary()
+
+    def test_auto_mode_without_cap_keeps_approve_all(self, stub_copilot_rpc: None) -> None:
+        session = types.ModuleType("copilot.session")
+        sentinel = object()
+        session.PermissionHandler = SimpleNamespace(approve_all=sentinel)  # type: ignore[attr-defined]
+        sys.modules["copilot"].session = session  # type: ignore[attr-defined]
+        sys.modules["copilot.session"] = session
+        try:
+            handler = CopilotBackend()._permission_handler(self._job("auto", None))
+            assert handler is sentinel
+        finally:
+            del sys.modules["copilot.session"]
+
+    def test_read_only_mode_caps_before_the_allowlist(self, stub_copilot_rpc: None) -> None:
+        from sbxloop_worker.backends.copilot import SessionHealthTracker, ToolCallGovernor
+
+        tracker = SessionHealthTracker()
+        governor = ToolCallGovernor(1)
+        handler = CopilotBackend()._permission_handler(
+            self._job("read_only", 1), tracker=tracker, governor=governor
+        )
+        assert isinstance(handler(SimpleNamespace(kind="read")), _StubApproveOnce)
+        # past the cap even an allowed kind is turned away, and it is the
+        # ceiling's nudge, not the read-only denial text
+        second = handler(SimpleNamespace(kind="read"))
+        assert isinstance(second, _StubReject) and "ceiling" in (second.feedback or "").lower()
+        health = tracker.health(governor)
+        assert health is not None and health.tool_cap_denials == 1
+        assert health.permission_denials == {}

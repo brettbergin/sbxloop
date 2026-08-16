@@ -135,6 +135,7 @@ class PhaseRunner:
             expect=expect,
             cwd=self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
+            max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
         )
         result = self.agent.submit(job, agent=agent_name)
         if result.status != "ok":
