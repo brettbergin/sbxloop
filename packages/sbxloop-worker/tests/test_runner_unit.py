@@ -114,13 +114,16 @@ class TestRunnerInProcess:
         assert result.error.type == "GithubOpError"  # type: ignore[attr-defined]
 
     def test_heartbeat_thread(self, tmp_path: Path) -> None:
+        # A 1 s job at a 50 ms cadence expects ~20 beats and asserts >= 2:
+        # the old 0.4 s / 100 ms pairing left a 4x margin that a loaded CI
+        # runner ate (one beat observed on py3.14 twice in one day).
         script = tmp_path / "script.json"
-        script.write_text(json.dumps([{"text": "slow", "sleep_s": 0.4}]))
+        script.write_text(json.dumps([{"text": "slow", "sleep_s": 1.0}]))
         import os
 
         os.environ["SBXLOOP_ECHO_SCRIPT"] = str(script)
         try:
-            result, events = run_job(tmp_path, agent_job(), heartbeat=0.1)
+            result, events = run_job(tmp_path, agent_job(), heartbeat=0.05)
         finally:
             del os.environ["SBXLOOP_ECHO_SCRIPT"]
         assert result.status == "ok"  # type: ignore[attr-defined]
