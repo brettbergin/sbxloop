@@ -131,3 +131,54 @@ class TestCloneForRun:
     def test_find_git_missing_binary(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(hostgit.shutil, "which", lambda name: None)
         assert hostgit.find_git() is None
+
+
+def touch(root: Path, *rels: str) -> None:
+    for rel in rels:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+
+
+class TestGitignoredFiles:
+    """Build byproducts a project gitignores (wheels, dist/, generated
+    _version.py) must not reach a delivered PR (#249)."""
+
+    def test_checkout_uses_its_index(self, tmp_path: Path) -> None:
+        root = make_repo(tmp_path)
+        (root / ".gitignore").write_text("dist/\n_vendor/\n_version.py\n")
+        touch(root, "dist/a.whl", "pkg/_vendor/w.whl", "pkg/_version.py", "src/m.py")
+        # A force-added ignored file is tracked, hence a deliverable.
+        git("add", "-f", "pkg/_version.py", cwd=root)
+        assert hostgit.gitignored_files(root) == {"dist/a.whl", "pkg/_vendor/w.whl"}
+
+    def test_plain_tree_honours_in_tree_gitignore(self, tmp_path: Path) -> None:
+        """Harvested copies carry .gitignore but never .git."""
+        root = tmp_path / "harvest"
+        root.mkdir()
+        (root / ".gitignore").write_text("dist/\n")
+        (root / "pkg").mkdir()
+        (root / "pkg" / ".gitignore").write_text("_version.py\n")
+        touch(root, "dist/a.whl", "pkg/_version.py", "pkg/m.py", "_version.py")
+        assert hostgit.gitignored_files(root) == {"dist/a.whl", "pkg/_version.py"}
+
+    def test_broken_dot_git_falls_back_to_plain_probe(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        (root / ".git").mkdir(parents=True)
+        (root / ".git" / "HEAD").write_text("ref\n")
+        (root / ".gitignore").write_text("dist/\n")
+        touch(root, "dist/a.whl", "m.py")
+        assert hostgit.gitignored_files(root) == {"dist/a.whl"}
+
+    def test_parent_checkout_rules_do_not_leak(self, tmp_path: Path) -> None:
+        """A harvest dir under a checkout's .sbxloop/ must not see itself as
+        ignored through the enclosing repo's rules."""
+        outer = make_repo(tmp_path)
+        (outer / ".gitignore").write_text(".sbxloop/\n")
+        root = outer / ".sbxloop" / "runs" / "r1" / "artifacts"
+        touch(root, "app.py", "dist/a.whl")
+        assert hostgit.gitignored_files(root) == frozenset()
+
+    def test_no_git_binary_is_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(hostgit, "find_git", lambda: None)
+        assert hostgit.gitignored_files(tmp_path) is None

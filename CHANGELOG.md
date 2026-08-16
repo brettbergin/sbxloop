@@ -20,6 +20,21 @@ All notable changes to sbxloop are documented here. The project adheres to
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
 
+### Fixed
+
+- Artifact listings, harvest reports and `--deliver` PRs now honour the
+  workspace's own `.gitignore` rules (#249): the name-based
+  `[artifacts] exclude` list cannot know a project's `dist/`, vendored
+  wheels or generated `_version.py` are build byproducts, so any tree after
+  a build/sync delivered them into the PR. Files git would ignore
+  (untracked *and* ignored — force-added tracked files still travel) are
+  dropped and tallied as `gitignored` in the surfaced exclusion note; the
+  probe works on the per-run clone and on harvested copies (which carry
+  `.gitignore` but no `.git`), applies only in-tree `.gitignore` files
+  (never the operator's global excludes or an enclosing checkout's rules),
+  and degrades to the name-based scan when git is unavailable.
+  `[artifacts] exclude` remains the operator override on top.
+
 ## [0.6.0] — 2026-08-15
 
 Rollup release: everything below shipped incrementally as the auto-released

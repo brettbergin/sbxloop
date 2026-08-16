@@ -19,7 +19,10 @@ behind that probe.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import subprocess
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -91,6 +94,68 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
         raise ProvisionError(
             f"cloning workspace {source} into {target} failed: {_describe(exc)}"
         ) from exc
+
+
+def gitignored_files(root: Path) -> frozenset[str] | None:
+    """Relative POSIX paths under ``root`` that the tree's own ``.gitignore``
+    rules ignore, or None when git is unavailable or the probe fails.
+
+    Backs the artifact scan (#249): the name-based exclude list cannot know
+    that *this* project's ``dist/``, ``_vendor/*.whl`` or generated
+    ``_version.py`` are build byproducts, but the project's ``.gitignore``
+    does — and any tree after a build/sync carries them, so without this
+    they land in the delivered PR.
+
+    Two modes, both ``git ls-files --others --ignored`` (untracked *and*
+    ignored — a force-added tracked file stays a deliverable):
+
+    * ``root`` is itself a checkout (the per-run clone, or an in-place
+      workspace): run in that repo, so the index decides what is tracked.
+    * otherwise (harvested copies never carry ``.git``; plain workspaces):
+      point git at a throwaway empty repo with ``root`` as the work tree,
+      so every file is untracked and only the ignore rules matter.
+
+    Only in-tree ``.gitignore`` files apply (``--exclude-per-directory``,
+    not ``--exclude-standard``): a delivery must not depend on the
+    operator's global excludes file, and the throwaway repo has no
+    ``info/exclude`` anyway. Never searches parent directories — a harvest
+    dir under a checkout's ``.sbxloop/`` would otherwise inherit that
+    checkout's rules and see *itself* as ignored, dropping everything.
+    """
+    git = find_git()
+    if git is None:
+        return None
+    argv = [git, "ls-files", "--others", "--ignored", "--exclude-per-directory=.gitignore", "-z"]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    if (root / ".git").exists():
+        try:
+            return _ls_files(argv, root, env)
+        except (subprocess.CalledProcessError, OSError):
+            # Not a usable repo (a bare `.git` marker, corrupt HEAD, …):
+            # fall through to the self-contained probe.
+            logger.debug("in-place gitignore probe failed in %s", root, exc_info=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="sbxloop-gitignore-") as tmp:
+            subprocess.run(  # nosec B603 - list argv, git binary, no shell
+                [git, "init", "-q", tmp], check=True, capture_output=True, env=env
+            )
+            env["GIT_DIR"] = str(Path(tmp) / ".git")
+            env["GIT_WORK_TREE"] = str(root)
+            return _ls_files(argv, root, env)
+    except (subprocess.CalledProcessError, OSError):
+        logger.warning(
+            "gitignore probe failed in %s; ignore rules not applied", root, exc_info=True
+        )
+        return None
+
+
+def _ls_files(argv: Sequence[str], cwd: Path, env: dict[str, str]) -> frozenset[str]:
+    proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
+        list(argv), cwd=cwd, env=env, check=True, capture_output=True
+    )
+    return frozenset(
+        part.decode("utf-8", "surrogateescape") for part in proc.stdout.split(b"\0") if part
+    )
 
 
 def _describe(exc: Exception) -> str:
