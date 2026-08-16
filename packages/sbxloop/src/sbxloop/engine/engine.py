@@ -246,7 +246,14 @@ class LoopEngine:
             )
         report_wanted = github_cfg.report if report is None else report
         assert run.workspace is not None
-        sandbox = self._provision_github_only(run_id, run.workspace)
+        try:
+            # Provisioning is part of the retry attempt: a missing token or a
+            # sandbox/worker failure must land in `logs` as a failed
+            # `run.deliver` too, not vanish into a raised exception.
+            sandbox = self._provision_github_only(run_id, run.workspace)
+        except SbxloopError as exc:
+            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
+            raise
         try:
             ops = GithubOps(sandbox.client, run_id)
             try:

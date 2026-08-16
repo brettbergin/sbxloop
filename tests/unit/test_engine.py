@@ -1288,6 +1288,26 @@ class TestDeliverCommand:
         assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
         assert harness.sandboxes_left() == []
 
+    def test_provisioning_failure_emits_error_event_and_raises(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A retry that dies before the sandbox is up (missing token, sbx
+        create/policy error, worker install) is still a failed delivery
+        attempt: `logs` must record it, not just the traceback."""
+        from sbxloop.engine.engine import LoopEngine
+        from sbxloop.errors import ProvisionError
+
+        run_id = self.completed_run(harness)
+
+        def fail(self: Any, *args: Any, **kwargs: Any) -> Any:
+            raise ProvisionError("no github token")
+
+        monkeypatch.setattr(LoopEngine, "_provision_github_only", fail)
+        with pytest.raises(ProvisionError, match="no github token"):
+            harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "no github token"}]
+
     def test_report_refreshes_tracking_issue(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
