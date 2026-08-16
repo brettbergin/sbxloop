@@ -6,6 +6,23 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-16
+
+The "run sbxloop on sbxloop" release. Everything a readiness audit
+(2026-08-15) found standing between the daemon and its own repository,
+landed as three reviewed PR stacks (#257–#277) plus the daemon field-test
+fixes: diff-based delivery for git workspaces, `.gitignore`-aware artifact
+scans, a uv-aware Python toolchain with a pinned 3.13 and `git` as baseline
+tooling, per-phase tool-call ceilings, larger-repo budgets, daemon
+guardrails (cancel semantics, gated recovery, persisted breaker,
+comment-lock claims, per-instance sandbox names), operator item controls,
+GC of run directories, a dedicated fetch-refreshed daemon workspace,
+configurable close-on-success, `sbxloop deliver`, structured GitHub error
+status, probes-as-data, an anchored `state_dir`, a tightened fake-sbx drift
+loop, documented prompt contracts, and a Discord-native chronology
+(embeds, batched tools, live status line, tool-burst digests, steer-wait
+surfacing, `sbxloop daemon ctl`).
+
 ### Fixed
 
 - Daemon: an operator `!sbx cancel` is no longer settled as a failed
