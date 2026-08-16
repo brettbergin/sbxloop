@@ -37,7 +37,9 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 __all__ = [
+    "BASELINE_TOOLS",
     "DEFAULT_LANGUAGES",
+    "GIT",
     "TOOLCHAINS",
     "Toolchain",
     "normalize_language",
@@ -477,6 +479,23 @@ TOOLCHAINS: tuple[Toolchain, ...] = (
     RUST,
     DOTNET,
 )
+
+# Baseline agent tooling: provisioned on every agent sandbox regardless of
+# `[sandbox] languages`, and deliberately NOT selectable through it (issue
+# #252). git is the one tool a project's tests or build shell out to no
+# matter which ecosystem it belongs to — sbxloop's own suite does, on a
+# hardcoded PATH — and a template without it fails those tasks on every
+# revision. apt `git` is cheap and comes from the mirrors already in the
+# always-reachable baseline, so it rides the same pooled apt call as the
+# selected languages.
+GIT = Toolchain(
+    name="git",
+    wanted="git",
+    probe="command -v git >/dev/null",
+    apt_packages=("git",),
+)
+
+BASELINE_TOOLS: tuple[Toolchain, ...] = (GIT,)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140

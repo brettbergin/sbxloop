@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 import sbxloop
 from sbxloop.cli.app import app
+from sbxloop.cli.doctor import Check
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
 from sbxloop_worker.protocol import Event as ProtocolEvent
@@ -569,20 +570,60 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "FAIL" in result.output
 
-    def _bake_record(self, workdir: Path, *, worker_version: str, ref: str) -> None:
+    def _bake_record(
+        self, workdir: Path, *, worker_version: str, ref: str, git: bool | None = None
+    ) -> None:
         state = workdir / ".sbxloop"
         state.mkdir(exist_ok=True)
-        (state / "bake.json").write_text(
-            json.dumps(
-                {
-                    "ref": ref,
-                    "worker_version": worker_version,
-                    "python": "/home/agent/.sbxloop/venv/bin/python",
-                    "runtime_cached": True,
-                    "baked_at": 0.0,
-                }
-            )
+        record: dict[str, object] = {
+            "ref": ref,
+            "worker_version": worker_version,
+            "python": "/home/agent/.sbxloop/venv/bin/python",
+            "runtime_cached": True,
+            "baked_at": 0.0,
+        }
+        if git is not None:
+            record["git"] = git
+        (state / "bake.json").write_text(json.dumps(record))
+
+    def _git_row(self, workdir: Path, fake_sbx: FakeSbx, git: bool | None) -> Check:
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        self._bake_record(
+            workdir, worker_version=sbxloop.__version__, ref="sbxloop-baked:latest", git=git
         )
+        checks = collect_checks(
+            {"COPILOT_GITHUB_TOKEN": "tok", "SBXLOOP_SANDBOX__TEMPLATE": "sbxloop-baked:latest"},
+            cli=SbxCLI(binary=str(fake_sbx.binary)),
+        )
+        return {c.name: c for c in checks}["git in template"]
+
+    def test_doctor_git_in_template_ok_when_baked_with_git(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # #252: git is baseline agent tooling; a bake that captured it means
+        # no per-run apt top-up.
+        row = self._git_row(workdir, fake_sbx, git=True)
+        assert row.ok and "git on PATH" in row.detail
+
+    def test_doctor_git_in_template_missing_is_soft_warn(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # Missing git is a warn, not a FAIL: provisioning still probes and
+        # apt-installs it per run, so the run is not lost — only slower.
+        row = self._git_row(workdir, fake_sbx, git=False)
+        assert not row.ok and not row.hard
+        assert "sbxloop bake" in row.detail
+
+    def test_doctor_git_in_template_unrecorded_by_older_bake(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # Records written before the field existed still load; the row says
+        # "not recorded" rather than inventing a verdict.
+        row = self._git_row(workdir, fake_sbx, git=None)
+        assert row.ok and not row.hard
+        assert "not recorded" in row.detail
 
     def test_doctor_template_fresh_and_listed(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

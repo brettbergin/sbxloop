@@ -187,6 +187,23 @@ def collect_checks(
                     hard=False,
                 )
             )
+            # git is baseline agent tooling (#252): a template without it
+            # costs an apt top-up on every provision, and loses git outright
+            # wherever apt is unreachable — worth a row, never a hard fail.
+            if record.git is None:
+                git_detail = (
+                    "not recorded by this bake (older sbxloop) — provisioning probes and "
+                    "installs git per run; re-run `sbxloop bake` to carry it in the template"
+                )
+            elif record.git:
+                git_detail = "git on PATH in the baked template"
+            else:
+                git_detail = (
+                    "git missing from the baked template — provisioning tries an apt "
+                    "install per run; check the apt mirrors are reachable and re-run "
+                    "`sbxloop bake`"
+                )
+            checks.append(Check("git in template", record.git is not False, git_detail, hard=False))
         else:
             checks.append(
                 Check(

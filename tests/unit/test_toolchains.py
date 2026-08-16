@@ -361,3 +361,23 @@ def test_python_entry_matches_the_pre_140_behavior() -> None:
     python = toolchains.resolve(["python"])[0]
     assert python.apt_packages == ("python3-venv", "python3-pip")
     assert "ensurepip" in python.probe
+
+
+def test_git_is_baseline_tooling_not_a_selectable_language() -> None:
+    # #252: git is provisioned on every agent sandbox regardless of
+    # `[sandbox] languages`, so it must not be something an operator can
+    # (or needs to) select — and must not leak into `supported_languages`.
+    assert toolchains.GIT in toolchains.BASELINE_TOOLS
+    assert toolchains.GIT not in toolchains.TOOLCHAINS
+    assert toolchains.normalize_language("git") is None
+    assert "git" not in toolchains.supported_languages()
+
+
+def test_baseline_tools_have_a_probe_and_an_apt_path() -> None:
+    # Baseline tooling rides the pooled apt call; an installer-only entry
+    # here would add a round trip to every provision.
+    for tool in toolchains.BASELINE_TOOLS:
+        assert tool.probe.strip(), tool.name
+        assert tool.apt_packages, tool.name
+        assert tool.install_script is None, tool.name
+    assert "git" in toolchains.apt_packages(toolchains.BASELINE_TOOLS)

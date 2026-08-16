@@ -103,6 +103,12 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+- `git` is now baseline agent tooling, provisioned on every agent sandbox
+  independent of `[sandbox] languages` (#252): the dev-tools ensure probes
+  `command -v git` and installs it in the same pooled apt call as the selected
+  toolchains; a prebaked template that lacks it is topped up from the single
+  prebake probe. `sbxloop bake` records whether git landed and `sbxloop doctor`
+  shows a soft "git in template" row.
 
 - Daemon guardrails now cover recovery, restarts and multi-daemon setups
   (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted
