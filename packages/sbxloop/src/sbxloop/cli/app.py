@@ -1648,6 +1648,9 @@ mem_warn = 90.0
 # thread_per_run = true
 # chronology_level = "normal"      # quiet | normal | verbose
 # max_message_chars = 1900
+# embeds = true                    # headline / finished / status as embed cards
+# status_line = true               # one per-run message edited as tasks progress
+# tool_batch_lines = 8             # consecutive tool calls per code block
 """
 
 
