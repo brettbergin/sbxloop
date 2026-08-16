@@ -409,12 +409,16 @@ class DiscordConfig(_ConfigModel):
     channel_id: int | None = None
     command_prefix: str = "!sbx"
     thread_per_run: bool = True
+    # quiet: lifecycle + links + chat; normal: plus agent messages, with each
+    # burst of tool calls digested into one line edited in place (#235:
+    # streaming every call drowned the channel); verbose: every call.
     chronology_level: ChronologyLevel = "normal"
     # Discord's hard cap is 2000; leave headroom for wrappers.
     max_message_chars: int = Field(default=1900, ge=200, le=2000)
     # Rich output: embed cards for the run headline, finished report and
     # `!sbx status`; a per-run status message edited in place as tasks
-    # progress; consecutive tool calls batched into one code block.
+    # progress; at the verbose level, consecutive tool calls batched into
+    # one code block of at most tool_batch_lines.
     embeds: bool = True
     status_line: bool = True
     tool_batch_lines: int = Field(default=8, ge=1, le=40)

@@ -310,6 +310,19 @@ def _close(chunks: list[list[str]], part: list[str], inside: bool) -> None:
 # -- tool batching --------------------------------------------------------------------------
 
 
+def failure_detail(tool: str, exit_code: int | None, detail: str) -> Chunk:
+    """The block a failed tool call gets to itself: marker line plus the
+    last few output lines, so the ✗ and its explanation sit together."""
+    tail = [ln for ln in str(detail or "").strip().splitlines() if ln.strip()][
+        -TOOL_FAIL_TAIL_LINES:
+    ]
+    head = f"✗ {code(tool)} failed" + (f" (exit {exit_code})" if exit_code is not None else "")
+    if not tail:
+        return block(head)
+    body = "\n".join(_clip(ln.rstrip(), 300).replace("```", "'''") for ln in tail)
+    return block(f"{head}\n```text\n{body}\n```")
+
+
 class ToolBatcher:
     """Collects consecutive tool calls into one fenced block.
 
@@ -360,14 +373,7 @@ class ToolBatcher:
             self._lines[idx] += marker
         elif not self.quiet:
             self._lines.append(f"$ {tool}{marker}")
-        tail = [ln for ln in str(detail or "").strip().splitlines() if ln.strip()][
-            -TOOL_FAIL_TAIL_LINES:
-        ]
-        head = f"✗ {code(tool)} failed" + (f" (exit {exit_code})" if exit_code is not None else "")
-        if not tail:
-            return block(head)
-        body = "\n".join(_clip(ln.rstrip(), 300).replace("```", "'''") for ln in tail)
-        return block(f"{head}\n```text\n{body}\n```")
+        return failure_detail(tool, exit_code, detail)
 
     def flush(self) -> Chunk | None:
         if not self._lines:
@@ -376,6 +382,136 @@ class ToolBatcher:
         self._lines = []
         self._by_call = {}
         return block(f"```text\n{body}\n```", flush=False)
+
+
+# -- tool digest (normal level) -----------------------------------------------------------
+
+# A burst is "repetitive" when its last REPETITION_WINDOW commands share a
+# head token and read as near-copies of one another (mean pairwise
+# similarity >= REPETITION_RATIO). Sized on the field shape: the re59gj4vq
+# spiral was runs of `grep`/`od` variants differing in a flag or a path.
+REPETITION_WINDOW = 6
+REPETITION_RATIO = 0.6
+DIGEST_LAST_CLIP = 100
+
+
+def _head(args: str) -> str:
+    """The command's leading word — what a human would call it ('grep')."""
+    for tok in str(args).split():
+        # `cd x && grep ...` and `FOO=1 grep ...` are still grep calls.
+        if tok in ("cd", "&&", ";", "|", "||") or "=" in tok:
+            continue
+        return tok
+    return ""
+
+
+def repetitive_streak(commands: list[tuple[str, str]], *, window: int = REPETITION_WINDOW) -> int:
+    """How many trailing ``(tool, args)`` calls are near-identical to one
+    another (same tool, same head word, similar text); 0 if fewer than
+    ``window`` are."""
+    if len(commands) < window:
+        return 0
+    from difflib import SequenceMatcher  # local: keep import cost off the hot path
+
+    tool, args = commands[-1]
+    head = (tool, _head(args))
+    n = 0
+    prev: str | None = None
+    for t, a in reversed(commands):
+        if (t, _head(a)) != head:
+            break
+        if prev is not None and SequenceMatcher(None, prev, a).ratio() < REPETITION_RATIO:
+            break
+        prev = a
+        n += 1
+    return n if n >= window else 0
+
+
+class ToolDigest:
+    """One burst of tool activity, summarised into a single line the pump
+    keeps editing in place (#235).
+
+    Field: two threads filled with hundreds of ``⚙ bash …`` lines during
+    an executor forensic spiral, drowning the agent messages, verdicts and
+    links a human reads a channel for. So at the normal level a burst is
+    one message — count, per-tool breakdown, the last command — that grows
+    by edits; failed calls still get their own detail chunk (``add_end``)
+    and a burst is closed by whatever non-tool line comes next. The full
+    stream stays in ``sbxloop logs`` and the verbose level.
+
+    ``repetitive`` flags a trailing run of near-identical commands (an
+    agent re-proving a fact it already has); the rendered line then carries
+    the "may be stuck; cancel to stop" nudge for the human.
+    """
+
+    def __init__(self, *, cancel_hint: str = "!sbx cancel") -> None:
+        self.cancel_hint = cancel_hint
+        self.count = 0
+        self.failed = 0
+        self.by_tool: dict[str, int] = {}
+        self.last: tuple[str, str] | None = None
+        self.commands: list[tuple[str, str]] = []
+        self._dirty = False
+
+    def __len__(self) -> int:
+        return self.count
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    @property
+    def repetitive(self) -> int:
+        return repetitive_streak(self.commands)
+
+    def add_start(self, tool: str, args: str) -> None:
+        self.count += 1
+        self.by_tool[tool] = self.by_tool.get(tool, 0) + 1
+        self.last = (tool, " ".join(str(args or "").split()))
+        # Repetition needs a bounded tail only; the count is what grows.
+        self.commands = [*self.commands[-(REPETITION_WINDOW * 2) :], self.last]
+        self._dirty = True
+
+    def add_end(
+        self,
+        tool: str,
+        *,
+        success: bool | None,
+        exit_code: int | None,
+        detail: str,
+    ) -> Chunk | None:
+        """A failed call is the one thing that stays individual: returns
+        its detail chunk (as the batcher would) and counts it in the line."""
+        if success is not False:
+            return None
+        self.failed += 1
+        self._dirty = True
+        return failure_detail(tool, exit_code, detail)
+
+    def render(self) -> str:
+        self._dirty = False
+        if not self.count:
+            return ""
+        streak = self.repetitive
+        last_tool, last_args = self.last or ("?", "")
+        last = f" — last: {code(_one_line_mid(last_args, DIGEST_LAST_CLIP))}" if last_args else ""
+        if streak and streak == self.count:
+            head = f"⚙ {last_tool} x{streak} similar commands{last}"
+        else:
+            breakdown = ", ".join(
+                f"{tool} x{n}" if n > 1 else tool
+                for tool, n in sorted(self.by_tool.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            noun = "tool call" if self.count == 1 else "tool calls"
+            head = f"⚙ {self.count} {noun} ({breakdown}){last}"
+        if self.failed:
+            head += f" · ✗ {self.failed} failed"
+        if streak:
+            head += (
+                f"\n⚠ the last {streak} {last_tool} calls are near-identical — the agent may be "
+                f"stuck; `{self.cancel_hint}` stops the run"
+            )
+        return head
 
 
 # -- live status line -----------------------------------------------------------------------
@@ -485,8 +621,9 @@ def format_for_discord(
 
     Mirrors ``render_event`` (cli/tui.py) with Discord Markdown. Tool
     events are NOT rendered here — the pump feeds them to a ``ToolBatcher``
-    so consecutive calls collapse into one block; the same goes for the
-    task/phase events the ``StatusLine`` absorbs at the normal level.
+    (verbose: every call, batched into code blocks) or a ``ToolDigest``
+    (normal: one summary line per burst, edited in place); the same goes
+    for the task/phase events the ``StatusLine`` absorbs at the normal level.
     """
     if event.type in _TRANSCRIPT_SKIP:
         return []
@@ -563,6 +700,18 @@ def format_for_discord(
             data.get("message") or data.get("error") or data.get("error_type") or "", 600
         )
         return [block(f"🛑 **worker error:** {msg}")]
+    if t == "agent.tool_cap":
+        # The #228 ceiling tripped: the human should know the agent was
+        # told to wrap up, since the digest line will stop growing.
+        if level == "quiet":
+            return []
+        return [
+            line(
+                f"⛔ tool-call ceiling ({data.get('cap')}) reached — further calls are turned "
+                "away; the agent was told to wrap up and report",
+                flush=True,
+            )
+        ]
     if t == "agent.permission_denied":
         if level == "quiet":
             return []

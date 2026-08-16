@@ -2028,11 +2028,12 @@ mem_warn = 90.0
 # channel_id = 123456789012345678
 # command_prefix = "!sbx"          # !sbx status|pause|resume|cancel|queue
 # thread_per_run = true
-# chronology_level = "normal"      # quiet | normal | verbose
+# chronology_level = "normal"      # quiet (lifecycle+links+chat) | normal (tool bursts
+#                                  # digested into one edited line) | verbose (every call)
 # max_message_chars = 1900
 # embeds = true                    # headline / finished / status as embed cards
 # status_line = true               # one per-run message edited as tasks progress
-# tool_batch_lines = 8             # consecutive tool calls per code block
+# tool_batch_lines = 8             # verbose: consecutive tool calls per code block
 """
 
 

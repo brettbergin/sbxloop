@@ -21,6 +21,18 @@ All notable changes to sbxloop are documented here. The project adheres to
   abandoned item (a human retry resets the attempt budget and skips the
   failure backoff; the daily cap still applies).
 
+### Changed
+
+- Discord `chronology_level = "normal"` no longer streams every tool call
+  (#235): a burst is digested into one line edited in place — count,
+  per-tool breakdown, last command, failure count — closed by the next
+  agent message, phase or task boundary. A trailing run of near-identical
+  commands is collapsed to `⚙ bash x17 similar commands` with a "may be
+  stuck; `!sbx cancel` stops the run" nudge; the `agent.tool_cap` ceiling
+  (#228) is surfaced too. Failed calls keep their own detail block. The
+  previous stream-everything behaviour is `"verbose"`; the full stream stays
+  in `sbxloop logs`.
+
 ### Added
 
 - `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed

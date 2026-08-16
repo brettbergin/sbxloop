@@ -16,6 +16,7 @@ from sbxloop.daemon.discord_format import (
     EmbedSpec,
     StatusLine,
     ToolBatcher,
+    ToolDigest,
     _clip,
     _fence_state,
     daemon_notice,
@@ -26,6 +27,7 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     mask_urls,
     queue_lines,
+    repetitive_streak,
     split_markdown,
     status_embed,
 )
@@ -195,6 +197,12 @@ class TestFormat:
         warn = ev("sandbox.tooling_warning", message="node missing")
         assert texts(format_for_discord(warn)) == ["⚠ tooling: node missing"]
         assert format_for_discord(warn, level="quiet") == []
+        cap = ev("agent.tool_cap", cap=40)
+        assert texts(format_for_discord(cap)) == [
+            "⛔ tool-call ceiling (40) reached — further calls are turned away; the agent was "
+            "told to wrap up and report"
+        ]
+        assert format_for_discord(cap, level="quiet") == []
 
     def test_lifecycle_absorbed_unless_verbose(self) -> None:
         for t, data in (
@@ -209,6 +217,63 @@ class TestFormat:
         assert texts(
             format_for_discord(ev("task.state", task_id="t1", state="done"), level="verbose")
         ) == ["· task t1 → done"]
+
+
+class TestToolDigest:
+    def test_one_line_grows_with_the_burst(self) -> None:
+        d = ToolDigest()
+        assert d.render() == "" and not d.dirty
+        d.add_start("bash", "ls  -la")
+        assert d.dirty
+        assert d.render() == "⚙ 1 tool call (bash) — last: `ls -la`"
+        assert not d.dirty
+        for i in range(20):
+            d.add_start("bash", f"grep -n x file{i}.py")
+        d.add_start("view", "README.md")
+        d.add_start("view", "docs/x.md")
+        d.add_start("bash", ".venv/bin/pytest -q")
+        assert d.render() == ("⚙ 24 tool calls (bash x22, view x2) — last: `.venv/bin/pytest -q`")
+        # a failure counts in the line AND yields its own detail block
+        detail = d.add_end("bash", success=False, exit_code=1, detail="FAILED a\n1 failed")
+        assert detail is not None and detail.text.startswith("✗ `bash` failed (exit 1)")
+        assert d.add_end("bash", success=True, exit_code=0, detail="") is None
+        assert d.render().endswith("`.venv/bin/pytest -q` · ✗ 1 failed")
+
+    def test_backticks_and_long_args_are_tamed(self) -> None:
+        d = ToolDigest()
+        d.add_start("bash", "echo `x` " + "a" * 400)
+        text = d.render()
+        assert "`echo 'x'" in text and len(text) < 200
+
+    def test_repetition_collapses_and_nudges_the_human(self) -> None:
+        d = ToolDigest(cancel_hint="!sbx cancel")
+        for i in range(5):
+            d.add_start("bash", f"grep -F 'exit {i}' /tmp/out | od -c")
+        assert d.repetitive == 0  # below the window
+        d.add_start("bash", "grep -E 'exit 9' /tmp/out | od -c | head")
+        assert d.repetitive == 6
+        assert d.render() == (
+            "⚙ bash x6 similar commands — last: `grep -E 'exit 9' /tmp/out | od -c | head`\n"
+            "⚠ the last 6 bash calls are near-identical — the agent may be stuck; "
+            "`!sbx cancel` stops the run"
+        )
+        # a burst that started differently keeps the full count and adds the warning
+        d2 = ToolDigest()
+        d2.add_start("view", "a.py")
+        d2.add_start("bash", "pytest -q")
+        for i in range(6):
+            d2.add_start("bash", f"grep -n 'exit {i}' /tmp/out")
+        assert d2.render().startswith("⚙ 8 tool calls (bash x7, view) — last:")
+        assert "the last 6 bash calls are near-identical" in d2.render()
+
+    def test_repetitive_streak_needs_same_head_and_similar_text(self) -> None:
+        alternating = [("bash", "grep -n a f"), ("bash", "od -c f")] * 4
+        assert repetitive_streak(alternating) == 0
+        prefixed = [("bash", f"cd /w && LC_ALL=C grep -n 'a{i}' f") for i in range(7)]
+        assert repetitive_streak(prefixed) == 7
+        different_tool = [*prefixed[:-1], ("view", "grep.txt")]
+        assert repetitive_streak(different_tool) == 0
+        assert repetitive_streak(prefixed[:3]) == 0
 
 
 class TestToolBatcher:

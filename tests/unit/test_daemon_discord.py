@@ -213,10 +213,10 @@ class FakeLoop:
 
 
 def make_bridge(
-    tmp_path: Path, *, channel_id: int = 42
+    tmp_path: Path, *, channel_id: int = 42, **discord: Any
 ) -> tuple[DiscordBridge, FakeClient, FakeLoop]:
     config = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": channel_id}}
+        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": channel_id, **discord}}
     )
     dstore = DaemonStore(config.state_dir / "state.db")
     client = FakeClient(channel_id)
@@ -518,8 +518,9 @@ class TestBridge:
         finally:
             bridge.close()
 
-    def test_tool_calls_are_batched_into_one_block(self, tmp_path: Path) -> None:
-        bridge, client, _ = make_bridge(tmp_path)
+    def test_tool_calls_are_batched_into_one_block_when_verbose(self, tmp_path: Path) -> None:
+        # verbose keeps the stream-everything behaviour normal had before #235
+        bridge, client, _ = make_bridge(tmp_path, chronology_level="verbose")
         bridge.start()
         try:
             item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
@@ -548,6 +549,91 @@ class TestBridge:
             assert batch.endswith("```")
             detail = next(s for s in thread.sent if s.startswith("✗ `bash` failed"))
             assert "```text\nFAILED test_x\n1 failed\n```" in detail
+        finally:
+            bridge.close()
+
+    def test_normal_level_digests_tool_bursts_into_one_edited_line(self, tmp_path: Path) -> None:
+        """#235: hundreds of ⚙ lines drowned the human channel. At the
+        normal level a burst is ONE message edited in place; agent
+        messages close it; a failed call keeps its own detail block; the
+        next burst is a fresh message."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit("agent.message", "r1", content="Looking around", agent="executor")
+            for i in range(12):
+                bus.emit(
+                    "agent.tool_start", "r1", tool="bash", args=f"ls {i}", tool_call_id=f"c{i}"
+                )
+                bus.emit("agent.tool_end", "r1", tool="bash", tool_call_id=f"c{i}", success=True)
+            bus.emit("agent.tool_start", "r1", tool="view", args="README.md", tool_call_id="v1")
+            bus.emit("agent.tool_start", "r1", tool="bash", args="pytest -q", tool_call_id="c9")
+            bus.emit(
+                "agent.tool_end",
+                "r1",
+                tool="bash",
+                tool_call_id="c9",
+                success=False,
+                exit_code=1,
+                error="FAILED test_x\n1 failed",
+            )
+            failed = "✗ `bash` failed (exit 1)"
+            assert wait_for(lambda: any(s.startswith(failed) for s in thread.sent))
+            # the burst message went out once, after the agent message it follows
+            digests = [m for m in thread.messages.values() if m.content.startswith("⚙ ")]
+            assert wait_for(lambda: "14 tool calls (bash x13, view)" in digests[0].content, 8)
+            assert len(digests) == 1
+            assert "last: `pytest -q`" in digests[0].content and "✗ 1 failed" in digests[0].content
+            assert sum(1 for s in thread.sent if s.startswith("⚙ ")) == 1
+            assert not any("$ bash" in s for s in thread.sent)  # no streamed tool lines
+            order = [s[:12] for s in thread.sent]
+            first, second, third = (
+                order.index("**executor**"),
+                order.index("⚙ 1 tool cal"),
+                order.index("✗ `bash` fai"),
+            )
+            assert first < second < third
+            # an agent message closes the burst; the next tool call is a new message
+            bus.emit("agent.message", "r1", content="Now fixing", agent="executor")
+            bus.emit("agent.tool_start", "r1", tool="edit", args="x.py", tool_call_id="e1")
+            assert wait_for(lambda: sum(1 for s in thread.sent if s.startswith("⚙ ")) == 2)
+            assert thread.sent[-1] == "⚙ 1 tool call (edit) — last: `x.py`"
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert wait_for(lambda: any(s.startswith("**finished") for s in thread.sent))
+        finally:
+            bridge.close()
+
+    def test_digest_flags_repetitive_burst_and_surfaces_tool_cap(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path, command_prefix="!loop")
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            for i in range(8):
+                bus.emit(
+                    "agent.tool_start",
+                    "r1",
+                    tool="bash",
+                    args=f"grep -n 'exit {i}' /tmp/out.txt | od -c | head",
+                    tool_call_id=f"c{i}",
+                )
+            bus.emit("phase.end", "r1", task_id="t1", phase="execute", status="ok")
+            msgs = thread.messages
+            assert wait_for(
+                lambda: any("bash x8 similar commands" in m.content for m in msgs.values()), 8
+            )
+            digest = next(m for m in thread.messages.values() if m.content.startswith("⚙ "))
+            assert "may be stuck; `!loop cancel` stops the run" in digest.content
+            bus.emit("agent.tool_cap", "r1", cap=40)
+            assert wait_for(lambda: any("⛔ tool-call ceiling (40)" in s for s in thread.sent))
         finally:
             bridge.close()
 

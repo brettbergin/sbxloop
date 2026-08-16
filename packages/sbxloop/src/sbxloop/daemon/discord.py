@@ -43,6 +43,7 @@ from sbxloop.daemon.discord_format import (
     EmbedSpec,
     StatusLine,
     ToolBatcher,
+    ToolDigest,
     _clip,
     _one_line,
     code,
@@ -73,6 +74,9 @@ INSTALL_HINT = (
 COALESCE_MAX_LINES = 10
 COALESCE_WINDOW_S = 2.0
 STATUS_EDIT_MIN_S = 2.0
+# The normal level's tool digest (one line per burst, #235) is edited at
+# most this often; the idle tick lands a deferred edit within COALESCE_WINDOW_S.
+DIGEST_EDIT_MIN_S = 3.0
 
 # Re-exported for callers/tests that import the formatting names from here.
 __all__ = [
@@ -85,6 +89,9 @@ __all__ = [
 
 _TOOL_EVENTS = ("agent.tool_start", "agent.tool_end")
 _STATUS_EVENTS = ("task.start", "task.state", "task.end", "phase.end", "run.end", "run.state")
+# A tool burst ends at a phase/task boundary even when that event renders
+# nothing at the normal level — the next phase's calls start a fresh line.
+_BURST_BOUNDARY = ("phase.end", "task.start", "task.end", "run.end")
 
 
 # -- bridge ---------------------------------------------------------------------------
@@ -142,6 +149,9 @@ class DiscordBridge:
         self._lock = threading.Lock()
         # Per-run rendering state, owned by the pump (discord thread only).
         self._batchers: dict[str, ToolBatcher] = {}
+        self._digests: dict[str, ToolDigest] = {}
+        self._digest_msg: dict[str, Any] = {}  # run_id -> the current burst's message
+        self._digest_last_edit: dict[str, float] = {}
         self._status: dict[str, StatusLine] = {}
         self._status_msg: dict[str, Any] = {}  # run_id -> discord message (cached)
         self._status_task: dict[str, asyncio.Task[None]] = {}
@@ -389,6 +399,8 @@ class DiscordBridge:
             except queue.Empty:
                 if buffer_run:
                     buffer = await self._flush_all(buffer_run, buffer)
+                    # A digest edit deferred by the rate limit lands now.
+                    buffer = await self._digest_tick(buffer_run, buffer)
                 continue
             try:
                 if run_id == "__daemon__":
@@ -407,9 +419,17 @@ class DiscordBridge:
                     await self._resolve_reply(event)
                 if buffer_run not in (None, run_id) and buffer_run:
                     buffer = await self._flush_all(buffer_run, buffer)
+                    buffer = await self._digest_tick(buffer_run, buffer, close=True)
                 buffer_run = run_id
                 chunks = self._render(run_id, event)
                 self._observe_facts(run_id, event)
+                if event.type == "agent.tool_start":
+                    buffer = await self._digest_tick(run_id, buffer)
+                elif event.type == "agent.tool_end":
+                    if chunks:  # a failure detail: the line it belongs to goes first
+                        buffer = await self._digest_tick(run_id, buffer, force=True)
+                elif chunks or event.type in _BURST_BOUNDARY:
+                    buffer = await self._digest_tick(run_id, buffer, close=True)
                 if not chunks:
                     continue
                 buffer.extend(chunks)
@@ -426,19 +446,38 @@ class DiscordBridge:
 
     def _render(self, run_id: str, event: Event) -> list[Chunk]:
         """Chunks for one event, routing tool events through the run's
-        batcher and lifecycle events through its status line."""
+        batcher (verbose/quiet) or digest (normal) and lifecycle events
+        through its status line."""
         level = self.discord.chronology_level
-        batcher = self._batchers.get(run_id)
-        if batcher is None:
-            batcher = self._batchers[run_id] = ToolBatcher(
-                max_lines=self.discord.tool_batch_lines, quiet=(level == "quiet")
-            )
         if self.discord.status_line and event.type in _STATUS_EVENTS:
             status = self._status.setdefault(run_id, StatusLine())
             status.observe(event)
             if status.dirty:
                 self._schedule_status_edit(run_id)
         d = event.data
+        if level == "normal":
+            # Field (#235): streaming every tool line buried the agent
+            # messages and verdicts a human reads the thread for. The
+            # digest folds a burst into one line the pump edits in place;
+            # only failures keep their own detail block.
+            digest = self._digest(run_id)
+            if event.type == "agent.tool_start":
+                digest.add_start(str(d.get("tool") or "?"), str(d.get("args") or ""))
+                return []
+            if event.type == "agent.tool_end":
+                detail = digest.add_end(
+                    str(d.get("tool") or "?"),
+                    success=d.get("success"),
+                    exit_code=d.get("exit_code"),
+                    detail=str(d.get("error") or d.get("output") or ""),
+                )
+                return [detail] if detail else []
+            return format_for_discord(event, level=level, max_chars=self.discord.max_message_chars)
+        batcher = self._batchers.get(run_id)
+        if batcher is None:
+            batcher = self._batchers[run_id] = ToolBatcher(
+                max_lines=self.discord.tool_batch_lines, quiet=(level == "quiet")
+            )
         if event.type == "agent.tool_start":
             batcher.add_start(
                 str(d.get("tool") or "?"), str(d.get("args") or ""), d.get("tool_call_id")
@@ -494,6 +533,52 @@ class DiscordBridge:
             await self._flush(run_id, chunks)
         return []
 
+    # -- tool digest (normal level) -----------------------------------------------------
+
+    def _digest(self, run_id: str) -> ToolDigest:
+        digest = self._digests.get(run_id)
+        if digest is None:
+            digest = self._digests[run_id] = ToolDigest(
+                cancel_hint=f"{self.discord.command_prefix} cancel"
+            )
+        return digest
+
+    async def _digest_tick(
+        self, run_id: str, buffer: list[Chunk], *, force: bool = False, close: bool = False
+    ) -> list[Chunk]:
+        """Bring the burst's summary message up to date: first sighting
+        sends it (after flushing what came before, so the thread stays in
+        order), later sightings edit it at most once per DIGEST_EDIT_MIN_S
+        unless ``force``d. ``close`` ends the burst — final edit, then the
+        next tool call starts a fresh message. Returns the (possibly
+        flushed) buffer."""
+        digest = self._digests.get(run_id)
+        if digest is None or not len(digest):
+            return buffer
+        msg = self._digest_msg.get(run_id)
+        now = asyncio.get_event_loop().time()
+        due = force or close or now - self._digest_last_edit.get(run_id, 0) >= DIGEST_EDIT_MIN_S
+        if digest.dirty and (msg is None or due):
+            text = _clip(digest.render(), self.discord.max_message_chars)
+            try:
+                if msg is None:
+                    buffer = await self._flush_all(run_id, buffer)
+                    thread = await self._ensure_thread(run_id)
+                    if thread is not None:
+                        msg = await self._send(thread, text)
+                        if msg is not None:
+                            self._digest_msg[run_id] = msg
+                else:
+                    await msg.edit(content=text)
+                self._digest_last_edit[run_id] = now
+            except Exception:
+                logger.debug("discord: digest send/edit failed", exc_info=True)
+        if close:
+            self._digests[run_id] = ToolDigest(cancel_hint=digest.cancel_hint)
+            self._digest_msg.pop(run_id, None)
+            self._digest_last_edit.pop(run_id, None)
+        return buffer
+
     async def _flush(self, run_id: str, chunks: list[Chunk]) -> None:
         thread = await self._ensure_thread(run_id)
         if thread is None:
@@ -536,6 +621,7 @@ class DiscordBridge:
         _, item, state, report, unanswered = payload
         run_id = report.run_id
         thread = await self._ensure_thread(run_id)
+        await self._digest_tick(run_id, [], close=True)
         # Final status-line edit, then the report card.
         status = self._status.get(run_id)
         if status is not None:
@@ -563,6 +649,9 @@ class DiscordBridge:
         await self._refresh_headline(run_id, item=item, state=state)
         # Per-run render state is no longer needed.
         self._batchers.pop(run_id, None)
+        self._digests.pop(run_id, None)
+        self._digest_msg.pop(run_id, None)
+        self._digest_last_edit.pop(run_id, None)
         self._status.pop(run_id, None)
         self._status_msg.pop(run_id, None)
         self._status_last_edit.pop(run_id, None)

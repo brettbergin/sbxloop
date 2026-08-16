@@ -314,9 +314,12 @@ card per run in the control channel (source, run id, branch, tracking
 issue, PR, task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
-code-fence boundaries instead of clipped; consecutive tool calls batched
-into one code block with failures marked; one **status line edited in
-place** as tasks progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
+code-fence boundaries instead of clipped; each burst of tool calls
+digested into **one line edited in place** (`⚙ 23 tool calls (bash x21, view x2) — last: pytest -q`, with a "may be stuck" nudge when the last
+calls are near-identical) — failed calls still get their own detail
+block, and `chronology_level = "verbose"` streams every call batched into
+code blocks instead; one **status line edited in place** as tasks
+progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
 and branch as links; verify failures, worker errors, denied permissions and
 refused egress called out; and a finished report card (the headline turns
 ✅/❌/⚠). Mentions are always disabled, so model output can never ping the
