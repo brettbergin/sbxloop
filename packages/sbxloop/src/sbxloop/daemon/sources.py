@@ -408,14 +408,16 @@ class GitHubIssueSource:
                 )
             self._delete_comment_quietly(number, comment_id)
             return False
-        if not self.close_on_success:
-            # A re-triggered issue may still carry the delivered label from a
-            # rejected PR; it is stale the moment a new run is claimed.
-            # Best-effort — a leftover label must not un-claim.
-            self._guard(
-                "clear delivered label",
-                lambda ops: self._remove_label(ops, number, self.labels.delivered),
-            )
+        # A re-triggered issue may still carry the delivered label from a
+        # rejected PR; it is stale the moment a new run is claimed. Cleared
+        # regardless of the current mode: the label was written by whatever
+        # mode was configured *then*, and a daemon restarted with
+        # close_on_success back on would otherwise leave it beside
+        # in-progress. Best-effort — a leftover label must not un-claim.
+        self._guard(
+            "clear delivered label",
+            lambda ops: self._remove_label(ops, number, self.labels.delivered),
+        )
         return True
 
     def _trigger_epoch(self, ops: GithubOps, number: str) -> str:
@@ -485,7 +487,8 @@ class GitHubIssueSource:
             if not self.close_on_success:
                 lines.append(
                     "Leaving this issue open (`close_on_success = false`); close it "
-                    "once the PR is merged or rejected."
+                    f"once the PR is merged, or re-add `{self.labels.trigger}` to "
+                    "run it again if the PR is rejected."
                 )
             self._comment(ops, n, "\n".join(lines))
             self._remove_label(ops, n, self.labels.in_progress)
@@ -570,16 +573,17 @@ class GitHubIssueSource:
     def report_requeued(self, item: WorkItem, by: str) -> None:
         def go(ops: GithubOps) -> None:
             n = item.source_key
-            # in-progress is the claim marker; a re-queued item is claimed
-            # again without a fresh label swap. An abandoned item also
-            # carries the failed label (absent → 404, tolerated).
-            self._add_label(ops, n, self.labels.in_progress)
+            # An abandoned item carries the failed label and a done item
+            # (keep-open mode, in whatever mode wrote it) the delivered
+            # label — both describe the previous run, not the one about to
+            # start (absent → 404, tolerated). Strip them *before* adding
+            # in-progress: `_guard` swallows a failure mid-way, and adding
+            # first would leave the issue wearing two lifecycle labels.
             self._remove_label(ops, n, self.labels.failed)
-            if not self.close_on_success:
-                # A done item re-queued by an operator would otherwise wear
-                # in-progress and delivered at once — the delivered label
-                # describes the previous run, not the one about to start.
-                self._remove_label(ops, n, self.labels.delivered)
+            self._remove_label(ops, n, self.labels.delivered)
+            # in-progress is the claim marker; a re-queued item is claimed
+            # again without a fresh label swap.
+            self._add_label(ops, n, self.labels.in_progress)
             self._comment(ops, n, f"Re-queued by {by}; a fresh run will start shortly.")
 
         self._guard("requeue report", go)

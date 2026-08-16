@@ -234,6 +234,8 @@ class TestGitHubSource:
         assert mutations == [
             ("POST", "/repos/o/r/issues/4/labels"),
             ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun"),
+            # stale-delivered sweep runs last, after the claim is settled
+            ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Adelivered"),
         ]
 
     def test_claim_failure_after_adding_in_progress_rolls_it_back(self) -> None:
@@ -419,19 +421,24 @@ class TestGitHubSource:
         body = ops.comments[-1][1]
         assert "pull/9" in body and "Leaving this issue open" in body
 
-    def test_claim_clears_stale_delivered_label_when_not_closing(self) -> None:
+    def test_claim_clears_stale_delivered_label_in_either_mode(self) -> None:
         """A rejected PR's issue gets re-triggered; the delivered label from
-        the previous run must not survive into the new one."""
-        ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:delivered")})
-        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
-        item = src.poll()[0]
-        assert src.claim(item) is True
-        deletes = [p for m, p, _ in ops.raw_calls if m == "DELETE"]
-        assert "/repos/o/r/issues/4/labels/sbxloop%3Adelivered" in deletes
-        # default (closing) mode never touches the delivered label
-        ops2 = RecordingOps({"4": issue(4, "sbxloop:run")})
-        assert self.make(ops2).claim(item) is True
-        assert not any("delivered" in p for m, p, _ in ops2.raw_calls if m == "DELETE")
+        the previous run must not survive into the new one. The label was
+        written by whatever mode was configured *then*, so a daemon that has
+        since flipped back to closing must clear it too."""
+        for closing in (False, True):
+            ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:delivered")})
+            src = GitHubIssueSource(
+                lambda ops=ops: ops,  # type: ignore[misc]
+                "o/r",
+                LABELS,
+                host="db",
+                close_on_success=closing,
+            )
+            item = src.poll()[0]
+            assert src.claim(item) is True
+            deletes = [p for m, p, _ in ops.raw_calls if m == "DELETE"]
+            assert "/repos/o/r/issues/4/labels/sbxloop%3Adelivered" in deletes, closing
 
     def test_delivery_failure_leaves_open_with_failed_label(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
@@ -506,19 +513,31 @@ class TestGitHubSource:
         assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Afailed", None) in ops.raw_calls
         assert "Re-queued by Discord user `b`" in ops.comments[-1][1]
 
-    def test_requeued_clears_delivered_label_when_not_closing(self) -> None:
-        """An operator re-queue of a done item in keep-open mode must not
-        leave the issue wearing in-progress and delivered together."""
+    def test_requeued_clears_delivered_label_before_claiming(self) -> None:
+        """An operator re-queue of a done item must not leave the issue
+        wearing in-progress and delivered together — in either mode, since
+        the label may have been written under the other one — and the stale
+        labels go first so a swallowed failure cannot leave both behind."""
+        for closing in (False, True):
+            ops = RecordingOps({"4": issue(4, "sbxloop:delivered")})
+            item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+            src = GitHubIssueSource(
+                lambda ops=ops: ops,  # type: ignore[misc]
+                "o/r",
+                LABELS,
+                host="db",
+                close_on_success=closing,
+            )
+            src.report_requeued(item, "b")
+            paths = [(m, p) for m, p, _ in ops.raw_calls if m in {"DELETE", "POST"}]
+            delivered = paths.index(("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Adelivered"))
+            in_progress = paths.index(("POST", "/repos/o/r/issues/4/labels"))
+            assert delivered < in_progress, closing
+        # a failing label removal must not leave in-progress added on top
         ops = RecordingOps({"4": issue(4, "sbxloop:delivered")})
-        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
-        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
+        ops.fail_on = {"DELETE"}
         src.report_requeued(item, "b")
-        deletes = [p for m, p, _ in ops.raw_calls if m == "DELETE"]
-        assert "/repos/o/r/issues/4/labels/sbxloop%3Adelivered" in deletes
-        # default (closing) mode never touches the delivered label
-        ops2 = RecordingOps({"4": issue(4, "sbxloop:delivered")})
-        self.make(ops2).report_requeued(item, "b")
-        assert not any("delivered" in p for m, p, _ in ops2.raw_calls if m == "DELETE")
+        assert not any(m == "POST" for m, _, _ in ops.raw_calls)
 
     def test_reporting_failures_are_swallowed(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
