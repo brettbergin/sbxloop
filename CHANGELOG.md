@@ -118,6 +118,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   `resume` leaves the terminal state before touching the workspace and
   re-checks the marker after — so the workspace is never half-removed and
   unmarked, and never pulled out from under a resume.
+
 - **Daemon workspace posture for unattended runs** (#255). Daemon runs
   against a git-checkout workspace use `clone` isolation by default
   (`[daemon] workspace_isolation`): a dirty tree proceeds from committed

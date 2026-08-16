@@ -348,6 +348,8 @@ class TestResolveDiffBase:
         plain = tmp_path / "plain"
         plain.mkdir()
         assert hostgit.resolve_diff_base(plain, None) is None
+
+
 def make_upstream_and_clone(tmp_path: Path) -> tuple[Path, Path]:
     """A bare 'origin' plus a checkout cloned from it — the daemon's
     dedicated-clone layout — so refresh has a real remote to fetch from."""

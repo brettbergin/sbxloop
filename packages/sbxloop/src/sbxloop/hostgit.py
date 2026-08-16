@@ -348,6 +348,8 @@ def _describe_change(repo_path: Path, path: str, git_status: str) -> WorkspaceCh
         return WorkspaceChange(path=path, status="deleted", mode="")
     executable = bool(full.stat().st_mode & 0o111)
     return WorkspaceChange(path=path, status=status, mode="100755" if executable else "100644")
+
+
 def refresh_from_origin(repo_path: Path) -> RefreshResult:
     """``git fetch`` and fast-forward the checked-out branch to its
     upstream, so an unattended run starts from current ``<remote>/<branch>``
