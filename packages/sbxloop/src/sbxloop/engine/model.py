@@ -141,11 +141,37 @@ class Issue(_Model):
 
 
 class Verdict(_Model):
-    """Critic output: scrutinize uses pass/revise, validate uses accept/reject."""
+    """Critic output: scrutinize uses pass/revise, validate uses accept/reject.
+
+    ``verify_suspect`` is the scrutinizer's ruling on the *check* rather
+    than the work (#231): a verify command can be portable and runnable and
+    still assert the wrong thing (field failure r567rsm4e — an ``od``
+    column layout that never matches). The executor cannot edit verify
+    commands and the mechanical verify phase has no opinion, so the
+    scrutinizer — which sees the failing command next to the passing code
+    — is the only stage placed to say "this check itself is wrong". The
+    engine turns a ``pass`` + ``verify_suspect`` into an immediate replan
+    instead of letting revisions burn against a check no revision can fix.
+    """
 
     verdict: Literal["pass", "revise", "accept", "reject"]
     issues: list[Issue] = Field(default_factory=list)
     feedback: str = ""
+    verify_suspect: bool = False
+    verify_suspect_reason: str = ""
+
+    @model_validator(mode="after")
+    def _check_verify_suspect(self) -> Verdict:
+        # The reason is the whole payload: it is what the planner is told
+        # about why the old check was wrong. A bare flag would spend a
+        # replan on "no reason given", so it is retried like a steer
+        # without guidance.
+        if self.verify_suspect and not self.verify_suspect_reason.strip():
+            raise ValueError(
+                "`verify_suspect: true` requires a non-empty `verify_suspect_reason` "
+                "saying concretely what the check asserts wrongly"
+            )
+        return self
 
 
 SteerAction = Literal["continue", "steer_task", "steer_run"]
@@ -306,7 +332,14 @@ class ArtifactScan:
         return f"{self.excluded_total} file(s) excluded ({', '.join(sorted(self.excluded))})"
 
 
-def scan_artifacts(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES) -> ArtifactScan:
+# Tally key for files dropped by the tree's own .gitignore rules — the one
+# exclusion that is not an entry of the exclude list.
+GITIGNORED = "gitignored"
+
+
+def scan_artifacts(
+    root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES, *, gitignore: bool = True
+) -> ArtifactScan:
     """Regular files under root, sorted for stable output, partitioned into
     kept files and per-entry counts of files whose path contains an excluded
     component (at any depth, so vendored nested .git dirs are caught too).
@@ -314,22 +347,29 @@ def scan_artifacts(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDE
     Entries containing a glob metacharacter match components via fnmatch
     (``*.egg-info`` — dynamically named directories that no exact name can
     cover); the exclusion tally reports the pattern, not each matched name.
+
+    With ``gitignore`` (the default) files the tree's own ``.gitignore``
+    rules ignore are dropped too, tallied under ``GITIGNORED`` — the
+    exclude list is a cross-ecosystem denylist that cannot know a project's
+    ``dist/`` or generated ``_version.py`` are byproducts, but its
+    ``.gitignore`` does (#249). Name-based entries take precedence in the
+    tally; ``exclude`` stays the operator's override on top of both.
     """
-    names = frozenset(entry for entry in exclude if not _is_glob(entry))
-    patterns = [entry for entry in exclude if _is_glob(entry)]
+    candidates = [p for p in sorted(root.rglob("*")) if p.is_file()]
+    ignored: frozenset[str] = frozenset()
+    if gitignore and ((root / ".git").exists() or any(p.name == ".gitignore" for p in candidates)):
+        # Local import: hostgit pulls in GitPython, which this pure model
+        # module must not require at import time.
+        from sbxloop.hostgit import gitignored_files
+
+        ignored = gitignored_files(root) or frozenset()
     files: list[Path] = []
     excluded: dict[str, int] = {}
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        hit = next(
-            (
-                match
-                for part in p.relative_to(root).parts
-                if (match := _exclusion_hit(part, names, patterns)) is not None
-            ),
-            None,
-        )
+    for p in candidates:
+        rel = p.relative_to(root)
+        hit = exclusion_hit(rel.parts, exclude)
+        if hit is None and rel.as_posix() in ignored:
+            hit = GITIGNORED
         if hit is None:
             files.append(p)
         else:
@@ -337,14 +377,23 @@ def scan_artifacts(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDE
     return ArtifactScan(files=files, excluded=excluded)
 
 
+def exclusion_hit(parts: Sequence[str], exclude: Sequence[str]) -> str | None:
+    """The exclude entry (name or glob) matching any component of a relative
+    path, or None when the path is kept. Shared by the workspace scan and
+    the git-diff delivery path so both apply one denylist."""
+    names = frozenset(entry for entry in exclude if not _is_glob(entry))
+    patterns = [entry for entry in exclude if _is_glob(entry)]
+    for part in parts:
+        if part in names:
+            return part
+        pattern = next((p for p in patterns if fnmatch.fnmatch(part, p)), None)
+        if pattern is not None:
+            return pattern
+    return None
+
+
 def _is_glob(entry: str) -> bool:
     return any(ch in entry for ch in "*?[")
-
-
-def _exclusion_hit(part: str, names: frozenset[str], patterns: Sequence[str]) -> str | None:
-    if part in names:
-        return part
-    return next((pattern for pattern in patterns if fnmatch.fnmatch(part, pattern)), None)
 
 
 def artifact_files(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES) -> list[Path]:

@@ -46,6 +46,13 @@ PLAN = {"json": {"steps": ["do the work"], "expected_artifacts": [], "verify_com
 EXECUTE = {"text": "work complete, files changed"}
 PASS = {"json": {"verdict": "pass"}}
 REVISE = {"json": {"verdict": "revise", "feedback": "missed an edge case"}}
+PASS_SUSPECT = {
+    "json": {
+        "verdict": "pass",
+        "verify_suspect": True,
+        "verify_suspect_reason": "greps for an od column layout od never prints",
+    }
+}
 ACCEPT = {"json": {"verdict": "accept"}}
 REJECT = {"json": {"verdict": "reject", "feedback": "criterion 1 unmet"}}
 
@@ -79,7 +86,9 @@ class Harness:
         # Resource guardrails default OFF in the harness: the real worker
         # samples the host filesystem here, so default thresholds would make
         # tests depend on how full the developer's disk is.
-        limits = config_overrides.pop("limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0})
+        limits = config_overrides.pop(
+            "limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0, "mem_abort": 0}
+        )
         config = Config.model_validate(
             {
                 "state_dir": str(self.state_dir),
@@ -282,6 +291,158 @@ class TestReviseAndVerify:
         assert result.state == "failed"
         assert result.tasks[0].state == "failed"
         assert result.tasks[0].revisions == 3
+
+    def test_verify_suspect_after_verify_failure_replans_immediately(
+        self, harness: Harness
+    ) -> None:
+        # Field failure (r567rsm4e, #231): a runnable verify command that
+        # asserts the wrong thing. Once verify has failed and the scrutinizer
+        # passes the work while flagging the check, the replan is spent now
+        # — no further revisions, no second verify run of the wrong check.
+        bad_plan = {
+            "json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": ["exit 1"]}
+        }
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                bad_plan,
+                EXECUTE,
+                PASS,  # verify fails -> revision 1
+                EXECUTE,
+                PASS_SUSPECT,  # work fine, check wrong -> replan now
+                PLAN,  # fresh plan drops the wrong check
+                EXECUTE,
+                PASS,
+                ACCEPT,
+            ]
+        )
+        engine = harness.engine()
+        result = engine.start("wrong check replans early")
+        assert result.state == "completed"
+        assert result.tasks[0].state == "done"
+        assert result.tasks[0].replans == 1
+        phases = [row["phase"] for row in engine.store.phase_attempts(result.run_id)]
+        assert phases.count("verify") == 2  # the wrong check ran once, the fixed one once
+        assert phases.count("execute") == 3  # not the full revision budget
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is True
+        assert "od column layout" in events[0].data["message"]
+
+    def test_verify_suspect_before_verify_ran_is_ignored(self, harness: Harness) -> None:
+        # A speculative flag on a check that has never failed must not cost
+        # a replan on a fine plan: verify runs (and here passes) as usual.
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS_SUSPECT, ACCEPT])
+        result = harness.engine().start("speculative flag")
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 0
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "before it has failed" in events[0].data["message"]
+
+    def test_verify_suspect_evidence_ignores_lookalike_critic_feedback(
+        self, harness: Harness
+    ) -> None:
+        # Provenance comes from the persisted verify attempt, not from the
+        # feedback text: a critic's `revise` that happens to open with the
+        # verify-failure wording must not make a later flag look
+        # verify-triggered when VERIFY has never run.
+        spoof = {
+            "json": {
+                "verdict": "revise",
+                "feedback": "verify command failed: `grep -q x out.txt` (exit 1) -- fix it",
+            }
+        }
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, spoof, EXECUTE, PASS_SUSPECT, ACCEPT])
+        result = harness.engine().start("spoofed evidence")
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 0
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "before it has failed" in events[0].data["message"]
+
+    def test_verify_suspect_with_revise_is_surfaced_not_honored(self, harness: Harness) -> None:
+        # `revise` + verify_suspect: the work is not done either, so the
+        # revision comes first; the ruling is still put in the live stream
+        # rather than swallowed by the revise branch.
+        revise_suspect = {
+            "json": {
+                "verdict": "revise",
+                "feedback": "missing the CLI flag",
+                "verify_suspect": True,
+                "verify_suspect_reason": "asserts a column od never prints",
+            }
+        }
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["exit 1"])),
+                PLAN,
+                EXECUTE,
+                PASS,  # verify fails -> revision 1
+                EXECUTE,
+                revise_suspect,  # revision 2: flag surfaced, revision registered
+                EXECUTE,
+                PASS,  # verify fails -> revision 3
+                EXECUTE,
+                PASS,
+            ]
+        )
+        result = harness.engine(budgets={"max_replans_per_task": 0}).start("revise first")
+        assert result.state == "failed"
+        assert result.tasks[0].replans == 0
+        assert result.tasks[0].revisions == 3
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "revisions first" in events[0].data["message"]
+
+    def test_verify_suspect_without_replan_budget_verifies_anyway(self, harness: Harness) -> None:
+        # No replan budget: the flag is surfaced but the loop stays bounded
+        # by the ordinary revision path.
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["exit 1"])),
+                PLAN,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS_SUSPECT,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS,
+            ]
+        )
+        result = harness.engine(budgets={"max_replans_per_task": 0}).start("no budget")
+        assert result.state == "failed"
+        assert result.tasks[0].replans == 0
+        assert result.tasks[0].revisions == 3
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "no replan budget" in events[0].data["message"]
 
     def test_verify_failure_surfaces_in_event_stream(self, harness: Harness) -> None:
         # Field failure (rv4zfdb1m): the transcript jumped verifying -> failed
@@ -649,6 +810,26 @@ class TestResume:
         assert engine.store.get_run(result.run_id).workspace == clone_dir
         assert (source / "hello.txt").read_text() == "hi\n"
         assert not (source / ".git" / "refs" / "heads" / "sbxloop").exists()
+
+    def test_phase_runner_sees_the_run_workspace(self, harness: Harness) -> None:
+        # #250: the verify-command lint keys on the host workspace (a
+        # `uv.lock` there flips the Python convention), so the runner must
+        # be handed the run's actual workspace path, not left blind.
+        from sbxloop.engine.phases import PhaseRunner
+
+        captured: dict[str, PhaseRunner] = {}
+        original_init = PhaseRunner.__init__
+
+        def spy_init(self: PhaseRunner, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            captured["phases"] = self
+
+        harness.monkeypatch.setattr(PhaseRunner, "__init__", spy_init)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("improve the project")
+        assert result.state == "completed"
+        assert captured["phases"].workspace == result.workspace
+        assert result.workspace is not None
 
     def test_resume_isolated_run_reuses_clone(self, harness: Harness) -> None:
         from tests.unit.test_hostgit import make_repo
@@ -1190,6 +1371,167 @@ class TestDeliverHook:
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
 
 
+class TestDeliverCommand:
+    """`sbxloop deliver <run>` — LoopEngine.deliver: the retry path for a
+    completed run whose end-of-run delivery failed (#223). Runs on a
+    github-only sandbox; deliver_workspace/ensure_repository are patched."""
+
+    def completed_run(self, harness: Harness, **config_overrides: Any) -> str:
+        execute = {"text": "done", "files": {"hello.txt": "hi"}}
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        result = harness.engine(**config_overrides).start("ship it")
+        assert result.state == "completed"
+        harness.events.clear()
+        return result.run_id
+
+    def patch_delivery(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import PrRef
+
+        calls: list[dict[str, Any]] = []
+
+        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
+            calls.append({"repo": repo, **kwargs})
+            return PrRef(number=5, url="https://github.com/o/r/pull/5")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
+        return calls
+
+    def test_delivers_completed_run_from_github_only_sandbox(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The run itself was github-less (no repo → no delivery); the repo
+        # arrives as an override, the way `deliver --repo` passes it.
+        run_id = self.completed_run(harness)
+        calls = self.patch_delivery(monkeypatch)
+        creates_before = len(harness.fake_sbx.invocations("create"))
+
+        pr = harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
+
+        assert pr.number == 5
+        assert len(calls) == 1
+        assert calls[0]["repo"] == "o/r"
+        assert calls[0]["run_id"] == run_id
+        assert calls[0]["outcome"] == "ship it"
+        assert calls[0]["source_dir"].is_dir()
+        # exactly one sandbox — the run's github name — created and torn down
+        creates = harness.fake_sbx.invocations("create")[creates_before:]
+        assert len(creates) == 1
+        assert any(f"sbxloop-{run_id}-github" in arg for arg in creates[0])
+        assert harness.sandboxes_left() == []
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [
+            {"repo": "o/r", "pr": 5, "url": "https://github.com/o/r/pull/5"}
+        ]
+        # persisted under the run, so `logs` and the finish summary see it
+        store = StateStore(harness.state_dir / "state.db")
+        assert [e.type for _s, e in store.events(run_id, type_prefix="run.deliver")] == [
+            HostEventTypes.RUN_DELIVER
+        ]
+
+    def test_uses_persisted_repo_when_no_override(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_id = self.completed_run(harness, github={"repo": "persisted/repo"})
+        calls = self.patch_delivery(monkeypatch)
+        harness.engine().deliver(run_id)
+        assert calls[0]["repo"] == "persisted/repo"
+
+    def test_refuses_run_without_repo(self, harness: Harness) -> None:
+        run_id = self.completed_run(harness)
+        with pytest.raises(StateError, match="no delivery repository"):
+            harness.engine().deliver(run_id)
+        assert harness.sandboxes_left() == []
+
+    def test_refuses_unfinished_run(self, harness: Harness) -> None:
+        engine = harness.engine()
+        engine.store.create_run("r-open", "x", engine.config.model_dump_json())
+        with pytest.raises(StateError, match="only completed runs"):
+            engine.deliver("r-open", github_overrides={"repo": "o/r"})
+
+    def test_failure_emits_error_event_raises_and_tears_down(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.errors import DeliveryError
+
+        run_id = self.completed_run(harness)
+
+        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
+            raise DeliveryError("boom")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
+        with pytest.raises(DeliveryError, match="boom"):
+            harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
+        assert harness.sandboxes_left() == []
+
+    def test_provisioning_failure_emits_error_event_and_raises(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A retry that dies before the sandbox is up (missing token, sbx
+        create/policy error, worker install) is still a failed delivery
+        attempt: `logs` must record it, not just the traceback."""
+        from sbxloop.engine.engine import LoopEngine
+        from sbxloop.errors import ProvisionError
+
+        run_id = self.completed_run(harness)
+
+        def fail(self: Any, *args: Any, **kwargs: Any) -> Any:
+            raise ProvisionError("no github token")
+
+        monkeypatch.setattr(LoopEngine, "_provision_github_only", fail)
+        with pytest.raises(ProvisionError, match="no github token"):
+            harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "no github token"}]
+
+    def test_report_refreshes_tracking_issue(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import IssueRef
+
+        run_id = self.completed_run(harness)
+        self.patch_delivery(monkeypatch)
+
+        class RecordingOps:
+            instances: ClassVar[list[Any]] = []
+
+            def __init__(self, client: Any, run_id: str, **kwargs: Any) -> None:
+                self.comments: list[str] = []
+                self.raw_calls: list[tuple[str, str]] = []
+                type(self).instances.append(self)
+
+            def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
+                return [{"title": f"sbxloop run {run_id}", "number": 9, "html_url": "https://x/9"}]
+
+            def issue_create(self, *a: Any, **k: Any) -> IssueRef:
+                raise AssertionError("existing issue must be reused")
+
+            def issue_comment(self, repo: str, number: int, body: str) -> str:
+                self.comments.append(body)
+                return "https://c"
+
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                self.raw_calls.append((method, path))
+                return {}
+
+        monkeypatch.setattr(engine_mod, "GithubOps", RecordingOps)
+        harness.engine().deliver(run_id, github_overrides={"repo": "o/r"}, report=True)
+
+        (ops,) = RecordingOps.instances
+        assert ops.comments == [f"Run `{run_id}` delivered: PR #5 https://github.com/o/r/pull/5"]
+        assert ("PATCH", "/repos/o/r/issues/9") in ops.raw_calls
+        report_events = [e for e in harness.events if e.type == HostEventTypes.RUN_REPORT]
+        assert [e.data for e in report_events] == [
+            {"repo": "o/r", "issue": 9, "url": "https://x/9"}
+        ]
+
+
 class TestPrebakedTemplate:
     """[sandbox].template + a baked template: install verifies and skips the
     ladder, and the run emits sandbox.prebaked telemetry."""
@@ -1274,6 +1616,23 @@ class TestResourceGuardrail:
         assert result.state == "failed"
         assert [t.state for t in result.tasks] == ["failed"]
         assert "sandbox disk exhausted" in (result.tasks[0].last_feedback or "")
+
+    def test_mem_abort_reason_names_memory(self, harness: Harness) -> None:
+        # #253: /proc/meminfo is Linux-only, so the memory sample is injected
+        # the way _track_resources would record it from a worker event.
+        engine = harness.engine(limits={"disk_warn": 0, "disk_abort": 95.0, "mem_abort": 97.0})
+        engine._last_resources["agent"] = {
+            "level": "abort",
+            "disk_used_pct": 40.0,
+            "mem_used_pct": 98.2,
+        }
+        reason = engine._resource_abort_reason()
+        assert reason is not None
+        assert reason.startswith("sandbox memory exhausted: 98.2%")
+        assert "limits.mem_abort=97.0%" in reason
+        # Disk is named when it is the one that tripped (both crossing).
+        engine._last_resources["agent"]["disk_used_pct"] = 99.0
+        assert (engine._resource_abort_reason() or "").startswith("sandbox disk exhausted")
 
     def test_disk_warn_never_fails_tasks(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])

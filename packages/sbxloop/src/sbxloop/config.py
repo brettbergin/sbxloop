@@ -1,7 +1,16 @@
 """Configuration loading with layered precedence.
 
 Precedence (highest wins): ``SBXLOOP_*`` environment variables >
-``./sbxloop.toml`` > ``pyproject.toml [tool.sbxloop]`` > built-in defaults.
+``./sbxloop.toml`` > ``pyproject.toml [tool.sbxloop]`` >
+``~/.config/sbxloop/sbxloop.toml`` (``$XDG_CONFIG_HOME`` honoured) >
+built-in defaults.
+
+The user-level file is the lowest layer so a project can always override it;
+it exists for settings that follow the operator rather than the checkout
+(``model``, ``app_name``, ``[discord]``). It is located from the *env mapping*
+handed to the loader — never from ``os.environ`` behind the caller's back — so
+hermetic callers (tests, embedders passing ``env={}``) never read the real
+home directory.
 
 Nested keys use ``__`` in environment variables, e.g.
 ``SBXLOOP_BUDGETS__MAX_TASKS=5``. Values are parsed as TOML scalars where
@@ -186,8 +195,11 @@ class ArtifactsConfig(_ConfigModel):
     Generic names that mean build output in one ecosystem and hand-written
     content in another — ``bin``, ``build``, ``dist``, ``out``, ``lib``,
     ``vendor`` — are deliberately *not* excluded; add them here if your
-    project wants them dropped. Exclusions are always counted and surfaced,
-    never silent.
+    project wants them dropped. On top of this list, files the workspace's
+    own ``.gitignore`` rules ignore are dropped too (tallied as
+    ``gitignored``): the project knows its build byproducts better than any
+    generic list can. Exclusions are always counted and surfaced, never
+    silent.
 
     The list covers every supported language regardless of
     ``[sandbox] languages``: that key governs which toolchains are
@@ -247,26 +259,35 @@ class Limits(_ConfigModel):
     Thresholds are percent-used of the workspace filesystem / memory; 0
     disables a guardrail. Crossing a warn threshold emits a prominent
     ``sandbox.resources_warning`` event and escalates the TUI gauge;
-    crossing ``disk_abort`` fails the current task with an explicit
-    "sandbox disk exhausted" error instead of letting in-VM tooling fail
-    confusingly on a full disk.
+    crossing ``disk_abort`` / ``mem_abort`` fails the current task with an
+    explicit "sandbox disk/memory exhausted" error instead of letting in-VM
+    tooling fail confusingly on a full disk or under the OOM killer.
+
+    ``mem_abort`` is off by default (#253): sbxloop cannot size the microVM,
+    and a healthy parallel test run on a large repo legitimately spikes
+    MemAvailable for a heartbeat or two — pressure that resolves itself,
+    unlike a full disk. Opt in when an in-VM OOM has been surfacing as a
+    confusing test failure.
     """
 
     disk_warn: float = 85.0
     disk_abort: float = 95.0
     mem_warn: float = 90.0
+    mem_abort: float = 0.0
 
     @model_validator(mode="after")
     def _check_thresholds(self) -> Limits:
-        for name in ("disk_warn", "disk_abort", "mem_warn"):
+        for name in ("disk_warn", "disk_abort", "mem_warn", "mem_abort"):
             value = getattr(self, name)
             if value < 0 or value > 100:
                 raise ValueError(f"limits.{name} must be a percentage in 0..100, got {value}")
-        if 0 < self.disk_abort <= self.disk_warn:
-            raise ValueError(
-                f"limits.disk_abort ({self.disk_abort}) must be greater than "
-                f"limits.disk_warn ({self.disk_warn})"
-            )
+        for warn, abort in (("disk_warn", "disk_abort"), ("mem_warn", "mem_abort")):
+            warn_value, abort_value = getattr(self, warn), getattr(self, abort)
+            if 0 < abort_value <= warn_value:
+                raise ValueError(
+                    f"limits.{abort} ({abort_value}) must be greater than "
+                    f"limits.{warn} ({warn_value})"
+                )
         return self
 
 
@@ -302,17 +323,52 @@ class DaemonConfig(_ConfigModel):
     inbox ``triage/`` dir) and never run until a human promotes them, unless
     ``backlog_auto_trigger`` is set — a self-feeding queue is the failure
     mode that flag guards.
+
+    ``close_on_success`` / ``tracking_issue`` shape how loudly a delivered
+    run touches the issue tracker. The defaults suit a task queue where the
+    PR is the reviewable object: close the source issue, open a per-run
+    tracking issue. Pointed at a repo whose issues are design/discussion
+    items (sbxloop's own tracker, #251) that auto-closes a design issue the
+    moment a *draft* PR appears and doubles issue volume with self-closing
+    tracking issues — set both to false there: the source issue gets the
+    summary comment plus ``delivered_label`` and stays open for the human
+    who merges the PR.
+
+    Unattended runs need a different workspace posture from a one-shot
+    ``sbxloop run`` (#255). ``workspace_isolation`` replaces the
+    ``[sandbox]`` setting for daemon runs whenever ``[sandbox] workspace``
+    is a git checkout: the default ``clone`` proceeds from committed HEAD
+    with a warning where ``auto`` would refuse a dirty tree — a refusal no
+    human is present to answer, which would otherwise fail every issue
+    while someone has uncommitted work in that checkout. ``refresh_workspace``
+    fetches and fast-forwards the checkout before each fresh run so runs
+    start from current ``origin/<branch>`` rather than a stale local HEAD.
+    ``state_dir`` anchors the daemon's state to an absolute path outside the
+    workspace; unset resolves to ``$XDG_STATE_HOME/sbxloop/<project>``
+    (``~/.local/state/...``) unless the top-level ``state_dir`` was set
+    explicitly or a legacy ``./.sbxloop/state.db`` already exists — see
+    :func:`sbxloop.daemon.paths.resolve_state_dir`.
     """
 
     inbox_dir: str = ".sbxloop/inbox"  # "" disables the inbox source
+    workspace_isolation: WorkspaceIsolation = "clone"
+    refresh_workspace: bool = True
+    state_dir: Path | None = None
     # Must be positive: Event.wait(<= 0) returns immediately and the loop spins.
     poll_interval_s: float = Field(default=60.0, gt=0)
     trigger_label: str = "sbxloop:run"
     in_progress_label: str = "sbxloop:in-progress"
     failed_label: str = "sbxloop:failed"
     backlog_label: str = "sbxloop:backlog"
+    delivered_label: str = "sbxloop:delivered"
+    close_on_success: bool = True
+    tracking_issue: bool = True
     max_runs_per_day: int = 12
     max_attempts_per_item: int = 2
+    # Resumes (after a restart/crash) are not attempts, but each one gets a
+    # fresh engine wall clock; past this many per item the interrupted run is
+    # settled as a failed attempt instead of resumed (#234). 0 = never resume.
+    max_resumes_per_item: int = Field(default=2, ge=0)
     retry_backoff_s: float = 900.0
     max_consecutive_failures: int = 3
     breaker_cooldown_s: float = 3600.0
@@ -325,6 +381,10 @@ class DaemonConfig(_ConfigModel):
     backlog_auto_trigger: bool = False
     # Autonomous PRs arrive as drafts unless the operator says otherwise.
     deliver_draft: bool = True
+    # Retention for runs/<run_id>/ on disk (workspace clone + harvested
+    # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
+    # rows are never removed. See sbxloop.gc for what is exempt.
+    prune_runs_after_days: float = Field(default=14.0, ge=0)
 
     @model_validator(mode="after")
     def _check(self) -> DaemonConfig:
@@ -333,6 +393,7 @@ class DaemonConfig(_ConfigModel):
             self.in_progress_label,
             self.failed_label,
             self.backlog_label,
+            self.delivered_label,
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")
@@ -366,12 +427,16 @@ class DiscordConfig(_ConfigModel):
     channel_id: int | None = None
     command_prefix: str = "!sbx"
     thread_per_run: bool = True
+    # quiet: lifecycle + links + chat; normal: plus agent messages, with each
+    # burst of tool calls digested into one line edited in place (#235:
+    # streaming every call drowned the channel); verbose: every call.
     chronology_level: ChronologyLevel = "normal"
     # Discord's hard cap is 2000; leave headroom for wrappers.
     max_message_chars: int = Field(default=1900, ge=200, le=2000)
     # Rich output: embed cards for the run headline, finished report and
     # `!sbx status`; a per-run status message edited in place as tasks
-    # progress; consecutive tool calls batched into one code block.
+    # progress; at the verbose level, consecutive tool calls batched into
+    # one code block of at most tool_batch_lines.
     embeds: bool = True
     status_line: bool = True
     tool_batch_lines: int = Field(default=8, ge=1, le=40)
@@ -381,6 +446,42 @@ class DiscordConfig(_ConfigModel):
         return self.channel_id is not None
 
 
+USER_CONFIG_SUBPATH = Path("sbxloop") / "sbxloop.toml"
+
+
+def default_state_dir() -> Path:
+    """``~/.sbxloop`` — one per user, wherever the shell happens to stand.
+
+    The default used to be the *relative* ``.sbxloop``, i.e. "cwd at the
+    time": ``sbxloop status`` from another directory showed an empty world,
+    and any command run from inside a checkout dropped a state dir into it
+    (field run ``r5a1d9m9c`` — the isolation probe then refused the next run
+    as dirty). Project-scoped state remains available by setting a relative
+    ``state_dir`` explicitly.
+    """
+    return Path.home() / ".sbxloop"
+
+
+def _home_dir(env: Mapping[str, str]) -> Path:
+    """The home the *loader* should trust: ``env["HOME"]`` when the mapping
+    names one, else the process home. Keeps the default ``state_dir`` and
+    ``~`` expansion consistent with ``user_config_path`` for hermetic
+    callers (``env={"HOME": ...}``), which would otherwise read the user
+    config from the mapped home but resolve state into the real one."""
+    home = env.get("HOME")
+    return Path(home) if home else Path.home()
+
+
+def _expand_home(value: str, home: Path) -> str:
+    """``expanduser`` against an explicit ``home`` (bare ``~`` and ``~/…``
+    only; ``~user`` is left to the field validator)."""
+    if value == "~":
+        return str(home)
+    if value.startswith("~/"):
+        return str(home / value[2:])
+    return value
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # sbx --app-name. Empty (the default) shares the user's normal sbx
@@ -388,7 +489,9 @@ class Config(_ConfigModel):
     # apply directly. Setting a name isolates sbxloop state, but the isolated
     # app-state needs its own `sbx --app-name <name> login` and policy init.
     app_name: str = ""
-    state_dir: Path = Path(".sbxloop")
+    # A relative value is anchored at the config discovery root (the cwd
+    # ``load_config`` was given), not at the process cwd at first use.
+    state_dir: Path = Field(default_factory=default_state_dir)
     keep_sandboxes: bool = False
     # Keep the pair alive only when a run fails, so the evidence (worker
     # stderr, install leftovers, workspace state) survives for
@@ -410,6 +513,13 @@ class Config(_ConfigModel):
     limits: Limits = Field(default_factory=Limits)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
+
+    @field_validator("state_dir", mode="after")
+    @classmethod
+    def _expand_home(cls, value: Path) -> Path:
+        # `state_dir = "~/.sbxloop"` in TOML must mean the home directory,
+        # not a literal "~" directory under the project.
+        return value.expanduser()
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -435,6 +545,25 @@ def _pyproject_layer(cwd: Path) -> dict[str, Any]:
 def _sbxloop_toml_layer(cwd: Path) -> dict[str, Any]:
     path = cwd / "sbxloop.toml"
     if not path.is_file():
+        return {}
+    return _read_toml(path)
+
+
+def user_config_path(env: Mapping[str, str]) -> Path | None:
+    """``$XDG_CONFIG_HOME/sbxloop/sbxloop.toml`` (``~/.config/...`` when
+    unset), or None when ``env`` names neither — the hermetic case."""
+    xdg = env.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / USER_CONFIG_SUBPATH
+    home = env.get("HOME")
+    if home:
+        return Path(home) / ".config" / USER_CONFIG_SUBPATH
+    return None
+
+
+def _user_config_layer(env: Mapping[str, str]) -> dict[str, Any]:
+    path = user_config_path(env)
+    if path is None or not path.is_file():
         return {}
     return _read_toml(path)
 
@@ -515,6 +644,7 @@ def load_config_with_sources(
     env = os.environ if env is None else env
 
     layers: list[tuple[str, dict[str, Any]]] = [
+        ("user config", _user_config_layer(env)),
         ("pyproject.toml", _pyproject_layer(cwd)),
         ("sbxloop.toml", _sbxloop_toml_layer(cwd)),
         ("env", _env_layer(env)),
@@ -527,10 +657,25 @@ def load_config_with_sources(
         for dotted in _flatten(layer):
             sources[dotted] = name
 
+    # Resolve the home-relative parts of ``state_dir`` against the loader's
+    # HOME (not the process environment) before validation, so ``env`` fully
+    # determines where state lands.
+    home = _home_dir(env)
+    if "state_dir" not in merged:
+        merged["state_dir"] = str(home / ".sbxloop")
+    elif isinstance(merged["state_dir"], str):
+        merged["state_dir"] = _expand_home(merged["state_dir"], home)
+
     try:
         config = Config.model_validate(merged)
     except ValidationError as exc:
         raise ConfigError(f"invalid sbxloop configuration: {exc}") from exc
+
+    if not config.state_dir.is_absolute():
+        # An explicit relative state_dir means project-scoped state: pin it
+        # to the directory the config was discovered in so its meaning
+        # cannot drift with a later chdir.
+        config = config.model_copy(update={"state_dir": cwd / config.state_dir})
 
     for dotted in _flatten(config.model_dump()):
         sources.setdefault(dotted, "default")

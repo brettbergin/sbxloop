@@ -7,7 +7,10 @@ Failure semantics:
   skipped and the run continues, finishing ``failed`` if any task failed.
   One exception: revisions exhausted by *verify-command* failures spend a
   replan first when budget remains — the executor cannot edit verify
-  commands, so only a fresh plan can unstick a broken check.
+  commands, so only a fresh plan can unstick a broken check. The faster
+  route out (#231): when the scrutinizer passes the work after a verify
+  failure and flags the *check itself* as wrong (``verify_suspect``), the
+  replan is spent immediately instead of after the revisions burn.
 - Infrastructure errors (worker/sbx crashes) propagate after state is
   persisted — equivalent to a kill. ``resume()`` re-provisions a fresh
   sandbox pair (sandboxes are cattle; the workspace and SQLite state
@@ -36,7 +39,7 @@ from typing import Any, NamedTuple
 
 from pydantic import ValidationError
 
-from sbxloop.config import Config, _flatten, load_config, load_dotenv_file
+from sbxloop.config import Config, GithubConfig, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace, ensure_repository
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
@@ -46,26 +49,32 @@ from sbxloop.engine.model import (
     SteerVerdict,
     TaskRecord,
     TaskState,
+    Verdict,
+    artifacts_dir,
     scan_artifacts,
 )
-from sbxloop.engine.phases import CriticOutcome, PhaseRunner, clip
+from sbxloop.engine.phases import VERIFY_FAILURE_PREFIX, CriticOutcome, PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
+    DeliveryError,
+    RunCancelledError,
     SbxError,
     SbxloopError,
     StateError,
     WorkerError,
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
-from sbxloop.gh.ops import GithubOps
+from sbxloop.gc import workspace_pruned
+from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_message_id, new_run_id
 from sbxloop.policy import EgressGranter
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.provision import Provisioner
-from sbxloop.sbx.sandbox import SBXLOOP_DIR
+from sbxloop.sbx.provision import Provisioner, sandbox_name
+from sbxloop.sbx.prune import remove_run_sandbox_secrets
+from sbxloop.sbx.sandbox import SBXLOOP_DIR, Sandbox
 from sbxloop.worker.client import WorkerClient
 
 logger = logging.getLogger(__name__)
@@ -76,6 +85,34 @@ class ChatMessage(NamedTuple):
 
     message_id: str
     text: str
+
+
+class _GithubOnly:
+    """A lone github-ops sandbox (``sbxloop deliver``) and its worker client.
+
+    Not a :class:`SandboxPair` — there is no agent half — but the teardown
+    is the pair's: stop, rm, and unregister the name-scoped secret, since
+    ``sbx rm`` leaves the registration behind and it would poison the next
+    provision under the same run name (see ``remove_run_sandbox_secrets``).
+    """
+
+    def __init__(self, sandbox: Sandbox, client: WorkerClient, *, keep: bool = False) -> None:
+        self.sandbox = sandbox
+        self.client = client
+        self.keep = keep
+
+    def close(self) -> None:
+        if self.keep:
+            return
+        for step in (
+            self.sandbox.stop,
+            self.sandbox.rm,
+            partial(remove_run_sandbox_secrets, self.sandbox.cli, self.sandbox.name, "github"),
+        ):
+            try:
+                step()
+            except Exception:
+                logger.warning("teardown of %s failed", self.sandbox.name, exc_info=True)
 
 
 class LoopEngine:
@@ -155,9 +192,33 @@ class LoopEngine:
         run = self.store.get_run(run_id)
         if run.state not in RESUMABLE_RUN_STATES:
             raise StateError(f"run {run_id} is {run.state}; only unfinished runs can resume")
+        self._refuse_if_pruned(run_id)
+        if run.state in TERMINAL_RUN_STATES:
+            # A failed run is both terminal (so gc may take it) and resumable.
+            # gc claims a directory only while the run is terminal, in one
+            # write transaction with its marker; leaving the terminal set
+            # BEFORE touching the workspace — and re-checking after — means
+            # whichever of the two committed first wins, and a sweep in
+            # another process can never pull the workspace out from under a
+            # resume that already passed the guard.
+            self.store.set_run_state(run_id, "provisioning")
+            try:
+                self._refuse_if_pruned(run_id)
+            except StateError:
+                self.store.set_run_state(run_id, run.state)
+                raise
         self._rehydrate_config(run_id)
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
         return self._drive(run_id, run.outcome, workspace=run.workspace)
+
+    def _refuse_if_pruned(self, run_id: str) -> None:
+        if workspace_pruned(self.store, run_id):
+            # The workspace pin would be re-created empty and the agent's
+            # prior work is gone; say so rather than resuming into nothing.
+            raise StateError(
+                f"run {run_id}: its workspace was removed by gc (see `sbxloop logs {run_id} "
+                "--type daemon.gc`); it cannot be resumed — start a new run"
+            )
 
     def cancel(self, run_id: str) -> None:
         run = self.store.get_run(run_id)  # raises for unknown runs
@@ -166,6 +227,130 @@ class LoopEngine:
             # (and `status` output); only in-flight runs are cancellable.
             raise StateError(f"run {run_id} is already {run.state}; nothing to cancel")
         self.store.set_run_state(run_id, "cancelled")
+
+    def deliver(
+        self,
+        run_id: str,
+        *,
+        github_overrides: dict[str, Any] | None = None,
+        report: bool | None = None,
+    ) -> PrRef:
+        """Deliver (or re-deliver) a completed run's artifacts as a PR.
+
+        Delivery at run end is a one-shot side effect: when it fails, the
+        work is done, verified, and stranded in the workspace, and
+        ``resume`` refuses completed runs (field failure rgwp5z40x, #223).
+        This is the retry path: a github-ops sandbox alone (no agent, no
+        Copilot token), the run's persisted config (same pinning
+        discipline as resume) with any explicit ``github_overrides`` on
+        top — a run that never had ``[github].repo`` can still be
+        delivered by naming one — and the same ``run.deliver`` events, so
+        ``logs`` and the finish summary see the outcome. Unlike the
+        end-of-run hook, failure raises: the caller asked for exactly this.
+
+        ``report`` (None → the run's ``[github].report``) refreshes the
+        tracking issue with the PR link once delivery succeeds.
+        """
+        run = self.store.get_run(run_id)
+        if run.state != "completed":
+            raise StateError(f"run {run_id} is {run.state}; only completed runs can be delivered")
+        self._rehydrate_config(run_id)
+        github_cfg = self.config.github
+        if github_overrides:
+            # Validate, don't model_copy: an ill-formed --repo must fail here.
+            github_cfg = GithubConfig.model_validate(
+                {**github_cfg.model_dump(), **github_overrides}
+            )
+            self.config = self.config.model_copy(update={"github": github_cfg})
+        repo = github_cfg.repo
+        if not repo:
+            raise StateError(
+                f"run {run_id} has no delivery repository: its config has no "
+                "[github].repo — pass --repo owner/name"
+            )
+        source = artifacts_dir(run, self.config.state_dir)
+        if source is None or not source.is_dir():
+            raise DeliveryError(
+                f"run {run_id} has no artifacts directory to deliver "
+                f"({source or 'no workspace recorded'})"
+            )
+        report_wanted = github_cfg.report if report is None else report
+        assert run.workspace is not None
+        try:
+            # Provisioning is part of the retry attempt: a missing token or a
+            # sandbox/worker failure must land in `logs` as a failed
+            # `run.deliver` too, not vanish into a raised exception.
+            sandbox = self._provision_github_only(run_id, run.workspace)
+        except SbxloopError as exc:
+            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
+            raise
+        try:
+            ops = GithubOps(sandbox.client, run_id)
+            try:
+                created = ensure_repository(
+                    ops, repo, create=github_cfg.create_repo, public=github_cfg.create_public
+                )
+                if created:
+                    self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, created=True)
+                pr = deliver_workspace(
+                    ops,
+                    repo,
+                    run_id=run_id,
+                    outcome=run.outcome,
+                    source_dir=source,
+                    base=github_cfg.deliver_base,
+                    draft=github_cfg.deliver_draft,
+                    exclude=self.config.artifacts.exclude,
+                )
+            except SbxloopError as exc:
+                self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
+                raise
+            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, pr=pr.number, url=pr.url)
+            if report_wanted:
+                hook = GithubReporterHook(ops, repo)
+                hook.open_run(run_id, run.outcome)
+                hook.note_delivery(run_id, pr)
+                if hook.issue is not None:
+                    self.bus.emit(
+                        HostEventTypes.RUN_REPORT,
+                        run_id,
+                        repo=repo,
+                        issue=hook.issue.number,
+                        url=hook.issue.url,
+                    )
+        finally:
+            sandbox.close()
+        return pr
+
+    def _provision_github_only(self, run_id: str, workspace: Path) -> _GithubOnly:
+        """One github-role sandbox under the run's github sandbox name (so
+        `status`/`shell --role github`/`sandbox prune` all recognize it),
+        worker installed, torn down by the returned handle's ``close``."""
+        clients: list[WorkerClient] = []
+
+        def install(created: Sandbox, _role: str) -> None:
+            # Inside ensure_github_only's try: a failed install rolls the
+            # sandbox and its registered secret back, as for the pair.
+            client = WorkerClient(
+                created,
+                self.bus,
+                transport=self.config.worker_transport,
+                python=self.worker_python,
+                role="github",
+                limits=self.config.limits,
+            )
+            if self.install_workers:
+                client.install(extras="", expect_prebaked=bool(self.config.sandbox.template))
+            clients.append(client)
+
+        provisioner = Provisioner(self.sbx, self.config, self.bus)
+        sandbox = provisioner.ensure_github_only(
+            sandbox_name(run_id, "github"), workspace, post_create=install, run_id=run_id
+        )
+        if self.config.keep_sandboxes:
+            # Same marker a kept run gets, so `sandbox prune` respects it.
+            self.store.set_run_kept(run_id, "manual")
+        return _GithubOnly(sandbox, clients[0], keep=self.config.keep_sandboxes)
 
     def request_cancel(self) -> None:
         """Ask a running engine (from another thread) to stop at the next
@@ -303,7 +488,12 @@ class LoopEngine:
                     reporter, detach = self._attach_reporter(github, run_id, outcome)
                     try:
                         phases = PhaseRunner(
-                            agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                            agent,
+                            self.config,
+                            run_id,
+                            outcome,
+                            workdir=pair.agent_workdir,
+                            workspace=pair.workspace,
                         )
                         # Replay persisted chat guidance (steer_run verdicts)
                         # so a resumed run keeps the direction the user set.
@@ -797,11 +987,105 @@ class LoopEngine:
             started_at=started,
         )
         self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
+        if self._replan_suspect_verify(run_id, task, verdict):
+            return
         if verdict.verdict == "revise":
             self._register_revision(run_id, task, verdict.feedback or "scrutiny found issues")
+            return
+        task.last_feedback = ""
+        self._set_task_state(run_id, task, "verifying")
+
+    def _last_verify_failure(self, run_id: str, task: TaskRecord) -> str | None:
+        """The verify feedback that triggered the revision now under review,
+        or None if that revision was not verify-triggered.
+
+        Read from the persisted verify attempt rather than
+        ``task.last_feedback``: feedback text is agent-authored (a critic's
+        ``revise`` may open with anything, including the verify-failure
+        wording), so only the phase ledger can say what actually ran. The
+        attempt numbers line up because verify runs at attempt ``revisions
+        + 1`` and a failure bumps ``revisions`` before the next execute — so
+        the last verify is the trigger iff its attempt equals the current
+        revision count. A replan resets revisions to 0, which no verify
+        attempt can match, so the old plan's failures do not carry over.
+        """
+        row = self.store.latest_phase_attempt(run_id, task.spec.id, "verify")
+        if row is None or row["status"] != "failed" or row["attempt"] != task.revisions:
+            return None
+        try:
+            feedback = json.loads(row["output_json"] or "{}").get("feedback")
+        except ValueError:
+            return None
+        return feedback if isinstance(feedback, str) else None
+
+    def _replan_suspect_verify(self, run_id: str, task: TaskRecord, verdict: Verdict) -> bool:
+        """Spend a replan now when the scrutinizer passed the work but ruled
+        the verify command itself wrong (#231). Returns True if the task was
+        sent back to planning.
+
+        Field failure r567rsm4e: a portable, runnable check asserting an
+        ``od`` column layout that never matches — correct code, wrong check,
+        130+ executor tool calls across revisions before verify exhaustion
+        finally replanned (#94). The scrutinizer is the one stage that sees
+        the failing command next to the passing code, so its ruling is the
+        earliest point the loop can act.
+
+        The ruling is only honored on a ``pass`` — a ``revise`` means the
+        work is not done either, and the executor's fix comes first — and
+        only when backed by evidence: the revision being reviewed was itself
+        triggered by a verify failure (read from the persisted verify
+        attempt, not from feedback text), so a speculative flag on a check
+        that has never run cannot cost a replan on a fine plan; and only
+        within the replan budget, since a task that has no replans left can
+        only fail bounded, not loop. Either way the ruling is put in the
+        live stream: silently ignoring a critic's finding is the
+        transcript-only failure #94 already fixed once.
+        """
+        if not verdict.verify_suspect:
+            return False
+        reason = verdict.verify_suspect_reason
+        failure = self._last_verify_failure(run_id, task)
+        budget = task.replans < self.config.budgets.max_replans_per_task
+        honored = verdict.verdict == "pass" and failure is not None and budget
+        if honored:
+            message = f"scrutinizer passed the work but ruled the verify command wrong: {reason}"
+        elif verdict.verdict != "pass":
+            message = (
+                "scrutinizer flagged the verify command as wrong but asked for "
+                f"revisions first; the work is revised before the check is judged: {reason}"
+            )
+        elif failure is None:
+            message = (
+                "scrutinizer flagged the verify command as wrong before it has "
+                f"failed; ignored until verify runs: {reason}"
+            )
         else:
-            task.last_feedback = ""
-            self._set_task_state(run_id, task, "verifying")
+            message = (
+                "scrutinizer flagged the verify command as wrong but no replan "
+                f"budget remains; verifying anyway: {reason}"
+            )
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="scrutinize",
+            status="verify_suspect",
+            honored=honored,
+            message=message,
+        )
+        if not honored:
+            return False
+        task.replans += 1
+        task.plan = None
+        task.revisions = 0
+        task.last_feedback = (
+            "the reviewer judged the work correct and the verify command itself "
+            f"wrong: {reason}\n\nWrite a plan whose verify_commands check what "
+            "the task actually requires — prefer the project's test runner over "
+            "shell pipelines. The failing check was:\n\n" + (failure or "")
+        )
+        self._set_task_state(run_id, task, "planning")
+        return True
 
     def _phase_verify(
         self,
@@ -833,7 +1117,7 @@ class LoopEngine:
         # Put the failing command in the live stream: without this the
         # transcript jumps verifying -> failed and the reason only exists
         # in the phase_attempts table.
-        failure_count = feedback.count("verify command failed:")
+        failure_count = feedback.count(VERIFY_FAILURE_PREFIX)
         first_line = feedback.splitlines()[0] if feedback else "verify failed"
         self.bus.emit(
             HostEventTypes.PHASE_END,
@@ -1068,21 +1352,31 @@ class LoopEngine:
 
     def _resource_abort_reason(self) -> str | None:
         """Non-None when the agent sandbox's last resource sample crossed
-        the disk_abort threshold (the worker classifies; the level rides on
-        the event)."""
+        an abort threshold (the worker classifies; the level rides on the
+        event). Names the resource that tripped so an OOM-bound task is not
+        diagnosed as a full disk (#253)."""
         sample = self._last_resources.get("agent")
-        if sample and sample.get("level") == "abort":
+        if not sample or sample.get("level") != "abort":
+            return None
+        limits = self.config.limits
+        disk = sample.get("disk_used_pct")
+        if isinstance(disk, (int, float)) and limits.disk_abort > 0 and disk >= limits.disk_abort:
             return (
-                f"sandbox disk exhausted: {sample.get('disk_used_pct')}% of the workspace "
-                f"filesystem is used (limits.disk_abort={self.config.limits.disk_abort}%)"
+                f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
+                f"(limits.disk_abort={limits.disk_abort}%)"
             )
-        return None
+        return (
+            f"sandbox memory exhausted: {sample.get('mem_used_pct')}% of memory is used "
+            f"(limits.mem_abort={limits.mem_abort}%)"
+        )
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
         if self._cancel_event.is_set():
-            raise StateError(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
+            raise RunCancelledError(
+                f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`"
+            )
         if self.store.get_run(run_id).state == "cancelled":
-            raise StateError(f"run {run_id} was cancelled")
+            raise RunCancelledError(f"run {run_id} was cancelled")
         if self.clock() > deadline:
             self._set_run_state(run_id, "failed")
             raise BudgetExceededError(

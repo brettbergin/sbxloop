@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import socket
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -310,6 +311,19 @@ def _close(chunks: list[list[str]], part: list[str], inside: bool) -> None:
 # -- tool batching --------------------------------------------------------------------------
 
 
+def failure_detail(tool: str, exit_code: int | None, detail: str) -> Chunk:
+    """The block a failed tool call gets to itself: marker line plus the
+    last few output lines, so the ✗ and its explanation sit together."""
+    tail = [ln for ln in str(detail or "").strip().splitlines() if ln.strip()][
+        -TOOL_FAIL_TAIL_LINES:
+    ]
+    head = f"✗ {code(tool)} failed" + (f" (exit {exit_code})" if exit_code is not None else "")
+    if not tail:
+        return block(head)
+    body = "\n".join(_clip(ln.rstrip(), 300).replace("```", "'''") for ln in tail)
+    return block(f"{head}\n```text\n{body}\n```")
+
+
 class ToolBatcher:
     """Collects consecutive tool calls into one fenced block.
 
@@ -360,14 +374,7 @@ class ToolBatcher:
             self._lines[idx] += marker
         elif not self.quiet:
             self._lines.append(f"$ {tool}{marker}")
-        tail = [ln for ln in str(detail or "").strip().splitlines() if ln.strip()][
-            -TOOL_FAIL_TAIL_LINES:
-        ]
-        head = f"✗ {code(tool)} failed" + (f" (exit {exit_code})" if exit_code is not None else "")
-        if not tail:
-            return block(head)
-        body = "\n".join(_clip(ln.rstrip(), 300).replace("```", "'''") for ln in tail)
-        return block(f"{head}\n```text\n{body}\n```")
+        return failure_detail(tool, exit_code, detail)
 
     def flush(self) -> Chunk | None:
         if not self._lines:
@@ -376,6 +383,167 @@ class ToolBatcher:
         self._lines = []
         self._by_call = {}
         return block(f"```text\n{body}\n```", flush=False)
+
+
+# -- tool digest (normal level) -----------------------------------------------------------
+
+# A burst is "repetitive" when its trailing commands share a head token and
+# every REPETITION_WINDOW-sized slice of them reads as near-copies of one
+# another (mean adjacent-pair similarity >= REPETITION_RATIO). Sized on the
+# field shape: the re59gj4vq spiral was runs of `grep`/`od` variants
+# differing in a flag or a path.
+REPETITION_WINDOW = 6
+REPETITION_RATIO = 0.6
+DIGEST_LAST_CLIP = 100
+
+
+def _head(args: str) -> str:
+    """The command's leading word — what a human would call it ('grep')."""
+    for tok in str(args).split():
+        # `cd x && grep ...` and `FOO=1 grep ...` are still grep calls.
+        if tok in ("cd", "&&", ";", "|", "||") or "=" in tok:
+            continue
+        return tok
+    return ""
+
+
+class RepetitionDetector:
+    """Trailing-run detector for near-identical commands, fed one call at a
+    time so a burst of any length costs O(window) memory.
+
+    A call extends the current run when it has the same tool and head word
+    as the previous one. The run is *repetitive* once it holds ``window``
+    calls and every trailing ``window``-sized slice of it has a mean
+    adjacent-pair similarity >= ``ratio``; ``streak`` is how many trailing
+    calls satisfy that (0 while it does not). A slice whose mean dips below
+    the threshold ends the streak but not the run — the next qualifying
+    slice starts a fresh ``window``-long streak.
+    """
+
+    def __init__(self, *, window: int = REPETITION_WINDOW, ratio: float = REPETITION_RATIO) -> None:
+        self.window = window
+        self.ratio = ratio
+        self.streak = 0
+        self._head: tuple[str, str] | None = None
+        self._prev: str | None = None
+        self._ratios: deque[float] = deque(maxlen=max(window - 1, 1))
+
+    def add(self, tool: str, args: str) -> int:
+        from difflib import SequenceMatcher  # local: keep import cost off the hot path
+
+        head = (tool, _head(args))
+        if head != self._head:
+            self._head, self._prev, self.streak = head, args, 0
+            self._ratios.clear()
+            return self.streak
+        assert self._prev is not None
+        self._ratios.append(SequenceMatcher(None, self._prev, args).ratio())
+        self._prev = args
+        if len(self._ratios) < self.window - 1:
+            return self.streak  # the run is shorter than a window
+        if sum(self._ratios) / len(self._ratios) >= self.ratio:
+            self.streak = self.streak + 1 if self.streak else self.window
+        else:
+            self.streak = 0
+        return self.streak
+
+
+def repetitive_streak(commands: list[tuple[str, str]], *, window: int = REPETITION_WINDOW) -> int:
+    """How many trailing ``(tool, args)`` calls are near-identical to one
+    another (same tool, same head word, similar text); 0 if fewer than
+    ``window`` are. Batch form of :class:`RepetitionDetector`."""
+    det = RepetitionDetector(window=window)
+    for tool, args in commands:
+        det.add(tool, args)
+    return det.streak
+
+
+class ToolDigest:
+    """One burst of tool activity, summarised into a single line the pump
+    keeps editing in place (#235).
+
+    Field: two threads filled with hundreds of ``⚙ bash …`` lines during
+    an executor forensic spiral, drowning the agent messages, verdicts and
+    links a human reads a channel for. So at the normal level a burst is
+    one message — count, per-tool breakdown, the last command — that grows
+    by edits; failed calls still get their own detail chunk (``add_end``)
+    and a burst is closed by whatever non-tool line comes next. The full
+    stream stays in ``sbxloop logs`` and the verbose level.
+
+    ``repetitive`` flags a trailing run of near-identical commands (an
+    agent re-proving a fact it already has); the rendered line then carries
+    the "may be stuck; cancel to stop" nudge for the human.
+    """
+
+    def __init__(self, *, cancel_hint: str = "!sbx cancel") -> None:
+        self.cancel_hint = cancel_hint
+        self.count = 0
+        self.failed = 0
+        self.by_tool: dict[str, int] = {}
+        self.last: tuple[str, str] | None = None
+        self._repetition = RepetitionDetector()
+        self._dirty = False
+
+    def __len__(self) -> int:
+        return self.count
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    @property
+    def repetitive(self) -> int:
+        return self._repetition.streak
+
+    def add_start(self, tool: str, args: str) -> None:
+        self.count += 1
+        self.by_tool[tool] = self.by_tool.get(tool, 0) + 1
+        self.last = (tool, " ".join(str(args or "").split()))
+        # Fed incrementally so a 200-call spiral still reports a 200-long
+        # streak (a bounded tail would cap it and never collapse the line).
+        self._repetition.add(*self.last)
+        self._dirty = True
+
+    def add_end(
+        self,
+        tool: str,
+        *,
+        success: bool | None,
+        exit_code: int | None,
+        detail: str,
+    ) -> Chunk | None:
+        """A failed call is the one thing that stays individual: returns
+        its detail chunk (as the batcher would) and counts it in the line."""
+        if success is not False:
+            return None
+        self.failed += 1
+        self._dirty = True
+        return failure_detail(tool, exit_code, detail)
+
+    def render(self) -> str:
+        self._dirty = False
+        if not self.count:
+            return ""
+        streak = self.repetitive
+        last_tool, last_args = self.last or ("?", "")
+        last = f" — last: {code(_one_line_mid(last_args, DIGEST_LAST_CLIP))}" if last_args else ""
+        if streak and streak == self.count:
+            head = f"⚙ {last_tool} x{streak} similar commands{last}"
+        else:
+            breakdown = ", ".join(
+                f"{tool} x{n}" if n > 1 else tool
+                for tool, n in sorted(self.by_tool.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            noun = "tool call" if self.count == 1 else "tool calls"
+            head = f"⚙ {self.count} {noun} ({breakdown}){last}"
+        if self.failed:
+            head += f" · ✗ {self.failed} failed"
+        if streak:
+            head += (
+                f"\n⚠ the last {streak} {last_tool} calls are near-identical — the agent may be "
+                f"stuck; `{self.cancel_hint}` stops the run"
+            )
+        return head
 
 
 # -- live status line -----------------------------------------------------------------------
@@ -475,6 +643,104 @@ class StatusLine:
         return head + (f"\n{totals}" if totals else "")
 
 
+# Task states are the engine's phase boundaries; a queued steer is answered
+# when the current one ends, so this is what "how long until my steer lands"
+# is measured against.
+_STATE_PHASE = {
+    "planning": "plan",
+    "executing": "execute",
+    "scrutinizing": "scrutinize",
+    "verifying": "verify",
+    "validating": "validate",
+}
+_PHASE_STATES = frozenset(_STATE_PHASE)
+
+
+class SteerProgress:
+    """Where the agent is *right now*, for the "⏳ queued" note under a steer.
+
+    Field: a steer posted during a 15-minute execute phase looked stuck —
+    the ⏳ reaction says "received", nothing said how long. This tracks the
+    current task, its phase, and the tool calls made since the last
+    checkpoint (plus the #228 ceiling, when configured) so the note can
+    say "mid-**execute** on t2 (12/40 tool calls); answered at the next
+    checkpoint" and the human can decide whether to wait or ``cancel``.
+    """
+
+    def __init__(self, cap: int | None = None) -> None:
+        self.cap = cap or None
+        self.task_id: str | None = None
+        self.title: str | None = None
+        self.phase: str | None = None
+        self.tool_calls = 0
+        self.capped = False
+        self._dirty = False
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def observe(self, event: Event) -> None:
+        d = event.data
+        t = event.type
+        tid = str(d.get("task_id") or "")
+        if t == "task.start" and tid:
+            # The engine emits ``task.state=planning`` (and, on resume, the
+            # persisted phase) *before* ``task.start``, so a start for the
+            # task already being tracked only supplies the title — the
+            # phase and counters observed for it stay put.
+            if tid != self.task_id:
+                self.phase, self.tool_calls, self.capped = None, 0, False
+            self.task_id, self.title = tid, str(d.get("title") or "") or None
+            self._dirty = True
+        elif t == "task.state" and tid and d.get("state") in _PHASE_STATES:
+            # Every state change is a checkpoint: the per-phase job (and its
+            # tool-call ceiling) restarts, so the count restarts with it.
+            self.task_id = tid
+            self.phase = _STATE_PHASE[str(d["state"])]
+            self.tool_calls, self.capped = 0, False
+            self._dirty = True
+        elif t == "task.end" and tid == self.task_id:
+            self.task_id, self.title, self.phase = None, None, None
+            self.tool_calls, self.capped = 0, False
+            self._dirty = True
+        elif t == "agent.tool_start":
+            self.tool_calls += 1
+            self._dirty = True
+        elif t == "agent.tool_cap":
+            self.capped = True
+            if d.get("cap"):
+                self.cap = int(d["cap"])
+            self._dirty = True
+
+    def render(self, *, state: str = "queued") -> str:
+        """``state`` is ``queued`` (waiting for a checkpoint), ``answering``
+        (the engine picked it up), ``answered``, ``failed`` or ``unanswered``
+        (the run ended first)."""
+        self._dirty = False
+        if state == "answering":
+            return "🧭 steer picked up — the agent is answering now"
+        if state == "answered":
+            return "✅ steer answered"
+        if state == "failed":
+            return "⚠ steer failed — see the error below"
+        if state == "unanswered":
+            return "⚠ steer not answered — the run ended first"
+        where = ""
+        if self.task_id and self.phase:
+            where = f" — agent is mid-**{self.phase}** on {code(self.task_id)}"
+        elif self.task_id:
+            where = f" — agent is on {code(self.task_id)}"
+        if where and self.title:
+            where += f" · {_one_line(self.title, 60)}"
+        if where and (self.tool_calls or self.capped):
+            calls = f"{self.tool_calls}/{self.cap}" if self.cap else str(self.tool_calls)
+            tail = " — ceiling reached)" if self.capped else " so far)"
+            noun = "tool call" if self.tool_calls == 1 and not self.cap else "tool calls"
+            where += f" ({calls} {noun}{tail}"
+        return f"⏳ steer queued{where}; answered at the next checkpoint"
+
+
 # -- per-event formatting -----------------------------------------------------------------
 
 
@@ -485,8 +751,9 @@ def format_for_discord(
 
     Mirrors ``render_event`` (cli/tui.py) with Discord Markdown. Tool
     events are NOT rendered here — the pump feeds them to a ``ToolBatcher``
-    so consecutive calls collapse into one block; the same goes for the
-    task/phase events the ``StatusLine`` absorbs at the normal level.
+    (verbose: every call, batched into code blocks) or a ``ToolDigest``
+    (normal: one summary line per burst, edited in place); the same goes
+    for the task/phase events the ``StatusLine`` absorbs at the normal level.
     """
     if event.type in _TRANSCRIPT_SKIP:
         return []
@@ -555,6 +822,13 @@ def format_for_discord(
             return [line(f"✗ **{phase}**{where}" + (f" — {msg}" if msg else ""))]
         if status == "degraded":
             return [line(f"⚠ **{phase} degraded**{where}" + (f" — {msg}" if msg else ""))]
+        if status == "verify_suspect":
+            # A critic ruling the *check* wrong (#231) is a course change a
+            # human steering the run should see: it either spends a replan
+            # or explains why it did not.
+            return [
+                line(f"🔎 **{phase} suspects the check**{where}" + (f" — {msg}" if msg else ""))
+            ]
         if verbose and msg:
             return [line(f"· {phase}{where} — {msg}")]
         return []
@@ -563,6 +837,18 @@ def format_for_discord(
             data.get("message") or data.get("error") or data.get("error_type") or "", 600
         )
         return [block(f"🛑 **worker error:** {msg}")]
+    if t == "agent.tool_cap":
+        # The #228 ceiling tripped: the human should know the agent was
+        # told to wrap up, since the digest line will stop growing.
+        if level == "quiet":
+            return []
+        return [
+            line(
+                f"⛔ tool-call ceiling ({data.get('cap')}) reached — further calls are turned "
+                "away; the agent was told to wrap up and report",
+                flush=True,
+            )
+        ]
     if t == "agent.permission_denied":
         if level == "quiet":
             return []
@@ -653,11 +939,27 @@ def headline_embed(
 
 
 def finish_text(state: str, report: RunReport) -> str:
-    return f"**finished: {state}** — {report.task_summary}"
+    text = f"**finished: {state}** — {report.task_summary}"
+    if report.cancelled_by:
+        text += f" · {_cancel_note(item_id=None, report=report)}"
+    return text
+
+
+def _cancel_note(item_id: str | None, report: RunReport) -> str:
+    """A cancel is not a failure: say who, and that the work is not lost."""
+    note = f"cancelled by {report.cancelled_by}"
+    if report.requeued:
+        return note + " — re-queued; a fresh run starts on the next tick"
+    note += f" — {code(f'sbxloop resume {report.run_id}')} continues the run"
+    if item_id:
+        note += f"; `!sbx retry {item_id}` reruns it fresh"
+    return note
 
 
 def finish_embed(item: WorkItem, report: RunReport, state: str, unanswered: int = 0) -> EmbedSpec:
     fields: list[tuple[str, str, bool]] = []
+    if report.cancelled_by:
+        fields.append(("Cancelled", _cancel_note(item.item_id, report), False))
     if report.tracking_issue:
         fields.append(
             ("Tracking issue", link(f"#{report.tracking_issue[0]}", report.tracking_issue[1]), True)
@@ -684,12 +986,14 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
     cur = status.get("current")
     current = f"{code(cur['run_id'])} — {_one_line(cur.get('title') or '', 120)}" if cur else "idle"
     breaker = "open" if status.get("breaker_open") else "closed"
+    resumes = status.get("resumes_today", 0)
     fields = (
         ("Current", current, False),
         ("Queued", str(status.get("queued", 0)), True),
         (
             "Runs today",
-            f"{status.get('runs_today', 0)}/{status.get('max_runs_per_day', '?')}",
+            f"{status.get('runs_today', 0)}/{status.get('max_runs_per_day', '?')}"
+            + (f" ({resumes} resumed)" if resumes else ""),
             True,
         ),
         ("Breaker", breaker, True),
@@ -711,6 +1015,35 @@ def queue_lines(items: list[WorkItem], limit: int = 15) -> str:
         + (link(_one_line(i.title, 80), i.url) if i.url else _one_line(i.title, 80))
         for i in items[:limit]
     ]
+    if len(items) > limit:
+        rows.append(f"… and {len(items) - limit} more")
+    return "\n".join(rows)
+
+
+ITEM_STATE_MARKER = {
+    "queued": "⏳",
+    "running": "▶",
+    "done": "✅",
+    "abandoned": "❌",
+    "failed": "❌",
+}
+
+
+def items_lines(items: list[WorkItem], limit: int = 20) -> str:
+    """One row per work item: state, id, title, attempts, pinned run, last
+    error — what an operator needs to decide between abandon/retry/requeue."""
+    if not items:
+        return "no work items."
+    rows = []
+    for i in items[:limit]:
+        row = f"{ITEM_STATE_MARKER.get(i.state, '•')} {code(i.item_id)} {i.state} · "
+        row += link(_one_line(i.title, 60), i.url) if i.url else _one_line(i.title, 60)
+        row += f" · attempts {i.attempts}"
+        if i.run_id:
+            row += f" · run {code(i.run_id)}"
+        if i.last_error:
+            row += f" · {_one_line(i.last_error, 80)}"
+        rows.append(row)
     if len(items) > limit:
         rows.append(f"… and {len(items) - limit} more")
     return "\n".join(rows)
@@ -742,6 +1075,7 @@ __all__ = [
     "format_for_discord",
     "headline_embed",
     "headline_text",
+    "items_lines",
     "line",
     "link",
     "mask_urls",

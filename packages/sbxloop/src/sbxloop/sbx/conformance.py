@@ -46,6 +46,7 @@ from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.sbx.secretstate import SECRET_EXISTS_MARKERS, parsed_scope
+from sbxloop.toolchains import PYTHON_SERIES
 
 # -- probe ids (importable so provisioning hooks can't typo them) -----------
 
@@ -56,6 +57,7 @@ PROBE_EXEC_ERROR_CHANNEL = "exec-error-channel"
 PROBE_CP_DIR_SEMANTICS = "cp-dir-semantics"
 PROBE_WORKSPACE_MOUNT = "workspace-mount"
 PROBE_PYTHON3_VENV = "python3-venv"
+PROBE_PYTHON_VERSION = "python-version"
 PROBE_PAGE_SIZE = "page-size"
 PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"  # nosec B105 - probe name
 PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"  # nosec B105 - probe name
@@ -211,6 +213,47 @@ def _probe_python3_venv(ctx: ProbeContext) -> tuple[str, str]:
     if result.ok:
         return "available", "python3 -m venv should work first try"
     return "missing", "venv/ensurepip not importable; the install ladder's apt rung is needed"
+
+
+def _probe_python_version(ctx: ProbeContext) -> tuple[str, str]:
+    """The template's own python3 against the series provisioning pins (#250).
+
+    This row reports observed compatibility only. Whether a `python3.13`
+    exists on PATH is a separate guarantee of the Python toolchain, whose
+    probe-first install adds uv and a uv-managed interpreter exactly when
+    they are missing — a template already shipping both skips the download
+    (and that interpreter is then not uv-managed), while a template whose
+    system python3 is newer but lacks the versioned name still gets one.
+    So the detail says what the template's python3 is and what that means
+    for a project pinning the series, without claiming where the versioned
+    interpreter will come from.
+    """
+    assert ctx.sandbox is not None
+    result = ctx.sandbox.exec(["python3", "--version"])
+    text = f"{result.stdout}\n{result.stderr}".strip()
+    match = re.search(r"Python (\d+)\.(\d+)", text)
+    if not result.ok or match is None:
+        return (
+            "no-python3",
+            f"the template ships no working python3; python{PYTHON_SERIES} on PATH "
+            "is the Python toolchain's guarantee, not the template's",
+        )
+    have = (int(match.group(1)), int(match.group(2)))
+    want = tuple(int(part) for part in PYTHON_SERIES.split("."))
+    version = f"{have[0]}.{have[1]}"
+    if have >= want:
+        return (
+            "meets-pin",
+            f"template python3 is {version} (>= {PYTHON_SERIES}); a python{PYTHON_SERIES} "
+            "on PATH is guaranteed separately by the Python toolchain (installed via uv "
+            "only if the template lacks it)",
+        )
+    return (
+        "below-pin",
+        f"template python3 is {version} < {PYTHON_SERIES}: projects pinning "
+        f"`requires-python >= {PYTHON_SERIES}` rely on the python{PYTHON_SERIES} the "
+        "Python toolchain guarantees (installed via uv only if the template lacks it)",
+    )
 
 
 def _probe_page_size(ctx: ProbeContext) -> tuple[str, str]:
@@ -374,6 +417,16 @@ CATALOG: tuple[Probe, ...] = (
         run=_probe_python3_venv,
     ),
     Probe(
+        id=PROBE_PYTHON_VERSION,
+        summary=f"the sandbox template's python3 against the pinned {PYTHON_SERIES} series",
+        tier="sandbox",
+        expected=None,  # the Python toolchain installs the pin through uv either way
+        depends="the Python toolchain's separate python3.13 guarantee (#250): its "
+        "probe-first install adds uv and a uv-managed interpreter only when the "
+        "template lacks them, whatever the template's own python3 reports here",
+        run=_probe_python_version,
+    ),
+    Probe(
         id=PROBE_PAGE_SIZE,
         summary="guest page size vs the Copilot CLI's bundled 4 KiB-page ripgrep",
         tier="sandbox",
@@ -519,6 +572,27 @@ class ConformanceReport:
     @property
     def drifted(self) -> list[ProbeOutcome]:
         return [o for o in self.outcomes if o.drifts]
+
+    @property
+    def unverified(self) -> list[str]:
+        """Why this report cannot vouch for the installed sbx build.
+
+        One line per drifted, errored, or unprobed probe; empty means every
+        catalog entry answered as this codebase expects. This is the
+        ``doctor --fail-on-drift`` gate: CI's e2e lane and the scheduled
+        sbx-release probe fail on it instead of warning, because a warning
+        buried in a workflow log is exactly the signal 0.38's ``ls`` rename
+        and mount change slipped past (#210, #226).
+        """
+        reasons: list[str] = []
+        for outcome in self.outcomes:
+            if outcome.source == "unprobed":
+                reasons.append(f"{outcome.probe.id}: unprobed under sbx {self.version}")
+            elif outcome.is_error:
+                reasons.append(f"{outcome.probe.id}: probe error: {outcome.detail}")
+            else:
+                reasons.extend(f"{outcome.probe.id}: {drift}" for drift in outcome.drifts)
+        return reasons
 
 
 ProgressFn = Callable[[str], None]

@@ -128,6 +128,23 @@ whole run.
 Structured JSON phases are validated against pydantic models with one retry
 that feeds the validation error back to the agent.
 
+### Prompt templates
+
+Each phase's prompt lives in `packages/sbxloop/src/sbxloop/engine/prompts/*.md`
+and is rendered by `sbxloop.engine.prompts.render` as a Python
+`string.Template`: `$name` placeholders are substituted strictly (a missing
+variable raises), braces need no escaping so JSON examples are pasted verbatim,
+and the registry tiers (`$baseline_registries`, `$declarable_registries`) are
+injected from `policy.py` rather than written into the files. The flip side is
+that a bare `$` anywhere else — a shell `$PID` in an example — breaks rendering
+(a literal dollar is `$$`), and `tests/unit/test_prompts.py` pins further
+section-level rules: plan.md's environment opener must stay language-neutral,
+every ecosystem's notes must keep their markers, and the response-format section
+must come last. Each template opens with an HTML comment stating its own
+contract (variables, escaping, which test guards which section); `render` strips
+that header before the prompt reaches the model, so it costs no tokens and
+cannot be mistaken for instructions.
+
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with

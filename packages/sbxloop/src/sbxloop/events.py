@@ -107,6 +107,9 @@ class HostEventTypes:
     CHAT_MESSAGE = "chat.message"
     CHAT_REPLY = "chat.reply"
     CHAT_ACTION = "chat.action"
+    # A gc sweep removed the run's on-disk payload (runs/<run>/); recorded on
+    # the run so `logs` explains the missing directory and `resume` refuses.
+    DAEMON_GC = "daemon.gc"
 
 
 __all__ = ["Event", "EventBus", "Hook", "HostEventTypes", "Subscriber"]

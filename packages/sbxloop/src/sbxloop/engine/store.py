@@ -292,6 +292,17 @@ class StateStore:
         ).fetchone()
         return row["output_json"] if row is not None else None
 
+    def latest_phase_attempt(self, run_id: str, task_id: str, phase: str) -> sqlite3.Row | None:
+        """The task's most recent attempt row of ``phase`` (attempt, status,
+        output_json...), or None if it never ran."""
+        row: sqlite3.Row | None = self._conn.execute(
+            "SELECT * FROM phase_attempts"
+            " WHERE run_id = ? AND task_id = ? AND phase = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (run_id, task_id, phase),
+        ).fetchone()
+        return row
+
     def phase_attempts(self, run_id: str, task_id: str | None = None) -> list[sqlite3.Row]:
         if task_id is None:
             return list(
@@ -326,6 +337,35 @@ class StateStore:
             (event.run_id, event.ts, event.type, event.job_id, json.dumps(event.data)),
         )
         self._conn.commit()
+
+    def append_event_if_state(self, event: Event, states: frozenset[str] | set[str]) -> bool:
+        """Append ``event`` only if the run is currently in one of ``states``,
+        checking and inserting under one write lock.
+
+        This is the gc claim: a sweep in another process must not take a
+        directory that a resume has just moved back into flight, and the
+        resume must not slip in between the sweep's check and its marker.
+        ``BEGIN IMMEDIATE`` holds the database write lock across both, so
+        the state check and the marker are one atomic step against every
+        other writer on the same state DB. Returns whether it was appended.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT state FROM runs WHERE run_id = ?", (event.run_id,)
+            ).fetchone()
+            if row is None or row["state"] not in states:
+                self._conn.rollback()
+                return False
+            self._conn.execute(
+                "INSERT INTO events (run_id, ts, type, job_id, data_json) VALUES (?, ?, ?, ?, ?)",
+                (event.run_id, event.ts, event.type, event.job_id, json.dumps(event.data)),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return True
 
     def events(
         self,

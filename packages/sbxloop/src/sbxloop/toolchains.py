@@ -37,7 +37,9 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 __all__ = [
+    "BASELINE_TOOLS",
     "DEFAULT_LANGUAGES",
+    "GIT",
     "TOOLCHAINS",
     "Toolchain",
     "normalize_language",
@@ -71,15 +73,92 @@ class Toolchain:
     requires: tuple[str, ...] = ()
 
 
+def _arch_dispatch(cases: dict[str, tuple[str, str]]) -> str:
+    """POSIX ``case`` on the Debian arch, setting ``$arch`` and ``$sum``.
+
+    Upstream tarballs are per-architecture and so are their digests, and
+    the fleet is genuinely mixed (Apple-silicon microVMs are arm64, CI
+    runners are amd64). Hardcoding one would work on half the hosts and
+    fail the checksum on the other half, so the arch is resolved in-sandbox
+    and an unrecognized one fails loudly rather than downloading something
+    that cannot run.
+    """
+    branches = " ".join(
+        f"{deb}) arch={upstream}; sum={digest};;" for deb, (upstream, digest) in cases.items()
+    )
+    return (
+        f'case "$(dpkg --print-architecture)" in {branches} '
+        '*) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1;; esac'
+    )
+
+
+# Python was the one entry left on "whatever the template ships" while every
+# other runtime here is pinned (#250): no `uv`, no interpreter version pin,
+# no probe of the version. Modern pyproject-driven projects — sbxloop's own
+# repo included — are uv workspaces declaring `requires-python >= 3.13`, and
+# a distro python3 several minors behind fails them at `uv sync` before any
+# work happens. So: uv from its pinned GitHub release (checksum-verified,
+# same shape as the Node/Go entries — `pip install uv` would need a bootstrap
+# venv first because the system Python is externally managed), and the
+# interpreter series installed *through* uv as a managed Python. Both
+# downloads are GitHub release assets: `github.com` answers with a redirect
+# to `release-assets.githubusercontent.com`, so that host is part of the
+# provision-time allowlist (``provision.AGENT_ALLOW_DOMAINS``). uv 0.12
+# would by default try Astral's own CDN (`releases.astral.sh`) first for
+# the managed interpreter and only fall back to GitHub; the install pins
+# `UV_PYTHON_INSTALL_MIRROR` to the canonical GitHub prefix so provisioning
+# reaches one vendor's hosts rather than needing a second in the baseline.
+UV_VERSION = "0.12.5"
+PYTHON_SERIES = "3.13"
+# The canonical python-build-standalone release prefix, given to uv as its
+# install mirror so the download stays on GitHub hosts (see above).
+UV_PYTHON_INSTALL_MIRROR = "https://github.com/astral-sh/python-build-standalone/releases/download"
+_PYTHON_SERIES_PATTERN = PYTHON_SERIES.replace(".", "\\.")
+_UV_TARBALL = "/tmp/uv.tar.gz"  # nosec B108 - path inside the sandbox VM, not host tmp
+_UV_DIGESTS = {
+    "amd64": (
+        "x86_64-unknown-linux-gnu",
+        "68a509da24b06b4223a1c0175fb5eb5bc79342b76cbeff0cfe51ac3f5b17b6b2",
+    ),
+    "arm64": (
+        "aarch64-unknown-linux-gnu",
+        "9bf43b4d1a07665bf64d4c4e710930b382321a785e0eb10aac07f46471f86a31",
+    ),
+}
+
 PYTHON = Toolchain(
     name="python",
-    wanted="python3, pip, venv",
-    # The historical probe, unchanged: templates ship a system python3 but
-    # Debian/Ubuntu split ensurepip into python3-venv, and it is exactly
+    wanted=f"python3, pip, venv, uv, python{PYTHON_SERIES}",
+    # The historical ensurepip probe stays: templates ship a system python3
+    # but Debian/Ubuntu split ensurepip into python3-venv, and it is exactly
     # that split that made the agent's `python3 -m venv` die with
     # "ensurepip is not available" on every revision (field failure, 0.4.0).
-    probe="python3 -c 'import ensurepip, pip'",
-    apt_packages=("python3-venv", "python3-pip"),
+    # Added to it: uv on PATH and the pinned series answering to its
+    # versioned name — like Node and Go, checking the version rather than
+    # mere presence, so a template with an older python3.x cannot satisfy
+    # the probe and leave the agent with the interpreter #250 says fails.
+    probe=(
+        "python3 -c 'import ensurepip, pip' && command -v uv >/dev/null "
+        f"&& python{PYTHON_SERIES} --version 2>/dev/null "
+        f'| grep -q "^Python {_PYTHON_SERIES_PATTERN}\\."'
+    ),
+    apt_packages=("python3-venv", "python3-pip", "curl", "ca-certificates"),
+    # uv and uvx go straight into /usr/local/bin (no profile edits to
+    # source). The managed interpreter lives under the agent's home so
+    # `uv run`/`uv sync` find it without sudo; its versioned name is linked
+    # onto PATH so `python3.13 -m venv` and the probe work without uv. The
+    # system `python3` is deliberately left alone — the worker runs on it.
+    install_script=(
+        "set -e; " + _arch_dispatch(_UV_DIGESTS) + "; "
+        f'curl -fsSL -o {_UV_TARBALL} "https://github.com/astral-sh/uv/releases/download'
+        f'/{UV_VERSION}/uv-$arch.tar.gz"; '
+        f"printf '%s  {_UV_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+        f"sudo -n tar -xzf {_UV_TARBALL} -C /usr/local/bin --strip-components=1 "
+        '"uv-$arch/uv" "uv-$arch/uvx"; '
+        f"rm -f {_UV_TARBALL}; "
+        f'UV_PYTHON_INSTALL_MIRROR="{UV_PYTHON_INSTALL_MIRROR}" uv python install {PYTHON_SERIES}; '
+        f'sudo -n ln -sf "$(uv python find {PYTHON_SERIES})" /usr/local/bin/python{PYTHON_SERIES}'
+    ),
     aliases=("py", "python3"),
 )
 
@@ -217,25 +296,6 @@ PHP = Toolchain(
         f"rm -f {_COMPOSER_PHAR}"
     ),
 )
-
-
-def _arch_dispatch(cases: dict[str, tuple[str, str]]) -> str:
-    """POSIX ``case`` on the Debian arch, setting ``$arch`` and ``$sum``.
-
-    Upstream tarballs are per-architecture and so are their digests, and
-    the fleet is genuinely mixed (Apple-silicon microVMs are arm64, CI
-    runners are amd64). Hardcoding one would work on half the hosts and
-    fail the checksum on the other half, so the arch is resolved in-sandbox
-    and an unrecognized one fails loudly rather than downloading something
-    that cannot run.
-    """
-    branches = " ".join(
-        f"{deb}) arch={upstream}; sum={digest};;" for deb, (upstream, digest) in cases.items()
-    )
-    return (
-        f'case "$(dpkg --print-architecture)" in {branches} '
-        '*) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1;; esac'
-    )
 
 
 # Debian/Ubuntu stable ship a Node several majors behind current LTS, which
@@ -477,6 +537,23 @@ TOOLCHAINS: tuple[Toolchain, ...] = (
     RUST,
     DOTNET,
 )
+
+# Baseline agent tooling: provisioned on every agent sandbox regardless of
+# `[sandbox] languages`, and deliberately NOT selectable through it (issue
+# #252). git is the one tool a project's tests or build shell out to no
+# matter which ecosystem it belongs to — sbxloop's own suite does, on a
+# hardcoded PATH — and a template without it fails those tasks on every
+# revision. apt `git` is cheap and comes from the mirrors already in the
+# always-reachable baseline, so it rides the same pooled apt call as the
+# selected languages.
+GIT = Toolchain(
+    name="git",
+    wanted="git",
+    probe="command -v git >/dev/null",
+    apt_packages=("git",),
+)
+
+BASELINE_TOOLS: tuple[Toolchain, ...] = (GIT,)
 
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140

@@ -6,7 +6,133 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Daemon: an operator `!sbx cancel` is no longer settled as a failed
+  attempt (field: cancelled from Discord → "failed; 1 attempt(s) left" →
+  re-run fresh after the 15-minute backoff, and counted toward the circuit
+  breaker — #246). The item now settles as **cancelled**: a new terminal
+  work-item state with no automatic retry and no breaker count, reported on
+  the source with attribution ("cancelled by Discord user `x`"; GitHub:
+  comment + in-progress label removed, trigger left for a human), while the
+  run itself stays resumable — the finish card and source comment say
+  `sbxloop resume RUN`. New `!sbx cancel --retry` re-queues the item for a
+  fresh run instead, and `!sbx retry <item>` reruns any cancelled or
+  abandoned item (a human retry resets the attempt budget and skips the
+  failure backoff; the daily cap still applies).
+- Discord bridge with `--once` and other short-lived runs (#236): a run
+  that started and finished before the gateway connected lost its headline
+  and everything after it (the pump only knew the *active* run's item).
+  Events are now buffered per run until the bridge is ready, and `close()`
+  waits (bounded, `DRAIN_WAIT_S`) for the pump to post what is already
+  queued, so a short run's chronology is complete instead of truncated at
+  process exit.
+
+### Changed
+
+- Discord `chronology_level = "normal"` no longer streams every tool call
+  (#235): a burst is digested into one line edited in place — count,
+  per-tool breakdown, last command, failure count — closed by the next
+  agent message, phase or task boundary. A trailing run of near-identical
+  commands is collapsed to `⚙ bash x17 similar commands` with a "may be
+  stuck; `!sbx cancel` stops the run" nudge; the `agent.tool_cap` ceiling
+  (#228) is surfaced too. Failed calls keep their own detail block. The
+  previous stream-everything behaviour is `"verbose"`; the full stream stays
+  in `sbxloop logs`.
+
+### Changed
+
+- `state_dir` now defaults to the per-user `~/.sbxloop` instead of the
+  relative `.sbxloop` (#224). The old default meant "wherever the shell was
+  standing": `sbxloop status`/`logs` showed an empty world from any other
+  directory, and a run started from inside a checkout dropped a state dir into
+  it (field run `r5a1d9m9c`; #218 patched the dirty-probe symptom). A relative
+  `state_dir` remains the explicit opt-in for project-scoped state and is now
+  anchored at the config's directory; `~` expands. **Migration:** an existing
+  `./.sbxloop` keeps working when `state_dir = ".sbxloop"` is set in
+  `sbxloop.toml` (or moved to `~/.sbxloop`); `sbxloop doctor` warns when an
+  unconfigured run finds a legacy `./.sbxloop` it would otherwise ignore.
+
 ### Added
+
+- `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed
+  run's artifacts as a PR without re-running the work. End-of-run delivery
+  was a one-shot side effect with no retry path (field failure `rgwp5z40x`:
+  every task passed, delivery failed on the empty-repo 409, and `resume`
+  refuses completed runs). The command provisions a github-ops sandbox only,
+  reuses the run's persisted config with `--repo`/`--deliver-base`/
+  `--deliver-draft`/`--create-repo` overrides on top, runs the normal
+  `ensure_repository` + `deliver_workspace` path, and emits the usual
+  `run.deliver` events so `logs` and the finish summary see it; `--report`
+  refreshes the run's tracking issue with the PR link. Re-delivering a run
+  whose `sbxloop/<run>` branch already exists (a prior partial attempt)
+  force-updates the branch and reuses an already-open PR for that head
+  instead of failing on the refs POST 422.
+
+- Operator controls for individual daemon work items (#229).
+  `sbxloop daemon items` lists every item with state, attempts, pinned run
+  and last error; `sbxloop daemon abandon <item> [--reason]` gives one up,
+  `sbxloop daemon retry <item>` re-queues an abandoned or cancelled item
+  with attempts reset and a fresh plan (not a resume), `sbxloop daemon requeue <item>` unpins a running item from its run so the next dispatch
+  starts over (attempts kept). Same controls on Discord as
+  `!sbx items|abandon|retry|requeue`. A live daemon
+  honors a CLI abandon/requeue of the item in flight within a second — the
+  run is cancelled, the operator's decision wins over the run's own outcome
+  (no retry, no breaker count), and the source hears `report_abandoned`
+  exactly once. The CLI runs in another process and can only flip the row,
+  so an abandon or retry leaves a durable `pending_report` debt on it: the
+  daemon pays it on its next tick (paused or not) or on the next start —
+  the abandon reaches the issue / inbox file (an unclaimed item loses its
+  trigger label / leaves `pending/`), a retry re-claims (drops the failed
+  label, moves the file out of `failed/`) — exactly once. Recovery also
+  closes the dead run's ledger and removes its sandboxes and secrets, as
+  does an in-process abandon/requeue of an item queued for resume. Item
+  transitions are single conditional statements, so a daemon settling the
+  item concurrently cannot have its verdict overwritten by a stale command. Field origin: a spiraling item (#228) could only be
+  abandoned by poking `DaemonStore` from Python, and recovery would have
+  resumed the doomed plan.
+
+- `sbxloop daemon ctl <status|pause|resume|cancel [--retry]|queue|items|abandon|retry|requeue>`
+  — a local control surface for the running daemon (#232). Requests go
+  through a file queue in the daemon's `state_dir/daemon/ctl/`, served by a
+  daemon thread so `cancel` lands mid-run; a request stamped before the
+  daemon's start (or before recovery finished — the control thread only
+  starts after `recover()`) is refused, one no daemon picks up within `--timeout` is
+  withdrawn, and one the daemon has already taken but not answered is
+  reported as pending — the command still executes. Discord's
+  `!sbx` and `ctl` share one command dispatcher (`sbxloop.daemon.control`),
+  so the two surfaces cannot drift; a ctl cancel/retry is attributed on the
+  source as "`<user>` via sbxloop daemon ctl". The bridge still ignores
+  bot-authored messages by design.
+
+- The scrutinizer now judges the verify commands as well as the work (#231):
+  its prompt carries the exact command list VERIFY will run and the feedback
+  the executor was addressing, and its verdict gains `verify_suspect` /
+  `verify_suspect_reason` (a flag without a reason is rejected and retried).
+  When a revision was triggered by a verify failure (read from the persisted
+  verify attempt, not from feedback text) and the scrutinizer passes the
+  work while ruling the check itself wrong,
+  the engine spends a replan immediately — the planner is told why the old
+  check was wrong — instead of burning the remaining revisions against a
+  check the executor cannot edit (field failure r567rsm4e: a portable,
+  runnable `od | grep` check asserting a column layout `od` never prints).
+  A speculative flag on a check that has not failed yet, or one raised with
+  no replan budget left, is surfaced but not acted on. Every ruling is a
+  `phase.end` event (`status=verify_suspect`, `honored`), shown in the
+  Discord bridge and the transcript.
+
+- `~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) is read as
+  the lowest-precedence config layer, below `pyproject.toml [tool.sbxloop]`,
+  for settings that follow the operator rather than the checkout (`model`,
+  `app_name`, `[discord]`). `sbxloop config show` reports it as
+  `user config`.
+
+- Every engine prompt template (`engine/prompts/*.md`) now opens with an HTML
+  comment stating its contract — `string.Template` syntax, the `$`-escaping
+  rule, the variables it takes, and which test guards which section — and
+  `docs/architecture.md` gains a "Prompt templates" paragraph. `render()`
+  strips the header before the prompt reaches the model, so rendered prompts
+  are byte-identical to before (#225).
 
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
@@ -19,6 +145,174 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+
+- Tighter drift loop around the fake sbx and the GitHub stubs (#226):
+  `sbxloop doctor --fail-on-drift` exits 1 when any conformance probe
+  drifted, errored, or is unprobed for the installed sbx build; the e2e lane
+  uses it instead of a workflow warning, and a new scheduled
+  `sbx-conformance` workflow runs the deep suite against the newest sbx
+  release ahead of adoption with a rolling verdict cache (cross-version flips
+  reported). Unit stubs now replay worker-shaped GitHub error strings from
+  `tests/fixtures/github_field_errors.json` (field-recorded entries name
+  their run; synthetic ones are marked as such) and a guard test rejects
+  inline `HTTP 404`/`409` literals in unit tests, so the 404-for-empty-repo
+  stub of #219 cannot recur; the e2e workflow uploads every GitHub error
+  string a real run produced for promotion into the fixture. Every
+  `TODO(e2e ...)` marker must now cite an issue or an e2e step name
+  (`tests/unit/test_e2e_markers.py`).
+
+- `git` is now baseline agent tooling, provisioned on every agent sandbox
+  independent of `[sandbox] languages` (#252): the dev-tools ensure probes
+  `command -v git` and installs it in the same pooled apt call as the selected
+  toolchains; a prebaked template that lacks it is topped up from the single
+  prebake probe. `sbxloop bake` records whether git landed and `sbxloop doctor`
+  shows a soft "git in template" row.
+
+- **uv-aware Python toolchain** (#250). The `python` toolchain now installs
+  `uv` from its pinned, checksum-verified GitHub release (per-arch digests,
+  like Node/Go) and a uv-managed Python 3.13 (`python3.13` linked onto PATH),
+  and its probe checks the interpreter series rather than mere presence —
+  uv-workspace repos declaring `requires-python >= 3.13` (sbxloop's own
+  included) previously failed at `uv sync` because the sandbox had neither.
+  The plan/execute/decompose prompts carry a "uv projects" note per Python
+  block (`uv.lock` present → `uv sync --all-packages` in steps, `uv run …`
+  to verify), and the verify-command lint requires `uv run` heads when the
+  workspace root has a `uv.lock` (bare `pytest` and `.venv/bin/…` are both
+  rejected with the uv remedy; without a lockfile `.venv/bin/…` is
+  unchanged). `astral.sh` (uv's installer host) joins the declarable
+  registries, and `release-assets.githubusercontent.com` (where GitHub
+  release-asset downloads redirect) joins the agent sandbox's provisioning
+  allowlist so both downloads actually complete. `sbxloop doctor --deep`
+  gains a `python-version` conformance row reporting the template's own
+  `python3` against the pinned series.
+
+- Budgets and resources for larger repositories (#253): verify output handed
+  to the critic keeps the first 2 KB and the last 4 KB of each command
+  (previously the last 1.5 KB only, so a long pytest run's failure summary
+  arrived without any assertion text); new `[limits] mem_abort` threshold
+  (off by default) fails the task with an explicit "sandbox memory exhausted"
+  error the way `disk_abort` does for disk, instead of an in-VM OOM surfacing
+  as a confusing test failure; `contrib/presets/large-repo.toml` documents a
+  4 h wall clock / 80 tool-call preset and the fact that sbxloop passes no
+  CPU/memory sizing to `sbx create`.
+
+- Daemon guardrails now cover recovery, restarts and multi-daemon setups
+  (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted
+  run is re-queued with its run pinned and the tick resumes it behind the same
+  breaker / daily-cap / pause gate as any dispatch. Resumes are recorded in a
+  ledger of their own: the daily cap counts them (each is a fresh engine wall
+  clock), `!sbx status` shows them, and a new `[daemon] max_resumes_per_item`
+  (default 2) bounds them — past it the interrupted run is settled as a failed
+  attempt so a plan that keeps getting interrupted cannot burn engine time
+  forever. Circuit-breaker state persists in the daemon store, so a
+  crash-restart loop no longer resets it. The GitHub claim is now a
+  compare-and-swap: the claim comment is posted first and the label swap only
+  proceeds if it is the first claim comment of the current trigger cycle, so
+  two daemons on one repo cannot both take an issue. The daemon's github
+  sandbox is named per state dir (`sbxloop-daemon-github-<hash>`) so a second
+  daemon on the host no longer removes the first's at startup. Source polling
+  raises on failure and backs off exponentially (up to 30 min); the github
+  sandbox is re-provisioned at most once per 5 minutes.
+
+- `[daemon] close_on_success` and `[daemon] tracking_issue` (#251), both
+  default true (today's behaviour). `close_on_success = false` leaves a
+  delivered source issue open with the new `delivered_label`
+  (`sbxloop:delivered`) instead of closing it the moment a draft PR appears
+  — the human closes it when the PR merges; a re-trigger or an operator
+  re-queue clears the label.
+  `tracking_issue = false` skips the per-run tracking issue for GitHub items,
+  whose source issue already carries the run's summary comment.
+
+- **Run-directory retention** (#233). Every run leaves
+  `<state_dir>/runs/<run>/` behind (the workspace clone under isolation plus
+  harvested artifacts) and nothing removed them; an always-on daemon accreted
+  clones without bound. New `[daemon] prune_runs_after_days` (default 14, `0`
+  disables): the daemon sweeps on its first tick and once a day thereafter,
+  and `sbxloop gc [--older-than DAYS] [--dry-run]` runs the same policy by
+  hand (`sbxloop.gc`). Only terminal runs past the window are removed — never
+  an in-flight/resumable run, a run with kept sandboxes, or one whose last
+  delivery failed (its workspace is the only copy of the work). SQLite rows
+  are kept; each removal is a `daemon.gc` event on the run (path, bytes,
+  age), the daemon reports counts and bytes freed to its frontend, `resume`
+  refuses a run whose workspace gc removed, and the workspace-clone finish
+  summary prints the retention window. A sweep and a `resume` of the same
+  failed run can race across processes: gc writes its marker in one write
+  transaction with a re-check that the run is still terminal, then renames
+  the directory out of `runs/` (into `gc-pending/`) before deleting it, and
+  `resume` leaves the terminal state before touching the workspace and
+  re-checks the marker after — so the workspace is never half-removed and
+  unmarked, and never pulled out from under a resume.
+
+- **Daemon workspace posture for unattended runs** (#255). Daemon runs
+  against a git-checkout workspace use `clone` isolation by default
+  (`[daemon] workspace_isolation`): a dirty tree proceeds from committed
+  HEAD with a warning instead of `auto`'s refusal, which no human is present
+  to answer. Before each fresh run the daemon `git fetch`es the checkout and
+  fast-forwards its branch to its upstream (the tracked remote, or
+  `origin/<branch>` when none is configured) — never a merge/rebase; diverged or
+  colliding trees are left alone and logged, fetch failures warn and run
+  from local HEAD (`[daemon] refresh_workspace`, default on). Daemon state
+  is anchored to an absolute path outside the workspace: `[daemon] state_dir`, else an explicit `state_dir`, else a pre-existing legacy
+  `./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`;
+  the resolved location is printed at start and the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule. Per-run clones now point
+  `origin` at the source checkout's origin URL instead of the host path
+  (metadata only; URL userinfo such as an embedded token is stripped). Docs and the systemd contrib prescribe a dedicated clone
+  nobody edits as the daemon's workspace.
+
+- Discord bridge, steering latency made visible (#236): a queued steer gets
+  a note under it — `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far); answered at the next checkpoint` — edited in place as
+  the phase, task and tool-call count (against the #228 ceiling) move, then
+  resolved to picked-up / answered / failed / not-answered-run-ended.
+
+- GitHub op failures carry the HTTP status as a structured field (#221):
+  worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken
+  from `urllib` `HTTPError.code`), `ErrorInfo.http_status` on the JobResult
+  envelope, and host `GithubOpsError.http_status`. The empty-repo bootstrap
+  (`409`), missing-repo probe (`404`) and already-absent trigger label
+  (`404`) now compare status codes instead of grepping gh's prose — the
+  wording-mismatch that broke delivery on run rgwp5z40x (fixed in #219) can
+  no longer recur. Message matching remains only as a fallback for a worker
+  that predates the field.
+
+### Fixed
+
+- Artifact listings, harvest reports and `--deliver` PRs now honour the
+  workspace's own `.gitignore` rules (#249): the name-based
+  `[artifacts] exclude` list cannot know a project's `dist/`, vendored
+  wheels or generated `_version.py` are build byproducts, so any tree after
+  a build/sync delivered them into the PR. Files git would ignore
+  (untracked *and* ignored — force-added tracked files still travel) are
+  dropped and tallied as `gitignored` in the surfaced exclusion note; the
+  probe works on the per-run clone and on harvested copies (which carry
+  `.gitignore` but no `.git`), applies only in-tree `.gitignore` files
+  (never the operator's global excludes or an enclosing checkout's rules),
+  and degrades to the name-based scan when git is unavailable.
+  `[artifacts] exclude` remains the operator override on top.
+- **Delivery of git-checkout workspaces commits the run's diff, not a
+  snapshot** (#248). When the workspace is a git checkout (the per-run
+  clone, or an in-place checkout), the PR tree now carries only what the
+  run changed relative to its base commit — deletions as `sha: null` tree
+  entries, renames as delete + add, executable scripts keeping `100755`,
+  symlinks as `120000` — instead of layering every file as `100644` onto
+  the base tree, which could never delete a file and flipped every exec
+  bit. The diff base is the merge base with the PR's target commit when
+  the clone knows it, else the commit the clone was cut from (pinned as
+  `refs/sbxloop/base` at clone time). Non-git workspaces still deliver as
+  a snapshot; a checkout with no base to diff against falls back to one
+  and says so in the PR body. The artifact exclude denylist applies to
+  both paths.
+- Expected probe answers no longer render as red error panels (#222). The
+  `--create-repo` existence probe and delivery's base-ref lookup asked GitHub a
+  question whose expected answer was "no", but the worker raised on the 404
+  (or the 409 an empty repository returns) and emitted its error event before
+  the host could classify the miss as fine — three field runs showed the
+  alarm on runs that delivered cleanly. `repo.get` and the new `ref.get` op
+  accept `allow_missing: true` and return `{"missing": true}` as an **ok**
+  result; `ensure_repository` and the base-commit lookup branch on that data
+  instead of sniffing exception messages. `GithubOpError` in the worker now
+  carries `http_status` (parsed from gh's trailing `(HTTP NNN)` or urllib's
+  `HTTPError.code`) so the miss/error split is a status compare, not a
+  substring match.
 
 ## [0.6.0] — 2026-08-15
 

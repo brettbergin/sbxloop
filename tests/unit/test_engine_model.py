@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from sbxloop.engine.model import (
     DEFAULT_ARTIFACT_EXCLUDES,
+    GITIGNORED,
     RunRecord,
     SteerVerdict,
     TaskGraph,
@@ -289,6 +290,72 @@ class TestDefaultBuildOutputExcludes:
             "app.py",
             "node_modules/a/i.js",
         ]
+
+
+class TestGitignoreAwareScan:
+    """The exclude list is a cross-ecosystem denylist; only the project's
+    own .gitignore knows its dist/, vendored wheels and generated
+    _version.py are byproducts (#249). Harvested copies carry .gitignore
+    without .git, so the rules must apply to plain trees too."""
+
+    def make_tree(self, tmp_path: Path) -> Path:
+        root = tmp_path / "ws"
+        (root / "pkg" / "_vendor").mkdir(parents=True)
+        (root / "dist").mkdir()
+        (root / ".gitignore").write_text("dist/\n_vendor/\n_version.py\n")
+        for rel in ("dist/app.whl", "pkg/_vendor/w.whl", "pkg/_version.py", "pkg/m.py"):
+            (root / rel).write_text("x\n")
+        return root
+
+    def test_gitignored_files_dropped_and_tallied(self, tmp_path: Path) -> None:
+        root = self.make_tree(tmp_path)
+        scan = scan_artifacts(root)
+        assert [p.relative_to(root).as_posix() for p in scan.files] == [".gitignore", "pkg/m.py"]
+        assert scan.excluded == {GITIGNORED: 3}
+        assert scan.excluded_note == "3 file(s) excluded (gitignored)"
+
+    def test_name_based_entries_take_precedence_in_tally(self, tmp_path: Path) -> None:
+        root = self.make_tree(tmp_path)
+        (root / ".gitignore").write_text("dist/\nnode_modules/\n")
+        (root / "node_modules").mkdir()
+        (root / "node_modules" / "i.js").write_text("x\n")
+        scan = scan_artifacts(root)
+        assert scan.excluded == {GITIGNORED: 1, "node_modules": 1}
+
+    def test_operator_exclude_still_applies_on_top(self, tmp_path: Path) -> None:
+        root = self.make_tree(tmp_path)
+        scan = scan_artifacts(root, exclude=["pkg"])
+        assert [p.relative_to(root).as_posix() for p in scan.files] == [".gitignore"]
+        assert scan.excluded == {GITIGNORED: 1, "pkg": 3}
+
+    def test_opt_out(self, tmp_path: Path) -> None:
+        root = self.make_tree(tmp_path)
+        scan = scan_artifacts(root, gitignore=False)
+        assert len(scan.files) == 5
+        assert scan.excluded == {}
+
+    def test_tree_without_gitignore_never_probes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import hostgit
+
+        def boom(root: Path) -> frozenset[str]:
+            raise AssertionError("probe must not run")
+
+        monkeypatch.setattr(hostgit, "gitignored_files", boom)
+        root = tmp_path / "plain"
+        root.mkdir()
+        (root / "a.txt").write_text("a")
+        assert [p.name for p in scan_artifacts(root).files] == ["a.txt"]
+
+    def test_failed_probe_degrades_to_name_based_scan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import hostgit
+
+        monkeypatch.setattr(hostgit, "gitignored_files", lambda root: None)
+        root = self.make_tree(tmp_path)
+        assert len(scan_artifacts(root).files) == 5
 
 
 class TestArtifactsDir:

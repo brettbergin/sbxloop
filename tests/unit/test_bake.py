@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import sbxloop
+from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.errors import BakeError
 from sbxloop.sbx.bake import (
@@ -39,10 +40,12 @@ def cli(fake_sbx: FakeSbx) -> SbxCLI:
     return SbxCLI(binary=str(fake_sbx.binary))
 
 
-def script_install(fake_sbx: FakeSbx, *, runtime_rc: int = 0) -> None:
+def script_install(fake_sbx: FakeSbx, *, runtime_rc: int = 0, git_rc: int = 0) -> None:
     # Page-size/ripgrep probe: scripted, else it runs on the host where the
     # answer varies by machine (16 KiB pages on Apple silicon).
     fake_sbx.script(f'exec {BOX} sh -c test "$(getconf PAGESIZE)"', returncode=0)
+    # Baseline git probe (#252): likewise host-dependent when unscripted.
+    fake_sbx.script(f"exec {BOX} sh -c {toolchains.GIT.probe}", returncode=git_rc)
     fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=0)
     fake_sbx.script(f"exec {BOX} python3 -m venv", returncode=0)
     fake_sbx.script(f"exec {BOX} /home/agent/.sbxloop/venv/bin/pip", returncode=0)
@@ -159,6 +162,45 @@ class TestBakeFailure:
         assert not (fake_sbx.state / "sandboxes" / BOX).exists()
         assert not bake_record_path(config).is_file()
         assert fake_sbx.invocations("template") == []
+
+    def test_bake_records_git_present(self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx) -> None:
+        # #252: doctor's "git in template" row reads this — a bake that
+        # captured git means runs skip the per-provision apt top-up.
+        script_install(fake_sbx, git_rc=0)
+        record = bake_template(cli, config, name=BOX)
+        assert record.git is True
+        loaded = load_bake_record(config)
+        assert loaded is not None and loaded.git is True
+
+    def test_bake_records_git_missing_after_failed_ensure(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        # The ensure is best-effort; the record reports what actually landed
+        # in the template, not what was attempted.
+        script_install(fake_sbx, git_rc=1)
+        record = bake_template(cli, config, name=BOX)
+        assert record.git is False
+        apt = [" ".join(c) for c in fake_sbx.invocations("exec") if "apt-get" in " ".join(c)]
+        assert any("git" in cmd.split() for cmd in apt), apt
+
+    def test_load_bake_record_without_git_field(self, config: Config) -> None:
+        # Records from before the field existed must still load: doctor
+        # renders "not recorded", it does not refuse the whole record.
+        path = bake_record_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "ref": DEFAULT_TEMPLATE_REF,
+                    "worker_version": sbxloop.__version__,
+                    "python": VENV_PY,
+                    "runtime_cached": True,
+                    "baked_at": 0.0,
+                }
+            )
+        )
+        loaded = load_bake_record(config)
+        assert loaded is not None and loaded.git is None
 
     def test_load_bake_record_tolerates_garbage(self, config: Config) -> None:
         path = bake_record_path(config)

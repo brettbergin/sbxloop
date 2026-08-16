@@ -217,7 +217,8 @@ def render_event(event: Event) -> RenderableType | None:
         elif event.type == HostEventTypes.PHASE_END and data.get("status") == "failed":
             style = "red"
         elif (
-            "fallback" in event.type
+            (event.type == HostEventTypes.PHASE_END and data.get("status") == "verify_suspect")
+            or "fallback" in event.type
             or "missing" in event.type
             or "warning" in event.type
             or event.type == HostEventTypes.POLICY_DENY

@@ -70,6 +70,8 @@ class TestDeepRun:
             assert outcome.matches_expected, (outcome.probe.id, outcome.verdict, outcome.detail)
         assert report.drifted == []
         assert report.deep_run_hint is None
+        # ...and the CI gate (`doctor --fail-on-drift`) has nothing to say
+        assert report.unverified == []
 
     def test_deep_run_removes_scratch_sandbox_and_secrets(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -166,6 +168,72 @@ class TestPageSizeProbe:
         assert verdict == "unknown"
 
 
+class TestPythonVersionProbe:
+    """Verdict logic for the template python3-vs-pin row (#250), through a
+    stub sandbox so every template shape is coverable on any host."""
+
+    class _StubSandbox:
+        def __init__(self, out: str, rc: int = 0, err: str = "") -> None:
+            self.out, self.rc, self.err = out, rc, err
+
+        def exec(self, argv: list[str], **_: object) -> object:
+            from sbxloop.sbx.models import ExecResult
+
+            assert argv == ["python3", "--version"]
+            return ExecResult(
+                argv=argv, returncode=self.rc, stdout=self.out, stderr=self.err, duration_s=0.0
+            )
+
+    def _run(self, sandbox: object) -> tuple[str, str]:
+        from sbxloop.sbx.conformance import ProbeContext, _probe_python_version
+
+        ctx = ProbeContext(cli=None, sandbox=sandbox)  # type: ignore[arg-type]
+        return _probe_python_version(ctx)
+
+    def test_at_or_above_the_pin(self) -> None:
+        from sbxloop.toolchains import PYTHON_SERIES
+
+        verdict, detail = self._run(self._StubSandbox(f"Python {PYTHON_SERIES}.1\n"))
+        assert verdict == "meets-pin"
+        assert PYTHON_SERIES in detail
+        verdict, _ = self._run(self._StubSandbox("Python 3.99.0\n"))
+        assert verdict == "meets-pin"
+
+    def test_below_the_pin_names_the_toolchain_guarantee(self) -> None:
+        verdict, detail = self._run(self._StubSandbox("Python 3.12.3\n"))
+        assert verdict == "below-pin"
+        assert "3.12" in detail and "toolchain" in detail
+
+    def test_detail_does_not_claim_the_interpreter_is_uv_managed(self) -> None:
+        # A template that already ships uv + python3.13 passes the toolchain
+        # probe and skips the install, so the versioned interpreter need not
+        # be uv-managed; the row reports compatibility, not provenance.
+        from sbxloop.toolchains import PYTHON_SERIES
+
+        for out in (f"Python {PYTHON_SERIES}.1\n", "Python 3.99.0\n", "Python 3.12.3\n"):
+            _, detail = self._run(self._StubSandbox(out))
+            assert "uv-managed" not in detail
+            assert "only if the template lacks it" in detail
+
+    def test_python2_style_stderr_output_is_parsed(self) -> None:
+        # Old interpreters print --version on stderr; the probe reads both.
+        verdict, _ = self._run(self._StubSandbox("", err="Python 3.8.10\n"))
+        assert verdict == "below-pin"
+
+    def test_missing_python3(self) -> None:
+        verdict, _ = self._run(self._StubSandbox("", rc=127, err="not found"))
+        assert verdict == "no-python3"
+
+    def test_catalog_row_is_informational(self) -> None:
+        # Both answers are handled by the toolchain ensure; the row informs,
+        # it never alarms as drift.
+        from sbxloop.sbx.conformance import PROBE_PYTHON_VERSION
+
+        probe = next(p for p in CATALOG if p.id == PROBE_PYTHON_VERSION)
+        assert probe.tier == "sandbox"
+        assert probe.expected is None
+
+
 class TestShallowRun:
     def test_sandbox_probes_unprobed_without_cache(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
@@ -174,6 +242,11 @@ class TestShallowRun:
         assert outcomes[PROBE_SECRET_ENV_VISIBILITY].source == "unprobed"
         assert report.deep_run_hint is not None
         assert "doctor --deep" in report.deep_run_hint
+        # unprobed seams are exactly what the drift gate must refuse (#226)
+        assert any(
+            reason.startswith(f"{PROBE_SECRET_ENV_VISIBILITY}: unprobed")
+            for reason in report.unverified
+        )
         # no sandbox was ever created
         assert make_cli(fake_sbx).ls() == []
 

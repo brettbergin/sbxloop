@@ -71,6 +71,13 @@ def script_toolchain_probe(
     fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=returncode, stderr=stderr)
 
 
+def script_git_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> None:
+    """Script the baseline git probe (#252). Unscripted it runs on the host,
+    where git is present on every dev machine and CI runner — so tests that
+    assert the exact apt command pin it rather than rely on that."""
+    fake_sbx.script(f"exec boxa sh -c {toolchains.GIT.probe}", returncode=returncode)
+
+
 def script_probes_for(fake_sbx: FakeSbx, languages: list[str], *, returncode: int = 1) -> None:
     """Script every probe a ``languages`` selection will run, requirements
     included — the safe way to set up a test that passes ``languages=``."""
@@ -581,9 +588,13 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=0)
         script_toolchain_probe(fake_sbx, "python", returncode=1)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        # The uv + managed-Python install script (#250) runs after apt; the
+        # fake would otherwise execute it on the host, where dpkg is absent.
+        fake_sbx.script("exec boxa sh -c set -e; case", returncode=0)
         self._script_happy_install(fake_sbx)
         client.install(wheel=wheel, ensure_dev_tools=True)
         apt_cmds = [
@@ -591,8 +602,51 @@ class TestInstallFallbacks:
         ]
         assert apt_cmds == [
             "exec boxa sh -c sudo -n apt-get update -q && "
-            "sudo -n apt-get install -y -q python3-venv python3-pip"
+            "sudo -n apt-get install -y -q python3-venv python3-pip curl ca-certificates"
         ]
+        scripts = [
+            " ".join(c)
+            for c in fake_sbx.invocations("exec")
+            if any("uv python install" in a for a in c)
+        ]
+        assert len(scripts) == 1 and "python3.13" in scripts[0], scripts
+
+    def test_ensure_dev_tools_installs_git_as_baseline(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # #252: git is provisioned regardless of `languages` — here with a
+        # selection that does not name it and whose own toolchain is present
+        # — and rides the SAME apt call as any missing language packages.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=1)
+        script_toolchain_probe(fake_sbx, "python", returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["python"])
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert apt_cmds == [
+            "exec boxa sh -c sudo -n apt-get update -q && "
+            "sudo -n apt-get install -y -q git python3-venv python3-pip curl ca-certificates"
+        ]
+
+    def test_ensure_dev_tools_git_probe_success_installs_nothing(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # A template that ships git costs no apt for it, even when nothing
+        # else is selected — probe first, like every other entry.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=0)
+        script_search_fallback_probe(fake_sbx)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=["nonesuch"])
+        assert not [c for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)]
 
     def test_ensure_dev_tools_unselected_language_installs_nothing(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
@@ -717,7 +771,10 @@ class TestInstallFallbacks:
     def _script_happy_install(self, fake_sbx: FakeSbx) -> None:
         import sbxloop
 
+        # First matching script wins, so a test that pins these probes
+        # earlier keeps its answer; these are the defaults for the rest.
         script_toolchain_probe(fake_sbx, "python", returncode=0)
+        script_git_probe(fake_sbx, returncode=0)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
         fake_sbx.script("exec boxa /home/agent/.sbxloop/venv/bin/pip", returncode=0)
         fake_sbx.script(
@@ -926,6 +983,100 @@ class TestPrebakedTemplate:
         assert not [c for c in fake_sbx.invocations("cp") if any(".whl" in a for a in c)]
         # the whole verification is ONE exec round trip (#127): manifest
         # read, import check, and entrypoint smoke run inside one script
+        assert len(fake_sbx.invocations("exec")) == 1
+        # (the host has git, so the probe reported it and no top-up ran)
+        assert client._prebake_missing == []
+
+    def test_verified_prebaked_without_git_tops_up_baseline(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A template that passes every worker check but lacks git (#252):
+        the ONE prebake probe reports it, and install() apt-installs git
+        without falling back to the ladder or spending another probe.
+
+        The fake exec runs on the host, so "no git on PATH" is staged with a
+        PATH holding only a python3 shim (a script, not a symlink — a
+        symlinked venv python would resolve its prefix from the link)."""
+        shim_dir = tmp_path / "shim-bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "python3"
+        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", str(shim_dir))
+        self.write_manifest(sandbox, python=sys.executable)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        client = make_client(sandbox, EventBus(), python="python3")
+        client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
+
+        assert client.prebaked
+        assert client._prebake_missing == [toolchains.GIT]
+        joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j]
+        assert joined[1:] == [
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
+        ]
+
+    @pytest.mark.parametrize(
+        "verdict",
+        [
+            pytest.param({"stage": "ok"}, id="git-absent"),
+            pytest.param({"stage": "ok", "git": "yes"}, id="git-non-boolean"),
+        ],
+    )
+    def test_verified_prebaked_with_malformed_git_verdict_tops_up(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        monkeypatch: pytest.MonkeyPatch,
+        verdict: dict[str, object],
+    ) -> None:
+        """Fail closed (#252): an otherwise-successful "ok" verdict whose
+        ``git`` field is absent or not a bool must NOT be read as "git
+        present" — the apt top-up runs, and the fast path is still taken (no
+        ladder). The real probe always emits a bool, so the malformed verdict
+        is staged by swapping the probe script for one that prints it as-is.
+        """
+        from sbxloop.worker import client as client_mod
+
+        verdict = {**verdict, "python": sys.executable}
+        monkeypatch.setattr(client_mod, "_PREBAKE_PROBE", f"print({json.dumps(verdict)!r})")
+        self.write_manifest(sandbox, python=sys.executable)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        client = make_client(sandbox, EventBus(), python="python3")
+        client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
+
+        assert client.prebaked
+        assert client._prebake_missing == [toolchains.GIT]
+        joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j]
+        assert joined[1:] == [
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
+        ]
+
+    def test_verified_prebaked_without_git_skips_top_up_for_non_agent(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The github sandbox only runs API ops: same missing-git verdict,
+        # but without ensure_dev_tools nothing is installed.
+        shim_dir = tmp_path / "shim-bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "python3"
+        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", str(shim_dir))
+        self.write_manifest(sandbox, python=sys.executable)
+        client = make_client(sandbox, EventBus(), python="python3")
+        client.install(extras="", expect_prebaked=True)
+
+        assert client.prebaked
         assert len(fake_sbx.invocations("exec")) == 1
 
     def test_missing_manifest_falls_back_to_ladder(

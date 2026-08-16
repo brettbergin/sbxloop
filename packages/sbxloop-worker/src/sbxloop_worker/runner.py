@@ -34,6 +34,7 @@ class JobRunner:
         disk_warn: float = 0.0,
         disk_abort: float = 0.0,
         mem_warn: float = 0.0,
+        mem_abort: float = 0.0,
     ) -> None:
         self.job = job
         self.events_path = events_path
@@ -43,6 +44,7 @@ class JobRunner:
         self.disk_warn = disk_warn
         self.disk_abort = disk_abort
         self.mem_warn = mem_warn
+        self.mem_abort = mem_abort
         self._resource_level = "ok"
         self._resource_abort: str | None = None
 
@@ -69,14 +71,16 @@ class JobRunner:
                     type(exc).__name__,
                     str(exc) or repr(exc),
                     detail="".join(traceback.format_exception(exc))[-OUTPUT_TAIL_CHARS:],
+                    http_status=getattr(exc, "http_status", None),
                 )
             finally:
                 heartbeat_stop.set()
 
             if self._resource_abort and result.status != "ok":
-                # The sandbox blew past disk_abort while this job ran: name
-                # the real cause instead of whatever confusing failure the
-                # in-VM tooling produced on a full disk.
+                # The sandbox blew past disk_abort/mem_abort while this job
+                # ran: name the real cause instead of whatever confusing
+                # failure the in-VM tooling produced on a full disk or under
+                # the OOM killer.
                 original = ""
                 if result.error is not None:
                     original = f"underlying failure: {result.error.type}: {result.error.message}"
@@ -215,12 +219,15 @@ class JobRunner:
         type_: str,
         message: str,
         detail: str | None = None,
+        http_status: int | None = None,
     ) -> JobResult:
         return JobResult.model_validate(
             {
                 "job_id": self.job.job_id,
                 "status": status,
-                "error": ErrorInfo(type=type_, message=message, detail=detail).model_dump(),
+                "error": ErrorInfo(
+                    type=type_, message=message, detail=detail, http_status=http_status
+                ).model_dump(),
             }
         )
 
@@ -254,6 +261,7 @@ class JobRunner:
             disk_warn=self.disk_warn,
             disk_abort=self.disk_abort,
             mem_warn=self.mem_warn,
+            mem_abort=self.mem_abort,
         )
         writer.emit(EventTypes.SANDBOX_RESOURCES, level=level, **sample)
         if LEVEL_SEVERITY[level] > LEVEL_SEVERITY[self._resource_level]:
@@ -263,17 +271,42 @@ class JobRunner:
                 message=self._level_message(level, sample),
                 **sample,
             )
-        if level == "abort" and self._resource_abort is None:
-            self._resource_abort = self._level_message(level, sample)
+        if level == "abort":
+            self._latch_abort(sample)
         self._resource_level = level
+
+    def _latch_abort(self, sample: dict[str, object]) -> None:
+        """Remember the abort diagnosis that rewrites a failed result.
+
+        The first abort sample latches; a later sample only replaces it when
+        disk has since crossed its threshold and the latched diagnosis was
+        memory. Disk wins because it is the non-transient resource — a run
+        that first spiked memory and then filled the filesystem failed for
+        the disk, and reporting "memory exhausted" would send the operator
+        chasing the wrong cause."""
+        message = self._level_message("abort", sample)
+        if self._resource_abort is None or (
+            self._disk_tripped(sample) and not self._resource_abort.startswith("sandbox disk")
+        ):
+            self._resource_abort = message
+
+    def _disk_tripped(self, sample: dict[str, object]) -> bool:
+        disk = sample.get("disk_used_pct")
+        return isinstance(disk, (int, float)) and self.disk_abort > 0 and disk >= self.disk_abort
 
     def _level_message(self, level: str, sample: dict[str, object]) -> str:
         disk = sample.get("disk_used_pct")
         mem = sample.get("mem_used_pct")
         if level == "abort":
+            # Disk wins when both tripped: it is the non-transient one.
+            if self._disk_tripped(sample):
+                return (
+                    f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
+                    f"(disk_abort threshold: {self.disk_abort}%)"
+                )
             return (
-                f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
-                f"(disk_abort threshold: {self.disk_abort}%)"
+                f"sandbox memory exhausted: {mem}% of memory is used "
+                f"(mem_abort threshold: {self.mem_abort}%)"
             )
         parts = []
         if isinstance(disk, (int, float)) and self.disk_warn > 0 and disk >= self.disk_warn:

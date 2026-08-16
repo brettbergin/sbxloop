@@ -23,6 +23,14 @@ Environment mutation (``sudo``/``apt``) is rejected for every language:
 verification must check the work, not rebuild the environment it checks.
 Project-local installs the ecosystem notes prescribe (``npm ci``,
 ``composer install``) stay legal.
+
+The Python rule has two shapes (#250). A workspace carrying ``uv.lock`` is
+a uv project — often a uv *workspace* with several members — and there
+``python3 -m venv`` + ``pip install`` does not reproduce the locked
+environment at all; ``uv run`` does (and syncs it first). So with a
+lockfile present the convention flips: ``uv run pytest`` is required and
+``.venv/bin/pytest`` is flagged. Without one, ``.venv/bin/...`` stays the
+shape and ``uv run`` is not demanded.
 """
 
 from __future__ import annotations
@@ -70,6 +78,30 @@ LANGUAGE_RULES: dict[str, LanguageRule] = {
         ),
     ),
 }
+
+# The uv-project variant of the Python rule. Same bare names are wrong, the
+# remedy is different: the executor's `uv sync` builds the environment from
+# uv.lock and `uv run` is what reaches it. And `.venv/bin/...` is wrong here
+# too — a hand-made venv beside a lockfile is exactly the environment drift
+# uv exists to prevent (a uv workspace's members are only importable when
+# uv installed them).
+UV_LOCKFILE = "uv.lock"
+UV_PYTHON_RULE = LanguageRule(
+    commands=LANGUAGE_RULES["python"].commands,
+    remedy=(
+        f"this workspace has a `{UV_LOCKFILE}`, so run through uv: `uv run pytest -q` "
+        "(`uv run python ...` for scripts). uv resolves the interpreter and the "
+        "locked dependencies itself; `uv sync` belongs in the plan's execution "
+        "steps, not in a verify command"
+    ),
+)
+_VENV_PATH = re.compile(r"(^|/)\.venv/bin/")
+_UV_VENV_REMEDY = (
+    f"this workspace has a `{UV_LOCKFILE}`, so use `uv run <command>` (e.g. "
+    "`uv run pytest -q`) rather than a `.venv/bin/...` path: uv builds and syncs "
+    "the environment from the lockfile, and a hand-made venv beside it does not "
+    "carry the workspace's own packages"
+)
 
 # Environment mutation is out of bounds in verify commands regardless of
 # language. Verify commands run mechanically after the work is done; a
@@ -191,14 +223,23 @@ def command_heads(command: str) -> list[str]:
     return heads
 
 
-def lint_verify_commands(commands: Sequence[str], languages: Sequence[str]) -> list[str]:
+def lint_verify_commands(
+    commands: Sequence[str], languages: Sequence[str], *, uv_project: bool = False
+) -> list[str]:
     """Violation messages for ``commands`` under the run's toolchains.
 
     Empty means clean. Messages are written to be fed back to the model
     verbatim: they name the offending command, the bare word, and the
-    ecosystem's remedy.
+    ecosystem's remedy. ``uv_project`` says the workspace carries a
+    ``uv.lock``, which swaps the Python convention from ``.venv/bin/...``
+    to ``uv run`` (see the module docstring).
     """
-    rules = [LANGUAGE_RULES[lang] for lang in languages if lang in LANGUAGE_RULES]
+    uv_python = uv_project and "python" in languages
+    rules = [
+        UV_PYTHON_RULE if uv_python and lang == "python" else LANGUAGE_RULES[lang]
+        for lang in languages
+        if lang in LANGUAGE_RULES
+    ]
     problems: list[str] = []
     for command in commands:
         for problem in bashisms(command):
@@ -210,6 +251,9 @@ def lint_verify_commands(commands: Sequence[str], languages: Sequence[str]) -> l
                     "must not modify the environment; anything that needs "
                     "installing is a plan step, not a verification"
                 )
+                continue
+            if uv_python and _VENV_PATH.search(head):
+                problems.append(f"verify command `{command}` invokes `{head}` — {_UV_VENV_REMEDY}")
                 continue
             for rule in rules:
                 if head in rule.commands:

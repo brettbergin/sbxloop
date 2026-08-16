@@ -1,0 +1,127 @@
+name: sbx conformance (new releases)
+
+# Runs the sbx conformance suite against the NEWEST sbx release ahead of
+# adoption (#226): the fake sbx in the unit suite is a second implementation
+# of an undocumented, moving CLI, and every drift so far (0.38's ls columns,
+# workspace mount, CI asset names — #210) was discovered by a real host
+# breaking. Scheduled, not per-PR: it probes docker/sbx-releases, not this
+# repo's changes. `doctor --deep --fail-on-drift` fails the job on any probe
+# that drifted from the verdicts this codebase depends on, errored, or is
+# unprobed. The version-keyed verdict cache is carried between runs with
+# actions/cache so cross-version flips ("changed from X under sbx N-1") are
+# reported too, and both the doctor output and the cache are uploaded.
+#
+# Requires DOCKERHUB_USERNAME / DOCKERHUB_TOKEN (for `sbx login`).
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"  # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      sbx_release:
+        description: docker/sbx-releases tag to probe (default is the latest release)
+        default: ""
+        required: false
+
+env:
+  SBX_INSTALL_DIR: /home/runner/.docker/sbx
+  SBXLOOP_APP_NAME: sbxloop-conformance
+  # state_dir defaults to ~/.sbxloop; the cache/upload steps below target
+  # .sbxloop/conformance in the checkout, so pin doctor's verdict store there.
+  SBXLOOP_STATE_DIR: .sbxloop
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs tags to resolve the version
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-packages
+
+      - name: Enable KVM and user namespaces
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install sbx
+        env:
+          SBX_RELEASE: ${{ inputs.sbx_release }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SBX_RELEASE" ]; then
+            api="https://api.github.com/repos/docker/sbx-releases/releases/tags/$SBX_RELEASE"
+          else
+            api="https://api.github.com/repos/docker/sbx-releases/releases/latest"
+          fi
+          url=$(curl -fsSL "$api" \
+            | uv run --no-project python -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and ('amd64' in a['name'] or 'x86_64' in a['name']) and a['name'].endswith('.tar.gz')]; print(assets[0])")
+          echo "downloading $url"
+          curl -fsSL -o /tmp/sbx.tar.gz "$url"
+          mkdir -p /tmp/docker-sbx && tar -xzf /tmp/sbx.tar.gz -C /tmp/docker-sbx --strip-components=1
+          sudo PREFIX="$SBX_INSTALL_DIR" /tmp/docker-sbx/install.sh
+          echo "$SBX_INSTALL_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Start keyring (Secret Service for sbx credential storage)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gnome-keyring dbus-x11
+          echo 'DBUS_SESSION_BUS_ADDRESS='$(dbus-daemon --session --fork --print-address) >> "$GITHUB_ENV"
+
+      - name: sbx login
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo -n "" | gnome-keyring-daemon --unlock --components=secrets || true
+          printf '%s' "$DOCKERHUB_TOKEN" | sbx --app-name "$SBXLOOP_APP_NAME" login --username "$DOCKERHUB_USERNAME" --password-stdin
+          sbx --app-name "$SBXLOOP_APP_NAME" version | tee sbx-version.out
+
+      - name: sbx policy init balanced
+        run: sbx --app-name "$SBXLOOP_APP_NAME" policy init balanced
+
+      # Rolling cache: each run restores the newest previous verdict set and
+      # saves its own, so run_conformance sees the last-probed sbx version
+      # as `previous_version` and reports cross-version flips.
+      - name: Restore conformance verdict cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .sbxloop/conformance
+          key: sbx-conformance-${{ github.run_id }}
+          restore-keys: |
+            sbx-conformance-
+
+      - name: sbx conformance suite (doctor --deep --fail-on-drift)
+        id: doctor
+        env:
+          # The token checks are host-readiness, not conformance; dummies
+          # keep the readiness half of doctor green so the exit code is the
+          # conformance verdict alone.
+          COPILOT_GITHUB_TOKEN: unused
+        run: |
+          set -o pipefail
+          uv run sbxloop doctor --deep --fail-on-drift 2>&1 | tee doctor-deep.out
+
+      - name: Save conformance verdict cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .sbxloop/conformance
+          key: sbx-conformance-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbx-conformance-${{ github.run_id }}
+          path: |
+            doctor-deep.out
+            sbx-version.out
+            .sbxloop/conformance/*.json
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        if: always()
+        run: |
+          uv run sbxloop sandbox rm --all || true
+          sbx --app-name "$SBXLOOP_APP_NAME" logout --yes || true

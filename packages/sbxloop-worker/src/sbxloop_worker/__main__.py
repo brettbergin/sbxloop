@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--disk-warn", type=float, default=0.0)
     run.add_argument("--disk-abort", type=float, default=0.0)
     run.add_argument("--mem-warn", type=float, default=0.0)
+    run.add_argument("--mem-abort", type=float, default=0.0)
     args = parser.parse_args(argv)
 
     apply_env_file(args.env_file)
@@ -103,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             disk_warn=args.disk_warn,
             disk_abort=args.disk_abort,
             mem_warn=args.mem_warn,
+            mem_abort=args.mem_abort,
         ).run()
     except BaseException as exc:
         print(f"sbxloop_worker: fatal: {exc}", file=sys.stderr)

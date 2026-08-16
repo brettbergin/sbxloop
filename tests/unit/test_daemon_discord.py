@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from sbxloop.config import Config
-from sbxloop.daemon.discord import DiscordBridge, format_for_discord, headline_text
+from sbxloop.daemon.discord import DiscordBridge, _Pending, format_for_discord, headline_text
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.errors import DaemonError
@@ -91,7 +91,7 @@ class FakeMessage:
         self.content = content
         self.channel = channel
         self.id = mid
-        self.author = type("A", (), {"bot": bot})()
+        self.author = type("A", (), {"bot": bot, "name": "brett"})()
         self.reactions: list[str] = []
 
     async def add_reaction(self, emoji: str) -> None:
@@ -174,6 +174,8 @@ class FakeLoop:
         self.dstore = dstore
         self.paused = False
         self.cancelled = 0
+        self.cancel_calls: list[tuple[str | None, bool]] = []
+        self.retried: list[tuple[str, str | None]] = []
 
     def status(self) -> dict[str, Any]:
         return {
@@ -192,16 +194,29 @@ class FakeLoop:
     def unpause(self) -> None:
         self.paused = False
 
-    def cancel_current(self) -> bool:
+    def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
         self.cancelled += 1
+        self.cancel_calls.append((requester, retry))
         return True
+
+    # #229 item controls: the real loop wraps DaemonStore; the fake exposes
+    # the store's own transitions so error text flows through unchanged.
+    def abandon_item(self, item_id: str, reason: str | None = None) -> WorkItem:
+        return self.dstore.abandon(item_id, reason or "abandoned by operator", 1.0)
+
+    def retry_item(self, item_id: str, by: str | None = None) -> WorkItem:
+        self.retried.append((item_id, by))
+        return self.dstore.retry(item_id, 1.0, f"re-queued by {by or 'operator'}")
+
+    def requeue_item(self, item_id: str) -> WorkItem:
+        return self.dstore.requeue(item_id, 1.0)
 
 
 def make_bridge(
-    tmp_path: Path, *, channel_id: int = 42
+    tmp_path: Path, *, channel_id: int = 42, **discord: Any
 ) -> tuple[DiscordBridge, FakeClient, FakeLoop]:
     config = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": channel_id}}
+        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": channel_id, **discord}}
     )
     dstore = DaemonStore(config.state_dir / "state.db")
     client = FakeClient(channel_id)
@@ -358,7 +373,79 @@ class TestBridge:
             assert "paused" in joined and "resumed." in joined
             assert floop.cancelled == 1 and "cancel requested" in joined
             assert "queue is empty." in joined
-            assert "commands:" in joined
+            assert "commands:" in joined and "abandon <item> [reason]" in joined
+        finally:
+            bridge.close()
+
+    def test_item_commands_abandon_retry_requeue(self, tmp_path: Path) -> None:
+        """#229: `!sbx items|abandon|retry|requeue` mirror the CLI; a refused
+        transition answers with the store's reason instead of a traceback."""
+        bridge, client, floop = make_bridge(tmp_path)
+        floop.dstore.upsert_new(
+            WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A"), 1.0
+        )
+        floop.dstore.mark_running("inbox:a.md", "r1", 1.0)
+        bridge.start()
+        try:
+            control = client.channels[42]
+
+            def ask(cmd: str) -> str:
+                # Item commands run off the gateway loop (executor), so
+                # replies to a burst may interleave: send one, await one.
+                n = len(control.sent)
+                bridge._handle_message(FakeMessage(cmd, control))
+                assert wait_for(lambda: len(control.sent) > n), cmd
+                return control.sent[n]
+
+            reply = ask("!sbx items")
+            assert "`inbox:a.md` running" in reply and "run `r1`" in reply
+            assert ask("!sbx abandon").startswith("usage: abandon")
+            reply = ask("!sbx retry inbox:a.md")
+            assert "retry failed:" in reply and "abandon it first" in reply
+            reply = ask("!sbx abandon inbox:a.md plan spiraled")
+            assert "abandoned" in reply and "`r1`" in reply
+            reply = ask("!sbx requeue inbox:a.md")
+            assert "requeue failed:" in reply and "use retry" in reply
+            assert "attempts reset" in ask("!sbx retry inbox:a.md")
+            reply = ask("!sbx abandon gh:404")
+            assert "abandon failed:" in reply and "gh:404" in reply
+            assert "`inbox:a.md` queued" in ask("!sbx items")
+            item = floop.dstore.get("inbox:a.md")
+            assert item is not None and item.state == "queued" and item.attempts == 0
+        finally:
+            bridge.close()
+
+    def test_cancel_and_retry_are_attributed_to_the_author(self, tmp_path: Path) -> None:
+        """#246: the loop settles a cancel by who asked (GitHub comment,
+        finish card); --retry re-queues instead; retry reruns a settled item
+        under the author's name."""
+        bridge, client, floop = make_bridge(tmp_path)
+        floop.dstore.upsert_new(
+            WorkItem(item_id="gh:8", source="github", source_key="8", title="Eight"), 1.0
+        )
+        floop.dstore.mark_running("gh:8", "r1", 1.0)
+        floop.dstore.mark_cancelled("gh:8", "cancelled by op", 2.0)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            for cmd in ("!sbx cancel", "!sbx cancel --retry"):
+                bridge._handle_message(FakeMessage(cmd, control))
+            assert wait_for(lambda: len(control.sent) >= 2)
+            assert floop.cancel_calls == [
+                ("Discord user `brett`", False),
+                ("Discord user `brett`", True),
+            ]
+            for cmd in ("!sbx retry gh:8", "!sbx retry"):
+                n = len(control.sent)
+                bridge._handle_message(FakeMessage(cmd, control))
+                assert wait_for(lambda n=n: len(control.sent) > n), cmd
+            assert floop.retried == [("gh:8", "Discord user `brett`")]
+            joined = "\n".join(control.sent)
+            assert "settles as cancelled" in joined and "run again fresh" in joined
+            assert "`gh:8` re-queued" in joined and "usage: retry" in joined
+            item = floop.dstore.get("gh:8")
+            assert item is not None and item.state == "queued"
+            assert item.last_error == "re-queued by Discord user `brett`"
         finally:
             bridge.close()
 
@@ -431,8 +518,9 @@ class TestBridge:
         finally:
             bridge.close()
 
-    def test_tool_calls_are_batched_into_one_block(self, tmp_path: Path) -> None:
-        bridge, client, _ = make_bridge(tmp_path)
+    def test_tool_calls_are_batched_into_one_block_when_verbose(self, tmp_path: Path) -> None:
+        # verbose keeps the stream-everything behaviour normal had before #235
+        bridge, client, _ = make_bridge(tmp_path, chronology_level="verbose")
         bridge.start()
         try:
             item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
@@ -461,6 +549,91 @@ class TestBridge:
             assert batch.endswith("```")
             detail = next(s for s in thread.sent if s.startswith("✗ `bash` failed"))
             assert "```text\nFAILED test_x\n1 failed\n```" in detail
+        finally:
+            bridge.close()
+
+    def test_normal_level_digests_tool_bursts_into_one_edited_line(self, tmp_path: Path) -> None:
+        """#235: hundreds of ⚙ lines drowned the human channel. At the
+        normal level a burst is ONE message edited in place; agent
+        messages close it; a failed call keeps its own detail block; the
+        next burst is a fresh message."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit("agent.message", "r1", content="Looking around", agent="executor")
+            for i in range(12):
+                bus.emit(
+                    "agent.tool_start", "r1", tool="bash", args=f"ls {i}", tool_call_id=f"c{i}"
+                )
+                bus.emit("agent.tool_end", "r1", tool="bash", tool_call_id=f"c{i}", success=True)
+            bus.emit("agent.tool_start", "r1", tool="view", args="README.md", tool_call_id="v1")
+            bus.emit("agent.tool_start", "r1", tool="bash", args="pytest -q", tool_call_id="c9")
+            bus.emit(
+                "agent.tool_end",
+                "r1",
+                tool="bash",
+                tool_call_id="c9",
+                success=False,
+                exit_code=1,
+                error="FAILED test_x\n1 failed",
+            )
+            failed = "✗ `bash` failed (exit 1)"
+            assert wait_for(lambda: any(s.startswith(failed) for s in thread.sent))
+            # the burst message went out once, after the agent message it follows
+            digests = [m for m in thread.messages.values() if m.content.startswith("⚙ ")]
+            assert wait_for(lambda: "14 tool calls (bash x13, view)" in digests[0].content, 8)
+            assert len(digests) == 1
+            assert "last: `pytest -q`" in digests[0].content and "✗ 1 failed" in digests[0].content
+            assert sum(1 for s in thread.sent if s.startswith("⚙ ")) == 1
+            assert not any("$ bash" in s for s in thread.sent)  # no streamed tool lines
+            order = [s[:12] for s in thread.sent]
+            first, second, third = (
+                order.index("**executor**"),
+                order.index("⚙ 1 tool cal"),
+                order.index("✗ `bash` fai"),
+            )
+            assert first < second < third
+            # an agent message closes the burst; the next tool call is a new message
+            bus.emit("agent.message", "r1", content="Now fixing", agent="executor")
+            bus.emit("agent.tool_start", "r1", tool="edit", args="x.py", tool_call_id="e1")
+            assert wait_for(lambda: sum(1 for s in thread.sent if s.startswith("⚙ ")) == 2)
+            assert thread.sent[-1] == "⚙ 1 tool call (edit) — last: `x.py`"
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert wait_for(lambda: any(s.startswith("**finished") for s in thread.sent))
+        finally:
+            bridge.close()
+
+    def test_digest_flags_repetitive_burst_and_surfaces_tool_cap(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path, command_prefix="!loop")
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            for i in range(8):
+                bus.emit(
+                    "agent.tool_start",
+                    "r1",
+                    tool="bash",
+                    args=f"grep -n 'exit {i}' /tmp/out.txt | od -c | head",
+                    tool_call_id=f"c{i}",
+                )
+            bus.emit("phase.end", "r1", task_id="t1", phase="execute", status="ok")
+            msgs = thread.messages
+            assert wait_for(
+                lambda: any("bash x8 similar commands" in m.content for m in msgs.values()), 8
+            )
+            digest = next(m for m in thread.messages.values() if m.content.startswith("⚙ "))
+            assert "may be stuck; `!loop cancel` stops the run" in digest.content
+            bus.emit("agent.tool_cap", "r1", cap=40)
+            assert wait_for(lambda: any("⛔ tool-call ceiling (40)" in s for s in thread.sent))
         finally:
             bridge.close()
 
@@ -549,6 +722,161 @@ class TestBridge:
             assert client.channels[42].sent == []  # no duplicate headline
         finally:
             bridge.close()
+
+    def test_short_run_that_ends_before_the_gateway_is_up_is_posted_in_full(
+        self, tmp_path: Path
+    ) -> None:
+        """--once (#236): a one-tick daemon can start AND finish its run
+        before the gateway connects. Nothing may be dropped — headline,
+        chronology and the finished card all land once the bridge is ready,
+        and close() waits for them instead of exiting mid-queue."""
+        bridge, client, _ = make_bridge(tmp_path)
+        gate = threading.Event()
+
+        async def slow_start(token: str) -> None:
+            while not gate.is_set():
+                await asyncio.sleep(0.02)
+            client.bridge.mark_ready()  # type: ignore[union-attr]
+            while not client.closed:
+                await asyncio.sleep(0.05)
+
+        client.start = slow_start  # type: ignore[method-assign]
+        bridge.start(connect_wait_s=0.2)
+        item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+        bus = EventBus()
+        bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+        bus.emit("agent.message", "r1", content="all done quickly", agent="executor")
+        bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+        assert client.channels[42].sent == []  # still connecting: buffered, not lost
+        gate.set()
+        bridge.close()  # drains before returning
+        control = client.channels[42]
+        assert control.sent and control.sent[0].startswith("▶ run `r1`")
+        thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+        assert any("all done quickly" in s for s in thread.sent)
+        assert any(s.startswith("**finished: completed**") for s in thread.sent)
+        assert control.messages[bridge.dstore.discord_thread("r1").headline_id].content.startswith(  # type: ignore[union-attr]
+            "✅"
+        )
+
+    def test_close_is_bounded_when_the_gateway_never_connects(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+
+        async def never_ready(token: str) -> None:
+            while not client.closed:
+                await asyncio.sleep(0.05)
+
+        client.start = never_ready  # type: ignore[method-assign]
+        bridge.start(connect_wait_s=0.1)
+        bridge.daemon_event("queued something")
+        t0 = time.time()
+        bridge.close(drain_wait_s=0.5)
+        assert time.time() - t0 < 5
+        assert bridge._thread is not None and not bridge._thread.is_alive()
+
+    def test_steer_gets_a_live_wait_note_edited_in_place(self, tmp_path: Path) -> None:
+        """#236: the ⏳ reaction says "received"; the note under the steer
+        says where the agent is (phase, task, tool calls vs the #228
+        ceiling) and is edited as that moves, then resolved with the reply."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            engine = FakeEngine()
+            bus = EventBus()
+            bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit("task.start", "r1", task_id="t2", title="Wire CLI")
+            bus.emit("task.state", "r1", task_id="t2", state="executing", revisions=0, replans=0)
+            for _ in range(3):
+                bus.emit("agent.tool_start", "r1", tool="bash", args="ls")
+            assert wait_for(
+                lambda: (
+                    bridge._progress.get("r1") is not None
+                    and bridge._progress["r1"].tool_calls == 3
+                )
+            )
+            msg = FakeMessage("focus on auth first", thread, mid=777)
+            thread.messages[777] = msg
+            bridge._handle_message(msg)
+            assert wait_for(lambda: any(s.startswith("⏳ steer queued") for s in thread.sent))
+            note_id = next(
+                m.id for m in thread.messages.values() if m.content.startswith("⏳ steer queued")
+            )
+            note = thread.messages[note_id]
+            assert "mid-**execute** on `t2` · Wire CLI (3/40 tool calls so far)" in note.content
+            assert note.content.endswith("answered at the next checkpoint")
+            # more tool calls -> the SAME note is edited, not a new one
+            for _ in range(2):
+                bus.emit("agent.tool_start", "r1", tool="bash", args="ls")
+            assert wait_for(lambda: "5/40 tool calls" in note.content, timeout=8)
+            bus.emit("agent.tool_cap", "r1", cap=40, calls=40, tool="bash")
+            assert wait_for(lambda: "ceiling reached" in note.content, timeout=8)
+            # the engine picks it up at the checkpoint, then answers
+            bus.emit("chat.message", "r1", message_id="m1", text="focus on auth first")
+            assert wait_for(lambda: note.content.startswith("🧭 steer picked up"), timeout=8)
+            bus.emit("chat.reply", "r1", message_id="m1", reply="Will do.", action="steer_task")
+            assert wait_for(lambda: note.content == "✅ steer answered", timeout=8)
+            assert wait_for(lambda: "✅" in msg.reactions)
+            assert sum(1 for s in thread.sent if s.startswith("⏳ steer queued")) == 1
+        finally:
+            bridge.close()
+
+    def test_steer_note_says_so_when_the_run_ends_first(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            msg = FakeMessage("late thought", thread, mid=778)
+            thread.messages[778] = msg
+            bridge._handle_message(msg)
+            assert wait_for(lambda: any(s.startswith("⏳ steer queued") for s in thread.sent))
+            note = next(m for m in thread.messages.values() if m.content.startswith("⏳ steer"))
+            assert note.content == "⏳ steer queued; answered at the next checkpoint"
+            bridge.run_finished(item, RunReport("r1", "completed", "done"))
+            assert wait_for(lambda: note.content.startswith("⚠ steer not answered"))
+            assert any("1 steering message(s) were not answered" in s for s in thread.sent)
+        finally:
+            bridge.close()
+
+    def test_reply_queued_before_the_finish_still_counts_as_answered(self, tmp_path: Path) -> None:
+        """A short run can emit chat.reply and finish before the pump has
+        drained either. Which steers went unanswered is decided by the pump
+        after it drains what was queued ahead of the finish marker, so the
+        queued reply still resolves its steer — no false "not answered"."""
+        bridge, client, _ = make_bridge(tmp_path)
+        gate = threading.Event()
+
+        async def slow_start(token: str) -> None:
+            while not gate.is_set():
+                await asyncio.sleep(0.02)
+            client.bridge.mark_ready()  # type: ignore[union-attr]
+            while not client.closed:
+                await asyncio.sleep(0.05)
+
+        client.start = slow_start  # type: ignore[method-assign]
+        bridge.start(connect_wait_s=0.2)
+        item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+        bus = EventBus()
+        engine = FakeEngine()
+        bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
+        # The steer itself needs a live thread to be posted from Discord; the
+        # bridge's own bookkeeping for it is what the finish path consults.
+        mid = engine.post_user_message("focus on auth first")
+        with bridge._lock:
+            bridge._pending[mid] = _Pending("r1", 4242, 778)
+        bus.emit("chat.reply", "r1", message_id=mid, reply="Will do.", action="steer_task")
+        bridge.run_finished(item, RunReport("r1", "completed", "done"))
+        gate.set()
+        bridge.close()  # drains: chat.reply first, then the finish marker
+        thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+        assert any(s.startswith("**finished: completed**") for s in thread.sent)
+        assert not any("were not answered" in s for s in thread.sent)
+        assert bridge._pending == {}
 
 
 def test_threading_sanity() -> None:

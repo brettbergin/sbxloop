@@ -111,3 +111,20 @@ def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", str(bin_dir), prepend=":")
     return FakeSbx(binary=shim, state=state)
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point HOME at the test's tmp dir.
+
+    ``state_dir`` defaults to ``~/.sbxloop`` and config discovery reads
+    ``~/.config/sbxloop/sbxloop.toml``, so without this every CLI test that
+    relies on defaults would read (and write!) the operator's real state.
+    Tests that chdir into ``tmp_path`` get ``tmp_path/.sbxloop`` as the
+    default state dir — the same place the old relative default landed.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Path.home() reads USERPROFILE on Windows, so pin it too.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return tmp_path

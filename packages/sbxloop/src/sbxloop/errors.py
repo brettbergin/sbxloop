@@ -70,7 +70,16 @@ class ProtocolError(SbxloopError):
 
 
 class GithubOpsError(SbxloopError):
-    """A GitHub operation failed in the github-ops sandbox."""
+    """A GitHub operation failed in the github-ops sandbox.
+
+    ``http_status`` mirrors the worker's structured status so callers that
+    treat some responses as expected (404 on a probe, 409 on an empty repo)
+    compare integers instead of grepping gh's prose (#221).
+    """
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
 
 
 class DeliveryError(SbxloopError):
@@ -83,6 +92,15 @@ class BudgetExceededError(SbxloopError):
 
 class StateError(SbxloopError):
     """Invalid state transition or corrupted persisted state."""
+
+
+class RunCancelledError(StateError):
+    """The engine stopped at a phase boundary because the run was cancelled
+    (in-process ``request_cancel`` or a persisted ``cancelled`` state). A
+    StateError subclass so existing handlers keep working; distinct so the
+    daemon can tell an operator's cancel from an infra failure that raced
+    with it — the persisted state alone cannot (both leave the run
+    resumable)."""
 
 
 class DaemonError(SbxloopError):

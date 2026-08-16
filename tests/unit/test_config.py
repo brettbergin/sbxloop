@@ -119,21 +119,36 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     assert config.daemon.trigger_label == "sbxloop:run"
     assert config.daemon.backlog == "off"
     assert config.daemon.max_runs_per_day == 12
+    # #255: unattended posture — clone isolation, fetch refresh, no state
+    # dir pin (resolved by daemon.paths at startup).
+    assert config.daemon.workspace_isolation == "clone"
+    assert config.daemon.refresh_workspace is True
+    assert config.daemon.state_dir is None
     assert config.discord.enabled is False
     over = load_config(
         cwd=tmp_path,
         env={
             "SBXLOOP_DAEMON__MAX_RUNS_PER_DAY": "3",
             "SBXLOOP_DAEMON__BACKLOG": "github",
+            "SBXLOOP_DAEMON__WORKSPACE_ISOLATION": "in-place",
+            "SBXLOOP_DAEMON__STATE_DIR": "/var/lib/sbxloop",
             "SBXLOOP_DISCORD__CHANNEL_ID": "123456789",
         },
     )
     assert over.daemon.max_runs_per_day == 3
     assert over.daemon.backlog == "github"
+    assert over.daemon.workspace_isolation == "in-place"
+    assert over.daemon.state_dir == Path("/var/lib/sbxloop")
     assert over.discord.enabled is True and over.discord.channel_id == 123456789
+    assert config.daemon.close_on_success is True and config.daemon.tracking_issue is True
+    assert config.daemon.delivered_label == "sbxloop:delivered"
     (tmp_path / "sbxloop.toml").write_text(
         '[daemon]\ntrigger_label = "x"\nin_progress_label = "x"\n'
     )
+    with pytest.raises(ConfigError, match="distinct"):
+        load_config(cwd=tmp_path, env={})
+    # delivered_label takes part in the lifecycle-label distinctness check
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\ndelivered_label = "sbxloop:failed"\n')
     with pytest.raises(ConfigError, match="distinct"):
         load_config(cwd=tmp_path, env={})
     # GitHub labels are case-insensitive: differing only by case is a collision
@@ -245,6 +260,17 @@ def test_limits_defaults(tmp_path: Path) -> None:
     assert config.limits.disk_warn == 85.0
     assert config.limits.disk_abort == 95.0
     assert config.limits.mem_warn == 90.0
+    # #253: memory abort is opt-in — transient spikes are normal under a
+    # parallel test run.
+    assert config.limits.mem_abort == 0.0
+
+
+def test_limits_mem_abort_must_exceed_mem_warn(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text("[limits]\nmem_warn = 90.0\nmem_abort = 85.0\n")
+    with pytest.raises(ConfigError, match="mem_abort"):
+        load_config(cwd=tmp_path, env={})
+    (tmp_path / "sbxloop.toml").write_text("[limits]\nmem_warn = 90.0\nmem_abort = 97.0\n")
+    assert load_config(cwd=tmp_path, env={}).limits.mem_abort == 97.0
 
 
 def test_limits_layers_and_env(tmp_path: Path) -> None:
@@ -276,3 +302,94 @@ def test_limits_abort_must_exceed_warn(tmp_path: Path) -> None:
 def test_limits_must_be_percentages(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"0\.\.100"):
         load_config(cwd=tmp_path, env={"SBXLOOP_LIMITS__DISK_WARN": "150"})
+
+
+class TestStateDirDefault:
+    """#224: the relative ``.sbxloop`` default meant "wherever the shell
+    stood" — state scattered into checkouts and an empty ``status`` from any
+    other directory. The default is now per-user; relative stays opt-in."""
+
+    def test_default_is_per_user_not_cwd(self, tmp_path: Path) -> None:
+        # HOME is tmp_path (autouse fixture); cwd is a different directory.
+        project = tmp_path / "proj"
+        project.mkdir()
+        config = load_config(cwd=project, env={})
+        assert config.state_dir == tmp_path / ".sbxloop"
+        assert config.state_dir.is_absolute()
+
+    def test_relative_opt_in_is_anchored_at_the_config_root(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "sbxloop.toml").write_text('state_dir = ".sbxloop"\n')
+        config, sources = load_config_with_sources(cwd=project, env={})
+        assert config.state_dir == project / ".sbxloop"
+        assert sources["state_dir"] == "sbxloop.toml"
+
+    def test_tilde_expands(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('state_dir = "~/elsewhere"\n')
+        config = load_config(cwd=tmp_path, env={})
+        assert config.state_dir == tmp_path / "elsewhere"
+
+    def test_env_override_wins(self, tmp_path: Path) -> None:
+        env = {"SBXLOOP_STATE_DIR": str(tmp_path / "explicit")}
+        assert load_config(cwd=tmp_path, env=env).state_dir == tmp_path / "explicit"
+
+    def test_mapped_home_governs_default_and_tilde(self, tmp_path: Path) -> None:
+        # A hermetic caller's env HOME must decide state_dir the same way it
+        # decides the user-config path; the process HOME (tmp_path here)
+        # must not leak in.
+        home = tmp_path / "mapped"
+        project = tmp_path / "proj"
+        project.mkdir()
+        env = {"HOME": str(home)}
+        assert load_config(cwd=project, env=env).state_dir == home / ".sbxloop"
+        (project / "sbxloop.toml").write_text('state_dir = "~/elsewhere"\n')
+        assert load_config(cwd=project, env=env).state_dir == home / "elsewhere"
+        assert load_config(cwd=project, env={**env, "SBXLOOP_STATE_DIR": "~"}).state_dir == home
+
+
+class TestUserConfigLayer:
+    """``~/.config/sbxloop/sbxloop.toml`` is the lowest layer: it carries
+    operator-level defaults and every project-level source overrides it."""
+
+    def _write_user(self, home: Path, body: str, xdg: Path | None = None) -> None:
+        root = (xdg or home / ".config") / "sbxloop"
+        root.mkdir(parents=True)
+        (root / "sbxloop.toml").write_text(body)
+
+    def test_read_from_home_config(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        project = tmp_path / "proj"
+        project.mkdir()
+        self._write_user(home, 'model = "gpt-5"\napp_name = "mine"\n')
+        config, sources = load_config_with_sources(cwd=project, env={"HOME": str(home)})
+        assert config.model == "gpt-5"
+        assert config.app_name == "mine"
+        assert sources["model"] == "user config"
+
+    def test_xdg_config_home_takes_priority_over_home(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        xdg = tmp_path / "xdg"
+        self._write_user(home, 'model = "from-home"\n')
+        self._write_user(home, 'model = "from-xdg"\n', xdg=xdg)
+        env = {"HOME": str(home), "XDG_CONFIG_HOME": str(xdg)}
+        assert load_config(cwd=tmp_path, env=env).model == "from-xdg"
+
+    def test_project_layers_override_user_config(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        project = tmp_path / "proj"
+        project.mkdir()
+        self._write_user(home, 'model = "user"\n[budgets]\nmax_tasks = 3\n')
+        (project / "pyproject.toml").write_text('[tool.sbxloop]\nmodel = "pyproject"\n')
+        config, sources = load_config_with_sources(cwd=project, env={"HOME": str(home)})
+        assert config.model == "pyproject"
+        assert sources["model"] == "pyproject.toml"
+        # untouched keys still flow up from the user layer
+        assert config.budgets.max_tasks == 3
+        assert sources["budgets.max_tasks"] == "user config"
+
+    def test_hermetic_env_never_reads_the_real_home(self, tmp_path: Path) -> None:
+        # env={} names no HOME/XDG_CONFIG_HOME → no user layer at all, even
+        # though Path.home() (the autouse tmp HOME) has a file.
+        self._write_user(tmp_path, 'model = "leak"\n')
+        assert load_config(cwd=tmp_path, env={}).model == "auto"

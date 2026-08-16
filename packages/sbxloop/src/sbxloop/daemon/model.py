@@ -9,7 +9,13 @@ from pydantic import BaseModel, ConfigDict
 from sbxloop.engine.model import RunState
 
 ItemSource = Literal["github", "inbox"]
-ItemState = Literal["queued", "running", "done", "failed", "abandoned"]
+# ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
+# it is terminal for the daemon (no retry, no breaker count) while the run
+# itself stays resumable from the CLI.
+ItemState = Literal["queued", "running", "done", "failed", "abandoned", "cancelled"]
+# An operator decision the source has not been told about yet: the row-only
+# CLI (another process) cannot report, so the loop owes and delivers it.
+PendingReport = Literal["abandoned", "requeued"]
 
 
 class WorkItem(BaseModel):
@@ -36,6 +42,7 @@ class WorkItem(BaseModel):
     last_error: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+    pending_report: PendingReport | None = None
 
 
 class RunReport(NamedTuple):
@@ -49,13 +56,21 @@ class RunReport(NamedTuple):
     delivery: tuple[int, str] | None = None
     delivery_error: str | None = None
     workspace: str | None = None
+    # Who asked for the cancel (``state`` is then ``cancelled`` from the
+    # daemon's point of view even though the persisted run is still
+    # resumable — the finish card tells the human how to continue it).
+    cancelled_by: str | None = None
+    # ``!sbx cancel --retry``: the item went straight back to the queue.
+    requeued: bool = False
 
     @property
     def succeeded(self) -> bool:
         return self.state == "completed" and self.delivery_error is None
 
 
-TickOutcome = Literal["done", "retry", "abandoned", "delivery_failed", "interrupted"]
+TickOutcome = Literal[
+    "done", "retry", "abandoned", "delivery_failed", "interrupted", "cancelled", "requeued"
+]
 IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work"]
 
 

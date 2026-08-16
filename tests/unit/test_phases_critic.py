@@ -50,9 +50,15 @@ def runner(agent: ScriptedAgent) -> PhaseRunner:
 
 def record() -> TaskRecord:
     return TaskRecord(
-        spec=TaskSpec(id="t1", title="Build it", acceptance_criteria=["it works"]),
+        spec=TaskSpec(
+            id="t1",
+            title="Build it",
+            acceptance_criteria=["it works"],
+            verify_commands=["test -f README.md"],
+        ),
         state="scrutinizing",
-        plan=PlanModel(steps=["step one"]),
+        last_feedback="verify command failed: `grep -q x out.txt` (exit 1)",
+        plan=PlanModel(steps=["step one"], verify_commands=["grep -q x out.txt"]),
     )
 
 
@@ -140,3 +146,46 @@ class TestValidateDegradedGuard:
         assert outcome.verdict.verdict == "accept"
         assert not outcome.downgraded
         assert len(agent.session_jobs) == 1
+
+
+class TestScrutinizeVerifySuspect:
+    """The scrutinizer judges the checks as well as the work (#231): it is
+    shown the exact verify commands VERIFY will run and the feedback the
+    executor was addressing, and may rule the check itself wrong."""
+
+    def test_prompt_carries_verify_commands_and_prior_feedback(self) -> None:
+        agent = ScriptedAgent([(PASS, None)])
+        scrutinize(agent)
+        prompt = agent.session_jobs[0].prompt or ""
+        # Spec-level and plan-level checks, in VERIFY's order.
+        assert prompt.index("- test -f README.md") < prompt.index("- grep -q x out.txt")
+        assert "verify command failed: `grep -q x out.txt`" in prompt
+        assert '"verify_suspect": false' in prompt
+
+    def test_verify_suspect_ruling_is_parsed(self) -> None:
+        agent = ScriptedAgent(
+            [({**PASS, "verify_suspect": True, "verify_suspect_reason": "wrong bytes"}, None)]
+        )
+        outcome = scrutinize(agent)
+        assert outcome.verdict.verdict == "pass"
+        assert outcome.verdict.verify_suspect
+        assert outcome.verdict.verify_suspect_reason == "wrong bytes"
+
+    def test_verify_suspect_defaults_off(self) -> None:
+        outcome = scrutinize(ScriptedAgent([(PASS, None)]))
+        assert not outcome.verdict.verify_suspect
+        assert outcome.verdict.verify_suspect_reason == ""
+
+    def test_verify_suspect_without_reason_is_retried(self) -> None:
+        # The reason is what the planner is told; a bare flag would spend a
+        # replan on nothing, so it is rejected and the critic gets one retry.
+        agent = ScriptedAgent(
+            [
+                ({**PASS, "verify_suspect": True, "verify_suspect_reason": "  "}, None),
+                ({**PASS, "verify_suspect": True, "verify_suspect_reason": "wrong bytes"}, None),
+            ]
+        )
+        outcome = scrutinize(agent)
+        assert outcome.verdict.verify_suspect_reason == "wrong bytes"
+        assert len(agent.session_jobs) == 2
+        assert "verify_suspect_reason" in (agent.session_jobs[1].prompt or "")

@@ -138,22 +138,25 @@ letting in-VM tooling fail confusingly on a full disk.
 
 ## CLI reference
 
-| Command                               | What it does                                                                                                                                                                                        |
-| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop run "OUTCOME"`               | Start a run. Options: `--repo`, `--report`, `--deliver`, `--deliver-base`, `--deliver-draft`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`.                                       |
-| `sbxloop daemon`                      | The always-on outer loop: poll labeled issues + an inbox dir, run each item, report back, mirror to Discord. Options: `--repo`, `--inbox`, `--backlog`, `--discord-channel`, `--once`, `--dry-run`. |
-| `sbxloop resume RUN`                  | Re-provision sandboxes and continue a checkpointed run under its persisted config.                                                                                                                  |
-| `sbxloop cancel RUN`                  | Cancel an in-flight run.                                                                                                                                                                            |
-| `sbxloop status [RUN]`                | List runs, or show one run's task/phase detail.                                                                                                                                                     |
-| `sbxloop logs RUN`                    | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                |
-| `sbxloop artifacts RUN`               | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                          |
-| `sbxloop shell RUN`                   | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                      |
-| `sbxloop init`                        | Write a commented starter `sbxloop.toml` (`--force` overwrites).                                                                                                                                    |
-| `sbxloop bake`                        | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                 |
-| `sbxloop doctor [--deep]`             | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                         |
-| `sbxloop sandbox ls\|rm\|prune`       | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                  |
-| `sbxloop secrets list\|clean\|rotate` | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                            |
-| `sbxloop config show\|policy`         | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                           |
+| Command                               | What it does                                                                                                                                                                                                                                          |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop run "OUTCOME"`               | Start a run. Options: `--repo`, `--report`, `--deliver`, `--deliver-base`, `--deliver-draft`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`.                                                                                         |
+| `sbxloop daemon`                      | The always-on outer loop: poll labeled issues + an inbox dir, run each item, report back, mirror to Discord. Options: `--repo`, `--inbox`, `--backlog`, `--discord-channel`, `--once`, `--dry-run`.                                                   |
+| `sbxloop daemon ctl CMD`              | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as Discord's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                    |
+| `sbxloop resume RUN`                  | Re-provision sandboxes and continue a checkpointed run under its persisted config.                                                                                                                                                                    |
+| `sbxloop deliver RUN`                 | Deliver (or re-deliver) a completed run's artifacts as a PR from a github-ops sandbox alone — the retry path when end-of-run delivery failed. Options: `--repo`, `--deliver-base`, `--deliver-draft`, `--create-repo`, `--create-public`, `--report`. |
+| `sbxloop cancel RUN`                  | Cancel an in-flight run.                                                                                                                                                                                                                              |
+| `sbxloop status [RUN]`                | List runs, or show one run's task/phase detail.                                                                                                                                                                                                       |
+| `sbxloop logs RUN`                    | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                  |
+| `sbxloop artifacts RUN`               | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                            |
+| `sbxloop shell RUN`                   | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                        |
+| `sbxloop init`                        | Write a commented starter `sbxloop.toml` (`--force` overwrites).                                                                                                                                                                                      |
+| `sbxloop bake`                        | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                   |
+| `sbxloop doctor [--deep]`             | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                           |
+| `sbxloop sandbox ls\|rm\|prune`       | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                    |
+| `sbxloop gc`                          | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                       |
+| `sbxloop secrets list\|clean\|rotate` | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                              |
+| `sbxloop config show\|policy`         | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                             |
 
 ## Network egress: least privilege, by plan
 
@@ -245,14 +248,19 @@ work came from, and keeps going. Two work sources, usable together:
   reporting and delivery forced on (PRs arrive as **drafts** by default),
   and on success comments the summary + PR link and **closes** the issue —
   the PR is now the reviewable object. Failures retry with backoff, then
-  land in `sbxloop:failed` with re-trigger instructions.
+  land in `sbxloop:failed` with re-trigger instructions. For a tracker whose
+  issues are design items rather than tasks, `close_on_success = false` in
+  `[daemon]` leaves the issue open with `sbxloop:delivered` for the human
+  who merges the PR, and `tracking_issue = false` skips the per-run tracking
+  issue (the summary comment on the source issue carries the same info).
 - **Inbox files**: drop a `.md` (first `# heading` = title) into
   `<inbox>/pending/`; it moves through `running/` to `done/` or `failed/`
   with a `<name>.result.md` beside it.
 
 It is **fully autonomous** — a label or a file alone starts a run — so the
 spend guardrails in `[daemon]` are the safety net: a rolling daily run cap,
-a per-item attempt cap, and a consecutive-failure circuit breaker. Treat the
+a per-item attempt cap, a per-item resume cap, and a consecutive-failure
+circuit breaker (persisted, so a restart cannot reset it). Treat the
 trigger label as "execute arbitrary instructions with GH_TOKEN's repo scope"
 and restrict who can apply it. Inner agents can file follow-up work they
 discover (`--backlog github|inbox`) — those land in **triage** (the
@@ -261,8 +269,42 @@ promotes them, unless `backlog_auto_trigger` is set.
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
-an interrupted run (SIGTERM, crash) is resumed on the next start. Ship it as
-a systemd user service with [`contrib/systemd/`](contrib/systemd/).
+an interrupted run (SIGTERM, crash) is resumed on the next start — through
+the same guardrails as any dispatch, and at most `max_resumes_per_item` times
+before it counts as a failed attempt. Ship it as a systemd user service with
+[`contrib/systemd/`](contrib/systemd/).
+
+Individual items are steerable from another shell without stopping the
+daemon: `sbxloop daemon items` lists them (state, attempts, pinned run, last
+error); `sbxloop daemon abandon <item> [--reason …]` gives one up (a live
+daemon cancels its in-flight run and tells the issue/inbox file — the report
+is owed on the row and paid by the next tick or the next daemon start, once);
+`sbxloop daemon retry <item>` re-queues an abandoned or cancelled item with attempts
+reset and a **fresh plan** — not a resume of the plan that failed; and
+`sbxloop daemon requeue <item>` drops a running item's pinned run so its
+next dispatch starts over (attempts and backoff kept). The same controls are
+`!sbx items|abandon|retry|requeue` on Discord.
+
+**Workspace posture for unattended runs.** Point `[sandbox] workspace` at a
+**dedicated clone nobody edits** (`git clone <repo> ~/sbxloop-runner/src`),
+not the checkout you work in. Before each fresh run the daemon
+`git fetch`es that clone and fast-forwards its branch to its upstream (the
+remote the branch tracks; `origin/<branch>` when none is configured) — never
+a merge or rebase; a diverged branch or a colliding local edit is left alone
+and logged — so runs start from the current remote branch rather than a
+stale local HEAD (`[daemon] refresh_workspace`). Daemon runs use `clone`
+isolation regardless of `[sandbox] workspace_isolation` (`[daemon] workspace_isolation`, default `clone`): a dirty tree proceeds from committed
+HEAD with a warning, because `auto`'s refusal has no human present to answer
+it. Per-run clones point their `origin` at the source's origin URL (metadata
+only; any userinfo such as an embedded token is stripped from the URL, so
+no credentials leave the host). And the daemon keeps its state
+**outside the workspace** at an absolute path — `[daemon] state_dir`, else
+an explicitly configured `state_dir`, else a pre-existing legacy
+`./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`
+(`~/.local/state/…`) — so a checkout never accretes one full clone per run.
+The daemon prints the resolved location at start; the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule, while
+`sbxloop status`/`logs`/`gc` from the runner directory need
+`SBXLOOP_STATE_DIR` pointed at it.
 
 ### Discord: chronology out, steering in
 
@@ -272,19 +314,35 @@ card per run in the control channel (source, run id, branch, tracking
 issue, PR, task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
-code-fence boundaries instead of clipped; consecutive tool calls batched
-into one code block with failures marked; one **status line edited in
-place** as tasks progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
+code-fence boundaries instead of clipped; each burst of tool calls
+digested into **one line edited in place** (`⚙ 23 tool calls (bash x21, view x2) — last: pytest -q`, with a "may be stuck" nudge when the last
+calls are near-identical) — failed calls still get their own detail
+block, and `chronology_level = "verbose"` streams every call batched into
+code blocks instead; one **status line edited in place** as tasks
+progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
 and branch as links; verify failures, worker errors, denied permissions and
 refused egress called out; and a finished report card (the headline turns
 ✅/❌/⚠). Mentions are always disabled, so model output can never ping the
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
 `chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
-checkpoint, which can be minutes into a long step — the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause|resume|cancel|queue` in the
-control channel drive the daemon itself. Anyone who can post in the channel
-can steer — that is the boundary to set.
+checkpoint, which can be minutes into a long step — a note under your
+message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
+when the reply lands). `!sbx status|pause|resume|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>` in the control channel drive the daemon
+itself. `!sbx cancel` stops the current run at its next boundary and settles
+the item as **cancelled** — attributed to you on the source, no automatic
+retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
+on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run
+instead, and `!sbx retry <item>` reruns any cancelled or abandoned item with
+its attempt budget reset. Anyone who can post in the channel
+can steer — that is the boundary to set. The bot ignores messages from bots
+(itself included), so scripts drive the daemon with `sbxloop daemon ctl <verb>`
+instead — the same verbs through the same dispatcher, no Discord needed; a
+request no daemon picks up within `--timeout` (30s) is withdrawn, so a stale
+`cancel` never fires when the daemon starts later. Timing out is not "not
+executed": once the daemon has taken a request it keeps running (item verbs
+cross the ops sandbox), and `ctl` reports it as pending (exit 1) rather than
+absent (exit 2).
 
 Bot setup, once: create an application in the Discord Developer Portal, add
 a bot, enable the **Message Content** privileged intent, copy the token, and
@@ -374,7 +432,13 @@ PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with
   github-ops sandbox (`GH_TOKEN` only). Needs `contents:write` +
   `pull_requests:write` on the repo. Delivery runs after the run has already
   succeeded; delivery failures are reported loudly (`run.deliver` event) but
-  never fail a completed run.
+  never fail a completed run. When one does fail, `sbxloop deliver <run>`
+  retries it later without re-running the work: it provisions only the
+  github-ops sandbox, reuses the run's persisted config (`--repo` and the
+  other options override its `[github]` section, so a run that never named a
+  repo can still be delivered), force-moves the same `sbxloop/<run>` branch
+  and reuses an already-open PR, and `--report` refreshes the tracking issue
+  with the PR link.
 
 ## Debugging failed runs
 
@@ -425,20 +489,28 @@ missing compiler on its first build and spending revision budget on it:
 languages = ["python"]   # the default when the key is unset
 ```
 
-| Value        | Also accepts               | Installs                                                      |
-| ------------ | -------------------------- | ------------------------------------------------------------- |
-| `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt)                           |
-| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt) |
-| `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)   |
-| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`             |
-| `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)    |
-| `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)         |
-| `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                        |
-| `go`         | `golang`                   | Go toolchain (pinned tarball from `go.dev`)                   |
-| `rust`       | `rs`, `cargo`              | cargo, rustc, rustfmt, clippy (pinned rustup)                 |
-| `dotnet`     | `csharp`, `c#`, `net`      | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`    |
+| Value        | Also accepts               | Installs                                                         |
+| ------------ | -------------------------- | ---------------------------------------------------------------- |
+| `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 (pinned) |
+| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)    |
+| `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)      |
+| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                |
+| `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)       |
+| `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)            |
+| `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                           |
+| `go`         | `golang`                   | Go toolchain (pinned tarball from `go.dev`)                      |
+| `rust`       | `rs`, `cargo`              | cargo, rustc, rustfmt, clippy (pinned rustup)                    |
+| `dotnet`     | `csharp`, `c#`, `net`      | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`       |
 
 Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
+
+The `python` entry is uv-aware: when the workspace carries a `uv.lock`, the
+prompts steer the agent to `uv sync` / `uv run …` instead of a hand-made
+`.venv`, and the verify-command lint requires `uv run` heads there (a
+`.venv/bin/pytest` beside a lockfile does not carry a uv workspace's own
+members). Without a lockfile the `.venv/bin/…` convention is unchanged.
+`sbxloop doctor --deep` reports the template's own `python3` against the
+pinned series in the `python-version` row.
 
 Three rules apply to every entry. Provisioning is **probe-first** — a template
 that already ships the toolchain costs no install and no network. It is
@@ -451,11 +523,15 @@ than downloaded per run.
 
 ### Toolchains that download from upstream need egress
 
-The apt-only entries (`python`, `cpp`, `ruby`, `java`) work out of the box:
-apt mirrors are in the sandbox's always-reachable baseline. The rest fetch
-from a vendor or registry, and **provisioning runs before the PLAN phase**, so
-a plan's `egress` declaration is too late to help it. Until those domains are
-part of the provisioning baseline, allow them explicitly:
+The apt-only entries (`cpp`, `ruby`, `java`) work out of the box: apt mirrors
+are in the sandbox's always-reachable baseline. So does `python`: its `uv`
+release and the uv-managed Python 3.13 are both GitHub release assets
+(`github.com`, redirecting to `release-assets.githubusercontent.com`), and
+both hosts are in the agent sandbox's provisioning-time allowlist. The rest
+fetch from a vendor or registry, and
+**provisioning runs before the PLAN phase**, so a plan's `egress` declaration
+is too late to help it. Until those domains are part of the provisioning
+baseline, allow them explicitly:
 
 ```toml
 [sandbox]
@@ -495,6 +571,25 @@ non-terminal but silent past `--min-age` (default 1 hour — the persisted event
 stream, heartbeats included, is the liveness signal). Sandboxes deliberately
 kept for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor` reports the current orphan-candidate count.
 
+Run directories accrete too: every run leaves `<state_dir>/runs/<run>/` — a
+full clone of the target checkout under workspace isolation, plus harvested
+artifacts — and an always-on daemon fills the disk with them. The daemon
+sweeps them on start and once a day (`[daemon] prune_runs_after_days`,
+default 14; `0` disables), and `sbxloop gc` runs the same policy by hand:
+
+```bash
+sbxloop gc --dry-run             # classify every run directory, remove nothing
+sbxloop gc                       # remove those past the retention window
+sbxloop gc --older-than 3        # a tighter window for this sweep only
+```
+
+Only terminal runs (completed/failed/cancelled) past the window go, and never
+one whose sandboxes were kept or whose delivery failed — that directory is the
+only copy of the work until it is fetched or redelivered. The SQLite rows stay
+(they are the audit trail); each removal is recorded as a `daemon.gc` event on
+the run, and `resume` refuses a run whose workspace is gone. Fetch results
+back within the retention window — the finish summary prints it.
+
 ## Setup
 
 1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then
@@ -529,8 +624,12 @@ live-sandbox verdicts from the cache; `sbxloop doctor --deep` boots one
 scratch sandbox for the full suite. When an sbx upgrade flips a verdict that
 sbxloop's behavior depends on, doctor warns loudly and names the dependent
 behavior. Ordinary runs feed the same cache, so verdicts stay fresh for free.
-Doctor also checks the installed Copilot SDK's permission-kind vocabulary
-against the field-verified snapshot backing the read-only critic barrier.
+`sbxloop doctor --fail-on-drift` turns that warning into an exit code (any
+drifted, errored, or unprobed probe fails) — the CI e2e lane uses it, and the
+scheduled `sbx-conformance` workflow runs it against the newest sbx release
+ahead of adoption. Doctor also checks the installed Copilot SDK's
+permission-kind vocabulary against the field-verified snapshot backing the
+read-only critic barrier.
 
 ### Secret registration hygiene
 
@@ -553,9 +652,11 @@ secret or registrations owned by other tools.
 ## Configuration
 
 Configuration resolves, in order, from `SBXLOOP_*` environment variables,
-`sbxloop.toml`, and `pyproject.toml [tool.sbxloop]`. `sbxloop init` writes a
-commented starter file; `sbxloop config show` prints every resolved value and
-where it came from. The notable knobs:
+`./sbxloop.toml`, `pyproject.toml [tool.sbxloop]`, and a user-level
+`~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) for settings
+that follow you rather than the checkout. `sbxloop init` writes a commented
+starter file; `sbxloop config show` prints every resolved value and where it
+came from. The notable knobs:
 
 | Key                                    | Default            | Meaning                                                                                                 |
 | -------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
@@ -573,6 +674,29 @@ where it came from. The notable knobs:
 | `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
 | `[limits]`                             | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                         |
+
+test failure.
+exhausted" error instead of letting an in-VM OOM surface as an inexplicable
+memory transiently) fails the task with an explicit "sandbox memory
+a warning; `mem_abort` (off by default, because a parallel test run spikes
+Memory pressure is instead made visible through `[limits]`: `mem_warn` emits
+memory flags, so the microVM is whatever size sbx gives every sandbox.
+sbxloop does not size the sandbox: `sbx create` is called without CPU or
+
+pytest run's first traceback and its failure summary both survive.
+critic keeps the first 2 KB and the last 4 KB of each command, so a long
+a starting point (4 h wall clock, tool cap 80). Verify output handed to the
+clock. [`contrib/presets/large-repo.toml`](contrib/presets/large-repo.toml) is
+minutes of test time, and 20 tasks × 3 attempts × verify presses on the wall
+packages to orient in — wants more headroom: one verify pass alone can be
+small greenfield project. A large existing repo — thousands of tests, several
+The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
+
+### Sizing budgets for a larger repository
+
+| `[daemon] workspace_isolation` | `clone` | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning). |
+| `[daemon] refresh_workspace` | `true` | `git fetch` + fast-forward the workspace checkout before each fresh daemon run. |
+| `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
 
 ## Repository layout
 

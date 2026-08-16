@@ -120,6 +120,9 @@ class ErrorInfo(ProtocolModel):
     type: str
     message: str
     detail: str | None = None
+    # HTTP status of a failed github.op, so the host can branch on the code
+    # rather than on message wording (#221). None for non-HTTP failures.
+    http_status: int | None = None
 
 
 class JobRequest(ProtocolModel):
