@@ -23,6 +23,26 @@ def ev(type: str, **data: Any) -> Event:
     return Event.now(type, "r1", **data)
 
 
+class FakeEmbed:
+    """Stands in for discord.Embed so the bridge's embed plumbing is
+    exercised whether or not discord.py is installed (CI syncs without the
+    extra)."""
+
+    def __init__(self, spec: Any) -> None:
+        self.spec = spec
+        self.fields = [
+            type("F", (), {"name": n, "value": v, "inline": i})() for n, v, i in spec.fields
+        ]
+
+
+@pytest.fixture(autouse=True)
+def _discord_adapters_without_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sbxloop.daemon import discord as bridge_module
+
+    monkeypatch.setattr(bridge_module, "_to_embed", lambda spec: FakeEmbed(spec.clamped()))
+    monkeypatch.setattr(bridge_module, "_allowed_mentions_none", lambda: "none")
+
+
 class TestClip:
     def test_clamps_bad_limits(self) -> None:
         from sbxloop.daemon.discord import DISCORD_MAX_MESSAGE, _clip
@@ -37,70 +57,25 @@ class TestClip:
 
 
 class TestFormat:
-    def test_agent_message_carries_attribution_and_clips(self) -> None:
-        text = format_for_discord(
+    """Bridge-facing contract only; the formatter's exact output lives in
+    tests/unit/test_discord_format.py."""
+
+    def test_returns_chunks_and_drops_noise(self) -> None:
+        chunks = format_for_discord(
             ev("agent.message", content="x" * 5000, agent="planner", model="claude-sonnet-5"),
             max_chars=1900,
         )
-        assert text is not None
-        assert text.startswith("**planner** · `claude-sonnet-5`\n")
-        assert len(text) <= 1900
-
-    def test_skipped_noise_returns_none(self) -> None:
+        assert chunks and chunks[0].text.startswith("**planner** · `claude-sonnet-5`\n")
+        assert all(len(c.text) <= 1900 for c in chunks)
         for t in ("agent.message_delta", "worker.heartbeat", "agent.usage", "sandbox.resources"):
-            assert format_for_discord(ev(t, x=1)) is None
-
-    def test_url_carriers_become_link_lines(self) -> None:
-        assert format_for_discord(ev("run.report", repo="o/r", issue=3, url="https://x/3")) == (
-            "📋 tracking issue #3 https://x/3"
-        )
-        assert format_for_discord(ev("run.deliver", repo="o/r", pr=9, url="https://x/pull/9")) == (
-            "🔀 PR #9 https://x/pull/9"
-        )
-        assert "delivery failed" in (
-            format_for_discord(ev("run.deliver", repo="o/r", error="409")) or ""
-        )
-        assert "created repository" in (
-            format_for_discord(ev("run.deliver", repo="o/r", created=True)) or ""
-        )
-        assert "branch `sbxloop/r1`" in (
-            format_for_discord(
-                ev("sandbox.workspace_clone", branch="sbxloop/r1", source="/p", target="/t")
-            )
-            or ""
-        )
-
-    def test_tool_lines_and_quiet_level(self) -> None:
-        start = ev("agent.tool_start", tool="bash", args="ls -la\n  extra")
-        assert format_for_discord(start) == "⚙ `bash` ls -la extra"
-        assert format_for_discord(start, level="quiet") is None
-        assert format_for_discord(ev("agent.tool_end", tool="bash", success=True)) is None
-        failed = format_for_discord(
-            ev("agent.tool_end", tool="bash", success=False, error="boom\nline2")
-        )
-        assert failed is not None and failed.startswith("✗ `bash` failed")
-
-    def test_chat_events(self) -> None:
-        assert "answering at the next checkpoint" in (
-            format_for_discord(ev("chat.message", message_id="m1", text="hi")) or ""
-        )
-        assert (
-            format_for_discord(ev("chat.reply", message_id="m1", reply="Sure.", action="continue"))
-            == "🧭 **steering:** Sure."
-        )
-        assert "steering failed" in (
-            format_for_discord(ev("chat.reply", message_id="m1", error="worker down")) or ""
-        )
-        assert "applied `steer_task`" in (
-            format_for_discord(ev("chat.action", action="steer_task", guidance="focus auth")) or ""
-        )
+            assert format_for_discord(ev(t, x=1)) == []
 
     def test_headline_states(self) -> None:
         item = WorkItem(
             item_id="gh:4", source="github", source_key="4", title="Fix login", url="https://x/4"
         )
         assert headline_text(item, "r1").startswith(
-            "▶ run `r1` — **Fix login** · issue #4 (https://x/4)"
+            "▶ run `r1` — **Fix login** · [issue #4](https://x/4)"
         )
         assert headline_text(item, "r1", "completed").startswith("✅")
         assert headline_text(item, "r1", "delivery_failed").startswith("⚠")
@@ -122,8 +97,11 @@ class FakeMessage:
     async def add_reaction(self, emoji: str) -> None:
         self.reactions.append(emoji)
 
-    async def edit(self, *, content: str) -> None:
-        self.content = content
+    async def edit(self, *, content: str | None = None, embed: Any = None) -> None:
+        if content is not None:
+            self.content = content
+        self.embed = embed
+        self.edits = getattr(self, "edits", 0) + 1
 
     async def create_thread(self, name: str) -> FakeChannel:
         thread = FakeChannel(self.channel.client, self.channel.id * 10 + 1, name=name)
@@ -137,13 +115,17 @@ class FakeChannel:
         self.id = cid
         self.name = name
         self.sent: list[str] = []
+        self.sent_kwargs: list[dict[str, Any]] = []
         self.messages: dict[int, FakeMessage] = {}
         self._next_id = 100
 
-    async def send(self, text: str) -> FakeMessage:
-        self.sent.append(text)
+    async def send(self, text: str | None = None, **kwargs: Any) -> FakeMessage:
+        # discord.py signature: send(content=None, *, embed=..., allowed_mentions=..., ...)
+        self.sent.append(text or "")
+        self.sent_kwargs.append(kwargs)
         self._next_id += 1
-        msg = FakeMessage(text, self, mid=self._next_id)
+        msg = FakeMessage(text or "", self, mid=self._next_id)
+        msg.embed = kwargs.get("embed")
         self.messages[msg.id] = msg
         return msg
 
@@ -267,13 +249,18 @@ class TestBridge:
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             control = client.channels[42]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
-            thread_id = bridge.dstore.discord_thread("r1")[1]  # type: ignore[index]
+            thread_id = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
             thread = client.channels[thread_id]
             assert control.sent and control.sent[0].startswith("▶ run `r1`")
             bus.emit("agent.message", "r1", content="Planning now", agent="planner", model="m")
             bus.emit("run.deliver", "r1", repo="o/r", pr=3, url="https://x/pull/3")
             assert wait_for(lambda: any("planner" in s for s in thread.sent))
-            assert wait_for(lambda: any("PR #3" in s for s in thread.sent))
+            assert wait_for(
+                lambda: any("PR [#3 · o/r](https://x/pull/3)" in s for s in thread.sent)
+            )
+            # every send disables mentions; the headline carries an embed card
+            assert all("allowed_mentions" in k for k in control.sent_kwargs + thread.sent_kwargs)
+            assert control.sent_kwargs[0].get("embed") is not None
             bridge.run_finished(
                 item,
                 RunReport("r1", "completed", "1/1 tasks done", delivery=(3, "https://x/pull/3")),
@@ -281,8 +268,15 @@ class TestBridge:
             assert wait_for(
                 lambda: any(s.startswith("**finished: completed**") for s in thread.sent)
             )
-            headline = control.messages[bridge.dstore.discord_thread("r1")[2]]  # type: ignore[index]
+            headline = control.messages[bridge.dstore.discord_thread("r1").headline_id]  # type: ignore[union-attr]
             assert wait_for(lambda: headline.content.startswith("✅"))
+            # the finished card is an embed with the PR field
+            finish_kwargs = [
+                k
+                for t, k in zip(thread.sent, thread.sent_kwargs, strict=True)
+                if t.startswith("**finished")
+            ]
+            assert finish_kwargs and finish_kwargs[0].get("embed") is not None
         finally:
             bridge.close()
 
@@ -306,7 +300,7 @@ class TestBridge:
             bus = EventBus()
             bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
-            thread = client.channels[bridge.dstore.discord_thread("r1")[1]]  # type: ignore[index]
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
             msg = FakeMessage("focus on auth first", thread, mid=777)
             thread.messages[777] = msg
             bridge._handle_message(msg)
@@ -327,7 +321,7 @@ class TestBridge:
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
-            thread = client.channels[bridge.dstore.discord_thread("r1")[1]]  # type: ignore[index]
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
             bridge.run_finished(item, RunReport("r1", "completed", "done"))
             bridge._handle_message(FakeMessage("too late?", thread))
             assert engine.posted == []
@@ -384,7 +378,7 @@ class TestBridge:
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
-            thread_id = bridge.dstore.discord_thread("r1")[1]  # type: ignore[index]
+            thread_id = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
             bridge._handle_message(FakeMessage("also add a docstring", control))
             assert wait_for(lambda: any(f"<#{thread_id}>" in s and "r1" in s for s in control.sent))
             assert engine.posted == []  # never treated as steering
@@ -423,6 +417,119 @@ class TestBridge:
         try:
             bridge.daemon_event("circuit breaker opened")
             assert wait_for(lambda: "circuit breaker opened" in client.channels[42].sent)
+            # URLs are masked so notices do not unfurl; an item we ran points at its thread
+            item = WorkItem(item_id="gh:8", source="github", source_key="8", title="T")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            tid = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
+            bridge.daemon_event("✅ gh:8 done (1/1 tasks done) · PR https://x/pull/9")
+            assert wait_for(
+                lambda: any(
+                    "<https://x/pull/9>" in s and f"<#{tid}>" in s for s in client.channels[42].sent
+                )
+            )
+        finally:
+            bridge.close()
+
+    def test_tool_calls_are_batched_into_one_block(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            for i in range(3):
+                bus.emit(
+                    "agent.tool_start", "r1", tool="bash", args=f"ls {i}", tool_call_id=f"c{i}"
+                )
+                bus.emit("agent.tool_end", "r1", tool="bash", tool_call_id=f"c{i}", success=True)
+            bus.emit("agent.tool_start", "r1", tool="bash", args="pytest -q", tool_call_id="c9")
+            bus.emit(
+                "agent.tool_end",
+                "r1",
+                tool="bash",
+                tool_call_id="c9",
+                success=False,
+                exit_code=1,
+                error="FAILED test_x\n1 failed",
+            )
+            assert wait_for(lambda: any("✗ `bash` failed (exit 1)" in s for s in thread.sent))
+            batch = next(s for s in thread.sent if s.startswith("```text\n$ bash  ls 0"))
+            assert batch.count("$ bash") == 4 and "pytest -q   ✗ exit 1" in batch
+            assert batch.endswith("```")
+            detail = next(s for s in thread.sent if s.startswith("✗ `bash` failed"))
+            assert "```text\nFAILED test_x\n1 failed\n```" in detail
+        finally:
+            bridge.close()
+
+    def test_status_line_is_one_message_edited_in_place(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit(
+                "task.state",
+                "r1",
+                task_id="t1",
+                title="Add tests",
+                state="pending",
+                revisions=0,
+                replans=0,
+            )
+            bus.emit(
+                "task.state",
+                "r1",
+                task_id="t2",
+                title="Wire CLI",
+                state="pending",
+                revisions=0,
+                replans=0,
+            )
+            bus.emit("task.start", "r1", task_id="t1", title="Add tests")
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1").status_id is not None)  # type: ignore[union-attr]
+            sid = bridge.dstore.discord_thread("r1").status_id  # type: ignore[union-attr]
+            status_msg = thread.messages[sid]
+            assert wait_for(lambda: status_msg.content.startswith("⏳ task 1/2 · **Add tests**"), 8)
+            # rapid transitions coalesce into edits of the SAME message
+            for st in ("executing", "verifying"):
+                bus.emit("task.state", "r1", task_id="t1", state=st, revisions=0, replans=0)
+            bus.emit("task.end", "r1", task_id="t1", title="Add tests", state="done")
+            bus.emit("task.start", "r1", task_id="t2", title="Wire CLI")
+            assert wait_for(lambda: "task 2/2" in status_msg.content, timeout=8)
+            assert "✅ 1 done" in status_msg.content
+            assert sum(1 for s in thread.sent if s.startswith("⏳")) == 1
+            bridge.run_finished(item, RunReport("r1", "completed", "2/2 tasks done"))
+            assert wait_for(lambda: status_msg.content.startswith("✅ finished"), timeout=8)
+        finally:
+            bridge.close()
+
+    def test_headline_card_gains_branch_and_pr(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(
+                item_id="gh:4", source="github", source_key="4", title="Fix", url="https://x/4"
+            )
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            control = client.channels[42]
+            headline = control.messages[bridge.dstore.discord_thread("r1").headline_id]  # type: ignore[union-attr]
+            bus.emit("sandbox.workspace_clone", "r1", source="/p", target="/t", branch="sbxloop/r1")
+            assert wait_for(lambda: getattr(headline, "edits", 0) >= 1)
+            bus.emit("run.deliver", "r1", repo="o/r", pr=3, url="https://x/pull/3")
+            assert wait_for(lambda: getattr(headline, "edits", 0) >= 2)
+            # the edited card lists the branch and PR (embed converted when discord.py present)
+            embed = headline.embed
+            assert embed is not None
+            names = [f.name for f in embed.fields]
+            assert "Branch" in names and "PR" in names
         finally:
             bridge.close()
 

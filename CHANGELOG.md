@@ -6,6 +6,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Discord bridge output is now Discord-native: headline, finished report and
+  `!sbx status` as embed cards; agent messages split at paragraph/code-fence
+  boundaries (fences re-opened with their language) instead of clipped;
+  consecutive tool calls batched into one code block with `✗ exit N` markers;
+  a per-run status line edited in place as tasks progress (persisted, so a
+  restarted daemon keeps editing the same message); issue/PR/branch as masked
+  links (raw URLs in notices wrapped so they don't unfurl); verify failures,
+  worker errors, denied permissions, refused egress and tooling warnings
+  surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
+  `status_line`, `tool_batch_lines`. Pure formatting layer
+  `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+
 ## [0.6.0] — 2026-08-15
 
 Rollup release: everything below shipped incrementally as the auto-released
