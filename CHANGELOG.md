@@ -17,8 +17,8 @@ All notable changes to sbxloop are documented here. The project adheres to
   comment + in-progress label removed, trigger left for a human), while the
   run itself stays resumable — the finish card and source comment say
   `sbxloop resume RUN`. New `!sbx cancel --retry` re-queues the item for a
-  fresh run instead, and `!sbx requeue <item>` reruns any cancelled or
-  abandoned item (a human re-queue resets the attempt budget and skips the
+  fresh run instead, and `!sbx retry <item>` reruns any cancelled or
+  abandoned item (a human retry resets the attempt budget and skips the
   failure backoff; the daily cap still applies).
 
 ### Added
@@ -36,6 +36,20 @@ All notable changes to sbxloop are documented here. The project adheres to
   whose `sbxloop/<run>` branch already exists (a prior partial attempt)
   force-updates the branch and reuses an already-open PR for that head
   instead of failing on the refs POST 422.
+
+- Operator controls for individual daemon work items (#229).
+  `sbxloop daemon items` lists every item with state, attempts, pinned run
+  and last error; `sbxloop daemon abandon <item> [--reason]` gives one up,
+  `sbxloop daemon retry <item>` re-queues an abandoned or cancelled item
+  with attempts reset and a fresh plan (not a resume), `sbxloop daemon requeue <item>` unpins a running item from its run so the next dispatch
+  starts over (attempts kept). Same controls on Discord as
+  `!sbx items|abandon|retry|requeue`. A live daemon
+  honors a CLI abandon/requeue of the item in flight within a second — the
+  run is cancelled, the operator's decision wins over the run's own outcome
+  (no retry, no breaker count), and the source hears `report_abandoned`
+  exactly once. Field origin: a spiraling item (#228) could only be
+  abandoned by poking `DaemonStore` from Python, and recovery would have
+  resumed the doomed plan.
 
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence

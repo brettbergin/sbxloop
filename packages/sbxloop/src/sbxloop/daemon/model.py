@@ -64,7 +64,9 @@ class RunReport(NamedTuple):
         return self.state == "completed" and self.delivery_error is None
 
 
-TickOutcome = Literal["done", "retry", "abandoned", "delivery_failed", "interrupted", "cancelled"]
+TickOutcome = Literal[
+    "done", "retry", "abandoned", "delivery_failed", "interrupted", "cancelled", "requeued"
+]
 IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work"]
 
 

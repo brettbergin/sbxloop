@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, NoReturn, cast, get_args
 
 import typer
 from pydantic import ValidationError
@@ -32,6 +32,7 @@ from sbxloop.config import (
     load_config_with_sources,
     load_dotenv_file,
 )
+from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
@@ -70,9 +71,14 @@ config_app = typer.Typer(help="Inspect configuration.", no_args_is_help=True)
 secrets_app = typer.Typer(
     help="Manage the sbx custom-secret registrations sbxloop owns.", no_args_is_help=True
 )
+# `sbxloop daemon` runs the loop; `sbxloop daemon items|abandon|retry|requeue`
+# are the operator's item controls (#229), so the group's callback IS the
+# daemon and only defers when a subcommand was named.
+daemon_app = typer.Typer(invoke_without_command=True)
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(config_app, name="config")
 app.add_typer(secrets_app, name="secrets")
+app.add_typer(daemon_app, name="daemon")
 
 console = Console()
 
@@ -1286,8 +1292,9 @@ def init(
     console.print(f"wrote {path}")
 
 
-@app.command()
+@daemon_app.callback()
 def daemon(
+    ctx: typer.Context,
     repo: Annotated[
         str | None,
         typer.Option("--repo", help='GitHub repository ("owner/name") to poll for labeled issues.'),
@@ -1319,14 +1326,16 @@ def daemon(
 ) -> None:
     """Run the always-on outer loop: discover work (labeled GitHub issues,
     inbox files), run each item through the inner loop, report back, and
-    mirror the chronology to Discord."""
+    mirror the chronology to Discord. Subcommands inspect and steer
+    individual work items."""
+    if ctx.invoked_subcommand is not None:
+        return
     import logging
 
     from sbxloop.daemon.discord import DiscordBridge
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.loop import DaemonLoop
     from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels, InboxSource, WorkSource
-    from sbxloop.daemon.store import DaemonStore
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -1444,6 +1453,106 @@ def daemon(
         if github is not None:
             github.close()
         dstore.close()
+
+
+def _daemon_store() -> DaemonStore:
+    return DaemonStore(load_config().state_dir / "state.db")
+
+
+_ITEM_CONTROL_NOTE = (
+    "[dim]a live daemon notices the change within a second: an in-flight run for "
+    "this item is cancelled and the source (issue / inbox file) is told; the item's "
+    "next dispatch, if any, starts a fresh run.[/]"
+)
+
+
+@daemon_app.command("items")
+def daemon_items(
+    state: Annotated[
+        list[str] | None,
+        typer.Option("--state", "-s", help="Only these states (repeatable)."),
+    ] = None,
+) -> None:
+    """List work items with attempts, pinned run and last error."""
+    from sbxloop.daemon.model import ItemState
+
+    states = tuple(state or ())
+    bad = [s for s in states if s not in get_args(ItemState)]
+    if bad:
+        console.print(f"[bold red]unknown item state:[/] {', '.join(bad)}")
+        raise typer.Exit(2)
+    dstore = _daemon_store()
+    try:
+        items = dstore.items(cast(Any, states) or None)
+    finally:
+        dstore.close()
+    if not items:
+        console.print("no work items")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("item", "state", "attempts", "run", "title", "last error"):
+        table.add_column(col)
+    for i in items:
+        table.add_row(
+            i.item_id,
+            i.state,
+            str(i.attempts),
+            i.run_id or "",
+            i.title[:60],
+            (i.last_error or "").splitlines()[0][:80] if i.last_error else "",
+        )
+    console.print(table)
+
+
+@daemon_app.command("abandon")
+def daemon_abandon(
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+    reason: Annotated[str | None, typer.Option("--reason", help="Recorded as last error.")] = None,
+) -> None:
+    """Give up on a queued or running item; its run will not be resumed."""
+    _item_control("abandon", item_id, reason)
+
+
+@daemon_app.command("retry")
+def daemon_retry(
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+) -> None:
+    """Re-queue an abandoned/cancelled item with attempts reset and a fresh plan (not a resume)."""
+    _item_control("retry", item_id, None)
+
+
+@daemon_app.command("requeue")
+def daemon_requeue(
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+) -> None:
+    """Unpin a running item from its run so the next dispatch starts fresh (attempts kept)."""
+    _item_control("requeue", item_id, None)
+
+
+def _item_control(action: str, item_id: str, reason: str | None) -> None:
+    dstore = _daemon_store()
+    try:
+        now = time.time()
+        if action == "abandon":
+            item = dstore.abandon(item_id, reason or "abandoned by operator", now)
+        elif action == "retry":
+            item = dstore.retry(item_id, now, "re-queued by operator (CLI)")
+        else:
+            item = dstore.requeue(item_id, now)
+    except KeyError:
+        console.print(f"[bold red]unknown work item:[/] {item_id}")
+        raise typer.Exit(2) from None
+    except ValueError as exc:
+        console.print(f"[bold red]{action} refused:[/] {exc}")
+        raise typer.Exit(2) from None
+    finally:
+        dstore.close()
+    console.print(
+        f"{item.item_id}: [bold]{item.state}[/] (attempts {item.attempts}"
+        + (f", run {item.run_id}" if item.run_id else "")
+        + ")"
+    )
+    console.print(_ITEM_CONTROL_NOTE)
 
 
 @app.command()

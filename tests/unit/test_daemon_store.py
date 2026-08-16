@@ -97,7 +97,7 @@ class TestQueueAndAttempts:
         assert got is not None
         assert got.state == "abandoned" and got.attempts == 2 and got.last_error == "err2"
 
-    def test_cancelled_is_terminal_and_requeue_resets_the_attempt_budget(
+    def test_cancelled_is_terminal_and_retry_resets_the_attempt_budget(
         self, tmp_path: Path
     ) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -108,9 +108,12 @@ class TestQueueAndAttempts:
         assert got is not None and got.state == "cancelled" and got.last_error == "cancelled by op"
         assert store.next_queued(now=1e9, backoff_s=1) is None  # never auto-retried
         assert store.upsert_new(item(), now=4.0) is False  # re-discovery dedups like done
-        store.requeue("gh:7", "re-queued by op", now=5.0)
+        with pytest.raises(ValueError, match="use retry"):
+            store.requeue("gh:7", now=5.0)  # requeue is for running/queued items
+        store.retry("gh:7", now=5.0, reason="re-queued by op")
         got = store.get("gh:7")
         assert got is not None and got.state == "queued" and got.attempts == 0
+        assert got.last_error == "re-queued by op"
         # Cancel keeps the run for `sbxloop resume`; a re-queue runs fresh, so
         # the pin must go or the next tick would resume the cancelled run.
         assert got.run_id is None
@@ -217,3 +220,62 @@ class TestLedgerBacklogThreads:
         assert daemon_store.get("gh:7").run_id == "r1"  # type: ignore[union-attr]
         engine_store.close()
         daemon_store.close()
+
+
+class TestOperatorControls:
+    """#229: abandon / retry / requeue transitions and what they clear."""
+
+    def test_abandon_keeps_run_id_and_records_reason(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        got = store.abandon("gh:7", "spiraling plan", now=3.0)
+        assert got.state == "abandoned" and got.run_id == "r1"
+        assert got.last_error == "spiraling plan"
+        with pytest.raises(ValueError, match="already abandoned"):
+            store.abandon("gh:7", "again", now=4.0)
+        with pytest.raises(KeyError):
+            store.abandon("gh:404", "x", now=4.0)
+
+    def test_retry_resets_attempts_and_unpins_run(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_failed("gh:7", "boom", now=3.0, requeue=False)
+        got = store.retry("gh:7", now=4.0)
+        assert (got.state, got.attempts, got.run_id, got.last_error) == ("queued", 0, None, None)
+        assert got.claimed is False  # untouched: whatever the source-side claim was stays
+        # eligible immediately (no backoff): attempts are zero
+        assert store.next_queued(now=4.0, backoff_s=600.0) is not None
+
+    def test_retry_refuses_running_and_done(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        with pytest.raises(ValueError, match="abandon it first"):
+            store.retry("gh:7", now=3.0)
+        store.mark_done("gh:7", now=3.0)
+        with pytest.raises(ValueError, match="is done"):
+            store.retry("gh:7", now=4.0)
+
+    def test_requeue_keeps_attempts_but_clears_run(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        got = store.requeue("gh:7", now=3.0)
+        assert (got.state, got.attempts, got.run_id) == ("queued", 1, None)
+        assert store.running_items() == []
+        store.mark_failed("gh:7", "x", now=4.0, requeue=False)
+        with pytest.raises(ValueError, match="use retry"):
+            store.requeue("gh:7", now=5.0)
+
+    def test_items_lists_all_or_filtered(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("1"), now=1.0)
+        store.upsert_new(item("2"), now=2.0)
+        store.mark_running("gh:2", "r2", now=3.0)
+        store.mark_failed("gh:2", "boom", now=4.0, requeue=False)
+        assert [i.item_id for i in store.items()] == ["gh:1", "gh:2"]
+        assert [i.item_id for i in store.items(["abandoned"])] == ["gh:2"]
+        assert [i.item_id for i in store.items(["queued", "abandoned"])] == ["gh:1", "gh:2"]
+        assert store.items(["done"]) == []

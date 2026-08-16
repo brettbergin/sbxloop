@@ -175,7 +175,7 @@ class FakeLoop:
         self.paused = False
         self.cancelled = 0
         self.cancel_calls: list[tuple[str | None, bool]] = []
-        self.requeued: list[tuple[str, str | None]] = []
+        self.retried: list[tuple[str, str | None]] = []
 
     def status(self) -> dict[str, Any]:
         return {
@@ -199,9 +199,17 @@ class FakeLoop:
         self.cancel_calls.append((requester, retry))
         return True
 
-    def requeue(self, item_id: str, by: str | None = None) -> str | None:
-        self.requeued.append((item_id, by))
-        return None if item_id == "gh:8" else f"unknown item {item_id}"
+    # #229 item controls: the real loop wraps DaemonStore; the fake exposes
+    # the store's own transitions so error text flows through unchanged.
+    def abandon_item(self, item_id: str, reason: str | None = None) -> WorkItem:
+        return self.dstore.abandon(item_id, reason or "abandoned by operator", 1.0)
+
+    def retry_item(self, item_id: str, by: str | None = None) -> WorkItem:
+        self.retried.append((item_id, by))
+        return self.dstore.retry(item_id, 1.0, f"re-queued by {by or 'operator'}")
+
+    def requeue_item(self, item_id: str) -> WorkItem:
+        return self.dstore.requeue(item_id, 1.0)
 
 
 def make_bridge(
@@ -365,35 +373,79 @@ class TestBridge:
             assert "paused" in joined and "resumed." in joined
             assert floop.cancelled == 1 and "cancel requested" in joined
             assert "queue is empty." in joined
-            assert "commands:" in joined
+            assert "commands:" in joined and "abandon <item> [reason]" in joined
         finally:
             bridge.close()
 
-    def test_cancel_and_requeue_are_attributed_to_the_author(self, tmp_path: Path) -> None:
-        """#246: the loop settles a cancel by who asked (GitHub comment,
-        finish card); --retry re-queues instead; requeue reruns a settled item."""
+    def test_item_commands_abandon_retry_requeue(self, tmp_path: Path) -> None:
+        """#229: `!sbx items|abandon|retry|requeue` mirror the CLI; a refused
+        transition answers with the store's reason instead of a traceback."""
         bridge, client, floop = make_bridge(tmp_path)
+        floop.dstore.upsert_new(
+            WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A"), 1.0
+        )
+        floop.dstore.mark_running("inbox:a.md", "r1", 1.0)
         bridge.start()
         try:
             control = client.channels[42]
-            for cmd in (
-                "!sbx cancel",
-                "!sbx cancel --retry",
-                "!sbx cancel --rety",  # typo: must not become a no-retry cancel
-                "!sbx requeue gh:8",
-                "!sbx requeue",
-            ):
+
+            def ask(cmd: str) -> str:
+                # Item commands run off the gateway loop (executor), so
+                # replies to a burst may interleave: send one, await one.
+                n = len(control.sent)
                 bridge._handle_message(FakeMessage(cmd, control))
-            assert wait_for(lambda: len(control.sent) >= 5)
+                assert wait_for(lambda: len(control.sent) > n), cmd
+                return control.sent[n]
+
+            reply = ask("!sbx items")
+            assert "`inbox:a.md` running" in reply and "run `r1`" in reply
+            assert ask("!sbx abandon").startswith("usage: abandon")
+            reply = ask("!sbx retry inbox:a.md")
+            assert "retry failed:" in reply and "abandon it first" in reply
+            reply = ask("!sbx abandon inbox:a.md plan spiraled")
+            assert "abandoned" in reply and "`r1`" in reply
+            reply = ask("!sbx requeue inbox:a.md")
+            assert "requeue failed:" in reply and "use retry" in reply
+            assert "attempts reset" in ask("!sbx retry inbox:a.md")
+            reply = ask("!sbx abandon gh:404")
+            assert "abandon failed:" in reply and "gh:404" in reply
+            assert "`inbox:a.md` queued" in ask("!sbx items")
+            item = floop.dstore.get("inbox:a.md")
+            assert item is not None and item.state == "queued" and item.attempts == 0
+        finally:
+            bridge.close()
+
+    def test_cancel_and_retry_are_attributed_to_the_author(self, tmp_path: Path) -> None:
+        """#246: the loop settles a cancel by who asked (GitHub comment,
+        finish card); --retry re-queues instead; retry reruns a settled item
+        under the author's name."""
+        bridge, client, floop = make_bridge(tmp_path)
+        floop.dstore.upsert_new(
+            WorkItem(item_id="gh:8", source="github", source_key="8", title="Eight"), 1.0
+        )
+        floop.dstore.mark_running("gh:8", "r1", 1.0)
+        floop.dstore.mark_cancelled("gh:8", "cancelled by op", 2.0)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            for cmd in ("!sbx cancel", "!sbx cancel --retry"):
+                bridge._handle_message(FakeMessage(cmd, control))
+            assert wait_for(lambda: len(control.sent) >= 2)
             assert floop.cancel_calls == [
                 ("Discord user `brett`", False),
                 ("Discord user `brett`", True),
             ]
-            assert floop.requeued == [("gh:8", "Discord user `brett`")]
+            for cmd in ("!sbx retry gh:8", "!sbx retry"):
+                n = len(control.sent)
+                bridge._handle_message(FakeMessage(cmd, control))
+                assert wait_for(lambda n=n: len(control.sent) > n), cmd
+            assert floop.retried == [("gh:8", "Discord user `brett`")]
             joined = "\n".join(control.sent)
             assert "settles as cancelled" in joined and "run again fresh" in joined
-            assert "unknown cancel argument `--rety`" in joined
-            assert "re-queued `gh:8`" in joined and "usage:" in joined
+            assert "`gh:8` re-queued" in joined and "usage: retry" in joined
+            item = floop.dstore.get("gh:8")
+            assert item is not None and item.state == "queued"
+            assert item.last_error == "re-queued by Discord user `brett`"
         finally:
             bridge.close()
 

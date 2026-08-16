@@ -268,6 +268,16 @@ the same guardrails as any dispatch, and at most `max_resumes_per_item` times
 before it counts as a failed attempt. Ship it as a systemd user service with
 [`contrib/systemd/`](contrib/systemd/).
 
+Individual items are steerable from another shell without stopping the
+daemon: `sbxloop daemon items` lists them (state, attempts, pinned run, last
+error); `sbxloop daemon abandon <item> [--reason …]` gives one up (a live
+daemon cancels its in-flight run and tells the issue/inbox file);
+`sbxloop daemon retry <item>` re-queues an abandoned or cancelled item with attempts
+reset and a **fresh plan** — not a resume of the plan that failed; and
+`sbxloop daemon requeue <item>` drops a running item's pinned run so its
+next dispatch starts over (attempts and backoff kept). The same controls are
+`!sbx items|abandon|retry|requeue` on Discord.
+
 ### Discord: chronology out, steering in
 
 With `pip install 'sbxloop[discord]'`, `DISCORD_BOT_TOKEN` in the
@@ -286,12 +296,13 @@ channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
 `chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause|resume|cancel|requeue|queue` in
-the control channel drive the daemon itself. `!sbx cancel` stops the current
-run at its next boundary and settles the item as **cancelled** — attributed
-to you on the source, no automatic retry, no breaker count — while the run
-stays resumable (`sbxloop resume RUN` on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run instead, and `!sbx requeue <item>`
-reruns any cancelled or abandoned item. Anyone who can post in the channel
+when the reply lands). `!sbx status|pause|resume|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>` in the control channel drive the daemon
+itself. `!sbx cancel` stops the current run at its next boundary and settles
+the item as **cancelled** — attributed to you on the source, no automatic
+retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
+on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run
+instead, and `!sbx retry <item>` reruns any cancelled or abandoned item with
+its attempt budget reset. Anyone who can post in the channel
 can steer — that is the boundary to set.
 
 Bot setup, once: create an application in the Discord Developer Portal, add

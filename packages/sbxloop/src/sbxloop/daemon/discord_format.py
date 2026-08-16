@@ -666,7 +666,7 @@ def _cancel_note(item_id: str | None, report: RunReport) -> str:
         return note + " — re-queued; a fresh run starts on the next tick"
     note += f" — {code(f'sbxloop resume {report.run_id}')} continues the run"
     if item_id:
-        note += f"; `!sbx requeue {item_id}` reruns it fresh"
+        note += f"; `!sbx retry {item_id}` reruns it fresh"
     return note
 
 
@@ -734,6 +734,35 @@ def queue_lines(items: list[WorkItem], limit: int = 15) -> str:
     return "\n".join(rows)
 
 
+ITEM_STATE_MARKER = {
+    "queued": "⏳",
+    "running": "▶",
+    "done": "✅",
+    "abandoned": "❌",
+    "failed": "❌",
+}
+
+
+def items_lines(items: list[WorkItem], limit: int = 20) -> str:
+    """One row per work item: state, id, title, attempts, pinned run, last
+    error — what an operator needs to decide between abandon/retry/requeue."""
+    if not items:
+        return "no work items."
+    rows = []
+    for i in items[:limit]:
+        row = f"{ITEM_STATE_MARKER.get(i.state, '•')} {code(i.item_id)} {i.state} · "
+        row += link(_one_line(i.title, 60), i.url) if i.url else _one_line(i.title, 60)
+        row += f" · attempts {i.attempts}"
+        if i.run_id:
+            row += f" · run {code(i.run_id)}"
+        if i.last_error:
+            row += f" · {_one_line(i.last_error, 80)}"
+        rows.append(row)
+    if len(items) > limit:
+        rows.append(f"… and {len(items) - limit} more")
+    return "\n".join(rows)
+
+
 def daemon_notice(text: str, *, thread_id: int | None = None) -> str:
     """A control-channel notice: URLs masked, optional pointer to the run's thread."""
     out = mask_urls(str(text))
@@ -760,6 +789,7 @@ __all__ = [
     "format_for_discord",
     "headline_embed",
     "headline_text",
+    "items_lines",
     "line",
     "link",
     "mask_urls",

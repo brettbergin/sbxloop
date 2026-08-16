@@ -416,6 +416,68 @@ class TestDaemonCommand:
         assert "tick:" in result.output and "no_work" in result.output
 
 
+class TestDaemonItemControls:
+    """#229: `sbxloop daemon items|abandon|retry|requeue` act on the store
+    the daemon shares; they need no live daemon and no sandbox."""
+
+    def seed(self, workdir: Path) -> None:
+        from sbxloop.config import load_config
+        from sbxloop.daemon.model import WorkItem
+        from sbxloop.daemon.store import DaemonStore
+
+        dstore = DaemonStore(load_config().state_dir / "state.db")
+        dstore.upsert_new(
+            WorkItem(item_id="inbox:x.md", source="inbox", source_key="x.md", title="Do X"), 1.0
+        )
+        dstore.mark_running("inbox:x.md", "r_x", 2.0)
+        dstore.close()
+
+    def test_items_lists_state_attempts_and_run(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "items"])
+        assert result.exit_code == 0, result.output
+        assert "no work items" in result.output
+        self.seed(workdir)
+        result = runner.invoke(app, ["daemon", "items"])
+        assert result.exit_code == 0, result.output
+        assert "inbox:x.md" in result.output and "running" in result.output
+        assert "r_x" in result.output
+        result = runner.invoke(app, ["daemon", "items", "--state", "queued"])
+        assert "no work items" in result.output
+        result = runner.invoke(app, ["daemon", "items", "--state", "bogus"])
+        assert result.exit_code == 2 and "unknown item state" in result.output
+
+    def test_abandon_retry_requeue_transitions(self, workdir: Path) -> None:
+        from sbxloop.config import load_config
+        from sbxloop.daemon.store import DaemonStore
+
+        self.seed(workdir)
+        result = runner.invoke(app, ["daemon", "retry", "inbox:x.md"])
+        assert result.exit_code == 2 and "retry refused" in result.output
+        result = runner.invoke(
+            app, ["daemon", "abandon", "inbox:x.md", "--reason", "plan spiraled"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "abandoned" in result.output and "r_x" in result.output
+        dstore = DaemonStore(load_config().state_dir / "state.db")
+        item = dstore.get("inbox:x.md")
+        assert item is not None and item.state == "abandoned"
+        assert item.last_error == "plan spiraled" and item.run_id == "r_x"
+        dstore.close()
+        result = runner.invoke(app, ["daemon", "requeue", "inbox:x.md"])
+        assert result.exit_code == 2 and "requeue refused" in result.output
+        result = runner.invoke(app, ["daemon", "retry", "inbox:x.md"])
+        assert result.exit_code == 0, result.output
+        assert "queued" in result.output and "attempts 0" in result.output
+        result = runner.invoke(app, ["daemon", "abandon", "gh:404"])
+        assert result.exit_code == 2 and "unknown work item" in result.output
+
+    def test_daemon_help_lists_subcommands_and_options(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "--help"])
+        assert result.exit_code == 0
+        for word in ("--inbox", "--once", "items", "abandon", "retry", "requeue"):
+            assert word in result.output
+
+
 class TestDoctor:
     def test_doctor_with_fake_sbx_and_tokens(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

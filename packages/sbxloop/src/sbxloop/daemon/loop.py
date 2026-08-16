@@ -160,29 +160,80 @@ class DaemonLoop:
         handle.engine.request_cancel()
         return True
 
-    def requeue(self, item_id: str, by: str | None = None) -> str | None:
-        """Put a settled (cancelled/abandoned) item back in the queue at a
-        human's request. Returns an error message, or None on success."""
-        item = self.dstore.get(item_id)
-        if item is None:
-            return f"unknown item {item_id}"
-        if item.state not in ("cancelled", "abandoned"):
-            return f"{item_id} is {item.state}; only cancelled or abandoned items can be re-queued"
-        source = self._source_for(item)
-        if source is None:
-            return f"no active source for {item_id}"
-        who = by or "operator"
-        self.dstore.requeue(item_id, f"re-queued by {who}", self.clock())
-        source.report_requeued(item, who)
-        self._notify(f"↻ {item_id} re-queued by {who}")
-        return None
-
     def _take_cancel(self, run_id: str) -> CancelRequest | None:
         """The cancel request for ``run_id``, consumed. Any other pending
         request is stale (its run is gone) and dropped."""
         with self._current_lock:
             request, self._cancel_request = self._cancel_request, None
         return request if request is not None and request.run_id == run_id else None
+
+    # -- operator item controls (#229) --------------------------------------------
+
+    def abandon_item(self, item_id: str, reason: str | None = None) -> WorkItem:
+        """Give up on an item deliberately. If it is the run in flight, the
+        engine is asked to cancel and the settle path reports the abandon
+        (so the source hears about it exactly once, after the run is really
+        down); otherwise the source is told right here."""
+        why = reason or "abandoned by operator"
+        now = self.clock()
+        fresh = self.dstore.abandon(item_id, why, now)
+        if self._cancel_if_current(item_id):
+            self._notify(f"abandoning {item_id}: cancelling its run {fresh.run_id}")
+            return fresh
+        if fresh.run_id is not None:
+            self.dstore.finish_ledger(fresh.run_id, "abandoned", now)
+        source = self._source_for(fresh)
+        if source is not None:
+            source.report_abandoned(fresh, why)
+        self._notify(f"❌ {item_id} abandoned by operator: {why}")
+        return fresh
+
+    def retry_item(self, item_id: str, by: str | None = None) -> WorkItem:
+        """Put a settled (abandoned/cancelled) item back in the queue with a
+        clean slate at a human's request — fresh plan, not a resume — and
+        tell the source who did it (GitHub: re-claim, drop the failed
+        label)."""
+        who = by or "operator"
+        fresh = self.dstore.retry(item_id, self.clock(), f"re-queued by {who}")
+        source = self._source_for(fresh)
+        if source is not None:
+            source.report_requeued(fresh, who)
+        self._notify(f"↻ {item_id} re-queued by {who} (attempts reset)")
+        return fresh
+
+    def requeue_item(self, item_id: str) -> WorkItem:
+        """Drop an item's pinned run so its next dispatch starts fresh
+        (attempts intact). Cancels the run if it is the one in flight."""
+        before = self.dstore.get(item_id)
+        pinned = before.run_id if before is not None else None
+        now = self.clock()
+        fresh = self.dstore.requeue(item_id, now)
+        if self._cancel_if_current(item_id):
+            self._notify(f"requeue: {item_id} — cancelling its run {pinned}")
+        elif pinned is not None:
+            self.dstore.finish_ledger(pinned, "requeued", now)
+            self._notify(f"requeue: {item_id} unpinned from {pinned}")
+        else:
+            self._notify(f"requeue: {item_id} re-queued")
+        return fresh
+
+    def _cancel_if_current(self, item_id: str) -> bool:
+        with self._current_lock:
+            handle = self._current
+        if handle is None or handle.item.item_id != item_id:
+            return False
+        handle.engine.request_cancel()
+        return True
+
+    def _operator_override(self, item_id: str, run_id: str) -> WorkItem | None:
+        """The item row is the daemon's only channel from a CLI running in
+        another process: an item that is no longer ``running`` on *this*
+        run was abandoned/requeued by an operator. Returns the fresh row
+        when so."""
+        fresh = self.dstore.get(item_id)
+        if fresh is None or (fresh.state == "running" and fresh.run_id == run_id):
+            return None
+        return fresh
 
     def quiesce(self) -> None:
         """The cleanup registry's shutdown hook: stop claiming, ask the
@@ -399,12 +450,28 @@ class DaemonLoop:
         thread = threading.Thread(target=target, name=f"sbxloop-daemon-run-{run_id}", daemon=True)
         self._engine_thread = thread
         thread.start()
+        cancel_sent = False
         while thread.is_alive():
             thread.join(timeout=1.0)
+            # `sbxloop daemon abandon|requeue` from another process can only
+            # touch the row; honor it by cancelling the run.
+            if (
+                not cancel_sent
+                and thread.is_alive()
+                and self._operator_override(item.item_id, run_id) is not None
+            ):
+                engine.request_cancel()
+                cancel_sent = True
         with self._current_lock:
             self._current = None
 
         error = result_box.get("error")
+        # An item-level operator decision (abandon/requeue, possibly from
+        # another process) outranks a pending `!sbx cancel`: the row already
+        # says what the item's fate is.
+        override = self._operator_override(item.item_id, run_id)
+        if override is not None:
+            return self._settle_override(item, source, run_id, override, result_box.get("result"))
         cancel = self._take_cancel(run_id)
         if (
             cancel is not None
@@ -431,6 +498,32 @@ class DaemonLoop:
         if error is not None and not isinstance(error, SbxloopError | StateError):
             logger.error("run %s crashed", run_id, exc_info=error)
         return self._settle(item, source, run_id, result_box.get("result"), error)
+
+    def _settle_override(
+        self,
+        item: WorkItem,
+        source: WorkSource,
+        run_id: str,
+        fresh: WorkItem,
+        result: RunResult | None,
+    ) -> TickOutcome:
+        """The operator already decided this item's fate while it ran; the
+        run's own outcome must not overwrite that (a cancelled run would
+        otherwise take the failure path and re-queue an abandoned item).
+        Operator decisions never count toward the circuit breaker."""
+        now = self.clock()
+        report = self._report(run_id, result)
+        if fresh.state == "abandoned":
+            why = fresh.last_error or "abandoned by operator"
+            self.dstore.finish_ledger(run_id, "abandoned", now)
+            source.report_abandoned(fresh, why)
+            self._frontend_finished(item, report)
+            self._notify(f"❌ {item.item_id} abandoned by operator: {why}")
+            return "abandoned"
+        self.dstore.finish_ledger(run_id, "requeued", now)
+        self._frontend_finished(item, report)
+        self._notify(f"{item.item_id} requeued by operator; run {run_id} ended {report.state}")
+        return "requeued"
 
     def _run_is_resumable(self, run_id: str) -> bool:
         """Whether the run was left mid-flight (interrupted) rather than
@@ -511,14 +604,15 @@ class DaemonLoop:
         )
         reason = f"cancelled by {cancel.requester}"
         self.dstore.finish_ledger(run_id, "cancelled", now)
+        self.dstore.mark_cancelled(item.item_id, reason, now)
         if cancel.retry:
-            self.dstore.requeue(item.item_id, reason, now)
+            # cancelled → queued is the same transition `!sbx retry` makes.
+            self.dstore.retry(item.item_id, now, reason)
             self._notify(f"⏹ {item.item_id} {reason}; re-queued to run again fresh")
         else:
-            self.dstore.mark_cancelled(item.item_id, reason, now)
             self._notify(
                 f"⏹ {item.item_id} {reason} — `sbxloop resume {run_id}` continues it, "
-                f"`!sbx requeue {item.item_id}` reruns it fresh"
+                f"`!sbx retry {item.item_id}` reruns it fresh"
             )
         source.report_cancelled(item, report)
         self._frontend_finished(item, report)

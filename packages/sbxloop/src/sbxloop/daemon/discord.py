@@ -50,6 +50,7 @@ from sbxloop.daemon.discord_format import (
     format_for_discord,
     headline_embed,
     headline_text,
+    items_lines,
     queue_lines,
     status_embed,
 )
@@ -390,29 +391,50 @@ class DiscordBridge:
                     "cancel requested — honored at the next task boundary; the item settles as "
                     "cancelled (no retry) and the run stays resumable.",
                 )
-        elif word == "requeue":
-            args = cmd.split()[1:]
-            if not args:
-                await self._send(
-                    channel, f"usage: `{self.discord.command_prefix} requeue <item-id>` (e.g. gh:8)"
-                )
-            else:
-                # requeue reports to the source synchronously (GitHub HTTP via
-                # the ops sandbox); off the event-loop thread so a slow
-                # request cannot stall heartbeats and message handling.
-                error = await asyncio.get_event_loop().run_in_executor(
-                    None, loop.requeue, args[0], _author_name(message)
-                )
-                await self._send(channel, error or f"re-queued {code(args[0])}.")
         elif word == "queue":
             await self._send(channel, queue_lines(loop.dstore.queued()), suppress_embeds=True)
+        elif word == "items":
+            await self._send(channel, items_lines(loop.dstore.items()), suppress_embeds=True)
+        elif word in ("abandon", "retry", "requeue"):
+            # Abandoning a queued GitHub item reports through the ops
+            # sandbox — seconds, not milliseconds — so keep it off the
+            # gateway's event loop.
+            reply = await asyncio.get_event_loop().run_in_executor(
+                None, self._item_command, loop, word, cmd.split()[1:], _author_name(message)
+            )
+            await self._send(channel, reply)
         else:
             await self._send(
                 channel,
                 f"commands: `{self.discord.command_prefix} status|pause|resume|"
-                "cancel [--retry]|requeue <item>|queue` — or type in a run's thread to steer "
-                "that run.",
+                "cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|"
+                "requeue <item>` — or type in a run's thread to steer that run.",
             )
+
+    @staticmethod
+    def _item_command(loop: Any, word: str, args: list[str], by: str) -> str:
+        """`!sbx abandon|retry|requeue <item_id> [reason…]` → reply text.
+        Item ids are the daemon's own (`gh:12`, `inbox:x.md`); the store
+        rejects bad transitions with a message worth showing verbatim. A
+        retry is attributed to the Discord author on the source."""
+        if not args:
+            return f"usage: {word} <item_id>" + (" [reason]" if word == "abandon" else "")
+        item_id = args[0]
+        try:
+            if word == "abandon":
+                item = loop.abandon_item(item_id, " ".join(args[1:]) or None)
+                return (
+                    f"{code(item_id)} abandoned"
+                    + (f" (its run {code(item.run_id)} will not resume)" if item.run_id else "")
+                    + "."
+                )
+            if word == "retry":
+                loop.retry_item(item_id, by)
+                return f"{code(item_id)} re-queued with attempts reset (fresh plan)."
+            loop.requeue_item(item_id)
+            return f"{code(item_id)} re-queued; its next dispatch starts a fresh run."
+        except (KeyError, ValueError) as exc:
+            return f"{word} failed: {exc.args[0] if exc.args else exc}"
 
     # -- pump: queue -> discord (discord thread) -------------------------------------
 

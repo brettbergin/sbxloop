@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -227,6 +228,83 @@ class DaemonStore:
                 )
             ]
 
+    def items(self, states: Sequence[ItemState] | None = None) -> list[WorkItem]:
+        """Every known item (optionally filtered by state), oldest first —
+        the operator's view for ``sbxloop daemon items`` / ``!sbx items``."""
+        with self._lock:
+            if states:
+                marks = ", ".join("?" for _ in states)
+                rows = self._conn.execute(
+                    f"SELECT * FROM daemon_work_items WHERE state IN ({marks}) "  # nosec B608
+                    "ORDER BY created_at ASC, rowid ASC",
+                    tuple(states),
+                )
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM daemon_work_items ORDER BY created_at ASC, rowid ASC"
+                )
+            return [_row_to_item(row) for row in rows]
+
+    # -- operator controls (#229) ------------------------------------------------
+
+    def abandon(self, item_id: str, reason: str, now: float) -> WorkItem:
+        """Operator abandon: queued/running → abandoned. ``run_id`` is kept
+        so the ledger and ``sbxloop logs`` still tie the item to the run
+        that made the operator give up on it; the loop treats
+        "abandoned while pinned to my run" as its cue to cancel that run."""
+        item = self._require(item_id)
+        if item.state in ("done", "abandoned", "cancelled"):
+            raise ValueError(f"{item_id} is already {item.state}")
+        self._update(item_id, now, state="abandoned", last_error=reason[:2000])
+        return self._require(item_id)
+
+    def retry(self, item_id: str, now: float, reason: str | None = None) -> WorkItem:
+        """Operator retry: an abandoned, cancelled or backoff-waiting item
+        goes back to the queue as if freshly discovered. The attempt budget
+        and retry backoff exist to bound *autonomous* churn, so a human
+        decision starts both over — attempts reset, eligible on the next
+        tick (the daily run cap still applies) — and the run is unpinned so
+        the next dispatch plans from scratch instead of resuming the plan
+        that failed (#228: recovery would have resumed a doomed plan; #254).
+        The source-side claim is kept: re-claiming would fail (the inbox
+        file / trigger label moved when it was first claimed). ``reason``
+        (e.g. "re-queued by X") is kept as ``last_error`` for the audit
+        trail in ``items``; without one the old error is cleared."""
+        item = self._require(item_id)
+        if item.state not in ("abandoned", "cancelled", "queued"):
+            raise ValueError(
+                f"{item_id} is {item.state}; only abandoned, cancelled or queued items can be "
+                "retried" + (" (abandon it first)" if item.state == "running" else "")
+            )
+        self._update(
+            item_id,
+            now,
+            state="queued",
+            attempts=0,
+            run_id=None,
+            last_error=reason[:2000] if reason else None,
+        )
+        return self._require(item_id)
+
+    def requeue(self, item_id: str, now: float) -> WorkItem:
+        """Operator requeue: a running (or queued) item loses its pinned run
+        and goes back to the queue with its attempt count intact — the
+        next dispatch starts a fresh run rather than resuming."""
+        item = self._require(item_id)
+        if item.state not in ("running", "queued"):
+            raise ValueError(
+                f"{item_id} is {item.state}; only running or queued items can be requeued"
+                + (" (use retry)" if item.state in ("abandoned", "cancelled") else "")
+            )
+        self._update(item_id, now, state="queued", run_id=None)
+        return self._require(item_id)
+
+    def _require(self, item_id: str) -> WorkItem:
+        item = self.get(item_id)
+        if item is None:
+            raise KeyError(f"unknown work item {item_id!r}")
+        return item
+
     def mark_claimed(self, item_id: str, now: float) -> None:
         self._update(item_id, now, claimed=1)
 
@@ -298,17 +376,6 @@ class DaemonStore:
         """Operator cancel: terminal for the daemon, unlike ``mark_failed``
         which either re-queues (with backoff) or abandons."""
         self._update(item_id, now, state="cancelled", last_error=reason[:2000])
-
-    def requeue(self, item_id: str, reason: str, now: float) -> None:
-        """A human explicitly re-runs a settled item (``!sbx requeue`` /
-        ``!sbx cancel --retry``). The attempt budget and retry backoff exist
-        to bound *autonomous* churn, so a human decision starts both over:
-        attempts reset to zero and the item is eligible on the next tick.
-        The daily run cap still applies. The run is unpinned: a re-queued
-        item runs fresh, never resumes the cancelled/failed run (#254)."""
-        self._update(
-            item_id, now, state="queued", attempts=0, run_id=None, last_error=reason[:2000]
-        )
 
     def mark_requeued_unstarted(self, item_id: str, now: float) -> None:
         """Crash between claim and start: back to the queue, claim kept."""

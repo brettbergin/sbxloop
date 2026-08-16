@@ -385,7 +385,7 @@ class TestOperatorCancel:
         assert h.loop.tick().outcome == "retry"  # b.md fails as a failure, not a cancel
         assert not any(c[0] == "cancelled" for c in h.source.calls)
 
-    def test_requeue_settled_item(self, tmp_path: Path) -> None:
+    def test_retry_settled_item_is_attributed(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
         )
@@ -393,13 +393,27 @@ class TestOperatorCancel:
         h.source.items = [inbox_item()]
         h.outcomes = ["raise"]
         assert h.loop.tick().outcome == "abandoned"
-        assert h.loop.requeue("inbox:nope") == "unknown item inbox:nope"
-        assert h.loop.requeue("inbox:a.md", "Discord user `brett`") is None
+        with pytest.raises(KeyError):
+            h.loop.retry_item("inbox:nope")
+        h.loop.retry_item("inbox:a.md", "Discord user `brett`")
         item = h.dstore.get("inbox:a.md")
         assert item is not None and item.state == "queued" and item.attempts == 0
+        assert item.last_error == "re-queued by Discord user `brett`"
         assert ("requeued", "Discord user `brett`") in h.source.calls
-        assert h.loop.requeue("inbox:a.md") is not None  # queued: nothing to re-queue
         assert h.loop.tick().outcome == "done"
+
+    def test_retry_of_cancelled_item_runs_fresh(self, tmp_path: Path) -> None:
+        """#246 + #229: `!sbx retry` is the way back from a cancel — attempts
+        reset, run unpinned so the next tick starts over, not resumes."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        h.dstore.upsert_new(inbox_item(), 1.0)
+        h.dstore.mark_running("inbox:a.md", "r1", 1.0)
+        h.dstore.mark_cancelled("inbox:a.md", "cancelled by op", 2.0)
+        with pytest.raises(ValueError, match="use retry"):
+            h.loop.requeue_item("inbox:a.md")
+        got = h.loop.retry_item("inbox:a.md", "op")
+        assert got.state == "queued" and got.attempts == 0 and got.run_id is None
 
 
 class TestShutdownAndRecovery:
@@ -756,3 +770,142 @@ class TestSourceBackoff:
 @pytest.fixture
 def _quiet_tasks() -> list[TaskRecord]:
     return [TaskRecord(spec=TaskSpec(id="t1", title="T"), state="done")]
+
+
+class TestOperatorItemControls:
+    """#229: abandon / retry / requeue from the CLI (row-only, other process)
+    and from Discord (in-process loop methods)."""
+
+    def _blocking_runner(self, h: Harness) -> tuple[threading.Event, Any]:
+        """A runner that waits until the engine's cancel flag is raised, then
+        ends the way a cancelled engine does (non-terminal persisted state,
+        StateError at the boundary)."""
+        started = threading.Event()
+
+        def runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            started.set()
+            engine = h.loop.current.engine  # type: ignore[union-attr]
+            assert engine._cancel_event.wait(5), "cancel never requested"
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "running")
+            raise StateError("run cancelled at phase boundary")
+
+        return started, runner
+
+    def test_cli_abandon_of_running_item_cancels_run_and_reports(self, tmp_path: Path) -> None:
+        """Field (#227/#228): the only way to abandon a spiraling item was
+        poking DaemonStore from Python — and even then the settle path would
+        have overwritten the row. An operator's row-level abandon must cancel
+        the in-flight run, win over the run's own outcome, and reach the
+        source exactly once without tripping the breaker."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        started, runner = self._blocking_runner(h)
+        h.loop._runner = runner
+        results: list[Any] = []
+        t = threading.Thread(target=lambda: results.append(h.loop.tick()))
+        t.start()
+        assert started.wait(5)
+        run_id = h.loop.current.run_id  # type: ignore[union-attr]
+        # another process: only the row changes
+        h.dstore.abandon("inbox:a.md", "operator: doomed plan", h.clock())
+        t.join(10)
+        assert results and results[0].outcome == "abandoned"
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "abandoned" and item.run_id == run_id
+        assert [c for c in h.source.calls if c[0] == "abandoned"] == [
+            ("abandoned", "operator: doomed plan")
+        ]
+        assert h.loop._consecutive_failures == 0
+        # ledger closed as abandoned, and recovery leaves the item alone
+        h.loop.recover()
+        assert h.dstore.get("inbox:a.md").state == "abandoned"  # type: ignore[union-attr]
+
+    def test_cli_requeue_of_running_item_cancels_and_next_tick_starts_fresh(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        started, runner = self._blocking_runner(h)
+        h.loop._runner = runner
+        results: list[Any] = []
+        t = threading.Thread(target=lambda: results.append(h.loop.tick()))
+        t.start()
+        assert started.wait(5)
+        first_run = h.loop.current.run_id  # type: ignore[union-attr]
+        h.dstore.requeue("inbox:a.md", h.clock())
+        t.join(10)
+        assert results and results[0].outcome == "requeued"
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "queued" and item.run_id is None
+        assert item.attempts == 1  # requeue keeps the count
+        assert not any(c[0] in ("abandoned", "retry") for c in h.source.calls)
+        # next tick: a fresh run (not a resume of the first), no re-claim
+        h.loop._runner = h.runner
+        h.clock.t += 10_000  # past the retry backoff for attempts=1
+        assert h.loop.tick().outcome == "done"
+        assert h.runs and h.runs[-1][0] != first_run and h.runs[-1][1] is False
+        assert [c[0] for c in h.source.calls].count("claim") == 1
+
+    def test_loop_abandon_item_in_flight_defers_source_report_to_settle(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        started, runner = self._blocking_runner(h)
+        h.loop._runner = runner
+        t = threading.Thread(target=h.loop.tick)
+        t.start()
+        assert started.wait(5)
+        got = h.loop.abandon_item("inbox:a.md", "operator says stop")
+        assert got.state == "abandoned"
+        t.join(10)
+        assert [c for c in h.source.calls if c[0] == "abandoned"] == [
+            ("abandoned", "operator says stop")
+        ]
+
+    def test_loop_abandon_queued_item_reports_immediately(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        got = h.loop.abandon_item("inbox:a.md")
+        assert got.state == "abandoned" and got.last_error == "abandoned by operator"
+        assert h.source.calls == [("abandoned", "abandoned by operator")]
+        assert h.loop.tick().idle_kind == "no_work"
+
+    def test_loop_retry_then_dispatch_is_a_fresh_plan(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item()]
+        h.outcomes = ["failed"]
+        assert h.loop.tick().outcome == "abandoned"
+        first_run = h.runs[0][0]
+        with pytest.raises(ValueError):
+            h.loop.requeue_item("inbox:a.md")  # abandoned items need retry, not requeue
+        got = h.loop.retry_item("inbox:a.md")
+        assert got.state == "queued" and got.attempts == 0 and got.run_id is None
+        assert h.loop.tick().outcome == "done"
+        assert h.runs[-1][0] != first_run and h.runs[-1][1] is False
+        assert [c[0] for c in h.source.calls].count("claim") == 1  # claim kept across retry
+
+    def test_loop_requeue_stale_pinned_item_closes_ledger(self, tmp_path: Path) -> None:
+        """A dead process left the item running with a pinned run; requeue
+        (daemon idle) must unpin it so recovery does not resume it."""
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_old", now=2.0)
+        h.store.create_run("r_old", "x")
+        h.store.set_run_state("r_old", "running")
+        got = h.loop.requeue_item("inbox:a.md")
+        assert got.state == "queued" and got.run_id is None
+        h.loop.recover()  # nothing running any more
+        assert h.runs == []
+        # attempts were kept, so the usual retry backoff still applies
+        assert h.loop.tick().idle_kind == "backoff"
+        h.clock.t += 10_000
+        assert h.loop.tick().outcome == "done"
+        assert h.runs[0][0] != "r_old" and h.runs[0][1] is False

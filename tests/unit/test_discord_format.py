@@ -350,7 +350,7 @@ class TestEmbeds:
         assert card.title == "⏹ finished: cancelled"
         assert card.fields[0][0] == "Cancelled"
         assert "`sbxloop resume r1`" in card.fields[0][1]
-        assert "!sbx requeue gh:8" in card.fields[0][1]
+        assert "!sbx retry gh:8" in card.fields[0][1]
         requeued = finish_embed(item, report._replace(requeued=True), "cancelled")
         assert "re-queued" in requeued.fields[0][1] and "resume" not in requeued.fields[0][1]
 
