@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS daemon_work_items (
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
     pending_report TEXT,
+    kind        TEXT NOT NULL DEFAULT 'patch',
     UNIQUE(source, source_key)
 );
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);
@@ -67,6 +68,26 @@ CREATE TABLE IF NOT EXISTS daemon_backlog_filed (
     filed_at    REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS daemon_postmortems (
+    run_id     TEXT PRIMARY KEY,
+    item_id    TEXT NOT NULL,
+    filed_as   TEXT NOT NULL,
+    filed_at   REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daemon_reviews (
+    run_id     TEXT PRIMARY KEY,
+    pr_number  INTEGER NOT NULL,
+    filed_as   TEXT NOT NULL,
+    filed_at   REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daemon_audits (
+    name       TEXT PRIMARY KEY,
+    filed_as   TEXT NOT NULL,
+    filed_at   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS daemon_discord_threads (
     run_id      TEXT PRIMARY KEY,
     channel_id  INTEGER NOT NULL,
@@ -90,6 +111,13 @@ _MIGRATIONS = (
         "pending_report",
         "ALTER TABLE daemon_work_items ADD COLUMN pending_report TEXT",
     ),
+    # Discovery lane: audit items investigate and file issues, patch items
+    # deliver PRs. Rows from before the column are patches.
+    (
+        "daemon_work_items",
+        "kind",
+        "ALTER TABLE daemon_work_items ADD COLUMN kind TEXT NOT NULL DEFAULT 'patch'",
+    ),
 )
 
 
@@ -107,6 +135,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         item_id=row["item_id"],
         source=row["source"],
         source_key=row["source_key"],
+        kind=row["kind"] or "patch",
         title=row["title"],
         body=row["body"],
         url=row["url"],
@@ -170,13 +199,14 @@ class DaemonStore:
                     "DELETE FROM daemon_work_items WHERE item_id = ?", (row["item_id"],)
                 )
             self._conn.execute(
-                "INSERT INTO daemon_work_items (item_id, source, source_key, title, body, "
+                "INSERT INTO daemon_work_items (item_id, source, source_key, kind, title, body, "
                 "url, state, attempts, claimed, run_id, last_error, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?)",
                 (
                     item.item_id,
                     item.source,
                     item.source_key,
+                    item.kind,
                     item.title,
                     item.body,
                     item.url,
@@ -569,6 +599,88 @@ class DaemonStore:
                 "INSERT OR IGNORE INTO daemon_backlog_filed "
                 "(fingerprint, run_id, filed_as, filed_at) VALUES (?, ?, ?, ?)",
                 (fingerprint, run_id, filed_as, now),
+            )
+            self._conn.commit()
+
+    # -- post-mortems (discovery lane) ---------------------------------------
+
+    def runs_for_item(self, item_id: str) -> list[str]:
+        """Run ids the item has been dispatched under, oldest first."""
+        with self._lock:
+            return [
+                str(r["run_id"])
+                for r in self._conn.execute(
+                    "SELECT run_id FROM daemon_runs WHERE item_id = ? ORDER BY started_at",
+                    (item_id,),
+                )
+            ]
+
+    def postmortem_filed(self, run_id: str) -> bool:
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM daemon_postmortems WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is not None
+            )
+
+    def postmortems_since(self, ts: float) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_postmortems WHERE filed_at >= ?", (ts,)
+            ).fetchone()
+            return int(row["n"])
+
+    def record_postmortem(self, run_id: str, item_id: str, filed_as: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_postmortems (run_id, item_id, filed_as, filed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, item_id, filed_as, now),
+            )
+            self._conn.commit()
+
+    # -- delivery reviews (discovery lane) ---------------------------------------
+
+    def review_filed(self, run_id: str) -> bool:
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM daemon_reviews WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is not None
+            )
+
+    def reviews_since(self, ts: float) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_reviews WHERE filed_at >= ?", (ts,)
+            ).fetchone()
+            return int(row["n"])
+
+    def record_review(self, run_id: str, pr_number: int, filed_as: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_reviews (run_id, pr_number, filed_as, filed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, pr_number, filed_as, now),
+            )
+            self._conn.commit()
+
+    # -- scheduled audits (discovery lane) -------------------------------------
+
+    def audit_last_filed(self) -> dict[str, float]:
+        with self._lock:
+            return {
+                str(r["name"]): float(r["filed_at"])
+                for r in self._conn.execute("SELECT name, filed_at FROM daemon_audits")
+            }
+
+    def record_audit(self, name: str, filed_as: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO daemon_audits (name, filed_as, filed_at) VALUES (?, ?, ?)",
+                (name, filed_as, now),
             )
             self._conn.commit()
 

@@ -26,8 +26,16 @@ from typing import Any, NamedTuple, Protocol
 
 from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
-from sbxloop.daemon.backlog import BACKLOG_INSTRUCTIONS, collect_backlog
+from sbxloop.daemon.audits import audit_marker, due_charters, issue_body, load_charters
+from sbxloop.daemon.backlog import (
+    AUDIT_INSTRUCTIONS,
+    BACKLOG_INSTRUCTIONS,
+    ToolFindings,
+    collect_backlog,
+    collect_tool_findings,
+)
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
+from sbxloop.daemon.postmortem import build_dossier
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
@@ -118,6 +126,7 @@ class DaemonLoop:
         self._runner = runner or self._default_runner
         self._stop = threading.Event()
         self._paused = False
+        self._audit_problems_seen: set[str] = set()
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
         self._cancel_request: CancelRequest | None = None
@@ -346,6 +355,7 @@ class DaemonLoop:
                     f"daily run cap reached ({started_today}/{cap}); idling until the window rolls"
                 )
             return TickResult(idle_kind="daily_cap")
+        self._schedule_audits(now)
         discovered = self._discover(now)
         item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s)
         if item is None:
@@ -638,7 +648,11 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         if result is not None and report.succeeded:
-            self._collect_backlog(run_id, source)
+            filed = self._collect_backlog(run_id, source)
+            tool = self._collect_tool_findings(run_id, source)
+            report = report._replace(
+                filed=tuple(filed), tool_filed=tuple(tool.filed), tool_noted=tuple(tool.unfiled)
+            )
             self.dstore.mark_done(item.item_id, now)
             self.dstore.finish_ledger(run_id, "done", now)
             self._set_breaker(None, 0)
@@ -647,7 +661,9 @@ class DaemonLoop:
             self._notify(
                 f"✅ {item.item_id} done ({report.task_summary})"
                 + (f" · PR {report.delivery[1]}" if report.delivery else "")
+                + (f" · filed {len(report.filed)} finding(s)" if item.kind == "audit" else "")
             )
+            self._file_review(item, run_id, report)
             return "done"
         if result is not None and result.state == "completed" and report.delivery_error:
             # Work done, PR failed: a human must look; retrying would redo the work.
@@ -659,6 +675,7 @@ class DaemonLoop:
             source.report_delivery_failed(item, report)
             self._frontend_finished(item, report)
             self._notify(f"⚠ {item.item_id} completed but delivery failed: {report.delivery_error}")
+            self._file_postmortem(item, run_id, f"delivery failed: {report.delivery_error}")
             return "delivery_failed"
         reason = str(error) if error is not None else f"run ended {report.state}"
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
@@ -673,6 +690,7 @@ class DaemonLoop:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=False)
             source.report_abandoned(item, reason)
             self._notify(f"❌ {item.item_id} abandoned after {item.attempts} attempt(s): {reason}")
+            self._file_postmortem(item, run_id, f"abandoned: {reason}")
             outcome = "abandoned"
         self._frontend_finished(item, report)
         if self._consecutive_failures >= self.config.daemon.max_consecutive_failures:
@@ -738,7 +756,10 @@ class DaemonLoop:
                     # issue already is one (#251); the summary comment there
                     # carries the same information.
                     "report": self.config.daemon.tracking_issue,
-                    "deliver": True,
+                    # An audit's output is the issues it files; delivering
+                    # its (deliberately unchanged) tree would only raise
+                    # "nothing to deliver" and mis-settle it as failed.
+                    "deliver": item.kind != "audit",
                     "deliver_draft": self.config.daemon.deliver_draft,
                     "create_repo": False,
                 }
@@ -807,7 +828,9 @@ class DaemonLoop:
         else:
             origin = f"inbox file `{item.source_key}`"
         parts.append(f"---\nThis work item came from: {origin}.")
-        if self.config.daemon.backlog != "off":
+        if item.kind == "audit":
+            parts.append(AUDIT_INSTRUCTIONS)
+        elif self.config.daemon.backlog != "off":
             parts.append(BACKLOG_INSTRUCTIONS)
         return "\n\n".join(parts)
 
@@ -853,14 +876,129 @@ class DaemonLoop:
         workspace = str(result.workspace) if result is not None and result.workspace else None
         return RunReport(run_id, state, summary, tracking, delivery, delivery_error, workspace)
 
-    def _collect_backlog(self, run_id: str, source: WorkSource) -> None:
+    def _schedule_audits(self, now: float) -> None:
+        """Open due charters from the checkout's ``audit_dir`` as audit issues.
+
+        Runs after the pause/breaker/cap gates (a stressed daemon does not
+        add work for itself) and before discovery, so a freshly filed audit
+        is picked up in the same tick. GitHub is the schedule's source of
+        truth (a still-open audit is never re-filed; one created within the
+        interval counts as filed) with the store as a cache; a GitHub
+        hiccup skips this tick, never raises."""
+        daemon = self.config.daemon
+        if not daemon.audits:
+            return
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "file_audit"):
+            return
+        checkout = self._workspace_checkout()
+        if checkout is None:
+            return
+        charters, problems = load_charters(checkout, daemon.audit_dir)
+        for problem in problems:
+            if problem not in self._audit_problems_seen:
+                self._audit_problems_seen.add(problem)
+                self._notify(f"⚠ audit charter skipped: {problem}")
+        for charter in due_charters(charters, self.dstore.audit_last_filed(), now):
+            try:
+                since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - charter.every_s))
+                is_open, filed_recently = github.audit_issue_state(charter.title, since)
+                if is_open or filed_recently:
+                    # Someone (or a previous process) already filed it: sync
+                    # the cache so we stop asking GitHub every tick.
+                    self.dstore.record_audit(charter.name, "gh:existing", now)
+                    continue
+                ref = github.file_audit(
+                    charter.title, issue_body(charter, audit_marker(charter.name))
+                )
+                self.dstore.record_audit(charter.name, ref, now)
+                self._notify(f"🔎 scheduled audit filed: {charter.title} → {ref}")
+            except Exception:
+                logger.warning("scheduled audit %s could not be filed", charter.name, exc_info=True)
+
+    def _collect_tool_findings(self, run_id: str, source: WorkSource) -> ToolFindings:
+        """Findings addressed to the tool: filed upstream when tool_repo is
+        set, otherwise noted for the closing comment. Never the project's."""
+        if self.config.daemon.backlog == "off":
+            return ToolFindings([], [])
+        target = next((s for s in self.sources if s.name == self.config.daemon.backlog), None)
+        if target is None:
+            return ToolFindings([], [])
+        try:
+            return collect_tool_findings(
+                self.store.get_run(run_id),
+                dstore=self.dstore,
+                source=target,
+                max_items=self.config.daemon.backlog_max_per_run,
+                now=self.clock(),
+            )
+        except SbxloopError:
+            logger.warning("tool-finding collection failed for %s", run_id, exc_info=True)
+            return ToolFindings([], [])
+
+    def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> None:
+        """The loop evaluating the code it just wrote: after a patch item
+        delivers a PR, open a review audit of that PR. Once per run, patch
+        items only (an audit has no PR), capped per rolling day, best-effort."""
+        daemon = self.config.daemon
+        if not daemon.review_deliveries or item.kind != "patch" or report.delivery is None:
+            return
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "file_review"):
+            return
+        now = self.clock()
+        try:
+            if self.dstore.review_filed(run_id):
+                return
+            if self.dstore.reviews_since(now - DAY_S) >= daemon.reviews_per_day:
+                logger.info("delivery review for %s skipped: daily cap reached", run_id)
+                return
+            number, url = report.delivery
+            ref = github.file_review(item, number, url, run_id)
+            self.dstore.record_review(run_id, number, ref, now)
+            self._notify(f"🔎 review audit filed for PR #{number}: {ref}")
+        except Exception:
+            logger.warning("delivery review for %s could not be filed", run_id, exc_info=True)
+
+    def _file_postmortem(self, item: WorkItem, run_id: str, reason: str) -> None:
+        """Turn the daemon's own failure into a discovery-lane charter.
+
+        Only for patch items — a failed audit filing a post-mortem that is
+        itself an audit would recurse — only once per run, and capped per
+        rolling day so a bad night cannot flood the tracker. Best-effort:
+        the item is already settled; this must never change that."""
+        daemon = self.config.daemon
+        if not daemon.postmortems or item.kind != "patch":
+            return
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "file_postmortem"):
+            return
+        now = self.clock()
+        try:
+            if self.dstore.postmortem_filed(run_id):
+                return
+            if self.dstore.postmortems_since(now - DAY_S) >= daemon.postmortems_per_day:
+                logger.info("post-mortem for %s skipped: daily cap reached", run_id)
+                return
+            run_ids = self.dstore.runs_for_item(item.item_id) or [run_id]
+            dossier = build_dossier(
+                self.store, item, run_ids, reason, state_dir=str(self.config.state_dir)
+            )
+            ref = github.file_postmortem(item, dossier, run_id)
+            self.dstore.record_postmortem(run_id, item.item_id, ref, now)
+            self._notify(f"🔎 post-mortem filed for {item.item_id}: {ref}")
+        except Exception:
+            logger.warning("post-mortem for %s could not be filed", run_id, exc_info=True)
+
+    def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:
+        """File the run's backlog items; returns their refs (``gh:<n>``)."""
         mode = self.config.daemon.backlog
         if mode == "off":
-            return
+            return []
         target = next((s for s in self.sources if s.name == mode), None)
         if target is None:
             logger.warning("backlog mode %r but no such source is active", mode)
-            return
+            return []
         try:
             record = self.store.get_run(run_id)
             filed = collect_backlog(
@@ -873,9 +1011,10 @@ class DaemonLoop:
             )
         except SbxloopError:
             logger.warning("backlog collection failed for %s", run_id, exc_info=True)
-            return
+            return []
         if filed:
             self._notify(f"filed {len(filed)} backlog item(s) from {run_id}: {', '.join(filed)}")
+        return list(filed)
 
     # -- recovery ------------------------------------------------------------------------
 

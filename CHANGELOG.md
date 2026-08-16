@@ -15,6 +15,44 @@ All notable changes to sbxloop are documented here. The project adheres to
   `git status | awk '{print $2}'` guard printed whole lines and failed every
   revision and the replan of a correct change. The plan prompt says so too.
 
+### Added
+
+- **Discovery lane for the daemon**: issues carrying `[daemon] audit_label`
+  (`sbxloop:audit`) are charters — the run investigates and files findings
+  as `sbxloop:backlog` issues (evidence / repro / proposal / size / kind
+  per finding, at most 5, "nothing real" is a valid outcome) instead of
+  delivering a PR. `WorkItem.kind` (`patch` | `audit`, persisted) drives a
+  two-label poll, a kind-aware claim, `deliver=False` for audits, the audit
+  contract in the outcome text, and an audit-success comment that names what
+  it filed (`RunReport.filed`) and always closes the audit issue. Discord
+  cards and `daemon items` show the kind. Promotion stays a human label swap.
+- **Post-mortems the daemon files itself** (`[daemon] postmortems`, default
+  on): when a patch item is abandoned or completes without delivering, the
+  daemon opens a `sbxloop:audit` issue carrying a dossier — plan and verify
+  commands, the last verify transcript, failure events, recent event tail,
+  and the `SBXLOOP_STATE_DIR=… sbxloop logs <run>` line — so the discovery
+  lane turns its own failures into evidenced findings. Once per run, never
+  for audit items (no recursion), `postmortems_per_day` (3) cap.
+- **Scheduled area audits, charters versioned in the repo** (`[daemon] audits = true`, `audit_dir = ".github/sbxloop/audits"`): each
+  `<name>.md` with front-matter `every: 7d` (and optional `enabled`) is a
+  charter the daemon opens as an `audit: <name>` issue when due. GitHub is
+  the schedule's source of truth (a still-open audit is never re-filed; one
+  created within the interval counts), the store is a cache; broken charters
+  are reported once and skipped. sbxloop's own repo ships four:
+  verify-lint-vs-prompts, daemon-guardrails, e2e-markers, test-flakes.
+- **Delivery reviews** (`[daemon] review_deliveries`, default on): after a
+  patch item delivers a PR, the daemon opens `review: PR #N` as an audit
+  charter — the loop evaluating the code it just wrote (defects, missing
+  edge cases, scope drift, unjustified claims) and filing findings for a
+  human to promote. Once per run, `reviews_per_day` (5) cap.
+- **Findings about the tool are routed, never dumped on the project.** The
+  audit contract asks the agent to put findings about sbxloop itself
+  (planner, prompts, lint, delivery, daemon) under
+  `.sbxloop/backlog/tool/`; with `[daemon] tool_repo = "owner/sbxloop"`
+  they are filed upstream (`RunReport.tool_filed`, named in the closing
+  comment), otherwise only noted in the comment (`tool_noted`) — the
+  project's tracker never receives issues about the tool that ran on it.
+
 ## [0.7.0] — 2026-08-16
 
 The "run sbxloop on sbxloop" release. Everything a readiness audit

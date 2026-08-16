@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
+from sbxloop.daemon.postmortem import postmortem_marker
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
 from sbxloop.gh.ops import GithubOps
 
@@ -89,6 +90,16 @@ def _report_lines(report: RunReport) -> list[str]:
         lines.append(f"Delivered as PR #{number}: {url}")
     if report.delivery_error:
         lines.append(f"Delivery failed: {report.delivery_error}")
+    if report.filed:
+        refs = ", ".join(f"#{ref.split(':', 1)[1]}" if ":" in ref else ref for ref in report.filed)
+        lines.append(f"Filed: {refs}")
+    if report.tool_filed:
+        lines.append(f"Filed upstream (about sbxloop itself): {', '.join(report.tool_filed)}")
+    if report.tool_noted:
+        lines.append(
+            "Findings about sbxloop itself, noted but not filed here (set `[daemon] "
+            "tool_repo` to route them upstream): " + "; ".join(report.tool_noted)
+        )
     if report.workspace:
         lines.append(f"Workspace: `{report.workspace}`")
     return lines
@@ -236,12 +247,20 @@ class GitHubLabels:
         failed: str,
         backlog: str,
         delivered: str = "sbxloop:delivered",
+        audit: str = "sbxloop:audit",
     ) -> None:
         self.trigger = trigger
         self.in_progress = in_progress
         self.failed = failed
         self.backlog = backlog
         self.delivered = delivered
+        # The discovery lane's trigger: an issue carrying it is a charter to
+        # investigate and file findings, not a change to deliver.
+        self.audit = audit
+
+    def trigger_for(self, kind: str) -> str:
+        """The label that put an item of ``kind`` in the queue."""
+        return self.audit if kind == "audit" else self.trigger
 
 
 class GitHubIssueSource:
@@ -268,12 +287,16 @@ class GitHubIssueSource:
         host: str | None = None,
         on_failure: Callable[[BaseException], object] | None = None,
         close_on_success: bool = True,
+        tool_repo: str | None = None,
     ) -> None:
         self._ops = ops
         self.repo = repo
         self.labels = labels
         self.host = host or socket.gethostname()
         self.close_on_success = close_on_success
+        # Findings ABOUT sbxloop go to its own tracker (never the project's);
+        # unset means "note them in the closing comment only".
+        self.tool_repo = tool_repo
         # Told about every failed op (``DaemonGithub.note_failure``) so a
         # dead sandbox gets replaced; the source itself never retries.
         self._on_failure = on_failure
@@ -320,27 +343,38 @@ class GitHubIssueSource:
         # Unlike the report_* paths this RAISES on failure: the loop backs
         # off a failing source (#254), which it cannot do if a GitHub outage
         # looks like an empty queue.
-        query = f'repo:{self.repo} is:issue is:open label:"{self.labels.trigger}"'
-        try:
-            found = self._ops().search_issues(query, per_page=50)
-        except (GithubOpsError, WorkerError, SbxError) as exc:
-            self._failed(exc)
-            raise
         items: list[WorkItem] = []
-        for issue in found:
-            number = issue.get("number")
-            if not number:
-                continue
-            items.append(
-                WorkItem(
-                    item_id=f"gh:{number}",
-                    source="github",
-                    source_key=str(number),
-                    title=str(issue.get("title") or f"issue #{number}"),
-                    body=str(issue.get("body") or ""),
-                    url=str(issue.get("html_url") or ""),
+        seen: set[str] = set()
+        # Two lanes, two labels, one queue: patch items (trigger label)
+        # deliver PRs; audit items (audit label) investigate and file
+        # issues. An issue carrying both is a patch — the safer reading.
+        lanes: tuple[tuple[str, ItemKind], ...] = (
+            (self.labels.trigger, "patch"),
+            (self.labels.audit, "audit"),
+        )
+        for label, kind in lanes:
+            query = f'repo:{self.repo} is:issue is:open label:"{label}"'
+            try:
+                found = self._ops().search_issues(query, per_page=50)
+            except (GithubOpsError, WorkerError, SbxError) as exc:
+                self._failed(exc)
+                raise
+            for issue in found:
+                number = issue.get("number")
+                if not number or str(number) in seen:
+                    continue
+                seen.add(str(number))
+                items.append(
+                    WorkItem(
+                        item_id=f"gh:{number}",
+                        source="github",
+                        source_key=str(number),
+                        kind=kind,
+                        title=str(issue.get("title") or f"issue #{number}"),
+                        body=str(issue.get("body") or ""),
+                        url=str(issue.get("html_url") or ""),
+                    )
                 )
-            )
         return items
 
     def claim(self, item: WorkItem) -> bool:
@@ -365,6 +399,7 @@ class GitHubIssueSource:
         comment are rolled back so a later claimer is not locked out.
         """
         number = item.source_key
+        trigger = self.labels.trigger_for(item.kind)
         added_in_progress = False
         comment_id: int | None = None
         try:
@@ -375,9 +410,9 @@ class GitHubIssueSource:
             names = {
                 label.get("name") for label in issue.get("labels") or [] if isinstance(label, dict)
             }
-            if self.labels.trigger not in names:
+            if trigger not in names:
                 return False
-            epoch = self._trigger_epoch(ops, number)
+            epoch = self._trigger_epoch(ops, number, trigger)
             token = uuid.uuid4().hex
             self._comment(
                 ops,
@@ -396,7 +431,7 @@ class GitHubIssueSource:
                 return False
             self._add_label(ops, number, self.labels.in_progress)
             added_in_progress = True
-            self._remove_label(ops, number, self.labels.trigger)
+            self._remove_label(ops, number, trigger)
         except (GithubOpsError, WorkerError, SbxError) as exc:
             logger.warning("github source: claim failed for #%s", number, exc_info=True)
             self._failed(exc)
@@ -420,17 +455,18 @@ class GitHubIssueSource:
         )
         return True
 
-    def _trigger_epoch(self, ops: GithubOps, number: str) -> str:
+    def _trigger_epoch(self, ops: GithubOps, number: str, trigger: str | None = None) -> str:
         """ISO timestamp of the trigger label's most recent addition — the
         start of the current claim cycle. Empty (every claim comment
         counts) if the issue's events do not show one."""
+        trigger = trigger or self.labels.trigger
         latest = ""
         for events in self._pages(ops, f"{self._issue_path(number)}/events"):
             for event in events:
                 if not isinstance(event, dict) or event.get("event") != "labeled":
                     continue
                 label = event.get("label")
-                if isinstance(label, dict) and label.get("name") == self.labels.trigger:
+                if isinstance(label, dict) and label.get("name") == trigger:
                     latest = max(latest, str(event.get("created_at") or ""))
         return latest
 
@@ -484,7 +520,13 @@ class GitHubIssueSource:
         def go(ops: GithubOps) -> None:
             n = item.source_key
             lines = _report_lines(report)
-            if not self.close_on_success:
+            # An audit is a chore whose output is the issues it filed: it
+            # closes on completion whatever close_on_success says (that knob
+            # is about leaving a *design* issue open until its PR merges).
+            close = self.close_on_success or item.kind == "audit"
+            if item.kind == "audit" and not report.filed:
+                lines.append("The audit filed no findings.")
+            if not close:
                 lines.append(
                     "Leaving this issue open (`close_on_success = false`); close it "
                     f"once the PR is merged, or re-add `{self.labels.trigger}` to "
@@ -492,7 +534,7 @@ class GitHubIssueSource:
                 )
             self._comment(ops, n, "\n".join(lines))
             self._remove_label(ops, n, self.labels.in_progress)
-            if self.close_on_success:
+            if close:
                 ops.raw(
                     "PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"}
                 )
@@ -512,7 +554,7 @@ class GitHubIssueSource:
                 "",
                 "The work completed but could not be delivered as a PR; a human needs "
                 "to look. Re-trigger by removing the failed label and re-adding "
-                f"`{self.labels.trigger}` (this will redo the work).",
+                f"`{self.labels.trigger_for(item.kind)}` (this will redo the work).",
             ]
             self._comment(ops, n, "\n".join(lines))
             self._remove_label(ops, n, self.labels.in_progress)
@@ -537,14 +579,14 @@ class GitHubIssueSource:
                 ops,
                 n,
                 f"Abandoned after retries: {error}\n\nRe-trigger by removing "
-                f"`{self.labels.failed}` and re-adding `{self.labels.trigger}`.",
+                f"`{self.labels.failed}` and re-adding `{self.labels.trigger_for(item.kind)}`.",
             )
             self._remove_label(ops, n, self.labels.in_progress)
             if not item.claimed:
                 # Abandoned while still queued: the trigger label is what
                 # is on the issue, and left there it would keep the item
                 # polling as work (and make "re-add the trigger" a no-op).
-                self._remove_label(ops, n, self.labels.trigger)
+                self._remove_label(ops, n, self.labels.trigger_for(item.kind))
             self._add_label(ops, n, self.labels.failed)
 
         self._guard("abandon report", go)
@@ -561,8 +603,8 @@ class GitHubIssueSource:
                 # key, same content), so say so instead of promising it.
                 lines.append(
                     f"To run it again from scratch: `!sbx retry {item.item_id}` in Discord "
-                    f"(re-adding `{self.labels.trigger}` only re-runs it if the issue was "
-                    "edited — an unchanged issue is deduplicated)."
+                    f"(re-adding `{self.labels.trigger_for(item.kind)}` only re-runs it if "
+                    "the issue was edited — an unchanged issue is deduplicated)."
                 )
             self._comment(ops, n, "\n".join(lines))
             if not report.requeued:
@@ -587,6 +629,82 @@ class GitHubIssueSource:
             self._comment(ops, n, f"Re-queued by {by}; a fresh run will start shortly.")
 
         self._guard("requeue report", go)
+
+    def audit_issue_state(self, title: str, since_iso: str) -> tuple[bool, bool]:
+        """(an OPEN issue with this exact title exists, one was CREATED since
+        ``since_iso``) — GitHub is the source of truth for the schedule, so a
+        wiped state dir cannot double-file and a still-open audit is never
+        re-opened on top of itself. Raises on GitHub failure (caller skips)."""
+        ops = self._ops()
+        quoted = title.replace('"', "")
+        opened = ops.search_issues(
+            f'repo:{self.repo} is:issue is:open label:"{self.labels.audit}" "{quoted}" in:title',
+            per_page=5,
+        )
+        recent = ops.search_issues(
+            f'repo:{self.repo} is:issue "{quoted}" in:title created:>={since_iso}', per_page=5
+        )
+
+        def exact(rows: list[dict[str, Any]]) -> bool:
+            return any(str(r.get("title") or "") == title for r in rows)
+
+        return exact(opened), exact(recent)
+
+    def file_audit(self, title: str, body: str) -> str:
+        ref = self._ops().issue_create(self.repo, title, body, labels=[self.labels.audit])
+        return f"gh:{ref.number}"
+
+    def file_postmortem(self, item: WorkItem, dossier: str, run_id: str) -> str:
+        """Open a post-mortem as an audit-lane charter and return its ref.
+
+        Labelled with the audit label so the daemon picks it up like any
+        other charter; the marker lets the store (and a human) tie it back
+        to the run it dissects."""
+        ref = self._ops().issue_create(
+            self.repo,
+            f"post-mortem: {' '.join(item.title.split())[:80]} (run {run_id})",
+            f"{dossier}\n\n{postmortem_marker(run_id)}\n---\nFiled by the sbxloop daemon "
+            f"after `{item.item_id}` failed (run `{run_id}`).",
+            labels=[self.labels.audit],
+        )
+        return f"gh:{ref.number}"
+
+    def file_tool_backlog(self, title: str, body: str, origin_run_id: str) -> str | None:
+        """A finding about the TOOL, filed to ``tool_repo`` (None → caller notes it)."""
+        if not self.tool_repo:
+            return None
+        ref = self._ops().issue_create(
+            self.tool_repo,
+            title,
+            f"{body}\n\n---\nFiled by sbxloop run `{origin_run_id}` while working on "
+            f"`{self.repo}` (a finding about the tool, routed upstream).",
+            labels=[self.labels.backlog],
+        )
+        return f"{self.tool_repo}#{ref.number}"
+
+    def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
+        """Open a review of a PR the loop just delivered, as an audit charter:
+        the loop evaluating the code it wrote."""
+        body = (
+            f"# Review: PR #{pr_number} (delivered by run `{run_id}` for {item.item_id})\n\n"
+            f"PR: {pr_url}\nSource issue: {item.url or item.source_key}\n\n"
+            "Charter: review this PR as a skeptical maintainer. Read the source issue and the "
+            "full diff (`gh pr diff` / `gh pr view` are available; the workspace is a fresh "
+            "clone — check out the PR's branch to run its tests). Look for: defects and "
+            "wrong behaviour, missing edge cases and tests, scope drift from the issue, "
+            "unjustified claims in the PR body, style that contradicts the repository's "
+            "conventions, and anything a reviewer would block on. Each real problem is one "
+            "finding with Evidence (file:line in the diff), Repro, Proposal, Size, Kind. If "
+            "the PR is fine, say so and file nothing — a clean review is a valid result.\n\n"
+            f"<!-- sbxloop-review {run_id} -->"
+        )
+        ref = self._ops().issue_create(
+            self.repo,
+            f"review: PR #{pr_number} — {' '.join(item.title.split())[:70]} (run {run_id})",
+            body,
+            labels=[self.labels.audit],
+        )
+        return f"gh:{ref.number}"
 
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         labels = [self.labels.trigger] if trigger else [self.labels.backlog]

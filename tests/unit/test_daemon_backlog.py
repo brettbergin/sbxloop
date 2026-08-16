@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sbxloop.daemon.backlog import BACKLOG_SUBDIR, collect_backlog
+from sbxloop.daemon.backlog import (
+    BACKLOG_SUBDIR,
+    TOOL_SUBDIR,
+    collect_backlog,
+    collect_tool_findings,
+)
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunRecord
 
@@ -132,3 +137,66 @@ class TestCollectBacklog:
             now=1.0,
         )
         assert filer.filed == [("A", True)]
+
+
+class ToolFiler(RecordingFiler):
+    """A filer that also routes tool findings upstream (tool_repo set)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_filed: list[tuple[str, str, str]] = []
+
+    def file_tool_backlog(self, title: str, body: str, origin_run_id: str) -> str | None:
+        self.tool_filed.append((title, body, origin_run_id))
+        return f"brettbergin/sbxloop#{len(self.tool_filed)}"
+
+
+def write_tool_finding(workspace: Path, name: str, title: str) -> None:
+    folder = workspace / TOOL_SUBDIR
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.md").write_text(f"# {title}\n\nthe planner did X\n")
+
+
+class TestToolFindings:
+    """Findings ABOUT sbxloop never become issues of the project: they go
+    upstream when a tool_repo is configured, else they are only noted."""
+
+    def test_noted_only_without_tool_repo(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        write_tool_finding(ws, "a", "Planner wraps verify in sh -c")
+        write_backlog(ws, "p", "Project bug")
+        store = DaemonStore(tmp_path / "state.db")
+        filer = RecordingFiler()  # no file_tool_backlog
+        project = collect_backlog(
+            run_record(ws), dstore=store, source=filer, max_items=5, trigger=False, now=1.0
+        )
+        tool = collect_tool_findings(
+            run_record(ws), dstore=store, source=filer, max_items=5, now=1.0
+        )
+        assert project == ["gh:1"] and [t for t, *_ in filer.filed] == ["Project bug"]
+        assert tool.filed == [] and tool.unfiled == ["Planner wraps verify in sh -c"]
+
+    def test_routed_upstream_with_tool_repo_and_deduped(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        write_tool_finding(ws, "a", "Planner wraps verify in sh -c")
+        store = DaemonStore(tmp_path / "state.db")
+        filer = ToolFiler()
+        tool = collect_tool_findings(
+            run_record(ws), dstore=store, source=filer, max_items=5, now=1.0
+        )
+        assert tool.filed == ["brettbergin/sbxloop#1"] and tool.unfiled == []
+        assert filer.filed == []  # nothing landed on the project's tracker
+        again = collect_tool_findings(
+            run_record(ws), dstore=store, source=filer, max_items=5, now=2.0
+        )
+        assert again.filed == [] and again.unfiled == []  # fingerprint-deduped
+
+    def test_unmounted_or_absent_is_empty(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        assert collect_tool_findings(
+            run_record(tmp_path / "ws", mounted=False),
+            dstore=store,
+            source=ToolFiler(),
+            max_items=5,
+            now=1.0,
+        ) == ([], [])

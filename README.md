@@ -267,6 +267,40 @@ discover (`--backlog github|inbox`) — those land in **triage** (the
 `sbxloop:backlog` label / `inbox/triage/`) and never run until a human
 promotes them, unless `backlog_auto_trigger` is set.
 
+**The discovery lane.** An issue carrying `sbxloop:audit` (`[daemon] audit_label`) is a *charter*, not a change: the run investigates — "review
+`daemon/loop.py` for guardrail holes", "post-mortem run rXXXX" — and its
+deliverable is findings, each written as one file under `.sbxloop/backlog/`
+with **Evidence** (file:line), **Repro**, **Proposal**, **Size** and
+**Kind**, which the daemon files as `sbxloop:backlog` issues (so
+`--backlog github` is required for the lane to produce anything). Audits
+never deliver a PR, close on completion with a `Filed: #…` comment, and an
+audit that finds nothing real says so. Promoting a finding is a label swap
+(`sbxloop:backlog` → `sbxloop:run`) — a human decision, so the loop's
+precision is visible before anyone hands it the keys.
+When a patch item is abandoned (or completes without delivering) the daemon
+files a **post-mortem** as an audit charter — the plan, the last verify
+transcript, the failure events, all in the issue body, because the auditor
+works in a fresh clone and cannot read the daemon's state — so the loop's own
+failures become findings too (`[daemon] postmortems`, capped per day, never
+for audit items).
+And with `[daemon] audits = true`, **charters versioned in the repository**
+(`.github/sbxloop/audits/<name>.md`, front-matter `every: 7d`) are opened as
+`audit: <name>` issues on schedule — reviewed like code, visible as issues,
+deduplicated against GitHub itself so a fresh state dir cannot double-file.
+sbxloop's own repo carries four (verify-lint vs. prompts, daemon guardrails,
+e2e markers, test flakes); every finding they produce is one more
+`sbxloop:backlog` issue for a human to promote or close.
+
+Two more things close the loop. Every PR the daemon delivers gets a
+**review audit** (`[daemon] review_deliveries`): a fresh run reads the source
+issue and the diff as a skeptical maintainer and files defects, missing
+tests and scope drift as backlog issues — sbxloop evaluating the code
+sbxloop wrote. And findings *about the tool itself* — the planner wrote a
+bad verify command, a prompt misled the agent, delivery mishandled a case —
+are never dumped on the project's tracker: the audit contract routes them
+to `.sbxloop/backlog/tool/`, and `[daemon] tool_repo = "brettbergin/sbxloop"`
+files them upstream (unset: they are noted in the closing comment only).
+
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
 an interrupted run (SIGTERM, crash) is resumed on the next start — through

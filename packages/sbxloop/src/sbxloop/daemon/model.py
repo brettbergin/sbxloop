@@ -9,6 +9,10 @@ from pydantic import BaseModel, ConfigDict
 from sbxloop.engine.model import RunState
 
 ItemSource = Literal["github", "inbox"]
+# What a run of the item is FOR. ``patch``: change the tree, deliver a PR.
+# ``audit``: investigate and file findings as backlog issues — no delivery,
+# the tree is disposable, the issues are the output (the discovery lane).
+ItemKind = Literal["patch", "audit"]
 # ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
 # it is terminal for the daemon (no retry, no breaker count) while the run
 # itself stays resumable from the CLI.
@@ -32,6 +36,7 @@ class WorkItem(BaseModel):
     item_id: str
     source: ItemSource
     source_key: str
+    kind: ItemKind = "patch"
     title: str
     body: str = ""
     url: str = ""
@@ -62,6 +67,12 @@ class RunReport(NamedTuple):
     cancelled_by: str | None = None
     # ``!sbx cancel --retry``: the item went straight back to the queue.
     requeued: bool = False
+    # Backlog issues the run filed (``gh:<n>`` refs) — an audit's deliverable.
+    filed: tuple[str, ...] = ()
+    # Findings addressed to sbxloop itself: filed upstream (``[daemon]
+    # tool_repo``) as refs, or merely noted by title in the closing comment.
+    tool_filed: tuple[str, ...] = ()
+    tool_noted: tuple[str, ...] = ()
 
     @property
     def succeeded(self) -> bool:

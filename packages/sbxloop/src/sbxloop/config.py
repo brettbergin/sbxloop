@@ -361,6 +361,30 @@ class DaemonConfig(_ConfigModel):
     failed_label: str = "sbxloop:failed"
     backlog_label: str = "sbxloop:backlog"
     delivered_label: str = "sbxloop:delivered"
+    # Discovery lane: an issue carrying this label is a charter — the run
+    # investigates and files findings as backlog issues, never a PR.
+    audit_label: str = "sbxloop:audit"
+    # When a patch item is abandoned (or delivers nothing), file a post-mortem
+    # charter carrying the plan, verify transcripts and failure events, so the
+    # discovery lane turns the daemon's own failures into evidenced findings.
+    # Never for audit items (no recursion); capped per rolling day.
+    postmortems: bool = True
+    postmortems_per_day: int = 3
+    # Scheduled area audits: charters versioned in the target repo under
+    # ``audit_dir`` (front-matter `every: 7d`), opened as audit issues when
+    # due. Off by default — a repo opts in by carrying charters AND the
+    # operator flipping this on.
+    audits: bool = False
+    audit_dir: Path = Path(".github/sbxloop/audits")
+    # After a run delivers a PR, open a review audit of that PR — the loop
+    # evaluating the code it just wrote (defects, missing edge cases, scope
+    # drift) and filing findings for a human to promote.
+    review_deliveries: bool = True
+    reviews_per_day: int = 5
+    # Where findings ABOUT THE TOOL (sbxloop's planner, prompts, lint,
+    # delivery) go — the tool's own tracker, never the project's. Unset:
+    # such findings are only noted in the closing comment.
+    tool_repo: str | None = None
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
@@ -394,6 +418,7 @@ class DaemonConfig(_ConfigModel):
             self.failed_label,
             self.backlog_label,
             self.delivered_label,
+            self.audit_label,
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")
@@ -406,9 +431,13 @@ class DaemonConfig(_ConfigModel):
             "max_attempts_per_item",
             "max_consecutive_failures",
             "backlog_max_per_run",
+            "postmortems_per_day",
+            "reviews_per_day",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"daemon.{name} must be >= 1")
+        if self.tool_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", self.tool_repo):
+            raise ValueError(f"daemon.tool_repo must be owner/name, got {self.tool_repo!r}")
         return self
 
 
