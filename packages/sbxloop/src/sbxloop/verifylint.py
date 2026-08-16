@@ -82,42 +82,90 @@ _SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\||\$\(|`|\n")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # Verify commands run under `sh -c` (POSIX sh, dash on Debian), NOT bash.
-# Bash-only syntax does not error there — it silently means something else:
-# `grep -q $'\033[31m'` searches for the literal text "$\033[31m" and never
-# matches. Field failure re59gj4vq: correct code, unrunnable check, revisions
-# burned in a verify→execute→scrutinize-pass→verify loop the executor cannot
-# escape because it may not edit the command. Each entry: (regex, what it is,
-# the portable rewrite).
-_BASHISMS: tuple[tuple[re.Pattern[str], str, str], ...] = (
+# Bash-only syntax fails there in one of two ways, and neither is a check
+# the executor can fix (it may not edit verify commands): ANSI-C quoting
+# `$'...'` is *silently reinterpreted* — `grep -q $'\033[31m'` searches for
+# the literal text "$\033[31m" and never matches (field failure re59gj4vq:
+# correct code, unrunnable check, revisions burned) — while `[[`, `source`,
+# `declare`/`local`, `pushd`/`popd` fail as *unknown commands* and `<<<` is
+# a *syntax error* in dash. Command-like bashisms are matched only in
+# command position (so `grep -F 'source' file` is data, not syntax);
+# operator-like ones only outside quotes.
+_BASHISM_COMMANDS: dict[str, tuple[str, str]] = {
+    "[[": ("`[[ ... ]]` (bash test)", "use POSIX `[ ... ]` / `test`"),
+    "source": ("`source` (bash builtin)", "use POSIX `.` to source a file"),
+    "declare": ("`declare` (bash builtin)", "use plain POSIX assignment"),
+    "local": ("`local` (bash builtin)", "use plain assignment or a subshell"),
+    "pushd": ("`pushd` (bash builtin)", "use `cd` in a subshell: `(cd dir && ...)`"),
+    "popd": ("`popd` (bash builtin)", "use `cd` in a subshell: `(cd dir && ...)`"),
+}
+_BASHISM_OPERATORS: tuple[tuple[str, str, str], ...] = (
     (
-        re.compile(r"\$'"),
-        "ANSI-C quoting `$'...'`",
+        "$'",
+        "ANSI-C quoting `$'...'`, which POSIX sh silently reinterprets as literal text",
         "use `printf` for escapes, e.g. `printf '\\033[31m'` or "
         "`grep -q \"$(printf '\\033')\\[31m\"`",
     ),
-    (re.compile(r"\[\["), "`[[ ... ]]`", "use POSIX `[ ... ]` / `test`"),
-    (re.compile(r"<<<"), "here-string `<<<`", "pipe with `printf '%s' ... |` instead"),
     (
-        re.compile(r"\bdeclare\b|\blocal\b|\bsource\b"),
-        "`declare`/`local`/`source`",
-        "POSIX: plain assignment and `.`",
-    ),
-    (
-        re.compile(r"\bpushd\b|\bpopd\b"),
-        "`pushd`/`popd`",
-        "use `cd` in a subshell: `(cd dir && ...)`",
+        "<<<",
+        "a here-string `<<<`, which is a syntax error in POSIX sh",
+        "pipe with `printf '%s' ... |` instead",
     ),
 )
 
 
+def _strip_quoted(command: str, *, keep_ansi_c: bool = False) -> str:
+    """The command with single- and double-quoted spans blanked out, so
+    operator scans see shell syntax rather than string data. With
+    ``keep_ansi_c`` the ``$`` opening an ANSI-C quote survives (the quote
+    body is still blanked), so ``$'`` can be detected."""
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote is None:
+            if ch in ("'", '"'):
+                quote = ch
+                if keep_ansi_c and ch == "'" and out and out[-1] == "$":
+                    out.append("'")
+                else:
+                    out.append(" ")
+            else:
+                out.append(ch)
+        else:
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                out.append("  ")
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            out.append(" ")
+        i += 1
+    return "".join(out)
+
+
 def bashisms(command: str) -> list[str]:
     """Portable-shell violations in one verify command (empty = clean)."""
-    return [
-        f"uses {what} — verify commands run under POSIX `sh -c`, where this is not "
-        f"bash syntax and silently means something else; {rewrite}"
-        for pattern, what, rewrite in _BASHISMS
-        if pattern.search(command)
-    ]
+    problems: list[str] = []
+    # ANSI-C quoting is `$` immediately followed by an opening single quote
+    # *outside* any quote — so it must be detected before quoted spans are
+    # blanked (the `'...'` part looks like an ordinary string otherwise).
+    # A `$'` inside double quotes is just a dollar sign and a quote.
+    if "$'" in _strip_quoted(command, keep_ansi_c=True):
+        what, rewrite = _BASHISM_OPERATORS[0][1], _BASHISM_OPERATORS[0][2]
+        problems.append(f"uses {what} — verify commands run under `sh -c`; {rewrite}")
+    unquoted = _strip_quoted(command)
+    for token, what, rewrite in _BASHISM_OPERATORS[1:]:
+        if token in unquoted:
+            problems.append(f"uses {what} — verify commands run under `sh -c`; {rewrite}")
+    for head in command_heads(command):
+        if head in _BASHISM_COMMANDS:
+            what, rewrite = _BASHISM_COMMANDS[head]
+            problems.append(
+                f"invokes {what}, which fails as an unknown command under `sh -c`; {rewrite}"
+            )
+    return problems
 
 
 def command_heads(command: str) -> list[str]:

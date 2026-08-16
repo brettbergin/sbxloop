@@ -121,7 +121,7 @@ class TestBashisms:
         (problem,) = lint_verify_commands(
             [".venv/bin/python app.py --color red | grep -q $'\\033[31m'"], ["python"]
         )
-        assert "ANSI-C quoting" in problem and "POSIX `sh -c`" in problem
+        assert "ANSI-C quoting" in problem and "`sh -c`" in problem
         assert "printf" in problem
 
     def test_other_bashisms_flagged(self) -> None:
@@ -130,8 +130,37 @@ class TestBashisms:
             'grep x <<< "$out"',
             "pushd app && make",
             "source .venv/bin/activate && pytest",
+            "cd app && declare -a xs",
         ):
             assert lint_verify_commands([cmd], ["go"]), cmd
+
+    def test_bashism_words_as_data_are_not_flagged(self) -> None:
+        """Command-like bashisms count only in command position, operator-like
+        ones only outside quotes — a portable command that merely *mentions*
+        them as data must not be rejected (review: grep -F 'source' file,
+        test -f source/output, printf '%s' '[[literal]]')."""
+        assert (
+            lint_verify_commands(
+                [
+                    "grep -F 'source' file",
+                    "test -f source/output",
+                    "printf '%s' '[[literal]]'",
+                    "echo '<<<'",
+                    'echo "cost is $x"',
+                    "grep -c local README.md",
+                ],
+                ["python", "go"],
+            )
+            == []
+        )
+
+    def test_feedback_distinguishes_silent_from_loud_failure(self) -> None:
+        (ansi,) = lint_verify_commands(["grep -q $'\\033'"], ["go"])
+        assert "silently reinterprets" in ansi
+        (loud,) = lint_verify_commands(["[[ -f x ]]"], ["go"])
+        assert "unknown command" in loud
+        (syntax,) = lint_verify_commands(['grep x <<< "$y"'], ["go"])
+        assert "syntax error" in syntax
 
     def test_portable_commands_clean(self) -> None:
         assert (
