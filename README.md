@@ -153,6 +153,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | `sbxloop bake`                        | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                   |
 | `sbxloop doctor [--deep]`             | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                           |
 | `sbxloop sandbox ls\|rm\|prune`       | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                    |
+| `sbxloop gc`                          | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                       |
 | `sbxloop secrets list\|clean\|rotate` | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                              |
 | `sbxloop config show\|policy`         | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                             |
 
@@ -524,6 +525,25 @@ A sandbox counts as an orphan candidate when its run is terminal
 non-terminal but silent past `--min-age` (default 1 hour — the persisted event
 stream, heartbeats included, is the liveness signal). Sandboxes deliberately
 kept for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor` reports the current orphan-candidate count.
+
+Run directories accrete too: every run leaves `<state_dir>/runs/<run>/` — a
+full clone of the target checkout under workspace isolation, plus harvested
+artifacts — and an always-on daemon fills the disk with them. The daemon
+sweeps them on start and once a day (`[daemon] prune_runs_after_days`,
+default 14; `0` disables), and `sbxloop gc` runs the same policy by hand:
+
+```bash
+sbxloop gc --dry-run             # classify every run directory, remove nothing
+sbxloop gc                       # remove those past the retention window
+sbxloop gc --older-than 3        # a tighter window for this sweep only
+```
+
+Only terminal runs (completed/failed/cancelled) past the window go, and never
+one whose sandboxes were kept or whose delivery failed — that directory is the
+only copy of the work until it is fetched or redelivered. The SQLite rows stay
+(they are the audit trail); each removal is recorded as a `daemon.gc` event on
+the run, and `resume` refuses a run whose workspace is gone. Fetch results
+back within the retention window — the finish summary prints it.
 
 ## Setup
 

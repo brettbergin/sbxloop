@@ -345,6 +345,10 @@ class DaemonConfig(_ConfigModel):
     backlog_auto_trigger: bool = False
     # Autonomous PRs arrive as drafts unless the operator says otherwise.
     deliver_draft: bool = True
+    # Retention for runs/<run_id>/ on disk (workspace clone + harvested
+    # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
+    # rows are never removed. See sbxloop.gc for what is exempt.
+    prune_runs_after_days: float = Field(default=14.0, ge=0)
 
     @model_validator(mode="after")
     def _check(self) -> DaemonConfig:

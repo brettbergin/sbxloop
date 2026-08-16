@@ -38,6 +38,7 @@ from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, 
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
+from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
@@ -389,6 +390,20 @@ def _print_workspace_clone_summary(result: RunResult, config: Config) -> None:
         console.print(f"  fetch into your checkout: [cyan]git fetch {target} {branch}[/]")
     else:
         console.print(f"  harvested changes are uncommitted in {target} (branch {branch})")
+    _print_retention_note(config)
+
+
+def _print_retention_note(config: Config) -> None:
+    """The run directory is the only copy of the work until it is fetched or
+    delivered — say how long it stays: the daemon sweeps on that window and
+    `sbxloop gc` uses it as the default."""
+    days = config.daemon.prune_runs_after_days
+    if days <= 0:
+        return
+    console.print(
+        f"  [dim]retention: run dirs older than {days:g}d are removed by the daemon / "
+        "[cyan]sbxloop gc[/] — fetch results before then[/]"
+    )
 
 
 def _finish(result: RunResult, config: Config) -> None:
@@ -1183,6 +1198,71 @@ def sandbox_prune(
         raise typer.Exit(1)
 
 
+@app.command()
+def gc(
+    older_than: Annotated[
+        float | None,
+        typer.Option(
+            "--older-than",
+            help="Days a finished run must be untouched before its directory is removed "
+            "(default: [daemon] prune_runs_after_days).",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Classify and report; remove nothing."),
+    ] = False,
+) -> None:
+    """Remove old run directories (workspace clones, harvested artifacts).
+
+    Same policy as the daemon's daily sweep: only runs that are terminal
+    (completed/failed/cancelled), past the retention window, not
+    kept-for-debugging and whose delivery did not fail. Run rows in the
+    state DB — the audit trail — are never removed.
+    """
+    config = load_config()
+    days = config.daemon.prune_runs_after_days if older_than is None else older_than
+    if days < 0:
+        console.print("[bold red]--older-than must be >= 0[/]")
+        raise typer.Exit(2)
+    store = _store(config)
+    result = prune_run_dirs(store, config.state_dir, older_than_s=days * DAY_S, dry_run=dry_run)
+    if not result.verdicts:
+        console.print(f"no run directories under {config.state_dir / 'runs'}")
+        return
+    table = Table(title="sbxloop gc" + (" (dry run)" if dry_run else ""))
+    for column in ("run", "state", "age", "size", "verdict"):
+        table.add_column(column)
+    for v in result.verdicts:
+        table.add_row(
+            v.run_id,
+            v.run_state or "[dim]unknown[/]",
+            format_age(v.age_s),
+            format_bytes(v.size_bytes) if v.prunable else "",
+            ("[red]prune[/] — " if v.prunable else "[green]keep[/] — ") + v.reason,
+        )
+    console.print(table)
+    candidates = result.candidates
+    if not candidates:
+        console.print(f"nothing to prune (retention {days:g}d)")
+        return
+    if dry_run:
+        console.print(
+            f"dry run: {len(candidates)} run dir(s), {format_bytes(result.bytes_freed)}; "
+            "re-run without --dry-run to remove",
+            highlight=False,
+        )
+        return
+    console.print(
+        f"removed {len(result.pruned)} run dir(s), freed {format_bytes(result.bytes_freed)}",
+        highlight=False,
+    )
+    for run_id in result.failed:
+        console.print(f"[yellow]could not remove {run_id}[/] (see log)")
+    if result.failed:
+        raise typer.Exit(1)
+
+
 @config_app.command("show")
 def config_show() -> None:
     """Show the resolved configuration and where each value came from."""
@@ -1843,6 +1923,9 @@ mem_warn = 90.0
 # backlog_max_per_run = 5
 # backlog_auto_trigger = false
 # deliver_draft = true             # autonomous PRs arrive as drafts
+# Retention for .sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
+# swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
+# prune_runs_after_days = 14
 
 [discord]
 # The daemon's human channel: a gateway bot posts each run's chronology

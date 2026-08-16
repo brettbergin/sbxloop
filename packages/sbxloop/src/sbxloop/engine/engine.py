@@ -61,6 +61,7 @@ from sbxloop.errors import (
     WorkerError,
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
+from sbxloop.gc import workspace_pruned
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_message_id, new_run_id
@@ -187,6 +188,13 @@ class LoopEngine:
         run = self.store.get_run(run_id)
         if run.state not in RESUMABLE_RUN_STATES:
             raise StateError(f"run {run_id} is {run.state}; only unfinished runs can resume")
+        if workspace_pruned(self.store, run_id):
+            # The workspace pin would be re-created empty and the agent's
+            # prior work is gone; say so rather than resuming into nothing.
+            raise StateError(
+                f"run {run_id}: its workspace was removed by gc (see `sbxloop logs {run_id} "
+                "--type daemon.gc`); it cannot be resumed — start a new run"
+            )
         self._rehydrate_config(run_id)
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
         return self._drive(run_id, run.outcome, workspace=run.workspace)

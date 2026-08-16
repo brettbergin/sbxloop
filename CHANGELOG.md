@@ -98,6 +98,19 @@ All notable changes to sbxloop are documented here. The project adheres to
   re-queue clears the label.
   `tracking_issue = false` skips the per-run tracking issue for GitHub items,
   whose source issue already carries the run's summary comment.
+- **Run-directory retention** (#233). Every run leaves
+  `<state_dir>/runs/<run>/` behind (the workspace clone under isolation plus
+  harvested artifacts) and nothing removed them; an always-on daemon accreted
+  clones without bound. New `[daemon] prune_runs_after_days` (default 14, `0`
+  disables): the daemon sweeps on its first tick and once a day thereafter,
+  and `sbxloop gc [--older-than DAYS] [--dry-run]` runs the same policy by
+  hand (`sbxloop.gc`). Only terminal runs past the window are removed — never
+  an in-flight/resumable run, a run with kept sandboxes, or one whose last
+  delivery failed (its workspace is the only copy of the work). SQLite rows
+  are kept; each removal is a `daemon.gc` event on the run (path, bytes,
+  age), the daemon reports counts and bytes freed to its frontend, `resume`
+  refuses a run whose workspace gc removed, and the workspace-clone finish
+  summary prints the retention window.
 
 - GitHub op failures carry the HTTP status as a structured field (#221):
   worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken

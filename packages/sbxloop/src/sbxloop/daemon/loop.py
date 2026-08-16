@@ -33,14 +33,13 @@ from sbxloop.engine.model import RESUMABLE_RUN_STATES, TERMINAL_RUN_STATES, RunR
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, SbxloopError, StateError
 from sbxloop.events import EventBus, HostEventTypes
+from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
 logger = logging.getLogger(__name__)
-
-DAY_S = 86400.0
 
 
 class Frontend(Protocol):
@@ -123,6 +122,7 @@ class DaemonLoop:
         # sandbox) is not hammered every tick.
         self._source_failures: dict[str, int] = {}
         self._source_next_poll: dict[str, float] = {}
+        self._last_gc: float | None = None
 
     # -- external control ---------------------------------------------------------
 
@@ -324,6 +324,7 @@ class DaemonLoop:
         # Before the gates: an operator decision made from another process
         # reaches its source even while paused or with the breaker open.
         self._deliver_pending_reports()
+        self._maybe_gc(now)
         if self._paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -401,6 +402,46 @@ class DaemonLoop:
         self._remove_stale_run_sandboxes(run_id)
         self._notify(f"resuming {run_id} for {item.item_id} (resume {resumes + 1}/{budget})")
         return self._dispatch(item, source, resume_run_id=run_id)
+
+    # -- state-dir retention -------------------------------------------------------
+
+    def _maybe_gc(self, now: float) -> None:
+        """Sweep runs/<id>/ on the first tick after start and once a day
+        thereafter. Runs before the pause/breaker checks: retention is
+        housekeeping, not dispatch, and a paused daemon still fills the disk."""
+        if self._last_gc is not None and now - self._last_gc < DAY_S:
+            return
+        self._last_gc = now
+        self.gc(now)
+
+    def gc(self, now: float | None = None) -> None:
+        """One retention sweep (see :mod:`sbxloop.gc`); never raises — a
+        failed sweep must not take the daemon down with it."""
+        days = self.config.daemon.prune_runs_after_days
+        if days <= 0:
+            return
+        now = self.clock() if now is None else now
+        try:
+            result = prune_run_dirs(
+                self.store,
+                self.config.state_dir,
+                older_than_s=days * DAY_S,
+                now=now,
+                actor="daemon",
+            )
+        except Exception:
+            logger.warning("daemon.gc: sweep failed", exc_info=True)
+            return
+        if not result.pruned and not result.failed:
+            logger.debug("daemon.gc: nothing to prune (retention %sd)", days)
+            return
+        text = (
+            f"daemon.gc: pruned {len(result.pruned)} run dir(s) older than {days:g}d, "
+            f"freed {format_bytes(result.bytes_freed)}"
+        )
+        if result.failed:
+            text += f"; {len(result.failed)} could not be removed ({', '.join(result.failed)})"
+        self._notify(text)
 
     # -- discovery ---------------------------------------------------------------------
 
