@@ -166,6 +166,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   `origin` at the source checkout's origin URL instead of the host path
   (metadata only; URL userinfo such as an embedded token is stripped). Docs and the systemd contrib prescribe a dedicated clone
   nobody edits as the daemon's workspace.
+
 - Discord bridge, steering latency made visible (#236): a queued steer gets
   a note under it — `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far); answered at the next checkpoint` — edited in place as
   the phase, task and tool-call count (against the #228 ceiling) move, then
