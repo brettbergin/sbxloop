@@ -193,6 +193,39 @@ class TestBashisms:
         ):
             assert lint_verify_commands([cmd], ["go"]), cmd
 
+    def test_nested_shell_wrapper_flagged(self) -> None:
+        """Field failure r7ef26eht (first sbxloop-on-sbxloop run): the plan
+        wrapped a `git status | awk '{print $2}'` guard in `sh -c "..."`;
+        the runner's own `sh -c` expanded `$2` first, awk printed whole
+        lines, and a correct change failed every revision and the replan."""
+        wrapped = (
+            "sh -c \"git status --porcelain | awk '{print $2}' | grep -vE '^(README.md)$' "
+            '| grep . && exit 1 || exit 0"'
+        )
+        (problem,) = lint_verify_commands([wrapped], ["python"])
+        assert "nested `sh -c`" in problem and "write the pipeline directly" in problem
+        for cmd in (
+            "bash -c 'make test'",
+            'cd app && /bin/sh -c "go test ./..."',
+            "sh -lc 'npm test'",
+        ):
+            assert lint_verify_commands([cmd], ["go"]), cmd
+        # the unwrapped pipeline is fine — that is the remedy
+        assert (
+            lint_verify_commands(
+                [
+                    "git status --porcelain | awk '{print $2}' "
+                    "| grep -vE '^(README.md)$' | (! grep .)"
+                ],
+                ["python"],
+            )
+            == []
+        )
+        # `sh` as data or as a script interpreter (no -c) is not a wrapper
+        assert (
+            lint_verify_commands(["sh scripts/check.sh", "grep -c 'sh -c' notes.md"], ["go"]) == []
+        )
+
     def test_bashism_words_as_data_are_not_flagged(self) -> None:
         """Command-like bashisms count only in command position, operator-like
         ones only outside quotes — a portable command that merely *mentions*

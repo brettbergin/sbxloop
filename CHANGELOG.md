@@ -6,6 +6,15 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- verify-lint rejects a check wrapped in its own `sh -c "..."` / `bash -c`
+  (field failure r7ef26eht, the first sbxloop-on-sbxloop run): each verify
+  command already runs under `sh -c`, so a dollar expansion inside the
+  wrapper's double quotes is consumed by the outer shell — the plan's
+  `git status | awk '{print $2}'` guard printed whole lines and failed every
+  revision and the replan of a correct change. The plan prompt says so too.
+
 ## [0.7.0] — 2026-08-16
 
 The "run sbxloop on sbxloop" release. Everything a readiness audit

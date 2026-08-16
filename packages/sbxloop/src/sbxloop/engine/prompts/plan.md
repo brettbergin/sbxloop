@@ -105,7 +105,14 @@ literal text (a grep for an escape code never matches, and nothing says
 why), while `[[ ]]`, `source`, `declare`/`local`, `pushd`/`popd` fail as
 unknown commands and here-strings are a syntax error. Write portable shell:
 `[ ]` not `[[ ]]`, `printf` for escape sequences, pipes instead of
-here-strings, `.` instead of `source`. Bashisms are rejected mechanically. And prefer to verify *behavior* through the project's test
+here-strings, `.` instead of `source`. Bashisms are rejected mechanically.
+Never wrap a check in its own `sh -c "..."` / `bash -c` — each command is
+already run that way, and any dollar expansion (`$$?`, an awk field) inside
+the wrapper's double quotes is consumed by the outer shell before the inner
+one ever sees it — a wrapped `git status | awk` field-print guard printed
+whole lines and failed every revision of a correct change. Write the
+pipeline directly. And
+prefer to verify *behavior* through the project's test
 runner rather than shell pipelines: asserting on bytes, escape sequences,
 exact whitespace, or exit codes is trivial and exact inside a test file
 (`assert "\x1b[31m" in captured.out`) and fragile as a `grep`/`od`
