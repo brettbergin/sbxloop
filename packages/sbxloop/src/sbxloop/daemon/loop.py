@@ -30,7 +30,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RESUMABLE_RUN_STATES, TERMINAL_RUN_STATES, RunResult
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxError, SbxloopError, StateError
+from sbxloop.errors import RunCancelledError, SbxError, SbxloopError, StateError
 from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.cli import SbxCLI
@@ -340,12 +340,19 @@ class DaemonLoop:
 
         error = result_box.get("error")
         cancel = self._take_cancel(run_id)
-        if cancel is not None and "result" not in result_box and self._run_is_resumable(run_id):
-            # The human's cancel took effect (engine raised at a boundary,
-            # persisted run left mid-flight). Checked before the shutdown
-            # branch: a cancel during quiesce must not be resumed by recovery.
-            # A run that finished or genuinely failed after the request
-            # settles normally — the cancel simply came too late.
+        if (
+            cancel is not None
+            and isinstance(error, RunCancelledError)
+            and self._run_is_resumable(run_id)
+        ):
+            # The human's cancel took effect (engine raised its cancellation
+            # error at a boundary, persisted run left mid-flight). Checked
+            # before the shutdown branch: a cancel during quiesce must not be
+            # resumed by recovery. Gated on the exception type, not just the
+            # persisted state: an infra error re-raised while the run is still
+            # resumable looks identical in the store, and a run that finished
+            # or genuinely failed after the request settles normally — the
+            # cancel simply came too late.
             return self._settle_cancelled(item, source, run_id, cancel)
         if self._stop.is_set() and "result" not in result_box and self._run_is_resumable(run_id):
             # Interrupted by shutdown at a phase boundary: the persisted run

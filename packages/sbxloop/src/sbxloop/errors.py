@@ -94,6 +94,15 @@ class StateError(SbxloopError):
     """Invalid state transition or corrupted persisted state."""
 
 
+class RunCancelledError(StateError):
+    """The engine stopped at a phase boundary because the run was cancelled
+    (in-process ``request_cancel`` or a persisted ``cancelled`` state). A
+    StateError subclass so existing handlers keep working; distinct so the
+    daemon can tell an operator's cancel from an infra failure that raced
+    with it — the persisted state alone cannot (both leave the run
+    resumable)."""
+
+
 class DaemonError(SbxloopError):
     """The daemon could not start or continue (misconfiguration, no work
     sources, an unrecoverable ops sandbox)."""

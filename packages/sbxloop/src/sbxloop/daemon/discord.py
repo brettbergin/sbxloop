@@ -363,6 +363,16 @@ class DiscordBridge:
             # cancelled (no retry, no breaker count) unless --retry asks for
             # a fresh run.
             args = cmd.split()[1:]
+            unknown = [a for a in args if a != "--retry"]
+            if unknown:
+                # A typo (`--rety`) must not silently become a terminal
+                # no-retry cancel: the two outcomes differ materially.
+                await self._send(
+                    channel,
+                    f"unknown cancel argument {code(' '.join(unknown))}; usage: "
+                    f"`{self.discord.command_prefix} cancel [--retry]`",
+                )
+                return
             retry = "--retry" in args
             ok = loop.cancel_current(_author_name(message), retry=retry)
             if not ok:
@@ -386,7 +396,12 @@ class DiscordBridge:
                     channel, f"usage: `{self.discord.command_prefix} requeue <item-id>` (e.g. gh:8)"
                 )
             else:
-                error = loop.requeue(args[0], _author_name(message))
+                # requeue reports to the source synchronously (GitHub HTTP via
+                # the ops sandbox); off the event-loop thread so a slow
+                # request cannot stall heartbeats and message handling.
+                error = await asyncio.get_event_loop().run_in_executor(
+                    None, loop.requeue, args[0], _author_name(message)
+                )
                 await self._send(channel, error or f"re-queued {code(args[0])}.")
         elif word == "queue":
             await self._send(channel, queue_lines(loop.dstore.queued()), suppress_embeds=True)

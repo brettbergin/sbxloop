@@ -105,6 +105,9 @@ class TestInbox:
         assert "cancelled by op" in note and "sbxloop resume r1" in note
         src.report_requeued(item, "op")
         assert (root / "running" / "a.md").exists() and not (root / "failed" / "a.md").exists()
+        # The stale note goes too, or a later success would show the item as
+        # both failed and done.
+        assert not (root / "failed" / "a.result.md").exists()
 
     def test_file_backlog_triage_vs_trigger(self, tmp_path: Path) -> None:
         src, root = self.make(tmp_path)

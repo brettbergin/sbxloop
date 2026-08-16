@@ -54,6 +54,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     DeliveryError,
+    RunCancelledError,
     SbxError,
     SbxloopError,
     StateError,
@@ -1235,9 +1236,11 @@ class LoopEngine:
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
         if self._cancel_event.is_set():
-            raise StateError(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
+            raise RunCancelledError(
+                f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`"
+            )
         if self.store.get_run(run_id).state == "cancelled":
-            raise StateError(f"run {run_id} was cancelled")
+            raise RunCancelledError(f"run {run_id} was cancelled")
         if self.clock() > deadline:
             self._set_run_state(run_id, "failed")
             raise BudgetExceededError(

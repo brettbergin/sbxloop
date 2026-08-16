@@ -190,11 +190,15 @@ class InboxSource:
         self._finish(item, "failed", _cancel_lines(report))
 
     def report_requeued(self, item: WorkItem, by: str) -> None:
-        # Undo the terminal move so the file is back where a running item lives.
+        # Undo the terminal move so the file is back where a running item lives,
+        # and drop the old result note with it: left behind, a later success
+        # would show the same item as both failed and done.
         src = self._dir("failed") / item.source_key
+        note = self._dir("failed") / f"{Path(item.source_key).stem}.result.md"
         try:
             if src.exists():
                 src.replace(self._dir("running") / item.source_key)
+                note.unlink(missing_ok=True)
         except OSError:
             logger.warning("inbox: could not requeue %s", item.source_key, exc_info=True)
 

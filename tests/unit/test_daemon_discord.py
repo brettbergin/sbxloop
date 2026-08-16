@@ -376,9 +376,15 @@ class TestBridge:
         bridge.start()
         try:
             control = client.channels[42]
-            for cmd in ("!sbx cancel", "!sbx cancel --retry", "!sbx requeue gh:8", "!sbx requeue"):
+            for cmd in (
+                "!sbx cancel",
+                "!sbx cancel --retry",
+                "!sbx cancel --rety",  # typo: must not become a no-retry cancel
+                "!sbx requeue gh:8",
+                "!sbx requeue",
+            ):
                 bridge._handle_message(FakeMessage(cmd, control))
-            assert wait_for(lambda: len(control.sent) >= 4)
+            assert wait_for(lambda: len(control.sent) >= 5)
             assert floop.cancel_calls == [
                 ("Discord user `brett`", False),
                 ("Discord user `brett`", True),
@@ -386,6 +392,7 @@ class TestBridge:
             assert floop.requeued == [("gh:8", "Discord user `brett`")]
             joined = "\n".join(control.sent)
             assert "settles as cancelled" in joined and "run again fresh" in joined
+            assert "unknown cancel argument `--rety`" in joined
             assert "re-queued `gh:8`" in joined and "usage:" in joined
         finally:
             bridge.close()

@@ -19,7 +19,7 @@ from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxError, StateError, WorkerError
+from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
 
 
@@ -271,7 +271,11 @@ class TestOperatorCancel:
 
     @staticmethod
     def _run_until_cancelled(
-        h: Harness, *, requester: str | None = None, retry: bool = False
+        h: Harness,
+        *,
+        requester: str | None = None,
+        retry: bool = False,
+        error: type[Exception] = RunCancelledError,
     ) -> None:
         started = threading.Event()
         cancelled = threading.Event()
@@ -284,8 +288,10 @@ class TestOperatorCancel:
             h.store.set_run_state(run_id, "running")  # mid-flight → resumable
             started.set()
             assert cancelled.wait(5)
-            # What the engine raises at the next boundary after request_cancel.
-            raise StateError(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
+            # By default: what the engine raises at the next boundary after
+            # request_cancel. Tests may substitute an infra error to model a
+            # failure racing with the cancel.
+            raise error(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
 
         h.loop._runner = runner
         t = threading.Thread(target=h.loop.tick)
@@ -336,6 +342,20 @@ class TestOperatorCancel:
         h.loop._runner = h.runner
         assert h.loop.tick().outcome == "done"
         assert h.runs[1][1] is False  # a fresh run, not a resume
+
+    def test_infra_error_racing_a_cancel_is_still_a_failure(self, tmp_path: Path) -> None:
+        """Review: an infra error is re-raised while the run is still resumable
+        (engine keeps it resumable on purpose), so persisted state alone cannot
+        tell it from a cancel that took effect. Only the engine's cancellation
+        error settles as cancelled; a real failure that races the request keeps
+        its retry/breaker accounting."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        self._run_until_cancelled(h, error=WorkerError)
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "queued" and item.attempts == 1
+        assert h.loop._consecutive_failures == 1
+        assert [c[0] for c in h.source.calls] == ["claim", "started", "retry"]
 
     def test_stale_cancel_never_taints_a_later_run(self, tmp_path: Path) -> None:
         """A cancel that lands after the engine already finished settles that
