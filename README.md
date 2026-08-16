@@ -306,6 +306,30 @@ The daemon prints the resolved location at start; the `sbxloop daemon items|aban
 `sbxloop status`/`logs`/`gc` from the runner directory need
 `SBXLOOP_STATE_DIR` pointed at it.
 
+#### Working a design tracker
+
+The daemon's defaults are task-queue semantics: a delivered run closes the
+source issue (the PR is the reviewable object) and opens a per-run tracking
+issue. When the repository's issues are design discussions rather than a
+queue of chores, flip both knobs:
+
+- `[daemon] close_on_success` (default `true`) — with `false` the daemon
+  comments on the source issue with the run summary and the PR link, removes
+  `sbxloop:in-progress`, adds `sbxloop:delivered`, and leaves the issue open
+  so the human who merges the PR decides when the discussion is settled.
+- `[daemon] tracking_issue` (default `true`) — with `false` no per-run
+  tracking issue is opened; the summary comment on the source issue is the
+  record, so the design thread stays in one place.
+
+```toml
+[daemon]
+deliver_draft = true          # PRs arrive as drafts for review
+close_on_success = false      # leave the design issue open for the human
+tracking_issue = false        # the summary comment is the record
+workspace_isolation = "clone" # never touch the runner's checkout
+refresh_workspace = true      # fast-forward it before each fresh run
+```
+
 ### Discord: chronology out, steering in
 
 With `pip install 'sbxloop[discord]'`, `DISCORD_BOT_TOKEN` in the
