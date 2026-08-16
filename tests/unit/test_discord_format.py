@@ -392,11 +392,34 @@ class TestSteerProgress:
         p.observe(ev("task.end", task_id="t2", title="Wire CLI", state="done"))
         assert p.render() == "⏳ steer queued; answered at the next checkpoint"
 
+    def test_production_event_order_keeps_the_planning_phase(self) -> None:
+        # LoopEngine._run_task emits task.state=planning BEFORE task.start
+        # (and the persisted phase first on resume); the start must not
+        # wipe the phase already observed for the same task.
+        p = SteerProgress(cap=40)
+        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
+        p.observe(ev("task.start", task_id="t1", title="Plan it"))
+        assert p.render() == (
+            "⏳ steer queued — agent is mid-**plan** on `t1` · Plan it; "
+            "answered at the next checkpoint"
+        )
+        p.observe(ev("task.state", task_id="t3", state="verifying", revisions=0))
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        p.observe(ev("task.start", task_id="t3", title="Resumed"))
+        assert "mid-**verify** on `t3` · Resumed (1/40 tool calls so far)" in p.render()
+        # a start for a DIFFERENT task still resets the phase and counters
+        p.observe(ev("task.start", task_id="t4", title="Next"))
+        assert p.render() == (
+            "⏳ steer queued — agent is on `t4` · Next; answered at the next checkpoint"
+        )
+
     def test_unbounded_cap_and_terminal_states(self) -> None:
         p = SteerProgress(cap=0)  # 0 = unbounded in [budgets]
         p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
         p.observe(ev("agent.tool_start", tool="bash", args="ls"))
-        assert "(1 tool calls so far)" in p.render()
+        assert "(1 tool call so far)" in p.render()
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert "(2 tool calls so far)" in p.render()
         assert p.render(state="answering") == "🧭 steer picked up — the agent is answering now"
         assert p.render(state="answered") == "✅ steer answered"
         assert p.render(state="failed").startswith("⚠ steer failed")

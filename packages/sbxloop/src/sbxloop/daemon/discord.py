@@ -311,8 +311,6 @@ class DiscordBridge:
             unsubscribe, self._unsubscribe = self._unsubscribe, None
             self._active_run = None
             self._active_item = None
-            unanswered = list(self._pending.values())
-            self._pending.clear()
         if unsubscribe is not None:
             unsubscribe()
         state = (
@@ -320,7 +318,10 @@ class DiscordBridge:
             if report.delivery_error and report.state == "completed"
             else report.state
         )
-        self._enqueue(report.run_id, ("__finished__", item, state, report, unanswered))
+        # Which steers went unanswered is decided by the pump in ``_finish``,
+        # AFTER it has drained the events queued ahead of this marker: a
+        # ``chat.reply`` already on the queue still resolves its steer.
+        self._enqueue(report.run_id, ("__finished__", item, state, report))
 
     def _enqueue(self, run_id: str, payload: Any) -> None:
         self._events.put((run_id, payload))
@@ -689,8 +690,11 @@ class DiscordBridge:
         await self._send_channel(daemon_notice(text, thread_id=thread_id))
 
     async def _finish(self, payload: tuple[Any, ...]) -> None:
-        _, item, state, report, unanswered = payload
+        _, item, state, report = payload
         run_id = report.run_id
+        with self._lock:
+            unanswered = [p for p in self._pending.values() if p.run_id == run_id]
+            self._pending = {m: p for m, p in self._pending.items() if p.run_id != run_id}
         thread = await self._ensure_thread(run_id)
         await self._digest_tick(run_id, [], close=True)
         # Final status-line edit, then the report card.

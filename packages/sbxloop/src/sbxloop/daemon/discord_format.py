@@ -685,8 +685,13 @@ class SteerProgress:
         t = event.type
         tid = str(d.get("task_id") or "")
         if t == "task.start" and tid:
+            # The engine emits ``task.state=planning`` (and, on resume, the
+            # persisted phase) *before* ``task.start``, so a start for the
+            # task already being tracked only supplies the title — the
+            # phase and counters observed for it stay put.
+            if tid != self.task_id:
+                self.phase, self.tool_calls, self.capped = None, 0, False
             self.task_id, self.title = tid, str(d.get("title") or "") or None
-            self.phase, self.tool_calls, self.capped = None, 0, False
             self._dirty = True
         elif t == "task.state" and tid and d.get("state") in _PHASE_STATES:
             # Every state change is a checkpoint: the per-phase job (and its
@@ -718,7 +723,7 @@ class SteerProgress:
         if state == "answered":
             return "✅ steer answered"
         if state == "failed":
-            return "⚠ steer failed — see the reply above"
+            return "⚠ steer failed — see the error below"
         if state == "unanswered":
             return "⚠ steer not answered — the run ended first"
         where = ""
@@ -731,7 +736,8 @@ class SteerProgress:
         if where and (self.tool_calls or self.capped):
             calls = f"{self.tool_calls}/{self.cap}" if self.cap else str(self.tool_calls)
             tail = " — ceiling reached)" if self.capped else " so far)"
-            where += f" ({calls} tool calls{tail}"
+            noun = "tool call" if self.tool_calls == 1 and not self.cap else "tool calls"
+            where += f" ({calls} {noun}{tail}"
         return f"⏳ steer queued{where}; answered at the next checkpoint"
 
 

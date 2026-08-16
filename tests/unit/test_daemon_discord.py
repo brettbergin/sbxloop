@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from sbxloop.config import Config
-from sbxloop.daemon.discord import DiscordBridge, format_for_discord, headline_text
+from sbxloop.daemon.discord import DiscordBridge, _Pending, format_for_discord, headline_text
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.errors import DaemonError
@@ -839,8 +839,44 @@ class TestBridge:
             assert note.content == "⏳ steer queued; answered at the next checkpoint"
             bridge.run_finished(item, RunReport("r1", "completed", "done"))
             assert wait_for(lambda: note.content.startswith("⚠ steer not answered"))
+            assert any("1 steering message(s) were not answered" in s for s in thread.sent)
         finally:
             bridge.close()
+
+    def test_reply_queued_before_the_finish_still_counts_as_answered(self, tmp_path: Path) -> None:
+        """A short run can emit chat.reply and finish before the pump has
+        drained either. Which steers went unanswered is decided by the pump
+        after it drains what was queued ahead of the finish marker, so the
+        queued reply still resolves its steer — no false "not answered"."""
+        bridge, client, _ = make_bridge(tmp_path)
+        gate = threading.Event()
+
+        async def slow_start(token: str) -> None:
+            while not gate.is_set():
+                await asyncio.sleep(0.02)
+            client.bridge.mark_ready()  # type: ignore[union-attr]
+            while not client.closed:
+                await asyncio.sleep(0.05)
+
+        client.start = slow_start  # type: ignore[method-assign]
+        bridge.start(connect_wait_s=0.2)
+        item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+        bus = EventBus()
+        engine = FakeEngine()
+        bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
+        # The steer itself needs a live thread to be posted from Discord; the
+        # bridge's own bookkeeping for it is what the finish path consults.
+        mid = engine.post_user_message("focus on auth first")
+        with bridge._lock:
+            bridge._pending[mid] = _Pending("r1", 4242, 778)
+        bus.emit("chat.reply", "r1", message_id=mid, reply="Will do.", action="steer_task")
+        bridge.run_finished(item, RunReport("r1", "completed", "done"))
+        gate.set()
+        bridge.close()  # drains: chat.reply first, then the finish marker
+        thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+        assert any(s.startswith("**finished: completed**") for s in thread.sent)
+        assert not any("were not answered" in s for s in thread.sent)
+        assert bridge._pending == {}
 
 
 def test_threading_sanity() -> None:
