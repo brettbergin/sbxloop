@@ -6,6 +6,8 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 
+from sbxloop.engine.model import RunState
+
 ItemSource = Literal["github", "inbox"]
 ItemState = Literal["queued", "running", "done", "failed", "abandoned"]
 
@@ -41,7 +43,7 @@ class RunReport(NamedTuple):
     the run's persisted events, the same way the CLI finish summary is."""
 
     run_id: str
-    state: str
+    state: RunState
     task_summary: str
     tracking_issue: tuple[int, str] | None = None
     delivery: tuple[int, str] | None = None
@@ -53,10 +55,22 @@ class RunReport(NamedTuple):
         return self.state == "completed" and self.delivery_error is None
 
 
+TickOutcome = Literal["done", "retry", "abandoned", "delivery_failed", "interrupted"]
+IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work"]
+
+
 class TickResult(NamedTuple):
     """What one poll+dispatch cycle did, for logs and tests."""
 
     discovered: int = 0
     dispatched: str | None = None  # item_id that ran this tick
-    outcome: str | None = None  # "done" | "retry" | "abandoned" | "delivery_failed"
-    idle_reason: str | None = None  # "breaker" | "daily_cap" | "no_work" | "paused"
+    outcome: TickOutcome | None = None
+    idle_kind: IdleKind | None = None
+    # Human detail for the idle kind (e.g. "3 queued; next eligible in 42s").
+    idle_detail: str | None = None
+
+    @property
+    def idle_reason(self) -> str | None:
+        if self.idle_kind is None:
+            return None
+        return f"{self.idle_kind} ({self.idle_detail})" if self.idle_detail else self.idle_kind

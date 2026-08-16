@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
@@ -62,6 +64,24 @@ class TestQueueAndAttempts:
         store.mark_done("gh:2", now=60.0)
         assert store.next_queued(now=100.0, backoff_s=100.0) is None
         assert store.next_queued(now=140.0, backoff_s=100.0).item_id == "gh:1"  # type: ignore[union-attr]
+
+    def test_same_created_at_dispatches_in_insertion_order(self, tmp_path: Path) -> None:
+        """A batch upserted with one `now` must still be FIFO: rowid breaks
+        the created_at tie (review: SQL guarantees no order for equal keys)."""
+        store = DaemonStore(tmp_path / "state.db")
+        for key in ("c", "a", "b"):  # deliberately not sorted by key
+            store.upsert_new(item(key), now=50.0)
+        order = []
+        while (nxt := store.next_queued(now=60.0, backoff_s=1.0)) is not None:
+            order.append(nxt.source_key)
+            store.mark_running(nxt.item_id, f"r{nxt.source_key}", now=61.0)
+        assert order == ["c", "a", "b"]
+
+    def test_mark_running_unknown_item_leaves_no_orphan_ledger_row(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        with pytest.raises(KeyError):
+            store.mark_running("gh:nope", "r_orphan", now=1.0)
+        assert store.runs_started_since(0) == 0
 
     def test_attempt_counting_requeue_vs_abandon(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")

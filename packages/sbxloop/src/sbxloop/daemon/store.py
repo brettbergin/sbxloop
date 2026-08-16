@@ -143,9 +143,12 @@ class DaemonStore:
 
     def next_queued(self, now: float, backoff_s: float) -> WorkItem | None:
         """Oldest queued item whose retry backoff (attempts * backoff) has
-        elapsed since its last update."""
+        elapsed since its last update. Ties on ``created_at`` (a batch
+        upserted with one ``now``) break on insertion order (rowid), so
+        dispatch is genuinely FIFO."""
         for row in self._conn.execute(
-            "SELECT * FROM daemon_work_items WHERE state = 'queued' ORDER BY created_at ASC"
+            "SELECT * FROM daemon_work_items WHERE state = 'queued' "
+            "ORDER BY created_at ASC, rowid ASC"
         ):
             item = _row_to_item(row)
             if item.attempts == 0 or now - item.updated_at >= item.attempts * backoff_s:
@@ -156,7 +159,8 @@ class DaemonStore:
         return [
             _row_to_item(row)
             for row in self._conn.execute(
-                "SELECT * FROM daemon_work_items WHERE state = 'queued' ORDER BY created_at ASC"
+                "SELECT * FROM daemon_work_items WHERE state = 'queued' "
+                "ORDER BY created_at ASC, rowid ASC"
             )
         ]
 
@@ -174,11 +178,16 @@ class DaemonStore:
         all before the engine starts, so a crash still leaves the item→run
         link for recovery."""
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE daemon_work_items SET state = 'running', attempts = attempts + 1, "
                 "run_id = ?, updated_at = ? WHERE item_id = ?",
                 (run_id, now, item_id),
             )
+            if cursor.rowcount != 1:
+                # An unknown item must not leave an orphan ledger row that the
+                # daily cap would count.
+                self._conn.rollback()
+                raise KeyError(f"unknown work item {item_id!r}")
             self._conn.execute(
                 "INSERT OR REPLACE INTO daemon_runs (run_id, item_id, started_at) VALUES (?, ?, ?)",
                 (run_id, item_id, now),

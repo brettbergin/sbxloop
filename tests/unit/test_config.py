@@ -136,6 +136,12 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="distinct"):
         load_config(cwd=tmp_path, env={})
+    # GitHub labels are case-insensitive: differing only by case is a collision
+    (tmp_path / "sbxloop.toml").write_text(
+        '[daemon]\ntrigger_label = "sbxloop:run"\nfailed_label = "SBXLOOP:RUN"\n'
+    )
+    with pytest.raises(ConfigError, match="case-insensitively"):
+        load_config(cwd=tmp_path, env={})
     (tmp_path / "sbxloop.toml").write_text('[daemon]\nbacklog = "yolo"\n')
     with pytest.raises(ConfigError):
         load_config(cwd=tmp_path, env={})

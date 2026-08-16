@@ -331,8 +331,10 @@ class DaemonConfig(_ConfigModel):
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")
-        if len(set(labels)) != len(labels):
-            raise ValueError("daemon labels must be distinct")
+        # GitHub label names are case-insensitive: "sbxloop:run" and
+        # "SBXLOOP:RUN" are the same label, so they cannot mark two states.
+        if len({label.strip().casefold() for label in labels}) != len(labels):
+            raise ValueError("daemon labels must be distinct (case-insensitively)")
         for name in (
             "max_runs_per_day",
             "max_attempts_per_item",
