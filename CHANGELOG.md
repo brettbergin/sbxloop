@@ -110,6 +110,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   toolchains; a prebaked template that lacks it is topped up from the single
   prebake probe. `sbxloop bake` records whether git landed and `sbxloop doctor`
   shows a soft "git in template" row.
+
 - **uv-aware Python toolchain** (#250). The `python` toolchain now installs
   `uv` from its pinned, checksum-verified GitHub release (per-arch digests,
   like Node/Go) and a uv-managed Python 3.13 (`python3.13` linked onto PATH),
