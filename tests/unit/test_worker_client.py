@@ -1011,6 +1011,43 @@ class TestPrebakedTemplate:
             "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
         ]
 
+    @pytest.mark.parametrize(
+        "verdict",
+        [
+            pytest.param({"stage": "ok"}, id="git-absent"),
+            pytest.param({"stage": "ok", "git": "yes"}, id="git-non-boolean"),
+        ],
+    )
+    def test_verified_prebaked_with_malformed_git_verdict_tops_up(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        monkeypatch: pytest.MonkeyPatch,
+        verdict: dict[str, object],
+    ) -> None:
+        """Fail closed (#252): an otherwise-successful "ok" verdict whose
+        ``git`` field is absent or not a bool must NOT be read as "git
+        present" — the apt top-up runs, and the fast path is still taken (no
+        ladder). The real probe always emits a bool, so the malformed verdict
+        is staged by swapping the probe script for one that prints it as-is.
+        """
+        from sbxloop.worker import client as client_mod
+
+        verdict = {**verdict, "python": sys.executable}
+        monkeypatch.setattr(client_mod, "_PREBAKE_PROBE", f"print({json.dumps(verdict)!r})")
+        self.write_manifest(sandbox, python=sys.executable)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        client = make_client(sandbox, EventBus(), python="python3")
+        client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
+
+        assert client.prebaked
+        assert client._prebake_missing == [toolchains.GIT]
+        joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j]
+        assert joined[1:] == [
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
+        ]
+
     def test_verified_prebaked_without_git_skips_top_up_for_non_agent(
         self,
         sandbox: Sandbox,
