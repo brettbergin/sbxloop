@@ -35,6 +35,10 @@ class TestParseGhHttpStatus:
             ("gh: Git Repository is empty. (HTTP 409)", 409),
             ("gh: Not Found (HTTP 404)", 404),
             ("HTTP 502: Bad Gateway", 502),
+            # gh's parenthesized status is authoritative over a status quoted
+            # inside the server message; the last parenthesized one wins.
+            ("gh: upstream said HTTP 404 (HTTP 500)", 500),
+            ("gh: retried after (HTTP 502) then failed (HTTP 409)", 409),
             ("gh: could not connect", None),
             ("gh: 12345 items", None),
         ],

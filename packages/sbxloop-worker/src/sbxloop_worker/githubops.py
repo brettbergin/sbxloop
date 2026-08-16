@@ -52,15 +52,25 @@ class GithubOpError(RuntimeError):
 
 # gh prints HTTP failures as ``gh: <message> (HTTP 409)``; the bare form
 # covers gh versions/paths that omit the parentheses. Only 3-digit codes.
-_GH_HTTP_STATUS = re.compile(r"\(HTTP (\d{3})\)|\bHTTP (\d{3})\b")
+_GH_PAREN_STATUS = re.compile(r"\(HTTP (\d{3})\)")
+_GH_BARE_STATUS = re.compile(r"\bHTTP (\d{3})\b")
 
 
 def parse_gh_http_status(stderr: str) -> int | None:
-    """Extract the HTTP status ``gh api`` reports on stderr, if any."""
-    match = _GH_HTTP_STATUS.search(stderr)
-    if match is None:
-        return None
-    return int(match.group(1) or match.group(2))
+    """Extract the HTTP status ``gh api`` reports on stderr, if any.
+
+    The parenthesized form is gh's own report of the response status and is
+    appended after the (server-supplied) message, so the *last* one wins:
+    a message like ``upstream said HTTP 404 (HTTP 500)`` is a 500, not a 404.
+    The bare form is only a fallback when gh printed no parenthesized status.
+    """
+    paren = _GH_PAREN_STATUS.findall(stderr)
+    if paren:
+        return int(paren[-1])
+    bare = _GH_BARE_STATUS.findall(stderr)
+    if bare:
+        return int(bare[-1])
+    return None
 
 
 class Transport(Protocol):
