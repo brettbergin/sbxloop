@@ -50,9 +50,10 @@ class TestParsing:
 
     def test_bad_charters_are_problems_not_crashes(self, tmp_path: Path) -> None:
         write_charter(tmp_path, "ok")
-        (tmp_path / ".github" / "sbxloop" / "audits" / "Bad Name.md").write_text("---\nevery: 1d\n---\nx\n")
-        (tmp_path / ".github" / "sbxloop" / "audits" / "nofm.md").write_text("# no front matter\n")
-        (tmp_path / ".github" / "sbxloop" / "audits" / "empty.md").write_text("---\nevery: 1d\n---\n")
+        folder = tmp_path / ".github" / "sbxloop" / "audits"
+        (folder / "Bad Name.md").write_text("---\nevery: 1d\n---\nx\n")
+        (folder / "nofm.md").write_text("# no front matter\n")
+        (folder / "empty.md").write_text("---\nevery: 1d\n---\n")
         charters, problems = load_charters(tmp_path)
         assert [c.name for c in charters] == ["ok"]
         assert len(problems) == 3
