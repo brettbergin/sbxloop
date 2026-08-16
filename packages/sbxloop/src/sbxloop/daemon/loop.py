@@ -57,6 +57,9 @@ from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
 logger = logging.getLogger(__name__)
 
+# How often the audit scheduler fast-forwards the checkout to see new charters.
+AUDIT_REFRESH_S = 600.0
+
 
 class Frontend(Protocol):
     """What a human-facing channel (Discord) sees of the loop's lifecycle.
@@ -127,6 +130,7 @@ class DaemonLoop:
         self._stop = threading.Event()
         self._paused = False
         self._audit_problems_seen: set[str] = set()
+        self._last_audit_refresh = float("-inf")
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
         self._cancel_request: CancelRequest | None = None
@@ -894,6 +898,13 @@ class DaemonLoop:
         checkout = self._workspace_checkout()
         if checkout is None:
             return
+        # The checkout is normally refreshed only when a run starts, so
+        # charters merged after the last run would never be seen (field:
+        # the first deploy read a clone that predated its own charters).
+        # Refresh here too, throttled — a fetch a minute is not the point.
+        if now - self._last_audit_refresh >= AUDIT_REFRESH_S:
+            self._last_audit_refresh = now
+            self._refresh_workspace()
         charters, problems = load_charters(checkout, daemon.audit_dir)
         for problem in problems:
             if problem not in self._audit_problems_seen:

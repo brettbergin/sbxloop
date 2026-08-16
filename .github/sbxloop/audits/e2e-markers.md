@@ -1,6 +1,4 @@
-______________________________________________________________________
-
-## every: 14d
+<!-- sbxloop: every=14d -->
 
 # Audit: e2e markers and unverified paths
 

@@ -8,6 +8,17 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Scheduled-audit charters carry their metadata as an HTML comment
+  (`<!-- sbxloop: every=7d -->`) instead of `---` front-matter: mdformat
+  rewrote the front-matter into a thematic break plus an H2 the first time
+  the charters shipped, and the daemon then saw no metadata at all (`---`
+  YAML still parses; the mangled form is a clear error naming the fix).
+  The scheduler also fast-forwards the daemon's checkout (throttled, 10 min)
+  before reading charters — it used to be refreshed only when a run started,
+  so charters merged after the last run were invisible.
+
+### Fixed
+
 - verify-lint rejects a check wrapped in its own `sh -c "..."` / `bash -c`
   (field failure r7ef26eht, the first sbxloop-on-sbxloop run): each verify
   command already runs under `sh -c`, so a dollar expansion inside the

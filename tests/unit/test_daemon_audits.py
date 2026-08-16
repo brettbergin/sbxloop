@@ -21,12 +21,18 @@ from tests.unit.test_daemon_loop import FakeSource, Harness, RecordingFrontend
 from tests.unit.test_hostgit import make_repo
 
 
-def write_charter(root: Path, name: str, every: str = "7d", enabled: str | None = None) -> Path:
+def write_charter(
+    root: Path, name: str, every: str = "7d", enabled: str | None = None, *, yaml: bool = False
+) -> Path:
     folder = root / ".github" / "sbxloop" / "audits"
     folder.mkdir(parents=True, exist_ok=True)
-    meta = f"every: {every}\n" + (f"enabled: {enabled}\n" if enabled else "")
     path = folder / f"{name}.md"
-    path.write_text(f"---\n{meta}---\n# Audit {name}\n\nLook at the thing.\n")
+    if yaml:
+        meta = f"every: {every}\n" + (f"enabled: {enabled}\n" if enabled else "")
+        path.write_text(f"---\n{meta}---\n# Audit {name}\n\nLook at the thing.\n")
+    else:
+        meta = f"every={every}" + (f" enabled={enabled}" if enabled else "")
+        path.write_text(f"<!-- sbxloop: {meta} -->\n\n# Audit {name}\n\nLook at the thing.\n")
     return path
 
 
@@ -47,12 +53,20 @@ class TestParsing:
         assert c.title == "audit: guardrails" and c.rel == ".github/sbxloop/audits/guardrails.md"
         off = parse_charter(write_charter(tmp_path, "later", "1d", enabled="false"))
         assert not off.enabled
+        # the --- YAML form still parses; the mdformat-mangled form is a
+        # clear error naming the fix (field: first deploy filed nothing)
+        y = parse_charter(write_charter(tmp_path, "yaml", "2d", yaml=True))
+        assert y.every_s == 2 * 86400
+        mangled = tmp_path / ".github" / "sbxloop" / "audits" / "mangled.md"
+        mangled.write_text("_" * 70 + "\n\n## every: 7d\n\n# Audit\n\nbody\n")
+        with pytest.raises(ValueError, match="<!-- sbxloop: every=7d -->"):
+            parse_charter(mangled)
 
     def test_bad_charters_are_problems_not_crashes(self, tmp_path: Path) -> None:
         write_charter(tmp_path, "ok")
         folder = tmp_path / ".github" / "sbxloop" / "audits"
         (folder / "Bad Name.md").write_text("---\nevery: 1d\n---\nx\n")
-        (folder / "nofm.md").write_text("# no front matter\n")
+        (folder / "nofm.md").write_text("# no metadata\n")
         (folder / "empty.md").write_text("---\nevery: 1d\n---\n")
         charters, problems = load_charters(tmp_path)
         assert [c.name for c in charters] == ["ok"]
@@ -162,11 +176,43 @@ class TestScheduling:
         front = RecordingFrontend()
         h.loop.frontend = front  # type: ignore[assignment]
         write_charter(repo, "good", "0d")
-        (repo / ".github" / "sbxloop" / "audits" / "bad.md").write_text("no front matter\n")
+        (repo / ".github" / "sbxloop" / "audits" / "bad.md").write_text("no metadata\n")
         h.loop.tick()
         h.loop.tick()
         assert [t for t, _ in h.source.filed][:1] == ["audit: good"]  # type: ignore[attr-defined]
         assert sum("audit charter skipped" in c for c in front.seen) == 1
+
+
+class TestRefreshBeforeSchedule:
+    def test_charters_merged_after_the_clone_are_seen(self, tmp_path: Path) -> None:
+        """Field: the daemon's checkout is refreshed only when a run starts,
+        so charters merged after the last run were invisible. The scheduler
+        now fast-forwards (throttled) before reading them."""
+        from tests.unit.test_hostgit import git, make_upstream_and_clone
+
+        upstream, clone = make_upstream_and_clone(tmp_path)
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "sandbox": {"workspace": str(clone)},
+                "daemon": {"audits": True},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        h.source = SchedulingSource()
+        h.loop.sources = [h.source]
+        # the charter is committed upstream from ANOTHER clone; the daemon's
+        # checkout does not have it until it fetches
+        other = tmp_path / "other"
+        git("clone", "-q", str(upstream), str(other), cwd=tmp_path)
+        write_charter(other, "fresh", "0d")
+        git("add", ".", cwd=other)
+        git("commit", "-q", "-m", "add charter", cwd=other)
+        git("push", "-q", "origin", "main", cwd=other)
+        assert not (clone / ".github" / "sbxloop" / "audits" / "fresh.md").exists()
+        h.loop.tick()
+        assert [t for t, _ in h.source.filed] == ["audit: fresh"]  # type: ignore[attr-defined]
 
 
 def test_charter_dataclass_title() -> None:
