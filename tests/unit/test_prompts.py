@@ -203,8 +203,10 @@ def test_render_all_templates_have_no_leftover_vars() -> None:
             "task_description": "d",
             "acceptance_criteria": "- c",
             "plan_steps": "- s",
+            "prior_feedback": "f",
             "executor_report": "r",
             "evidence": "e",
+            "verify_commands": "- true",
         },
         "validate": {
             "outcome": "o",
