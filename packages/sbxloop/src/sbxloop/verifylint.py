@@ -177,6 +177,14 @@ def _strip_quoted(command: str, *, keep_ansi_c: bool = False) -> str:
     return "".join(out)
 
 
+# `sh -c "..."` / `bash -c '...'` at command position: a shell inside the
+# shell the runner already provides. Matched on the raw command so quoting
+# does not hide it.
+_NESTED_SHELL = re.compile(
+    r"(?:^|[|&;(]\s*)(?:/bin/|/usr/bin/)?(?:sh|bash|dash|zsh)\s+-[a-zA-Z]*c\b"
+)
+
+
 def bashisms(command: str) -> list[str]:
     """Portable-shell violations in one verify command (empty = clean)."""
     problems: list[str] = []
@@ -191,12 +199,26 @@ def bashisms(command: str) -> list[str]:
     for token, what, rewrite in _BASHISM_OPERATORS[1:]:
         if token in unquoted:
             problems.append(f"uses {what} — verify commands run under `sh -c`; {rewrite}")
-    for head in command_heads(command):
+    heads = command_heads(command)
+    for head in heads:
         if head in _BASHISM_COMMANDS:
             what, rewrite = _BASHISM_COMMANDS[head]
             problems.append(
                 f"invokes {what}, which fails as an unknown command under `sh -c`; {rewrite}"
             )
+    if _NESTED_SHELL.search(command):
+        # Field failure r7ef26eht (first sbxloop-on-sbxloop run): the plan
+        # wrapped a pipeline as `sh -c "... awk '{print $2}' ..."`. The
+        # runner already executes each verify command under `sh -c`, so the
+        # OUTER shell expanded the double-quoted `$2` to nothing, awk printed
+        # whole lines, the allowlist grep matched none of them, and a correct
+        # change failed verification three revisions and a replan in a row.
+        problems.append(
+            "wraps the check in a nested `sh -c`/`bash -c` string — verify commands "
+            "already run under `sh -c`, and `$` expansions inside the wrapper's double "
+            "quotes are consumed by the outer shell; write the pipeline directly, "
+            "unwrapped"
+        )
     return problems
 
 
