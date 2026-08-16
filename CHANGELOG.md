@@ -110,7 +110,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   are kept; each removal is a `daemon.gc` event on the run (path, bytes,
   age), the daemon reports counts and bytes freed to its frontend, `resume`
   refuses a run whose workspace gc removed, and the workspace-clone finish
-  summary prints the retention window.
+  summary prints the retention window. A sweep and a `resume` of the same
+  failed run can race across processes: gc writes its marker in one write
+  transaction with a re-check that the run is still terminal, then renames
+  the directory out of `runs/` (into `gc-pending/`) before deleting it, and
+  `resume` leaves the terminal state before touching the workspace and
+  re-checks the marker after — so the workspace is never half-removed and
+  unmarked, and never pulled out from under a resume.
 
 - GitHub op failures carry the HTTP status as a structured field (#221):
   worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken

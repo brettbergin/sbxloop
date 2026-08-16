@@ -192,8 +192,24 @@ def prune_run_dirs(
     ``sbxloop logs`` shows why the payload is gone, and so ``resume`` can
     refuse a run whose workspace no longer exists instead of silently
     re-provisioning an empty one.
+
+    Removal is ordered so a crash or a concurrent ``resume`` at any point
+    leaves the run either intact or durably marked, never half-gone and
+    unmarked:
+
+    1. the marker is written first, in one write transaction with a re-check
+       that the run is still terminal (``resume`` moves it out of the
+       terminal set before it touches the workspace, so whichever of the two
+       commits first wins and the other backs off);
+    2. the directory is renamed out of ``runs/`` in one atomic step
+       (``rmtree`` can fail half-way; a rename cannot), then deleted.
+
+    A marker with no removal behind it (crash between the two steps, or a
+    removal that failed) only costs a refused resume of a run that was
+    already past retention; the next sweep finishes the job.
     """
     now = time.time() if now is None else now
+    _remove_staged(state_dir)
     verdicts = classify_run_dirs(store, state_dir, older_than_s=older_than_s, now=now)
     pruned: list[str] = []
     failed: list[str] = []
@@ -208,29 +224,28 @@ def prune_run_dirs(
         workspace_removed = record.workspace is not None and _is_within(
             record.workspace, verdict.path
         )
-        try:
-            shutil.rmtree(verdict.path)
-        except OSError:
-            logger.warning("gc: could not remove %s", verdict.path, exc_info=True)
+        data = {
+            "path": str(verdict.path),
+            "bytes": verdict.size_bytes,
+            "age_s": verdict.age_s,
+            "workspace_removed": workspace_removed,
+            "by": actor,
+        }
+        if not store.append_event_if_state(
+            _gc_event(verdict.run_id, now, data), TERMINAL_RUN_STATES
+        ):
+            logger.info(
+                "gc: %s left the terminal states since classification; kept", verdict.run_id
+            )
+            continue
+        if not _remove(verdict.path, state_dir):
             failed.append(verdict.run_id)
+            store.append_event(
+                _gc_event(verdict.run_id, now, {**data, "error": "could not remove directory"})
+            )
             continue
         pruned.append(verdict.run_id)
         freed += verdict.size_bytes
-        store.append_event(
-            Event(
-                ts=now,
-                run_id=verdict.run_id,
-                job_id=None,
-                type=HostEventTypes.DAEMON_GC,
-                data={
-                    "path": str(verdict.path),
-                    "bytes": verdict.size_bytes,
-                    "age_s": verdict.age_s,
-                    "workspace_removed": workspace_removed,
-                    "by": actor,
-                },
-            )
-        )
     return GcResult(
         verdicts=verdicts, pruned=pruned, failed=failed, bytes_freed=freed, dry_run=dry_run
     )
@@ -242,6 +257,62 @@ def workspace_pruned(store: StateStore, run_id: str) -> bool:
         bool(event.data.get("workspace_removed"))
         for _seq, event in store.events(run_id, type_prefix=HostEventTypes.DAEMON_GC)
     )
+
+
+def _gc_event(run_id: str, ts: float, data: dict[str, object]) -> Event:
+    return Event(ts=ts, run_id=run_id, job_id=None, type=HostEventTypes.DAEMON_GC, data=data)
+
+
+def _staging_root(state_dir: Path) -> Path:
+    return state_dir / "gc-pending"
+
+
+def _remove(path: Path, state_dir: Path) -> bool:
+    """Remove a run directory: rename it out of ``runs/`` first, then delete.
+
+    A rename is all-or-nothing where ``rmtree`` is not, so once it succeeds
+    the run directory is wholly gone from its address and a failure while
+    deleting the staged copy is only wasted disk (reclaimed next sweep).
+    Falls back to deleting in place when the rename is impossible (a
+    ``runs/`` on another filesystem); the marker is already durable by then,
+    so even a half-deletion can never be resumed into.
+    """
+    staging = _staging_root(state_dir)
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+        staged = staging / path.name
+        if staged.exists():
+            _rmtree_quiet(staged)
+        path.rename(staged)
+    except OSError:
+        logger.debug("gc: could not stage %s; removing in place", path, exc_info=True)
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            logger.warning("gc: could not remove %s", path, exc_info=True)
+            return False
+        return True
+    _rmtree_quiet(staged)
+    return True
+
+
+def _remove_staged(state_dir: Path) -> None:
+    """Finish what an interrupted sweep started: anything under gc-pending/
+    was already marked and renamed away, so it is just disk to reclaim."""
+    staging = _staging_root(state_dir)
+    if not staging.is_dir():
+        return
+    for leftover in staging.iterdir():
+        _rmtree_quiet(leftover)
+
+
+def _rmtree_quiet(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        logger.warning("gc: could not remove %s", path, exc_info=True)
 
 
 def _is_within(path: Path, root: Path) -> bool:

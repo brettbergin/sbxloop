@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import queue
 import sys
@@ -1222,8 +1223,11 @@ def gc(
     """
     config = load_config()
     days = config.daemon.prune_runs_after_days if older_than is None else older_than
-    if days < 0:
-        console.print("[bold red]--older-than must be >= 0[/]")
+    # typer parses "nan" and "inf" as valid floats; NaN compares false
+    # against everything, which would make EVERY terminal run "past
+    # retention" — the one input this destructive command must not accept.
+    if not math.isfinite(days) or days < 0:
+        console.print("[bold red]--older-than must be a finite number of days >= 0[/]")
         raise typer.Exit(2)
     store = _store(config)
     result = prune_run_dirs(store, config.state_dir, older_than_s=days * DAY_S, dry_run=dry_run)

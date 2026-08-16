@@ -209,6 +209,59 @@ class TestPrune:
         again = prune_run_dirs(store, state_dir, older_than_s=RETENTION, now=NOW)
         assert again.pruned == [] and again.verdicts == []
 
+    def test_claim_backs_off_when_run_leaves_terminal_after_classification(
+        self, store: StateStore, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Another process resumes the failed run between our read of its
+        # state and our removal: the marker+re-check is one write
+        # transaction, so the sweep must see the new state and keep the dir.
+        run_dir = seed_run(store, state_dir, "rbbbbbbb7", state="failed")
+        real = StateStore.append_event_if_state
+
+        def resume_first(self_: StateStore, event: Event, states: object) -> bool:
+            self_.set_run_state(event.run_id, "provisioning")
+            return real(self_, event, states)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(StateStore, "append_event_if_state", resume_first)
+        result = prune_run_dirs(store, state_dir, older_than_s=RETENTION, now=NOW)
+        assert result.pruned == [] and result.failed == []
+        assert run_dir.exists()
+        assert not workspace_pruned(store, "rbbbbbbb7")
+
+    def test_marker_precedes_removal_and_survives_a_failed_rmtree(
+        self, store: StateStore, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # rmtree can delete half a workspace and then raise; the durable
+        # marker must already exist by then so resume refuses the remains.
+        run_dir = seed_run(store, state_dir, "rbbbbbbb8", state="failed")
+
+        def half_then_fail(path: object, *a: object, **k: object) -> None:
+            (run_dir / "workspace" / "file.bin").unlink(missing_ok=True)
+            raise OSError("EBUSY")
+
+        def no_rename(*a: object, **k: object) -> None:
+            raise OSError("EXDEV")
+
+        # Force the in-place fallback (rename refused) and make rmtree fail.
+        monkeypatch.setattr(Path, "rename", no_rename)
+        monkeypatch.setattr("sbxloop.gc.shutil.rmtree", half_then_fail)
+        result = prune_run_dirs(store, state_dir, older_than_s=RETENTION, now=NOW)
+        assert result.failed == ["rbbbbbbb8"] and result.pruned == []
+        assert workspace_pruned(store, "rbbbbbbb8")
+        events = [e for _s, e in store.events("rbbbbbbb8", type_prefix="daemon.gc")]
+        assert [bool(e.data.get("error")) for e in events] == [False, True]
+
+    def test_staged_leftovers_are_reclaimed_next_sweep(
+        self, store: StateStore, state_dir: Path
+    ) -> None:
+        # A sweep that died after the rename but before the delete leaves
+        # the payload under gc-pending/; it was already marked, so the next
+        # sweep just reclaims the disk.
+        leftover = state_dir / "gc-pending" / "rdeadrun1"
+        (leftover / "workspace").mkdir(parents=True)
+        prune_run_dirs(store, state_dir, older_than_s=RETENTION, now=NOW)
+        assert not leftover.exists()
+
     def test_dir_size_counts_symlinks_without_following(self, tmp_path: Path) -> None:
         root = tmp_path / "root"
         (root / "sub").mkdir(parents=True)
@@ -237,6 +290,61 @@ class TestResumeGuard:
         engine = LoopEngine(Config.model_validate({"state_dir": str(state_dir)}), store=store)
         with pytest.raises(StateError, match="removed by gc"):
             engine.resume("rccccccc1")
+
+    def test_resume_leaves_terminal_before_touching_workspace(
+        self, store: StateStore, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.engine.engine import LoopEngine
+
+        # resume moves a failed run out of the terminal set before it
+        # provisions, so a sweep racing it backs off: its claim re-checks
+        # the state under the write lock.
+        run_dir = seed_run(store, state_dir, "rccccccc2", state="failed")
+        engine = LoopEngine(Config.model_validate({"state_dir": str(state_dir)}), store=store)
+        real = StateStore.set_run_state
+        seen: list[str] = []
+
+        def gc_between(self_: StateStore, run_id: str, state: str) -> None:
+            real(self_, run_id, state)  # type: ignore[arg-type]
+            if state == "provisioning" and not seen:
+                seen.append(state)
+                # A concurrent sweep now: the run is no longer terminal.
+                result = prune_run_dirs(self_, state_dir, older_than_s=RETENTION, now=NOW)
+                assert result.pruned == []
+                raise RuntimeError("stop before provisioning")
+
+        monkeypatch.setattr(StateStore, "set_run_state", gc_between)
+        with pytest.raises(RuntimeError, match="stop before"):
+            engine.resume("rccccccc2")
+        assert run_dir.exists() and not workspace_pruned(store, "rccccccc2")
+
+    def test_resume_rechecks_after_leaving_terminal_and_restores_state(
+        self, store: StateStore, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.engine.engine import LoopEngine
+        from sbxloop.errors import StateError
+
+        # The sweep's marker lands right after resume's first guard check:
+        # the second check (after the transition) must refuse, and the run
+        # goes back to failed rather than dangling in provisioning.
+        seed_run(store, state_dir, "rccccccc3", state="failed")
+        engine = LoopEngine(Config.model_validate({"state_dir": str(state_dir)}), store=store)
+        calls: list[str] = []
+
+        def marker_lands_after_first_check(store_: StateStore, run_id: str) -> bool:
+            calls.append(run_id)
+            if len(calls) == 1:
+                prune_run_dirs(store_, state_dir, older_than_s=RETENTION, now=NOW)
+                return False  # what the pre-check saw a moment ago
+            return workspace_pruned(store_, run_id)
+
+        monkeypatch.setattr(
+            "sbxloop.engine.engine.workspace_pruned", marker_lands_after_first_check
+        )
+        with pytest.raises(StateError, match="removed by gc"):
+            engine.resume("rccccccc3")
+        assert store.get_run("rccccccc3").state == "failed"
+        assert len(calls) == 2
 
 
 class TestDaemonSweep:
@@ -346,6 +454,16 @@ class TestCli:
         result = runner.invoke(app, ["gc", "--older-than", "0"])
         assert result.exit_code == 0, result.output
         assert not young.exists()
+
+    @pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+    def test_gc_rejects_negative_and_non_finite_older_than(self, workdir: Path, value: str) -> None:
+        # NaN compares false against every age, which would classify every
+        # terminal run as past retention; inf/negative are just nonsense.
+        _store, old, young = self.cli_seed(workdir)
+        result = runner.invoke(app, ["gc", "--older-than", value])
+        assert result.exit_code == 2, result.output
+        assert "finite" in result.output
+        assert old.exists() and young.exists()
 
     def test_gc_nothing_to_do(self, workdir: Path) -> None:
         StateStore(workdir / ".sbxloop" / "state.db")
