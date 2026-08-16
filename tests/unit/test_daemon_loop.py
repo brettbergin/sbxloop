@@ -315,6 +315,30 @@ class TestOutcomeAndConfig:
         )
         assert patch.github.deliver is True
 
+    def test_audit_contract_forbids_suite_verify_and_failed_audit_still_files(
+        self, tmp_path: Path
+    ) -> None:
+        """Field failure rakvqn6fr: the planner gave an audit `uv run pytest`
+        as its verify command — an audit chartered to find a failing test —
+        so it failed by construction and its findings were lost."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": {"backlog": "github", "max_attempts_per_item": 1},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        audit = WorkItem(item_id="gh:9", source="github", source_key="9", kind="audit", title="A")
+        text = h.loop.outcome_text(audit)
+        assert "need NO verify_commands" in text and "Never the project's test suite" in text
+        # a failed audit run still gets its findings collected
+        h.source.items = [audit]
+        h.source.name = "github"  # type: ignore[misc]
+        h.outcomes = ["failed"]
+        h.loop._collect_backlog = lambda run_id, source: ["gh:50"]  # type: ignore[method-assign]
+        assert h.loop.tick().outcome == "abandoned"
+
     def test_item_config_skips_tracking_issue_when_disabled(self, tmp_path: Path) -> None:
         """tracking_issue=false (#251): the source issue already is the
         tracker, so no per-run issue — delivery stays forced on."""

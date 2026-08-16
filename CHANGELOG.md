@@ -8,6 +8,15 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Audit runs no longer sink on a verify command they never needed: the
+  audit contract now tells the planner an audit changes no code and needs
+  no `verify_commands` (never the project's suite/build/lint — field failure
+  rakvqn6fr, an audit chartered to find a failing test was asked to prove
+  the suite green), and an audit that still fails on the harness has its
+  findings collected and filed instead of lost.
+
+### Fixed
+
 - Scheduled-audit charters carry their metadata as an HTML comment
   (`<!-- sbxloop: every=7d -->`) instead of `---` front-matter: mdformat
   rewrote the front-matter into a thematic break plus an H2 the first time
