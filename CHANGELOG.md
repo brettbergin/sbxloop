@@ -128,7 +128,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   from local HEAD (`[daemon] refresh_workspace`, default on). Daemon state
   is anchored to an absolute path outside the workspace: `[daemon] state_dir`, else an explicit `state_dir`, else a pre-existing legacy
   `./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`;
-  the resolved location is printed at start. Per-run clones now point
+  the resolved location is printed at start and the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule. Per-run clones now point
   `origin` at the source checkout's origin URL instead of the host path
   (metadata only). Docs and the systemd contrib prescribe a dedicated clone
   nobody edits as the daemon's workspace.

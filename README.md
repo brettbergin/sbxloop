@@ -299,8 +299,10 @@ only; no credentials leave the host). And the daemon keeps its state
 an explicitly configured `state_dir`, else a pre-existing legacy
 `./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`
 (`~/.local/state/…`) — so a checkout never accretes one full clone per run.
-The daemon prints the resolved location at start; `sbxloop status`/`logs`
-from the runner directory need `SBXLOOP_STATE_DIR` pointed at it.
+The daemon prints the resolved location at start; the `sbxloop daemon
+items|abandon|retry|requeue` controls follow the same rule, while
+`sbxloop status`/`logs`/`gc` from the runner directory need
+`SBXLOOP_STATE_DIR` pointed at it.
 
 ### Discord: chronology out, steering in
 

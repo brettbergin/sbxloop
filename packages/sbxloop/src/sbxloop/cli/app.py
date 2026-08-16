@@ -1556,7 +1556,14 @@ def daemon(
 
 
 def _daemon_store() -> DaemonStore:
-    return DaemonStore(load_config().state_dir / "state.db")
+    # Same resolution as `sbxloop daemon` itself (#255): with the anchored
+    # default the daemon's queue is not under the runner dir's `.sbxloop`,
+    # so the item controls must follow the daemon's rule, not `_store`'s.
+    from sbxloop.daemon.paths import resolve_state_dir
+
+    config, sources = load_config_with_sources()
+    choice = resolve_state_dir(config, sources, cwd=Path.cwd(), env=os.environ, home=Path.home())
+    return DaemonStore(choice.path / "state.db")
 
 
 _ITEM_CONTROL_NOTE = (
@@ -1950,7 +1957,8 @@ mem_warn = 90.0
 # Daemon state lives OUTSIDE the workspace, at an absolute path. Unset:
 # $XDG_STATE_HOME/sbxloop/<runner-dir-name> (~/.local/state/...), unless the
 # top-level state_dir is set or a legacy ./.sbxloop/state.db already exists.
-# `sbxloop status`/`logs` need SBXLOOP_STATE_DIR pointed there.
+# `sbxloop daemon items|abandon|retry|requeue` follow the same rule;
+# `sbxloop status`/`logs`/`gc` need SBXLOOP_STATE_DIR pointed there.
 # state_dir = "~/.local/state/sbxloop/my-project"
 
 [discord]

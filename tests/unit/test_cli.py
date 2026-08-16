@@ -453,12 +453,19 @@ class TestDaemonItemControls:
     """#229: `sbxloop daemon items|abandon|retry|requeue` act on the store
     the daemon shares; they need no live daemon and no sandbox."""
 
+    @staticmethod
+    def daemon_state(workdir: Path) -> Path:
+        # Where the daemon itself keeps its queue — the anchored XDG default
+        # (#255), not the runner dir's `.sbxloop`; seeding there proves the
+        # item controls follow the daemon's state-dir rule.
+        assert not (workdir / ".sbxloop" / "state.db").exists()
+        return workdir / "xdg-state" / "sbxloop" / workdir.name
+
     def seed(self, workdir: Path) -> None:
-        from sbxloop.config import load_config
         from sbxloop.daemon.model import WorkItem
         from sbxloop.daemon.store import DaemonStore
 
-        dstore = DaemonStore(load_config().state_dir / "state.db")
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
         dstore.upsert_new(
             WorkItem(item_id="inbox:x.md", source="inbox", source_key="x.md", title="Do X"), 1.0
         )
@@ -480,7 +487,6 @@ class TestDaemonItemControls:
         assert result.exit_code == 2 and "unknown item state" in result.output
 
     def test_abandon_retry_requeue_transitions(self, workdir: Path) -> None:
-        from sbxloop.config import load_config
         from sbxloop.daemon.store import DaemonStore
 
         self.seed(workdir)
@@ -491,7 +497,7 @@ class TestDaemonItemControls:
         )
         assert result.exit_code == 0, result.output
         assert "abandoned" in result.output and "r_x" in result.output
-        dstore = DaemonStore(load_config().state_dir / "state.db")
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
         item = dstore.get("inbox:x.md")
         assert item is not None and item.state == "abandoned"
         assert item.last_error == "plan spiraled" and item.run_id == "r_x"
