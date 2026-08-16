@@ -42,6 +42,7 @@ from sbxloop.daemon.discord_format import (
     Chunk,
     EmbedSpec,
     StatusLine,
+    SteerProgress,
     ToolBatcher,
     ToolDigest,
     _clip,
@@ -77,6 +78,10 @@ STATUS_EDIT_MIN_S = 2.0
 # The normal level's tool digest (one line per burst, #235) is edited at
 # most this often; the idle tick lands a deferred edit within COALESCE_WINDOW_S.
 DIGEST_EDIT_MIN_S = 3.0
+# close() waits this long for the pump to post what is already queued: a
+# --once daemon can finish its run before the gateway is even up, and its
+# chronology must not end wherever the process happened to exit.
+DRAIN_WAIT_S = 20.0
 
 # Re-exported for callers/tests that import the formatting names from here.
 __all__ = [
@@ -98,11 +103,15 @@ _BURST_BOUNDARY = ("phase.end", "task.start", "task.end", "run.end")
 
 
 class _Pending:
-    """A steering message awaiting its chat.reply."""
+    """A steering message awaiting its chat.reply. ``status`` is the bridge's
+    own "⏳ queued …" note under it, edited in place as the run moves."""
 
-    def __init__(self, thread_id: int, discord_message_id: int) -> None:
+    def __init__(self, run_id: str, thread_id: int, discord_message_id: int) -> None:
+        self.run_id = run_id
         self.thread_id = thread_id
         self.discord_message_id = discord_message_id
+        self.status: Any = None
+        self.state = "queued"
 
 
 class DiscordBridge:
@@ -142,9 +151,17 @@ class DiscordBridge:
         # (run_id, payload): payload is an Event, None (ensure-thread sentinel),
         # a daemon-event string, or a ("__finished__", ...) tuple.
         self._events: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
+        self._drained: asyncio.Event | None = None
+        self._drain_wait_s = DRAIN_WAIT_S
         self._unsubscribe: Callable[[], None] | None = None
         self._active_run: str | None = None
         self._active_item: WorkItem | None = None
+        # run_id -> item for every run whose events may still be queued. The
+        # active pair above says "steering is possible"; this says "we can
+        # still post the headline" — a short run (--once) can finish before
+        # the pump ever sees its first event, and its chronology must not
+        # be dropped for lack of an item.
+        self._items: dict[str, WorkItem] = {}
         self._pending: dict[str, _Pending] = {}  # message_id -> pending steer
         self._lock = threading.Lock()
         # Per-run rendering state, owned by the pump (discord thread only).
@@ -156,6 +173,10 @@ class DiscordBridge:
         self._status_msg: dict[str, Any] = {}  # run_id -> discord message (cached)
         self._status_task: dict[str, asyncio.Task[None]] = {}
         self._status_last_edit: dict[str, float] = {}
+        # Where the agent is, for the note under a queued steer (#236).
+        self._progress: dict[str, SteerProgress] = {}
+        self._steer_task: dict[str, asyncio.Task[None]] = {}
+        self._steer_last_edit: dict[str, float] = {}
         # Facts that enrich the headline card as the run reveals them.
         self._facts: dict[str, dict[str, Any]] = {}
         # item_id -> run_id for the last run of an item (notice -> thread pointer).
@@ -182,14 +203,21 @@ class DiscordBridge:
         # the daemon — the pump waits for readiness on its own.
         self._ready.wait(timeout=connect_wait_s)
 
-    def close(self) -> None:
+    def close(self, *, drain_wait_s: float = DRAIN_WAIT_S) -> None:
         """Ask the bridge thread to shut down and wait for it. The client is
         closed *inside* its own loop (``_amain``) so aiohttp's connector
-        teardown completes before the loop is torn down."""
+        teardown completes before the loop is torn down.
+
+        Everything enqueued before this call is posted first (bounded by
+        ``drain_wait_s``): the pump sees the ``__stop__`` sentinel only
+        after the events ahead of it, flushes, and signals ``_drained``.
+        """
+        self._drain_wait_s = drain_wait_s
+        self._events.put(("__stop__", None))
         if self._aloop is not None and not self._aloop.is_closed():
             self._aloop.call_soon_threadsafe(self._stop_event_set)
         if self._thread is not None:
-            self._thread.join(timeout=20)
+            self._thread.join(timeout=20 + drain_wait_s)
 
     def _stop_event_set(self) -> None:
         if self._stop_evt is not None:
@@ -199,6 +227,7 @@ class DiscordBridge:
         self._aloop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._aloop)
         self._stop_evt = asyncio.Event()
+        self._drained = asyncio.Event()
         self._loop_up.set()
         try:
             self._aloop.run_until_complete(self._amain())
@@ -239,6 +268,17 @@ class DiscordBridge:
                 self._degraded = True
                 self._gateway_ready.set()  # unblock the pump so it drains
                 await stopper
+            elif self._drained is not None:
+                # close(): let the pump post what is already queued. A
+                # gateway that never connected keeps the pump parked in
+                # _wait_ready; the timeout bounds that.
+                try:
+                    await asyncio.wait_for(self._drained.wait(), timeout=self._drain_wait_s)
+                except TimeoutError:
+                    logger.warning(
+                        "discord bridge closed with %d event(s) still unsent",
+                        self._events.qsize(),
+                    )
         finally:
             pump.cancel()
             stopper.cancel()
@@ -259,6 +299,7 @@ class DiscordBridge:
         with self._lock:
             self._active_run = run_id
             self._active_item = item
+            self._items[run_id] = item
             self._engine = engine
             self._item_runs[item.item_id] = run_id
             # Non-blocking subscriber: just enqueue; the pump renders + sends.
@@ -322,8 +363,9 @@ class DiscordBridge:
             return
         mid = engine.post_user_message(text)
         with self._lock:
-            self._pending[mid] = _Pending(thread_id, int(getattr(message, "id", 0)))
+            self._pending[mid] = _Pending(run_id, thread_id, int(getattr(message, "id", 0)))
         self._schedule(self._react(message, "⏳"))
+        self._schedule(self._post_steer_status(run_id, mid, channel))
 
     async def _hint_where_to_steer(self, message: Any) -> None:
         with self._lock:
@@ -383,11 +425,13 @@ class DiscordBridge:
             # Consume forever so the queue stays bounded; nothing to send to.
             while True:
                 try:
-                    await asyncio.get_event_loop().run_in_executor(
+                    run_id, _ = await asyncio.get_event_loop().run_in_executor(
                         None, self._events.get, True, COALESCE_WINDOW_S
                     )
                 except queue.Empty:
                     continue
+                if run_id == "__stop__" and self._drained is not None:
+                    self._drained.set()
         buffer: list[Chunk] = []
         buffer_run: str | None = None
         last_flush = asyncio.get_event_loop().time()
@@ -403,6 +447,12 @@ class DiscordBridge:
                     buffer = await self._digest_tick(buffer_run, buffer)
                 continue
             try:
+                if run_id == "__stop__":
+                    if buffer_run:
+                        buffer = await self._flush_all(buffer_run, buffer)
+                    if self._drained is not None:
+                        self._drained.set()
+                    continue
                 if run_id == "__daemon__":
                     await self._daemon_notice(str(payload))
                     continue
@@ -415,6 +465,8 @@ class DiscordBridge:
                     await self._finish(payload)
                     continue
                 event: Event = payload
+                if event.type == HostEventTypes.CHAT_MESSAGE:
+                    await self._steer_picked_up(event)
                 if event.type == HostEventTypes.CHAT_REPLY:
                     await self._resolve_reply(event)
                 if buffer_run not in (None, run_id) and buffer_run:
@@ -430,6 +482,7 @@ class DiscordBridge:
                         buffer = await self._digest_tick(run_id, buffer, force=True)
                 elif chunks or event.type in _BURST_BOUNDARY:
                     buffer = await self._digest_tick(run_id, buffer, close=True)
+                self._observe_progress(run_id, event)
                 if not chunks:
                     continue
                 buffer.extend(chunks)
@@ -522,6 +575,24 @@ class DiscordBridge:
             changed = True
         if changed:
             self._schedule(self._refresh_headline(run_id))
+
+    def _observe_progress(self, run_id: str, event: Event) -> None:
+        """Keep the "where is the agent" tracker current; re-render the note
+        under any queued steer when it moved (coalesced like the status line)."""
+        progress = self._progress.get(run_id)
+        if progress is None:
+            progress = self._progress[run_id] = SteerProgress(
+                cap=self.config.budgets.max_tool_calls_per_phase
+            )
+        progress.observe(event)
+        if not progress.dirty:
+            return
+        with self._lock:
+            waiting = any(
+                p.run_id == run_id and p.state == "queued" for p in self._pending.values()
+            )
+        if waiting:
+            self._schedule_steer_edit(run_id)
 
     async def _flush_all(self, run_id: str, buffer: list[Chunk]) -> list[Chunk]:
         """Send the tool batch (if any) then everything buffered; returns the
@@ -638,6 +709,8 @@ class DiscordBridge:
             text += (
                 f"\n⚠ {len(unanswered)} steering message(s) were not answered before the run ended"
             )
+            for pending in unanswered:
+                await self._edit_steer_status(pending, "unanswered")
         if thread is not None:
             await self._send(thread, text, embed=finish_embed(item, report, state, len(unanswered)))
         facts = self._facts.setdefault(run_id, {})
@@ -656,9 +729,12 @@ class DiscordBridge:
         self._status_msg.pop(run_id, None)
         self._status_last_edit.pop(run_id, None)
         self._facts.pop(run_id, None)
-        task = self._status_task.pop(run_id, None)
-        if task is not None:
-            task.cancel()
+        self._items.pop(run_id, None)
+        self._progress.pop(run_id, None)
+        self._steer_last_edit.pop(run_id, None)
+        for task in (self._status_task.pop(run_id, None), self._steer_task.pop(run_id, None)):
+            if task is not None:
+                task.cancel()
 
     # -- status line ------------------------------------------------------------------
 
@@ -708,12 +784,73 @@ class DiscordBridge:
         except Exception:
             logger.debug("discord: status edit failed", exc_info=True)
 
+    # -- steer status note ------------------------------------------------------------
+
+    async def _post_steer_status(self, run_id: str, mid: str, thread: Any) -> None:
+        """The "⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls);
+        answered at the next checkpoint" note, posted right under the steer
+        so the wait is visible, then edited in place as the run moves."""
+        with self._lock:
+            pending = self._pending.get(mid)
+        if pending is None:
+            return
+        progress = self._progress.setdefault(
+            run_id, SteerProgress(cap=self.config.budgets.max_tool_calls_per_phase)
+        )
+        msg = await self._send(thread, progress.render(state=pending.state))
+        if msg is None:
+            return
+        pending.status = msg
+        self._steer_last_edit[run_id] = asyncio.get_event_loop().time()
+        if pending.state != "queued":
+            # The reply landed while we were posting; catch the note up.
+            await self._edit_steer_status(pending, pending.state)
+
+    def _schedule_steer_edit(self, run_id: str) -> None:
+        pending = self._steer_task.get(run_id)
+        if pending is not None and not pending.done():
+            return
+        self._steer_task[run_id] = asyncio.ensure_future(self._steer_edit_later(run_id))
+
+    async def _steer_edit_later(self, run_id: str) -> None:
+        now = asyncio.get_event_loop().time()
+        last = self._steer_last_edit.get(run_id)
+        if last is not None and now - last < STATUS_EDIT_MIN_S:
+            await asyncio.sleep(STATUS_EDIT_MIN_S - (now - last))
+        with self._lock:
+            waiting = [
+                p for p in self._pending.values() if p.run_id == run_id and p.state == "queued"
+            ]
+        for pending in waiting:
+            await self._edit_steer_status(pending, "queued")
+        self._steer_last_edit[run_id] = asyncio.get_event_loop().time()
+
+    async def _edit_steer_status(self, pending: _Pending, state: str) -> None:
+        pending.state = state
+        if pending.status is None:
+            return  # not posted yet; _post_steer_status catches up
+        progress = self._progress.get(pending.run_id) or SteerProgress()
+        try:
+            await pending.status.edit(
+                content=_clip(progress.render(state=state), self.discord.max_message_chars)
+            )
+        except Exception:
+            logger.debug("discord: steer status edit failed", exc_info=True)
+
+    async def _steer_picked_up(self, event: Event) -> None:
+        mid = str(event.data.get("message_id") or "")
+        with self._lock:
+            pending = self._pending.get(mid)
+        if pending is not None:
+            await self._edit_steer_status(pending, "answering")
+
     async def _resolve_reply(self, event: Event) -> None:
         mid = str(event.data.get("message_id") or "")
         with self._lock:
             pending = self._pending.pop(mid, None)
         if pending is None:
             return
+        await self._edit_steer_status(pending, "failed" if event.data.get("error") else "answered")
         try:
             channel = self.client.get_channel(pending.thread_id) or await self.client.fetch_channel(
                 pending.thread_id
@@ -842,7 +979,7 @@ class DiscordBridge:
                 logger.warning("discord: lost thread %s for %s", thread_id, run_id, exc_info=True)
                 return None
         with self._lock:
-            item = self._active_item if self._active_run == run_id else None
+            item = self._items.get(run_id)
         if item is None:
             return None
         try:
@@ -872,7 +1009,7 @@ class DiscordBridge:
         """Re-render the headline (text + card) with everything known so far."""
         if item is None:
             with self._lock:
-                item = self._active_item if self._active_run == run_id else None
+                item = self._items.get(run_id)
         if item is None:
             return
         facts = self._facts.get(run_id, {})

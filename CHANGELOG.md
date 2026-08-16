@@ -20,6 +20,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   fresh run instead, and `!sbx retry <item>` reruns any cancelled or
   abandoned item (a human retry resets the attempt budget and skips the
   failure backoff; the daily cap still applies).
+- Discord bridge with `--once` and other short-lived runs (#236): a run
+  that started and finished before the gateway connected lost its headline
+  and everything after it (the pump only knew the *active* run's item).
+  Events are now buffered per run until the bridge is ready, and `close()`
+  waits (bounded, `DRAIN_WAIT_S`) for the pump to post what is already
+  queued, so a short run's chronology is complete instead of truncated at
+  process exit.
 
 ### Changed
 
@@ -159,6 +166,10 @@ All notable changes to sbxloop are documented here. The project adheres to
   `origin` at the source checkout's origin URL instead of the host path
   (metadata only; URL userinfo such as an embedded token is stripped). Docs and the systemd contrib prescribe a dedicated clone
   nobody edits as the daemon's workspace.
+- Discord bridge, steering latency made visible (#236): a queued steer gets
+  a note under it — `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far); answered at the next checkpoint` — edited in place as
+  the phase, task and tool-call count (against the #228 ceiling) move, then
+  resolved to picked-up / answered / failed / not-answered-run-ended.
 
 - GitHub op failures carry the HTTP status as a structured field (#221):
   worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken

@@ -723,6 +723,125 @@ class TestBridge:
         finally:
             bridge.close()
 
+    def test_short_run_that_ends_before_the_gateway_is_up_is_posted_in_full(
+        self, tmp_path: Path
+    ) -> None:
+        """--once (#236): a one-tick daemon can start AND finish its run
+        before the gateway connects. Nothing may be dropped — headline,
+        chronology and the finished card all land once the bridge is ready,
+        and close() waits for them instead of exiting mid-queue."""
+        bridge, client, _ = make_bridge(tmp_path)
+        gate = threading.Event()
+
+        async def slow_start(token: str) -> None:
+            while not gate.is_set():
+                await asyncio.sleep(0.02)
+            client.bridge.mark_ready()  # type: ignore[union-attr]
+            while not client.closed:
+                await asyncio.sleep(0.05)
+
+        client.start = slow_start  # type: ignore[method-assign]
+        bridge.start(connect_wait_s=0.2)
+        item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+        bus = EventBus()
+        bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+        bus.emit("agent.message", "r1", content="all done quickly", agent="executor")
+        bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+        assert client.channels[42].sent == []  # still connecting: buffered, not lost
+        gate.set()
+        bridge.close()  # drains before returning
+        control = client.channels[42]
+        assert control.sent and control.sent[0].startswith("▶ run `r1`")
+        thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+        assert any("all done quickly" in s for s in thread.sent)
+        assert any(s.startswith("**finished: completed**") for s in thread.sent)
+        assert control.messages[bridge.dstore.discord_thread("r1").headline_id].content.startswith(  # type: ignore[union-attr]
+            "✅"
+        )
+
+    def test_close_is_bounded_when_the_gateway_never_connects(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+
+        async def never_ready(token: str) -> None:
+            while not client.closed:
+                await asyncio.sleep(0.05)
+
+        client.start = never_ready  # type: ignore[method-assign]
+        bridge.start(connect_wait_s=0.1)
+        bridge.daemon_event("queued something")
+        t0 = time.time()
+        bridge.close(drain_wait_s=0.5)
+        assert time.time() - t0 < 5
+        assert bridge._thread is not None and not bridge._thread.is_alive()
+
+    def test_steer_gets_a_live_wait_note_edited_in_place(self, tmp_path: Path) -> None:
+        """#236: the ⏳ reaction says "received"; the note under the steer
+        says where the agent is (phase, task, tool calls vs the #228
+        ceiling) and is edited as that moves, then resolved with the reply."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            engine = FakeEngine()
+            bus = EventBus()
+            bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit("task.start", "r1", task_id="t2", title="Wire CLI")
+            bus.emit("task.state", "r1", task_id="t2", state="executing", revisions=0, replans=0)
+            for _ in range(3):
+                bus.emit("agent.tool_start", "r1", tool="bash", args="ls")
+            assert wait_for(
+                lambda: (
+                    bridge._progress.get("r1") is not None
+                    and bridge._progress["r1"].tool_calls == 3
+                )
+            )
+            msg = FakeMessage("focus on auth first", thread, mid=777)
+            thread.messages[777] = msg
+            bridge._handle_message(msg)
+            assert wait_for(lambda: any(s.startswith("⏳ steer queued") for s in thread.sent))
+            note_id = next(
+                m.id for m in thread.messages.values() if m.content.startswith("⏳ steer queued")
+            )
+            note = thread.messages[note_id]
+            assert "mid-**execute** on `t2` · Wire CLI (3/40 tool calls so far)" in note.content
+            assert note.content.endswith("answered at the next checkpoint")
+            # more tool calls -> the SAME note is edited, not a new one
+            for _ in range(2):
+                bus.emit("agent.tool_start", "r1", tool="bash", args="ls")
+            assert wait_for(lambda: "5/40 tool calls" in note.content, timeout=8)
+            bus.emit("agent.tool_cap", "r1", cap=40, calls=40, tool="bash")
+            assert wait_for(lambda: "ceiling reached" in note.content, timeout=8)
+            # the engine picks it up at the checkpoint, then answers
+            bus.emit("chat.message", "r1", message_id="m1", text="focus on auth first")
+            assert wait_for(lambda: note.content.startswith("🧭 steer picked up"), timeout=8)
+            bus.emit("chat.reply", "r1", message_id="m1", reply="Will do.", action="steer_task")
+            assert wait_for(lambda: note.content == "✅ steer answered", timeout=8)
+            assert wait_for(lambda: "✅" in msg.reactions)
+            assert sum(1 for s in thread.sent if s.startswith("⏳ steer queued")) == 1
+        finally:
+            bridge.close()
+
+    def test_steer_note_says_so_when_the_run_ends_first(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            msg = FakeMessage("late thought", thread, mid=778)
+            thread.messages[778] = msg
+            bridge._handle_message(msg)
+            assert wait_for(lambda: any(s.startswith("⏳ steer queued") for s in thread.sent))
+            note = next(m for m in thread.messages.values() if m.content.startswith("⏳ steer"))
+            assert note.content == "⏳ steer queued; answered at the next checkpoint"
+            bridge.run_finished(item, RunReport("r1", "completed", "done"))
+            assert wait_for(lambda: note.content.startswith("⚠ steer not answered"))
+        finally:
+            bridge.close()
+
 
 def test_threading_sanity() -> None:
     # guard: the module must not require an event loop at import/construct time

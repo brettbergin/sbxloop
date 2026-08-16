@@ -643,6 +643,98 @@ class StatusLine:
         return head + (f"\n{totals}" if totals else "")
 
 
+# Task states are the engine's phase boundaries; a queued steer is answered
+# when the current one ends, so this is what "how long until my steer lands"
+# is measured against.
+_STATE_PHASE = {
+    "planning": "plan",
+    "executing": "execute",
+    "scrutinizing": "scrutinize",
+    "verifying": "verify",
+    "validating": "validate",
+}
+_PHASE_STATES = frozenset(_STATE_PHASE)
+
+
+class SteerProgress:
+    """Where the agent is *right now*, for the "⏳ queued" note under a steer.
+
+    Field: a steer posted during a 15-minute execute phase looked stuck —
+    the ⏳ reaction says "received", nothing said how long. This tracks the
+    current task, its phase, and the tool calls made since the last
+    checkpoint (plus the #228 ceiling, when configured) so the note can
+    say "mid-**execute** on t2 (12/40 tool calls); answered at the next
+    checkpoint" and the human can decide whether to wait or ``cancel``.
+    """
+
+    def __init__(self, cap: int | None = None) -> None:
+        self.cap = cap or None
+        self.task_id: str | None = None
+        self.title: str | None = None
+        self.phase: str | None = None
+        self.tool_calls = 0
+        self.capped = False
+        self._dirty = False
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def observe(self, event: Event) -> None:
+        d = event.data
+        t = event.type
+        tid = str(d.get("task_id") or "")
+        if t == "task.start" and tid:
+            self.task_id, self.title = tid, str(d.get("title") or "") or None
+            self.phase, self.tool_calls, self.capped = None, 0, False
+            self._dirty = True
+        elif t == "task.state" and tid and d.get("state") in _PHASE_STATES:
+            # Every state change is a checkpoint: the per-phase job (and its
+            # tool-call ceiling) restarts, so the count restarts with it.
+            self.task_id = tid
+            self.phase = _STATE_PHASE[str(d["state"])]
+            self.tool_calls, self.capped = 0, False
+            self._dirty = True
+        elif t == "task.end" and tid == self.task_id:
+            self.task_id, self.title, self.phase = None, None, None
+            self.tool_calls, self.capped = 0, False
+            self._dirty = True
+        elif t == "agent.tool_start":
+            self.tool_calls += 1
+            self._dirty = True
+        elif t == "agent.tool_cap":
+            self.capped = True
+            if d.get("cap"):
+                self.cap = int(d["cap"])
+            self._dirty = True
+
+    def render(self, *, state: str = "queued") -> str:
+        """``state`` is ``queued`` (waiting for a checkpoint), ``answering``
+        (the engine picked it up), ``answered``, ``failed`` or ``unanswered``
+        (the run ended first)."""
+        self._dirty = False
+        if state == "answering":
+            return "🧭 steer picked up — the agent is answering now"
+        if state == "answered":
+            return "✅ steer answered"
+        if state == "failed":
+            return "⚠ steer failed — see the reply above"
+        if state == "unanswered":
+            return "⚠ steer not answered — the run ended first"
+        where = ""
+        if self.task_id and self.phase:
+            where = f" — agent is mid-**{self.phase}** on {code(self.task_id)}"
+        elif self.task_id:
+            where = f" — agent is on {code(self.task_id)}"
+        if where and self.title:
+            where += f" · {_one_line(self.title, 60)}"
+        if where and (self.tool_calls or self.capped):
+            calls = f"{self.tool_calls}/{self.cap}" if self.cap else str(self.tool_calls)
+            tail = " — ceiling reached)" if self.capped else " so far)"
+            where += f" ({calls} tool calls{tail}"
+        return f"⏳ steer queued{where}; answered at the next checkpoint"
+
+
 # -- per-event formatting -----------------------------------------------------------------
 
 

@@ -15,6 +15,7 @@ from sbxloop.daemon.discord_format import (
     EMBED_TOTAL_MAX,
     EmbedSpec,
     StatusLine,
+    SteerProgress,
     ToolBatcher,
     ToolDigest,
     _clip,
@@ -364,6 +365,52 @@ class TestStatusLine:
         assert not s.dirty
         s.observe(ev("agent.message", content="ignored"))
         assert not s.dirty
+
+
+class TestSteerProgress:
+    def test_where_the_agent_is(self) -> None:
+        p = SteerProgress(cap=40)
+        assert p.render() == "⏳ steer queued; answered at the next checkpoint"
+        p.observe(ev("task.start", task_id="t2", title="Wire CLI"))
+        assert p.render() == (
+            "⏳ steer queued — agent is on `t2` · Wire CLI; answered at the next checkpoint"
+        )
+        p.observe(ev("task.state", task_id="t2", state="executing", revisions=0))
+        for _ in range(12):
+            p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert p.render() == (
+            "⏳ steer queued — agent is mid-**execute** on `t2` · Wire CLI "
+            "(12/40 tool calls so far); answered at the next checkpoint"
+        )
+        # a phase boundary is a checkpoint: the count restarts with the new job
+        p.observe(ev("task.state", task_id="t2", state="verifying", revisions=0))
+        assert "mid-**verify** on `t2` · Wire CLI;" in p.render()
+        p.observe(ev("task.state", task_id="t2", state="executing", revisions=1))
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        p.observe(ev("agent.tool_cap", cap=40, calls=40, tool="bash"))
+        assert "(1/40 tool calls — ceiling reached)" in p.render()
+        p.observe(ev("task.end", task_id="t2", title="Wire CLI", state="done"))
+        assert p.render() == "⏳ steer queued; answered at the next checkpoint"
+
+    def test_unbounded_cap_and_terminal_states(self) -> None:
+        p = SteerProgress(cap=0)  # 0 = unbounded in [budgets]
+        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert "(1 tool calls so far)" in p.render()
+        assert p.render(state="answering") == "🧭 steer picked up — the agent is answering now"
+        assert p.render(state="answered") == "✅ steer answered"
+        assert p.render(state="failed").startswith("⚠ steer failed")
+        assert p.render(state="unanswered") == "⚠ steer not answered — the run ended first"
+
+    def test_dirty_flag(self) -> None:
+        p = SteerProgress()
+        assert not p.dirty
+        p.observe(ev("agent.message", content="ignored"))
+        assert not p.dirty
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert p.dirty
+        p.render()
+        assert not p.dirty
 
 
 class TestEmbeds:

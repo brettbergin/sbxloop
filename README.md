@@ -326,7 +326,8 @@ refused egress called out; and a finished report card (the headline turns
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
 `chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
-checkpoint, which can be minutes into a long step — the ⏳ reaction turns ✅
+checkpoint, which can be minutes into a long step — a note under your
+message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
 when the reply lands). `!sbx status|pause|resume|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>` in the control channel drive the daemon
 itself. `!sbx cancel` stops the current run at its next boundary and settles
 the item as **cancelled** — attributed to you on the source, no automatic
