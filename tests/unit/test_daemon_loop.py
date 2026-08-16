@@ -53,6 +53,12 @@ class FakeSource:
     def report_abandoned(self, item: WorkItem, error: str) -> None:
         self.calls.append(("abandoned", error))
 
+    def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
+        self.calls.append(("cancelled", report))
+
+    def report_requeued(self, item: WorkItem, by: str) -> None:
+        self.calls.append(("requeued", by))
+
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         self.calls.append(("backlog", title))
         return f"inbox:{title}"
@@ -256,6 +262,124 @@ class TestOutcomeAndConfig:
         assert gh.github.create_repo is False and gh.keep_on_failure is False
         inbox = h.loop._item_config(inbox_item())
         assert inbox.github.deliver is False and inbox.keep_on_failure is False
+
+
+class TestOperatorCancel:
+    """#246: a Discord `!sbx cancel` was settled as a failed attempt — retried
+    fresh after the backoff and counted toward the breaker. An operator
+    cancel is a decision, not a failure."""
+
+    @staticmethod
+    def _run_until_cancelled(
+        h: Harness, *, requester: str | None = None, retry: bool = False
+    ) -> None:
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        def runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            h.runs.append((run_id, resume))
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "running")  # mid-flight → resumable
+            started.set()
+            assert cancelled.wait(5)
+            # What the engine raises at the next boundary after request_cancel.
+            raise StateError(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
+
+        h.loop._runner = runner
+        t = threading.Thread(target=h.loop.tick)
+        t.start()
+        assert started.wait(5)
+        assert h.loop.cancel_current(requester, retry=retry) is True
+        cancelled.set()
+        t.join(5)
+
+    def test_cancel_settles_item_as_cancelled_not_failed(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "daemon": {"max_attempts_per_item": 3, "max_consecutive_failures": 1},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item()]
+        self._run_until_cancelled(h, requester="Discord user `brett`")
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "cancelled"
+        assert item.last_error == "cancelled by Discord user `brett`"
+        # Not a failure: no retry report, no breaker count (limit is 1 here).
+        kinds = [c[0] for c in h.source.calls]
+        assert kinds == ["claim", "started", "cancelled"]
+        assert h.loop.status()["breaker_open"] is False
+        report = h.source.calls[-1][1]
+        assert report.state == "cancelled" and report.cancelled_by == "Discord user `brett`"
+        assert report.requeued is False
+        # The run itself stays resumable, and no fresh attempt is scheduled.
+        assert h.store.get_run(h.runs[0][0]).state == "running"
+        h.clock.t += 100_000
+        assert h.loop.tick().idle_reason == "no_work"
+        assert len(h.runs) == 1
+
+    def test_cancel_with_retry_requeues_without_backoff(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"retry_backoff_s": 900}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item()]
+        self._run_until_cancelled(h, retry=True)
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "queued" and item.attempts == 0
+        report = h.source.calls[-1][1]
+        assert report.requeued is True and report.cancelled_by == "operator"
+        # Eligible immediately: a human asked, so no failure backoff applies.
+        h.loop._runner = h.runner
+        assert h.loop.tick().outcome == "done"
+        assert h.runs[1][1] is False  # a fresh run, not a resume
+
+    def test_stale_cancel_never_taints_a_later_run(self, tmp_path: Path) -> None:
+        """A cancel that lands after the engine already finished settles that
+        run normally and must not carry over to the next item."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item("a.md"), inbox_item("b.md")]
+        started = threading.Event()
+        release = threading.Event()
+
+        def runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            started.set()
+            release.wait(5)
+            return h.runner(item, cfg, run_id, bus, resume)
+
+        h.loop._runner = runner
+        t = threading.Thread(target=h.loop.tick)
+        t.start()
+        assert started.wait(5)
+        assert h.loop.cancel_current("late")
+        release.set()
+        t.join(5)
+        assert h.dstore.get("inbox:a.md").state == "done"  # type: ignore[union-attr]
+        h.loop._runner = h.runner
+        h.outcomes = ["raise"]
+        assert h.loop.tick().outcome == "retry"  # b.md fails as a failure, not a cancel
+        assert not any(c[0] == "cancelled" for c in h.source.calls)
+
+    def test_requeue_settled_item(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item()]
+        h.outcomes = ["raise"]
+        assert h.loop.tick().outcome == "abandoned"
+        assert h.loop.requeue("inbox:nope") == "unknown item inbox:nope"
+        assert h.loop.requeue("inbox:a.md", "Discord user `brett`") is None
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "queued" and item.attempts == 0
+        assert ("requeued", "Discord user `brett`") in h.source.calls
+        assert h.loop.requeue("inbox:a.md") is not None  # queued: nothing to re-queue
+        assert h.loop.tick().outcome == "done"
 
 
 class TestShutdownAndRecovery:

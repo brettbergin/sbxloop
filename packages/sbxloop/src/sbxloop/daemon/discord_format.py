@@ -653,11 +653,27 @@ def headline_embed(
 
 
 def finish_text(state: str, report: RunReport) -> str:
-    return f"**finished: {state}** — {report.task_summary}"
+    text = f"**finished: {state}** — {report.task_summary}"
+    if report.cancelled_by:
+        text += f" · {_cancel_note(item_id=None, report=report)}"
+    return text
+
+
+def _cancel_note(item_id: str | None, report: RunReport) -> str:
+    """A cancel is not a failure: say who, and that the work is not lost."""
+    note = f"cancelled by {report.cancelled_by}"
+    if report.requeued:
+        return note + " — re-queued; a fresh run starts on the next tick"
+    note += f" — {code(f'sbxloop resume {report.run_id}')} continues the run"
+    if item_id:
+        note += f"; `!sbx requeue {item_id}` reruns it fresh"
+    return note
 
 
 def finish_embed(item: WorkItem, report: RunReport, state: str, unanswered: int = 0) -> EmbedSpec:
     fields: list[tuple[str, str, bool]] = []
+    if report.cancelled_by:
+        fields.append(("Cancelled", _cancel_note(item.item_id, report), False))
     if report.tracking_issue:
         fields.append(
             ("Tracking issue", link(f"#{report.tracking_issue[0]}", report.tracking_issue[1]), True)

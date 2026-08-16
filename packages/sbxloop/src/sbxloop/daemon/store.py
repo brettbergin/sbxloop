@@ -137,7 +137,7 @@ class DaemonStore:
                 (item.source, item.source_key),
             ).fetchone()
             if row is not None:
-                terminal = row["state"] in ("done", "abandoned")
+                terminal = row["state"] in ("done", "abandoned", "cancelled")
                 changed = (row["title"], row["body"]) != (item.title, item.body)
                 if not (terminal and changed):
                     return False
@@ -237,6 +237,19 @@ class DaemonStore:
             state="queued" if requeue else "abandoned",
             last_error=error[:2000],
         )
+
+    def mark_cancelled(self, item_id: str, reason: str, now: float) -> None:
+        """Operator cancel: terminal for the daemon, unlike ``mark_failed``
+        which either re-queues (with backoff) or abandons."""
+        self._update(item_id, now, state="cancelled", last_error=reason[:2000])
+
+    def requeue(self, item_id: str, reason: str, now: float) -> None:
+        """A human explicitly re-runs a settled item (``!sbx requeue`` /
+        ``!sbx cancel --retry``). The attempt budget and retry backoff exist
+        to bound *autonomous* churn, so a human decision starts both over:
+        attempts reset to zero and the item is eligible on the next tick.
+        The daily run cap still applies."""
+        self._update(item_id, now, state="queued", attempts=0, last_error=reason[:2000])
 
     def mark_requeued_unstarted(self, item_id: str, now: float) -> None:
         """Crash between claim and start: back to the queue, claim kept."""

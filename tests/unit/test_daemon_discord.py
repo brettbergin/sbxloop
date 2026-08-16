@@ -91,7 +91,7 @@ class FakeMessage:
         self.content = content
         self.channel = channel
         self.id = mid
-        self.author = type("A", (), {"bot": bot})()
+        self.author = type("A", (), {"bot": bot, "name": "brett"})()
         self.reactions: list[str] = []
 
     async def add_reaction(self, emoji: str) -> None:
@@ -174,6 +174,8 @@ class FakeLoop:
         self.dstore = dstore
         self.paused = False
         self.cancelled = 0
+        self.cancel_calls: list[tuple[str | None, bool]] = []
+        self.requeued: list[tuple[str, str | None]] = []
 
     def status(self) -> dict[str, Any]:
         return {
@@ -192,9 +194,14 @@ class FakeLoop:
     def unpause(self) -> None:
         self.paused = False
 
-    def cancel_current(self) -> bool:
+    def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
         self.cancelled += 1
+        self.cancel_calls.append((requester, retry))
         return True
+
+    def requeue(self, item_id: str, by: str | None = None) -> str | None:
+        self.requeued.append((item_id, by))
+        return None if item_id == "gh:8" else f"unknown item {item_id}"
 
 
 def make_bridge(
@@ -359,6 +366,27 @@ class TestBridge:
             assert floop.cancelled == 1 and "cancel requested" in joined
             assert "queue is empty." in joined
             assert "commands:" in joined
+        finally:
+            bridge.close()
+
+    def test_cancel_and_requeue_are_attributed_to_the_author(self, tmp_path: Path) -> None:
+        """#246: the loop settles a cancel by who asked (GitHub comment,
+        finish card); --retry re-queues instead; requeue reruns a settled item."""
+        bridge, client, floop = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            for cmd in ("!sbx cancel", "!sbx cancel --retry", "!sbx requeue gh:8", "!sbx requeue"):
+                bridge._handle_message(FakeMessage(cmd, control))
+            assert wait_for(lambda: len(control.sent) >= 4)
+            assert floop.cancel_calls == [
+                ("Discord user `brett`", False),
+                ("Discord user `brett`", True),
+            ]
+            assert floop.requeued == [("gh:8", "Discord user `brett`")]
+            joined = "\n".join(control.sent)
+            assert "settles as cancelled" in joined and "run again fresh" in joined
+            assert "re-queued `gh:8`" in joined and "usage:" in joined
         finally:
             bridge.close()
 

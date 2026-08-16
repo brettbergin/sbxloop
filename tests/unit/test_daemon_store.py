@@ -97,6 +97,23 @@ class TestQueueAndAttempts:
         assert got is not None
         assert got.state == "abandoned" and got.attempts == 2 and got.last_error == "err2"
 
+    def test_cancelled_is_terminal_and_requeue_resets_the_attempt_budget(
+        self, tmp_path: Path
+    ) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_cancelled("gh:7", "cancelled by op", now=3.0)
+        got = store.get("gh:7")
+        assert got is not None and got.state == "cancelled" and got.last_error == "cancelled by op"
+        assert store.next_queued(now=1e9, backoff_s=1) is None  # never auto-retried
+        assert store.upsert_new(item(), now=4.0) is False  # re-discovery dedups like done
+        store.requeue("gh:7", "re-queued by op", now=5.0)
+        got = store.get("gh:7")
+        assert got is not None and got.state == "queued" and got.attempts == 0
+        # A human's re-queue is eligible right away, no failure backoff.
+        assert store.next_queued(now=5.0, backoff_s=900) is not None
+
     def test_running_items_and_unstarted_requeue(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)

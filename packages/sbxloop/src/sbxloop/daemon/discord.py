@@ -359,20 +359,43 @@ class DiscordBridge:
             loop.unpause()
             await self._send(channel, "resumed.")
         elif word == "cancel":
-            ok = loop.cancel_current()
-            await self._send(
-                channel,
-                "cancel requested — honored at the next task boundary; the run stays resumable."
-                if ok
-                else "nothing is running.",
-            )
+            # Attributed to the Discord author: the item is settled as
+            # cancelled (no retry, no breaker count) unless --retry asks for
+            # a fresh run.
+            args = cmd.split()[1:]
+            retry = "--retry" in args
+            ok = loop.cancel_current(_author_name(message), retry=retry)
+            if not ok:
+                await self._send(channel, "nothing is running.")
+            elif retry:
+                await self._send(
+                    channel,
+                    "cancel requested — honored at the next task boundary; the item will be "
+                    "re-queued and run again fresh.",
+                )
+            else:
+                await self._send(
+                    channel,
+                    "cancel requested — honored at the next task boundary; the item settles as "
+                    "cancelled (no retry) and the run stays resumable.",
+                )
+        elif word == "requeue":
+            args = cmd.split()[1:]
+            if not args:
+                await self._send(
+                    channel, f"usage: `{self.discord.command_prefix} requeue <item-id>` (e.g. gh:8)"
+                )
+            else:
+                error = loop.requeue(args[0], _author_name(message))
+                await self._send(channel, error or f"re-queued {code(args[0])}.")
         elif word == "queue":
             await self._send(channel, queue_lines(loop.dstore.queued()), suppress_embeds=True)
         else:
             await self._send(
                 channel,
-                f"commands: `{self.discord.command_prefix} status|pause|resume|cancel|queue` — "
-                "or type in a run's thread to steer that run.",
+                f"commands: `{self.discord.command_prefix} status|pause|resume|"
+                "cancel [--retry]|requeue <item>|queue` — or type in a run's thread to steer "
+                "that run.",
             )
 
     # -- pump: queue -> discord (discord thread) -------------------------------------
@@ -855,6 +878,16 @@ class DiscordBridge:
         client.event(on_ready)
         client.event(on_message)
         return client
+
+
+def _author_name(message: Any) -> str:
+    """Who sent a control-channel command, for attribution on the source
+    (GitHub comment) and in the finish card. Username over display name (it
+    is stable), in backticks so a GitHub comment never @-mentions whoever
+    happens to own that handle on GitHub."""
+    author = getattr(message, "author", None)
+    name = getattr(author, "name", None) or getattr(author, "display_name", None)
+    return f"Discord user `{name}`" if name else "a Discord operator"
 
 
 # -- discord.py adapters (the only place the optional extra is touched) ------------------

@@ -20,7 +20,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from sbxloop.config import Config, GithubConfig
 from sbxloop.daemon.backlog import BACKLOG_INSTRUCTIONS, collect_backlog
@@ -51,6 +51,18 @@ class Frontend(Protocol):
         self, item: WorkItem, run_id: str, engine: LoopEngine, bus: EventBus
     ) -> None: ...
     def run_finished(self, item: WorkItem, report: RunReport) -> None: ...
+
+
+class CancelRequest(NamedTuple):
+    """An operator's ``!sbx cancel`` for one specific run. Recorded so the
+    settle step can tell it from a failure: the engine surfaces both as an
+    exception at the next boundary (field: a Discord cancel was settled as
+    a failed attempt, re-run fresh after the backoff and counted toward the
+    breaker — #246)."""
+
+    run_id: str
+    requester: str
+    retry: bool
 
 
 class RunHandle:
@@ -100,6 +112,7 @@ class DaemonLoop:
         self._paused = False
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
+        self._cancel_request: CancelRequest | None = None
         self._consecutive_failures = 0
         self._breaker_opened_at: float | None = None
         self._last_cap_log = 0.0
@@ -127,13 +140,42 @@ class DaemonLoop:
     def request_stop(self) -> None:
         self._stop.set()
 
-    def cancel_current(self) -> bool:
+    def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
+        """Operator cancel of the in-flight run. The engine stops at its next
+        boundary and the item settles as *cancelled* — no retry, no breaker
+        count — unless ``retry`` asks for a fresh run. Recorded under the
+        current lock so the request can never be attributed to a later run."""
         with self._current_lock:
             handle = self._current
-        if handle is None:
-            return False
+            if handle is None:
+                return False
+            self._cancel_request = CancelRequest(handle.run_id, requester or "operator", retry)
         handle.engine.request_cancel()
         return True
+
+    def requeue(self, item_id: str, by: str | None = None) -> str | None:
+        """Put a settled (cancelled/abandoned) item back in the queue at a
+        human's request. Returns an error message, or None on success."""
+        item = self.dstore.get(item_id)
+        if item is None:
+            return f"unknown item {item_id}"
+        if item.state not in ("cancelled", "abandoned"):
+            return f"{item_id} is {item.state}; only cancelled or abandoned items can be re-queued"
+        source = self._source_for(item)
+        if source is None:
+            return f"no active source for {item_id}"
+        who = by or "operator"
+        self.dstore.requeue(item_id, f"re-queued by {who}", self.clock())
+        source.report_requeued(item, who)
+        self._notify(f"↻ {item_id} re-queued by {who}")
+        return None
+
+    def _take_cancel(self, run_id: str) -> CancelRequest | None:
+        """The cancel request for ``run_id``, consumed. Any other pending
+        request is stale (its run is gone) and dropped."""
+        with self._current_lock:
+            request, self._cancel_request = self._cancel_request, None
+        return request if request is not None and request.run_id == run_id else None
 
     def quiesce(self) -> None:
         """The cleanup registry's shutdown hook: stop claiming, ask the
@@ -297,6 +339,14 @@ class DaemonLoop:
             self._current = None
 
         error = result_box.get("error")
+        cancel = self._take_cancel(run_id)
+        if cancel is not None and "result" not in result_box and self._run_is_resumable(run_id):
+            # The human's cancel took effect (engine raised at a boundary,
+            # persisted run left mid-flight). Checked before the shutdown
+            # branch: a cancel during quiesce must not be resumed by recovery.
+            # A run that finished or genuinely failed after the request
+            # settles normally — the cancel simply came too late.
+            return self._settle_cancelled(item, source, run_id, cancel)
         if self._stop.is_set() and "result" not in result_box and self._run_is_resumable(run_id):
             # Interrupted by shutdown at a phase boundary: the persisted run
             # is still resumable, so leave the item running for recovery.
@@ -376,6 +426,30 @@ class DaemonLoop:
                 f"failures; pausing dispatch for {self.config.daemon.breaker_cooldown_s:.0f}s"
             )
         return outcome
+
+    def _settle_cancelled(
+        self, item: WorkItem, source: WorkSource, run_id: str, cancel: CancelRequest
+    ) -> TickOutcome:
+        now = self.clock()
+        # The daemon's verdict is "cancelled" even though the persisted run
+        # is still mid-flight (and therefore resumable) — that is the point.
+        report = self._report(run_id, None)._replace(
+            state="cancelled", cancelled_by=cancel.requester, requeued=cancel.retry
+        )
+        reason = f"cancelled by {cancel.requester}"
+        self.dstore.finish_ledger(run_id, "cancelled", now)
+        if cancel.retry:
+            self.dstore.requeue(item.item_id, reason, now)
+            self._notify(f"⏹ {item.item_id} {reason}; re-queued to run again fresh")
+        else:
+            self.dstore.mark_cancelled(item.item_id, reason, now)
+            self._notify(
+                f"⏹ {item.item_id} {reason} — `sbxloop resume {run_id}` continues it, "
+                f"`!sbx requeue {item.item_id}` reruns it fresh"
+            )
+        source.report_cancelled(item, report)
+        self._frontend_finished(item, report)
+        return "cancelled"
 
     def _breaker_open(self, now: float) -> bool:
         if self._breaker_opened_at is None:

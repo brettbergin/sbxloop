@@ -49,6 +49,8 @@ class WorkSource(Protocol):
     def report_delivery_failed(self, item: WorkItem, report: RunReport) -> None: ...
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None: ...
     def report_abandoned(self, item: WorkItem, error: str) -> None: ...
+    def report_cancelled(self, item: WorkItem, report: RunReport) -> None: ...
+    def report_requeued(self, item: WorkItem, by: str) -> None: ...
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str: ...
 
 
@@ -79,6 +81,21 @@ def _report_lines(report: RunReport) -> list[str]:
         lines.append(f"Delivery failed: {report.delivery_error}")
     if report.workspace:
         lines.append(f"Workspace: `{report.workspace}`")
+    return lines
+
+
+def _cancel_lines(report: RunReport) -> list[str]:
+    who = report.cancelled_by or "an operator"
+    lines = [f"Run `{report.run_id}` cancelled by {who} ({report.task_summary})."]
+    if report.requeued:
+        lines.append("Re-queued at their request; a fresh run will start on the next tick.")
+    else:
+        # The persisted run is left mid-flight on purpose: the human may
+        # want to continue it rather than redo the work.
+        lines.append(
+            f"The run stays resumable: `sbxloop resume {report.run_id}` on the daemon host "
+            "continues it; re-queueing runs the item again from scratch."
+        )
     return lines
 
 
@@ -164,6 +181,22 @@ class InboxSource:
 
     def report_abandoned(self, item: WorkItem, error: str) -> None:
         self._finish(item, "failed", [f"Abandoned after retries: {error}"])
+
+    def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
+        if report.requeued:
+            # Still work: the file stays in running/, like a retry.
+            logger.info("inbox: %s cancelled and re-queued", item.source_key)
+            return
+        self._finish(item, "failed", _cancel_lines(report))
+
+    def report_requeued(self, item: WorkItem, by: str) -> None:
+        # Undo the terminal move so the file is back where a running item lives.
+        src = self._dir("failed") / item.source_key
+        try:
+            if src.exists():
+                src.replace(self._dir("running") / item.source_key)
+        except OSError:
+            logger.warning("inbox: could not requeue %s", item.source_key, exc_info=True)
 
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         fingerprint = hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()[:8]
@@ -355,6 +388,36 @@ class GitHubIssueSource:
             self._add_label(ops, n, self.labels.failed)
 
         self._guard("abandon report", go)
+
+    def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
+        def go(ops: GithubOps) -> None:
+            n = item.source_key
+            lines = _cancel_lines(report)
+            if not report.requeued:
+                # Neither failed nor triggered: the human decides what
+                # happens next, so no label speaks for them. Re-adding the
+                # trigger label or `!sbx requeue` runs it again fresh.
+                lines.append(
+                    f"To run it again from scratch, re-add `{self.labels.trigger}` "
+                    f"or `!sbx requeue {item.item_id}` in Discord."
+                )
+            self._comment(ops, n, "\n".join(lines))
+            if not report.requeued:
+                self._remove_label(ops, n, self.labels.in_progress)
+
+        self._guard("cancel report", go)
+
+    def report_requeued(self, item: WorkItem, by: str) -> None:
+        def go(ops: GithubOps) -> None:
+            n = item.source_key
+            # in-progress is the claim marker; a re-queued item is claimed
+            # again without a fresh label swap. An abandoned item also
+            # carries the failed label (absent → 404, tolerated).
+            self._add_label(ops, n, self.labels.in_progress)
+            self._remove_label(ops, n, self.labels.failed)
+            self._comment(ops, n, f"Re-queued by {by}; a fresh run will start shortly.")
+
+        self._guard("requeue report", go)
 
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         labels = [self.labels.trigger] if trigger else [self.labels.backlog]

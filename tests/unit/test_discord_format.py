@@ -339,6 +339,21 @@ class TestEmbeds:
         )
         assert failed.color == COLOR_WARN and failed.fields[0][1].startswith("⚠ 409")
 
+    def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
+        """#246: a cancel is not a failure; the card must name the requester
+        and tell the human the run is resumable (or already re-queued)."""
+        item = WorkItem(item_id="gh:8", source="github", source_key="8", title="Demo")
+        report = RunReport("r1", "cancelled", "1/3 tasks done", cancelled_by="Discord user `b`")
+        text = finish_text("cancelled", report)
+        assert "cancelled by Discord user `b`" in text and "`sbxloop resume r1`" in text
+        card = finish_embed(item, report, "cancelled")
+        assert card.title == "⏹ finished: cancelled"
+        assert card.fields[0][0] == "Cancelled"
+        assert "`sbxloop resume r1`" in card.fields[0][1]
+        assert "!sbx requeue gh:8" in card.fields[0][1]
+        requeued = finish_embed(item, report._replace(requeued=True), "cancelled")
+        assert "re-queued" in requeued.fields[0][1] and "resume" not in requeued.fields[0][1]
+
     def test_status_card_and_queue(self) -> None:
         card = status_embed(
             {

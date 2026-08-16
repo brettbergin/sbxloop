@@ -90,6 +90,22 @@ class TestInbox:
         assert (root / "failed" / "b.md").exists()
         assert "kaboom" in (root / "failed" / "b.result.md").read_text()
 
+    def test_cancelled_lands_in_failed_with_resume_hint_and_requeue_undoes_it(
+        self, tmp_path: Path
+    ) -> None:
+        src, root = self.make(tmp_path)
+        self._drop(root, "a.md", "# A\n", mtime=1.0)
+        item = src.poll()[0]
+        src.claim(item)
+        src.report_cancelled(item, report(state="cancelled", cancelled_by="op", requeued=True))
+        assert (root / "running" / "a.md").exists()  # --retry: still work
+        src.report_cancelled(item, report(state="cancelled", cancelled_by="op"))
+        assert (root / "failed" / "a.md").exists()
+        note = (root / "failed" / "a.result.md").read_text()
+        assert "cancelled by op" in note and "sbxloop resume r1" in note
+        src.report_requeued(item, "op")
+        assert (root / "running" / "a.md").exists() and not (root / "failed" / "a.md").exists()
+
     def test_file_backlog_triage_vs_trigger(self, tmp_path: Path) -> None:
         src, root = self.make(tmp_path)
         ref = src.file_backlog("Add caching", "it is slow", "r7", trigger=False)
@@ -279,6 +295,40 @@ class TestGitHubSource:
         ) in ops.raw_calls
         assert any("re-adding `sbxloop:run`" in body for _, body in ops.comments)
 
+    def test_cancelled_removes_in_progress_and_leaves_trigger_to_a_human(self) -> None:
+        """#246: a cancel is neither failure nor trigger — the issue is left
+        unlabeled with a comment saying who cancelled and how to continue."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        cancelled = report(
+            state="cancelled", delivery=None, tracking_issue=None, cancelled_by="Discord user `b`"
+        )
+        self.make(ops).report_cancelled(item, cancelled)
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Ain-progress", None) in ops.raw_calls
+        assert not any(m == "POST" for m, _, _ in ops.raw_calls)  # no failed label
+        body = ops.comments[-1][1]
+        assert "cancelled by Discord user `b`" in body
+        assert "`sbxloop resume r1`" in body and "!sbx requeue gh:4" in body
+
+    def test_cancelled_with_requeue_keeps_in_progress(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        self.make(ops).report_cancelled(item, report(state="cancelled", requeued=True))
+        assert not any(m == "DELETE" for m, _, _ in ops.raw_calls)
+        assert "Re-queued" in ops.comments[-1][1]
+
+    def test_requeued_reclaims_with_in_progress_and_drops_failed(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:failed")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        self.make(ops).report_requeued(item, "Discord user `b`")
+        assert (
+            "POST",
+            "/repos/o/r/issues/4/labels",
+            {"labels": ["sbxloop:in-progress"]},
+        ) in ops.raw_calls
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Afailed", None) in ops.raw_calls
+        assert "Re-queued by Discord user `b`" in ops.comments[-1][1]
+
     def test_reporting_failures_are_swallowed(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
         ops.fail_on = {"COMMENT", "PATCH", "DELETE", "POST"}
@@ -288,6 +338,8 @@ class TestGitHubSource:
         src.report_success(item, report())
         src.report_retry(item, "err", 1)
         src.report_abandoned(item, "err")
+        src.report_cancelled(item, report(state="cancelled"))
+        src.report_requeued(item, "b")
 
     def test_file_backlog_label_per_trigger(self) -> None:
         ops = RecordingOps()

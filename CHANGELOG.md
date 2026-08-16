@@ -6,6 +6,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Daemon: an operator `!sbx cancel` is no longer settled as a failed
+  attempt (field: cancelled from Discord → "failed; 1 attempt(s) left" →
+  re-run fresh after the 15-minute backoff, and counted toward the circuit
+  breaker — #246). The item now settles as **cancelled**: a new terminal
+  work-item state with no automatic retry and no breaker count, reported on
+  the source with attribution ("cancelled by Discord user `x`"; GitHub:
+  comment + in-progress label removed, trigger left for a human), while the
+  run itself stays resumable — the finish card and source comment say
+  `sbxloop resume RUN`. New `!sbx cancel --retry` re-queues the item for a
+  fresh run instead, and `!sbx requeue <item>` reruns any cancelled or
+  abandoned item (a human re-queue resets the attempt budget and skips the
+  failure backoff; the daily cap still applies).
+
 ### Added
 
 - `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed
