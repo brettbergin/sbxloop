@@ -92,6 +92,7 @@ class Harness:
             str
         ] = []  # scripted per run: "completed"|"failed"|"raise"|"deliver_fail"
         self.runs: list[tuple[str, bool]] = []
+        self.run_configs: list[Config] = []  # the config each dispatch handed the runner
         self.source = FakeSource()
         self.loop = DaemonLoop(
             self.config,
@@ -106,6 +107,7 @@ class Harness:
         self, item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
     ) -> RunResult:
         self.runs.append((run_id, resume))
+        self.run_configs.append(cfg)
         kind = self.outcomes.pop(0) if self.outcomes else "completed"
         if kind == "raise":
             raise WorkerError("sandbox exploded")
@@ -1141,6 +1143,15 @@ class TestWorkspacePosture:
         h = Harness(tmp_path, self._config(tmp_path, make_repo(tmp_path)))
         assert h.config.sandbox.workspace_isolation == "auto"
         assert h.loop._item_config(inbox_item()).sandbox.workspace_isolation == "clone"
+
+    def test_dispatch_hands_the_runner_clone_isolation(self, tmp_path: Path) -> None:
+        """The override must reach the config the runner actually receives —
+        `_item_config` being right is worthless if dispatch passes `self.config`."""
+        h = Harness(tmp_path, self._config(tmp_path, make_repo(tmp_path)))
+        h.source.items = [inbox_item()]
+        assert h.loop.tick().outcome == "done"
+        assert [c.sandbox.workspace_isolation for c in h.run_configs] == ["clone"]
+        assert h.config.sandbox.workspace_isolation == "auto"  # operator config untouched
 
     def test_daemon_isolation_knob_governs_daemon_runs(self, tmp_path: Path) -> None:
         cfg = self._config(tmp_path, make_repo(tmp_path), workspace_isolation="in-place")
