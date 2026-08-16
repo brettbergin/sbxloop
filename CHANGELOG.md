@@ -89,6 +89,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   daemon on the host no longer removes the first's at startup. Source polling
   raises on failure and backs off exponentially (up to 30 min); the github
   sandbox is re-provisioned at most once per 5 minutes.
+
 - `[daemon] close_on_success` and `[daemon] tracking_issue` (#251), both
   default true (today's behaviour). `close_on_success = false` leaves a
   delivered source issue open with the new `delivered_label`
