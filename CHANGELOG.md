@@ -123,14 +123,15 @@ All notable changes to sbxloop are documented here. The project adheres to
   (`[daemon] workspace_isolation`): a dirty tree proceeds from committed
   HEAD with a warning instead of `auto`'s refusal, which no human is present
   to answer. Before each fresh run the daemon `git fetch`es the checkout and
-  fast-forwards its branch to origin — never a merge/rebase; diverged or
+  fast-forwards its branch to its upstream (the tracked remote, or
+  `origin/<branch>` when none is configured) — never a merge/rebase; diverged or
   colliding trees are left alone and logged, fetch failures warn and run
   from local HEAD (`[daemon] refresh_workspace`, default on). Daemon state
   is anchored to an absolute path outside the workspace: `[daemon] state_dir`, else an explicit `state_dir`, else a pre-existing legacy
   `./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`;
   the resolved location is printed at start and the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule. Per-run clones now point
   `origin` at the source checkout's origin URL instead of the host path
-  (metadata only). Docs and the systemd contrib prescribe a dedicated clone
+  (metadata only; URL userinfo such as an embedded token is stripped). Docs and the systemd contrib prescribe a dedicated clone
   nobody edits as the daemon's workspace.
 
 - GitHub op failures carry the HTTP status as a structured field (#221):

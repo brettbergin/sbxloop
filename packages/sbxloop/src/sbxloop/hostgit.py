@@ -125,6 +125,24 @@ def origin_url(repo_path: Path) -> str | None:
     return url or None
 
 
+def public_remote_url(url: str) -> str:
+    """``url`` with any embedded userinfo removed.
+
+    Git remotes routinely carry a credential in the URL itself
+    (``https://x-access-token:ghp_...@github.com/o/r``); copying such a URL
+    into a per-run clone would persist that token in the clone's
+    ``.git/config``, which the agent sandbox can read. Only scheme URLs can
+    carry userinfo worth hiding — the ``git@`` in an scp-style
+    ``git@github.com:o/r`` is a login name, not a secret, and is left alone.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    authority, slash, path = rest.partition("/")
+    _userinfo, at, host = authority.rpartition("@")
+    return f"{scheme}://{host if at else authority}{slash}{path}"
+
+
 def clone_for_run(source: Path, target: Path, branch: str) -> str:
     """Clone ``source`` into ``target`` on a fresh ``branch``; return HEAD sha.
 
@@ -140,11 +158,13 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
     meaningless inside the sandbox VM and misleading to anyone reading
     ``git remote -v`` in the run workspace afterwards. When the source has
     its own ``origin`` (the GitHub remote, typically) the clone's origin is
-    re-pointed at that URL — metadata only: no credentials travel, and
-    nothing in sbxloop pushes from the workspace (delivery goes through the
-    GitHub API from the github sandbox).
+    re-pointed at that URL — metadata only: userinfo is stripped first (see
+    :func:`public_remote_url`) so no credential travels, and nothing in
+    sbxloop pushes from the workspace (delivery goes through the GitHub API
+    from the github sandbox).
     """
-    upstream = origin_url(source)
+    raw_upstream = origin_url(source)
+    upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
     try:
         with Repo.clone_from(str(source), str(target)) as clone:
             clone.git.checkout("-b", branch)
@@ -329,9 +349,13 @@ def _describe_change(repo_path: Path, path: str, git_status: str) -> WorkspaceCh
     executable = bool(full.stat().st_mode & 0o111)
     return WorkspaceChange(path=path, status=status, mode="100755" if executable else "100644")
 def refresh_from_origin(repo_path: Path) -> RefreshResult:
-    """``git fetch origin`` and fast-forward the checked-out branch to its
-    upstream, so an unattended run starts from current ``origin/<branch>``
+    """``git fetch`` and fast-forward the checked-out branch to its
+    upstream, so an unattended run starts from current ``<remote>/<branch>``
     rather than whatever HEAD the checkout was last left at (#255).
+
+    The remote fetched is the one the branch tracks (``upstream/main`` in a
+    fork layout, not necessarily ``origin``); a branch with no upstream
+    falls back to ``origin/<branch>``, the convention everyone expects.
 
     Strictly non-destructive: fast-forward only. A detached HEAD, a branch
     with no upstream, a diverged local branch, or a working tree whose
@@ -342,24 +366,30 @@ def refresh_from_origin(repo_path: Path) -> RefreshResult:
     """
     try:
         with Repo(repo_path) as repo:
-            if "origin" not in {r.name for r in repo.remotes}:
-                return RefreshResult(False, None, None, f"{repo_path}: no origin remote")
+            remotes = {r.name for r in repo.remotes}
             before = repo.head.commit.hexsha if repo.head.is_valid() else None
+            on_branch = before is not None and not repo.head.is_detached
+            tracking = repo.active_branch.tracking_branch() if on_branch else None
+            # Fetch the remote that owns the ref we will fast-forward to;
+            # fetching origin while the branch tracks another remote would
+            # leave that ref stale and call the checkout "up to date".
+            remote_name = tracking.remote_name if tracking is not None else "origin"
+            if remote_name not in remotes:
+                return RefreshResult(False, before, before, f"{repo_path}: no {remote_name} remote")
             try:
-                repo.remotes.origin.fetch()
+                repo.remote(remote_name).fetch()
             except GitCommandError as exc:
                 raise ProvisionError(
-                    f"git fetch origin failed in {repo_path}: {_describe(exc)}"
+                    f"git fetch {remote_name} failed in {repo_path}: {_describe(exc)}"
                 ) from exc
-            if before is None or repo.head.is_detached:
+            if not on_branch:
                 why = "unborn HEAD" if before is None else "detached HEAD"
                 return RefreshResult(False, before, before, f"{repo_path}: {why}; fetched only")
             branch = repo.active_branch
-            tracking = branch.tracking_branch()
             if tracking is None:
                 # No upstream configured (a plain `git clone` sets one, a
                 # hand-built checkout may not): fall back to the same-named
-                # remote branch, the convention everyone expects.
+                # origin branch.
                 candidate = f"origin/{branch.name}"
                 if candidate not in {r.name for r in repo.remotes.origin.refs}:
                     return RefreshResult(

@@ -400,6 +400,32 @@ class TestClonePointsOriginAtSourceOrigin:
         assert hostgit.origin_url(target) == str(source)
 
 
+class TestPublicRemoteUrl:
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://x-access-token:ghp_secret@github.com/o/r.git", "https://github.com/o/r.git"),
+            ("https://token@github.com/o/r", "https://github.com/o/r"),
+            ("https://github.com/o/r.git", "https://github.com/o/r.git"),
+            ("ssh://git@github.com/o/r.git", "ssh://github.com/o/r.git"),
+            ("git@github.com:o/r.git", "git@github.com:o/r.git"),
+            ("/srv/git/upstream.git", "/srv/git/upstream.git"),
+        ],
+    )
+    def test_strips_userinfo_from_scheme_urls_only(self, url: str, expected: str) -> None:
+        assert hostgit.public_remote_url(url) == expected
+
+    def test_run_clone_never_carries_a_token_from_the_source_origin(self, tmp_path: Path) -> None:
+        """The source checkout's origin holds a PAT in the URL (common for
+        bots); the per-run clone the agent can read must not."""
+        source = make_repo(tmp_path)
+        git("remote", "add", "origin", "https://x:ghp_secret@github.com/o/r.git", cwd=source)
+        target = tmp_path / "ws"
+        hostgit.clone_for_run(source, target, "sbxloop/r1")
+        assert hostgit.origin_url(target) == "https://github.com/o/r.git"
+        assert "ghp_secret" not in (target / ".git" / "config").read_text()
+
+
 class TestRefreshFromOrigin:
     def test_up_to_date_is_a_no_op(self, tmp_path: Path) -> None:
         _upstream, checkout = make_upstream_and_clone(tmp_path)
@@ -478,6 +504,26 @@ class TestRefreshFromOrigin:
         result = hostgit.refresh_from_origin(checkout)
         assert result.advanced is False
         assert "no origin branch" in result.message
+
+    def test_branch_tracking_another_remote_fetches_that_remote(self, tmp_path: Path) -> None:
+        """Fork layout: `origin` is the fork, `main` tracks `upstream/main`.
+        Fetching only origin would leave upstream/main stale and report the
+        checkout as up to date; the tracked remote must be the one fetched."""
+        fork, checkout = make_upstream_and_clone(tmp_path)
+        seed = tmp_path / "seed"
+        upstream = tmp_path / "real-upstream.git"
+        git("clone", "--bare", "-q", str(seed), str(upstream), cwd=tmp_path)
+        git("remote", "add", "upstream", str(upstream), cwd=checkout)
+        git("fetch", "-q", "upstream", cwd=checkout)
+        git("branch", "-u", "upstream/main", "main", cwd=checkout)
+        stale = hostgit.head_commit(checkout)
+        new_sha = push_upstream_commit(tmp_path, upstream, name="upstream-pusher")
+        assert push_upstream_commit(tmp_path, fork, name="fork-pusher") != new_sha
+        result = hostgit.refresh_from_origin(checkout)
+        assert result.advanced is True
+        assert (result.before, result.after) == (stale, new_sha)
+        assert hostgit.head_commit(checkout) == new_sha
+        assert "upstream/main" in result.message
 
     def test_detached_head_fetches_only(self, tmp_path: Path) -> None:
         upstream, checkout = make_upstream_and_clone(tmp_path)

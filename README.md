@@ -287,14 +287,16 @@ next dispatch starts over (attempts and backoff kept). The same controls are
 **Workspace posture for unattended runs.** Point `[sandbox] workspace` at a
 **dedicated clone nobody edits** (`git clone <repo> ~/sbxloop-runner/src`),
 not the checkout you work in. Before each fresh run the daemon
-`git fetch`es that clone and fast-forwards its branch to `origin` — never a
-merge or rebase; a diverged branch or a colliding local edit is left alone
-and logged — so runs start from current `origin/<branch>` rather than a
+`git fetch`es that clone and fast-forwards its branch to its upstream (the
+remote the branch tracks; `origin/<branch>` when none is configured) — never
+a merge or rebase; a diverged branch or a colliding local edit is left alone
+and logged — so runs start from the current remote branch rather than a
 stale local HEAD (`[daemon] refresh_workspace`). Daemon runs use `clone`
 isolation regardless of `[sandbox] workspace_isolation` (`[daemon] workspace_isolation`, default `clone`): a dirty tree proceeds from committed
 HEAD with a warning, because `auto`'s refusal has no human present to answer
 it. Per-run clones point their `origin` at the source's origin URL (metadata
-only; no credentials leave the host). And the daemon keeps its state
+only; any userinfo such as an embedded token is stripped from the URL, so
+no credentials leave the host). And the daemon keeps its state
 **outside the workspace** at an absolute path — `[daemon] state_dir`, else
 an explicitly configured `state_dir`, else a pre-existing legacy
 `./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`
