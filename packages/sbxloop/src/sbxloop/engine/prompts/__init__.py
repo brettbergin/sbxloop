@@ -8,6 +8,7 @@ prompt section is a debugging nightmare.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from functools import cache
 from importlib import resources
@@ -15,11 +16,23 @@ from string import Template
 
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
 
+_CONTRACT_HEADER = re.compile(r"\A<!--.*?-->\n?", re.DOTALL)
+
+
+def _strip_contract_header(text: str) -> str:
+    """Drop the leading ``<!-- ... -->`` block that documents a template's
+    contract (#225). It is written for the humans editing the file — the
+    variables it lists, the ``$``-escaping rule, which test guards which
+    section — and must never cost the model tokens or, worse, be read by
+    it as instructions. Stripping happens before ``Template`` sees the text
+    so the header can name ``$variables`` freely."""
+    return _CONTRACT_HEADER.sub("", text, count=1)
+
 
 @cache
 def _template(name: str) -> Template:
     text = (resources.files(__name__) / f"{name}.md").read_text()
-    return Template(text)
+    return Template(_strip_contract_header(text))
 
 
 def _domain_list(domains: Iterable[str]) -> str:

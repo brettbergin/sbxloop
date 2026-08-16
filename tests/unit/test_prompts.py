@@ -1,7 +1,10 @@
 """Prompt template rendering tests."""
 
+from importlib import resources
+
 import pytest
 
+from sbxloop.engine import prompts
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
 
@@ -175,58 +178,87 @@ def test_environment_facts_lead_language_neutral() -> None:
         )
 
 
+# One full context per template. Kept in sync with the header comment at the
+# top of each prompts/*.md — that header is where an editor learns which
+# variables a template takes (#225).
+RENDER_CONTEXTS: dict[str, dict[str, str]] = {
+    "decompose": {"outcome": "o", "max_tasks": "3"},
+    "plan": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "- c",
+        "feedback": "f",
+        "user_guidance": "g",
+    },
+    "execute": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "plan_steps": "- s",
+        "expected_artifacts": "- a",
+        "feedback": "f",
+        "user_guidance": "g",
+    },
+    "scrutinize": {
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "- c",
+        "plan_steps": "- s",
+        "prior_feedback": "f",
+        "executor_report": "r",
+        "evidence": "e",
+        "verify_commands": "- true",
+    },
+    "validate": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "- c",
+        "verify_results": "v",
+    },
+    "steer": {
+        "outcome": "o",
+        "tasks_summary": "- t1 [executing] T",
+        "current_task": "Task t1: T",
+        "user_guidance": "(none)",
+        "user_message": "how is it going?",
+    },
+}
+
+
 def test_render_all_templates_have_no_leftover_vars() -> None:
-    contexts = {
-        "decompose": {"outcome": "o", "max_tasks": "3"},
-        "plan": {
-            "outcome": "o",
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "acceptance_criteria": "- c",
-            "feedback": "f",
-            "user_guidance": "g",
-        },
-        "execute": {
-            "outcome": "o",
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "plan_steps": "- s",
-            "expected_artifacts": "- a",
-            "feedback": "f",
-            "user_guidance": "g",
-        },
-        "scrutinize": {
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "acceptance_criteria": "- c",
-            "plan_steps": "- s",
-            "prior_feedback": "f",
-            "executor_report": "r",
-            "evidence": "e",
-            "verify_commands": "- true",
-        },
-        "validate": {
-            "outcome": "o",
-            "task_id": "t1",
-            "task_title": "T",
-            "task_description": "d",
-            "acceptance_criteria": "- c",
-            "verify_results": "v",
-        },
-        "steer": {
-            "outcome": "o",
-            "tasks_summary": "- t1 [executing] T",
-            "current_task": "Task t1: T",
-            "user_guidance": "(none)",
-            "user_message": "how is it going?",
-        },
-    }
-    for name, context in contexts.items():
+    for name, context in RENDER_CONTEXTS.items():
         text = render(name, **context)
         assert "$" not in text.replace("$?", ""), f"unsubstituted var in {name}"
+
+
+def test_every_template_opens_with_contract_header() -> None:
+    """#225: the rules above are enforced by this file but were discoverable
+    only by breaking them. Each template must carry the contract in an
+    HTML comment header naming the file's variables, so a new one cannot
+    ship without one."""
+    for name, context in RENDER_CONTEXTS.items():
+        source = (resources.files(prompts) / f"{name}.md").read_text()
+        assert source.startswith("<!--\n"), f"{name}.md lacks the contract header"
+        header = source[: source.index("-->")]
+        assert "string.Template" in header
+        assert "$$" in header, f"{name}.md header must state the $-escaping rule"
+        for var in context:
+            assert f"${var}" in header, f"{name}.md header does not list ${var}"
+
+
+def test_contract_header_never_reaches_the_model() -> None:
+    """The header is written for editors, not the agent: it must cost no
+    tokens and must not be readable as instructions."""
+    for name, context in RENDER_CONTEXTS.items():
+        text = render(name, **context)
+        assert "<!--" not in text, f"{name}: header leaked into the rendered prompt"
+        assert text.startswith("# "), f"{name}: rendered prompt must open with its title"
 
 
 def test_registry_tiers_are_injected_not_hardcoded() -> None:

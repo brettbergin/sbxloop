@@ -127,6 +127,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   `app_name`, `[discord]`). `sbxloop config show` reports it as
   `user config`.
 
+- Every engine prompt template (`engine/prompts/*.md`) now opens with an HTML
+  comment stating its contract — `string.Template` syntax, the `$`-escaping
+  rule, the variables it takes, and which test guards which section — and
+  `docs/architecture.md` gains a "Prompt templates" paragraph. `render()`
+  strips the header before the prompt reaches the model, so rendered prompts
+  are byte-identical to before (#225).
+
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
   boundaries (fences re-opened with their language) instead of clipped;
