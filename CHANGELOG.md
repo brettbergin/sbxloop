@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed
+  run's artifacts as a PR without re-running the work. End-of-run delivery
+  was a one-shot side effect with no retry path (field failure `rgwp5z40x`:
+  every task passed, delivery failed on the empty-repo 409, and `resume`
+  refuses completed runs). The command provisions a github-ops sandbox only,
+  reuses the run's persisted config with `--repo`/`--deliver-base`/
+  `--deliver-draft`/`--create-repo` overrides on top, runs the normal
+  `ensure_repository` + `deliver_workspace` path, and emits the usual
+  `run.deliver` events so `logs` and the finish summary see it; `--report`
+  refreshes the run's tracking issue with the PR link. Re-delivering a run
+  whose `sbxloop/<run>` branch already exists (a prior partial attempt)
+  force-updates the branch and reuses an already-open PR for that head
+  instead of failing on the refs POST 422.
+
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
   boundaries (fences re-opened with their language) instead of clipped;
@@ -19,6 +33,56 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+
+- GitHub op failures carry the HTTP status as a structured field (#221):
+  worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken
+  from `urllib` `HTTPError.code`), `ErrorInfo.http_status` on the JobResult
+  envelope, and host `GithubOpsError.http_status`. The empty-repo bootstrap
+  (`409`), missing-repo probe (`404`) and already-absent trigger label
+  (`404`) now compare status codes instead of grepping gh's prose — the
+  wording-mismatch that broke delivery on run rgwp5z40x (fixed in #219) can
+  no longer recur. Message matching remains only as a fallback for a worker
+  that predates the field.
+
+### Fixed
+
+- Artifact listings, harvest reports and `--deliver` PRs now honour the
+  workspace's own `.gitignore` rules (#249): the name-based
+  `[artifacts] exclude` list cannot know a project's `dist/`, vendored
+  wheels or generated `_version.py` are build byproducts, so any tree after
+  a build/sync delivered them into the PR. Files git would ignore
+  (untracked *and* ignored — force-added tracked files still travel) are
+  dropped and tallied as `gitignored` in the surfaced exclusion note; the
+  probe works on the per-run clone and on harvested copies (which carry
+  `.gitignore` but no `.git`), applies only in-tree `.gitignore` files
+  (never the operator's global excludes or an enclosing checkout's rules),
+  and degrades to the name-based scan when git is unavailable.
+  `[artifacts] exclude` remains the operator override on top.
+- **Delivery of git-checkout workspaces commits the run's diff, not a
+  snapshot** (#248). When the workspace is a git checkout (the per-run
+  clone, or an in-place checkout), the PR tree now carries only what the
+  run changed relative to its base commit — deletions as `sha: null` tree
+  entries, renames as delete + add, executable scripts keeping `100755`,
+  symlinks as `120000` — instead of layering every file as `100644` onto
+  the base tree, which could never delete a file and flipped every exec
+  bit. The diff base is the merge base with the PR's target commit when
+  the clone knows it, else the commit the clone was cut from (pinned as
+  `refs/sbxloop/base` at clone time). Non-git workspaces still deliver as
+  a snapshot; a checkout with no base to diff against falls back to one
+  and says so in the PR body. The artifact exclude denylist applies to
+  both paths.
+- Expected probe answers no longer render as red error panels (#222). The
+  `--create-repo` existence probe and delivery's base-ref lookup asked GitHub a
+  question whose expected answer was "no", but the worker raised on the 404
+  (or the 409 an empty repository returns) and emitted its error event before
+  the host could classify the miss as fine — three field runs showed the
+  alarm on runs that delivered cleanly. `repo.get` and the new `ref.get` op
+  accept `allow_missing: true` and return `{"missing": true}` as an **ok**
+  result; `ensure_repository` and the base-commit lookup branch on that data
+  instead of sniffing exception messages. `GithubOpError` in the worker now
+  carries `http_status` (parsed from gh's trailing `(HTTP NNN)` or urllib's
+  `HTTPError.code`) so the miss/error split is a status compare, not a
+  substring match.
 
 ## [0.6.0] — 2026-08-15
 

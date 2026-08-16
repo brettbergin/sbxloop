@@ -227,8 +227,12 @@ class GitHubIssueSource:
         try:
             ops.raw("DELETE", f"{self._issue_path(number)}/labels/{quote(label, safe='')}")
         except GithubOpsError as exc:
-            # Already absent is fine (404 on the label resource).
-            if "HTTP 404" not in str(exc):
+            # Already absent is fine (404 on the label resource). Message
+            # grep is the fallback for a pre-#221 worker only.
+            missing = (
+                exc.http_status == 404 if exc.http_status is not None else "HTTP 404" in str(exc)
+            )
+            if not missing:
                 raise
 
     def _comment(self, ops: GithubOps, number: str, body: str) -> None:

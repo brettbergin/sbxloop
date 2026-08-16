@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -34,7 +35,42 @@ JsonValue = dict[str, Any] | list[Any]
 
 
 class GithubOpError(RuntimeError):
-    """A GitHub operation failed (bad op, transport error, HTTP error)."""
+    """A GitHub operation failed (bad op, transport error, HTTP error).
+
+    ``http_status`` is set when the failure was an HTTP response so the host
+    can branch on ``== 404`` / ``== 409`` instead of grepping the message.
+    Field failure (run rgwp5z40x, #219): the empty-repo bootstrap listened
+    for "HTTP 404" because the stubs said so; real GitHub answered 409 via a
+    gh-CLI wording nobody had modelled. A structured status survives message
+    rewording on either transport.
+    """
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
+# gh prints HTTP failures as ``gh: <message> (HTTP 409)``; the bare form
+# covers gh versions/paths that omit the parentheses. Only 3-digit codes.
+_GH_PAREN_STATUS = re.compile(r"\(HTTP (\d{3})\)")
+_GH_BARE_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+
+
+def parse_gh_http_status(stderr: str) -> int | None:
+    """Extract the HTTP status ``gh api`` reports on stderr, if any.
+
+    The parenthesized form is gh's own report of the response status and is
+    appended after the (server-supplied) message, so the *last* one wins:
+    a message like ``upstream said HTTP 404 (HTTP 500)`` is a 500, not a 404.
+    The bare form is only a fallback when gh printed no parenthesized status.
+    """
+    paren = _GH_PAREN_STATUS.findall(stderr)
+    if paren:
+        return int(paren[-1])
+    bare = _GH_BARE_STATUS.findall(stderr)
+    if bare:
+        return int(bare[-1])
+    return None
 
 
 class Transport(Protocol):
@@ -65,9 +101,10 @@ class GhCliTransport:
             argv, capture_output=True, text=True, input=stdin, timeout=120, check=False
         )
         if proc.returncode != 0:
+            stderr = proc.stderr.strip()[:2000]
             raise GithubOpError(
-                f"gh api {method} {path} failed (rc={proc.returncode}): "
-                f"{proc.stderr.strip()[:2000]}"
+                f"gh api {method} {path} failed (rc={proc.returncode}): {stderr}",
+                http_status=parse_gh_http_status(stderr),
             )
         if not proc.stdout.strip():
             return {}
@@ -109,7 +146,9 @@ class RestTransport:
                 raw = response.read().decode()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]
-            raise GithubOpError(f"{method} {url} -> HTTP {exc.code}: {detail}") from exc
+            raise GithubOpError(
+                f"{method} {url} -> HTTP {exc.code}: {detail}", http_status=exc.code
+            ) from exc
         except urllib.error.URLError as exc:
             raise GithubOpError(f"{method} {url} failed: {exc.reason}") from exc
         if not raw.strip():
@@ -206,8 +245,52 @@ def _status_create(t: Transport, p: dict[str, Any]) -> JsonValue:
 
 
 def _repo_get(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """Fetch a repository; with ``allow_missing`` a 404 is an *answer*.
+
+    The existence probe behind ``--create-repo`` asks "is it there?" and
+    "no" is expected. Raising here would emit the worker's error event
+    before the host gets to say the miss is fine, and the transcript would
+    show a red panel for a routine question (#222) — so the miss comes back
+    as ``{"missing": true}`` on an ok result instead.
+    """
     _require(p, "repo")
-    return t.request("GET", f"/repos/{p['repo']}")
+    try:
+        return t.request("GET", f"/repos/{p['repo']}")
+    except GithubOpError as exc:
+        if p.get("allow_missing") and exc.http_status == 404:
+            return {"missing": True, "http_status": exc.http_status}
+        raise
+
+
+# Statuses a ref lookup answers with when there is no base to build on: 404
+# for an absent ref on a non-empty repository, 409 for a repository with no
+# commits at all (field-verified: run rgwp5z40x got ``HTTP 409 "Git
+# Repository is empty."`` where the stubs had modeled a 404).
+REF_MISSING_STATUSES = frozenset({404, 409})
+
+
+def _ref_get(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """Resolve a git ref (``heads/main``) to its object sha.
+
+    Delivery uses this to find the base commit; an empty repository or an
+    absent branch is a normal state it bootstraps around, so with
+    ``allow_missing`` those statuses come back as ``{"missing": true}`` on
+    an ok result rather than as an error event (#222).
+    """
+    _require(p, "repo", "ref")
+    try:
+        data = t.request("GET", f"/repos/{p['repo']}/git/ref/{p['ref']}")
+    except GithubOpError as exc:
+        if p.get("allow_missing") and exc.http_status in REF_MISSING_STATUSES:
+            return {"missing": True, "http_status": exc.http_status}
+        raise
+    if not isinstance(data, dict):
+        raise GithubOpError(f"GitHub returned no object sha for ref {p['ref']!r}: {data!r}")
+    obj = data.get("object")
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if not sha:
+        raise GithubOpError(f"GitHub returned no object sha for ref {p['ref']!r}: {data!r}")
+    return {"ref": data.get("ref"), "sha": sha}
 
 
 def _search_issues(t: Transport, p: dict[str, Any]) -> JsonValue:
@@ -261,7 +344,8 @@ def _blobs_create_many(t: Transport, p: dict[str, Any], progress: ProgressFn | N
             # Name the failing file: this message rides the JobResult error all
             # the way into the host's run.deliver event.
             raise GithubOpError(
-                f"blob create failed for {path!r} (file {index + 1}/{total}): {exc}"
+                f"blob create failed for {path!r} (file {index + 1}/{total}): {exc}",
+                http_status=exc.http_status,
             ) from exc
         sha = data.get("sha") if isinstance(data, dict) else None
         if not sha:
@@ -281,6 +365,7 @@ OPS: dict[str, OpImpl] = {
     "contents.read": _contents_read,
     "status.create": _status_create,
     "repo.get": _repo_get,
+    "ref.get": _ref_get,
     "search.issues": _search_issues,
     "raw.api": _raw_api,
 }

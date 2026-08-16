@@ -107,9 +107,16 @@ as whatever confusing error the in-VM tooling produced. Query history with
 
 `github.op` jobs execute in the github sandbox only (the sole holder of
 `GH_TOKEN`). Ops: `issue.create`, `issue.comment`, `pr.create`, `pr.comment`,
-`contents.read`, `status.create`, `repo.get`, `search.issues`, `raw.api`.
-Transport inside the sandbox: `gh api` when gh is available, otherwise a
-pure-stdlib REST client — both produce identical result shapes.
+`contents.read`, `status.create`, `repo.get`, `ref.get`, `search.issues`,
+`raw.api`, `blobs.create_many`. Transport inside the sandbox: `gh api` when gh
+is available, otherwise a pure-stdlib REST client — both produce identical
+result shapes.
+
+Probes ask questions and get "no" as data: `repo.get` and `ref.get` accept
+`allow_missing: true`, under which an expected miss (404; for `ref.get` also
+the 409 GitHub returns for an empty repository) is an **ok** result of
+`{"missing": true, "http_status": N}` rather than a failed job — so the
+transcript shows no error event for a question whose answer was "no".
 
 ## Worker installation
 

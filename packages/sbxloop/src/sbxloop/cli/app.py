@@ -556,6 +556,75 @@ def resume(
 
 
 @app.command()
+def deliver(
+    run_id: Annotated[str, typer.Argument(help="Completed run id to deliver.")],
+    repo: Annotated[
+        str | None,
+        typer.Option(
+            "--repo",
+            help='GitHub repository ("owner/name"), overriding the run\'s [github].repo.',
+        ),
+    ] = None,
+    deliver_base: Annotated[
+        str | None,
+        typer.Option("--deliver-base", help="Base branch for the PR (default: repo default)."),
+    ] = None,
+    deliver_draft: Annotated[
+        bool | None,
+        typer.Option("--deliver-draft/--no-deliver-draft", help="Open the PR as a draft."),
+    ] = None,
+    create_repo: Annotated[
+        bool | None,
+        typer.Option(
+            "--create-repo/--no-create-repo",
+            help="Create the repository if it does not exist (see `sbxloop run --help`).",
+        ),
+    ] = None,
+    create_public: Annotated[
+        bool | None,
+        typer.Option("--create-public/--no-create-public"),
+    ] = None,
+    report: Annotated[
+        bool | None,
+        typer.Option(
+            "--report/--no-report",
+            help="Also refresh the run's tracking issue with the PR link "
+            "(default: the run's [github].report).",
+        ),
+    ] = None,
+) -> None:
+    """Deliver (or re-deliver) a completed run's artifacts as a PR.
+
+    The retry path for a run whose end-of-run delivery failed: provisions a
+    github-ops sandbox only, reuses the run's persisted config (options here
+    override its [github] section), and re-delivers the same branch/PR.
+    """
+    config = load_config()
+    overrides = {
+        key: value
+        for key, value in (
+            ("repo", repo),
+            ("deliver_base", deliver_base),
+            ("deliver_draft", deliver_draft),
+            ("create_repo", create_repo),
+            ("create_public", create_public),
+        )
+        if value is not None
+    }
+    engine = LoopEngine(config)
+    engine.bus.subscribe(plain_printer(console))
+    try:
+        pr = engine.deliver(run_id, github_overrides=overrides, report=report)
+    except ValidationError as exc:
+        console.print(f"[bold red]invalid GitHub option:[/] {exc.errors()[0]['msg']}")
+        raise typer.Exit(2) from exc
+    except SbxloopError as exc:
+        console.print(f"[bold red]delivery failed:[/] {exc}")
+        raise typer.Exit(2) from exc
+    console.print(f"run [bold cyan]{run_id}[/] delivered: PR [bold]#{pr.number}[/]  {pr.url}")
+
+
+@app.command()
 def cancel(run_id: Annotated[str, typer.Argument()]) -> None:
     """Mark a run cancelled (takes effect at the next phase boundary)."""
     config = load_config()

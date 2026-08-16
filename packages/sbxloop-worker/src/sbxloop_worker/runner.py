@@ -69,6 +69,7 @@ class JobRunner:
                     type(exc).__name__,
                     str(exc) or repr(exc),
                     detail="".join(traceback.format_exception(exc))[-OUTPUT_TAIL_CHARS:],
+                    http_status=getattr(exc, "http_status", None),
                 )
             finally:
                 heartbeat_stop.set()
@@ -215,12 +216,15 @@ class JobRunner:
         type_: str,
         message: str,
         detail: str | None = None,
+        http_status: int | None = None,
     ) -> JobResult:
         return JobResult.model_validate(
             {
                 "job_id": self.job.job_id,
                 "status": status,
-                "error": ErrorInfo(type=type_, message=message, detail=detail).model_dump(),
+                "error": ErrorInfo(
+                    type=type_, message=message, detail=detail, http_status=http_status
+                ).model_dump(),
             }
         )
 

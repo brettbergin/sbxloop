@@ -52,7 +52,8 @@ class GithubOps:
         if result.status != "ok":
             assert result.error is not None
             raise GithubOpsError(
-                f"github op {op} failed: {result.error.type}: {result.error.message}"
+                f"github op {op} failed: {result.error.type}: {result.error.message}",
+                http_status=result.error.http_status,
             )
         return result.output_json
 
@@ -128,6 +129,32 @@ class GithubOps:
         data = self._op("repo.get", {"repo": repo})
         assert isinstance(data, dict)
         return data
+
+    def repo_lookup(self, repo: str) -> dict[str, Any] | None:
+        """Probe a repository: its data, or None when it does not exist.
+
+        The miss travels as data (``allow_missing``) rather than as a failed
+        job, so an expected "no" never raises the worker's error event and
+        never paints a red panel in the transcript (#222).
+        """
+        data = self._op("repo.get", {"repo": repo, "allow_missing": True})
+        assert isinstance(data, dict)
+        return None if data.get("missing") else data
+
+    def ref_lookup(self, repo: str, ref: str) -> str | None:
+        """Resolve ``ref`` (e.g. ``heads/main``) to a commit sha, or None
+        when there is no such ref — including the empty-repository case
+        GitHub reports as 409 rather than 404. Same rationale as
+        :meth:`repo_lookup`: the miss is an answer, not an error."""
+        data = self._op("ref.get", {"repo": repo, "ref": ref, "allow_missing": True})
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"ref.get returned a malformed result: {data!r}")
+        if data.get("missing"):
+            return None
+        sha = data.get("sha")
+        if not sha:
+            raise GithubOpsError(f"ref.get returned no sha for {ref!r}: {data!r}")
+        return str(sha)
 
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         data = self._op("search.issues", {"query": query, "per_page": per_page})

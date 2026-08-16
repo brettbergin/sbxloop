@@ -434,21 +434,26 @@ class Provisioner:
         workspace: Path,
         *,
         post_create: PostCreate | None = None,
+        run_id: str | None = None,
     ) -> Sandbox:
-        """Provision one github-role sandbox (GH_TOKEN only) outside any run.
+        """Provision one github-role sandbox (GH_TOKEN only) outside a run's
+        pair.
 
         The daemon polls issues and drives label/comment lifecycle from
         here, keeping the credential split intact: the host still never
-        holds the PAT. Same fail-fast/rollback discipline as the pair —
-        token check before any microVM, sandbox + registered secrets
-        removed on failure. ``post_create`` (falling back to the
-        instance-level hook) runs *inside* that try, so a caller's worker
-        install failing rolls the sandbox and its secrets back too.
+        holds the PAT; ``sbxloop deliver`` re-delivers a finished run from
+        one too (#223) and passes ``run_id`` so the provisioning events land
+        in that run's log rather than under a daemon label. Same
+        fail-fast/rollback discipline as the pair — token check before any
+        microVM, sandbox + registered secrets removed on failure.
+        ``post_create`` (falling back to the instance-level hook) runs
+        *inside* that try, so a caller's worker install failing rolls the
+        sandbox and its secrets back too.
         """
         token = self.gh_token()
         spec = self.github_only_spec(name, workspace)
         workspace.mkdir(parents=True, exist_ok=True)
-        label = f"daemon:{name}"
+        label = run_id or f"daemon:{name}"
         created: Sandbox | None = None
         registered_secret_rms: list[Callable[[], bool]] = []
         try:

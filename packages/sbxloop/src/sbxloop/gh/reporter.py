@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 
 from sbxloop.events import Event, HostEventTypes
-from sbxloop.gh.ops import GithubOps, IssueRef
+from sbxloop.gh.ops import GithubOps, IssueRef, PrRef
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,29 @@ class GithubReporterHook:
                 )
         except Exception:
             logger.warning("github reporting: final summary failed", exc_info=True)
+
+    def note_delivery(self, run_id: str, pr: PrRef) -> None:
+        """Refresh the tracking issue after an out-of-run delivery (``sbxloop
+        deliver <run> --report``, #223): the issue was closed (or left open
+        with a failed-delivery summary) when the run finished, so the PR
+        link is appended as a comment and the issue closed as completed —
+        the run's work is delivered, which is what "completed" promised.
+        Same guard as the rest: reporting never fails the delivery."""
+        if self.issue is None:
+            return
+        try:
+            self.ops.issue_comment(
+                self.repo,
+                self.issue.number,
+                f"Run `{run_id}` delivered: PR #{pr.number} {pr.url}",
+            )
+            self.ops.raw(
+                "PATCH",
+                f"/repos/{self.repo}/issues/{self.issue.number}",
+                {"state": "closed", "state_reason": "completed"},
+            )
+        except Exception:
+            logger.warning("github reporting: delivery note failed", exc_info=True)
 
     # -- Hook protocol (task progress only) ----------------------------------
 

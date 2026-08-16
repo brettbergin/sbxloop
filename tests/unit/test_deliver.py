@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from sbxloop import hostgit
 from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import PrRef
@@ -19,6 +21,7 @@ class StubOps:
     def __init__(self) -> None:
         self.raw_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.repo_get_calls: list[str] = []
+        self.ref_lookups: list[tuple[str, str]] = []
         self.pr_kwargs: dict[str, Any] = {}
         self.blob_batches: list[list[dict[str, str]]] = []
         self.blob_count = 0
@@ -26,6 +29,14 @@ class StubOps:
     def repo_get(self, repo: str) -> dict[str, Any]:
         self.repo_get_calls.append(repo)
         return {"default_branch": "main"}
+
+    def repo_lookup(self, repo: str) -> dict[str, Any] | None:
+        self.repo_get_calls.append(repo)
+        return {"default_branch": "main"}
+
+    def ref_lookup(self, repo: str, ref: str) -> str | None:
+        self.ref_lookups.append((repo, ref))
+        return "base123"
 
     def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
         self.blob_batches.append(files)
@@ -37,8 +48,6 @@ class StubOps:
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
-        if method == "GET" and "/git/ref/heads/" in path:
-            return {"object": {"sha": "base123"}}
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree"}}
         if path.endswith("/git/trees"):
@@ -78,7 +87,7 @@ class TestDeliverWorkspace:
 
         # base resolved from the repo's default branch
         assert ops.repo_get_calls == ["o/r"]
-        assert ("GET", "/repos/o/r/git/ref/heads/main", None) in ops.raw_calls
+        assert ops.ref_lookups == [("o/r", "heads/main")]
 
         # all blobs ride ONE batched worker job (base64, binary-safe);
         # .git excluded
@@ -178,7 +187,7 @@ class TestDeliverWorkspace:
             draft=True,
         )
         assert ops.repo_get_calls == []
-        assert ("GET", "/repos/o/r/git/ref/heads/develop", None) in ops.raw_calls
+        assert ops.ref_lookups == [("o/r", "heads/develop")]
         assert ops.pr_kwargs["base"] == "develop"
         assert ops.pr_kwargs["draft"] is True
 
@@ -192,22 +201,6 @@ class TestDeliverWorkspace:
                 run_id="r1",
                 outcome="x",
                 source_dir=empty,
-            )
-
-    def test_unresolvable_base_branch(self, tmp_path: Path) -> None:
-        class NoRefOps(StubOps):
-            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if "/git/ref/heads/" in path:
-                    return {"message": "Not Found"}
-                return super().raw(method, path, body)
-
-        with pytest.raises(DeliveryError, match="cannot resolve base branch"):
-            deliver_workspace(
-                NoRefOps(),  # type: ignore[arg-type]
-                "o/r",
-                run_id="r1",
-                outcome="x",
-                source_dir=make_workspace(tmp_path),
             )
 
     def test_missing_blob_sha_names_file(self, tmp_path: Path) -> None:
@@ -279,17 +272,18 @@ class TestDeliverWorkspace:
 
 
 class MissingRepoOps(StubOps):
-    """repo_get 404s until a creation POST lands."""
+    """The repository probe answers "missing" (as data, not an error — #222)
+    until a creation POST lands."""
 
     def __init__(self, login: str = "me") -> None:
         super().__init__()
         self.exists = False
         self.login = login
 
-    def repo_get(self, repo: str) -> dict[str, Any]:
+    def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         self.repo_get_calls.append(repo)
         if not self.exists:
-            raise GithubOpsError("github op repo.get failed: GET /repos -> HTTP 404: Not Found")
+            return None
         return {"default_branch": "main"}
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
@@ -339,7 +333,7 @@ class TestEnsureRepository:
 
     def test_non_404_probe_errors_propagate(self) -> None:
         class ForbiddenOps(StubOps):
-            def repo_get(self, repo: str) -> dict[str, Any]:
+            def repo_lookup(self, repo: str) -> dict[str, Any] | None:
                 raise GithubOpsError("GET /repos -> HTTP 403: rate limited")
 
         with pytest.raises(GithubOpsError, match="403"):
@@ -356,19 +350,14 @@ class TestEmptyRepoBootstrap:
                 super().__init__()
                 self.bootstrapped = False
 
-            # The exact worker-shaped error real GitHub produces for an
-            # empty repo — field-verified on run rgwp5z40x (it is a 409,
-            # NOT a 404; the stub used 404 and the field disagreed).
-            error = (
-                "github op raw.api failed: GithubOpError: gh api GET "
-                "/repos/o/r/git/ref/heads/main failed (rc=1): gh: Git "
-                "Repository is empty. (HTTP 409)"
-            )
+            # The worker answers "missing" for both the 409 an empty repo
+            # gets and the 404 an absent branch gets (#222); the host sees
+            # None either way and bootstraps.
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return "base123" if self.bootstrapped else None
 
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
-                    self.raw_calls.append((method, path, body))
-                    raise GithubOpsError(self.error)
                 if method == "PUT" and path.endswith("/contents/README.md"):
                     self.raw_calls.append((method, path, body))
                     self.bootstrapped = True
@@ -389,39 +378,32 @@ class TestEmptyRepoBootstrap:
         assert puts[0][2] is not None and puts[0][2]["branch"] == "main"
         # the bootstrap README round-trips as valid base64
         base64.b64decode(puts[0][2]["content"])
+        # ref looked up twice: the miss, then the bootstrapped base
+        assert ops.ref_lookups == [("o/r", "heads/main")] * 2
 
-    def test_404_missing_ref_also_bootstraps(self, tmp_path: Path) -> None:
-        """An explicit `base` naming a branch that does not exist yet gets
-        the 404 shape; it means the same thing (no base to build on)."""
-
-        class MissingRefOps(StubOps):
-            def __init__(self) -> None:
-                super().__init__()
-                self.bootstrapped = False
+    def test_still_missing_after_bootstrap_is_loud(self, tmp_path: Path) -> None:
+        class NeverThereOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                return None
 
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
-                    raise GithubOpsError("GET ref -> HTTP 404: Not Found")
                 if method == "PUT" and path.endswith("/contents/README.md"):
-                    self.bootstrapped = True
                     return {"content": {"path": "README.md"}}
                 return super().raw(method, path, body)
 
-        pr = deliver_workspace(
-            MissingRefOps(),  # type: ignore[arg-type]
-            "o/r",
-            run_id="r9",
-            outcome="x",
-            source_dir=make_workspace(tmp_path),
-        )
-        assert pr.number == 7
+        with pytest.raises(DeliveryError, match="still missing after bootstrap"):
+            deliver_workspace(
+                NeverThereOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r9",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
 
     def test_unrelated_ref_errors_still_raise(self, tmp_path: Path) -> None:
         class ForbiddenRefOps(StubOps):
-            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path:
-                    raise GithubOpsError("GET ref -> HTTP 403: rate limited")
-                return super().raw(method, path, body)
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                raise GithubOpsError("GET ref -> HTTP 403: rate limited")
 
         with pytest.raises(GithubOpsError, match="403"):
             deliver_workspace(
@@ -434,9 +416,10 @@ class TestEmptyRepoBootstrap:
 
     def test_missing_base_ref_error_still_loud_when_bootstrap_fails(self, tmp_path: Path) -> None:
         class BrokenOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                return None
+
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path:
-                    raise GithubOpsError("gh: Git Repository is empty. (HTTP 409)")
                 if method == "PUT" and path.endswith("/contents/README.md"):
                     raise GithubOpsError("PUT contents -> HTTP 403: token lacks contents:write")
                 return super().raw(method, path, body)
@@ -446,6 +429,288 @@ class TestEmptyRepoBootstrap:
                 BrokenOps(),  # type: ignore[arg-type]
                 "o/r",
                 run_id="r9",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+
+
+def git(*argv: str, cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *argv],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+    ).stdout.strip()
+
+
+def make_clone_workspace(tmp_path: Path) -> tuple[Path, str]:
+    """A source checkout with an executable script and a file to delete,
+    plus the run clone hostgit would make of it. Returns (clone, base_sha)."""
+    source = tmp_path / "src"
+    source.mkdir()
+    git("init", "-b", "main", cwd=source)
+    (source / "keep.txt").write_text("keep\n")
+    (source / "old.txt").write_text("old\n")
+    (source / "scripts").mkdir()
+    (source / "scripts" / "run.sh").write_text("#!/bin/sh\n")
+    (source / "scripts" / "run.sh").chmod(0o755)
+    git("add", ".", cwd=source)
+    git("commit", "-m", "init", cwd=source)
+    clone = tmp_path / "clone"
+    hostgit.clone_for_run(source, clone, "sbxloop/r1")
+    return clone, git("rev-parse", "HEAD", cwd=source)
+
+
+def deliver(ops: StubOps, source_dir: Path) -> PrRef:
+    return deliver_workspace(
+        ops,  # type: ignore[arg-type]
+        "o/r",
+        run_id="r1",
+        outcome="refactor",
+        source_dir=source_dir,
+    )
+
+
+def tree_entries(ops: StubOps) -> list[dict[str, Any]]:
+    (tree_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/trees")]
+    assert tree_body is not None
+    return list(tree_body["tree"])
+
+
+class TestGitDiffDelivery:
+    """A git-checkout workspace delivers its diff, not a snapshot (#248):
+    deletions propagate, exec bits survive, unchanged files stay home."""
+
+    def test_clone_delivers_only_changes(self, tmp_path: Path) -> None:
+        clone, base_sha = make_clone_workspace(tmp_path)
+        (clone / "old.txt").unlink()
+        (clone / "new.txt").write_text("new\n")
+        (clone / "scripts" / "run.sh").write_text("#!/bin/sh\necho hi\n")
+        # a rename: delete + add in tree terms
+        (clone / "keep.txt").rename(clone / "kept.txt")
+
+        class KnownBaseOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return base_sha
+
+        ops = KnownBaseOps()
+        assert deliver(ops, clone).number == 7
+
+        # only changed content is uploaded — keep.txt's bytes travel as kept.txt
+        uploaded = {e["path"] for batch in ops.blob_batches for e in batch}
+        assert uploaded == {"kept.txt", "new.txt", "scripts/run.sh"}
+
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert set(by_path) == {"keep.txt", "kept.txt", "new.txt", "old.txt", "scripts/run.sh"}
+        # deletions are sha: null entries; the exec bit is preserved
+        assert by_path["old.txt"] == {
+            "path": "old.txt",
+            "mode": "100644",
+            "type": "blob",
+            "sha": None,
+        }
+        assert by_path["keep.txt"]["sha"] is None
+        assert by_path["scripts/run.sh"]["mode"] == "100755"
+        assert by_path["new.txt"]["mode"] == "100644"
+        assert by_path["new.txt"]["sha"].startswith("blob")
+
+        # the tree still overlays the GitHub base tree and the commit
+        # parents on the GitHub base commit
+        (tree_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/trees")]
+        assert tree_body is not None and tree_body["base_tree"] == "basetree"
+        (commit_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/commits")]
+        assert commit_body is not None and commit_body["parents"] == [base_sha]
+
+        # the PR body says what happened, per path, and how it was derived
+        body = ops.pr_kwargs["body"]
+        assert "**Changes (5):**" in body
+        assert "- D `old.txt`" in body
+        assert "- A `new.txt`" in body
+        assert "- M `scripts/run.sh`" in body
+        assert f"git diff against `{base_sha[:12]}`" in body
+
+    def test_unknown_remote_tip_diffs_against_clone_pin(self, tmp_path: Path) -> None:
+        """The GitHub base commit is not necessarily in the clone (source
+        checkout behind origin); the clone's own pin then anchors the diff
+        and only the run's changes overlay the remote tip."""
+        clone, base_sha = make_clone_workspace(tmp_path)
+        (clone / "new.txt").write_text("new\n")
+        ops = StubOps()  # base ref resolves to "base123", unknown locally
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["new.txt"]
+        assert f"git diff against `{base_sha[:12]}`" in ops.pr_kwargs["body"]
+
+    def test_committed_work_counts(self, tmp_path: Path) -> None:
+        clone, _ = make_clone_workspace(tmp_path)
+        (clone / "old.txt").unlink()
+        (clone / "new.txt").write_text("new\n")
+        git("add", "-A", cwd=clone)
+        git("commit", "-m", "agent work", cwd=clone)
+        ops = StubOps()
+        deliver(ops, clone)
+        assert {(e["path"], e["sha"] is None) for e in tree_entries(ops)} == {
+            ("new.txt", False),
+            ("old.txt", True),
+        }
+
+    def test_excludes_still_apply_to_diff(self, tmp_path: Path) -> None:
+        """An un-ignored .venv the agent built must not ride the diff any
+        more than it rides a snapshot; the exclusion is surfaced (#67)."""
+        clone, _ = make_clone_workspace(tmp_path)
+        (clone / ".venv" / "bin").mkdir(parents=True)
+        (clone / ".venv" / "bin" / "python").write_text("bin\n")
+        (clone / "new.txt").write_text("new\n")
+        ops = StubOps()
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["new.txt"]
+        assert "1 file(s) excluded (.venv)" in ops.pr_kwargs["body"]
+
+    def test_no_changes_refused(self, tmp_path: Path) -> None:
+        clone, _ = make_clone_workspace(tmp_path)
+        ops = StubOps()
+        with pytest.raises(DeliveryError, match="no changes relative to"):
+            deliver(ops, clone)
+        # nothing was written to GitHub
+        assert not any(m == "POST" for m, _, _ in ops.raw_calls)
+
+    def test_agent_initialized_repo_falls_back_to_snapshot(self, tmp_path: Path) -> None:
+        """A checkout with no base to diff against (git init'ed by the agent)
+        still delivers — as a snapshot, and the PR body says so."""
+        root = tmp_path / "ws"
+        root.mkdir()
+        git("init", "-b", "main", cwd=root)
+        (root / "hello.txt").write_text("hi\n")
+        git("add", ".", cwd=root)
+        git("commit", "-m", "init", cwd=root)
+        ops = StubOps()
+        deliver(ops, root)
+        assert [e["path"] for e in tree_entries(ops)] == ["hello.txt"]
+        assert "**Files (1):**" in ops.pr_kwargs["body"]
+        assert "workspace snapshot: no base commit" in ops.pr_kwargs["body"]
+
+    def test_no_git_binary_keeps_snapshot_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clone, _ = make_clone_workspace(tmp_path)
+        (clone / "new.txt").write_text("new\n")
+        monkeypatch.setattr(hostgit, "find_git", lambda: None)
+        ops = StubOps()
+        deliver(ops, clone)
+        assert "keep.txt" in [e["path"] for e in tree_entries(ops)]
+        assert "**Files (" in ops.pr_kwargs["body"]
+
+
+class TestRedeliveryCollisions:
+    """`sbxloop deliver <run>` re-runs delivery for a run id whose branch
+    (and maybe PR) a prior partial attempt already created (#223). The 422
+    shapes are GitHub's documented answers, not yet field-observed."""
+
+    def test_existing_branch_is_force_updated(self, tmp_path: Path) -> None:
+        class BranchExistsOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    self.raw_calls.append((method, path, body))
+                    raise GithubOpsError(
+                        "github op raw.api failed: GithubOpError: gh api POST "
+                        "/repos/o/r/git/refs failed (rc=1): gh: Reference already "
+                        "exists (HTTP 422)"
+                    )
+                if method == "PATCH" and "/git/refs/heads/" in path:
+                    self.raw_calls.append((method, path, body))
+                    return {"ref": path}
+                return super().raw(method, path, body)
+
+        ops = BranchExistsOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr.number == 7
+        patches = [call for call in ops.raw_calls if call[0] == "PATCH"]
+        assert patches == [
+            (
+                "PATCH",
+                f"/repos/o/r/git/refs/heads/{branch_name('r42')}",
+                {"sha": "commit789", "force": True},
+            )
+        ]
+        # a fresh PR was still opened from the (moved) branch
+        assert ops.pr_kwargs["head"] == branch_name("r42")
+
+    def test_existing_open_pr_is_reused(self, tmp_path: Path) -> None:
+        class PrExistsOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    self.raw_calls.append((method, path, body))
+                    return [{"number": 12, "html_url": "https://github.com/o/r/pull/12"}]
+                return super().raw(method, path, body)
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise GithubOpsError(
+                    "github op pr.create failed: GithubOpError: POST .../pulls -> HTTP 422: "
+                    '{"message":"Validation Failed","errors":[{"message":"A pull request '
+                    'already exists for o:sbxloop/r42."}]}'
+                )
+
+        ops = PrExistsOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr == PrRef(number=12, url="https://github.com/o/r/pull/12")
+        lookups = [call for call in ops.raw_calls if call[0] == "GET" and "/pulls?" in call[1]]
+        assert lookups == [
+            ("GET", f"/repos/o/r/pulls?state=open&head=o:{branch_name('r42')}", None)
+        ]
+
+    def test_pr_collision_without_open_pr_stays_loud(self, tmp_path: Path) -> None:
+        class GhostPrOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    return []
+                return super().raw(method, path, body)
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise GithubOpsError("HTTP 422: A pull request already exists for o:sbxloop/r42.")
+
+        with pytest.raises(GithubOpsError, match="already exists"):
+            deliver_workspace(
+                GhostPrOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+
+    def test_unrelated_ref_post_errors_still_raise(self, tmp_path: Path) -> None:
+        class ForbiddenRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise GithubOpsError("POST refs -> HTTP 403: token lacks contents:write")
+                return super().raw(method, path, body)
+
+        with pytest.raises(GithubOpsError, match="403"):
+            deliver_workspace(
+                ForbiddenRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
                 outcome="x",
                 source_dir=make_workspace(tmp_path),
             )

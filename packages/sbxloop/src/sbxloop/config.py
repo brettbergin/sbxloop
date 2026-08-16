@@ -186,8 +186,11 @@ class ArtifactsConfig(_ConfigModel):
     Generic names that mean build output in one ecosystem and hand-written
     content in another — ``bin``, ``build``, ``dist``, ``out``, ``lib``,
     ``vendor`` — are deliberately *not* excluded; add them here if your
-    project wants them dropped. Exclusions are always counted and surfaced,
-    never silent.
+    project wants them dropped. On top of this list, files the workspace's
+    own ``.gitignore`` rules ignore are dropped too (tallied as
+    ``gitignored``): the project knows its build byproducts better than any
+    generic list can. Exclusions are always counted and surfaced, never
+    silent.
 
     The list covers every supported language regardless of
     ``[sandbox] languages``: that key governs which toolchains are

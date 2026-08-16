@@ -60,6 +60,7 @@ class TestBasics:
         for command in (
             "run",
             "resume",
+            "deliver",
             "status",
             "logs",
             "artifacts",
@@ -1249,6 +1250,65 @@ class TestRunCommand:
         assert "sandboxes kept:" in result.output
         assert "sbxloop shell" in result.output
         assert "sandbox rm --run" in result.output
+
+
+class TestDeliverCommand:
+    """`sbxloop deliver <run>` wiring; the engine path is covered in
+    test_engine.py. LoopEngine.deliver is patched here — no sandboxes."""
+
+    def test_unknown_run_errors(self, workdir: Path) -> None:
+        seed_store(workdir)
+        result = runner.invoke(app, ["deliver", "rghost", "--repo", "o/r"])
+        assert result.exit_code == 2
+        assert "unknown run" in result.output
+
+    def test_options_become_github_overrides(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.gh.ops import PrRef
+
+        seed_store(workdir)
+        calls: list[dict[str, Any]] = []
+
+        def fake_deliver(self: Any, run_id: str, **kwargs: Any) -> PrRef:
+            calls.append({"run_id": run_id, **kwargs})
+            return PrRef(number=4, url="https://github.com/o/r/pull/4")
+
+        monkeypatch.setattr("sbxloop.engine.engine.LoopEngine.deliver", fake_deliver)
+        result = runner.invoke(
+            app,
+            ["deliver", "rseeded11", "--repo", "o/r", "--deliver-draft", "--report"],
+        )
+        assert result.exit_code == 0, result.output
+        assert calls == [
+            {
+                "run_id": "rseeded11",
+                "github_overrides": {"repo": "o/r", "deliver_draft": True},
+                "report": True,
+            }
+        ]
+        assert "PR #4" in result.output
+        assert "https://github.com/o/r/pull/4" in result.output
+
+    def test_invalid_repo_fails_before_provisioning(self, workdir: Path) -> None:
+        seed_store(workdir)
+        result = runner.invoke(app, ["deliver", "rseeded11", "--repo", "not-a-repo"])
+        assert result.exit_code == 2
+        assert "invalid GitHub option" in result.output
+
+    def test_delivery_failure_exits_2(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sbxloop.errors import DeliveryError
+
+        seed_store(workdir)
+
+        def fake_deliver(self: Any, run_id: str, **kwargs: Any) -> Any:
+            raise DeliveryError("nothing to deliver")
+
+        monkeypatch.setattr("sbxloop.engine.engine.LoopEngine.deliver", fake_deliver)
+        result = runner.invoke(app, ["deliver", "rseeded11", "--repo", "o/r"])
+        assert result.exit_code == 2
+        assert "delivery failed" in result.output
+        assert "nothing to deliver" in result.output
 
 
 class TestArtifactsTree:
