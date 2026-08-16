@@ -467,15 +467,25 @@ class TestDaemonItemControls:
         assert result.exit_code == 2 and "requeue refused" in result.output
         result = runner.invoke(app, ["daemon", "retry", "inbox:x.md"])
         assert result.exit_code == 0, result.output
-        assert "queued" in result.output and "attempts 0" in result.output
+        # FORCE_COLOR / a forced terminal makes rich highlight the number
+        # ("attempts \x1b[1;36m0"): assert on the ANSI-stripped text.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "queued" in plain and "attempts 0" in plain
         result = runner.invoke(app, ["daemon", "abandon", "gh:404"])
         assert result.exit_code == 2 and "unknown work item" in result.output
 
-    def test_daemon_help_lists_subcommands_and_options(self, workdir: Path) -> None:
+    def test_daemon_help_lists_subcommands_and_options(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COLUMNS", "300")
         result = runner.invoke(app, ["daemon", "--help"])
         assert result.exit_code == 0
+        # GitHub Actions forces typer's help colours on and the option
+        # highlighter styles "--" and "inbox" separately, so "--inbox" is
+        # never a contiguous substring of the raw output.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         for word in ("--inbox", "--once", "items", "abandon", "retry", "requeue"):
-            assert word in result.output
+            assert word in plain
 
 
 class TestDoctor:

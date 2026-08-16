@@ -891,6 +891,118 @@ class TestOperatorItemControls:
         assert h.runs[-1][0] != first_run and h.runs[-1][1] is False
         assert [c[0] for c in h.source.calls].count("claim") == 1  # claim kept across retry
 
+    def test_row_override_outranks_pending_cancel(self, tmp_path: Path) -> None:
+        """`!sbx cancel` then, before the engine stops, `sbxloop daemon
+        abandon` from another shell: the row already states the item's
+        fate, so the abandon wins (no 'cancelled' report, no retry) and the
+        consumed CancelRequest cannot leak onto the next run."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item("a.md"), inbox_item("b.md")]
+        started = threading.Event()
+        release = threading.Event()
+
+        def runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            h.runs.append((run_id, resume))
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "running")
+            started.set()
+            assert release.wait(5)
+            raise StateError("run cancelled at phase boundary")
+
+        h.loop._runner = runner
+        results: list[Any] = []
+        t = threading.Thread(target=lambda: results.append(h.loop.tick()))
+        t.start()
+        assert started.wait(5)
+        assert h.loop.cancel_current("discord op", retry=True) is True
+        h.dstore.abandon("inbox:a.md", "operator: doomed plan", h.clock())
+        release.set()
+        t.join(10)
+        assert results and results[0].outcome == "abandoned"
+        a = h.dstore.get("inbox:a.md")
+        assert a is not None and a.state == "abandoned" and a.attempts == 1
+        assert [c[0] for c in h.source.calls if c[0] in ("abandoned", "cancelled")] == ["abandoned"]
+        # b.md's failure settles as a failure: the stale cancel is gone.
+        h.loop._runner = h.runner
+        h.outcomes = ["raise"]
+        assert h.loop.tick().outcome == "retry"
+        assert h.loop._cancel_request is None
+        assert not any(c[0] == "cancelled" for c in h.source.calls)
+
+    def test_recover_reports_item_abandoned_offline(self, tmp_path: Path) -> None:
+        """Field scenario of #229: the daemon is *not* running, the item is
+        left running/pinned, `sbxloop daemon abandon` flips the row only.
+        The next daemon start must report the abandon to the source, close
+        the run's ledger and remove the dead run's sandboxes — once."""
+        h = Harness(tmp_path)
+        removed: list[str] = []
+
+        class FakeSbx:
+            def stop(self, name: str) -> None: ...
+
+            def rm(self, name: str, **kwargs: Any) -> None:
+                removed.append(name)
+
+            def secret_rm(self, **kwargs: Any) -> bool:
+                return True
+
+        h.loop.sbx = FakeSbx()  # type: ignore[assignment]
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_dead", now=2.0)
+        h.dstore.finish_ledger("r_dead", "interrupted", 3.0)  # clean shutdown
+        h.store.create_run("r_dead", "x")
+        h.store.set_run_state("r_dead", "running")
+        h.dstore.abandon("inbox:a.md", "operator: doomed plan", 4.0)  # CLI, no daemon
+        h.loop.recover()
+        assert h.source.calls == [("abandoned", "operator: doomed plan")]
+        assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
+        row = h.dstore._conn.execute(
+            "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
+        ).fetchone()
+        assert row["result"] == "abandoned"
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "abandoned" and item.run_id == "r_dead"
+        assert h.loop.tick().idle_kind == "no_work"
+        h.loop.recover()  # idempotent: the ledger is closed, nothing to report
+        assert len(h.source.calls) == 1
+
+    def test_recover_closes_run_of_item_requeued_offline(self, tmp_path: Path) -> None:
+        """Same, for `sbxloop daemon requeue` with no daemon: the crashed
+        run's ledger row is still open; recovery closes it (no source
+        report — requeue is not a verdict) and the item is dispatched fresh."""
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_dead", now=2.0)  # crash: ledger open
+        h.store.create_run("r_dead", "x")
+        h.store.set_run_state("r_dead", "running")
+        h.dstore.requeue("inbox:a.md", 4.0)
+        h.loop.recover()
+        row = h.dstore._conn.execute(
+            "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
+        ).fetchone()
+        assert row["result"] == "requeued"
+        assert not any(c[0] in ("abandoned", "cancelled") for c in h.source.calls)
+        h.clock.t += 10_000
+        assert h.loop.tick().outcome == "done"
+        assert h.runs == [(h.runs[0][0], False)] and h.runs[0][0] != "r_dead"
+
+    def test_recover_leaves_pending_resume_alone(self, tmp_path: Path) -> None:
+        """A queued item still pinned to its interrupted run is a pending
+        resume, not an offline requeue."""
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_live", now=2.0)
+        h.dstore.finish_ledger("r_live", "interrupted", 3.0)
+        h.store.create_run("r_live", "x")
+        h.store.set_run_state("r_live", "running")
+        h.loop.recover()
+        h.loop.tick()
+        assert h.runs == [("r_live", True)]
+
     def test_loop_requeue_stale_pinned_item_closes_ledger(self, tmp_path: Path) -> None:
         """A dead process left the item running with a pinned run; requeue
         (daemon idle) must unpin it so recovery does not resume it."""

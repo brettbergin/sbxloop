@@ -1461,8 +1461,9 @@ def _daemon_store() -> DaemonStore:
 
 _ITEM_CONTROL_NOTE = (
     "[dim]a live daemon notices the change within a second: an in-flight run for "
-    "this item is cancelled and the source (issue / inbox file) is told; the item's "
-    "next dispatch, if any, starts a fresh run.[/]"
+    "this item is cancelled and the source (issue / inbox file) is told; with no "
+    "daemon running, the next daemon start reports it and closes the dead run. "
+    "The item's next dispatch, if any, starts a fresh run.[/]"
 )
 
 
@@ -1547,12 +1548,15 @@ def _item_control(action: str, item_id: str, reason: str | None) -> None:
         raise typer.Exit(2) from None
     finally:
         dstore.close()
+    # highlight=False: rich would otherwise wrap the attempt count and run id
+    # in colour codes, splitting the plain text a script (or test) greps for.
     console.print(
         f"{item.item_id}: [bold]{item.state}[/] (attempts {item.attempts}"
         + (f", run {item.run_id}" if item.run_id else "")
-        + ")"
+        + ")",
+        highlight=False,
     )
-    console.print(_ITEM_CONTROL_NOTE)
+    console.print(_ITEM_CONTROL_NOTE, highlight=False)
 
 
 @app.command()

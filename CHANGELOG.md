@@ -47,7 +47,11 @@ All notable changes to sbxloop are documented here. The project adheres to
   honors a CLI abandon/requeue of the item in flight within a second — the
   run is cancelled, the operator's decision wins over the run's own outcome
   (no retry, no breaker count), and the source hears `report_abandoned`
-  exactly once. Field origin: a spiraling item (#228) could only be
+  exactly once. With no daemon running (the field case: item left
+  running/pinned after a clean shutdown) the CLI can only flip the row, so
+  recovery on the next daemon start settles it — reports the abandon,
+  closes the dead run's ledger and removes its sandboxes; a requeue-offline
+  run is closed the same way. Field origin: a spiraling item (#228) could only be
   abandoned by poking `DaemonStore` from Python, and recovery would have
   resumed the doomed plan.
 

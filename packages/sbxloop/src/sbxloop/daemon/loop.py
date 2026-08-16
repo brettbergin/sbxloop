@@ -776,6 +776,36 @@ class DaemonLoop:
                 self.dstore.mark_resume_pending(item.item_id, now)
             else:
                 self.dstore.mark_requeued_unstarted(item.item_id, now)
+        self._settle_offline_overrides()
+
+    def _settle_offline_overrides(self) -> None:
+        """`sbxloop daemon abandon|requeue` while no daemon is running can
+        only flip the row (field scenario of #229: the item was left
+        running/pinned after a clean shutdown). The source was never told,
+        the run's ledger row is still open (or ``interrupted``) and its
+        microVMs still exist. Finish that work here so the abandon reaches
+        the issue / inbox file exactly once, on the next daemon start."""
+        for run_id, item_id in self.dstore.unsettled_runs():
+            item = self.dstore.get(item_id)
+            if item is None:
+                continue
+            now = self.clock()
+            if item.state == "abandoned" and item.run_id == run_id:
+                why = item.last_error or "abandoned by operator"
+                self.dstore.finish_ledger(run_id, "abandoned", now)
+                self._remove_stale_run_sandboxes(run_id)
+                source = self._source_for(item)
+                if source is not None:
+                    source.report_abandoned(item, why)
+                self._notify(f"recovery: ❌ {item_id} abandoned offline by operator: {why}")
+            elif item.state == "queued" and item.run_id != run_id:
+                # Requeued (unpinned) offline: the run is dead and will not be
+                # resumed — close its ledger and drop its sandboxes.
+                self.dstore.finish_ledger(run_id, "requeued", now)
+                self._remove_stale_run_sandboxes(run_id)
+                self._notify(f"recovery: {item_id} requeued offline; run {run_id} closed")
+            # A queued item still pinned to this run is a pending resume; a
+            # running one was reconciled above.
 
     def _remove_stale_run_sandboxes(self, run_id: str) -> None:
         """A dead process leaves the run's microVMs — and their secret

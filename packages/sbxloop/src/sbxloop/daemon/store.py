@@ -425,6 +425,21 @@ class DaemonStore:
             ).fetchone()
             return int(row["n"])
 
+    def unsettled_runs(self) -> list[tuple[str, str]]:
+        """``(run_id, item_id)`` for every ledger row the loop never closed
+        with a verdict: still open (the process died mid-run) or closed as
+        ``interrupted`` (a clean shutdown expecting to resume). Recovery
+        uses it to notice an item that an operator abandoned/requeued
+        *offline* — the row-only CLI cannot report to the source or clean
+        up the dead run's sandboxes, and the item is no longer ``running``
+        so the ordinary reconciliation never sees it (#229)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT run_id, item_id FROM daemon_runs "
+                "WHERE finished_at IS NULL OR result = 'interrupted' ORDER BY started_at ASC"
+            )
+            return [(str(row["run_id"]), str(row["item_id"])) for row in rows]
+
     def finish_ledger(self, run_id: str, result: str, now: float) -> None:
         with self._lock:
             self._conn.execute(
