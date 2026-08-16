@@ -160,6 +160,19 @@ class Verdict(_Model):
     verify_suspect: bool = False
     verify_suspect_reason: str = ""
 
+    @model_validator(mode="after")
+    def _check_verify_suspect(self) -> Verdict:
+        # The reason is the whole payload: it is what the planner is told
+        # about why the old check was wrong. A bare flag would spend a
+        # replan on "no reason given", so it is retried like a steer
+        # without guidance.
+        if self.verify_suspect and not self.verify_suspect_reason.strip():
+            raise ValueError(
+                "`verify_suspect: true` requires a non-empty `verify_suspect_reason` "
+                "saying concretely what the check asserts wrongly"
+            )
+        return self
+
 
 SteerAction = Literal["continue", "steer_task", "steer_run"]
 

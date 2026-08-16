@@ -349,6 +349,71 @@ class TestReviseAndVerify:
         assert events[0].data["honored"] is False
         assert "before it has failed" in events[0].data["message"]
 
+    def test_verify_suspect_evidence_ignores_lookalike_critic_feedback(
+        self, harness: Harness
+    ) -> None:
+        # Provenance comes from the persisted verify attempt, not from the
+        # feedback text: a critic's `revise` that happens to open with the
+        # verify-failure wording must not make a later flag look
+        # verify-triggered when VERIFY has never run.
+        spoof = {
+            "json": {
+                "verdict": "revise",
+                "feedback": "verify command failed: `grep -q x out.txt` (exit 1) -- fix it",
+            }
+        }
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, spoof, EXECUTE, PASS_SUSPECT, ACCEPT])
+        result = harness.engine().start("spoofed evidence")
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 0
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "before it has failed" in events[0].data["message"]
+
+    def test_verify_suspect_with_revise_is_surfaced_not_honored(self, harness: Harness) -> None:
+        # `revise` + verify_suspect: the work is not done either, so the
+        # revision comes first; the ruling is still put in the live stream
+        # rather than swallowed by the revise branch.
+        revise_suspect = {
+            "json": {
+                "verdict": "revise",
+                "feedback": "missing the CLI flag",
+                "verify_suspect": True,
+                "verify_suspect_reason": "asserts a column od never prints",
+            }
+        }
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["exit 1"])),
+                PLAN,
+                EXECUTE,
+                PASS,  # verify fails -> revision 1
+                EXECUTE,
+                revise_suspect,  # revision 2: flag surfaced, revision registered
+                EXECUTE,
+                PASS,  # verify fails -> revision 3
+                EXECUTE,
+                PASS,
+            ]
+        )
+        result = harness.engine(budgets={"max_replans_per_task": 0}).start("revise first")
+        assert result.state == "failed"
+        assert result.tasks[0].replans == 0
+        assert result.tasks[0].revisions == 3
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "revisions first" in events[0].data["message"]
+
     def test_verify_suspect_without_replan_budget_verifies_anyway(self, harness: Harness) -> None:
         # No replan budget: the flag is surfaced but the loop stays bounded
         # by the ordinary revision path.

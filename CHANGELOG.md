@@ -95,8 +95,10 @@ All notable changes to sbxloop are documented here. The project adheres to
 - The scrutinizer now judges the verify commands as well as the work (#231):
   its prompt carries the exact command list VERIFY will run and the feedback
   the executor was addressing, and its verdict gains `verify_suspect` /
-  `verify_suspect_reason`. When a revision was triggered by a verify failure
-  and the scrutinizer passes the work while ruling the check itself wrong,
+  `verify_suspect_reason` (a flag without a reason is rejected and retried).
+  When a revision was triggered by a verify failure (read from the persisted
+  verify attempt, not from feedback text) and the scrutinizer passes the
+  work while ruling the check itself wrong,
   the engine spends a replan immediately — the planner is told why the old
   check was wrong — instead of burning the remaining revisions against a
   check the executor cannot edit (field failure r567rsm4e: a portable,

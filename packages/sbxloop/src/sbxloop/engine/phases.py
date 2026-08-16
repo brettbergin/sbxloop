@@ -49,11 +49,10 @@ OUTPUT_CLIP = 6_000
 VERIFY_HEAD_CLIP = 2_000
 VERIFY_TAIL_CLIP = 4_000
 
-# Every verify failure fed back to the executor starts with this, so the
-# engine can tell "the last round failed a verify command" apart from
-# critic feedback without a schema change — that distinction gates which
-# feedback may spend a replan (#94) and when a scrutinizer's
-# ``verify_suspect`` ruling is backed by evidence (#231).
+# Every verify failure fed back to the executor starts with this; the
+# engine counts occurrences to headline "N more" in the live stream. It is
+# a display convention only — provenance decisions read the persisted
+# verify attempt, never this text (critic feedback is agent-authored).
 VERIFY_FAILURE_PREFIX = "verify command failed:"
 
 # Persona label per phase prompt: stamped onto the job's agent.* events (via

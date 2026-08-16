@@ -987,13 +987,36 @@ class LoopEngine:
             started_at=started,
         )
         self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
+        if self._replan_suspect_verify(run_id, task, verdict):
+            return
         if verdict.verdict == "revise":
             self._register_revision(run_id, task, verdict.feedback or "scrutiny found issues")
             return
-        if self._replan_suspect_verify(run_id, task, verdict):
-            return
         task.last_feedback = ""
         self._set_task_state(run_id, task, "verifying")
+
+    def _last_verify_failure(self, run_id: str, task: TaskRecord) -> str | None:
+        """The verify feedback that triggered the revision now under review,
+        or None if that revision was not verify-triggered.
+
+        Read from the persisted verify attempt rather than
+        ``task.last_feedback``: feedback text is agent-authored (a critic's
+        ``revise`` may open with anything, including the verify-failure
+        wording), so only the phase ledger can say what actually ran. The
+        attempt numbers line up because verify runs at attempt ``revisions
+        + 1`` and a failure bumps ``revisions`` before the next execute — so
+        the last verify is the trigger iff its attempt equals the current
+        revision count. A replan resets revisions to 0, which no verify
+        attempt can match, so the old plan's failures do not carry over.
+        """
+        row = self.store.latest_phase_attempt(run_id, task.spec.id, "verify")
+        if row is None or row["status"] != "failed" or row["attempt"] != task.revisions:
+            return None
+        try:
+            feedback = json.loads(row["output_json"] or "{}").get("feedback")
+        except ValueError:
+            return None
+        return feedback if isinstance(feedback, str) else None
 
     def _replan_suspect_verify(self, run_id: str, task: TaskRecord, verdict: Verdict) -> bool:
         """Spend a replan now when the scrutinizer passed the work but ruled
@@ -1007,24 +1030,31 @@ class LoopEngine:
         the failing command next to the passing code, so its ruling is the
         earliest point the loop can act.
 
-        The ruling is only honored when backed by evidence — the revision
-        being reviewed was itself triggered by a verify failure — so a
-        speculative flag on a check that has never run cannot cost a replan
-        on a fine plan; and only within the replan budget, since a task
-        that has no replans left can only fail bounded, not loop. Either
-        way the ruling is put in the live stream: silently ignoring a
-        critic's finding is the transcript-only failure #94 already fixed
-        once.
+        The ruling is only honored on a ``pass`` — a ``revise`` means the
+        work is not done either, and the executor's fix comes first — and
+        only when backed by evidence: the revision being reviewed was itself
+        triggered by a verify failure (read from the persisted verify
+        attempt, not from feedback text), so a speculative flag on a check
+        that has never run cannot cost a replan on a fine plan; and only
+        within the replan budget, since a task that has no replans left can
+        only fail bounded, not loop. Either way the ruling is put in the
+        live stream: silently ignoring a critic's finding is the
+        transcript-only failure #94 already fixed once.
         """
         if not verdict.verify_suspect:
             return False
-        reason = verdict.verify_suspect_reason or "no reason given"
-        evidence = task.last_feedback.startswith(VERIFY_FAILURE_PREFIX)
+        reason = verdict.verify_suspect_reason
+        failure = self._last_verify_failure(run_id, task)
         budget = task.replans < self.config.budgets.max_replans_per_task
-        honored = evidence and budget
+        honored = verdict.verdict == "pass" and failure is not None and budget
         if honored:
             message = f"scrutinizer passed the work but ruled the verify command wrong: {reason}"
-        elif not evidence:
+        elif verdict.verdict != "pass":
+            message = (
+                "scrutinizer flagged the verify command as wrong but asked for "
+                f"revisions first; the work is revised before the check is judged: {reason}"
+            )
+        elif failure is None:
             message = (
                 "scrutinizer flagged the verify command as wrong before it has "
                 f"failed; ignored until verify runs: {reason}"
@@ -1052,7 +1082,7 @@ class LoopEngine:
             "the reviewer judged the work correct and the verify command itself "
             f"wrong: {reason}\n\nWrite a plan whose verify_commands check what "
             "the task actually requires — prefer the project's test runner over "
-            "shell pipelines. The failing check was:\n\n" + task.last_feedback
+            "shell pipelines. The failing check was:\n\n" + (failure or "")
         )
         self._set_task_state(run_id, task, "planning")
         return True

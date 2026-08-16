@@ -175,3 +175,17 @@ class TestScrutinizeVerifySuspect:
         outcome = scrutinize(ScriptedAgent([(PASS, None)]))
         assert not outcome.verdict.verify_suspect
         assert outcome.verdict.verify_suspect_reason == ""
+
+    def test_verify_suspect_without_reason_is_retried(self) -> None:
+        # The reason is what the planner is told; a bare flag would spend a
+        # replan on nothing, so it is rejected and the critic gets one retry.
+        agent = ScriptedAgent(
+            [
+                ({**PASS, "verify_suspect": True, "verify_suspect_reason": "  "}, None),
+                ({**PASS, "verify_suspect": True, "verify_suspect_reason": "wrong bytes"}, None),
+            ]
+        )
+        outcome = scrutinize(agent)
+        assert outcome.verdict.verify_suspect_reason == "wrong bytes"
+        assert len(agent.session_jobs) == 2
+        assert "verify_suspect_reason" in (agent.session_jobs[1].prompt or "")
