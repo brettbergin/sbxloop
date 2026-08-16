@@ -506,6 +506,20 @@ class TestGitHubSource:
         assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Afailed", None) in ops.raw_calls
         assert "Re-queued by Discord user `b`" in ops.comments[-1][1]
 
+    def test_requeued_clears_delivered_label_when_not_closing(self) -> None:
+        """An operator re-queue of a done item in keep-open mode must not
+        leave the issue wearing in-progress and delivered together."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:delivered")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
+        src.report_requeued(item, "b")
+        deletes = [p for m, p, _ in ops.raw_calls if m == "DELETE"]
+        assert "/repos/o/r/issues/4/labels/sbxloop%3Adelivered" in deletes
+        # default (closing) mode never touches the delivered label
+        ops2 = RecordingOps({"4": issue(4, "sbxloop:delivered")})
+        self.make(ops2).report_requeued(item, "b")
+        assert not any("delivered" in p for m, p, _ in ops2.raw_calls if m == "DELETE")
+
     def test_reporting_failures_are_swallowed(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
         ops.fail_on = {"COMMENT", "PATCH", "DELETE", "POST"}

@@ -93,7 +93,8 @@ All notable changes to sbxloop are documented here. The project adheres to
   default true (today's behaviour). `close_on_success = false` leaves a
   delivered source issue open with the new `delivered_label`
   (`sbxloop:delivered`) instead of closing it the moment a draft PR appears
-  — the human closes it when the PR merges; a re-trigger clears the label.
+  — the human closes it when the PR merges; a re-trigger or an operator
+  re-queue clears the label.
   `tracking_issue = false` skips the per-run tracking issue for GitHub items,
   whose source issue already carries the run's summary comment.
 

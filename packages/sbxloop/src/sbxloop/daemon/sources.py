@@ -575,6 +575,11 @@ class GitHubIssueSource:
             # carries the failed label (absent → 404, tolerated).
             self._add_label(ops, n, self.labels.in_progress)
             self._remove_label(ops, n, self.labels.failed)
+            if not self.close_on_success:
+                # A done item re-queued by an operator would otherwise wear
+                # in-progress and delivered at once — the delivered label
+                # describes the previous run, not the one about to start.
+                self._remove_label(ops, n, self.labels.delivered)
             self._comment(ops, n, f"Re-queued by {by}; a fresh run will start shortly.")
 
         self._guard("requeue report", go)
