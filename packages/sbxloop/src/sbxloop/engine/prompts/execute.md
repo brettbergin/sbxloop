@@ -32,7 +32,12 @@ destroyed.
   - **Python** — the system Python is externally managed (PEP 668): bare
     `pip install X` fails. Create a virtualenv first —
     `python3 -m venv .venv && .venv/bin/pip install X` — and run project
-    commands through `.venv/bin/...`.
+    commands through `.venv/bin/...`. **uv projects** — if the workspace
+    has a `uv.lock`, skip the hand-made venv: `uv` and a managed Python
+    3.13 are on PATH, so `uv sync --all-packages` builds the locked
+    environment (workspace members included) and `uv run …` runs
+    everything in it (`uv run pytest -q`). `uv add X` is how a dependency
+    gets added, not `pip install`.
   - **JavaScript/Node** — install from the directory holding
     `package.json`; `node_modules/` is project-local, so nothing needs a
     global install. `npm ci` is the reproducible install but fails without

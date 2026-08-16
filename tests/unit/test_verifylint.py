@@ -65,6 +65,65 @@ class TestPythonRules:
         # a Go-only run may legitimately mention python in, say, a grep
         assert lint_verify_commands(["python tool.py"], ["go"]) == []
 
+    def test_uv_run_is_clean_without_a_lockfile(self) -> None:
+        # uv is provisioned with the toolchain now (#250), so `uv run` is
+        # never the exec-time failure it used to be — no lockfile needed
+        # to allow it.
+        assert lint_verify_commands(["uv run pytest -q"], ["python"]) == []
+
+
+class TestUvProjectRule:
+    """#250: a `uv.lock` in the workspace flips the Python convention."""
+
+    def test_venv_paths_flagged_with_uv_remedy(self) -> None:
+        problems = lint_verify_commands(
+            [".venv/bin/pytest -q", "cd app && app/.venv/bin/python check.py"],
+            ["python"],
+            uv_project=True,
+        )
+        assert len(problems) == 2
+        for problem in problems:
+            assert "uv.lock" in problem
+            assert "uv run" in problem
+
+    def test_bare_python_flagged_with_uv_remedy_not_venv(self) -> None:
+        problems = lint_verify_commands(["pytest -q", "python3 -m x"], ["python"], uv_project=True)
+        assert len(problems) == 2
+        for problem in problems:
+            assert "uv run pytest" in problem
+            assert ".venv/bin/pytest" not in problem
+        assert "uv sync` belongs in the plan's execution steps" in problems[0]
+
+    def test_uv_run_and_non_python_commands_are_clean(self) -> None:
+        assert (
+            lint_verify_commands(
+                [
+                    "uv run pytest -q",
+                    "uv run ruff check .",
+                    "test -f uv.lock",
+                    "git diff --exit-code",
+                ],
+                ["python"],
+                uv_project=True,
+            )
+            == []
+        )
+
+    def test_lockfile_is_inert_without_the_python_toolchain(self) -> None:
+        # A Go run whose workspace happens to carry a uv.lock (a polyglot
+        # repo) must not start rejecting `.venv/bin/...` for a language it
+        # never configured.
+        assert lint_verify_commands([".venv/bin/pytest"], ["go"], uv_project=True) == []
+
+    def test_lockfile_absent_keeps_the_venv_convention(self) -> None:
+        assert lint_verify_commands([".venv/bin/pytest -q"], ["python"], uv_project=False) == []
+        problems = lint_verify_commands(["pytest -q"], ["python"], uv_project=False)
+        assert len(problems) == 1 and ".venv/bin/pytest" in problems[0]
+
+    def test_other_language_rules_unaffected(self) -> None:
+        problems = lint_verify_commands(["rspec spec/"], ["python", "ruby"], uv_project=True)
+        assert len(problems) == 1 and "bundle exec" in problems[0]
+
 
 class TestRubyAndPhpRules:
     def test_bare_rspec_flagged_bundle_exec_clean(self) -> None:

@@ -357,9 +357,12 @@ def test_every_language_in_the_agreed_set_is_registered() -> None:
     }
 
 
-def test_python_entry_matches_the_pre_140_behavior() -> None:
+def test_python_entry_keeps_the_pre_140_venv_heal() -> None:
+    # The 0.4.0 field failure (`ensurepip is not available`) is still the
+    # first thing this entry guards; #250 adds to it, never replaces it.
     python = toolchains.resolve(["python"])[0]
-    assert python.apt_packages == ("python3-venv", "python3-pip")
+    assert "python3-venv" in python.apt_packages
+    assert "python3-pip" in python.apt_packages
     assert "ensurepip" in python.probe
 
 
@@ -381,3 +384,57 @@ def test_baseline_tools_have_a_probe_and_an_apt_path() -> None:
         assert tool.apt_packages, tool.name
         assert tool.install_script is None, tool.name
     assert "git" in toolchains.apt_packages(toolchains.BASELINE_TOOLS)
+
+
+def test_python_installs_uv_pinned_and_checksum_verified() -> None:
+    # #250: every other runtime is pinned and verified; Python was the one
+    # left on "whatever the template ships". uv comes from its GitHub
+    # release with per-arch digests, never from a curl-into-shell.
+    python = toolchains.resolve(["python"])[0]
+    assert python.install_script is not None
+    assert toolchains.UV_VERSION in python.install_script
+    assert "astral.sh/uv/install.sh" not in python.install_script
+    for deb_arch, (upstream, digest) in toolchains._UV_DIGESTS.items():
+        assert f"{deb_arch}) arch={upstream}" in python.install_script
+        assert len(digest) == 64
+        assert digest in python.install_script
+    assert "sha256sum -c" in python.install_script
+
+
+def test_python_probes_uv_and_the_pinned_series() -> None:
+    # A template carrying an older python3.x would satisfy a bare presence
+    # check and leave `requires-python >= 3.13` projects failing at sync.
+    python = toolchains.resolve(["python"])[0]
+    assert "command -v uv" in python.probe
+    assert f"python{toolchains.PYTHON_SERIES} --version" in python.probe
+    assert f'grep -q "^Python {toolchains.PYTHON_SERIES.replace(".", "\\.")}\\.' in python.probe
+    assert python.install_script is not None
+    assert f"uv python install {toolchains.PYTHON_SERIES}" in python.install_script
+    assert f"/usr/local/bin/python{toolchains.PYTHON_SERIES}" in python.install_script
+
+
+def test_python_probe_accepts_the_series_and_rejects_others() -> None:
+    # Run the version half of the probe with a stubbed `python3.13` so the
+    # grep anchors are exercised, not just eyeballed.
+    python = toolchains.resolve(["python"])[0]
+    version_check = python.probe.split("&& command -v uv >/dev/null && ", 1)[1]
+    for output, expected in (
+        (f"Python {toolchains.PYTHON_SERIES}.2", 0),
+        ("Python 3.12.9", 1),
+        (f"Python {toolchains.PYTHON_SERIES}0.1", 1),
+    ):
+        script = version_check.replace(
+            f"python{toolchains.PYTHON_SERIES} --version", f"printf '%s\\n' '{output}'"
+        )
+        result = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+        assert result.returncode == expected, (output, script)
+
+
+def test_python_leaves_the_system_interpreter_alone() -> None:
+    # The worker runs on the template's python3; the pin is exposed under
+    # its versioned name only.
+    python = toolchains.resolve(["python"])[0]
+    assert python.install_script is not None
+    assert "/usr/local/bin/python3 " not in python.install_script
+    assert "/usr/local/bin/python3;" not in python.install_script
+    assert not python.install_script.endswith("/usr/local/bin/python3")

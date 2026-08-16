@@ -46,6 +46,7 @@ from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.sbx.secretstate import SECRET_EXISTS_MARKERS, parsed_scope
+from sbxloop.toolchains import PYTHON_SERIES
 
 # -- probe ids (importable so provisioning hooks can't typo them) -----------
 
@@ -56,6 +57,7 @@ PROBE_EXEC_ERROR_CHANNEL = "exec-error-channel"
 PROBE_CP_DIR_SEMANTICS = "cp-dir-semantics"
 PROBE_WORKSPACE_MOUNT = "workspace-mount"
 PROBE_PYTHON3_VENV = "python3-venv"
+PROBE_PYTHON_VERSION = "python-version"
 PROBE_PAGE_SIZE = "page-size"
 PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"  # nosec B105 - probe name
 PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"  # nosec B105 - probe name
@@ -211,6 +213,38 @@ def _probe_python3_venv(ctx: ProbeContext) -> tuple[str, str]:
     if result.ok:
         return "available", "python3 -m venv should work first try"
     return "missing", "venv/ensurepip not importable; the install ladder's apt rung is needed"
+
+
+def _probe_python_version(ctx: ProbeContext) -> tuple[str, str]:
+    """The template's own python3 against the series provisioning pins (#250).
+
+    Nothing here breaks: the Python toolchain installs a managed
+    ``python3.13`` through uv whenever the template's is older. But that is
+    a download on every fresh sandbox, and a template already carrying the
+    series (or a newer one) skips it — so the row says which case this
+    template is, and where the interpreter comes from.
+    """
+    assert ctx.sandbox is not None
+    result = ctx.sandbox.exec(["python3", "--version"])
+    text = f"{result.stdout}\n{result.stderr}".strip()
+    match = re.search(r"Python (\d+)\.(\d+)", text)
+    if not result.ok or match is None:
+        return "no-python3", "the template ships no working python3 (uv provisions the pin)"
+    have = (int(match.group(1)), int(match.group(2)))
+    want = tuple(int(part) for part in PYTHON_SERIES.split("."))
+    version = f"{have[0]}.{have[1]}"
+    if have >= want:
+        return (
+            "meets-pin",
+            f"template python3 is {version} (>= {PYTHON_SERIES}); the uv-managed "
+            "interpreter is still installed under the versioned name for `uv run`",
+        )
+    return (
+        "below-pin",
+        f"template python3 is {version} < {PYTHON_SERIES}: projects pinning "
+        f"`requires-python >= {PYTHON_SERIES}` rely on the uv-managed "
+        f"python{PYTHON_SERIES} provisioning installs (a download per fresh sandbox)",
+    )
 
 
 def _probe_page_size(ctx: ProbeContext) -> tuple[str, str]:
@@ -372,6 +406,16 @@ CATALOG: tuple[Probe, ...] = (
         depends="the worker install ladder (venv -> apt python3-venv -> user-site) exists "
         "because the default template lacks python3-venv",
         run=_probe_python3_venv,
+    ),
+    Probe(
+        id=PROBE_PYTHON_VERSION,
+        summary=f"the sandbox template's python3 against the pinned {PYTHON_SERIES} series",
+        tier="sandbox",
+        expected=None,  # the Python toolchain installs the pin through uv either way
+        depends="the Python toolchain's uv-managed interpreter (#250): a below-pin "
+        "template pays a python download per fresh sandbox; a template at or "
+        "above the pin only needs uv itself",
+        run=_probe_python_version,
     ),
     Probe(
         id=PROBE_PAGE_SIZE,

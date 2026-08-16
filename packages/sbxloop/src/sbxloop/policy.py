@@ -131,6 +131,13 @@ WELL_KNOWN_REGISTRY_DOMAINS: tuple[str, ...] = (
     # whatever upstream each port names, which is unbounded by construction
     # and belongs in operator [policy] allow.)
     "center.conan.io",
+    # uv's installer host (`curl -LsSf https://astral.sh/uv/install.sh`).
+    # Provisioning installs uv from its pinned GitHub release, so the
+    # ordinary path never touches this — but an agent following upstream's
+    # own instructions on a run without the Python toolchain, or wanting a
+    # different uv, reaches for it (#250). Declarable rather than seeded:
+    # the installer is a curl-into-shell, not a package registry.
+    "astral.sh",
 )
 
 

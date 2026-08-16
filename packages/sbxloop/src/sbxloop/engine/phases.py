@@ -20,6 +20,7 @@ Session strategy per phase (a deliberate design decision):
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
 
 from pydantic import BaseModel
@@ -29,7 +30,7 @@ from sbxloop.engine.model import Issue, PlanModel, SteerVerdict, TaskGraph, Task
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
-from sbxloop.verifylint import lint_verify_commands
+from sbxloop.verifylint import UV_LOCKFILE, lint_verify_commands
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
@@ -95,6 +96,7 @@ class PhaseRunner:
         outcome: str,
         *,
         workdir: str | None = None,
+        workspace: Path | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
@@ -104,6 +106,14 @@ class PhaseRunner:
         # discovered workspace mount, or the harvest dir. Evidence and verify
         # commands must run where the executor wrote its files.
         self.workdir = workdir
+        # The host-side workspace directory (the run's clone), consulted for
+        # project-shape facts the verify-command lint keys on — a `uv.lock`
+        # at the root flips the Python convention (#250). Host-side because
+        # the lint runs at JSON acceptance, where a round trip into the VM
+        # per retry would cost more than the check is worth; the workspace
+        # is mounted identically in the common case, and an unmounted run
+        # still starts from this clone.
+        self.workspace = workspace
         # Standing chat guidance (steer_run verdicts), injected into every
         # later plan/execute prompt. The engine appends live entries and
         # replays persisted ones on resume.
@@ -114,6 +124,19 @@ class PhaseRunner:
 
     def _guidance(self) -> str:
         return bullet_list(self.user_guidance)
+
+    def _lint_verify_commands(self, commands: Sequence[str]) -> list[str]:
+        """Verify-command lint under this run's toolchains and project shape.
+
+        Re-checks the lockfile every time rather than once at construction:
+        on a mounted workspace the executor may have created ``uv.lock`` in
+        an earlier task, and later plans should be held to the convention
+        the workspace now has.
+        """
+        uv_project = self.workspace is not None and (self.workspace / UV_LOCKFILE).is_file()
+        return lint_verify_commands(
+            commands, self.config.sandbox.effective_languages, uv_project=uv_project
+        )
 
     # -- job plumbing ------------------------------------------------------
 
@@ -257,11 +280,10 @@ class PhaseRunner:
         workaround at verify time (field failure r12ygfd7t); rejecting at
         JSON acceptance costs one retry with the rule quoted.
         """
-        languages = self.config.sandbox.effective_languages
         problems = [
             f"- task {task.id}: {message}"
             for task in graph.tasks
-            for message in lint_verify_commands(task.verify_commands, languages)
+            for message in self._lint_verify_commands(task.verify_commands)
         ]
         if problems:
             raise ValueError(
@@ -289,9 +311,7 @@ class PhaseRunner:
     def _check_plan(self, plan: PlanModel) -> None:
         """Semantic plan validation: egress bounds + verify-command lint."""
         self._check_plan_egress(plan)
-        problems = lint_verify_commands(
-            plan.verify_commands, self.config.sandbox.effective_languages
-        )
+        problems = self._lint_verify_commands(plan.verify_commands)
         if problems:
             raise ValueError(
                 "verify commands violate the sandbox's toolchain conventions:\n"

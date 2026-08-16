@@ -110,6 +110,20 @@ All notable changes to sbxloop are documented here. The project adheres to
   toolchains; a prebaked template that lacks it is topped up from the single
   prebake probe. `sbxloop bake` records whether git landed and `sbxloop doctor`
   shows a soft "git in template" row.
+- **uv-aware Python toolchain** (#250). The `python` toolchain now installs
+  `uv` from its pinned, checksum-verified GitHub release (per-arch digests,
+  like Node/Go) and a uv-managed Python 3.13 (`python3.13` linked onto PATH),
+  and its probe checks the interpreter series rather than mere presence —
+  uv-workspace repos declaring `requires-python >= 3.13` (sbxloop's own
+  included) previously failed at `uv sync` because the sandbox had neither.
+  The plan/execute/decompose prompts carry a "uv projects" note per Python
+  block (`uv.lock` present → `uv sync --all-packages` in steps, `uv run …`
+  to verify), and the verify-command lint requires `uv run` heads when the
+  workspace root has a `uv.lock` (bare `pytest` and `.venv/bin/…` are both
+  rejected with the uv remedy; without a lockfile `.venv/bin/…` is
+  unchanged). `astral.sh` (uv's installer host) joins the declarable
+  registries. `sbxloop doctor --deep` gains a `python-version` conformance
+  row reporting the template's own `python3` against the pinned series.
 
 - Daemon guardrails now cover recovery, restarts and multi-daemon setups
   (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted

@@ -484,7 +484,12 @@ class LoopEngine:
                     reporter, detach = self._attach_reporter(github, run_id, outcome)
                     try:
                         phases = PhaseRunner(
-                            agent, self.config, run_id, outcome, workdir=pair.agent_workdir
+                            agent,
+                            self.config,
+                            run_id,
+                            outcome,
+                            workdir=pair.agent_workdir,
+                            workspace=pair.workspace,
                         )
                         # Replay persisted chat guidance (steer_run verdicts)
                         # so a resumed run keeps the direction the user set.

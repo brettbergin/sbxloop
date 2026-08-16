@@ -26,7 +26,10 @@ $outcome
   project virtualenv's paths (`.venv/bin/python`, `.venv/bin/pytest`),
   never bare `python`/`pip`/`pytest` — the system Python is externally
   managed with no project dependencies, and unversioned `python` does not
-  exist. Ruby: `bundle exec rspec`, never bare `rspec`/`rake`. PHP:
+  exist. **uv projects**: if the workspace has a `uv.lock`, the convention
+  flips — `uv run pytest` (`uv run …`) is required and `.venv/bin/...` is
+  rejected, because uv builds the locked environment itself. Ruby:
+  `bundle exec rspec`, never bare `rspec`/`rake`. PHP:
   `./vendor/bin/phpunit`, never bare `phpunit`. Go/Rust/.NET/Node commands
   are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
   Never `sudo` or `apt` in a verify command: verification checks the work,

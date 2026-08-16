@@ -650,6 +650,26 @@ class TestResume:
         assert (source / "hello.txt").read_text() == "hi\n"
         assert not (source / ".git" / "refs" / "heads" / "sbxloop").exists()
 
+    def test_phase_runner_sees_the_run_workspace(self, harness: Harness) -> None:
+        # #250: the verify-command lint keys on the host workspace (a
+        # `uv.lock` there flips the Python convention), so the runner must
+        # be handed the run's actual workspace path, not left blind.
+        from sbxloop.engine.phases import PhaseRunner
+
+        captured: dict[str, PhaseRunner] = {}
+        original_init = PhaseRunner.__init__
+
+        def spy_init(self: PhaseRunner, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            captured["phases"] = self
+
+        harness.monkeypatch.setattr(PhaseRunner, "__init__", spy_init)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("improve the project")
+        assert result.state == "completed"
+        assert captured["phases"].workspace == result.workspace
+        assert result.workspace is not None
+
     def test_resume_isolated_run_reuses_clone(self, harness: Harness) -> None:
         from tests.unit.test_hostgit import make_repo
 

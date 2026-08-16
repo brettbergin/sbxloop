@@ -13,6 +13,15 @@ def test_render_decompose() -> None:
     assert "$outcome" not in text
 
 
+def test_decompose_states_the_uv_project_convention() -> None:
+    # #250: the decomposer writes verify commands too, and the lint holds
+    # them to the uv convention when a lockfile is present — so the rule
+    # has to be stated where the decomposer reads it, not only in plan.md.
+    text = render("decompose", outcome="o", max_tasks="5")
+    assert "uv.lock" in text
+    assert "uv run pytest" in text
+
+
 def test_execute_and_plan_carry_environment_notes() -> None:
     """Field regression: the agent burned its whole revision budget on
     `python3 -m venv` failing (missing ensurepip) and bare pip hitting
@@ -67,6 +76,12 @@ def test_execute_and_plan_carry_environment_notes() -> None:
 # one row per language sub-issue.
 ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("Python", ("PEP 668", "python3 -m venv", ".venv/bin/pytest"), ("PEP 668", ".venv/bin/")),
+    # #250: the uv-projects note rides inside the Python block of every prompt.
+    (
+        "uv projects",
+        ("uv.lock", "uv sync", "uv run pytest -q"),
+        ("uv.lock", "uv sync", "uv run"),
+    ),
     ("JavaScript/Node", ("package.json", "npm ci && npm test"), ("package.json", "npm ci")),
     (
         "TypeScript",

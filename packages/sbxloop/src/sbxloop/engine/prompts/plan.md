@@ -90,6 +90,14 @@ and none of these is the "normal" choice.
   command is rejected outright (there is no compliant way to bootstrap a
   venv from inside one). Verify: `.venv/bin/pytest`, or
   `cd app && .venv/bin/pytest` for a subdirectory build.
+  **uv projects** — if the workspace has a `uv.lock` (often a uv workspace
+  with several members and a `requires-python` pin), do not build a venv by
+  hand: `uv` and a managed Python 3.13 are on PATH, so `uv sync
+  --all-packages` in your **steps** builds the locked environment, and
+  every command including `verify_commands` runs through it as `uv run …`
+  (`uv run pytest -q`, `uv run ruff check .`). With a lockfile present,
+  `.venv/bin/...` and bare `pytest` verify commands are rejected; `uv run`
+  is the shape.
 - **JavaScript/Node** — `package.json` and its lockfile sit at the project
   root, and `node_modules/` is local to the project, so no global-install
   workaround is needed. Prefer `npm ci` over `npm install` for a
