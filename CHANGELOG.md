@@ -48,6 +48,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+
 - Daemon guardrails now cover recovery, restarts and multi-daemon setups
   (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted
   run is re-queued with its run pinned and the tick resumes it behind the same
