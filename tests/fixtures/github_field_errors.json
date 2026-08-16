@@ -19,41 +19,37 @@
       "message": "github op raw.api failed: GithubOpError: gh api GET /repos/o/r/git/ref/heads/main failed (rc=1): gh: Git Repository is empty. (HTTP 409)",
       "status": 409,
       "provenance": "field",
-      "observed": "run rgwp5z40x (2026-08, PR #219): GET git/ref/heads/<default_branch> on an empty repository; repo slug replaced with o/r",
-      "expect": {
-        "deliver.is_missing": false,
-        "deliver.is_empty_repo": true
-      }
+      "observed": "run rgwp5z40x (2026-08, PR #219): GET git/ref/heads/<default_branch> on an empty repository; repo slug replaced with o/r"
     },
     "ref_missing_404": {
       "message": "github op raw.api failed: GithubOpError: gh api GET /repos/o/r/git/ref/heads/topic failed (rc=1): gh: Not Found (HTTP 404)",
       "status": 404,
       "provenance": "synthetic",
-      "observed": "not yet captured: an explicit deliver_base naming a branch that does not exist on a non-empty repository",
-      "expect": {
-        "deliver.is_missing": true,
-        "deliver.is_empty_repo": false
-      }
+      "observed": "not yet captured: an explicit deliver_base naming a branch that does not exist on a non-empty repository"
     },
     "repo_missing_404": {
       "message": "github op repo.get failed: GithubOpError: gh api GET /repos/o/r failed (rc=1): gh: Not Found (HTTP 404)",
       "status": 404,
       "provenance": "synthetic",
-      "observed": "not yet captured: repo.get against a repository that does not exist (ensure_repository create path)",
-      "expect": {
-        "deliver.is_missing": true,
-        "deliver.is_empty_repo": false
-      }
+      "observed": "not yet captured: repo.get against a repository that does not exist (ensure_repository create path)"
     },
     "label_missing_404": {
       "message": "github op raw.api failed: GithubOpError: gh api DELETE /repos/o/r/issues/7/labels/sbxloop failed (rc=1): gh: Label does not exist (HTTP 404)",
       "status": 404,
       "provenance": "synthetic",
-      "observed": "not yet captured: removing a label an operator already removed by hand (daemon GithubIssueSource)",
-      "expect": {
-        "deliver.is_missing": true,
-        "deliver.is_empty_repo": false
-      }
+      "observed": "not yet captured: removing a label an operator already removed by hand (daemon GithubIssueSource)"
+    },
+    "ref_exists_422": {
+      "message": "github op raw.api failed: GithubOpError: gh api POST /repos/o/r/git/refs failed (rc=1): gh: Reference already exists (HTTP 422)",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: re-delivering a run whose sbxloop/<run> branch exists (#223; deliver.py TODO(e2e))"
+    },
+    "pr_exists_422": {
+      "message": "github op pr.create failed: GithubOpError: POST https://api.github.com/repos/o/r/pulls -> HTTP 422: {\"message\":\"Validation Failed\",\"errors\":[{\"message\":\"A pull request already exists for o:sbxloop/r42.\"}]}",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: re-delivering a run whose PR is already open (#223; deliver.py TODO(e2e))"
     }
   }
 }

@@ -50,5 +50,7 @@ def field_error(name: str) -> str:
 
 
 def github_error(name: str) -> GithubOpsError:
-    """A GithubOpsError carrying the recorded string, ready to ``raise``."""
-    return GithubOpsError(field_error(name))
+    """A GithubOpsError carrying the recorded string AND its status as
+    structured data (#221) — the shape the worker really hands the host."""
+    entry = field_errors()[name]
+    return GithubOpsError(str(entry["message"]), http_status=int(entry["status"]))
