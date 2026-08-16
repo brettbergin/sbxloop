@@ -1392,17 +1392,28 @@ def daemon(
             config.daemon.failed_label,
             config.daemon.backlog_label,
         )
-        sources.append(GitHubIssueSource(github.ops, config.github.repo, labels))
+        sources.append(
+            GitHubIssueSource(
+                github.ops, config.github.repo, labels, on_failure=github.note_failure
+            )
+        )
 
     if dry_run:
-        for source in sources:
-            for item in source.poll():
-                console.print(
-                    f"[cyan]{item.item_id}[/]  {item.title}" + (f"  {item.url}" if item.url else "")
-                )
-        if github is not None:
-            github.close()
-        raise typer.Exit(0)
+        code = 0
+        try:
+            for source in sources:
+                for item in source.poll():
+                    console.print(
+                        f"[cyan]{item.item_id}[/]  {item.title}"
+                        + (f"  {item.url}" if item.url else "")
+                    )
+        except SbxloopError as exc:
+            console.print(f"[bold red]poll failed:[/] {exc}")
+            code = 1
+        finally:
+            if github is not None:
+                github.close()
+        raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, sources=sources, sbx=sbx)
     bridge: DiscordBridge | None = None
@@ -1694,6 +1705,7 @@ mem_warn = 90.0
 # backlog_label = "sbxloop:backlog"
 # max_runs_per_day = 12            # rolling 24h window, persisted across restarts
 # max_attempts_per_item = 2
+# max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
 # retry_backoff_s = 900.0          # times the attempt number
 # max_consecutive_failures = 3     # circuit breaker ...
 # breaker_cooldown_s = 3600.0      # ... and how long it stays open

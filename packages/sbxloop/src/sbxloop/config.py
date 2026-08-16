@@ -316,6 +316,10 @@ class DaemonConfig(_ConfigModel):
     backlog_label: str = "sbxloop:backlog"
     max_runs_per_day: int = 12
     max_attempts_per_item: int = 2
+    # Resumes (after a restart/crash) are not attempts, but each one gets a
+    # fresh engine wall clock; past this many per item the interrupted run is
+    # settled as a failed attempt instead of resumed (#234). 0 = never resume.
+    max_resumes_per_item: int = Field(default=2, ge=0)
     retry_backoff_s: float = 900.0
     max_consecutive_failures: int = 3
     breaker_cooldown_s: float = 3600.0

@@ -10,6 +10,7 @@ import pytest
 
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.sources import (
+    CLAIM_MARKER,
     GitHubIssueSource,
     GitHubLabels,
     InboxSource,
@@ -129,6 +130,15 @@ class RecordingOps:
         self.comments: list[tuple[int, str]] = []
         self.created: list[tuple[str, list[str] | None]] = []
         self.fail_on: set[str] = set()
+        # Comments as GitHub lists them (ascending), events per issue; a
+        # claim test scripts a rival's claim comment here.
+        self.comment_rows: list[dict[str, Any]] = []
+        self.events: dict[str, list[dict[str, Any]]] = {}
+        self.deleted_comments: list[int] = []
+        # Called after each posted claim comment: lets a test interleave a
+        # rival between our post and our re-read.
+        self.after_comment: Any = None
+        self._next_comment_id = 100
 
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         self.searches.append(query)
@@ -138,15 +148,33 @@ class RecordingOps:
         if method in self.fail_on:
             raise GithubOpsError(f"{method} {path} -> HTTP 500: boom")
         self.raw_calls.append((method, path, body))
+        base, _, query = path.partition("?")
+        if method == "GET" and base.endswith("/comments"):
+            return [] if "page=2" in query else list(self.comment_rows)
+        if method == "GET" and base.endswith("/events"):
+            number = base.rsplit("/", 2)[-2]
+            return [] if "page=2" in query else list(self.events.get(number, []))
+        if method == "DELETE" and "/issues/comments/" in base:
+            self.deleted_comments.append(int(base.rsplit("/", 1)[-1]))
+            return {}
         if method == "GET":
-            number = path.rsplit("/", 1)[-1]
+            number = base.rsplit("/", 1)[-1]
             return self.issues.get(number, {"state": "closed", "labels": []})
         return {}
+
+    def add_comment(self, body: str, created_at: str = "2026-08-15T10:00:00Z") -> int:
+        cid = self._next_comment_id
+        self._next_comment_id += 1
+        self.comment_rows.append({"id": cid, "body": body, "created_at": created_at})
+        return cid
 
     def issue_comment(self, repo: str, number: int, body: str) -> str:
         if "COMMENT" in self.fail_on:
             raise GithubOpsError("comment -> HTTP 502")
         self.comments.append((number, body))
+        self.add_comment(body)
+        if self.after_comment is not None:
+            self.after_comment()
         return "https://c"
 
     def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> IssueRef:
@@ -231,8 +259,8 @@ class TestGitHubSource:
             {"labels": ["sbxloop:in-progress"]},
         ) in ops.raw_calls
         assert any(d.endswith("sbxloop%3Ain-progress") for d in deletes)
-        # no claim comment was posted for a failed claim
-        assert not any("claimed" in body for _, body in ops.comments)
+        # the claim comment (the lock) is released too
+        assert any(d.endswith("/issues/comments/100") for d in deletes)
 
     def test_claim_tolerates_structured_404_on_trigger_removal(self) -> None:
         """#221: an already-absent trigger label is signalled by http_status,
@@ -249,11 +277,100 @@ class TestGitHubSource:
         item = self.make(ops).poll()[0]
         assert self.make(ops).claim(item) is True
 
-    def test_claim_comment_failure_does_not_unclaim(self) -> None:
+    def test_claim_comment_failure_fails_the_claim_without_touching_labels(self) -> None:
+        """The claim comment is the lock (#254): if it cannot be posted the
+        claim did not happen, and the issue is left exactly as found."""
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})
         ops.fail_on = {"COMMENT"}
         item = self.make(ops).poll()[0]
-        assert self.make(ops).claim(item) is True  # labels swapped; comment is cosmetic
+        assert self.make(ops).claim(item) is False
+        assert all(m == "GET" for m, _, _ in ops.raw_calls)
+
+    def test_claim_comment_is_posted_before_labels_and_carries_marker(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        assert self.make(ops).claim(item) is True
+        assert ops.comments[0][1].startswith(CLAIM_MARKER)
+        # comment (lock) → re-read comments → label swap
+        kinds = [(m, p.split("?")[0].rsplit("/", 1)[-1]) for m, p, _ in ops.raw_calls]
+        assert kinds.index(("GET", "comments")) < kinds.index(("POST", "labels"))
+
+    def test_claim_lost_race_yields_and_releases_its_comment(self) -> None:
+        """Two daemons interleaving between the re-GET and the label swap
+        both used to claim (#254). With the comment lock the one whose
+        claim comment is not first backs off — labels untouched, its own
+        comment removed so it does not lock anyone else out."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        rival = f"{CLAIM_MARKER}{'b' * 32} -->\nsbxloop daemon claimed this issue (host `other`)."
+        # The rival posted a moment earlier; GitHub lists it first.
+        ops.comment_rows.append({"id": 50, "body": rival, "created_at": "2026-08-15T09:59:59Z"})
+        assert self.make(ops).claim(item) is False
+        assert not any(m in ("POST", "PUT", "PATCH") for m, p, _ in ops.raw_calls if "labels" in p)
+        assert ops.deleted_comments == [100]  # ours, not the rival's
+
+    def test_claim_same_second_race_breaks_ties_on_comment_id(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        rival = f"{CLAIM_MARKER}{'c' * 32} -->\nclaimed (host `other`)."
+
+        def rival_lands_after_ours() -> None:
+            ops.add_comment(rival)  # same created_at, higher id
+
+        ops.after_comment = rival_lands_after_ours
+        assert self.make(ops).claim(item) is True
+        assert ops.deleted_comments == []
+
+    def test_claim_ignores_claim_comments_from_an_earlier_trigger_cycle(self) -> None:
+        """A re-triggered issue (failed label removed, trigger re-added)
+        carries the claim comment of its earlier run; that must not lock
+        every future claimer out. Only claims since the trigger label was
+        last added count."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        stale = f"{CLAIM_MARKER}{'d' * 32} -->\nclaimed (host `db`)."
+        ops.comment_rows.append({"id": 10, "body": stale, "created_at": "2026-08-01T00:00:00Z"})
+        ops.events["4"] = [
+            {
+                "event": "labeled",
+                "label": {"name": "sbxloop:run"},
+                "created_at": "2026-07-30T00:00:00Z",
+            },
+            {
+                "event": "labeled",
+                "label": {"name": "sbxloop:failed"},
+                "created_at": "2026-08-02T00:00:00Z",
+            },
+            {
+                "event": "labeled",
+                "label": {"name": "sbxloop:run"},
+                "created_at": "2026-08-10T00:00:00Z",
+            },
+        ]
+        item = self.make(ops).poll()[0]
+        assert self.make(ops).claim(item) is True
+
+    def test_claim_label_swap_failure_releases_the_comment_lock(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.fail_on = {"POST"}  # in-progress add fails
+        assert self.make(ops).claim(item) is False
+        assert ops.deleted_comments == [100]
+
+    def test_poll_raises_and_reports_failure_to_the_sandbox_owner(self) -> None:
+        """poll used to swallow failures as an empty result; the loop needs
+        the exception to back the source off (#254), and DaemonGithub
+        needs to hear about it to replace a dead sandbox."""
+        ops = RecordingOps()
+        failures: list[BaseException] = []
+
+        def search(query: str, per_page: int = 30) -> list[dict[str, Any]]:
+            raise GithubOpsError("HTTP 502")
+
+        ops.search_issues = search  # type: ignore[method-assign]
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", on_failure=failures.append)  # type: ignore[arg-type]
+        with pytest.raises(GithubOpsError):
+            src.poll()
+        assert len(failures) == 1
 
     def test_claim_refuses_when_label_gone_or_issue_closed(self) -> None:
         stale = RecordingOps({"4": issue(4)})  # trigger label already removed
@@ -351,6 +468,86 @@ class TestGitHubSource:
         assert ops.created[-1] == ("Later", ["sbxloop:backlog"])
         src.file_backlog("Now", "detail", "r1", trigger=True)
         assert ops.created[-1] == ("Now", ["sbxloop:run"])
+
+
+class TestDaemonGithubInstance:
+    def test_sandbox_name_is_per_state_dir(self, tmp_path: Path) -> None:
+        """A fixed name plus remove_stale() at startup meant a second daemon
+        on the host killed the first's github sandbox (#254)."""
+        from sbxloop.config import Config
+        from sbxloop.daemon.github import SANDBOX_NAME_PREFIX, DaemonGithub, sandbox_name_for
+        from sbxloop.events import EventBus
+
+        a = Config.model_validate({"state_dir": str(tmp_path / "a")})
+        b = Config.model_validate({"state_dir": str(tmp_path / "b")})
+        gh_a = DaemonGithub(a, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
+        gh_b = DaemonGithub(b, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
+        assert gh_a.name != gh_b.name
+        assert gh_a.name.startswith(SANDBOX_NAME_PREFIX + "-")
+        assert gh_a.name == sandbox_name_for(a.state_dir)  # stable across restarts
+
+    def test_reprovision_is_rate_limited(self, tmp_path: Path) -> None:
+        """A GitHub outage used to cost one microVM rebuild per failing
+        call; now at most one per REPROVISION_MIN_INTERVAL_S (#254)."""
+        from sbxloop.config import Config
+        from sbxloop.daemon.github import REPROVISION_MIN_INTERVAL_S, DaemonGithub
+        from sbxloop.events import EventBus
+
+        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        now = [1000.0]
+        gh = DaemonGithub(
+            config,
+            sbx=object(),
+            bus=EventBus(),
+            worker_python="python3",
+            clock=lambda: now[0],  # type: ignore[arg-type]
+        )
+        provisions = 0
+
+        def provision() -> object:
+            nonlocal provisions
+            provisions += 1
+            return object()
+
+        gh._provision = provision  # type: ignore[method-assign]
+        gh.ops()
+        assert provisions == 1
+        assert gh.note_failure(GithubOpsError("HTTP 502")) is True
+        gh.ops()
+        assert provisions == 2
+        now[0] += 10
+        assert gh.note_failure(GithubOpsError("HTTP 502")) is False
+        gh.ops()
+        assert provisions == 2  # still the same sandbox
+        now[0] += REPROVISION_MIN_INTERVAL_S
+        assert gh.note_failure(GithubOpsError("HTTP 502")) is True
+        gh.ops()
+        assert provisions == 3
+
+    def test_call_retries_once_after_reprovision_and_raises_when_throttled(
+        self, tmp_path: Path
+    ) -> None:
+        from sbxloop.config import Config
+        from sbxloop.daemon.github import DaemonGithub
+        from sbxloop.events import EventBus
+
+        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        gh = DaemonGithub(
+            config, sbx=object(), bus=EventBus(), worker_python="python3", clock=lambda: 0.0
+        )  # type: ignore[arg-type]
+        gh._provision = lambda: object()  # type: ignore[method-assign, assignment]
+        calls = 0
+
+        def flaky(_ops: object) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise GithubOpsError("boom")
+            return "ok"
+
+        assert gh.call(flaky) == "ok" and calls == 2
+        with pytest.raises(GithubOpsError):
+            gh.call(lambda _ops: (_ for _ in ()).throw(GithubOpsError("again")))
 
 
 class TestDaemonGithubProvisioning:

@@ -510,9 +510,18 @@ class TestShutdownAndRecovery:
         h.store.set_run_state("r_live", "running")
         h.outcomes = ["completed"]
         h.loop.recover()
+        # Recovery only queues the resume (run pinned); the tick runs it.
+        pending = h.dstore.get("inbox:a.md")
+        assert pending is not None and pending.state == "queued" and pending.run_id == "r_live"
+        assert h.runs == []
+        assert h.loop.tick().outcome == "done"
         assert h.runs == [("r_live", True)]  # resumed, not restarted
         item = h.dstore.get("inbox:a.md")
         assert item is not None and item.state == "done" and item.attempts == 1
+        # A resume is the same attempt but a fresh engine wall clock: the
+        # daily cap sees it (#254/#234).
+        assert h.dstore.runs_started_since(0) == 2
+        assert h.loop.status()["resumes_today"] == 1
 
     def test_recover_removes_stale_run_sandboxes_and_secrets_before_resume(
         self, tmp_path: Path
@@ -545,6 +554,7 @@ class TestShutdownAndRecovery:
         h.store.set_run_state("r_live", "running")
         h.outcomes = ["completed"]
         h.loop.recover()
+        h.loop.tick()
         agent, gh = "sbxloop-r_live-agent", "sbxloop-r_live-github"
         assert [c for c in calls if c[0] == "rm"] == [("rm", agent), ("rm", gh)]
         secret_calls = [c[1] for c in calls if c[0] == "secret_rm"]
@@ -582,8 +592,139 @@ class TestShutdownAndRecovery:
         h.store.set_run_state("r_live", "running")
         h.outcomes = ["completed"]
         h.loop.recover()
+        h.loop.tick()
         assert len(calls) == 2
         assert h.runs == [("r_live", True)]
+
+    @staticmethod
+    def _interrupted(h: Harness, run_id: str = "r_live") -> None:
+        now = h.clock()
+        h.dstore.upsert_new(inbox_item(), now=now)
+        h.dstore.mark_claimed("inbox:a.md", now=now)
+        h.dstore.mark_running("inbox:a.md", run_id, now=now)
+        h.store.create_run(run_id, "x")
+        h.store.set_run_state(run_id, "running")
+
+    def test_recovered_resume_waits_behind_pause_breaker_and_cap(self, tmp_path: Path) -> None:
+        """recover() used to dispatch resumes directly, skipping every
+        guardrail tick() enforces (#254): a daemon restarting into an open
+        breaker, a spent cap, or an operator pause resumed anyway."""
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        self._interrupted(h)
+        h.outcomes = ["completed"]
+        h.loop.recover()
+        h.loop.pause()
+        assert h.loop.tick().idle_reason == "paused" and h.runs == []
+        h.loop.unpause()
+        h.dstore.set_breaker(h.clock(), 3)
+        h.loop._breaker_opened_at, h.loop._consecutive_failures = h.dstore.breaker()
+        assert h.loop.tick().idle_reason == "breaker" and h.runs == []
+        h.dstore.set_breaker(None, 0)
+        h.loop._breaker_opened_at = None
+        # The interrupted run's own start already counts against the cap of 1.
+        assert h.loop.tick().idle_reason == "daily_cap" and h.runs == []
+        h.clock.t += 86400 + 1
+        assert h.loop.tick().outcome == "done"
+        assert h.runs == [("r_live", True)]
+
+    def test_resume_budget_exhausted_settles_as_failed_attempt(self, tmp_path: Path) -> None:
+        """A plan that keeps getting interrupted burns a fresh engine wall
+        clock per resume while never touching the attempt cap (#234): past
+        ``max_resumes_per_item`` the interrupted run is a failed attempt."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "daemon": {"max_resumes_per_item": 1, "max_attempts_per_item": 2},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        self._interrupted(h)
+        h.dstore.mark_resuming("inbox:a.md", "r_live", now=h.clock())  # one resume spent
+        h.loop.recover()
+        result = h.loop.tick()
+        assert result.outcome == "retry" and h.runs == []  # not resumed
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "queued" and item.run_id is None
+        assert any(c[0] == "retry" for c in h.source.calls)
+        # The next tick (past the retry backoff) is a FRESH dispatch,
+        # counting as attempt 2.
+        h.clock.t += cfg.daemon.retry_backoff_s + 1
+        h.outcomes = ["completed"]
+        assert h.loop.tick().outcome == "done"
+        assert len(h.runs) == 1 and h.runs[0][1] is False
+        assert h.dstore.get("inbox:a.md").attempts == 2  # type: ignore[union-attr]
+
+    def test_zero_resume_budget_never_resumes(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_resumes_per_item": 0}}
+        )
+        h = Harness(tmp_path, cfg)
+        self._interrupted(h)
+        h.loop.recover()
+        assert h.loop.tick().outcome == "retry" and h.runs == []
+
+    def test_breaker_state_survives_restart(self, tmp_path: Path) -> None:
+        """The breaker used to be instance state: a crash-restart loop
+        reset it every time and the "pause dispatch" it promised never
+        happened (#254)."""
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_consecutive_failures": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [inbox_item("a.md")]
+        h.outcomes = ["failed"]
+        assert h.loop.tick().outcome == "retry"
+        assert h.loop.status()["breaker_open"] is True
+        # A new loop over the same store (a restarted daemon) sees it.
+        again = DaemonLoop(
+            cfg,
+            store=h.store,
+            dstore=h.dstore,
+            sources=[h.source],
+            runner=h.runner,
+            clock=h.clock,
+        )
+        assert again.tick().idle_reason == "breaker"
+        assert again.status()["consecutive_failures"] == 1
+        h.clock.t += cfg.daemon.breaker_cooldown_s + 1
+        assert again.tick().idle_reason != "breaker"
+
+
+class TestSourceBackoff:
+    def test_failing_source_is_backed_off_then_recovers(self, tmp_path: Path) -> None:
+        """A source that raises every poll (GitHub outage, dead github
+        sandbox) is polled with doubling delays, not every tick (#254)."""
+        h = Harness(tmp_path)
+        polls = 0
+
+        class Flaky(FakeSource):
+            def poll(self) -> list[WorkItem]:
+                nonlocal polls
+                polls += 1
+                if polls <= 3:
+                    raise WorkerError("github sandbox is gone")
+                return list(self.items)
+
+        flaky = Flaky([inbox_item()])
+        h.loop.sources = [flaky]
+        interval = h.config.daemon.poll_interval_s
+        h.loop.tick()  # failure 1 -> next poll in 2*interval
+        h.loop.tick()  # skipped
+        assert polls == 1
+        h.clock.t += 2 * interval
+        h.loop.tick()  # failure 2 -> next poll in 4*interval
+        h.clock.t += 2 * interval
+        h.loop.tick()  # skipped
+        assert polls == 2
+        h.clock.t += 2 * interval
+        h.loop.tick()  # failure 3
+        h.clock.t += 8 * interval
+        result = h.loop.tick()  # recovers and dispatches
+        assert polls == 4 and result.dispatched == "inbox:a.md"
+        assert h.loop._source_failures == {}
 
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(

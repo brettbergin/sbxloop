@@ -347,7 +347,8 @@ class DiscordBridge:
             lines = [
                 f"**current:** {cur['run_id']} — {cur['title']}" if cur else "**current:** idle",
                 f"**queued:** {s['queued']} · **runs today:** "
-                f"{s['runs_today']}/{s['max_runs_per_day']}",
+                f"{s['runs_today']}/{s['max_runs_per_day']}"
+                f" (resumes {s.get('resumes_today', 0)})",
                 f"**breaker:** {'open' if s['breaker_open'] else 'closed'} · "
                 f"**paused:** {s['paused']}",
             ]

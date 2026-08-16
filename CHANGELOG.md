@@ -48,6 +48,23 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+- Daemon guardrails now cover recovery, restarts and multi-daemon setups
+  (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted
+  run is re-queued with its run pinned and the tick resumes it behind the same
+  breaker / daily-cap / pause gate as any dispatch. Resumes are recorded in a
+  ledger of their own: the daily cap counts them (each is a fresh engine wall
+  clock), `!sbx status` shows them, and a new `[daemon] max_resumes_per_item`
+  (default 2) bounds them — past it the interrupted run is settled as a failed
+  attempt so a plan that keeps getting interrupted cannot burn engine time
+  forever. Circuit-breaker state persists in the daemon store, so a
+  crash-restart loop no longer resets it. The GitHub claim is now a
+  compare-and-swap: the claim comment is posted first and the label swap only
+  proceeds if it is the first claim comment of the current trigger cycle, so
+  two daemons on one repo cannot both take an issue. The daemon's github
+  sandbox is named per state dir (`sbxloop-daemon-github-<hash>`) so a second
+  daemon on the host no longer removes the first's at startup. Source polling
+  raises on failure and backs off exponentially (up to 30 min); the github
+  sandbox is re-provisioned at most once per 5 minutes.
 
 - GitHub op failures carry the HTTP status as a structured field (#221):
   worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken

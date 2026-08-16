@@ -253,7 +253,8 @@ work came from, and keeps going. Two work sources, usable together:
 
 It is **fully autonomous** — a label or a file alone starts a run — so the
 spend guardrails in `[daemon]` are the safety net: a rolling daily run cap,
-a per-item attempt cap, and a consecutive-failure circuit breaker. Treat the
+a per-item attempt cap, a per-item resume cap, and a consecutive-failure
+circuit breaker (persisted, so a restart cannot reset it). Treat the
 trigger label as "execute arbitrary instructions with GH_TOKEN's repo scope"
 and restrict who can apply it. Inner agents can file follow-up work they
 discover (`--backlog github|inbox`) — those land in **triage** (the
@@ -262,8 +263,10 @@ promotes them, unless `backlog_auto_trigger` is set.
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
-an interrupted run (SIGTERM, crash) is resumed on the next start. Ship it as
-a systemd user service with [`contrib/systemd/`](contrib/systemd/).
+an interrupted run (SIGTERM, crash) is resumed on the next start — through
+the same guardrails as any dispatch, and at most `max_resumes_per_item` times
+before it counts as a failed attempt. Ship it as a systemd user service with
+[`contrib/systemd/`](contrib/systemd/).
 
 ### Discord: chronology out, steering in
 

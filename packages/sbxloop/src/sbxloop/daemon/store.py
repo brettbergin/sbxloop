@@ -44,6 +44,20 @@ CREATE TABLE IF NOT EXISTS daemon_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_daemon_runs_started ON daemon_runs(started_at);
 
+CREATE TABLE IF NOT EXISTS daemon_run_resumes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    resumed_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_daemon_resumes_at ON daemon_run_resumes(resumed_at);
+CREATE INDEX IF NOT EXISTS idx_daemon_resumes_item ON daemon_run_resumes(item_id);
+
+CREATE TABLE IF NOT EXISTS daemon_state (
+    key         TEXT PRIMARY KEY,
+    value       TEXT
+);
+
 CREATE TABLE IF NOT EXISTS daemon_backlog_filed (
     fingerprint TEXT PRIMARY KEY,
     run_id      TEXT NOT NULL,
@@ -173,14 +187,24 @@ class DaemonStore:
         """Oldest queued item whose retry backoff (attempts * backoff) has
         elapsed since its last update. Ties on ``created_at`` (a batch
         upserted with one ``now``) break on insertion order (rowid), so
-        dispatch is genuinely FIFO."""
+        dispatch is genuinely FIFO.
+
+        A queued item that still carries a ``run_id`` is an interrupted run
+        awaiting resume (see :meth:`mark_resume_pending`): it was in flight
+        when the previous process died, so it goes first and skips the
+        retry backoff — that backoff spaces out *failed* attempts, and an
+        interruption is not a failure."""
         with self._lock:
             for row in self._conn.execute(
                 "SELECT * FROM daemon_work_items WHERE state = 'queued' "
-                "ORDER BY created_at ASC, rowid ASC"
+                "ORDER BY (run_id IS NULL) ASC, created_at ASC, rowid ASC"
             ):
                 item = _row_to_item(row)
-                if item.attempts == 0 or now - item.updated_at >= item.attempts * backoff_s:
+                if (
+                    item.run_id is not None
+                    or item.attempts == 0
+                    or now - item.updated_at >= item.attempts * backoff_s
+                ):
                     return item
             return None
 
@@ -227,16 +251,48 @@ class DaemonStore:
             )
             self._conn.commit()
 
+    def mark_resume_pending(self, item_id: str, now: float) -> None:
+        """Recovery found the item's run interrupted mid-flight: back to
+        the queue with the run pinned, so the next tick resumes it through
+        the same breaker/cap/pause gate a fresh dispatch faces (#254) —
+        recovery itself never starts engines."""
+        self._update(item_id, now, state="queued")
+
+    def mark_resuming(self, item_id: str, run_id: str, now: float) -> None:
+        """Resume the pinned run: back to running (the attempt count is
+        unchanged — a resume is the same attempt) and record the resume in
+        its own ledger so the daily cap and the per-item resume budget see
+        it. ``daemon_runs`` is keyed by run id, so a second segment of the
+        same run cannot be a second row there."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE daemon_work_items SET state = 'running', updated_at = ? "
+                "WHERE item_id = ? AND run_id = ?",
+                (now, item_id, run_id),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                raise KeyError(f"work item {item_id!r} does not carry run {run_id!r}")
+            self._conn.execute(
+                "INSERT INTO daemon_run_resumes (run_id, item_id, resumed_at) VALUES (?, ?, ?)",
+                (run_id, item_id, now),
+            )
+            self._conn.commit()
+
     def mark_done(self, item_id: str, now: float) -> None:
         self._update(item_id, now, state="done", last_error=None)
 
     def mark_failed(self, item_id: str, error: str, now: float, *, requeue: bool) -> None:
-        self._update(
-            item_id,
-            now,
-            state="queued" if requeue else "abandoned",
-            last_error=error[:2000],
-        )
+        # A requeued item must not keep its run pinned: queued + run_id
+        # means "resume this run", and a failed run is dispatched fresh. An
+        # abandoned item keeps it for forensics.
+        fields: dict[str, object] = {
+            "state": "queued" if requeue else "abandoned",
+            "last_error": error[:2000],
+        }
+        if requeue:
+            fields["run_id"] = None
+        self._update(item_id, now, **fields)
 
     def mark_cancelled(self, item_id: str, reason: str, now: float) -> None:
         """Operator cancel: terminal for the daemon, unlike ``mark_failed``
@@ -273,9 +329,29 @@ class DaemonStore:
     # -- run ledger ------------------------------------------------------------
 
     def runs_started_since(self, ts: float) -> int:
+        """Fresh starts plus resumes in the window: each resume spends a
+        full engine wall clock, so the daily cap counts it (#254/#234)."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_runs WHERE started_at >= ?", (ts,)
+                "SELECT (SELECT COUNT(*) FROM daemon_runs WHERE started_at >= ?) + "
+                "(SELECT COUNT(*) FROM daemon_run_resumes WHERE resumed_at >= ?) AS n",
+                (ts, ts),
+            ).fetchone()
+            return int(row["n"])
+
+    def resumes_since(self, ts: float) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_run_resumes WHERE resumed_at >= ?", (ts,)
+            ).fetchone()
+            return int(row["n"])
+
+    def resumes_for_item(self, item_id: str) -> int:
+        """Resumes across ALL of the item's runs: the budget bounds total
+        effort per item, not per plan."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_run_resumes WHERE item_id = ?", (item_id,)
             ).fetchone()
             return int(row["n"])
 
@@ -284,6 +360,38 @@ class DaemonStore:
             self._conn.execute(
                 "UPDATE daemon_runs SET finished_at = ?, result = ? WHERE run_id = ?",
                 (now, result, run_id),
+            )
+            self._conn.commit()
+
+    # -- circuit breaker ---------------------------------------------------------
+
+    def breaker(self) -> tuple[float | None, int]:
+        """(opened_at, consecutive_failures) as last persisted. Kept in the
+        db rather than on the loop object so a crash-restart cycle cannot
+        reset the breaker (#254)."""
+        with self._lock:
+            rows = {
+                row["key"]: row["value"]
+                for row in self._conn.execute(
+                    "SELECT key, value FROM daemon_state WHERE key IN "
+                    "('breaker_opened_at', 'consecutive_failures')"
+                )
+            }
+        opened = rows.get("breaker_opened_at")
+        failures = rows.get("consecutive_failures")
+        return (
+            float(opened) if opened not in (None, "") else None,
+            int(failures) if failures not in (None, "") else 0,
+        )
+
+    def set_breaker(self, opened_at: float | None, consecutive_failures: int) -> None:
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
+                [
+                    ("breaker_opened_at", "" if opened_at is None else repr(float(opened_at))),
+                    ("consecutive_failures", str(int(consecutive_failures))),
+                ],
             )
             self._conn.commit()
 

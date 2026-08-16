@@ -10,8 +10,9 @@ setup, so they are enforced in the tick, not left to configuration hope.
 
 Shutdown is cooperative: a signal sets the stop flag, asks the in-flight
 engine to cancel (honored at its next task boundary), and joins it briefly.
-Interrupted runs are resumable by design, so the item stays ``running`` and
-:meth:`recover` picks it up on the next start.
+Interrupted runs are resumable by design, so the item stays ``running``;
+:meth:`recover` re-queues it with the run pinned on the next start and the
+tick resumes it through the same guardrails as any dispatch.
 """
 
 from __future__ import annotations
@@ -113,9 +114,15 @@ class DaemonLoop:
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
         self._cancel_request: CancelRequest | None = None
-        self._consecutive_failures = 0
-        self._breaker_opened_at: float | None = None
+        # Breaker state lives in the store: a crash-restart loop must not
+        # reset it (#254). These attributes are the write-through cache.
+        self._breaker_opened_at, self._consecutive_failures = self.dstore.breaker()
         self._last_cap_log = 0.0
+        # Per-source poll backoff: consecutive failures and the earliest
+        # next poll, so a source that is down (GitHub outage, dead github
+        # sandbox) is not hammered every tick.
+        self._source_failures: dict[str, int] = {}
+        self._source_next_poll: dict[str, float] = {}
 
     # -- external control ---------------------------------------------------------
 
@@ -204,8 +211,10 @@ class DaemonLoop:
             else None,
             "queued": len(self.dstore.queued()),
             "runs_today": self.dstore.runs_started_since(now - DAY_S),
+            "resumes_today": self.dstore.resumes_since(now - DAY_S),
             "max_runs_per_day": self.config.daemon.max_runs_per_day,
             "breaker_open": self._breaker_open(now),
+            "consecutive_failures": self._consecutive_failures,
             "paused": self._paused,
             "stopping": self._stop.is_set(),
         }
@@ -267,19 +276,73 @@ class DaemonLoop:
                     discovered=discovered, dispatched=item.item_id, outcome="abandoned"
                 )
             self.dstore.mark_claimed(item.item_id, now)
-        outcome = self._dispatch(item, source, resume_run_id=None)
+        if item.run_id is not None:
+            outcome = self._resume(item, source, now)
+        else:
+            outcome = self._dispatch(item, source, resume_run_id=None)
         return TickResult(discovered=discovered, dispatched=item.item_id, outcome=outcome)
 
+    def _resume(self, item: WorkItem, source: WorkSource, now: float) -> TickOutcome:
+        """Resume the run recovery pinned on a queued item — or, past the
+        per-item resume budget, settle that run as a failed attempt so a
+        plan that keeps getting interrupted cannot burn engine wall clock
+        forever (#234)."""
+        run_id = item.run_id
+        assert run_id is not None
+        resumes = self.dstore.resumes_for_item(item.item_id)
+        budget = self.config.daemon.max_resumes_per_item
+        if resumes >= budget:
+            self._notify(
+                f"{item.item_id}: {run_id} interrupted again after {resumes} resume(s) "
+                f"(budget {budget}); settling as a failed attempt"
+            )
+            return self._settle(
+                item,
+                source,
+                run_id,
+                None,
+                StateError(f"run {run_id} interrupted; resume budget ({budget}) exhausted"),
+            )
+        # A dead process leaves its microVMs alive; resume re-provisions
+        # under the same names and `sbx create` refuses a name that exists
+        # (field: SIGKILL mid-run → 'sandbox already exists' on the very
+        # next start).
+        self._remove_stale_run_sandboxes(run_id)
+        self._notify(f"resuming {run_id} for {item.item_id} (resume {resumes + 1}/{budget})")
+        return self._dispatch(item, source, resume_run_id=run_id)
+
     # -- discovery ---------------------------------------------------------------------
+
+    # Poll backoff doubles per consecutive failure, from one poll interval up
+    # to this ceiling; a source that is down for an hour is polled every 30
+    # minutes, not every tick.
+    SOURCE_BACKOFF_MAX_S = 1800.0
 
     def _discover(self, now: float) -> int:
         new = 0
         for source in self.sources:
+            if now < self._source_next_poll.get(source.name, 0.0):
+                continue
             try:
                 found = source.poll()
             except Exception:
-                logger.warning("source %s poll failed", source.name, exc_info=True)
+                failures = self._source_failures.get(source.name, 0) + 1
+                self._source_failures[source.name] = failures
+                delay = min(
+                    self.config.daemon.poll_interval_s * 2**failures, self.SOURCE_BACKOFF_MAX_S
+                )
+                self._source_next_poll[source.name] = now + delay
+                logger.warning(
+                    "source %s poll failed (%d in a row); next poll in %.0fs",
+                    source.name,
+                    failures,
+                    delay,
+                    exc_info=True,
+                )
                 continue
+            if self._source_failures.pop(source.name, 0):
+                self._source_next_poll.pop(source.name, None)
+                self._notify(f"source {source.name} polling recovered")
             for item in found:
                 if self.dstore.upsert_new(item, now):
                     new += 1
@@ -301,6 +364,9 @@ class DaemonLoop:
             self.dstore.mark_running(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
             source.report_started(item, run_id)
+        else:
+            self.dstore.mark_resuming(item.item_id, run_id, now)
+            item = self.dstore.get(item.item_id) or item
         item_config = self._item_config(item)
         bus = EventBus()
         engine = LoopEngine(
@@ -392,7 +458,7 @@ class DaemonLoop:
             self._collect_backlog(run_id, source)
             self.dstore.mark_done(item.item_id, now)
             self.dstore.finish_ledger(run_id, "done", now)
-            self._consecutive_failures = 0
+            self._set_breaker(None, 0)
             source.report_success(item, report)
             self._frontend_finished(item, report)
             self._notify(
@@ -413,7 +479,7 @@ class DaemonLoop:
             return "delivery_failed"
         reason = str(error) if error is not None else f"run ended {report.state}"
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
-        self._consecutive_failures += 1
+        self._set_breaker(self._breaker_opened_at, self._consecutive_failures + 1)
         self.dstore.finish_ledger(run_id, "failed", now)
         if attempts_left > 0:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=True)
@@ -427,7 +493,7 @@ class DaemonLoop:
             outcome = "abandoned"
         self._frontend_finished(item, report)
         if self._consecutive_failures >= self.config.daemon.max_consecutive_failures:
-            self._breaker_opened_at = now
+            self._set_breaker(now, self._consecutive_failures)
             self._notify(
                 f"🛑 circuit breaker opened after {self._consecutive_failures} consecutive "
                 f"failures; pausing dispatch for {self.config.daemon.breaker_cooldown_s:.0f}s"
@@ -458,14 +524,18 @@ class DaemonLoop:
         self._frontend_finished(item, report)
         return "cancelled"
 
+    def _set_breaker(self, opened_at: float | None, consecutive_failures: int) -> None:
+        self._breaker_opened_at = opened_at
+        self._consecutive_failures = consecutive_failures
+        self.dstore.set_breaker(opened_at, consecutive_failures)
+
     def _breaker_open(self, now: float) -> bool:
         if self._breaker_opened_at is None:
             return False
         if now - self._breaker_opened_at >= self.config.daemon.breaker_cooldown_s:
             # Half-open: allow one item through; a success resets, a failure
             # re-opens via the counter.
-            self._breaker_opened_at = None
-            self._consecutive_failures = max(self._consecutive_failures - 1, 0)
+            self._set_breaker(None, max(self._consecutive_failures - 1, 0))
             self._notify("circuit breaker half-open; allowing one item")
             return False
         return True
@@ -570,7 +640,14 @@ class DaemonLoop:
     # -- recovery ------------------------------------------------------------------------
 
     def recover(self) -> None:
-        """Reconcile items left ``running`` by a previous process."""
+        """Reconcile items left ``running`` by a previous process.
+
+        Finished runs are settled here; an interrupted run is only *queued
+        for resume* — the actual resume happens in :meth:`tick`, behind the
+        breaker / daily cap / pause gate and the per-item resume budget.
+        Recovery used to dispatch resumes directly, so a daemon restarting
+        into a bad state (breaker open, cap spent, operator-paused) resumed
+        anyway (#254)."""
         for item in self.dstore.running_items():
             source = self._source_for(item)
             now = self.clock()
@@ -597,17 +674,12 @@ class DaemonLoop:
             elif record.state in RESUMABLE_RUN_STATES:
                 last = self.store.last_event_ts(item.run_id)
                 self._notify(
-                    f"recovery: resuming {item.run_id} for {item.item_id} "
+                    f"recovery: {item.run_id} for {item.item_id} queued for resume "
                     f"(last activity {self.clock() - last:.0f}s ago)"
                     if last
-                    else f"recovery: resuming {item.run_id} for {item.item_id}"
+                    else f"recovery: {item.run_id} for {item.item_id} queued for resume"
                 )
-                # A dead process leaves its microVMs alive; resume
-                # re-provisions under the same names and `sbx create` refuses
-                # a name that exists (field: SIGKILL mid-run → 'sandbox
-                # already exists' on the very next start).
-                self._remove_stale_run_sandboxes(item.run_id)
-                self._dispatch(item, source, resume_run_id=item.run_id)
+                self.dstore.mark_resume_pending(item.item_id, now)
             else:
                 self.dstore.mark_requeued_unstarted(item.item_id, now)
 

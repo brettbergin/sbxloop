@@ -126,6 +126,55 @@ class TestQueueAndAttempts:
         assert got.state == "queued" and got.claimed is True and got.run_id is None
 
 
+class TestResumeAndBreaker:
+    def test_resume_pending_goes_first_and_skips_backoff(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("1"), now=1.0)
+        store.upsert_new(item("2"), now=2.0)
+        store.mark_claimed("gh:2", now=2.0)
+        store.mark_running("gh:2", "r2", now=3.0)  # attempts -> 1
+        store.mark_resume_pending("gh:2", now=4.0)
+        # gh:1 is older and has no backoff, but the interrupted run is
+        # in-flight work and goes first — regardless of gh:2's backoff.
+        got = store.next_queued(now=4.0, backoff_s=900.0)
+        assert got is not None and got.item_id == "gh:2" and got.run_id == "r2"
+
+    def test_mark_resuming_records_resume_and_keeps_attempts(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claimed("gh:7", now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_resume_pending("gh:7", now=3.0)
+        store.mark_resuming("gh:7", "r1", now=4.0)
+        got = store.get("gh:7")
+        assert got is not None and got.state == "running" and got.attempts == 1
+        assert store.resumes_for_item("gh:7") == 1
+        assert store.resumes_since(3.5) == 1 and store.resumes_since(4.5) == 0
+        # The daily cap counts fresh starts AND resumes.
+        assert store.runs_started_since(0) == 2
+        with pytest.raises(KeyError):
+            store.mark_resuming("gh:7", "other-run", now=5.0)
+
+    def test_requeue_after_failure_unpins_the_run(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_failed("gh:7", "boom", now=3.0, requeue=True)
+        got = store.get("gh:7")
+        assert got is not None and got.state == "queued" and got.run_id is None
+        store.mark_running("gh:7", "r2", now=4.0)
+        store.mark_failed("gh:7", "boom", now=5.0, requeue=False)
+        assert store.get("gh:7").run_id == "r2"  # type: ignore[union-attr]
+
+    def test_breaker_roundtrip(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.breaker() == (None, 0)
+        store.set_breaker(1234.5, 3)
+        assert store.breaker() == (1234.5, 3)
+        store.set_breaker(None, 1)
+        assert DaemonStore(tmp_path / "state.db").breaker() == (None, 1)
+
+
 class TestLedgerBacklogThreads:
     def test_rolling_window(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
