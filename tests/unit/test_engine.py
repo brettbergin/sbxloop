@@ -79,7 +79,9 @@ class Harness:
         # Resource guardrails default OFF in the harness: the real worker
         # samples the host filesystem here, so default thresholds would make
         # tests depend on how full the developer's disk is.
-        limits = config_overrides.pop("limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0})
+        limits = config_overrides.pop(
+            "limits", {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0, "mem_abort": 0}
+        )
         config = Config.model_validate(
             {
                 "state_dir": str(self.state_dir),
@@ -1455,6 +1457,23 @@ class TestResourceGuardrail:
         assert result.state == "failed"
         assert [t.state for t in result.tasks] == ["failed"]
         assert "sandbox disk exhausted" in (result.tasks[0].last_feedback or "")
+
+    def test_mem_abort_reason_names_memory(self, harness: Harness) -> None:
+        # #253: /proc/meminfo is Linux-only, so the memory sample is injected
+        # the way _track_resources would record it from a worker event.
+        engine = harness.engine(limits={"disk_warn": 0, "disk_abort": 95.0, "mem_abort": 97.0})
+        engine._last_resources["agent"] = {
+            "level": "abort",
+            "disk_used_pct": 40.0,
+            "mem_used_pct": 98.2,
+        }
+        reason = engine._resource_abort_reason()
+        assert reason is not None
+        assert reason.startswith("sandbox memory exhausted: 98.2%")
+        assert "limits.mem_abort=97.0%" in reason
+        # Disk is named when it is the one that tripped (both crossing).
+        engine._last_resources["agent"]["disk_used_pct"] = 99.0
+        assert (engine._resource_abort_reason() or "").startswith("sandbox disk exhausted")
 
     def test_disk_warn_never_fails_tasks(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])

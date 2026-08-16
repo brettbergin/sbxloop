@@ -668,9 +668,29 @@ where it came from. The notable knobs:
 | `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
 | `[limits]`                             | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                         |
-| `[daemon] workspace_isolation`         | `clone`            | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).        |
-| `[daemon] refresh_workspace`           | `true`             | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                         |
-| `[daemon] state_dir`                   | unset              | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above).   |
+
+test failure.
+exhausted" error instead of letting an in-VM OOM surface as an inexplicable
+memory transiently) fails the task with an explicit "sandbox memory
+a warning; `mem_abort` (off by default, because a parallel test run spikes
+Memory pressure is instead made visible through `[limits]`: `mem_warn` emits
+memory flags, so the microVM is whatever size sbx gives every sandbox.
+sbxloop does not size the sandbox: `sbx create` is called without CPU or
+
+pytest run's first traceback and its failure summary both survive.
+critic keeps the first 2 KB and the last 4 KB of each command, so a long
+a starting point (4 h wall clock, tool cap 80). Verify output handed to the
+clock. [`contrib/presets/large-repo.toml`](contrib/presets/large-repo.toml) is
+minutes of test time, and 20 tasks × 3 attempts × verify presses on the wall
+packages to orient in — wants more headroom: one verify pass alone can be
+small greenfield project. A large existing repo — thousands of tests, several
+The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
+
+### Sizing budgets for a larger repository
+
+| `[daemon] workspace_isolation` | `clone` | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning). |
+| `[daemon] refresh_workspace` | `true` | `git fetch` + fast-forward the workspace checkout before each fresh daemon run. |
+| `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
 
 ## Repository layout
 

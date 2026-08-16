@@ -41,6 +41,13 @@ EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 OUTPUT_CLIP = 6_000
+# Verify output keeps head + tail (#253): a pytest run over hundreds of
+# tests prints the failing assertions in the middle/top of its output and
+# only a "N failed" summary at the bottom, so a tail-only clip handed the
+# critic a summary with no assertion text. The head is the first failure's
+# traceback; the tail is the summary and the last failure.
+VERIFY_HEAD_CLIP = 2_000
+VERIFY_TAIL_CLIP = 4_000
 
 # Persona label per phase prompt: stamped onto the job's agent.* events (via
 # WorkerClient.submit) so the transcript header says WHO is responding
@@ -83,6 +90,18 @@ def clip(text: str | None, limit: int = OUTPUT_CLIP) -> str:
     if len(text) <= limit:
         return text
     return f"...(clipped)...\n{text[-limit:]}"
+
+
+def clip_head_tail(
+    text: str | None, head: int = VERIFY_HEAD_CLIP, tail: int = VERIFY_TAIL_CLIP
+) -> str:
+    """Keep the first ``head`` and last ``tail`` characters, eliding the
+    middle with a marker that says how much was dropped."""
+    text = text or ""
+    if len(text) <= head + tail:
+        return text
+    dropped = len(text) - head - tail
+    return f"{text[:head]}\n...(clipped {dropped} chars)...\n{text[-tail:]}"
 
 
 class PhaseRunner:
@@ -506,7 +525,7 @@ class PhaseRunner:
         failures: list[str] = []
         results: list[str] = []
         for result in self.shell_batch(commands) if commands else []:
-            output = clip(result.output, 1_500)
+            output = clip_head_tail(result.output)
             results.append(f"$ {result.command}\n(exit {result.exit_code})\n{output}")
             if result.exit_code != 0:
                 failures.append(

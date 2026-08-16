@@ -34,6 +34,7 @@ class JobRunner:
         disk_warn: float = 0.0,
         disk_abort: float = 0.0,
         mem_warn: float = 0.0,
+        mem_abort: float = 0.0,
     ) -> None:
         self.job = job
         self.events_path = events_path
@@ -43,6 +44,7 @@ class JobRunner:
         self.disk_warn = disk_warn
         self.disk_abort = disk_abort
         self.mem_warn = mem_warn
+        self.mem_abort = mem_abort
         self._resource_level = "ok"
         self._resource_abort: str | None = None
 
@@ -75,9 +77,10 @@ class JobRunner:
                 heartbeat_stop.set()
 
             if self._resource_abort and result.status != "ok":
-                # The sandbox blew past disk_abort while this job ran: name
-                # the real cause instead of whatever confusing failure the
-                # in-VM tooling produced on a full disk.
+                # The sandbox blew past disk_abort/mem_abort while this job
+                # ran: name the real cause instead of whatever confusing
+                # failure the in-VM tooling produced on a full disk or under
+                # the OOM killer.
                 original = ""
                 if result.error is not None:
                     original = f"underlying failure: {result.error.type}: {result.error.message}"
@@ -258,6 +261,7 @@ class JobRunner:
             disk_warn=self.disk_warn,
             disk_abort=self.disk_abort,
             mem_warn=self.mem_warn,
+            mem_abort=self.mem_abort,
         )
         writer.emit(EventTypes.SANDBOX_RESOURCES, level=level, **sample)
         if LEVEL_SEVERITY[level] > LEVEL_SEVERITY[self._resource_level]:
@@ -275,9 +279,15 @@ class JobRunner:
         disk = sample.get("disk_used_pct")
         mem = sample.get("mem_used_pct")
         if level == "abort":
+            # Disk wins when both tripped: it is the non-transient one.
+            if isinstance(disk, (int, float)) and self.disk_abort > 0 and disk >= self.disk_abort:
+                return (
+                    f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
+                    f"(disk_abort threshold: {self.disk_abort}%)"
+                )
             return (
-                f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
-                f"(disk_abort threshold: {self.disk_abort}%)"
+                f"sandbox memory exhausted: {mem}% of memory is used "
+                f"(mem_abort threshold: {self.mem_abort}%)"
             )
         parts = []
         if isinstance(disk, (int, float)) and self.disk_warn > 0 and disk >= self.disk_warn:

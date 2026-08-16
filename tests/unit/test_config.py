@@ -260,6 +260,17 @@ def test_limits_defaults(tmp_path: Path) -> None:
     assert config.limits.disk_warn == 85.0
     assert config.limits.disk_abort == 95.0
     assert config.limits.mem_warn == 90.0
+    # #253: memory abort is opt-in — transient spikes are normal under a
+    # parallel test run.
+    assert config.limits.mem_abort == 0.0
+
+
+def test_limits_mem_abort_must_exceed_mem_warn(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text("[limits]\nmem_warn = 90.0\nmem_abort = 85.0\n")
+    with pytest.raises(ConfigError, match="mem_abort"):
+        load_config(cwd=tmp_path, env={})
+    (tmp_path / "sbxloop.toml").write_text("[limits]\nmem_warn = 90.0\nmem_abort = 97.0\n")
+    assert load_config(cwd=tmp_path, env={}).limits.mem_abort == 97.0
 
 
 def test_limits_layers_and_env(tmp_path: Path) -> None:

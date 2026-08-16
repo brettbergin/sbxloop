@@ -6,7 +6,13 @@ from __future__ import annotations
 
 from sbxloop.config import Config
 from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
-from sbxloop.engine.phases import EVIDENCE_COMMANDS, PhaseRunner
+from sbxloop.engine.phases import (
+    EVIDENCE_COMMANDS,
+    VERIFY_HEAD_CLIP,
+    VERIFY_TAIL_CLIP,
+    PhaseRunner,
+    clip_head_tail,
+)
 from sbxloop_worker.protocol import BatchCommandResult, ErrorInfo, JobRequest, JobResult
 
 
@@ -20,8 +26,10 @@ class BatchStubAgent:
         exits: dict[str, int] | None = None,
         verdict: dict[str, str] | None = None,
         batch_error: bool = False,
+        outputs: dict[str, str] | None = None,
     ) -> None:
         self.exits = exits or {}
+        self.outputs = outputs or {}
         self.verdict = verdict or {"verdict": "pass"}
         self.batch_error = batch_error
         self.jobs: list[JobRequest] = []
@@ -40,7 +48,7 @@ class BatchStubAgent:
                 BatchCommandResult(
                     command=command,
                     exit_code=self.exits.get(command, 0),
-                    output=f"output of {command}",
+                    output=self.outputs.get(command, f"output of {command}"),
                 ).model_dump()
                 for command in job.commands
             ]
@@ -93,6 +101,28 @@ class TestVerifyBatching:
         assert "verify command failed: `exit 2` (exit 2)" in outcome.feedback
         assert "$ true\n(exit 0)" in outcome.results
         assert "$ exit 2\n(exit 2)" in outcome.results
+
+    def test_long_output_keeps_head_and_tail(self) -> None:
+        # #253: a long pytest run prints its first traceback near the top
+        # and the "N failed" summary at the bottom; a tail-only clip handed
+        # the critic a summary with no assertion text.
+        head = "FAILED tests/test_a.py::test_x - AssertionError: first\n" + "a" * 3_000
+        tail = "b" * 5_000 + "\n=== 1 failed, 999 passed ==="
+        agent = BatchStubAgent(exits={"pytest -q": 1}, outputs={"pytest -q": head + tail})
+        outcome = runner(agent).verify(record(["pytest -q"]), plan())
+
+        assert not outcome.passed
+        assert "AssertionError: first" in outcome.feedback
+        assert "1 failed, 999 passed" in outcome.feedback
+        assert "...(clipped" in outcome.feedback
+        assert len(outcome.feedback) < VERIFY_HEAD_CLIP + VERIFY_TAIL_CLIP + 200
+        assert "AssertionError: first" in outcome.results
+
+    def test_clip_head_tail_passes_short_text_through(self) -> None:
+        assert clip_head_tail("short", 2, 3) == "short"
+        assert clip_head_tail(None) == ""
+        clipped = clip_head_tail("0123456789", 2, 3)
+        assert clipped.startswith("01\n...(clipped 5 chars)...\n789")
 
     def test_no_commands_submits_no_job(self) -> None:
         agent = BatchStubAgent()

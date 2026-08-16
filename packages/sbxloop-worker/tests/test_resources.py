@@ -79,8 +79,15 @@ class TestClassifyLevel:
         assert classify_level({"disk_used_pct": 85.0}, **self.LIMITS) == "warn"
         assert classify_level({"disk_used_pct": 95.0}, **self.LIMITS) == "abort"
 
-    def test_memory_only_warns(self) -> None:
+    def test_memory_only_warns_without_mem_abort(self) -> None:
         assert classify_level({"mem_used_pct": 99.0}, **self.LIMITS) == "warn"
+
+    def test_mem_abort_levels(self) -> None:
+        # #253: memory abort is opt-in — the host passes 0 unless configured.
+        limits = {**self.LIMITS, "mem_abort": 97.0}
+        assert classify_level({"mem_used_pct": 96.9}, **limits) == "warn"
+        assert classify_level({"mem_used_pct": 97.0}, **limits) == "abort"
+        assert classify_level({"disk_used_pct": 10.0, "mem_used_pct": 99.0}, **limits) == "abort"
 
     def test_empty_sample_is_ok(self) -> None:
         assert classify_level({}, **self.LIMITS) == "ok"
@@ -176,3 +183,39 @@ class TestRunnerTelemetry:
         warnings = [e for e in events if e.type == EventTypes.SANDBOX_RESOURCES_WARNING]
         assert len(warnings) == 1
         assert "memory 95.0% used" in warnings[0].data["message"]
+
+    def test_mem_abort_rewrites_failed_result_naming_memory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #253: an OOM-bound job is diagnosed as memory, not as a full disk.
+        result, events = run_with_sample(
+            tmp_path,
+            monkeypatch,
+            {"disk_used_pct": 10.0, "mem_used_pct": 98.5},
+            job=failing_job(),
+            disk_warn=85.0,
+            disk_abort=95.0,
+            mem_warn=90.0,
+            mem_abort=97.0,
+        )
+        assert result.status == "error"
+        assert result.error.type == "SandboxResourcesExhausted"
+        assert "sandbox memory exhausted" in result.error.message
+        assert "98.5%" in result.error.message
+        assert "disk" not in result.error.message
+        warnings = [e for e in events if e.type == EventTypes.SANDBOX_RESOURCES_WARNING]
+        assert warnings and warnings[0].data["level"] == "abort"
+
+    def test_disk_named_when_both_abort_thresholds_trip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, _ = run_with_sample(
+            tmp_path,
+            monkeypatch,
+            {"disk_used_pct": 99.0, "mem_used_pct": 99.0},
+            job=failing_job(),
+            disk_abort=95.0,
+            mem_abort=97.0,
+        )
+        assert result.status == "error"
+        assert "sandbox disk exhausted" in result.error.message

@@ -587,6 +587,8 @@ class WorkerClient:
                 str(self.limits.disk_abort),
                 "--mem-warn",
                 str(self.limits.mem_warn),
+                "--mem-abort",
+                str(self.limits.mem_abort),
             ]
         # sbx injects secrets through the sandbox session/profile machinery;
         # a bare exec'd process may not see them. Run the worker under a

@@ -95,12 +95,13 @@ Envelope: `{v, ts, run_id, job_id?, type, data}` — one JSON object per line.
 disk usage of the workspace filesystem (statvfs), memory from
 `/proc/meminfo`, 1-minute load average, plus a guardrail `level`
 (`ok`/`warn`/`abort`) classified against the `--disk-warn`/`--disk-abort`/
-`--mem-warn` thresholds the host passes from `[limits]`. The host enriches
-the event with the sandbox `role`. Escalations (ok→warn, →abort) emit an
-additional edge-triggered `sandbox.resources_warning`. When a job fails after
-crossing `disk_abort`, the worker rewrites the result error to
-`SandboxResourcesExhausted` so a full disk is diagnosed instead of surfacing
-as whatever confusing error the in-VM tooling produced. Query history with
+`--mem-warn`/`--mem-abort` thresholds the host passes from `[limits]`. The
+host enriches the event with the sandbox `role`. Escalations (ok→warn,
+→abort) emit an additional edge-triggered `sandbox.resources_warning`. When a
+job fails after crossing `disk_abort` or `mem_abort`, the worker rewrites the
+result error to `SandboxResourcesExhausted` so a full disk or an OOM is
+diagnosed instead of surfacing as whatever confusing error the in-VM tooling
+produced. Query history with
 `sbxloop logs <run> --type-prefix sandbox.resources`.
 
 ## GitHub ops

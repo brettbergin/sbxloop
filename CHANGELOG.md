@@ -128,6 +128,15 @@ All notable changes to sbxloop are documented here. The project adheres to
   allowlist so both downloads actually complete. `sbxloop doctor --deep`
   gains a `python-version` conformance row reporting the template's own
   `python3` against the pinned series.
+- Budgets and resources for larger repositories (#253): verify output handed
+  to the critic keeps the first 2 KB and the last 4 KB of each command
+  (previously the last 1.5 KB only, so a long pytest run's failure summary
+  arrived without any assertion text); new `[limits] mem_abort` threshold
+  (off by default) fails the task with an explicit "sandbox memory exhausted"
+  error the way `disk_abort` does for disk, instead of an in-VM OOM surfacing
+  as a confusing test failure; `contrib/presets/large-repo.toml` documents a
+  4 h wall clock / 80 tool-call preset and the fact that sbxloop passes no
+  CPU/memory sizing to `sbx create`.
 
 - Daemon guardrails now cover recovery, restarts and multi-daemon setups
   (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted

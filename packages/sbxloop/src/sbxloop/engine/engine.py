@@ -1254,15 +1254,23 @@ class LoopEngine:
 
     def _resource_abort_reason(self) -> str | None:
         """Non-None when the agent sandbox's last resource sample crossed
-        the disk_abort threshold (the worker classifies; the level rides on
-        the event)."""
+        an abort threshold (the worker classifies; the level rides on the
+        event). Names the resource that tripped so an OOM-bound task is not
+        diagnosed as a full disk (#253)."""
         sample = self._last_resources.get("agent")
-        if sample and sample.get("level") == "abort":
+        if not sample or sample.get("level") != "abort":
+            return None
+        limits = self.config.limits
+        disk = sample.get("disk_used_pct")
+        if isinstance(disk, (int, float)) and limits.disk_abort > 0 and disk >= limits.disk_abort:
             return (
-                f"sandbox disk exhausted: {sample.get('disk_used_pct')}% of the workspace "
-                f"filesystem is used (limits.disk_abort={self.config.limits.disk_abort}%)"
+                f"sandbox disk exhausted: {disk}% of the workspace filesystem is used "
+                f"(limits.disk_abort={limits.disk_abort}%)"
             )
-        return None
+        return (
+            f"sandbox memory exhausted: {sample.get('mem_used_pct')}% of memory is used "
+            f"(limits.mem_abort={limits.mem_abort}%)"
+        )
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
         if self._cancel_event.is_set():

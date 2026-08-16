@@ -1953,6 +1953,9 @@ exclude = [
 ]
 
 [budgets]
+# Sized for a small greenfield project. A large existing repo (thousands of
+# tests, a multi-package tree to orient in) wants a bigger wall clock and
+# tool cap — see contrib/presets/large-repo.toml.
 max_revisions_per_task = 2
 max_replans_per_task = 1
 max_tasks = 20
@@ -1964,10 +1967,12 @@ max_tool_calls_per_phase = 40   # 0 = unbounded; past it the agent is told to wr
 # Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
 # the worker heartbeat and shown as a gauge in the TUI status panel.
 # Crossing disk_abort fails the current task with an explicit
-# "sandbox disk exhausted" error.
+# "sandbox disk exhausted" error; mem_abort does the same for memory (off by
+# default: a parallel test run legitimately spikes memory for a heartbeat).
 disk_warn = 85.0
 disk_abort = 95.0
 mem_warn = 90.0
+mem_abort = 0.0
 
 [daemon]
 # `sbxloop daemon` — the always-on outer loop. Discovers work and runs each

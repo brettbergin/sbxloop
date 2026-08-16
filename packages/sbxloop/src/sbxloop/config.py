@@ -250,26 +250,35 @@ class Limits(_ConfigModel):
     Thresholds are percent-used of the workspace filesystem / memory; 0
     disables a guardrail. Crossing a warn threshold emits a prominent
     ``sandbox.resources_warning`` event and escalates the TUI gauge;
-    crossing ``disk_abort`` fails the current task with an explicit
-    "sandbox disk exhausted" error instead of letting in-VM tooling fail
-    confusingly on a full disk.
+    crossing ``disk_abort`` / ``mem_abort`` fails the current task with an
+    explicit "sandbox disk/memory exhausted" error instead of letting in-VM
+    tooling fail confusingly on a full disk or under the OOM killer.
+
+    ``mem_abort`` is off by default (#253): sbxloop cannot size the microVM,
+    and a healthy parallel test run on a large repo legitimately spikes
+    MemAvailable for a heartbeat or two — pressure that resolves itself,
+    unlike a full disk. Opt in when an in-VM OOM has been surfacing as a
+    confusing test failure.
     """
 
     disk_warn: float = 85.0
     disk_abort: float = 95.0
     mem_warn: float = 90.0
+    mem_abort: float = 0.0
 
     @model_validator(mode="after")
     def _check_thresholds(self) -> Limits:
-        for name in ("disk_warn", "disk_abort", "mem_warn"):
+        for name in ("disk_warn", "disk_abort", "mem_warn", "mem_abort"):
             value = getattr(self, name)
             if value < 0 or value > 100:
                 raise ValueError(f"limits.{name} must be a percentage in 0..100, got {value}")
-        if 0 < self.disk_abort <= self.disk_warn:
-            raise ValueError(
-                f"limits.disk_abort ({self.disk_abort}) must be greater than "
-                f"limits.disk_warn ({self.disk_warn})"
-            )
+        for warn, abort in (("disk_warn", "disk_abort"), ("mem_warn", "mem_abort")):
+            warn_value, abort_value = getattr(self, warn), getattr(self, abort)
+            if 0 < abort_value <= warn_value:
+                raise ValueError(
+                    f"limits.{abort} ({abort_value}) must be greater than "
+                    f"limits.{warn} ({warn_value})"
+                )
         return self
 
 
