@@ -302,3 +302,81 @@ def test_limits_abort_must_exceed_warn(tmp_path: Path) -> None:
 def test_limits_must_be_percentages(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"0\.\.100"):
         load_config(cwd=tmp_path, env={"SBXLOOP_LIMITS__DISK_WARN": "150"})
+
+
+class TestStateDirDefault:
+    """#224: the relative ``.sbxloop`` default meant "wherever the shell
+    stood" — state scattered into checkouts and an empty ``status`` from any
+    other directory. The default is now per-user; relative stays opt-in."""
+
+    def test_default_is_per_user_not_cwd(self, tmp_path: Path) -> None:
+        # HOME is tmp_path (autouse fixture); cwd is a different directory.
+        project = tmp_path / "proj"
+        project.mkdir()
+        config = load_config(cwd=project, env={})
+        assert config.state_dir == tmp_path / ".sbxloop"
+        assert config.state_dir.is_absolute()
+
+    def test_relative_opt_in_is_anchored_at_the_config_root(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "sbxloop.toml").write_text('state_dir = ".sbxloop"\n')
+        config, sources = load_config_with_sources(cwd=project, env={})
+        assert config.state_dir == project / ".sbxloop"
+        assert sources["state_dir"] == "sbxloop.toml"
+
+    def test_tilde_expands(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('state_dir = "~/elsewhere"\n')
+        config = load_config(cwd=tmp_path, env={})
+        assert config.state_dir == tmp_path / "elsewhere"
+
+    def test_env_override_wins(self, tmp_path: Path) -> None:
+        env = {"SBXLOOP_STATE_DIR": str(tmp_path / "explicit")}
+        assert load_config(cwd=tmp_path, env=env).state_dir == tmp_path / "explicit"
+
+
+class TestUserConfigLayer:
+    """``~/.config/sbxloop/sbxloop.toml`` is the lowest layer: it carries
+    operator-level defaults and every project-level source overrides it."""
+
+    def _write_user(self, home: Path, body: str, xdg: Path | None = None) -> None:
+        root = (xdg or home / ".config") / "sbxloop"
+        root.mkdir(parents=True)
+        (root / "sbxloop.toml").write_text(body)
+
+    def test_read_from_home_config(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        project = tmp_path / "proj"
+        project.mkdir()
+        self._write_user(home, 'model = "gpt-5"\napp_name = "mine"\n')
+        config, sources = load_config_with_sources(cwd=project, env={"HOME": str(home)})
+        assert config.model == "gpt-5"
+        assert config.app_name == "mine"
+        assert sources["model"] == "user config"
+
+    def test_xdg_config_home_takes_priority_over_home(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        xdg = tmp_path / "xdg"
+        self._write_user(home, 'model = "from-home"\n')
+        self._write_user(home, 'model = "from-xdg"\n', xdg=xdg)
+        env = {"HOME": str(home), "XDG_CONFIG_HOME": str(xdg)}
+        assert load_config(cwd=tmp_path, env=env).model == "from-xdg"
+
+    def test_project_layers_override_user_config(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        project = tmp_path / "proj"
+        project.mkdir()
+        self._write_user(home, 'model = "user"\n[budgets]\nmax_tasks = 3\n')
+        (project / "pyproject.toml").write_text('[tool.sbxloop]\nmodel = "pyproject"\n')
+        config, sources = load_config_with_sources(cwd=project, env={"HOME": str(home)})
+        assert config.model == "pyproject"
+        assert sources["model"] == "pyproject.toml"
+        # untouched keys still flow up from the user layer
+        assert config.budgets.max_tasks == 3
+        assert sources["budgets.max_tasks"] == "user config"
+
+    def test_hermetic_env_never_reads_the_real_home(self, tmp_path: Path) -> None:
+        # env={} names no HOME/XDG_CONFIG_HOME → no user layer at all, even
+        # though Path.home() (the autouse tmp HOME) has a file.
+        self._write_user(tmp_path, 'model = "leak"\n')
+        assert load_config(cwd=tmp_path, env={}).model == "auto"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -538,6 +539,42 @@ class TestDoctor:
         assert result.exit_code == 0
         assert "sbx binary" in result.output
         assert "FAIL" not in result.output
+
+    def test_doctor_hints_at_legacy_relative_state_dir(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#224: a ``./.sbxloop`` from the former relative default is
+        silently ignored once state_dir defaults to ``~/.sbxloop``; doctor
+        must say so (soft) — unless the operator opted in explicitly."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.setenv("HOME", str(workdir / "home"))
+        (workdir / ".sbxloop").mkdir()
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output  # warn, not FAIL
+        assert "legacy state dir" in result.output
+        # rich folds the detail column, so check the remedy text unwrapped
+        from sbxloop.cli.doctor import collect_checks
+
+        (legacy,) = [c for c in collect_checks(dict(os.environ)) if c.name == "legacy state dir"]
+        assert not legacy.ok and not legacy.hard
+        assert 'state_dir = ".sbxloop"' in legacy.detail
+
+        (workdir / "sbxloop.toml").write_text('state_dir = ".sbxloop"\n')
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "legacy state dir" not in result.output
+
+    def test_doctor_no_legacy_hint_when_default_is_here(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # HOME == cwd (autouse fixture): ./.sbxloop *is* the default state dir.
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        (workdir / ".sbxloop").mkdir()
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "legacy state dir" not in result.output
 
     def test_doctor_fails_without_tokens(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

@@ -14,12 +14,13 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
 import sbxloop
-from sbxloop.config import load_config
+from sbxloop.config import load_config, load_config_with_sources
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.bake import load_bake_record
@@ -59,7 +60,7 @@ def collect_checks(
     cli: SbxCLI | None = None,
     progress: ProgressFn | None = None,
 ) -> list[Check]:
-    config = load_config(env=env)
+    config, sources = load_config_with_sources(env=env)
     cli = cli or SbxCLI(app_name=config.app_name or None)
     checks: list[Check] = []
     report = progress or (lambda _message: None)
@@ -352,7 +353,34 @@ def collect_checks(
     except OSError as exc:
         checks.append(Check("state dir", False, f"not writable: {exc}"))
 
+    legacy = _legacy_state_dir(config.state_dir, sources)
+    if legacy is not None:
+        checks.append(
+            Check(
+                "legacy state dir",
+                False,
+                f"{legacy} exists but state_dir is unconfigured, so runs, "
+                f"status and logs now use {config.state_dir}; set "
+                'state_dir = ".sbxloop" in sbxloop.toml to keep project-scoped '
+                "state, or move it to the new location",
+                hard=False,
+            )
+        )
+
     return checks
+
+
+def _legacy_state_dir(state_dir: Path, sources: dict[str, str]) -> Path | None:
+    """A ``./.sbxloop`` left by the former relative default that
+    an unconfigured run would now silently ignore. Only reported when the
+    default is in effect and points elsewhere: an explicit relative
+    ``state_dir = ".sbxloop"`` is the supported project-scoped opt-in."""
+    if sources.get("state_dir") != "default":
+        return None
+    candidate = Path.cwd() / ".sbxloop"
+    if not candidate.is_dir() or candidate.resolve() == state_dir.resolve():
+        return None
+    return candidate
 
 
 def _clean(detail: str, limit: int = 300) -> str:

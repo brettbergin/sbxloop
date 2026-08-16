@@ -40,6 +40,19 @@ All notable changes to sbxloop are documented here. The project adheres to
   previous stream-everything behaviour is `"verbose"`; the full stream stays
   in `sbxloop logs`.
 
+### Changed
+
+- `state_dir` now defaults to the per-user `~/.sbxloop` instead of the
+  relative `.sbxloop` (#224). The old default meant "wherever the shell was
+  standing": `sbxloop status`/`logs` showed an empty world from any other
+  directory, and a run started from inside a checkout dropped a state dir into
+  it (field run `r5a1d9m9c`; #218 patched the dirty-probe symptom). A relative
+  `state_dir` remains the explicit opt-in for project-scoped state and is now
+  anchored at the config's directory; `~` expands. **Migration:** an existing
+  `./.sbxloop` keeps working when `state_dir = ".sbxloop"` is set in
+  `sbxloop.toml` (or moved to `~/.sbxloop`); `sbxloop doctor` warns when an
+  unconfigured run finds a legacy `./.sbxloop` it would otherwise ignore.
+
 ### Added
 
 - `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed
@@ -107,6 +120,12 @@ All notable changes to sbxloop are documented here. The project adheres to
   no replan budget left, is surfaced but not acted on. Every ruling is a
   `phase.end` event (`status=verify_suspect`, `honored`), shown in the
   Discord bridge and the transcript.
+
+- `~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) is read as
+  the lowest-precedence config layer, below `pyproject.toml [tool.sbxloop]`,
+  for settings that follow the operator rather than the checkout (`model`,
+  `app_name`, `[discord]`). `sbxloop config show` reports it as
+  `user config`.
 
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence

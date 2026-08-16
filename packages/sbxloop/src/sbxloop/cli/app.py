@@ -1858,7 +1858,8 @@ def doctor(
 
 DEFAULT_CONFIG_TOML = """\
 # sbxloop configuration. Every key is optional; these are the defaults.
-# Precedence: SBXLOOP_* env vars > this file > pyproject [tool.sbxloop].
+# Precedence: SBXLOOP_* env vars > this file > pyproject [tool.sbxloop]
+# > ~/.config/sbxloop/sbxloop.toml (user-level defaults).
 
 # Copilot model for agent sessions ("auto" lets the SDK choose).
 model = "auto"
@@ -1867,8 +1868,10 @@ model = "auto"
 # If set, that isolated state needs its own `sbx --app-name <name> login`
 # and `sbx --app-name <name> policy init balanced`.
 app_name = ""
-# Where run state (SQLite) and per-run workspaces live.
-state_dir = ".sbxloop"
+# Where run state (SQLite) and per-run workspaces live. Per-user by default
+# so status/logs see the same runs from any directory; a relative path
+# (e.g. ".sbxloop") scopes state to this project instead.
+state_dir = "~/.sbxloop"
 # Keep sandboxes around after a run (for debugging).
 keep_sandboxes = false
 # Keep the pair alive only when a run fails; inspect with `sbxloop shell <run>`.

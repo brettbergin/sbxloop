@@ -217,6 +217,7 @@ def test_tui_run_sigterm_removes_both_sandboxes(fake_sbx: FakeSbx, tmp_path: Pat
             "SBXLOOP_WORKER_PYTHON": sys.executable,
             "SBXLOOP_INSTALL_WORKERS": "false",
             "SBXLOOP_GITHUB__REPO": "owner/repo",  # so the pair has both roles
+            "SBXLOOP_STATE_DIR": str(workdir / ".sbxloop"),
         }
     )
     log_path = workdir / "run.log"

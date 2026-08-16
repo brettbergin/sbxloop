@@ -648,9 +648,11 @@ secret or registrations owned by other tools.
 ## Configuration
 
 Configuration resolves, in order, from `SBXLOOP_*` environment variables,
-`sbxloop.toml`, and `pyproject.toml [tool.sbxloop]`. `sbxloop init` writes a
-commented starter file; `sbxloop config show` prints every resolved value and
-where it came from. The notable knobs:
+`./sbxloop.toml`, `pyproject.toml [tool.sbxloop]`, and a user-level
+`~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) for settings
+that follow you rather than the checkout. `sbxloop init` writes a commented
+starter file; `sbxloop config show` prints every resolved value and where it
+came from. The notable knobs:
 
 | Key                                    | Default            | Meaning                                                                                                 |
 | -------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
