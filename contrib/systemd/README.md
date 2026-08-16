@@ -15,6 +15,21 @@
    sbxloop doctor                   # confirms tokens, sbx, and the discord bridge row
    ```
 
+   Give the daemon a **dedicated clone nobody edits** as its workspace and
+   point `[sandbox] workspace` at it — never the checkout you work in
+   (the daemon fetches and fast-forwards it before every run, and runs
+   proceed from committed HEAD even when the tree is dirty):
+
+   ```bash
+   git clone https://github.com/you/your-repo ~/sbxloop-runner/src
+   # sbxloop.toml: [sandbox] workspace = "src"
+   ```
+
+   Run state (per-run clones, artifacts, SQLite) lands under
+   `~/.local/state/sbxloop/sbxloop-runner/` by default, outside the
+   workspace; set `[daemon] state_dir` to choose. The daemon prints the
+   resolved location on start.
+
 2. Install the unit, pointing `WorkingDirectory` at that directory if you
    used a different path:
 

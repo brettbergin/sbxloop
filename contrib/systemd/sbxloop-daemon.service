@@ -10,8 +10,10 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # The project directory: sbxloop.toml, .env (COPILOT_GITHUB_TOKEN, GH_TOKEN,
-# DISCORD_BOT_TOKEN), and the .sbxloop/ state dir live here. Tokens are
-# loaded from .env by sbxloop itself, so no EnvironmentFile is needed.
+# DISCORD_BOT_TOKEN) and the inbox live here; run state goes to
+# ~/.local/state/sbxloop/<this dir's name>/ unless [daemon] state_dir says
+# otherwise. Tokens are loaded from .env by sbxloop itself, so no
+# EnvironmentFile is needed.
 WorkingDirectory=%h/sbxloop-runner
 ExecStart=%h/.local/bin/sbxloop daemon
 Restart=always

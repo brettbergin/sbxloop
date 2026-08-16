@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import queue
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, NoReturn, cast, get_args
 
 import typer
 from pydantic import ValidationError
@@ -32,11 +33,14 @@ from sbxloop.config import (
     load_config_with_sources,
     load_dotenv_file,
 )
+from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
+from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
+from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
@@ -70,9 +74,15 @@ config_app = typer.Typer(help="Inspect configuration.", no_args_is_help=True)
 secrets_app = typer.Typer(
     help="Manage the sbx custom-secret registrations sbxloop owns.", no_args_is_help=True
 )
+# `sbxloop daemon` runs the loop; `sbxloop daemon items|abandon|retry|requeue`
+# are the operator's item controls (#229) and `sbxloop daemon ctl` drives a
+# running daemon (#232), so the group's callback IS the daemon and only
+# defers when a subcommand was named.
+daemon_app = typer.Typer(invoke_without_command=True)
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(config_app, name="config")
 app.add_typer(secrets_app, name="secrets")
+app.add_typer(daemon_app, name="daemon")
 
 console = Console()
 
@@ -383,6 +393,20 @@ def _print_workspace_clone_summary(result: RunResult, config: Config) -> None:
         console.print(f"  fetch into your checkout: [cyan]git fetch {target} {branch}[/]")
     else:
         console.print(f"  harvested changes are uncommitted in {target} (branch {branch})")
+    _print_retention_note(config)
+
+
+def _print_retention_note(config: Config) -> None:
+    """The run directory is the only copy of the work until it is fetched or
+    delivered — say how long it stays: the daemon sweeps on that window and
+    `sbxloop gc` uses it as the default."""
+    days = config.daemon.prune_runs_after_days
+    if days <= 0:
+        return
+    console.print(
+        f"  [dim]retention: run dirs older than {days:g}d are removed by the daemon / "
+        "[cyan]sbxloop gc[/] — fetch results before then[/]"
+    )
 
 
 def _finish(result: RunResult, config: Config) -> None:
@@ -1177,6 +1201,74 @@ def sandbox_prune(
         raise typer.Exit(1)
 
 
+@app.command()
+def gc(
+    older_than: Annotated[
+        float | None,
+        typer.Option(
+            "--older-than",
+            help="Days a finished run must be untouched before its directory is removed "
+            "(default: [daemon] prune_runs_after_days).",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Classify and report; remove nothing."),
+    ] = False,
+) -> None:
+    """Remove old run directories (workspace clones, harvested artifacts).
+
+    Same policy as the daemon's daily sweep: only runs that are terminal
+    (completed/failed/cancelled), past the retention window, not
+    kept-for-debugging and whose delivery did not fail. Run rows in the
+    state DB — the audit trail — are never removed.
+    """
+    config = load_config()
+    days = config.daemon.prune_runs_after_days if older_than is None else older_than
+    # typer parses "nan" and "inf" as valid floats; NaN compares false
+    # against everything, which would make EVERY terminal run "past
+    # retention" — the one input this destructive command must not accept.
+    if not math.isfinite(days) or days < 0:
+        console.print("[bold red]--older-than must be a finite number of days >= 0[/]")
+        raise typer.Exit(2)
+    store = _store(config)
+    result = prune_run_dirs(store, config.state_dir, older_than_s=days * DAY_S, dry_run=dry_run)
+    if not result.verdicts:
+        console.print(f"no run directories under {config.state_dir / 'runs'}")
+        return
+    table = Table(title="sbxloop gc" + (" (dry run)" if dry_run else ""))
+    for column in ("run", "state", "age", "size", "verdict"):
+        table.add_column(column)
+    for v in result.verdicts:
+        table.add_row(
+            v.run_id,
+            v.run_state or "[dim]unknown[/]",
+            format_age(v.age_s),
+            format_bytes(v.size_bytes) if v.prunable else "",
+            ("[red]prune[/] — " if v.prunable else "[green]keep[/] — ") + v.reason,
+        )
+    console.print(table)
+    candidates = result.candidates
+    if not candidates:
+        console.print(f"nothing to prune (retention {days:g}d)")
+        return
+    if dry_run:
+        console.print(
+            f"dry run: {len(candidates)} run dir(s), {format_bytes(result.bytes_freed)}; "
+            "re-run without --dry-run to remove",
+            highlight=False,
+        )
+        return
+    console.print(
+        f"removed {len(result.pruned)} run dir(s), freed {format_bytes(result.bytes_freed)}",
+        highlight=False,
+    )
+    for run_id in result.failed:
+        console.print(f"[yellow]could not remove {run_id}[/] (see log)")
+    if result.failed:
+        raise typer.Exit(1)
+
+
 @config_app.command("show")
 def config_show() -> None:
     """Show the resolved configuration and where each value came from."""
@@ -1286,8 +1378,9 @@ def init(
     console.print(f"wrote {path}")
 
 
-@app.command()
+@daemon_app.callback()
 def daemon(
+    ctx: typer.Context,
     repo: Annotated[
         str | None,
         typer.Option("--repo", help='GitHub repository ("owner/name") to poll for labeled issues.'),
@@ -1319,19 +1412,31 @@ def daemon(
 ) -> None:
     """Run the always-on outer loop: discover work (labeled GitHub issues,
     inbox files), run each item through the inner loop, report back, and
-    mirror the chronology to Discord."""
+    mirror the chronology to Discord. Subcommands inspect and steer
+    individual work items; `sbxloop daemon ctl CMD` talks to the running
+    daemon instead."""
+    if ctx.invoked_subcommand is not None:
+        return
     import logging
 
+    from sbxloop.daemon.control import ControlServer
     from sbxloop.daemon.discord import DiscordBridge
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.loop import DaemonLoop
+    from sbxloop.daemon.paths import resolve_state_dir
     from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels, InboxSource, WorkSource
-    from sbxloop.daemon.store import DaemonStore
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    config = load_config()
+    config, config_sources = load_config_with_sources()
+    # The daemon's state lives at an absolute path outside the workspace
+    # (#255): a relative `.sbxloop` inside the checkout it works on would
+    # accrete a per-run clone there forever.
+    state_choice = resolve_state_dir(
+        config, config_sources, cwd=Path.cwd(), env=os.environ, home=Path.home()
+    )
+    config = config.model_copy(update={"state_dir": state_choice.path})
     daemon_overrides = {
         k: v
         for k, v in (
@@ -1373,6 +1478,9 @@ def daemon(
         console.print("[bold red]--backlog github needs a GitHub repository[/] (--repo).")
         raise typer.Exit(2)
 
+    # Say where the state went: with the anchored default, `sbxloop status`
+    # in the runner dir shows nothing unless SBXLOOP_STATE_DIR points here.
+    console.print(f"state dir: [cyan]{config.state_dir}[/] ({state_choice.reason})")
     store = _store(config)
     dstore = DaemonStore(config.state_dir / "state.db")
     sbx = SbxCLI(app_name=config.app_name or None)
@@ -1391,18 +1499,34 @@ def daemon(
             config.daemon.in_progress_label,
             config.daemon.failed_label,
             config.daemon.backlog_label,
+            config.daemon.delivered_label,
         )
-        sources.append(GitHubIssueSource(github.ops, config.github.repo, labels))
+        sources.append(
+            GitHubIssueSource(
+                github.ops,
+                config.github.repo,
+                labels,
+                on_failure=github.note_failure,
+                close_on_success=config.daemon.close_on_success,
+            )
+        )
 
     if dry_run:
-        for source in sources:
-            for item in source.poll():
-                console.print(
-                    f"[cyan]{item.item_id}[/]  {item.title}" + (f"  {item.url}" if item.url else "")
-                )
-        if github is not None:
-            github.close()
-        raise typer.Exit(0)
+        code = 0
+        try:
+            for source in sources:
+                for item in source.poll():
+                    console.print(
+                        f"[cyan]{item.item_id}[/]  {item.title}"
+                        + (f"  {item.url}" if item.url else "")
+                    )
+        except SbxloopError as exc:
+            console.print(f"[bold red]poll failed:[/] {exc}")
+            code = 1
+        finally:
+            if github is not None:
+                github.close()
+        raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, sources=sources, sbx=sbx)
     bridge: DiscordBridge | None = None
@@ -1415,10 +1539,16 @@ def daemon(
             raise typer.Exit(2) from exc
         loop.frontend = bridge
 
+    ctl = ControlServer(loop, config.state_dir)
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
     try:
         loop.recover()
+        # Only now: an `abandon`/`requeue` served while recover() is still
+        # settling the item it snapshotted would be overwritten by recovery's
+        # own verdict. Requests submitted before this point are refused as
+        # stale, never executed.
+        ctl.start()
         if once:
             result = loop.tick()
             console.print(f"tick: {result}")
@@ -1428,11 +1558,169 @@ def daemon(
         console.print("\n[bold yellow]daemon interrupted[/]")
     finally:
         cleanup_registry.set_quiesce(None)
+        ctl.close()
         if bridge is not None:
             bridge.close()
         if github is not None:
             github.close()
         dstore.close()
+
+
+def _daemon_state_dir() -> Path:
+    # Same resolution as `sbxloop daemon` itself (#255): with the anchored
+    # default the daemon's queue and control queue are not under the runner
+    # dir's `.sbxloop`, so the operator commands must follow the daemon's
+    # rule, not `_store`'s.
+    from sbxloop.daemon.paths import resolve_state_dir
+
+    config, sources = load_config_with_sources()
+    return resolve_state_dir(config, sources, cwd=Path.cwd(), env=os.environ, home=Path.home()).path
+
+
+def _daemon_store() -> DaemonStore:
+    return DaemonStore(_daemon_state_dir() / "state.db")
+
+
+_ITEM_CONTROL_NOTE = (
+    "[dim]a live daemon notices the change within a second: an in-flight run for "
+    "this item is cancelled and the source (issue / inbox file) is told on its next "
+    "tick; with no daemon running, the next daemon start reports it and closes the "
+    "dead run. The item's next dispatch, if any, starts a fresh run.[/]"
+)
+
+
+@daemon_app.command("items")
+def daemon_items(
+    state: Annotated[
+        list[str] | None,
+        typer.Option("--state", "-s", help="Only these states (repeatable)."),
+    ] = None,
+) -> None:
+    """List work items with attempts, pinned run and last error."""
+    from sbxloop.daemon.model import ItemState
+
+    states = tuple(state or ())
+    bad = [s for s in states if s not in get_args(ItemState)]
+    if bad:
+        console.print(f"[bold red]unknown item state:[/] {', '.join(bad)}")
+        raise typer.Exit(2)
+    dstore = _daemon_store()
+    try:
+        items = dstore.items(cast(Any, states) or None)
+    finally:
+        dstore.close()
+    if not items:
+        console.print("no work items")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("item", "state", "attempts", "run", "title", "last error"):
+        table.add_column(col)
+    for i in items:
+        table.add_row(
+            i.item_id,
+            i.state,
+            str(i.attempts),
+            i.run_id or "",
+            i.title[:60],
+            (i.last_error or "").splitlines()[0][:80] if i.last_error else "",
+        )
+    console.print(table)
+
+
+@daemon_app.command("abandon")
+def daemon_abandon(
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+    reason: Annotated[str | None, typer.Option("--reason", help="Recorded as last error.")] = None,
+) -> None:
+    """Give up on a queued or running item; its run will not be resumed."""
+    _item_control("abandon", item_id, reason)
+
+
+@daemon_app.command("retry")
+def daemon_retry(
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+) -> None:
+    """Re-queue an abandoned/cancelled item with attempts reset and a fresh plan (not a resume)."""
+    _item_control("retry", item_id, None)
+
+
+@daemon_app.command("requeue")
+def daemon_requeue(
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+) -> None:
+    """Unpin a running item from its run so the next dispatch starts fresh (attempts kept)."""
+    _item_control("requeue", item_id, None)
+
+
+def _item_control(action: str, item_id: str, reason: str | None) -> None:
+    dstore = _daemon_store()
+    try:
+        now = time.time()
+        if action == "abandon":
+            item = dstore.abandon(item_id, reason or "abandoned by operator", now)
+        elif action == "retry":
+            item = dstore.retry(item_id, now, "re-queued by operator (CLI)")
+        else:
+            item = dstore.requeue(item_id, now)
+    except KeyError:
+        console.print(f"[bold red]unknown work item:[/] {item_id}")
+        raise typer.Exit(2) from None
+    except ValueError as exc:
+        console.print(f"[bold red]{action} refused:[/] {exc}")
+        raise typer.Exit(2) from None
+    finally:
+        dstore.close()
+    # highlight=False: rich would otherwise wrap the attempt count and run id
+    # in colour codes, splitting the plain text a script (or test) greps for.
+    console.print(
+        f"{item.item_id}: [bold]{item.state}[/] (attempts {item.attempts}"
+        + (f", run {item.run_id}" if item.run_id else "")
+        + ")",
+        highlight=False,
+    )
+    console.print(_ITEM_CONTROL_NOTE, highlight=False)
+
+
+# `--retry` belongs to the daemon's `cancel` verb, not to this command: pass
+# unknown options through as words so the CLI and Discord spell it the same.
+@daemon_app.command("ctl", context_settings={"ignore_unknown_options": True})
+def daemon_ctl(
+    command: Annotated[
+        list[str],
+        typer.Argument(
+            help="status | pause | resume | cancel [--retry] | queue | items | abandon <item> "
+            "[reason] | retry <item> | requeue <item> (the Discord !sbx verbs)."
+        ),
+    ],
+    timeout: Annotated[
+        float,
+        typer.Option(
+            "--timeout",
+            help="Seconds to wait for the daemon's reply. A request no daemon picks up in "
+            "time is withdrawn (exit 2); one the daemon has already taken keeps "
+            "executing and is reported as pending (exit 1).",
+        ),
+    ] = DEFAULT_TIMEOUT_S,
+) -> None:
+    """Send a command to the daemon running against this state_dir — the
+    programmatic twin of Discord's `!sbx`, for scripts, cron and remote
+    operators (the bot ignores its own messages by design)."""
+    from sbxloop.daemon.control import ControlClient, plain
+
+    state_dir = _daemon_state_dir()
+    reply = ControlClient(state_dir).submit(" ".join(command), timeout_s=timeout)
+    if reply is None:
+        console.print(
+            f"[bold red]no reply from the daemon[/] within {timeout:g}s — is "
+            f"[cyan]sbxloop daemon[/] running with state dir {state_dir}?"
+        )
+        raise typer.Exit(2)
+    if reply.pending:
+        console.print(f"pending: {plain(reply.text)}", markup=False, highlight=False)
+        raise typer.Exit(1)
+    console.print(plain(reply.text), markup=False, highlight=False)
+    if not reply.ok:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -1692,8 +1980,17 @@ mem_warn = 90.0
 # in_progress_label = "sbxloop:in-progress"
 # failed_label = "sbxloop:failed"
 # backlog_label = "sbxloop:backlog"
-# max_runs_per_day = 12            # rolling 24h window, persisted across restarts
+# delivered_label = "sbxloop:delivered"
+# What a delivered run does to the tracker. Defaults are task-queue
+# semantics: close the source issue (the PR is the reviewable object) and
+# open a per-run tracking issue. For a design/discussion tracker set both
+# false: the source issue gets the summary + delivered_label and stays open
+# until a human merges the PR, and no extra tracking issue is opened.
+# close_on_success = true
+# tracking_issue = true
+# max_runs_per_day = 12           # rolling 24h window, persisted across restarts
 # max_attempts_per_item = 2
+# max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
 # retry_backoff_s = 900.0          # times the attempt number
 # max_consecutive_failures = 3     # circuit breaker ...
 # breaker_cooldown_s = 3600.0      # ... and how long it stays open
@@ -1705,6 +2002,21 @@ mem_warn = 90.0
 # backlog_max_per_run = 5
 # backlog_auto_trigger = false
 # deliver_draft = true             # autonomous PRs arrive as drafts
+# Retention for .sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
+# swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
+# prune_runs_after_days = 14
+# Unattended workspace posture. Point [sandbox] workspace at a dedicated clone
+# nobody edits; before each run the daemon `git fetch`es it and fast-forwards
+# to origin (never merges/rebases), and daemon runs use `clone` isolation so a
+# dirty tree proceeds from HEAD with a warning instead of `auto`'s refusal.
+# workspace_isolation = "clone"    # clone | auto | in-place, for daemon runs
+# refresh_workspace = true
+# Daemon state lives OUTSIDE the workspace, at an absolute path. Unset:
+# $XDG_STATE_HOME/sbxloop/<runner-dir-name> (~/.local/state/...), unless the
+# top-level state_dir is set or a legacy ./.sbxloop/state.db already exists.
+# `sbxloop daemon items|abandon|retry|requeue` follow the same rule;
+# `sbxloop status`/`logs`/`gc` need SBXLOOP_STATE_DIR pointed there.
+# state_dir = "~/.local/state/sbxloop/my-project"
 
 [discord]
 # The daemon's human channel: a gateway bot posts each run's chronology
@@ -1716,11 +2028,12 @@ mem_warn = 90.0
 # channel_id = 123456789012345678
 # command_prefix = "!sbx"          # !sbx status|pause|resume|cancel|queue
 # thread_per_run = true
-# chronology_level = "normal"      # quiet | normal | verbose
+# chronology_level = "normal"      # quiet (lifecycle+links+chat) | normal (tool bursts
+#                                  # digested into one edited line) | verbose (every call)
 # max_message_chars = 1900
 # embeds = true                    # headline / finished / status as embed cards
 # status_line = true               # one per-run message edited as tasks progress
-# tool_batch_lines = 8             # consecutive tool calls per code block
+# tool_batch_lines = 8             # verbose: consecutive tool calls per code block
 """
 
 

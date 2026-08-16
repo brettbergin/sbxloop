@@ -15,7 +15,9 @@ from sbxloop.daemon.discord_format import (
     EMBED_TOTAL_MAX,
     EmbedSpec,
     StatusLine,
+    SteerProgress,
     ToolBatcher,
+    ToolDigest,
     _clip,
     _fence_state,
     daemon_notice,
@@ -26,6 +28,7 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     mask_urls,
     queue_lines,
+    repetitive_streak,
     split_markdown,
     status_embed,
 )
@@ -195,6 +198,12 @@ class TestFormat:
         warn = ev("sandbox.tooling_warning", message="node missing")
         assert texts(format_for_discord(warn)) == ["⚠ tooling: node missing"]
         assert format_for_discord(warn, level="quiet") == []
+        cap = ev("agent.tool_cap", cap=40)
+        assert texts(format_for_discord(cap)) == [
+            "⛔ tool-call ceiling (40) reached — further calls are turned away; the agent was "
+            "told to wrap up and report"
+        ]
+        assert format_for_discord(cap, level="quiet") == []
 
     def test_lifecycle_absorbed_unless_verbose(self) -> None:
         for t, data in (
@@ -209,6 +218,92 @@ class TestFormat:
         assert texts(
             format_for_discord(ev("task.state", task_id="t1", state="done"), level="verbose")
         ) == ["· task t1 → done"]
+
+
+class TestToolDigest:
+    def test_one_line_grows_with_the_burst(self) -> None:
+        d = ToolDigest()
+        assert d.render() == "" and not d.dirty
+        d.add_start("bash", "ls  -la")
+        assert d.dirty
+        assert d.render() == "⚙ 1 tool call (bash) — last: `ls -la`"
+        assert not d.dirty
+        for i in range(20):
+            d.add_start("bash", f"grep -n x file{i}.py")
+        d.add_start("view", "README.md")
+        d.add_start("view", "docs/x.md")
+        d.add_start("bash", ".venv/bin/pytest -q")
+        assert d.render() == ("⚙ 24 tool calls (bash x22, view x2) — last: `.venv/bin/pytest -q`")
+        # a failure counts in the line AND yields its own detail block
+        detail = d.add_end("bash", success=False, exit_code=1, detail="FAILED a\n1 failed")
+        assert detail is not None and detail.text.startswith("✗ `bash` failed (exit 1)")
+        assert d.add_end("bash", success=True, exit_code=0, detail="") is None
+        assert d.render().endswith("`.venv/bin/pytest -q` · ✗ 1 failed")
+
+    def test_backticks_and_long_args_are_tamed(self) -> None:
+        d = ToolDigest()
+        d.add_start("bash", "echo `x` " + "a" * 400)
+        text = d.render()
+        assert "`echo 'x'" in text and len(text) < 200
+
+    def test_repetition_collapses_and_nudges_the_human(self) -> None:
+        d = ToolDigest(cancel_hint="!sbx cancel")
+        for i in range(5):
+            d.add_start("bash", f"grep -F 'exit {i}' /tmp/out | od -c")
+        assert d.repetitive == 0  # below the window
+        d.add_start("bash", "grep -E 'exit 9' /tmp/out | od -c | head")
+        assert d.repetitive == 6
+        assert d.render() == (
+            "⚙ bash x6 similar commands — last: `grep -E 'exit 9' /tmp/out | od -c | head`\n"
+            "⚠ the last 6 bash calls are near-identical — the agent may be stuck; "
+            "`!sbx cancel` stops the run"
+        )
+        # a burst that started differently keeps the full count and adds the warning
+        d2 = ToolDigest()
+        d2.add_start("view", "a.py")
+        d2.add_start("bash", "pytest -q")
+        for i in range(6):
+            d2.add_start("bash", f"grep -n 'exit {i}' /tmp/out")
+        assert d2.render().startswith("⚙ 8 tool calls (bash x7, view) — last:")
+        assert "the last 6 bash calls are near-identical" in d2.render()
+
+    def test_repetitive_streak_needs_same_head_and_similar_text(self) -> None:
+        alternating = [("bash", "grep -n a f"), ("bash", "od -c f")] * 4
+        assert repetitive_streak(alternating) == 0
+        prefixed = [("bash", f"cd /w && LC_ALL=C grep -n 'a{i}' f") for i in range(7)]
+        assert repetitive_streak(prefixed) == 7
+        different_tool = [*prefixed[:-1], ("view", "grep.txt")]
+        assert repetitive_streak(different_tool) == 0
+        assert repetitive_streak(prefixed[:3]) == 0
+
+    def test_long_spiral_collapses_past_the_bounded_tail(self) -> None:
+        # The digest used to keep only a bounded tail of commands, so a 17-call
+        # spiral capped the streak at 13 and never rendered as "x17 similar".
+        d = ToolDigest()
+        for i in range(17):
+            d.add_start("bash", f"grep -n 'exit {i}' /tmp/out | od -c")
+        assert d.repetitive == 17
+        assert d.render().startswith("⚙ bash x17 similar commands — last:")
+        assert "the last 17 bash calls are near-identical" in d.render()
+
+    def test_streak_uses_the_window_mean_not_every_adjacent_pair(self) -> None:
+        # One dissimilar neighbour inside an otherwise near-identical window
+        # does not veto it: the mean over the six-command window is what counts.
+        run = [("bash", f"grep -n 'exit {i}' /tmp/out") for i in range(5)]
+        run.append(("bash", "grep -rIl --include='*.py' 'zzzzzzzzzzzzzzzzzzzzzz' /somewhere/else"))
+        run.extend(("bash", f"grep -n 'exit {i}' /tmp/out") for i in range(5, 9))
+        assert repetitive_streak(run) == 10
+        # ...whereas a run that drifts one flag at a time can keep every adjacent
+        # pair similar while the window's mean falls under the threshold.
+        drift = [("bash", "a" * 6 + "b" * (2 * i)) for i in range(1, 12)]
+        assert repetitive_streak(drift) == 0
+        # a slice whose mean fails ends the streak (0, not the run length); once a
+        # later slice qualifies again the streak restarts from that window rather
+        # than reaching back over the break.
+        same = [("bash", "grep -n 'x' f")] * 6
+        unrelated = [("bash", f"grep {c * 60}") for c in "qzy"]
+        assert repetitive_streak(same + unrelated) == 0
+        assert repetitive_streak(same + unrelated + same) == 8  # < len(run) == 15
 
 
 class TestToolBatcher:
@@ -270,6 +365,75 @@ class TestStatusLine:
         assert not s.dirty
         s.observe(ev("agent.message", content="ignored"))
         assert not s.dirty
+
+
+class TestSteerProgress:
+    def test_where_the_agent_is(self) -> None:
+        p = SteerProgress(cap=40)
+        assert p.render() == "⏳ steer queued; answered at the next checkpoint"
+        p.observe(ev("task.start", task_id="t2", title="Wire CLI"))
+        assert p.render() == (
+            "⏳ steer queued — agent is on `t2` · Wire CLI; answered at the next checkpoint"
+        )
+        p.observe(ev("task.state", task_id="t2", state="executing", revisions=0))
+        for _ in range(12):
+            p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert p.render() == (
+            "⏳ steer queued — agent is mid-**execute** on `t2` · Wire CLI "
+            "(12/40 tool calls so far); answered at the next checkpoint"
+        )
+        # a phase boundary is a checkpoint: the count restarts with the new job
+        p.observe(ev("task.state", task_id="t2", state="verifying", revisions=0))
+        assert "mid-**verify** on `t2` · Wire CLI;" in p.render()
+        p.observe(ev("task.state", task_id="t2", state="executing", revisions=1))
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        p.observe(ev("agent.tool_cap", cap=40, calls=40, tool="bash"))
+        assert "(1/40 tool calls — ceiling reached)" in p.render()
+        p.observe(ev("task.end", task_id="t2", title="Wire CLI", state="done"))
+        assert p.render() == "⏳ steer queued; answered at the next checkpoint"
+
+    def test_production_event_order_keeps_the_planning_phase(self) -> None:
+        # LoopEngine._run_task emits task.state=planning BEFORE task.start
+        # (and the persisted phase first on resume); the start must not
+        # wipe the phase already observed for the same task.
+        p = SteerProgress(cap=40)
+        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
+        p.observe(ev("task.start", task_id="t1", title="Plan it"))
+        assert p.render() == (
+            "⏳ steer queued — agent is mid-**plan** on `t1` · Plan it; "
+            "answered at the next checkpoint"
+        )
+        p.observe(ev("task.state", task_id="t3", state="verifying", revisions=0))
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        p.observe(ev("task.start", task_id="t3", title="Resumed"))
+        assert "mid-**verify** on `t3` · Resumed (1/40 tool calls so far)" in p.render()
+        # a start for a DIFFERENT task still resets the phase and counters
+        p.observe(ev("task.start", task_id="t4", title="Next"))
+        assert p.render() == (
+            "⏳ steer queued — agent is on `t4` · Next; answered at the next checkpoint"
+        )
+
+    def test_unbounded_cap_and_terminal_states(self) -> None:
+        p = SteerProgress(cap=0)  # 0 = unbounded in [budgets]
+        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert "(1 tool call so far)" in p.render()
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert "(2 tool calls so far)" in p.render()
+        assert p.render(state="answering") == "🧭 steer picked up — the agent is answering now"
+        assert p.render(state="answered") == "✅ steer answered"
+        assert p.render(state="failed").startswith("⚠ steer failed")
+        assert p.render(state="unanswered") == "⚠ steer not answered — the run ended first"
+
+    def test_dirty_flag(self) -> None:
+        p = SteerProgress()
+        assert not p.dirty
+        p.observe(ev("agent.message", content="ignored"))
+        assert not p.dirty
+        p.observe(ev("agent.tool_start", tool="bash", args="ls"))
+        assert p.dirty
+        p.render()
+        assert not p.dirty
 
 
 class TestEmbeds:
@@ -338,6 +502,21 @@ class TestEmbeds:
             item, RunReport("r1", "completed", "x", delivery_error="409"), "delivery_failed"
         )
         assert failed.color == COLOR_WARN and failed.fields[0][1].startswith("⚠ 409")
+
+    def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
+        """#246: a cancel is not a failure; the card must name the requester
+        and tell the human the run is resumable (or already re-queued)."""
+        item = WorkItem(item_id="gh:8", source="github", source_key="8", title="Demo")
+        report = RunReport("r1", "cancelled", "1/3 tasks done", cancelled_by="Discord user `b`")
+        text = finish_text("cancelled", report)
+        assert "cancelled by Discord user `b`" in text and "`sbxloop resume r1`" in text
+        card = finish_embed(item, report, "cancelled")
+        assert card.title == "⏹ finished: cancelled"
+        assert card.fields[0][0] == "Cancelled"
+        assert "`sbxloop resume r1`" in card.fields[0][1]
+        assert "!sbx retry gh:8" in card.fields[0][1]
+        requeued = finish_embed(item, report._replace(requeued=True), "cancelled")
+        assert "re-queued" in requeued.fields[0][1] and "resume" not in requeued.fields[0][1]
 
     def test_status_card_and_queue(self) -> None:
         card = status_embed(

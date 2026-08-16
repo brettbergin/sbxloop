@@ -305,17 +305,52 @@ class DaemonConfig(_ConfigModel):
     inbox ``triage/`` dir) and never run until a human promotes them, unless
     ``backlog_auto_trigger`` is set — a self-feeding queue is the failure
     mode that flag guards.
+
+    ``close_on_success`` / ``tracking_issue`` shape how loudly a delivered
+    run touches the issue tracker. The defaults suit a task queue where the
+    PR is the reviewable object: close the source issue, open a per-run
+    tracking issue. Pointed at a repo whose issues are design/discussion
+    items (sbxloop's own tracker, #251) that auto-closes a design issue the
+    moment a *draft* PR appears and doubles issue volume with self-closing
+    tracking issues — set both to false there: the source issue gets the
+    summary comment plus ``delivered_label`` and stays open for the human
+    who merges the PR.
+
+    Unattended runs need a different workspace posture from a one-shot
+    ``sbxloop run`` (#255). ``workspace_isolation`` replaces the
+    ``[sandbox]`` setting for daemon runs whenever ``[sandbox] workspace``
+    is a git checkout: the default ``clone`` proceeds from committed HEAD
+    with a warning where ``auto`` would refuse a dirty tree — a refusal no
+    human is present to answer, which would otherwise fail every issue
+    while someone has uncommitted work in that checkout. ``refresh_workspace``
+    fetches and fast-forwards the checkout before each fresh run so runs
+    start from current ``origin/<branch>`` rather than a stale local HEAD.
+    ``state_dir`` anchors the daemon's state to an absolute path outside the
+    workspace; unset resolves to ``$XDG_STATE_HOME/sbxloop/<project>``
+    (``~/.local/state/...``) unless the top-level ``state_dir`` was set
+    explicitly or a legacy ``./.sbxloop/state.db`` already exists — see
+    :func:`sbxloop.daemon.paths.resolve_state_dir`.
     """
 
     inbox_dir: str = ".sbxloop/inbox"  # "" disables the inbox source
+    workspace_isolation: WorkspaceIsolation = "clone"
+    refresh_workspace: bool = True
+    state_dir: Path | None = None
     # Must be positive: Event.wait(<= 0) returns immediately and the loop spins.
     poll_interval_s: float = Field(default=60.0, gt=0)
     trigger_label: str = "sbxloop:run"
     in_progress_label: str = "sbxloop:in-progress"
     failed_label: str = "sbxloop:failed"
     backlog_label: str = "sbxloop:backlog"
+    delivered_label: str = "sbxloop:delivered"
+    close_on_success: bool = True
+    tracking_issue: bool = True
     max_runs_per_day: int = 12
     max_attempts_per_item: int = 2
+    # Resumes (after a restart/crash) are not attempts, but each one gets a
+    # fresh engine wall clock; past this many per item the interrupted run is
+    # settled as a failed attempt instead of resumed (#234). 0 = never resume.
+    max_resumes_per_item: int = Field(default=2, ge=0)
     retry_backoff_s: float = 900.0
     max_consecutive_failures: int = 3
     breaker_cooldown_s: float = 3600.0
@@ -328,6 +363,10 @@ class DaemonConfig(_ConfigModel):
     backlog_auto_trigger: bool = False
     # Autonomous PRs arrive as drafts unless the operator says otherwise.
     deliver_draft: bool = True
+    # Retention for runs/<run_id>/ on disk (workspace clone + harvested
+    # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
+    # rows are never removed. See sbxloop.gc for what is exempt.
+    prune_runs_after_days: float = Field(default=14.0, ge=0)
 
     @model_validator(mode="after")
     def _check(self) -> DaemonConfig:
@@ -336,6 +375,7 @@ class DaemonConfig(_ConfigModel):
             self.in_progress_label,
             self.failed_label,
             self.backlog_label,
+            self.delivered_label,
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")
@@ -369,12 +409,16 @@ class DiscordConfig(_ConfigModel):
     channel_id: int | None = None
     command_prefix: str = "!sbx"
     thread_per_run: bool = True
+    # quiet: lifecycle + links + chat; normal: plus agent messages, with each
+    # burst of tool calls digested into one line edited in place (#235:
+    # streaming every call drowned the channel); verbose: every call.
     chronology_level: ChronologyLevel = "normal"
     # Discord's hard cap is 2000; leave headroom for wrappers.
     max_message_chars: int = Field(default=1900, ge=200, le=2000)
     # Rich output: embed cards for the run headline, finished report and
     # `!sbx status`; a per-run status message edited in place as tasks
-    # progress; consecutive tool calls batched into one code block.
+    # progress; at the verbose level, consecutive tool calls batched into
+    # one code block of at most tool_batch_lines.
     embeds: bool = True
     status_line: bool = True
     tool_batch_lines: int = Field(default=8, ge=1, le=40)

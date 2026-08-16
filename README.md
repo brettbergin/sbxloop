@@ -142,6 +142,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sbxloop run "OUTCOME"`               | Start a run. Options: `--repo`, `--report`, `--deliver`, `--deliver-base`, `--deliver-draft`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`.                                                                                         |
 | `sbxloop daemon`                      | The always-on outer loop: poll labeled issues + an inbox dir, run each item, report back, mirror to Discord. Options: `--repo`, `--inbox`, `--backlog`, `--discord-channel`, `--once`, `--dry-run`.                                                   |
+| `sbxloop daemon ctl CMD`              | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as Discord's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                    |
 | `sbxloop resume RUN`                  | Re-provision sandboxes and continue a checkpointed run under its persisted config.                                                                                                                                                                    |
 | `sbxloop deliver RUN`                 | Deliver (or re-deliver) a completed run's artifacts as a PR from a github-ops sandbox alone — the retry path when end-of-run delivery failed. Options: `--repo`, `--deliver-base`, `--deliver-draft`, `--create-repo`, `--create-public`, `--report`. |
 | `sbxloop cancel RUN`                  | Cancel an in-flight run.                                                                                                                                                                                                                              |
@@ -153,6 +154,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | `sbxloop bake`                        | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                   |
 | `sbxloop doctor [--deep]`             | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                           |
 | `sbxloop sandbox ls\|rm\|prune`       | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                    |
+| `sbxloop gc`                          | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                       |
 | `sbxloop secrets list\|clean\|rotate` | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                              |
 | `sbxloop config show\|policy`         | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                             |
 
@@ -246,14 +248,19 @@ work came from, and keeps going. Two work sources, usable together:
   reporting and delivery forced on (PRs arrive as **drafts** by default),
   and on success comments the summary + PR link and **closes** the issue —
   the PR is now the reviewable object. Failures retry with backoff, then
-  land in `sbxloop:failed` with re-trigger instructions.
+  land in `sbxloop:failed` with re-trigger instructions. For a tracker whose
+  issues are design items rather than tasks, `close_on_success = false` in
+  `[daemon]` leaves the issue open with `sbxloop:delivered` for the human
+  who merges the PR, and `tracking_issue = false` skips the per-run tracking
+  issue (the summary comment on the source issue carries the same info).
 - **Inbox files**: drop a `.md` (first `# heading` = title) into
   `<inbox>/pending/`; it moves through `running/` to `done/` or `failed/`
   with a `<name>.result.md` beside it.
 
 It is **fully autonomous** — a label or a file alone starts a run — so the
 spend guardrails in `[daemon]` are the safety net: a rolling daily run cap,
-a per-item attempt cap, and a consecutive-failure circuit breaker. Treat the
+a per-item attempt cap, a per-item resume cap, and a consecutive-failure
+circuit breaker (persisted, so a restart cannot reset it). Treat the
 trigger label as "execute arbitrary instructions with GH_TOKEN's repo scope"
 and restrict who can apply it. Inner agents can file follow-up work they
 discover (`--backlog github|inbox`) — those land in **triage** (the
@@ -262,8 +269,42 @@ promotes them, unless `backlog_auto_trigger` is set.
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
-an interrupted run (SIGTERM, crash) is resumed on the next start. Ship it as
-a systemd user service with [`contrib/systemd/`](contrib/systemd/).
+an interrupted run (SIGTERM, crash) is resumed on the next start — through
+the same guardrails as any dispatch, and at most `max_resumes_per_item` times
+before it counts as a failed attempt. Ship it as a systemd user service with
+[`contrib/systemd/`](contrib/systemd/).
+
+Individual items are steerable from another shell without stopping the
+daemon: `sbxloop daemon items` lists them (state, attempts, pinned run, last
+error); `sbxloop daemon abandon <item> [--reason …]` gives one up (a live
+daemon cancels its in-flight run and tells the issue/inbox file — the report
+is owed on the row and paid by the next tick or the next daemon start, once);
+`sbxloop daemon retry <item>` re-queues an abandoned or cancelled item with attempts
+reset and a **fresh plan** — not a resume of the plan that failed; and
+`sbxloop daemon requeue <item>` drops a running item's pinned run so its
+next dispatch starts over (attempts and backoff kept). The same controls are
+`!sbx items|abandon|retry|requeue` on Discord.
+
+**Workspace posture for unattended runs.** Point `[sandbox] workspace` at a
+**dedicated clone nobody edits** (`git clone <repo> ~/sbxloop-runner/src`),
+not the checkout you work in. Before each fresh run the daemon
+`git fetch`es that clone and fast-forwards its branch to its upstream (the
+remote the branch tracks; `origin/<branch>` when none is configured) — never
+a merge or rebase; a diverged branch or a colliding local edit is left alone
+and logged — so runs start from the current remote branch rather than a
+stale local HEAD (`[daemon] refresh_workspace`). Daemon runs use `clone`
+isolation regardless of `[sandbox] workspace_isolation` (`[daemon] workspace_isolation`, default `clone`): a dirty tree proceeds from committed
+HEAD with a warning, because `auto`'s refusal has no human present to answer
+it. Per-run clones point their `origin` at the source's origin URL (metadata
+only; any userinfo such as an embedded token is stripped from the URL, so
+no credentials leave the host). And the daemon keeps its state
+**outside the workspace** at an absolute path — `[daemon] state_dir`, else
+an explicitly configured `state_dir`, else a pre-existing legacy
+`./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`
+(`~/.local/state/…`) — so a checkout never accretes one full clone per run.
+The daemon prints the resolved location at start; the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule, while
+`sbxloop status`/`logs`/`gc` from the runner directory need
+`SBXLOOP_STATE_DIR` pointed at it.
 
 ### Discord: chronology out, steering in
 
@@ -273,19 +314,35 @@ card per run in the control channel (source, run id, branch, tracking
 issue, PR, task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
-code-fence boundaries instead of clipped; consecutive tool calls batched
-into one code block with failures marked; one **status line edited in
-place** as tasks progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
+code-fence boundaries instead of clipped; each burst of tool calls
+digested into **one line edited in place** (`⚙ 23 tool calls (bash x21, view x2) — last: pytest -q`, with a "may be stuck" nudge when the last
+calls are near-identical) — failed calls still get their own detail
+block, and `chronology_level = "verbose"` streams every call batched into
+code blocks instead; one **status line edited in place** as tasks
+progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
 and branch as links; verify failures, worker errors, denied permissions and
 refused egress called out; and a finished report card (the headline turns
 ✅/❌/⚠). Mentions are always disabled, so model output can never ping the
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
 `chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
-checkpoint, which can be minutes into a long step — the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause|resume|cancel|queue` in the
-control channel drive the daemon itself. Anyone who can post in the channel
-can steer — that is the boundary to set.
+checkpoint, which can be minutes into a long step — a note under your
+message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
+when the reply lands). `!sbx status|pause|resume|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>` in the control channel drive the daemon
+itself. `!sbx cancel` stops the current run at its next boundary and settles
+the item as **cancelled** — attributed to you on the source, no automatic
+retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
+on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run
+instead, and `!sbx retry <item>` reruns any cancelled or abandoned item with
+its attempt budget reset. Anyone who can post in the channel
+can steer — that is the boundary to set. The bot ignores messages from bots
+(itself included), so scripts drive the daemon with `sbxloop daemon ctl <verb>`
+instead — the same verbs through the same dispatcher, no Discord needed; a
+request no daemon picks up within `--timeout` (30s) is withdrawn, so a stale
+`cancel` never fires when the daemon starts later. Timing out is not "not
+executed": once the daemon has taken a request it keeps running (item verbs
+cross the ops sandbox), and `ctl` reports it as pending (exit 1) rather than
+absent (exit 2).
 
 Bot setup, once: create an application in the Discord Developer Portal, add
 a bot, enable the **Message Content** privileged intent, copy the token, and
@@ -502,6 +559,25 @@ non-terminal but silent past `--min-age` (default 1 hour — the persisted event
 stream, heartbeats included, is the liveness signal). Sandboxes deliberately
 kept for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor` reports the current orphan-candidate count.
 
+Run directories accrete too: every run leaves `<state_dir>/runs/<run>/` — a
+full clone of the target checkout under workspace isolation, plus harvested
+artifacts — and an always-on daemon fills the disk with them. The daemon
+sweeps them on start and once a day (`[daemon] prune_runs_after_days`,
+default 14; `0` disables), and `sbxloop gc` runs the same policy by hand:
+
+```bash
+sbxloop gc --dry-run             # classify every run directory, remove nothing
+sbxloop gc                       # remove those past the retention window
+sbxloop gc --older-than 3        # a tighter window for this sweep only
+```
+
+Only terminal runs (completed/failed/cancelled) past the window go, and never
+one whose sandboxes were kept or whose delivery failed — that directory is the
+only copy of the work until it is fetched or redelivered. The SQLite rows stay
+(they are the audit trail); each removal is recorded as a `daemon.gc` event on
+the run, and `resume` refuses a run whose workspace is gone. Fetch results
+back within the retention window — the finish summary prints it.
+
 ## Setup
 
 1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then
@@ -580,6 +656,9 @@ where it came from. The notable knobs:
 | `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
 | `[limits]`                             | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                         |
+| `[daemon] workspace_isolation`         | `clone`            | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).        |
+| `[daemon] refresh_workspace`           | `true`             | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                         |
+| `[daemon] state_dir`                   | unset              | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above).   |
 
 ## Repository layout
 

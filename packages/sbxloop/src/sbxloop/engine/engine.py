@@ -54,12 +54,14 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     DeliveryError,
+    RunCancelledError,
     SbxError,
     SbxloopError,
     StateError,
     WorkerError,
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
+from sbxloop.gc import workspace_pruned
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_message_id, new_run_id
@@ -186,9 +188,33 @@ class LoopEngine:
         run = self.store.get_run(run_id)
         if run.state not in RESUMABLE_RUN_STATES:
             raise StateError(f"run {run_id} is {run.state}; only unfinished runs can resume")
+        self._refuse_if_pruned(run_id)
+        if run.state in TERMINAL_RUN_STATES:
+            # A failed run is both terminal (so gc may take it) and resumable.
+            # gc claims a directory only while the run is terminal, in one
+            # write transaction with its marker; leaving the terminal set
+            # BEFORE touching the workspace — and re-checking after — means
+            # whichever of the two committed first wins, and a sweep in
+            # another process can never pull the workspace out from under a
+            # resume that already passed the guard.
+            self.store.set_run_state(run_id, "provisioning")
+            try:
+                self._refuse_if_pruned(run_id)
+            except StateError:
+                self.store.set_run_state(run_id, run.state)
+                raise
         self._rehydrate_config(run_id)
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
         return self._drive(run_id, run.outcome, workspace=run.workspace)
+
+    def _refuse_if_pruned(self, run_id: str) -> None:
+        if workspace_pruned(self.store, run_id):
+            # The workspace pin would be re-created empty and the agent's
+            # prior work is gone; say so rather than resuming into nothing.
+            raise StateError(
+                f"run {run_id}: its workspace was removed by gc (see `sbxloop logs {run_id} "
+                "--type daemon.gc`); it cannot be resumed — start a new run"
+            )
 
     def cancel(self, run_id: str) -> None:
         run = self.store.get_run(run_id)  # raises for unknown runs
@@ -1235,9 +1261,11 @@ class LoopEngine:
 
     def _check_cancelled_and_clock(self, run_id: str, deadline: float) -> None:
         if self._cancel_event.is_set():
-            raise StateError(f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`")
+            raise RunCancelledError(
+                f"run {run_id} interrupted; resume with `sbxloop resume {run_id}`"
+            )
         if self.store.get_run(run_id).state == "cancelled":
-            raise StateError(f"run {run_id} was cancelled")
+            raise RunCancelledError(f"run {run_id} was cancelled")
         if self.clock() > deadline:
             self._set_run_state(run_id, "failed")
             raise BudgetExceededError(

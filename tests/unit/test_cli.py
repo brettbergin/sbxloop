@@ -24,6 +24,9 @@ runner = CliRunner()
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
+    # The daemon anchors its default state dir under XDG state home (#255);
+    # keep that inside tmp so tests never touch the real ~/.local/state.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     return tmp_path
 
 
@@ -414,6 +417,114 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
         assert result.exit_code == 0, result.output
         assert "tick:" in result.output and "no_work" in result.output
+
+    def test_state_dir_defaults_outside_cwd_and_is_announced(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        """#255: daemon state is anchored to XDG state home, not a relative
+        .sbxloop that would nest run clones inside the workspace checkout."""
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        expected = (workdir / "xdg-state" / "sbxloop" / workdir.name).resolve()
+        assert (expected / "state.db").is_file()
+        assert not (workdir / ".sbxloop" / "state.db").exists()
+        assert "state dir:" in result.output and str(expected) in result.output.replace("\n", "")
+
+    def test_legacy_state_dir_keeps_being_used(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        seed_store(workdir)  # an existing ./.sbxloop/state.db from before the change
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "legacy" in result.output
+        assert not (workdir / "xdg-state").exists()
+
+    def test_explicit_daemon_state_dir_wins(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBXLOOP_DAEMON__STATE_DIR", str(workdir / "elsewhere"))
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        assert (workdir / "elsewhere" / "state.db").is_file()
+
+
+class TestDaemonItemControls:
+    """#229: `sbxloop daemon items|abandon|retry|requeue` act on the store
+    the daemon shares; they need no live daemon and no sandbox."""
+
+    @staticmethod
+    def daemon_state(workdir: Path) -> Path:
+        # Where the daemon itself keeps its queue — the anchored XDG default
+        # (#255), not the runner dir's `.sbxloop`; seeding there proves the
+        # item controls follow the daemon's state-dir rule.
+        assert not (workdir / ".sbxloop" / "state.db").exists()
+        return workdir / "xdg-state" / "sbxloop" / workdir.name
+
+    def seed(self, workdir: Path) -> None:
+        from sbxloop.daemon.model import WorkItem
+        from sbxloop.daemon.store import DaemonStore
+
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
+        dstore.upsert_new(
+            WorkItem(item_id="inbox:x.md", source="inbox", source_key="x.md", title="Do X"), 1.0
+        )
+        dstore.mark_running("inbox:x.md", "r_x", 2.0)
+        dstore.close()
+
+    def test_items_lists_state_attempts_and_run(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "items"])
+        assert result.exit_code == 0, result.output
+        assert "no work items" in result.output
+        self.seed(workdir)
+        result = runner.invoke(app, ["daemon", "items"])
+        assert result.exit_code == 0, result.output
+        assert "inbox:x.md" in result.output and "running" in result.output
+        assert "r_x" in result.output
+        result = runner.invoke(app, ["daemon", "items", "--state", "queued"])
+        assert "no work items" in result.output
+        result = runner.invoke(app, ["daemon", "items", "--state", "bogus"])
+        assert result.exit_code == 2 and "unknown item state" in result.output
+
+    def test_abandon_retry_requeue_transitions(self, workdir: Path) -> None:
+        from sbxloop.daemon.store import DaemonStore
+
+        self.seed(workdir)
+        result = runner.invoke(app, ["daemon", "retry", "inbox:x.md"])
+        assert result.exit_code == 2 and "retry refused" in result.output
+        result = runner.invoke(
+            app, ["daemon", "abandon", "inbox:x.md", "--reason", "plan spiraled"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "abandoned" in result.output and "r_x" in result.output
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
+        item = dstore.get("inbox:x.md")
+        assert item is not None and item.state == "abandoned"
+        assert item.last_error == "plan spiraled" and item.run_id == "r_x"
+        dstore.close()
+        result = runner.invoke(app, ["daemon", "requeue", "inbox:x.md"])
+        assert result.exit_code == 2 and "requeue refused" in result.output
+        result = runner.invoke(app, ["daemon", "retry", "inbox:x.md"])
+        assert result.exit_code == 0, result.output
+        # FORCE_COLOR / a forced terminal makes rich highlight the number
+        # ("attempts \x1b[1;36m0"): assert on the ANSI-stripped text.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "queued" in plain and "attempts 0" in plain
+        result = runner.invoke(app, ["daemon", "abandon", "gh:404"])
+        assert result.exit_code == 2 and "unknown work item" in result.output
+
+    def test_daemon_help_lists_subcommands_and_options(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COLUMNS", "300")
+        result = runner.invoke(app, ["daemon", "--help"])
+        assert result.exit_code == 0
+        # GitHub Actions forces typer's help colours on and the option
+        # highlighter styles "--" and "inbox" separately, so "--inbox" is
+        # never a contiguous substring of the raw output.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        for word in ("--inbox", "--once", "items", "abandon", "retry", "requeue"):
+            assert word in plain
 
 
 class TestDoctor:

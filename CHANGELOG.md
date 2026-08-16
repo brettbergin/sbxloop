@@ -6,6 +6,40 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Daemon: an operator `!sbx cancel` is no longer settled as a failed
+  attempt (field: cancelled from Discord → "failed; 1 attempt(s) left" →
+  re-run fresh after the 15-minute backoff, and counted toward the circuit
+  breaker — #246). The item now settles as **cancelled**: a new terminal
+  work-item state with no automatic retry and no breaker count, reported on
+  the source with attribution ("cancelled by Discord user `x`"; GitHub:
+  comment + in-progress label removed, trigger left for a human), while the
+  run itself stays resumable — the finish card and source comment say
+  `sbxloop resume RUN`. New `!sbx cancel --retry` re-queues the item for a
+  fresh run instead, and `!sbx retry <item>` reruns any cancelled or
+  abandoned item (a human retry resets the attempt budget and skips the
+  failure backoff; the daily cap still applies).
+- Discord bridge with `--once` and other short-lived runs (#236): a run
+  that started and finished before the gateway connected lost its headline
+  and everything after it (the pump only knew the *active* run's item).
+  Events are now buffered per run until the bridge is ready, and `close()`
+  waits (bounded, `DRAIN_WAIT_S`) for the pump to post what is already
+  queued, so a short run's chronology is complete instead of truncated at
+  process exit.
+
+### Changed
+
+- Discord `chronology_level = "normal"` no longer streams every tool call
+  (#235): a burst is digested into one line edited in place — count,
+  per-tool breakdown, last command, failure count — closed by the next
+  agent message, phase or task boundary. A trailing run of near-identical
+  commands is collapsed to `⚙ bash x17 similar commands` with a "may be
+  stuck; `!sbx cancel` stops the run" nudge; the `agent.tool_cap` ceiling
+  (#228) is surfaced too. Failed calls keep their own detail block. The
+  previous stream-everything behaviour is `"verbose"`; the full stream stays
+  in `sbxloop logs`.
+
 ### Added
 
 - `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed
@@ -22,6 +56,42 @@ All notable changes to sbxloop are documented here. The project adheres to
   force-updates the branch and reuses an already-open PR for that head
   instead of failing on the refs POST 422.
 
+- Operator controls for individual daemon work items (#229).
+  `sbxloop daemon items` lists every item with state, attempts, pinned run
+  and last error; `sbxloop daemon abandon <item> [--reason]` gives one up,
+  `sbxloop daemon retry <item>` re-queues an abandoned or cancelled item
+  with attempts reset and a fresh plan (not a resume), `sbxloop daemon requeue <item>` unpins a running item from its run so the next dispatch
+  starts over (attempts kept). Same controls on Discord as
+  `!sbx items|abandon|retry|requeue`. A live daemon
+  honors a CLI abandon/requeue of the item in flight within a second — the
+  run is cancelled, the operator's decision wins over the run's own outcome
+  (no retry, no breaker count), and the source hears `report_abandoned`
+  exactly once. The CLI runs in another process and can only flip the row,
+  so an abandon or retry leaves a durable `pending_report` debt on it: the
+  daemon pays it on its next tick (paused or not) or on the next start —
+  the abandon reaches the issue / inbox file (an unclaimed item loses its
+  trigger label / leaves `pending/`), a retry re-claims (drops the failed
+  label, moves the file out of `failed/`) — exactly once. Recovery also
+  closes the dead run's ledger and removes its sandboxes and secrets, as
+  does an in-process abandon/requeue of an item queued for resume. Item
+  transitions are single conditional statements, so a daemon settling the
+  item concurrently cannot have its verdict overwritten by a stale command. Field origin: a spiraling item (#228) could only be
+  abandoned by poking `DaemonStore` from Python, and recovery would have
+  resumed the doomed plan.
+
+- `sbxloop daemon ctl <status|pause|resume|cancel [--retry]|queue|items|abandon|retry|requeue>`
+  — a local control surface for the running daemon (#232). Requests go
+  through a file queue in the daemon's `state_dir/daemon/ctl/`, served by a
+  daemon thread so `cancel` lands mid-run; a request stamped before the
+  daemon's start (or before recovery finished — the control thread only
+  starts after `recover()`) is refused, one no daemon picks up within `--timeout` is
+  withdrawn, and one the daemon has already taken but not answered is
+  reported as pending — the command still executes. Discord's
+  `!sbx` and `ctl` share one command dispatcher (`sbxloop.daemon.control`),
+  so the two surfaces cannot drift; a ctl cancel/retry is attributed on the
+  source as "`<user>` via sbxloop daemon ctl". The bridge still ignores
+  bot-authored messages by design.
+
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
   boundaries (fences re-opened with their language) instead of clipped;
@@ -33,6 +103,74 @@ All notable changes to sbxloop are documented here. The project adheres to
   surfaced; every send disables mentions. New `[discord]` knobs `embeds`,
   `status_line`, `tool_batch_lines`. Pure formatting layer
   `sbxloop.daemon.discord_format` (no discord.py needed to test it).
+
+- Daemon guardrails now cover recovery, restarts and multi-daemon setups
+  (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted
+  run is re-queued with its run pinned and the tick resumes it behind the same
+  breaker / daily-cap / pause gate as any dispatch. Resumes are recorded in a
+  ledger of their own: the daily cap counts them (each is a fresh engine wall
+  clock), `!sbx status` shows them, and a new `[daemon] max_resumes_per_item`
+  (default 2) bounds them — past it the interrupted run is settled as a failed
+  attempt so a plan that keeps getting interrupted cannot burn engine time
+  forever. Circuit-breaker state persists in the daemon store, so a
+  crash-restart loop no longer resets it. The GitHub claim is now a
+  compare-and-swap: the claim comment is posted first and the label swap only
+  proceeds if it is the first claim comment of the current trigger cycle, so
+  two daemons on one repo cannot both take an issue. The daemon's github
+  sandbox is named per state dir (`sbxloop-daemon-github-<hash>`) so a second
+  daemon on the host no longer removes the first's at startup. Source polling
+  raises on failure and backs off exponentially (up to 30 min); the github
+  sandbox is re-provisioned at most once per 5 minutes.
+
+- `[daemon] close_on_success` and `[daemon] tracking_issue` (#251), both
+  default true (today's behaviour). `close_on_success = false` leaves a
+  delivered source issue open with the new `delivered_label`
+  (`sbxloop:delivered`) instead of closing it the moment a draft PR appears
+  — the human closes it when the PR merges; a re-trigger or an operator
+  re-queue clears the label.
+  `tracking_issue = false` skips the per-run tracking issue for GitHub items,
+  whose source issue already carries the run's summary comment.
+
+- **Run-directory retention** (#233). Every run leaves
+  `<state_dir>/runs/<run>/` behind (the workspace clone under isolation plus
+  harvested artifacts) and nothing removed them; an always-on daemon accreted
+  clones without bound. New `[daemon] prune_runs_after_days` (default 14, `0`
+  disables): the daemon sweeps on its first tick and once a day thereafter,
+  and `sbxloop gc [--older-than DAYS] [--dry-run]` runs the same policy by
+  hand (`sbxloop.gc`). Only terminal runs past the window are removed — never
+  an in-flight/resumable run, a run with kept sandboxes, or one whose last
+  delivery failed (its workspace is the only copy of the work). SQLite rows
+  are kept; each removal is a `daemon.gc` event on the run (path, bytes,
+  age), the daemon reports counts and bytes freed to its frontend, `resume`
+  refuses a run whose workspace gc removed, and the workspace-clone finish
+  summary prints the retention window. A sweep and a `resume` of the same
+  failed run can race across processes: gc writes its marker in one write
+  transaction with a re-check that the run is still terminal, then renames
+  the directory out of `runs/` (into `gc-pending/`) before deleting it, and
+  `resume` leaves the terminal state before touching the workspace and
+  re-checks the marker after — so the workspace is never half-removed and
+  unmarked, and never pulled out from under a resume.
+
+- **Daemon workspace posture for unattended runs** (#255). Daemon runs
+  against a git-checkout workspace use `clone` isolation by default
+  (`[daemon] workspace_isolation`): a dirty tree proceeds from committed
+  HEAD with a warning instead of `auto`'s refusal, which no human is present
+  to answer. Before each fresh run the daemon `git fetch`es the checkout and
+  fast-forwards its branch to its upstream (the tracked remote, or
+  `origin/<branch>` when none is configured) — never a merge/rebase; diverged or
+  colliding trees are left alone and logged, fetch failures warn and run
+  from local HEAD (`[daemon] refresh_workspace`, default on). Daemon state
+  is anchored to an absolute path outside the workspace: `[daemon] state_dir`, else an explicit `state_dir`, else a pre-existing legacy
+  `./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`;
+  the resolved location is printed at start and the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule. Per-run clones now point
+  `origin` at the source checkout's origin URL instead of the host path
+  (metadata only; URL userinfo such as an embedded token is stripped). Docs and the systemd contrib prescribe a dedicated clone
+  nobody edits as the daemon's workspace.
+
+- Discord bridge, steering latency made visible (#236): a queued steer gets
+  a note under it — `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far); answered at the next checkpoint` — edited in place as
+  the phase, task and tool-call count (against the #228 ceiling) move, then
+  resolved to picked-up / answered / failed / not-answered-run-ended.
 
 - GitHub op failures carry the HTTP status as a structured field (#221):
   worker `GithubOpError.http_status` (parsed from `gh api` stderr or taken
