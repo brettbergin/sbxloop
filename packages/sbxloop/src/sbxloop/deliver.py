@@ -73,31 +73,6 @@ BLOB_BATCH_MAX_B64_BYTES = 4 * 1024 * 1024
 STATUS_MARKER = {"added": "A", "modified": "M", "deleted": "D"}
 
 
-def _has_status(exc: GithubOpsError, status: int) -> bool:
-    """Structured status first; message grep only for a worker that predates
-    ``ErrorInfo.http_status`` (lockstep versioning makes that window brief,
-    but a mid-upgrade daemon still runs the old worker for one cycle)."""
-    if exc.http_status is not None:
-        return exc.http_status == status
-    return f"HTTP {status}" in str(exc)
-
-
-def _is_missing(exc: GithubOpsError) -> bool:
-    """Whether an op failure was a 404."""
-    return _has_status(exc, 404)
-
-
-def _is_empty_repo(exc: GithubOpsError) -> bool:
-    """Whether a ref lookup failed because the repository has no commits.
-
-    Field-verified (run rgwp5z40x): real GitHub answers
-    ``GET /repos/.../git/ref/heads/<base>`` on an empty repository with
-    **HTTP 409 "Git Repository is empty."** — not the 404 a missing ref on
-    a non-empty repository gets. Both mean "no base to build on".
-    """
-    return _has_status(exc, 409)
-
-
 def _is_ref_collision(exc: GithubOpsError) -> bool:
     """Whether a refs POST failed because the branch already exists —
     GitHub's documented answer is HTTP 422 "Reference already exists"."""
@@ -122,13 +97,13 @@ def ensure_repository(
     loudly instead of silently delivering into a brand-new repository. New
     repositories are private unless ``public``, and ``auto_init`` so the
     default branch exists and the normal PR delivery path applies unchanged.
+
+    The probe asks the worker for "missing" as data rather than catching a
+    404: three field runs showed the expected miss painted as a red error
+    panel in the transcript before this code got to say it was fine (#222).
     """
-    try:
-        ops.repo_get(repo)
+    if ops.repo_lookup(repo) is not None:
         return False
-    except GithubOpsError as exc:
-        if not _is_missing(exc):
-            raise
     if not create:
         raise DeliveryError(
             f"repository {repo} does not exist — create it first, or pass "
@@ -189,19 +164,17 @@ def deliver_workspace(
 
     if base is None:
         base = str(ops.repo_get(repo).get("default_branch") or "main")
-    try:
-        base_sha = _base_commit_sha(ops, repo, base)
-    except GithubOpsError as exc:
+    base_sha = _base_commit_sha(ops, repo, base)
+    if base_sha is None:
         # An existing-but-empty repository has a default branch name and no
-        # ref behind it; bootstrap an initial commit so the normal PR path
-        # (branch off base, open a PR against it) applies unchanged. GitHub
-        # reports the empty-repo case as HTTP 409, and a missing ref on a
-        # non-empty repo (unusual explicit `base`) as HTTP 404 — both mean
-        # "no base to build on".
-        if not (_is_missing(exc) or _is_empty_repo(exc)):
-            raise
+        # ref behind it (GitHub answers 409; an absent branch on a non-empty
+        # repo — unusual explicit `base` — answers 404; the worker folds
+        # both into "missing"). Bootstrap an initial commit so the normal PR
+        # path (branch off base, open a PR against it) applies unchanged.
         _bootstrap_empty_repo(ops, repo, base, run_id=run_id, outcome=outcome)
         base_sha = _base_commit_sha(ops, repo, base)
+        if base_sha is None:
+            raise DeliveryError(f"base branch {base!r} of {repo} still missing after bootstrap")
     base_tree = _commit_tree_sha(ops, repo, base_sha)
 
     if plan is None:
@@ -382,12 +355,11 @@ def _bootstrap_empty_repo(
     )
 
 
-def _base_commit_sha(ops: GithubOps, repo: str, base: str) -> str:
-    ref = ops.raw("GET", f"/repos/{repo}/git/ref/heads/{base}")
-    try:
-        return str(ref["object"]["sha"])
-    except (TypeError, KeyError) as exc:
-        raise DeliveryError(f"cannot resolve base branch {base!r} of {repo}") from exc
+def _base_commit_sha(ops: GithubOps, repo: str, base: str) -> str | None:
+    """The commit sha behind ``base``, or None when there is no such ref
+    (missing branch or empty repository) — a state delivery bootstraps
+    around, so it arrives as data, not as an exception."""
+    return ops.ref_lookup(repo, f"heads/{base}")
 
 
 def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:

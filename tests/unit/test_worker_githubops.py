@@ -1,9 +1,12 @@
-"""Worker github.op error plumbing: HTTP status as a structured field (#221).
+"""Worker github.op tests: HTTP status as a structured field (#221) and
+probes answering "missing" as data instead of raising (#222).
 
 Field failure rgwp5z40x: the host matched "HTTP 404" in the error prose while
 real GitHub (via gh) said "(HTTP 409)". These tests pin that both transports
-put the status on ``GithubOpError.http_status`` and that the runner carries it
-onto ``ErrorInfo`` so host code never has to grep messages again.
+put the status on ``GithubOpError.http_status``, that the runner carries it
+onto ``ErrorInfo``, and that ``repo.get`` / ``ref.get`` under
+``allow_missing`` turn the expected "no" into an ok result. The op registry
+runs against a scripted Transport (no gh, no network).
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from sbxloop_worker import githubops
 from sbxloop_worker.githubops import (
     GhCliTransport,
     GithubOpError,
+    JsonValue,
     RestTransport,
     execute_op,
     parse_gh_http_status,
@@ -45,6 +49,86 @@ class TestParseGhHttpStatus:
     )
     def test_cases(self, stderr: str, expected: int | None) -> None:
         assert parse_gh_http_status(stderr) == expected
+
+
+class ScriptedTransport:
+    """Answers each request from a path -> (json | GithubOpError) table."""
+
+    def __init__(self, table: dict[str, Any]) -> None:
+        self.table = table
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
+        self.calls.append((method, path))
+        answer = self.table[path]
+        if isinstance(answer, Exception):
+            raise answer
+        result: JsonValue = answer
+        return result
+
+
+def http_error(status: int, message: str = "nope") -> GithubOpError:
+    return GithubOpError(f"gh: {message} (HTTP {status})", http_status=status)
+
+
+class TestRepoGet:
+    def test_missing_is_data_only_when_asked(self) -> None:
+        t = ScriptedTransport({"/repos/o/r": http_error(404, "Not Found")})
+        # Default: a 404 is still an error (callers that did not opt in must
+        # not silently get an empty dict).
+        with pytest.raises(GithubOpError, match="404"):
+            execute_op("repo.get", {"repo": "o/r"}, transport=t)
+        assert execute_op("repo.get", {"repo": "o/r", "allow_missing": True}, transport=t) == {
+            "missing": True,
+            "http_status": 404,
+        }
+
+    def test_other_statuses_still_raise_with_allow_missing(self) -> None:
+        t = ScriptedTransport({"/repos/o/r": http_error(403, "rate limited")})
+        with pytest.raises(GithubOpError, match="403"):
+            execute_op("repo.get", {"repo": "o/r", "allow_missing": True}, transport=t)
+
+    def test_present_repo_passes_through(self) -> None:
+        t = ScriptedTransport({"/repos/o/r": {"full_name": "o/r"}})
+        assert execute_op("repo.get", {"repo": "o/r", "allow_missing": True}, transport=t) == {
+            "full_name": "o/r"
+        }
+
+
+class TestRefGet:
+    def test_resolves_sha(self) -> None:
+        t = ScriptedTransport(
+            {"/repos/o/r/git/ref/heads/main": {"ref": "refs/heads/main", "object": {"sha": "abc"}}}
+        )
+        assert execute_op("ref.get", {"repo": "o/r", "ref": "heads/main"}, transport=t) == {
+            "ref": "refs/heads/main",
+            "sha": "abc",
+        }
+
+    @pytest.mark.parametrize("status", [404, 409])
+    def test_missing_and_empty_repo_are_data(self, status: int) -> None:
+        """404 (absent branch) and 409 (empty repository — the shape real
+        GitHub gave run rgwp5z40x) both mean 'no base to build on'."""
+        t = ScriptedTransport({"/repos/o/r/git/ref/heads/main": http_error(status)})
+        params = {"repo": "o/r", "ref": "heads/main", "allow_missing": True}
+        assert execute_op("ref.get", params, transport=t) == {
+            "missing": True,
+            "http_status": status,
+        }
+        with pytest.raises(GithubOpError, match=str(status)):
+            execute_op("ref.get", {"repo": "o/r", "ref": "heads/main"}, transport=t)
+
+    def test_unrelated_status_raises(self) -> None:
+        t = ScriptedTransport({"/repos/o/r/git/ref/heads/main": http_error(403)})
+        with pytest.raises(GithubOpError, match="403"):
+            execute_op(
+                "ref.get", {"repo": "o/r", "ref": "heads/main", "allow_missing": True}, transport=t
+            )
+
+    def test_malformed_response_raises(self) -> None:
+        t = ScriptedTransport({"/repos/o/r/git/ref/heads/main": {"message": "weird"}})
+        with pytest.raises(GithubOpError, match="no object sha"):
+            execute_op("ref.get", {"repo": "o/r", "ref": "heads/main"}, transport=t)
 
 
 class TestGhCliTransport:

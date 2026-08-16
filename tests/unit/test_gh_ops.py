@@ -85,6 +85,33 @@ class TestGithubOpsFacade:
             "raw.api",
         ]
 
+    def test_repo_lookup_returns_none_for_a_miss(self) -> None:
+        """The probe asks for the miss as data (allow_missing) so an
+        expected 404 never becomes a failed job / error event (#222)."""
+        ops, client = make_ops({"repo.get": {"missing": True, "http_status": 404}})
+        assert ops.repo_lookup("o/r") is None
+        assert client.jobs[0].params == {"repo": "o/r", "allow_missing": True}
+
+        ops, _ = make_ops({"repo.get": {"full_name": "o/r", "default_branch": "main"}})
+        assert ops.repo_lookup("o/r") == {"full_name": "o/r", "default_branch": "main"}
+
+    def test_ref_lookup(self) -> None:
+        ops, client = make_ops({"ref.get": {"ref": "refs/heads/main", "sha": "abc"}})
+        assert ops.ref_lookup("o/r", "heads/main") == "abc"
+        assert client.jobs[0].params == {"repo": "o/r", "ref": "heads/main", "allow_missing": True}
+
+        ops, _ = make_ops({"ref.get": {"missing": True, "http_status": 409}})
+        assert ops.ref_lookup("o/r", "heads/main") is None
+
+        ops, _ = make_ops({"ref.get": {"ref": "refs/heads/main"}})
+        with pytest.raises(GithubOpsError, match="no sha"):
+            ops.ref_lookup("o/r", "heads/main")
+
+        # a real failure (403, network) is still a failed job and still raises
+        ops, _ = make_ops({"ref.get": "FAIL"})
+        with pytest.raises(GithubOpsError, match="HTTP 403"):
+            ops.ref_lookup("o/r", "heads/main")
+
     def test_error_result_raises(self) -> None:
         ops, _ = make_ops({"issue.create": "FAIL"})
         with pytest.raises(GithubOpsError, match="HTTP 403") as info:

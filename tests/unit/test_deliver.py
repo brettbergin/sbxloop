@@ -21,6 +21,7 @@ class StubOps:
     def __init__(self) -> None:
         self.raw_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.repo_get_calls: list[str] = []
+        self.ref_lookups: list[tuple[str, str]] = []
         self.pr_kwargs: dict[str, Any] = {}
         self.blob_batches: list[list[dict[str, str]]] = []
         self.blob_count = 0
@@ -28,6 +29,14 @@ class StubOps:
     def repo_get(self, repo: str) -> dict[str, Any]:
         self.repo_get_calls.append(repo)
         return {"default_branch": "main"}
+
+    def repo_lookup(self, repo: str) -> dict[str, Any] | None:
+        self.repo_get_calls.append(repo)
+        return {"default_branch": "main"}
+
+    def ref_lookup(self, repo: str, ref: str) -> str | None:
+        self.ref_lookups.append((repo, ref))
+        return "base123"
 
     def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
         self.blob_batches.append(files)
@@ -39,8 +48,6 @@ class StubOps:
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
-        if method == "GET" and "/git/ref/heads/" in path:
-            return {"object": {"sha": "base123"}}
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree"}}
         if path.endswith("/git/trees"):
@@ -80,7 +87,7 @@ class TestDeliverWorkspace:
 
         # base resolved from the repo's default branch
         assert ops.repo_get_calls == ["o/r"]
-        assert ("GET", "/repos/o/r/git/ref/heads/main", None) in ops.raw_calls
+        assert ops.ref_lookups == [("o/r", "heads/main")]
 
         # all blobs ride ONE batched worker job (base64, binary-safe);
         # .git excluded
@@ -180,7 +187,7 @@ class TestDeliverWorkspace:
             draft=True,
         )
         assert ops.repo_get_calls == []
-        assert ("GET", "/repos/o/r/git/ref/heads/develop", None) in ops.raw_calls
+        assert ops.ref_lookups == [("o/r", "heads/develop")]
         assert ops.pr_kwargs["base"] == "develop"
         assert ops.pr_kwargs["draft"] is True
 
@@ -194,22 +201,6 @@ class TestDeliverWorkspace:
                 run_id="r1",
                 outcome="x",
                 source_dir=empty,
-            )
-
-    def test_unresolvable_base_branch(self, tmp_path: Path) -> None:
-        class NoRefOps(StubOps):
-            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if "/git/ref/heads/" in path:
-                    return {"message": "Not Found"}
-                return super().raw(method, path, body)
-
-        with pytest.raises(DeliveryError, match="cannot resolve base branch"):
-            deliver_workspace(
-                NoRefOps(),  # type: ignore[arg-type]
-                "o/r",
-                run_id="r1",
-                outcome="x",
-                source_dir=make_workspace(tmp_path),
             )
 
     def test_missing_blob_sha_names_file(self, tmp_path: Path) -> None:
@@ -281,17 +272,18 @@ class TestDeliverWorkspace:
 
 
 class MissingRepoOps(StubOps):
-    """repo_get 404s until a creation POST lands."""
+    """The repository probe answers "missing" (as data, not an error — #222)
+    until a creation POST lands."""
 
     def __init__(self, login: str = "me") -> None:
         super().__init__()
         self.exists = False
         self.login = login
 
-    def repo_get(self, repo: str) -> dict[str, Any]:
+    def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         self.repo_get_calls.append(repo)
         if not self.exists:
-            raise GithubOpsError("github op repo.get failed: GET /repos -> HTTP 404: Not Found")
+            return None
         return {"default_branch": "main"}
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
@@ -341,36 +333,11 @@ class TestEnsureRepository:
 
     def test_non_404_probe_errors_propagate(self) -> None:
         class ForbiddenOps(StubOps):
-            def repo_get(self, repo: str) -> dict[str, Any]:
+            def repo_lookup(self, repo: str) -> dict[str, Any] | None:
                 raise GithubOpsError("GET /repos -> HTTP 403: rate limited")
 
         with pytest.raises(GithubOpsError, match="403"):
             ensure_repository(ForbiddenOps(), "o/r", create=True)  # type: ignore[arg-type]
-
-    def test_structured_status_wins_over_message_wording(self) -> None:
-        """#221: a worker that reports http_status is believed even when the
-        message happens to mention another code (a 500 whose body quotes
-        '404' must not be mistaken for a missing repo)."""
-
-        class MisleadingOps(StubOps):
-            def repo_get(self, repo: str) -> dict[str, Any]:
-                raise GithubOpsError(
-                    "GET /repos -> HTTP 500: upstream said HTTP 404", http_status=500
-                )
-
-        with pytest.raises(GithubOpsError, match="500"):
-            ensure_repository(MisleadingOps(), "o/r", create=True)  # type: ignore[arg-type]
-
-    def test_structured_404_without_wording_still_means_missing(self) -> None:
-        class TerseMissingOps(MissingRepoOps):
-            def repo_get(self, repo: str) -> dict[str, Any]:
-                self.repo_get_calls.append(repo)
-                if not self.exists:
-                    raise GithubOpsError("repo.get failed", http_status=404)
-                return {"default_branch": "main"}
-
-        ops = TerseMissingOps()
-        assert ensure_repository(ops, "me/proj", create=True) is True  # type: ignore[arg-type]
 
 
 class TestEmptyRepoBootstrap:
@@ -383,19 +350,14 @@ class TestEmptyRepoBootstrap:
                 super().__init__()
                 self.bootstrapped = False
 
-            # The exact worker-shaped error real GitHub produces for an
-            # empty repo — field-verified on run rgwp5z40x (it is a 409,
-            # NOT a 404; the stub used 404 and the field disagreed).
-            error = (
-                "github op raw.api failed: GithubOpError: gh api GET "
-                "/repos/o/r/git/ref/heads/main failed (rc=1): gh: Git "
-                "Repository is empty. (HTTP 409)"
-            )
+            # The worker answers "missing" for both the 409 an empty repo
+            # gets and the 404 an absent branch gets (#222); the host sees
+            # None either way and bootstraps.
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return "base123" if self.bootstrapped else None
 
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
-                    self.raw_calls.append((method, path, body))
-                    raise GithubOpsError(self.error)
                 if method == "PUT" and path.endswith("/contents/README.md"):
                     self.raw_calls.append((method, path, body))
                     self.bootstrapped = True
@@ -416,68 +378,32 @@ class TestEmptyRepoBootstrap:
         assert puts[0][2] is not None and puts[0][2]["branch"] == "main"
         # the bootstrap README round-trips as valid base64
         base64.b64decode(puts[0][2]["content"])
+        # ref looked up twice: the miss, then the bootstrapped base
+        assert ops.ref_lookups == [("o/r", "heads/main")] * 2
 
-    def test_structured_409_bootstraps_regardless_of_wording(self, tmp_path: Path) -> None:
-        """#221: the empty-repo decision keys off ``http_status == 409``, so a
-        gh rewording (or the urllib transport's different phrasing) no longer
-        breaks delivery the way run rgwp5z40x did."""
-
-        class TerseEmptyOps(StubOps):
-            def __init__(self) -> None:
-                super().__init__()
-                self.bootstrapped = False
+    def test_still_missing_after_bootstrap_is_loud(self, tmp_path: Path) -> None:
+        class NeverThereOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                return None
 
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
-                    raise GithubOpsError("ref lookup failed", http_status=409)
                 if method == "PUT" and path.endswith("/contents/README.md"):
-                    self.bootstrapped = True
-                    self.raw_calls.append((method, path, body))
                     return {"content": {"path": "README.md"}}
                 return super().raw(method, path, body)
 
-        ops = TerseEmptyOps()
-        deliver_workspace(
-            ops,  # type: ignore[arg-type]
-            "o/r",
-            run_id="r9",
-            outcome="x",
-            source_dir=make_workspace(tmp_path),
-        )
-        assert any(m == "PUT" and p.endswith("/contents/README.md") for m, p, _ in ops.raw_calls)
-
-    def test_404_missing_ref_also_bootstraps(self, tmp_path: Path) -> None:
-        """An explicit `base` naming a branch that does not exist yet gets
-        the 404 shape; it means the same thing (no base to build on)."""
-
-        class MissingRefOps(StubOps):
-            def __init__(self) -> None:
-                super().__init__()
-                self.bootstrapped = False
-
-            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path and not self.bootstrapped:
-                    raise GithubOpsError("GET ref -> HTTP 404: Not Found")
-                if method == "PUT" and path.endswith("/contents/README.md"):
-                    self.bootstrapped = True
-                    return {"content": {"path": "README.md"}}
-                return super().raw(method, path, body)
-
-        pr = deliver_workspace(
-            MissingRefOps(),  # type: ignore[arg-type]
-            "o/r",
-            run_id="r9",
-            outcome="x",
-            source_dir=make_workspace(tmp_path),
-        )
-        assert pr.number == 7
+        with pytest.raises(DeliveryError, match="still missing after bootstrap"):
+            deliver_workspace(
+                NeverThereOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r9",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
 
     def test_unrelated_ref_errors_still_raise(self, tmp_path: Path) -> None:
         class ForbiddenRefOps(StubOps):
-            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path:
-                    raise GithubOpsError("GET ref -> HTTP 403: rate limited")
-                return super().raw(method, path, body)
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                raise GithubOpsError("GET ref -> HTTP 403: rate limited")
 
         with pytest.raises(GithubOpsError, match="403"):
             deliver_workspace(
@@ -490,9 +416,10 @@ class TestEmptyRepoBootstrap:
 
     def test_missing_base_ref_error_still_loud_when_bootstrap_fails(self, tmp_path: Path) -> None:
         class BrokenOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                return None
+
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path:
-                    raise GithubOpsError("gh: Git Repository is empty. (HTTP 409)")
                 if method == "PUT" and path.endswith("/contents/README.md"):
                     raise GithubOpsError("PUT contents -> HTTP 403: token lacks contents:write")
                 return super().raw(method, path, body)
@@ -573,11 +500,9 @@ class TestGitDiffDelivery:
         (clone / "keep.txt").rename(clone / "kept.txt")
 
         class KnownBaseOps(StubOps):
-            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-                if method == "GET" and "/git/ref/heads/" in path:
-                    self.raw_calls.append((method, path, body))
-                    return {"object": {"sha": base_sha}}
-                return super().raw(method, path, body)
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return base_sha
 
         ops = KnownBaseOps()
         assert deliver(ops, clone).number == 7

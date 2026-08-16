@@ -245,8 +245,52 @@ def _status_create(t: Transport, p: dict[str, Any]) -> JsonValue:
 
 
 def _repo_get(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """Fetch a repository; with ``allow_missing`` a 404 is an *answer*.
+
+    The existence probe behind ``--create-repo`` asks "is it there?" and
+    "no" is expected. Raising here would emit the worker's error event
+    before the host gets to say the miss is fine, and the transcript would
+    show a red panel for a routine question (#222) — so the miss comes back
+    as ``{"missing": true}`` on an ok result instead.
+    """
     _require(p, "repo")
-    return t.request("GET", f"/repos/{p['repo']}")
+    try:
+        return t.request("GET", f"/repos/{p['repo']}")
+    except GithubOpError as exc:
+        if p.get("allow_missing") and exc.http_status == 404:
+            return {"missing": True, "http_status": exc.http_status}
+        raise
+
+
+# Statuses a ref lookup answers with when there is no base to build on: 404
+# for an absent ref on a non-empty repository, 409 for a repository with no
+# commits at all (field-verified: run rgwp5z40x got ``HTTP 409 "Git
+# Repository is empty."`` where the stubs had modeled a 404).
+REF_MISSING_STATUSES = frozenset({404, 409})
+
+
+def _ref_get(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """Resolve a git ref (``heads/main``) to its object sha.
+
+    Delivery uses this to find the base commit; an empty repository or an
+    absent branch is a normal state it bootstraps around, so with
+    ``allow_missing`` those statuses come back as ``{"missing": true}`` on
+    an ok result rather than as an error event (#222).
+    """
+    _require(p, "repo", "ref")
+    try:
+        data = t.request("GET", f"/repos/{p['repo']}/git/ref/{p['ref']}")
+    except GithubOpError as exc:
+        if p.get("allow_missing") and exc.http_status in REF_MISSING_STATUSES:
+            return {"missing": True, "http_status": exc.http_status}
+        raise
+    if not isinstance(data, dict):
+        raise GithubOpError(f"GitHub returned no object sha for ref {p['ref']!r}: {data!r}")
+    obj = data.get("object")
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if not sha:
+        raise GithubOpError(f"GitHub returned no object sha for ref {p['ref']!r}: {data!r}")
+    return {"ref": data.get("ref"), "sha": sha}
 
 
 def _search_issues(t: Transport, p: dict[str, Any]) -> JsonValue:
@@ -321,6 +365,7 @@ OPS: dict[str, OpImpl] = {
     "contents.read": _contents_read,
     "status.create": _status_create,
     "repo.get": _repo_get,
+    "ref.get": _ref_get,
     "search.issues": _search_issues,
     "raw.api": _raw_api,
 }

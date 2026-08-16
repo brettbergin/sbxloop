@@ -71,6 +71,18 @@ All notable changes to sbxloop are documented here. The project adheres to
   a snapshot; a checkout with no base to diff against falls back to one
   and says so in the PR body. The artifact exclude denylist applies to
   both paths.
+- Expected probe answers no longer render as red error panels (#222). The
+  `--create-repo` existence probe and delivery's base-ref lookup asked GitHub a
+  question whose expected answer was "no", but the worker raised on the 404
+  (or the 409 an empty repository returns) and emitted its error event before
+  the host could classify the miss as fine — three field runs showed the
+  alarm on runs that delivered cleanly. `repo.get` and the new `ref.get` op
+  accept `allow_missing: true` and return `{"missing": true}` as an **ok**
+  result; `ensure_repository` and the base-commit lookup branch on that data
+  instead of sniffing exception messages. `GithubOpError` in the worker now
+  carries `http_status` (parsed from gh's trailing `(HTTP NNN)` or urllib's
+  `HTTPError.code`) so the miss/error split is a status compare, not a
+  substring match.
 
 ## [0.6.0] — 2026-08-15
 
