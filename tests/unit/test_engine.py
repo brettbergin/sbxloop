@@ -1190,6 +1190,147 @@ class TestDeliverHook:
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
 
 
+class TestDeliverCommand:
+    """`sbxloop deliver <run>` — LoopEngine.deliver: the retry path for a
+    completed run whose end-of-run delivery failed (#223). Runs on a
+    github-only sandbox; deliver_workspace/ensure_repository are patched."""
+
+    def completed_run(self, harness: Harness, **config_overrides: Any) -> str:
+        execute = {"text": "done", "files": {"hello.txt": "hi"}}
+        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        result = harness.engine(**config_overrides).start("ship it")
+        assert result.state == "completed"
+        harness.events.clear()
+        return result.run_id
+
+    def patch_delivery(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import PrRef
+
+        calls: list[dict[str, Any]] = []
+
+        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
+            calls.append({"repo": repo, **kwargs})
+            return PrRef(number=5, url="https://github.com/o/r/pull/5")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
+        return calls
+
+    def test_delivers_completed_run_from_github_only_sandbox(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The run itself was github-less (no repo → no delivery); the repo
+        # arrives as an override, the way `deliver --repo` passes it.
+        run_id = self.completed_run(harness)
+        calls = self.patch_delivery(monkeypatch)
+        creates_before = len(harness.fake_sbx.invocations("create"))
+
+        pr = harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
+
+        assert pr.number == 5
+        assert len(calls) == 1
+        assert calls[0]["repo"] == "o/r"
+        assert calls[0]["run_id"] == run_id
+        assert calls[0]["outcome"] == "ship it"
+        assert calls[0]["source_dir"].is_dir()
+        # exactly one sandbox — the run's github name — created and torn down
+        creates = harness.fake_sbx.invocations("create")[creates_before:]
+        assert len(creates) == 1
+        assert any(f"sbxloop-{run_id}-github" in arg for arg in creates[0])
+        assert harness.sandboxes_left() == []
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [
+            {"repo": "o/r", "pr": 5, "url": "https://github.com/o/r/pull/5"}
+        ]
+        # persisted under the run, so `logs` and the finish summary see it
+        store = StateStore(harness.state_dir / "state.db")
+        assert [e.type for _s, e in store.events(run_id, type_prefix="run.deliver")] == [
+            HostEventTypes.RUN_DELIVER
+        ]
+
+    def test_uses_persisted_repo_when_no_override(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_id = self.completed_run(harness, github={"repo": "persisted/repo"})
+        calls = self.patch_delivery(monkeypatch)
+        harness.engine().deliver(run_id)
+        assert calls[0]["repo"] == "persisted/repo"
+
+    def test_refuses_run_without_repo(self, harness: Harness) -> None:
+        run_id = self.completed_run(harness)
+        with pytest.raises(StateError, match="no delivery repository"):
+            harness.engine().deliver(run_id)
+        assert harness.sandboxes_left() == []
+
+    def test_refuses_unfinished_run(self, harness: Harness) -> None:
+        engine = harness.engine()
+        engine.store.create_run("r-open", "x", engine.config.model_dump_json())
+        with pytest.raises(StateError, match="only completed runs"):
+            engine.deliver("r-open", github_overrides={"repo": "o/r"})
+
+    def test_failure_emits_error_event_raises_and_tears_down(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.errors import DeliveryError
+
+        run_id = self.completed_run(harness)
+
+        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
+            raise DeliveryError("boom")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
+        with pytest.raises(DeliveryError, match="boom"):
+            harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
+        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
+        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
+        assert harness.sandboxes_left() == []
+
+    def test_report_refreshes_tracking_issue(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import IssueRef
+
+        run_id = self.completed_run(harness)
+        self.patch_delivery(monkeypatch)
+
+        class RecordingOps:
+            instances: ClassVar[list[Any]] = []
+
+            def __init__(self, client: Any, run_id: str, **kwargs: Any) -> None:
+                self.comments: list[str] = []
+                self.raw_calls: list[tuple[str, str]] = []
+                type(self).instances.append(self)
+
+            def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
+                return [{"title": f"sbxloop run {run_id}", "number": 9, "html_url": "https://x/9"}]
+
+            def issue_create(self, *a: Any, **k: Any) -> IssueRef:
+                raise AssertionError("existing issue must be reused")
+
+            def issue_comment(self, repo: str, number: int, body: str) -> str:
+                self.comments.append(body)
+                return "https://c"
+
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                self.raw_calls.append((method, path))
+                return {}
+
+        monkeypatch.setattr(engine_mod, "GithubOps", RecordingOps)
+        harness.engine().deliver(run_id, github_overrides={"repo": "o/r"}, report=True)
+
+        (ops,) = RecordingOps.instances
+        assert ops.comments == [f"Run `{run_id}` delivered: PR #5 https://github.com/o/r/pull/5"]
+        assert ("PATCH", "/repos/o/r/issues/9") in ops.raw_calls
+        report_events = [e for e in harness.events if e.type == HostEventTypes.RUN_REPORT]
+        assert [e.data for e in report_events] == [
+            {"repo": "o/r", "issue": 9, "url": "https://x/9"}
+        ]
+
+
 class TestPrebakedTemplate:
     """[sandbox].template + a baked template: install verifies and skips the
     ladder, and the run emits sandbox.prebaked telemetry."""

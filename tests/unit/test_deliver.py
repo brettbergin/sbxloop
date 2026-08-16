@@ -630,3 +630,108 @@ class TestGitDiffDelivery:
         deliver(ops, clone)
         assert "keep.txt" in [e["path"] for e in tree_entries(ops)]
         assert "**Files (" in ops.pr_kwargs["body"]
+
+
+class TestRedeliveryCollisions:
+    """`sbxloop deliver <run>` re-runs delivery for a run id whose branch
+    (and maybe PR) a prior partial attempt already created (#223). The 422
+    shapes are GitHub's documented answers, not yet field-observed."""
+
+    def test_existing_branch_is_force_updated(self, tmp_path: Path) -> None:
+        class BranchExistsOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    self.raw_calls.append((method, path, body))
+                    raise GithubOpsError(
+                        "github op raw.api failed: GithubOpError: gh api POST "
+                        "/repos/o/r/git/refs failed (rc=1): gh: Reference already "
+                        "exists (HTTP 422)"
+                    )
+                if method == "PATCH" and "/git/refs/heads/" in path:
+                    self.raw_calls.append((method, path, body))
+                    return {"ref": path}
+                return super().raw(method, path, body)
+
+        ops = BranchExistsOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr.number == 7
+        patches = [call for call in ops.raw_calls if call[0] == "PATCH"]
+        assert patches == [
+            (
+                "PATCH",
+                f"/repos/o/r/git/refs/heads/{branch_name('r42')}",
+                {"sha": "commit789", "force": True},
+            )
+        ]
+        # a fresh PR was still opened from the (moved) branch
+        assert ops.pr_kwargs["head"] == branch_name("r42")
+
+    def test_existing_open_pr_is_reused(self, tmp_path: Path) -> None:
+        class PrExistsOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    self.raw_calls.append((method, path, body))
+                    return [{"number": 12, "html_url": "https://github.com/o/r/pull/12"}]
+                return super().raw(method, path, body)
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise GithubOpsError(
+                    "github op pr.create failed: GithubOpError: POST .../pulls -> HTTP 422: "
+                    '{"message":"Validation Failed","errors":[{"message":"A pull request '
+                    'already exists for o:sbxloop/r42."}]}'
+                )
+
+        ops = PrExistsOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr == PrRef(number=12, url="https://github.com/o/r/pull/12")
+        lookups = [call for call in ops.raw_calls if call[0] == "GET" and "/pulls?" in call[1]]
+        assert lookups == [
+            ("GET", f"/repos/o/r/pulls?state=open&head=o:{branch_name('r42')}", None)
+        ]
+
+    def test_pr_collision_without_open_pr_stays_loud(self, tmp_path: Path) -> None:
+        class GhostPrOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    return []
+                return super().raw(method, path, body)
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise GithubOpsError("HTTP 422: A pull request already exists for o:sbxloop/r42.")
+
+        with pytest.raises(GithubOpsError, match="already exists"):
+            deliver_workspace(
+                GhostPrOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+
+    def test_unrelated_ref_post_errors_still_raise(self, tmp_path: Path) -> None:
+        class ForbiddenRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise GithubOpsError("POST refs -> HTTP 403: token lacks contents:write")
+                return super().raw(method, path, body)
+
+        with pytest.raises(GithubOpsError, match="403"):
+            deliver_workspace(
+                ForbiddenRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )

@@ -36,7 +36,7 @@ from typing import Any, NamedTuple
 
 from pydantic import ValidationError
 
-from sbxloop.config import Config, _flatten, load_config, load_dotenv_file
+from sbxloop.config import Config, GithubConfig, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace, ensure_repository
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
@@ -46,26 +46,29 @@ from sbxloop.engine.model import (
     SteerVerdict,
     TaskRecord,
     TaskState,
+    artifacts_dir,
     scan_artifacts,
 )
 from sbxloop.engine.phases import CriticOutcome, PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
+    DeliveryError,
     SbxError,
     SbxloopError,
     StateError,
     WorkerError,
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
-from sbxloop.gh.ops import GithubOps
+from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_message_id, new_run_id
 from sbxloop.policy import EgressGranter
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.provision import Provisioner
-from sbxloop.sbx.sandbox import SBXLOOP_DIR
+from sbxloop.sbx.provision import Provisioner, sandbox_name
+from sbxloop.sbx.prune import remove_run_sandbox_secrets
+from sbxloop.sbx.sandbox import SBXLOOP_DIR, Sandbox
 from sbxloop.worker.client import WorkerClient
 
 logger = logging.getLogger(__name__)
@@ -76,6 +79,34 @@ class ChatMessage(NamedTuple):
 
     message_id: str
     text: str
+
+
+class _GithubOnly:
+    """A lone github-ops sandbox (``sbxloop deliver``) and its worker client.
+
+    Not a :class:`SandboxPair` — there is no agent half — but the teardown
+    is the pair's: stop, rm, and unregister the name-scoped secret, since
+    ``sbx rm`` leaves the registration behind and it would poison the next
+    provision under the same run name (see ``remove_run_sandbox_secrets``).
+    """
+
+    def __init__(self, sandbox: Sandbox, client: WorkerClient, *, keep: bool = False) -> None:
+        self.sandbox = sandbox
+        self.client = client
+        self.keep = keep
+
+    def close(self) -> None:
+        if self.keep:
+            return
+        for step in (
+            self.sandbox.stop,
+            self.sandbox.rm,
+            partial(remove_run_sandbox_secrets, self.sandbox.cli, self.sandbox.name, "github"),
+        ):
+            try:
+                step()
+            except Exception:
+                logger.warning("teardown of %s failed", self.sandbox.name, exc_info=True)
 
 
 class LoopEngine:
@@ -166,6 +197,123 @@ class LoopEngine:
             # (and `status` output); only in-flight runs are cancellable.
             raise StateError(f"run {run_id} is already {run.state}; nothing to cancel")
         self.store.set_run_state(run_id, "cancelled")
+
+    def deliver(
+        self,
+        run_id: str,
+        *,
+        github_overrides: dict[str, Any] | None = None,
+        report: bool | None = None,
+    ) -> PrRef:
+        """Deliver (or re-deliver) a completed run's artifacts as a PR.
+
+        Delivery at run end is a one-shot side effect: when it fails, the
+        work is done, verified, and stranded in the workspace, and
+        ``resume`` refuses completed runs (field failure rgwp5z40x, #223).
+        This is the retry path: a github-ops sandbox alone (no agent, no
+        Copilot token), the run's persisted config (same pinning
+        discipline as resume) with any explicit ``github_overrides`` on
+        top — a run that never had ``[github].repo`` can still be
+        delivered by naming one — and the same ``run.deliver`` events, so
+        ``logs`` and the finish summary see the outcome. Unlike the
+        end-of-run hook, failure raises: the caller asked for exactly this.
+
+        ``report`` (None → the run's ``[github].report``) refreshes the
+        tracking issue with the PR link once delivery succeeds.
+        """
+        run = self.store.get_run(run_id)
+        if run.state != "completed":
+            raise StateError(f"run {run_id} is {run.state}; only completed runs can be delivered")
+        self._rehydrate_config(run_id)
+        github_cfg = self.config.github
+        if github_overrides:
+            # Validate, don't model_copy: an ill-formed --repo must fail here.
+            github_cfg = GithubConfig.model_validate(
+                {**github_cfg.model_dump(), **github_overrides}
+            )
+            self.config = self.config.model_copy(update={"github": github_cfg})
+        repo = github_cfg.repo
+        if not repo:
+            raise StateError(
+                f"run {run_id} has no delivery repository: its config has no "
+                "[github].repo — pass --repo owner/name"
+            )
+        source = artifacts_dir(run, self.config.state_dir)
+        if source is None or not source.is_dir():
+            raise DeliveryError(
+                f"run {run_id} has no artifacts directory to deliver "
+                f"({source or 'no workspace recorded'})"
+            )
+        report_wanted = github_cfg.report if report is None else report
+        assert run.workspace is not None
+        sandbox = self._provision_github_only(run_id, run.workspace)
+        try:
+            ops = GithubOps(sandbox.client, run_id)
+            try:
+                created = ensure_repository(
+                    ops, repo, create=github_cfg.create_repo, public=github_cfg.create_public
+                )
+                if created:
+                    self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, created=True)
+                pr = deliver_workspace(
+                    ops,
+                    repo,
+                    run_id=run_id,
+                    outcome=run.outcome,
+                    source_dir=source,
+                    base=github_cfg.deliver_base,
+                    draft=github_cfg.deliver_draft,
+                    exclude=self.config.artifacts.exclude,
+                )
+            except SbxloopError as exc:
+                self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
+                raise
+            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, pr=pr.number, url=pr.url)
+            if report_wanted:
+                hook = GithubReporterHook(ops, repo)
+                hook.open_run(run_id, run.outcome)
+                hook.note_delivery(run_id, pr)
+                if hook.issue is not None:
+                    self.bus.emit(
+                        HostEventTypes.RUN_REPORT,
+                        run_id,
+                        repo=repo,
+                        issue=hook.issue.number,
+                        url=hook.issue.url,
+                    )
+        finally:
+            sandbox.close()
+        return pr
+
+    def _provision_github_only(self, run_id: str, workspace: Path) -> _GithubOnly:
+        """One github-role sandbox under the run's github sandbox name (so
+        `status`/`shell --role github`/`sandbox prune` all recognize it),
+        worker installed, torn down by the returned handle's ``close``."""
+        clients: list[WorkerClient] = []
+
+        def install(created: Sandbox, _role: str) -> None:
+            # Inside ensure_github_only's try: a failed install rolls the
+            # sandbox and its registered secret back, as for the pair.
+            client = WorkerClient(
+                created,
+                self.bus,
+                transport=self.config.worker_transport,
+                python=self.worker_python,
+                role="github",
+                limits=self.config.limits,
+            )
+            if self.install_workers:
+                client.install(extras="", expect_prebaked=bool(self.config.sandbox.template))
+            clients.append(client)
+
+        provisioner = Provisioner(self.sbx, self.config, self.bus)
+        sandbox = provisioner.ensure_github_only(
+            sandbox_name(run_id, "github"), workspace, post_create=install, run_id=run_id
+        )
+        if self.config.keep_sandboxes:
+            # Same marker a kept run gets, so `sandbox prune` respects it.
+            self.store.set_run_kept(run_id, "manual")
+        return _GithubOnly(sandbox, clients[0], keep=self.config.keep_sandboxes)
 
     def request_cancel(self) -> None:
         """Ask a running engine (from another thread) to stop at the next

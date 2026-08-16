@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- `sbxloop deliver <run>` (#223): deliver — or re-deliver — a completed
+  run's artifacts as a PR without re-running the work. End-of-run delivery
+  was a one-shot side effect with no retry path (field failure `rgwp5z40x`:
+  every task passed, delivery failed on the empty-repo 409, and `resume`
+  refuses completed runs). The command provisions a github-ops sandbox only,
+  reuses the run's persisted config with `--repo`/`--deliver-base`/
+  `--deliver-draft`/`--create-repo` overrides on top, runs the normal
+  `ensure_repository` + `deliver_workspace` path, and emits the usual
+  `run.deliver` events so `logs` and the finish summary see it; `--report`
+  refreshes the run's tracking issue with the PR link. Re-delivering a run
+  whose `sbxloop/<run>` branch already exists (a prior partial attempt)
+  force-updates the branch and reuses an already-open PR for that head
+  instead of failing on the refs POST 422.
+
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
   boundaries (fences re-opened with their language) instead of clipped;

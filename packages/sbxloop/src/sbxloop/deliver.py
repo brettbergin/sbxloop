@@ -26,8 +26,12 @@ but per the project pattern — unverified external behaviors get a seam and
 an e2e check, never a confident default — it is NOT field-proven until the
 real-sbx e2e workflow exercises it. Known e2e-validation items:
 
-- TODO(e2e): branch-name collisions (re-delivering the same run id — the
-  refs POST will 422; decide between force-update and suffixing)
+- TODO(e2e): branch-name collisions — handled in code (a 422 on the refs
+  POST force-updates the existing ``sbxloop/<run>`` branch, and a 422 on
+  the PR create reuses the open PR for that head), because ``sbxloop
+  deliver <run>`` re-runs delivery against a repository a prior partial
+  attempt may already have touched (#223) — but the 422 shapes are taken
+  from the GitHub API docs, not yet observed in the field
 - TODO(e2e): ``sha: null`` deletions and ``100755``/``120000`` modes in
   the git-diff tree against real GitHub (documented Git Data API
   behavior, not yet exercised end to end)
@@ -85,6 +89,20 @@ def _is_empty_repo(exc: GithubOpsError) -> bool:
     """
     text = str(exc)
     return "HTTP 409" in text and "empty" in text.lower()
+
+
+def _is_ref_collision(exc: GithubOpsError) -> bool:
+    """Whether a refs POST failed because the branch already exists —
+    GitHub's documented answer is HTTP 422 "Reference already exists"."""
+    text = str(exc)
+    return "HTTP 422" in text and "already exists" in text.lower()
+
+
+def _is_pr_collision(exc: GithubOpsError) -> bool:
+    """Whether a PR create failed because that head already has an open PR
+    (HTTP 422 "A pull request already exists for owner:branch")."""
+    text = str(exc)
+    return "HTTP 422" in text and "pull request already exists" in text.lower()
 
 
 def ensure_repository(
@@ -210,16 +228,55 @@ def deliver_workspace(
         f"commit for {repo}",
     )
     branch = branch_name(run_id)
-    ops.raw("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": commit})
+    _point_branch(ops, repo, branch, commit)
 
-    return ops.pr_create(
-        repo,
-        base=base,
-        head=branch,
-        title=_title(outcome),
-        body=_body(run_id, outcome, plan),
-        draft=draft,
-    )
+    try:
+        return ops.pr_create(
+            repo,
+            base=base,
+            head=branch,
+            title=_title(outcome),
+            body=_body(run_id, outcome, plan),
+            draft=draft,
+        )
+    except GithubOpsError as exc:
+        if not _is_pr_collision(exc):
+            raise
+        existing = _find_open_pr(ops, repo, branch)
+        if existing is None:
+            raise
+        return existing
+
+
+def _point_branch(ops: GithubOps, repo: str, branch: str, commit: str) -> None:
+    """Create the delivery branch at ``commit`` — or, when a prior attempt
+    for the same run already created it, force-move it there.
+
+    The branch name is a pure function of the run id, so a re-delivery
+    (``sbxloop deliver <run>`` after a failed first attempt, #223) collides
+    with whatever the earlier attempt left. Force-updating rather than
+    suffixing keeps one branch (and one PR) per run: the newer commit is
+    built from the same artifacts and supersedes the old one.
+    """
+    try:
+        ops.raw("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": commit})
+    except GithubOpsError as exc:
+        if not _is_ref_collision(exc):
+            raise
+        ops.raw("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": commit, "force": True})
+
+
+def _find_open_pr(ops: GithubOps, repo: str, branch: str) -> PrRef | None:
+    """The open PR whose head is ``branch`` — a re-delivery's earlier PR,
+    which the force-moved branch has just refreshed."""
+    owner = repo.split("/", 1)[0]
+    pulls = ops.raw("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}")
+    if not isinstance(pulls, list):
+        return None
+    for pull in pulls:
+        if isinstance(pull, dict) and pull.get("number"):
+            return PrRef(number=int(pull["number"]), url=str(pull.get("html_url", "")))
+    return None
 
 
 def _is_checkout_root(source_dir: Path) -> bool:
