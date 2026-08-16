@@ -257,8 +257,16 @@ class GitHubIssueSource:
         return items
 
     def claim(self, item: WorkItem) -> bool:
-        """Re-verify (search lags), then swap trigger → in-progress and say so."""
+        """Re-verify (search lags), then swap trigger → in-progress and say so.
+
+        Ordered so a failure part-way can never lose the item: in-progress
+        is added *before* the trigger is removed (both present is a safe
+        intermediate — polling still finds it), and if removing the trigger
+        fails the in-progress label is rolled back. The claim comment is
+        cosmetic and comes last: a failure there must not un-claim.
+        """
         number = item.source_key
+        added_in_progress = False
         try:
             ops = self._ops()
             issue = ops.raw("GET", self._issue_path(number))
@@ -269,13 +277,25 @@ class GitHubIssueSource:
             }
             if self.labels.trigger not in names:
                 return False
-            self._remove_label(ops, number, self.labels.trigger)
             self._add_label(ops, number, self.labels.in_progress)
-            self._comment(ops, number, f"sbxloop daemon claimed this issue (host `{self.host}`).")
-            return True
+            added_in_progress = True
+            self._remove_label(ops, number, self.labels.trigger)
         except (GithubOpsError, WorkerError, SbxError):
             logger.warning("github source: claim failed for #%s", number, exc_info=True)
+            if added_in_progress:
+                # Best-effort: leave the issue exactly as we found it.
+                self._guard(
+                    "claim rollback",
+                    lambda ops: self._remove_label(ops, number, self.labels.in_progress),
+                )
             return False
+        self._guard(
+            "claim comment",
+            lambda ops: self._comment(
+                ops, number, f"sbxloop daemon claimed this issue (host `{self.host}`)."
+            ),
+        )
+        return True
 
     def report_started(self, item: WorkItem, run_id: str) -> None:
         self._guard(

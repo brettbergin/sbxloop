@@ -10,14 +10,13 @@ replaced sandbox is picked up transparently.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
 from sbxloop.config import Config
-from sbxloop.errors import DaemonError, GithubOpsError, SbxError, WorkerError
+from sbxloop.errors import DaemonError, GithubOpsError, SbxError, SbxloopError, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.gh.ops import GithubOps
 from sbxloop.sbx.cli import SbxCLI
@@ -99,24 +98,31 @@ class DaemonGithub:
                 logger.warning("failed to remove daemon sandbox %s", self.name, exc_info=True)
 
     def _provision(self) -> GithubOps:
-        try:
-            sandbox = self.provisioner.ensure_github_only(self.name, self.workspace)
-        except SbxError as exc:
-            raise DaemonError(f"cannot provision the daemon github sandbox: {exc}") from exc
-        client = WorkerClient(
-            sandbox,
-            self.bus,
-            transport=self.config.worker_transport,
-            python=self.worker_python,
-            role="github",
-            limits=self.config.limits,
-        )
-        if self.install_workers:
-            try:
+        clients: list[WorkerClient] = []
+
+        def install(sandbox: Sandbox, _role: str) -> None:
+            # Runs inside ensure_github_only's try: a failed worker install
+            # rolls back the sandbox AND its registered secrets, the same
+            # way a failed pair provision does.
+            client = WorkerClient(
+                sandbox,
+                self.bus,
+                transport=self.config.worker_transport,
+                python=self.worker_python,
+                role="github",
+                limits=self.config.limits,
+            )
+            if self.install_workers:
                 client.install(extras="")
-            except (WorkerError, SbxError) as exc:
-                with contextlib.suppress(SbxError):
-                    sandbox.rm()
-                raise DaemonError(f"daemon github worker install failed: {exc}") from exc
-        self._sandbox, self._client = sandbox, client
-        return GithubOps(client, DAEMON_RUN_ID)
+            clients.append(client)
+
+        try:
+            sandbox = self.provisioner.ensure_github_only(
+                self.name, self.workspace, post_create=install
+            )
+        except SbxloopError as exc:
+            # ProvisionError, WorkerError, SbxError alike: one daemon-level
+            # error, and nothing left behind.
+            raise DaemonError(f"cannot provision the daemon github sandbox: {exc}") from exc
+        self._sandbox, self._client = sandbox, clients[0]
+        return GithubOps(clients[0], DAEMON_RUN_ID)

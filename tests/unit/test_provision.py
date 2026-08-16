@@ -402,6 +402,25 @@ class TestGithubOnly:
             provisioner.ensure_github_only("sbxloop-daemon-github", tmp_path / "ws")
         assert fake_sbx.invocations("rm") != []
 
+    def test_post_create_failure_rolls_back_sandbox_and_secrets(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """The daemon installs its worker via post_create so an install
+        failure gets the same sandbox+secret rollback as any provisioning
+        failure (review: previously only the sandbox was removed)."""
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+
+        def boom(sandbox: object, role: str) -> None:
+            raise RuntimeError("worker install exploded")
+
+        with pytest.raises(ProvisionError, match="worker install exploded"):
+            provisioner.ensure_github_only(
+                "sbxloop-daemon-github", tmp_path / "ws", post_create=boom
+            )
+        assert fake_sbx.invocations("rm") != []
+        # secrets registered for the sandbox were unregistered again
+        assert not any("sbxloop-daemon-github" in s for s in fake_sbx.secrets())
+
 
 class TestWorkspaceIsolation:
     """Runs against a git-checkout workspace work in a per-run clone; the

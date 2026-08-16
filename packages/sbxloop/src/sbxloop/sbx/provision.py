@@ -428,14 +428,22 @@ class Provisioner:
             secrets=[SecretSpec(kind="service", service="github")],
         )
 
-    def ensure_github_only(self, name: str, workspace: Path) -> Sandbox:
+    def ensure_github_only(
+        self,
+        name: str,
+        workspace: Path,
+        *,
+        post_create: PostCreate | None = None,
+    ) -> Sandbox:
         """Provision one github-role sandbox (GH_TOKEN only) outside any run.
 
         The daemon polls issues and drives label/comment lifecycle from
         here, keeping the credential split intact: the host still never
         holds the PAT. Same fail-fast/rollback discipline as the pair —
         token check before any microVM, sandbox + registered secrets
-        removed on failure.
+        removed on failure. ``post_create`` (falling back to the
+        instance-level hook) runs *inside* that try, so a caller's worker
+        install failing rolls the sandbox and its secrets back too.
         """
         token = self.gh_token()
         spec = self.github_only_spec(name, workspace)
@@ -451,8 +459,9 @@ class Provisioner:
             registered_secret_rms.extend(self._apply_secrets(spec, created, token))
             self._verify_secret_env(label, spec, created, token)
             created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
-            if self.post_create is not None:
-                self.post_create(created, spec.role)
+            hook = post_create or self.post_create
+            if hook is not None:
+                hook(created, spec.role)
             self.bus.emit("sandbox.ready", label, name=spec.name, role=spec.role)
             return created
         except Exception as exc:
@@ -463,7 +472,8 @@ class Provisioner:
                     logger.warning("rollback: failed to remove %s", created.name, exc_info=True)
             for rm in registered_secret_rms:
                 try:
-                    rm()
+                    if not rm():
+                        logger.warning("rollback: sbx rejected removing a registered secret")
                 except SbxError:
                     logger.warning("rollback: failed to remove a registered secret", exc_info=True)
             if isinstance(exc, ProvisionError):

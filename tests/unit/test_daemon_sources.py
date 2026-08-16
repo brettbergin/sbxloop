@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.sources import (
     GitHubIssueSource,
@@ -165,6 +167,60 @@ class TestGitHubSource:
         assert ("POST", "/repos/o/r/issues/4/labels") in methods
         assert ops.comments and "claimed" in ops.comments[0][1] and "`db`" in ops.comments[0][1]
 
+    def test_claim_adds_in_progress_before_removing_trigger(self) -> None:
+        """Both labels present is the safe intermediate: a crash between the
+        two mutations leaves the trigger, so polling still finds the item."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        assert self.make(ops).claim(item) is True
+        mutations = [(m, p) for m, p, _ in ops.raw_calls if m in ("POST", "DELETE")]
+        assert mutations == [
+            ("POST", "/repos/o/r/issues/4/labels"),
+            ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun"),
+        ]
+
+    def test_claim_failure_after_adding_in_progress_rolls_it_back(self) -> None:
+        """If removing the trigger fails, in-progress must come back off so
+        the issue is exactly as found (review: otherwise the item is lost —
+        polling only looks for the trigger)."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        ops.fail_on = {"DELETE"}  # trigger removal fails
+        item = self.make(ops).poll()[0]
+        # DELETE fails both for the trigger removal AND the rollback attempt;
+        # rollback is best-effort. Verify the rollback was *attempted* by
+        # allowing DELETE for the rollback path only.
+        deletes: list[str] = []
+
+        original_raw = ops.raw
+
+        def raw(method: str, path: str, body: object = None) -> object:
+            if method == "DELETE":
+                deletes.append(path)
+                if path.endswith("sbxloop%3Arun"):
+                    raise GithubOpsError("DELETE trigger -> HTTP 502")
+                ops.raw_calls.append((method, path, body))
+                return {}
+            return original_raw(method, path, body)
+
+        ops.raw = raw  # type: ignore[method-assign]
+        ops.fail_on = set()
+        assert self.make(ops).claim(item) is False
+        # in-progress was added, then rolled back
+        assert (
+            "POST",
+            "/repos/o/r/issues/4/labels",
+            {"labels": ["sbxloop:in-progress"]},
+        ) in ops.raw_calls
+        assert any(d.endswith("sbxloop%3Ain-progress") for d in deletes)
+        # no claim comment was posted for a failed claim
+        assert not any("claimed" in body for _, body in ops.comments)
+
+    def test_claim_comment_failure_does_not_unclaim(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        ops.fail_on = {"COMMENT"}
+        item = self.make(ops).poll()[0]
+        assert self.make(ops).claim(item) is True  # labels swapped; comment is cosmetic
+
     def test_claim_refuses_when_label_gone_or_issue_closed(self) -> None:
         stale = RecordingOps({"4": issue(4)})  # trigger label already removed
         item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
@@ -225,3 +281,24 @@ class TestGitHubSource:
         assert ops.created[-1] == ("Later", ["sbxloop:backlog"])
         src.file_backlog("Now", "detail", "r1", trigger=True)
         assert ops.created[-1] == ("Now", ["sbxloop:run"])
+
+
+class TestDaemonGithubProvisioning:
+    def test_provision_error_is_wrapped_as_daemon_error(self, tmp_path: Path) -> None:
+        """ensure_github_only can raise ProvisionError (not just SbxError);
+        both must surface as one DaemonError (review)."""
+        from sbxloop.config import Config
+        from sbxloop.daemon.github import DaemonGithub
+        from sbxloop.errors import DaemonError, ProvisionError
+        from sbxloop.events import EventBus
+
+        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        gh = DaemonGithub(config, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
+
+        class Boom:
+            def ensure_github_only(self, *a: object, **k: object) -> object:
+                raise ProvisionError("GH_TOKEN is not set")
+
+        gh.provisioner = Boom()  # type: ignore[assignment]
+        with pytest.raises(DaemonError, match="GH_TOKEN"):
+            gh.ops()
