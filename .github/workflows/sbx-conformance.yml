@@ -26,6 +26,9 @@ on:
 env:
   SBX_INSTALL_DIR: /home/runner/.docker/sbx
   SBXLOOP_APP_NAME: sbxloop-conformance
+  # state_dir defaults to ~/.sbxloop; the cache/upload steps below target
+  # .sbxloop/conformance in the checkout, so pin doctor's verdict store there.
+  SBXLOOP_STATE_DIR: .sbxloop
 
 jobs:
   conformance:

@@ -17,6 +17,9 @@ on:
 
 env:
   SBX_INSTALL_DIR: /home/runner/.docker/sbx
+  # state_dir defaults to ~/.sbxloop; the steps below read the run's
+  # state.db / runs/ from the checkout, so pin state to the workspace.
+  SBXLOOP_STATE_DIR: .sbxloop
 
 jobs:
   e2e:
