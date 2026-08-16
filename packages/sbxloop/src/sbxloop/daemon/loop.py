@@ -665,7 +665,12 @@ class DaemonLoop:
             self._notify(
                 f"✅ {item.item_id} done ({report.task_summary})"
                 + (f" · PR {report.delivery[1]}" if report.delivery else "")
-                + (f" · filed {len(report.filed)} finding(s)" if item.kind == "audit" else "")
+                + (
+                    f" · filed {len(report.filed) + len(report.tool_filed)} finding(s)"
+                    + (f" ({len(report.tool_filed)} upstream)" if report.tool_filed else "")
+                    if item.kind == "audit"
+                    else ""
+                )
             )
             self._file_review(item, run_id, report)
             return "done"
