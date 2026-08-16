@@ -246,6 +246,21 @@ class TestGitHubSource:
         assert items["gh:5"].kind == "audit"
         assert items["gh:6"].kind == "patch"
 
+    def test_claim_clears_delivered_only_when_present(self) -> None:
+        """A blind DELETE of the delivered label 404s on every fresh issue and
+        the event stream renders each as an error panel (field noise on
+        every audit claim); only clear it when the re-GET showed it."""
+        fresh = RecordingOps({"4": issue(4, "sbxloop:run")})
+        assert self.make(fresh).claim(self.make(fresh).poll()[0]) is True
+        assert not any(
+            p.endswith("sbxloop%3Adelivered") for m, p, _ in fresh.raw_calls if m == "DELETE"
+        )
+        stale = RecordingOps({"5": issue(5, "sbxloop:run", "sbxloop:delivered")})
+        assert self.make(stale).claim(self.make(stale).poll()[0]) is True
+        assert any(
+            p.endswith("sbxloop%3Adelivered") for m, p, _ in stale.raw_calls if m == "DELETE"
+        )
+
     def test_audit_claim_swaps_the_audit_label(self) -> None:
         ops = RecordingOps({"5": issue(5, "sbxloop:audit")})
         item = self.make(ops).poll()[0]
@@ -323,8 +338,7 @@ class TestGitHubSource:
         assert mutations == [
             ("POST", "/repos/o/r/issues/4/labels"),
             ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun"),
-            # stale-delivered sweep runs last, after the claim is settled
-            ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Adelivered"),
+            # no stale-delivered sweep: the re-GET showed no such label
         ]
 
     def test_claim_failure_after_adding_in_progress_rolls_it_back(self) -> None:
