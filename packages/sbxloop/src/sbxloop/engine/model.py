@@ -329,8 +329,6 @@ def scan_artifacts(
     ``.gitignore`` does (#249). Name-based entries take precedence in the
     tally; ``exclude`` stays the operator's override on top of both.
     """
-    names = frozenset(entry for entry in exclude if not _is_glob(entry))
-    patterns = [entry for entry in exclude if _is_glob(entry)]
     candidates = [p for p in sorted(root.rglob("*")) if p.is_file()]
     ignored: frozenset[str] = frozenset()
     if gitignore and ((root / ".git").exists() or any(p.name == ".gitignore" for p in candidates)):
@@ -343,14 +341,7 @@ def scan_artifacts(
     excluded: dict[str, int] = {}
     for p in candidates:
         rel = p.relative_to(root)
-        hit = next(
-            (
-                match
-                for part in rel.parts
-                if (match := _exclusion_hit(part, names, patterns)) is not None
-            ),
-            None,
-        )
+        hit = exclusion_hit(rel.parts, exclude)
         if hit is None and rel.as_posix() in ignored:
             hit = GITIGNORED
         if hit is None:
@@ -360,14 +351,23 @@ def scan_artifacts(
     return ArtifactScan(files=files, excluded=excluded)
 
 
+def exclusion_hit(parts: Sequence[str], exclude: Sequence[str]) -> str | None:
+    """The exclude entry (name or glob) matching any component of a relative
+    path, or None when the path is kept. Shared by the workspace scan and
+    the git-diff delivery path so both apply one denylist."""
+    names = frozenset(entry for entry in exclude if not _is_glob(entry))
+    patterns = [entry for entry in exclude if _is_glob(entry)]
+    for part in parts:
+        if part in names:
+            return part
+        pattern = next((p for p in patterns if fnmatch.fnmatch(part, p)), None)
+        if pattern is not None:
+            return pattern
+    return None
+
+
 def _is_glob(entry: str) -> bool:
     return any(ch in entry for ch in "*?[")
-
-
-def _exclusion_hit(part: str, names: frozenset[str], patterns: Sequence[str]) -> str | None:
-    if part in names:
-        return part
-    return next((pattern for pattern in patterns if fnmatch.fnmatch(part, pattern)), None)
 
 
 def artifact_files(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES) -> list[Path]:

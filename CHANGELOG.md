@@ -34,6 +34,19 @@ All notable changes to sbxloop are documented here. The project adheres to
   (never the operator's global excludes or an enclosing checkout's rules),
   and degrades to the name-based scan when git is unavailable.
   `[artifacts] exclude` remains the operator override on top.
+- **Delivery of git-checkout workspaces commits the run's diff, not a
+  snapshot** (#248). When the workspace is a git checkout (the per-run
+  clone, or an in-place checkout), the PR tree now carries only what the
+  run changed relative to its base commit — deletions as `sha: null` tree
+  entries, renames as delete + add, executable scripts keeping `100755`,
+  symlinks as `120000` — instead of layering every file as `100644` onto
+  the base tree, which could never delete a file and flipped every exec
+  bit. The diff base is the merge base with the PR's target commit when
+  the clone knows it, else the commit the clone was cut from (pinned as
+  `refs/sbxloop/base` at clone time). Non-git workspaces still deliver as
+  a snapshot; a checkout with no base to diff against falls back to one
+  and says so in the PR body. The artifact exclude denylist applies to
+  both paths.
 
 ## [0.6.0] — 2026-08-15
 

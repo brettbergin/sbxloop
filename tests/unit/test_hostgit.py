@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from sbxloop import hostgit
-from sbxloop.errors import ProvisionError
+from sbxloop.errors import DeliveryError, ProvisionError
 
 
 def git(*argv: str, cwd: Path) -> None:
@@ -124,6 +124,28 @@ class TestCloneForRun:
         assert not (source / ".git" / "refs" / "heads" / "sbxloop").exists()
         assert hostgit.head_commit(source) == sha
 
+    def test_clone_pins_base_ref(self, tmp_path: Path) -> None:
+        """The commit the clone was cut from is pinned so delivery can diff
+        against it after the agent commits or moves the branch (#248)."""
+        source = make_repo(tmp_path)
+        target = tmp_path / "target"
+        sha = hostgit.clone_for_run(source, target, "sbxloop/r1")
+        pinned = subprocess.run(
+            ["git", "rev-parse", hostgit.CLONE_BASE_REF],
+            cwd=target,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert pinned == sha
+        # the pin is not a branch: it must never show up as one to the agent
+        assert (
+            "sbxloop/base"
+            not in subprocess.run(
+                ["git", "branch", "--list"], cwd=target, check=True, capture_output=True, text=True
+            ).stdout
+        )
+
     def test_clone_failure_raises_provision_error(self, tmp_path: Path) -> None:
         with pytest.raises(ProvisionError, match="cloning workspace"):
             hostgit.clone_for_run(tmp_path / "nope", tmp_path / "target", "sbxloop/r1")
@@ -209,3 +231,119 @@ class TestGitignoredFiles:
     def test_no_git_binary_is_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
         assert hostgit.gitignored_files(tmp_path) is None
+
+
+def rev(cwd: Path, ref: str = "HEAD") -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def make_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """A source repo with a committed executable script, and its run clone."""
+    source = make_repo(tmp_path)
+    (source / "scripts").mkdir()
+    script = source / "scripts" / "run.sh"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
+    (source / "old.txt").write_text("old\n")
+    git("add", ".", cwd=source)
+    git("commit", "-m", "more", cwd=source)
+    clone = tmp_path / "clone"
+    hostgit.clone_for_run(source, clone, "sbxloop/r1")
+    return source, clone
+
+
+class TestChangesSince:
+    def test_lists_adds_mods_deletes_with_modes(self, tmp_path: Path) -> None:
+        """Working-tree edits (uncommitted), a deletion, an untracked file and
+        an executable all surface — the shapes a snapshot overlay got wrong."""
+        _, clone = make_clone(tmp_path)
+        (clone / "hello.txt").write_text("changed\n")
+        (clone / "old.txt").unlink()
+        (clone / "new.txt").write_text("new\n")
+        (clone / "scripts" / "run.sh").write_text("#!/bin/sh\necho hi\n")
+        (clone / "tool.py").write_text("print()\n")
+        (clone / "tool.py").chmod(0o755)
+
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+
+        assert [(c.path, c.status, c.mode) for c in changes] == [
+            ("hello.txt", "modified", "100644"),
+            ("new.txt", "added", "100644"),
+            ("old.txt", "deleted", ""),
+            ("scripts/run.sh", "modified", "100755"),
+            ("tool.py", "added", "100755"),
+        ]
+
+    def test_committed_changes_and_renames(self, tmp_path: Path) -> None:
+        """Committed work counts the same as uncommitted, and a rename comes
+        back as delete + add — a git tree has no rename entry."""
+        _, clone = make_clone(tmp_path)
+        git("mv", "old.txt", "renamed.txt", cwd=clone)
+        git("commit", "-m", "rename", cwd=clone)
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert [(c.path, c.status) for c in changes] == [
+            ("old.txt", "deleted"),
+            ("renamed.txt", "added"),
+        ]
+
+    def test_ignored_files_do_not_count(self, tmp_path: Path) -> None:
+        source = make_repo(tmp_path)
+        (source / ".gitignore").write_text("*.log\n")
+        git("add", ".", cwd=source)
+        git("commit", "-m", "ignore", cwd=source)
+        clone = tmp_path / "clone"
+        hostgit.clone_for_run(source, clone, "sbxloop/r1")
+        (clone / "debug.log").write_text("noise\n")
+        (clone / "kept.txt").write_text("x\n")
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert [c.path for c in changes] == ["kept.txt"]
+
+    def test_symlink_mode(self, tmp_path: Path) -> None:
+        _, clone = make_clone(tmp_path)
+        (clone / "link").symlink_to("hello.txt")
+        (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert (change.path, change.mode) == ("link", "120000")
+
+    def test_unchanged_clone_is_empty(self, tmp_path: Path) -> None:
+        _, clone = make_clone(tmp_path)
+        assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF)) == []
+
+    def test_bad_base_raises_delivery_error(self, tmp_path: Path) -> None:
+        _, clone = make_clone(tmp_path)
+        with pytest.raises(DeliveryError, match="git diff failed"):
+            hostgit.changes_since(clone, "0" * 40)
+
+
+class TestResolveDiffBase:
+    def test_prefers_merge_base_with_known_remote_tip(self, tmp_path: Path) -> None:
+        """When the PR target commit is known locally, the diff base is the
+        merge base — local commits the source was ahead by travel too."""
+        source, clone = make_clone(tmp_path)
+        remote_tip = rev(source, "HEAD~1")
+        assert hostgit.resolve_diff_base(clone, remote_tip) == remote_tip
+
+    def test_falls_back_to_clone_pin(self, tmp_path: Path) -> None:
+        _, clone = make_clone(tmp_path)
+        pinned = rev(clone, hostgit.CLONE_BASE_REF)
+        # remote tip unknown locally (a sha the clone never saw)
+        assert hostgit.resolve_diff_base(clone, "f" * 40) == pinned
+        assert hostgit.resolve_diff_base(clone, None) == pinned
+
+    def test_falls_back_to_origin_head_without_pin(self, tmp_path: Path) -> None:
+        """Clones made before the pin existed still resolve via origin/HEAD."""
+        _, clone = make_clone(tmp_path)
+        git("update-ref", "-d", hostgit.CLONE_BASE_REF, cwd=clone)
+        assert hostgit.resolve_diff_base(clone, None) == rev(clone, "origin/HEAD")
+
+    def test_no_anchor_is_none(self, tmp_path: Path) -> None:
+        """A repo the agent git-init-ed itself has nothing to diff against."""
+        root = make_repo(tmp_path)
+        assert hostgit.resolve_diff_base(root, None) is None
+        assert hostgit.resolve_diff_base(root, "f" * 40) is None
+
+    def test_plain_directory_is_none(self, tmp_path: Path) -> None:
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        assert hostgit.resolve_diff_base(plain, None) is None

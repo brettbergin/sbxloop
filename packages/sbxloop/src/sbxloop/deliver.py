@@ -7,6 +7,20 @@ atomically through the git data API (blobs → tree → commit → ref) rather
 than per-file contents PUTs: one commit regardless of file count, and
 base64 blobs carry binary content.
 
+Two ways of building that tree (#248):
+
+- **git diff** — when the workspace is a git checkout (the per-run clone
+  from ``hostgit.clone_for_run``, or an in-place checkout), only what the
+  run changed relative to its base commit is committed: added/modified
+  files as blobs with their real mode (``100755`` kept), deletions as
+  ``sha: null`` tree entries. A snapshot overlay could never delete or
+  rename a file and flipped every executable to ``100644`` — silently
+  wrong PRs against an existing repository, the one failure a reviewer
+  may not notice.
+- **snapshot** — every kept file layered onto the base tree; the right
+  answer for greenfield workspaces (no git history to diff against), and
+  the fallback when a checkout carries no usable base commit.
+
 Scaffold status: this is a real, unit-tested code path (stubbed GithubOps),
 but per the project pattern — unverified external behaviors get a seam and
 an e2e check, never a confident default — it is NOT field-proven until the
@@ -14,7 +28,9 @@ real-sbx e2e workflow exercises it. Known e2e-validation items:
 
 - TODO(e2e): branch-name collisions (re-delivering the same run id — the
   refs POST will 422; decide between force-update and suffixing)
-- TODO(e2e): executable permission bits (every file is committed 100644)
+- TODO(e2e): ``sha: null`` deletions and ``100755``/``120000`` modes in
+  the git-diff tree against real GitHub (documented Git Data API
+  behavior, not yet exercised end to end)
 - TODO(e2e): empty repositories — handled in code (contents-API bootstrap
   commit when the base ref is missing) but not yet exercised against real
   GitHub
@@ -32,10 +48,12 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, ArtifactScan, scan_artifacts
+from sbxloop import hostgit
+from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, exclusion_hit, scan_artifacts
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
@@ -48,6 +66,7 @@ TITLE_CLIP = 72
 # bounds the staged file size; a single oversized file still gets its own
 # chunk rather than failing.
 BLOB_BATCH_MAX_B64_BYTES = 4 * 1024 * 1024
+STATUS_MARKER = {"added": "A", "modified": "M", "deleted": "D"}
 
 
 def _is_missing(exc: GithubOpsError) -> bool:
@@ -102,6 +121,29 @@ def ensure_repository(
     return True
 
 
+@dataclass
+class DeliveryPlan:
+    """What one delivery commits.
+
+    ``uploads`` (relative path -> content) become blobs; ``entries`` are the
+    tree entries without blob shas (deletions already carry ``sha: None``,
+    which is how the Git Data API removes a path from a base tree).
+    ``lines`` is the PR-body listing and ``note`` says how the plan was
+    derived, so a reviewer can tell a diff-based PR from a snapshot.
+    """
+
+    mode: str  # "git-diff" | "snapshot"
+    entries: list[dict[str, Any]]
+    uploads: dict[str, bytes]
+    lines: list[str]
+    excluded_note: str | None = None
+    note: str | None = None
+
+    @property
+    def count(self) -> int:
+        return len(self.entries)
+
+
 def deliver_workspace(
     ops: GithubOps,
     repo: str,
@@ -114,10 +156,11 @@ def deliver_workspace(
     exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES,
 ) -> PrRef:
     """Publish source_dir as one commit on a new branch and open a PR."""
-    scan = scan_artifacts(source_dir, exclude)
-    files = scan.files
-    if not files:
-        raise DeliveryError(f"nothing to deliver: no files in {source_dir}")
+    plan: DeliveryPlan | None = None
+    if not _is_checkout_root(source_dir):
+        # Fail before any API call when there is nothing to send; the
+        # git-diff plan can only decide that once the base commit is known.
+        plan = _plan_snapshot(source_dir, exclude)
 
     if base is None:
         base = str(ops.repo_get(repo).get("default_branch") or "main")
@@ -136,15 +179,19 @@ def deliver_workspace(
         base_sha = _base_commit_sha(ops, repo, base)
     base_tree = _commit_tree_sha(ops, repo, base_sha)
 
-    shas = _create_blobs(ops, repo, source_dir, files)
+    if plan is None:
+        plan = _plan_git_diff(source_dir, base_sha, exclude)
+    if plan is None:
+        # A checkout with nothing to diff against (the agent git-init-ed
+        # the workspace itself): the snapshot is still the right delivery,
+        # said out loud in the PR body rather than silently.
+        plan = _plan_snapshot(source_dir, exclude)
+        plan.note = "delivered as a workspace snapshot: no base commit to diff against"
+
+    shas = _create_blobs(ops, repo, plan.uploads)
     entries = [
-        {
-            "path": file.relative_to(source_dir).as_posix(),
-            "mode": FILE_MODE,
-            "type": "blob",
-            "sha": shas[file.relative_to(source_dir).as_posix()],
-        }
-        for file in files
+        {**entry, "sha": shas[entry["path"]]} if entry["path"] in shas else entry
+        for entry in plan.entries
     ]
     tree = _sha(
         ops.raw("POST", f"/repos/{repo}/git/trees", {"base_tree": base_tree, "tree": entries}),
@@ -170,8 +217,82 @@ def deliver_workspace(
         base=base,
         head=branch,
         title=_title(outcome),
-        body=_body(run_id, outcome, source_dir, scan),
+        body=_body(run_id, outcome, plan),
         draft=draft,
+    )
+
+
+def _is_checkout_root(source_dir: Path) -> bool:
+    """Whether source_dir is the working-tree root of a git checkout — the
+    only shape the git-diff plan handles (a subtree of a checkout is never
+    a run workspace: provisioning refuses it). Without a git binary there
+    is no diff to take, so the snapshot path applies as before."""
+    if hostgit.find_git() is None or not (source_dir / ".git").exists():
+        return False
+    root = hostgit.repo_toplevel(source_dir)
+    return root is not None and root == source_dir.resolve()
+
+
+def _plan_snapshot(source_dir: Path, exclude: Sequence[str]) -> DeliveryPlan:
+    scan = scan_artifacts(source_dir, exclude)
+    if not scan.files:
+        raise DeliveryError(f"nothing to deliver: no files in {source_dir}")
+    rel = [f.relative_to(source_dir).as_posix() for f in scan.files]
+    return DeliveryPlan(
+        mode="snapshot",
+        entries=[{"path": path, "mode": FILE_MODE, "type": "blob"} for path in rel],
+        uploads={path: file.read_bytes() for path, file in zip(rel, scan.files, strict=True)},
+        lines=[f"- `{path}`" for path in rel],
+        excluded_note=scan.excluded_note,
+    )
+
+
+def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> DeliveryPlan | None:
+    """The run's changes as tree entries, or None when the checkout has no
+    base commit to measure against (the caller falls back to a snapshot).
+
+    The exclude denylist still applies: an agent that builds a ``.venv``
+    inside an un-ignored checkout must not have it delivered any more than
+    the snapshot path would.
+    """
+    diff_base = hostgit.resolve_diff_base(source_dir, base_sha)
+    if diff_base is None:
+        return None
+    excluded: dict[str, int] = {}
+    kept: list[hostgit.WorkspaceChange] = []
+    for change in hostgit.changes_since(source_dir, diff_base):
+        hit = exclusion_hit(change.path.split("/"), exclude)
+        if hit is None:
+            kept.append(change)
+        else:
+            excluded[hit] = excluded.get(hit, 0) + 1
+    if not kept:
+        raise DeliveryError(
+            f"nothing to deliver: {source_dir} has no changes relative to {diff_base[:12]}"
+        )
+    entries: list[dict[str, Any]] = []
+    uploads: dict[str, bytes] = {}
+    for change in kept:
+        if change.status == "deleted":
+            entries.append({"path": change.path, "mode": FILE_MODE, "type": "blob", "sha": None})
+            continue
+        entries.append({"path": change.path, "mode": change.mode, "type": "blob"})
+        full = source_dir / change.path
+        uploads[change.path] = (
+            str(full.readlink()).encode() if change.mode == "120000" else full.read_bytes()
+        )
+    excluded_note = (
+        f"{sum(excluded.values())} file(s) excluded ({', '.join(sorted(excluded))})"
+        if excluded
+        else None
+    )
+    return DeliveryPlan(
+        mode="git-diff",
+        entries=entries,
+        uploads=uploads,
+        lines=[f"- {STATUS_MARKER[c.status]} `{c.path}`" for c in kept],
+        excluded_note=excluded_note,
+        note=f"delivered as the workspace's git diff against `{diff_base[:12]}`",
     )
 
 
@@ -213,29 +334,28 @@ def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:
         raise DeliveryError(f"cannot read base commit {commit_sha} of {repo}") from exc
 
 
-def _create_blobs(ops: GithubOps, repo: str, source_dir: Path, files: list[Path]) -> dict[str, str]:
+def _create_blobs(ops: GithubOps, repo: str, uploads: dict[str, bytes]) -> dict[str, str]:
     """Create all blobs via batched worker jobs; returns relative path -> sha."""
     shas: dict[str, str] = {}
-    for chunk in _manifest_chunks(source_dir, files):
+    for chunk in _manifest_chunks(uploads):
         shas.update(ops.blobs_create_many(repo, chunk))
-    missing = [f.relative_to(source_dir).as_posix() for f in files]
-    missing = [path for path in missing if path not in shas]
+    missing = [path for path in uploads if path not in shas]
     if missing:
         raise DeliveryError(f"GitHub returned no blob sha for: {', '.join(missing[:5])}")
     return shas
 
 
-def _manifest_chunks(source_dir: Path, files: list[Path]) -> list[list[dict[str, str]]]:
+def _manifest_chunks(uploads: dict[str, bytes]) -> list[list[dict[str, str]]]:
     """Split the file manifest into payload-size-capped job chunks."""
     chunks: list[list[dict[str, str]]] = []
     current: list[dict[str, str]] = []
     current_bytes = 0
-    for file in files:
-        content = base64.b64encode(file.read_bytes()).decode("ascii")
+    for path, raw in uploads.items():
+        content = base64.b64encode(raw).decode("ascii")
         if current and current_bytes + len(content) > BLOB_BATCH_MAX_B64_BYTES:
             chunks.append(current)
             current, current_bytes = [], 0
-        current.append({"path": file.relative_to(source_dir).as_posix(), "content_b64": content})
+        current.append({"path": path, "content_b64": content})
         current_bytes += len(content)
     if current:
         chunks.append(current)
@@ -254,16 +374,18 @@ def _title(outcome: str) -> str:
     return title if len(title) <= TITLE_CLIP else title[: TITLE_CLIP - 1] + "…"
 
 
-def _body(run_id: str, outcome: str, source_dir: Path, scan: ArtifactScan) -> str:
-    files = scan.files
-    listed = [f"- `{f.relative_to(source_dir).as_posix()}`" for f in files[:BODY_FILE_LIST_CAP]]
-    if len(files) > BODY_FILE_LIST_CAP:
-        listed.append(f"- … +{len(files) - BODY_FILE_LIST_CAP} more")
+def _body(run_id: str, outcome: str, plan: DeliveryPlan) -> str:
+    listed = plan.lines[:BODY_FILE_LIST_CAP]
+    if plan.count > BODY_FILE_LIST_CAP:
+        listed.append(f"- … +{plan.count - BODY_FILE_LIST_CAP} more")
+    heading = "Changes" if plan.mode == "git-diff" else "Files"
     body = (
         f"Artifacts produced by sbxloop run `{run_id}`.\n\n"
         f"**Outcome:** {outcome}\n\n"
-        f"**Files ({len(files)}):**\n" + "\n".join(listed) + "\n"
+        f"**{heading} ({plan.count}):**\n" + "\n".join(listed) + "\n"
     )
-    if scan.excluded_note:
-        body += f"\n**Not delivered:** {scan.excluded_note}\n"
+    if plan.excluded_note:
+        body += f"\n**Not delivered:** {plan.excluded_note}\n"
+    if plan.note:
+        body += f"\n_{plan.note}_\n"
     return body

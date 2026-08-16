@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from sbxloop import hostgit
 from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import PrRef
@@ -449,3 +451,182 @@ class TestEmptyRepoBootstrap:
                 outcome="x",
                 source_dir=make_workspace(tmp_path),
             )
+
+
+def git(*argv: str, cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *argv],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+    ).stdout.strip()
+
+
+def make_clone_workspace(tmp_path: Path) -> tuple[Path, str]:
+    """A source checkout with an executable script and a file to delete,
+    plus the run clone hostgit would make of it. Returns (clone, base_sha)."""
+    source = tmp_path / "src"
+    source.mkdir()
+    git("init", "-b", "main", cwd=source)
+    (source / "keep.txt").write_text("keep\n")
+    (source / "old.txt").write_text("old\n")
+    (source / "scripts").mkdir()
+    (source / "scripts" / "run.sh").write_text("#!/bin/sh\n")
+    (source / "scripts" / "run.sh").chmod(0o755)
+    git("add", ".", cwd=source)
+    git("commit", "-m", "init", cwd=source)
+    clone = tmp_path / "clone"
+    hostgit.clone_for_run(source, clone, "sbxloop/r1")
+    return clone, git("rev-parse", "HEAD", cwd=source)
+
+
+def deliver(ops: StubOps, source_dir: Path) -> PrRef:
+    return deliver_workspace(
+        ops,  # type: ignore[arg-type]
+        "o/r",
+        run_id="r1",
+        outcome="refactor",
+        source_dir=source_dir,
+    )
+
+
+def tree_entries(ops: StubOps) -> list[dict[str, Any]]:
+    (tree_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/trees")]
+    assert tree_body is not None
+    return list(tree_body["tree"])
+
+
+class TestGitDiffDelivery:
+    """A git-checkout workspace delivers its diff, not a snapshot (#248):
+    deletions propagate, exec bits survive, unchanged files stay home."""
+
+    def test_clone_delivers_only_changes(self, tmp_path: Path) -> None:
+        clone, base_sha = make_clone_workspace(tmp_path)
+        (clone / "old.txt").unlink()
+        (clone / "new.txt").write_text("new\n")
+        (clone / "scripts" / "run.sh").write_text("#!/bin/sh\necho hi\n")
+        # a rename: delete + add in tree terms
+        (clone / "keep.txt").rename(clone / "kept.txt")
+
+        class KnownBaseOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/git/ref/heads/" in path:
+                    self.raw_calls.append((method, path, body))
+                    return {"object": {"sha": base_sha}}
+                return super().raw(method, path, body)
+
+        ops = KnownBaseOps()
+        assert deliver(ops, clone).number == 7
+
+        # only changed content is uploaded — keep.txt's bytes travel as kept.txt
+        uploaded = {e["path"] for batch in ops.blob_batches for e in batch}
+        assert uploaded == {"kept.txt", "new.txt", "scripts/run.sh"}
+
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert set(by_path) == {"keep.txt", "kept.txt", "new.txt", "old.txt", "scripts/run.sh"}
+        # deletions are sha: null entries; the exec bit is preserved
+        assert by_path["old.txt"] == {
+            "path": "old.txt",
+            "mode": "100644",
+            "type": "blob",
+            "sha": None,
+        }
+        assert by_path["keep.txt"]["sha"] is None
+        assert by_path["scripts/run.sh"]["mode"] == "100755"
+        assert by_path["new.txt"]["mode"] == "100644"
+        assert by_path["new.txt"]["sha"].startswith("blob")
+
+        # the tree still overlays the GitHub base tree and the commit
+        # parents on the GitHub base commit
+        (tree_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/trees")]
+        assert tree_body is not None and tree_body["base_tree"] == "basetree"
+        (commit_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/commits")]
+        assert commit_body is not None and commit_body["parents"] == [base_sha]
+
+        # the PR body says what happened, per path, and how it was derived
+        body = ops.pr_kwargs["body"]
+        assert "**Changes (5):**" in body
+        assert "- D `old.txt`" in body
+        assert "- A `new.txt`" in body
+        assert "- M `scripts/run.sh`" in body
+        assert f"git diff against `{base_sha[:12]}`" in body
+
+    def test_unknown_remote_tip_diffs_against_clone_pin(self, tmp_path: Path) -> None:
+        """The GitHub base commit is not necessarily in the clone (source
+        checkout behind origin); the clone's own pin then anchors the diff
+        and only the run's changes overlay the remote tip."""
+        clone, base_sha = make_clone_workspace(tmp_path)
+        (clone / "new.txt").write_text("new\n")
+        ops = StubOps()  # base ref resolves to "base123", unknown locally
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["new.txt"]
+        assert f"git diff against `{base_sha[:12]}`" in ops.pr_kwargs["body"]
+
+    def test_committed_work_counts(self, tmp_path: Path) -> None:
+        clone, _ = make_clone_workspace(tmp_path)
+        (clone / "old.txt").unlink()
+        (clone / "new.txt").write_text("new\n")
+        git("add", "-A", cwd=clone)
+        git("commit", "-m", "agent work", cwd=clone)
+        ops = StubOps()
+        deliver(ops, clone)
+        assert {(e["path"], e["sha"] is None) for e in tree_entries(ops)} == {
+            ("new.txt", False),
+            ("old.txt", True),
+        }
+
+    def test_excludes_still_apply_to_diff(self, tmp_path: Path) -> None:
+        """An un-ignored .venv the agent built must not ride the diff any
+        more than it rides a snapshot; the exclusion is surfaced (#67)."""
+        clone, _ = make_clone_workspace(tmp_path)
+        (clone / ".venv" / "bin").mkdir(parents=True)
+        (clone / ".venv" / "bin" / "python").write_text("bin\n")
+        (clone / "new.txt").write_text("new\n")
+        ops = StubOps()
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["new.txt"]
+        assert "1 file(s) excluded (.venv)" in ops.pr_kwargs["body"]
+
+    def test_no_changes_refused(self, tmp_path: Path) -> None:
+        clone, _ = make_clone_workspace(tmp_path)
+        ops = StubOps()
+        with pytest.raises(DeliveryError, match="no changes relative to"):
+            deliver(ops, clone)
+        # nothing was written to GitHub
+        assert not any(m == "POST" for m, _, _ in ops.raw_calls)
+
+    def test_agent_initialized_repo_falls_back_to_snapshot(self, tmp_path: Path) -> None:
+        """A checkout with no base to diff against (git init'ed by the agent)
+        still delivers — as a snapshot, and the PR body says so."""
+        root = tmp_path / "ws"
+        root.mkdir()
+        git("init", "-b", "main", cwd=root)
+        (root / "hello.txt").write_text("hi\n")
+        git("add", ".", cwd=root)
+        git("commit", "-m", "init", cwd=root)
+        ops = StubOps()
+        deliver(ops, root)
+        assert [e["path"] for e in tree_entries(ops)] == ["hello.txt"]
+        assert "**Files (1):**" in ops.pr_kwargs["body"]
+        assert "workspace snapshot: no base commit" in ops.pr_kwargs["body"]
+
+    def test_no_git_binary_keeps_snapshot_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clone, _ = make_clone_workspace(tmp_path)
+        (clone / "new.txt").write_text("new\n")
+        monkeypatch.setattr(hostgit, "find_git", lambda: None)
+        ops = StubOps()
+        deliver(ops, clone)
+        assert "keep.txt" in [e["path"] for e in tree_entries(ops)]
+        assert "**Files (" in ops.pr_kwargs["body"]
