@@ -122,8 +122,11 @@ All notable changes to sbxloop are documented here. The project adheres to
   workspace root has a `uv.lock` (bare `pytest` and `.venv/bin/…` are both
   rejected with the uv remedy; without a lockfile `.venv/bin/…` is
   unchanged). `astral.sh` (uv's installer host) joins the declarable
-  registries. `sbxloop doctor --deep` gains a `python-version` conformance
-  row reporting the template's own `python3` against the pinned series.
+  registries, and `release-assets.githubusercontent.com` (where GitHub
+  release-asset downloads redirect) joins the agent sandbox's provisioning
+  allowlist so both downloads actually complete. `sbxloop doctor --deep`
+  gains a `python-version` conformance row reporting the template's own
+  `python3` against the pinned series.
 
 - Daemon guardrails now cover recovery, restarts and multi-daemon setups
   (#254, #234). `recover()` no longer dispatches resumes itself: an interrupted

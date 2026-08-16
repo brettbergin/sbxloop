@@ -218,32 +218,41 @@ def _probe_python3_venv(ctx: ProbeContext) -> tuple[str, str]:
 def _probe_python_version(ctx: ProbeContext) -> tuple[str, str]:
     """The template's own python3 against the series provisioning pins (#250).
 
-    Nothing here breaks: the Python toolchain installs a managed
-    ``python3.13`` through uv whenever the template's is older. But that is
-    a download on every fresh sandbox, and a template already carrying the
-    series (or a newer one) skips it — so the row says which case this
-    template is, and where the interpreter comes from.
+    This row reports observed compatibility only. Whether a `python3.13`
+    exists on PATH is a separate guarantee of the Python toolchain, whose
+    probe-first install adds uv and a uv-managed interpreter exactly when
+    they are missing — a template already shipping both skips the download
+    (and that interpreter is then not uv-managed), while a template whose
+    system python3 is newer but lacks the versioned name still gets one.
+    So the detail says what the template's python3 is and what that means
+    for a project pinning the series, without claiming where the versioned
+    interpreter will come from.
     """
     assert ctx.sandbox is not None
     result = ctx.sandbox.exec(["python3", "--version"])
     text = f"{result.stdout}\n{result.stderr}".strip()
     match = re.search(r"Python (\d+)\.(\d+)", text)
     if not result.ok or match is None:
-        return "no-python3", "the template ships no working python3 (uv provisions the pin)"
+        return (
+            "no-python3",
+            f"the template ships no working python3; python{PYTHON_SERIES} on PATH "
+            "is the Python toolchain's guarantee, not the template's",
+        )
     have = (int(match.group(1)), int(match.group(2)))
     want = tuple(int(part) for part in PYTHON_SERIES.split("."))
     version = f"{have[0]}.{have[1]}"
     if have >= want:
         return (
             "meets-pin",
-            f"template python3 is {version} (>= {PYTHON_SERIES}); the uv-managed "
-            "interpreter is still installed under the versioned name for `uv run`",
+            f"template python3 is {version} (>= {PYTHON_SERIES}); a python{PYTHON_SERIES} "
+            "on PATH is guaranteed separately by the Python toolchain (installed via uv "
+            "only if the template lacks it)",
         )
     return (
         "below-pin",
         f"template python3 is {version} < {PYTHON_SERIES}: projects pinning "
-        f"`requires-python >= {PYTHON_SERIES}` rely on the uv-managed "
-        f"python{PYTHON_SERIES} provisioning installs (a download per fresh sandbox)",
+        f"`requires-python >= {PYTHON_SERIES}` rely on the python{PYTHON_SERIES} the "
+        "Python toolchain guarantees (installed via uv only if the template lacks it)",
     )
 
 
@@ -412,9 +421,9 @@ CATALOG: tuple[Probe, ...] = (
         summary=f"the sandbox template's python3 against the pinned {PYTHON_SERIES} series",
         tier="sandbox",
         expected=None,  # the Python toolchain installs the pin through uv either way
-        depends="the Python toolchain's uv-managed interpreter (#250): a below-pin "
-        "template pays a python download per fresh sandbox; a template at or "
-        "above the pin only needs uv itself",
+        depends="the Python toolchain's separate python3.13 guarantee (#250): its "
+        "probe-first install adds uv and a uv-managed interpreter only when the "
+        "template lacks them, whatever the template's own python3 reports here",
         run=_probe_python_version,
     ),
     Probe(

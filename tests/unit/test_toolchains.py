@@ -430,6 +430,27 @@ def test_python_probe_accepts_the_series_and_rejects_others() -> None:
         assert result.returncode == expected, (output, script)
 
 
+def test_python_downloads_stay_on_allowlisted_github_hosts() -> None:
+    # GitHub release assets redirect from github.com to
+    # release-assets.githubusercontent.com, and uv 0.12 tries Astral's own
+    # CDN first for managed interpreters. Provisioning runs before PLAN, so
+    # both must be settled in the baseline: the redirect host is
+    # allowlisted, and uv is pointed at the canonical GitHub prefix rather
+    # than needing a second vendor host reachable.
+    from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
+
+    python = toolchains.resolve(["python"])[0]
+    assert python.install_script is not None
+    assert "release-assets.githubusercontent.com" in AGENT_ALLOW_DOMAINS
+    assert "github.com" in AGENT_ALLOW_DOMAINS
+    assert toolchains.UV_PYTHON_INSTALL_MIRROR.startswith("https://github.com/")
+    assert (
+        f'UV_PYTHON_INSTALL_MIRROR="{toolchains.UV_PYTHON_INSTALL_MIRROR}" '
+        f"uv python install {toolchains.PYTHON_SERIES}"
+    ) in python.install_script
+    assert "releases.astral.sh" not in python.install_script
+
+
 def test_python_leaves_the_system_interpreter_alone() -> None:
     # The worker runs on the template's python3; the pin is exposed under
     # its versioned name only.

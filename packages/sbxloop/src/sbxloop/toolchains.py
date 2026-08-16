@@ -101,10 +101,18 @@ def _arch_dispatch(cases: dict[str, tuple[str, str]]) -> str:
 # same shape as the Node/Go entries — `pip install uv` would need a bootstrap
 # venv first because the system Python is externally managed), and the
 # interpreter series installed *through* uv as a managed Python. Both
-# downloads are github.com/objects.githubusercontent.com, which the agent
-# sandbox already reaches at provision time for the Copilot runtime.
+# downloads are GitHub release assets: `github.com` answers with a redirect
+# to `release-assets.githubusercontent.com`, so that host is part of the
+# provision-time allowlist (``provision.AGENT_ALLOW_DOMAINS``). uv 0.12
+# would by default try Astral's own CDN (`releases.astral.sh`) first for
+# the managed interpreter and only fall back to GitHub; the install pins
+# `UV_PYTHON_INSTALL_MIRROR` to the canonical GitHub prefix so provisioning
+# reaches one vendor's hosts rather than needing a second in the baseline.
 UV_VERSION = "0.12.5"
 PYTHON_SERIES = "3.13"
+# The canonical python-build-standalone release prefix, given to uv as its
+# install mirror so the download stays on GitHub hosts (see above).
+UV_PYTHON_INSTALL_MIRROR = "https://github.com/astral-sh/python-build-standalone/releases/download"
 _PYTHON_SERIES_PATTERN = PYTHON_SERIES.replace(".", "\\.")
 _UV_TARBALL = "/tmp/uv.tar.gz"  # nosec B108 - path inside the sandbox VM, not host tmp
 _UV_DIGESTS = {
@@ -148,7 +156,7 @@ PYTHON = Toolchain(
         f"sudo -n tar -xzf {_UV_TARBALL} -C /usr/local/bin --strip-components=1 "
         '"uv-$arch/uv" "uv-$arch/uvx"; '
         f"rm -f {_UV_TARBALL}; "
-        f"uv python install {PYTHON_SERIES}; "
+        f'UV_PYTHON_INSTALL_MIRROR="{UV_PYTHON_INSTALL_MIRROR}" uv python install {PYTHON_SERIES}; '
         f'sudo -n ln -sf "$(uv python find {PYTHON_SERIES})" /usr/local/bin/python{PYTHON_SERIES}'
     ),
     aliases=("py", "python3"),

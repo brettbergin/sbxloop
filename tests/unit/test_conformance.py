@@ -197,10 +197,21 @@ class TestPythonVersionProbe:
         verdict, _ = self._run(self._StubSandbox("Python 3.99.0\n"))
         assert verdict == "meets-pin"
 
-    def test_below_the_pin_names_the_download(self) -> None:
+    def test_below_the_pin_names_the_toolchain_guarantee(self) -> None:
         verdict, detail = self._run(self._StubSandbox("Python 3.12.3\n"))
         assert verdict == "below-pin"
-        assert "3.12" in detail and "uv-managed" in detail
+        assert "3.12" in detail and "toolchain" in detail
+
+    def test_detail_does_not_claim_the_interpreter_is_uv_managed(self) -> None:
+        # A template that already ships uv + python3.13 passes the toolchain
+        # probe and skips the install, so the versioned interpreter need not
+        # be uv-managed; the row reports compatibility, not provenance.
+        from sbxloop.toolchains import PYTHON_SERIES
+
+        for out in (f"Python {PYTHON_SERIES}.1\n", "Python 3.99.0\n", "Python 3.12.3\n"):
+            _, detail = self._run(self._StubSandbox(out))
+            assert "uv-managed" not in detail
+            assert "only if the template lacks it" in detail
 
     def test_python2_style_stderr_output_is_parsed(self) -> None:
         # Old interpreters print --version on stderr; the probe reads both.

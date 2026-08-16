@@ -525,9 +525,10 @@ than downloaded per run.
 
 The apt-only entries (`cpp`, `ruby`, `java`) work out of the box: apt mirrors
 are in the sandbox's always-reachable baseline. So does `python`: its `uv`
-release and the uv-managed Python 3.13 both come from `github.com` /
-`objects.githubusercontent.com`, which the agent sandbox already reaches at
-provisioning time. The rest fetch from a vendor or registry, and
+release and the uv-managed Python 3.13 are both GitHub release assets
+(`github.com`, redirecting to `release-assets.githubusercontent.com`), and
+both hosts are in the agent sandbox's provisioning-time allowlist. The rest
+fetch from a vendor or registry, and
 **provisioning runs before the PLAN phase**, so a plan's `egress` declaration
 is too late to help it. Until those domains are part of the provisioning
 baseline, allow them explicitly:
