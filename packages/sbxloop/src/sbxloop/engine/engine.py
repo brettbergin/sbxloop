@@ -7,7 +7,10 @@ Failure semantics:
   skipped and the run continues, finishing ``failed`` if any task failed.
   One exception: revisions exhausted by *verify-command* failures spend a
   replan first when budget remains — the executor cannot edit verify
-  commands, so only a fresh plan can unstick a broken check.
+  commands, so only a fresh plan can unstick a broken check. The faster
+  route out (#231): when the scrutinizer passes the work after a verify
+  failure and flags the *check itself* as wrong (``verify_suspect``), the
+  replan is spent immediately instead of after the revisions burn.
 - Infrastructure errors (worker/sbx crashes) propagate after state is
   persisted — equivalent to a kill. ``resume()`` re-provisions a fresh
   sandbox pair (sandboxes are cattle; the workspace and SQLite state
@@ -46,10 +49,11 @@ from sbxloop.engine.model import (
     SteerVerdict,
     TaskRecord,
     TaskState,
+    Verdict,
     artifacts_dir,
     scan_artifacts,
 )
-from sbxloop.engine.phases import CriticOutcome, PhaseRunner, clip
+from sbxloop.engine.phases import VERIFY_FAILURE_PREFIX, CriticOutcome, PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -985,9 +989,73 @@ class LoopEngine:
         self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
         if verdict.verdict == "revise":
             self._register_revision(run_id, task, verdict.feedback or "scrutiny found issues")
+            return
+        if self._replan_suspect_verify(run_id, task, verdict):
+            return
+        task.last_feedback = ""
+        self._set_task_state(run_id, task, "verifying")
+
+    def _replan_suspect_verify(self, run_id: str, task: TaskRecord, verdict: Verdict) -> bool:
+        """Spend a replan now when the scrutinizer passed the work but ruled
+        the verify command itself wrong (#231). Returns True if the task was
+        sent back to planning.
+
+        Field failure r567rsm4e: a portable, runnable check asserting an
+        ``od`` column layout that never matches — correct code, wrong check,
+        130+ executor tool calls across revisions before verify exhaustion
+        finally replanned (#94). The scrutinizer is the one stage that sees
+        the failing command next to the passing code, so its ruling is the
+        earliest point the loop can act.
+
+        The ruling is only honored when backed by evidence — the revision
+        being reviewed was itself triggered by a verify failure — so a
+        speculative flag on a check that has never run cannot cost a replan
+        on a fine plan; and only within the replan budget, since a task
+        that has no replans left can only fail bounded, not loop. Either
+        way the ruling is put in the live stream: silently ignoring a
+        critic's finding is the transcript-only failure #94 already fixed
+        once.
+        """
+        if not verdict.verify_suspect:
+            return False
+        reason = verdict.verify_suspect_reason or "no reason given"
+        evidence = task.last_feedback.startswith(VERIFY_FAILURE_PREFIX)
+        budget = task.replans < self.config.budgets.max_replans_per_task
+        honored = evidence and budget
+        if honored:
+            message = f"scrutinizer passed the work but ruled the verify command wrong: {reason}"
+        elif not evidence:
+            message = (
+                "scrutinizer flagged the verify command as wrong before it has "
+                f"failed; ignored until verify runs: {reason}"
+            )
         else:
-            task.last_feedback = ""
-            self._set_task_state(run_id, task, "verifying")
+            message = (
+                "scrutinizer flagged the verify command as wrong but no replan "
+                f"budget remains; verifying anyway: {reason}"
+            )
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="scrutinize",
+            status="verify_suspect",
+            honored=honored,
+            message=message,
+        )
+        if not honored:
+            return False
+        task.replans += 1
+        task.plan = None
+        task.revisions = 0
+        task.last_feedback = (
+            "the reviewer judged the work correct and the verify command itself "
+            f"wrong: {reason}\n\nWrite a plan whose verify_commands check what "
+            "the task actually requires — prefer the project's test runner over "
+            "shell pipelines. The failing check was:\n\n" + task.last_feedback
+        )
+        self._set_task_state(run_id, task, "planning")
+        return True
 
     def _phase_verify(
         self,
@@ -1019,7 +1087,7 @@ class LoopEngine:
         # Put the failing command in the live stream: without this the
         # transcript jumps verifying -> failed and the reason only exists
         # in the phase_attempts table.
-        failure_count = feedback.count("verify command failed:")
+        failure_count = feedback.count(VERIFY_FAILURE_PREFIX)
         first_line = feedback.splitlines()[0] if feedback else "verify failed"
         self.bus.emit(
             HostEventTypes.PHASE_END,

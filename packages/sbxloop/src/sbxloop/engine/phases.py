@@ -49,6 +49,13 @@ OUTPUT_CLIP = 6_000
 VERIFY_HEAD_CLIP = 2_000
 VERIFY_TAIL_CLIP = 4_000
 
+# Every verify failure fed back to the executor starts with this, so the
+# engine can tell "the last round failed a verify command" apart from
+# critic feedback without a schema change — that distinction gates which
+# feedback may spend a replan (#94) and when a scrutinizer's
+# ``verify_suspect`` ruling is backed by evidence (#231).
+VERIFY_FAILURE_PREFIX = "verify command failed:"
+
 # Persona label per phase prompt: stamped onto the job's agent.* events (via
 # WorkerClient.submit) so the transcript header says WHO is responding
 # (planner, executor, ...) instead of a generic "agent".
@@ -416,6 +423,13 @@ class PhaseRunner:
         )
         return verdict
 
+    @staticmethod
+    def verify_commands(task: TaskRecord, plan: PlanModel) -> list[str]:
+        """The exact command list VERIFY will run: spec-level checks first,
+        then the plan's, deduplicated. Shown to the scrutinizer verbatim so
+        it judges the same checks the mechanical phase runs (#231)."""
+        return list(dict.fromkeys(task.spec.verify_commands + plan.verify_commands))
+
     def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> CriticOutcome:
         try:
             evidence = self.shell_batch([command for _, command in EVIDENCE_COMMANDS])
@@ -435,8 +449,12 @@ class PhaseRunner:
                 "task_description": task.spec.description or "(no further description)",
                 "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
                 "plan_steps": bullet_list(plan.steps),
+                "prior_feedback": clip(task.last_feedback) or "(none — first attempt)",
                 "executor_report": clip(executor_report) or "(executor produced no report)",
                 "evidence": "\n\n".join(evidence_parts) or "(no evidence gathered)",
+                "verify_commands": bullet_list(
+                    self.verify_commands(task, plan), empty="(no verify commands)"
+                ),
             },
             allowed=("pass", "revise"),
         )
@@ -521,7 +539,7 @@ class PhaseRunner:
 
     def verify(self, task: TaskRecord, plan: PlanModel) -> VerifyOutcome:
         """Run every verify command; the transcript rides on the outcome."""
-        commands = list(dict.fromkeys(task.spec.verify_commands + plan.verify_commands))
+        commands = self.verify_commands(task, plan)
         failures: list[str] = []
         results: list[str] = []
         for result in self.shell_batch(commands) if commands else []:
@@ -529,7 +547,8 @@ class PhaseRunner:
             results.append(f"$ {result.command}\n(exit {result.exit_code})\n{output}")
             if result.exit_code != 0:
                 failures.append(
-                    f"verify command failed: `{result.command}` (exit {result.exit_code})\n{output}"
+                    f"{VERIFY_FAILURE_PREFIX} `{result.command}` "
+                    f"(exit {result.exit_code})\n{output}"
                 )
         return VerifyOutcome(
             passed=not failures,

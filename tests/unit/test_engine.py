@@ -46,6 +46,13 @@ PLAN = {"json": {"steps": ["do the work"], "expected_artifacts": [], "verify_com
 EXECUTE = {"text": "work complete, files changed"}
 PASS = {"json": {"verdict": "pass"}}
 REVISE = {"json": {"verdict": "revise", "feedback": "missed an edge case"}}
+PASS_SUSPECT = {
+    "json": {
+        "verdict": "pass",
+        "verify_suspect": True,
+        "verify_suspect_reason": "greps for an od column layout od never prints",
+    }
+}
 ACCEPT = {"json": {"verdict": "accept"}}
 REJECT = {"json": {"verdict": "reject", "feedback": "criterion 1 unmet"}}
 
@@ -284,6 +291,93 @@ class TestReviseAndVerify:
         assert result.state == "failed"
         assert result.tasks[0].state == "failed"
         assert result.tasks[0].revisions == 3
+
+    def test_verify_suspect_after_verify_failure_replans_immediately(
+        self, harness: Harness
+    ) -> None:
+        # Field failure (r567rsm4e, #231): a runnable verify command that
+        # asserts the wrong thing. Once verify has failed and the scrutinizer
+        # passes the work while flagging the check, the replan is spent now
+        # — no further revisions, no second verify run of the wrong check.
+        bad_plan = {
+            "json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": ["exit 1"]}
+        }
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                bad_plan,
+                EXECUTE,
+                PASS,  # verify fails -> revision 1
+                EXECUTE,
+                PASS_SUSPECT,  # work fine, check wrong -> replan now
+                PLAN,  # fresh plan drops the wrong check
+                EXECUTE,
+                PASS,
+                ACCEPT,
+            ]
+        )
+        engine = harness.engine()
+        result = engine.start("wrong check replans early")
+        assert result.state == "completed"
+        assert result.tasks[0].state == "done"
+        assert result.tasks[0].replans == 1
+        phases = [row["phase"] for row in engine.store.phase_attempts(result.run_id)]
+        assert phases.count("verify") == 2  # the wrong check ran once, the fixed one once
+        assert phases.count("execute") == 3  # not the full revision budget
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is True
+        assert "od column layout" in events[0].data["message"]
+
+    def test_verify_suspect_before_verify_ran_is_ignored(self, harness: Harness) -> None:
+        # A speculative flag on a check that has never failed must not cost
+        # a replan on a fine plan: verify runs (and here passes) as usual.
+        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS_SUSPECT, ACCEPT])
+        result = harness.engine().start("speculative flag")
+        assert result.state == "completed"
+        assert result.tasks[0].replans == 0
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "before it has failed" in events[0].data["message"]
+
+    def test_verify_suspect_without_replan_budget_verifies_anyway(self, harness: Harness) -> None:
+        # No replan budget: the flag is surfaced but the loop stays bounded
+        # by the ordinary revision path.
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["exit 1"])),
+                PLAN,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS_SUSPECT,
+                EXECUTE,
+                PASS,
+                EXECUTE,
+                PASS,
+            ]
+        )
+        result = harness.engine(budgets={"max_replans_per_task": 0}).start("no budget")
+        assert result.state == "failed"
+        assert result.tasks[0].replans == 0
+        assert result.tasks[0].revisions == 3
+        events = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
+        ]
+        assert len(events) == 1
+        assert events[0].data["honored"] is False
+        assert "no replan budget" in events[0].data["message"]
 
     def test_verify_failure_surfaces_in_event_stream(self, harness: Harness) -> None:
         # Field failure (rv4zfdb1m): the transcript jumped verifying -> failed

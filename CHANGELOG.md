@@ -92,6 +92,20 @@ All notable changes to sbxloop are documented here. The project adheres to
   source as "`<user>` via sbxloop daemon ctl". The bridge still ignores
   bot-authored messages by design.
 
+- The scrutinizer now judges the verify commands as well as the work (#231):
+  its prompt carries the exact command list VERIFY will run and the feedback
+  the executor was addressing, and its verdict gains `verify_suspect` /
+  `verify_suspect_reason`. When a revision was triggered by a verify failure
+  and the scrutinizer passes the work while ruling the check itself wrong,
+  the engine spends a replan immediately — the planner is told why the old
+  check was wrong — instead of burning the remaining revisions against a
+  check the executor cannot edit (field failure r567rsm4e: a portable,
+  runnable `od | grep` check asserting a column layout `od` never prints).
+  A speculative flag on a check that has not failed yet, or one raised with
+  no replan budget left, is surfaced but not acted on. Every ruling is a
+  `phase.end` event (`status=verify_suspect`, `honored`), shown in the
+  Discord bridge and the transcript.
+
 - Discord bridge output is now Discord-native: headline, finished report and
   `!sbx status` as embed cards; agent messages split at paragraph/code-fence
   boundaries (fences re-opened with their language) instead of clipped;

@@ -183,6 +183,17 @@ class TestFormat:
                 ev("phase.end", task_id="t2", phase="critic", status="degraded", message="skipped")
             )
         ) == ["⚠ **critic degraded** · task `t2` — skipped"]
+        assert texts(
+            format_for_discord(
+                ev(
+                    "phase.end",
+                    task_id="t2",
+                    phase="scrutinize",
+                    status="verify_suspect",
+                    message="wrong od layout",
+                )
+            )
+        ) == ["🔎 **scrutinize suspects the check** · task `t2` — wrong od layout"]
         assert format_for_discord(ev("phase.end", task_id="t2", phase="plan", status="ok")) == []
 
     def test_newly_surfaced_events_and_levels(self) -> None:
