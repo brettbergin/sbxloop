@@ -201,7 +201,6 @@ def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole) -> Non
     with contextlib.suppress(SbxError):
         if role == "agent":
             cli.secret_rm(host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV, sandbox=name)
-            cli.secret_rm(env=COPILOT_TOKEN_ENV, sandbox=name)
         else:
             cli.secret_rm(service="github", sandbox=name)
 

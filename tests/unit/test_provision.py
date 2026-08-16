@@ -656,7 +656,12 @@ class TestSecretIdempotency:
             assert entry["value"] == "github_pat_copilot"
             # the rm targeted the OLD run's scope, parsed from the error
             rms = [s["args"] for s in fake_sbx.secrets() if s["args"][0] == "rm"]
-            assert any(a[1] == "sbxloop-r1-agent" for a in rms)
+            assert any(
+                "--sandbox" in a and a[a.index("--sandbox") + 1] == "sbxloop-r1-agent" for a in rms
+            )
+            # every removal is forced: without -f sbx 0.38 prompts, cancels
+            # non-interactively, and exits 0 having removed nothing
+            assert all("-f" in a for a in rms)
         finally:
             pair.cleanup()
 

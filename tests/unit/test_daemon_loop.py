@@ -404,11 +404,10 @@ class TestShutdownAndRecovery:
         agent, gh = "sbxloop-r_live-agent", "sbxloop-r_live-github"
         assert [c for c in calls if c[0] == "rm"] == [("rm", agent), ("rm", gh)]
         secret_calls = [c[1] for c in calls if c[0] == "secret_rm"]
-        # Agent: the Copilot custom secret (host+env, then the env-only
-        # form real sbx keys it by); github: the built-in service secret.
+        # Agent: the Copilot custom secret (host+env — sbx rejects env-only
+        # selection); github: the built-in service secret.
         assert secret_calls == [
             {"host": "api.github.com", "env": "COPILOT_GITHUB_TOKEN", "sandbox": agent},
-            {"env": "COPILOT_GITHUB_TOKEN", "sandbox": agent},
             {"service": "github", "sandbox": gh},
         ]
         assert h.runs == [("r_live", True)]
@@ -439,7 +438,7 @@ class TestShutdownAndRecovery:
         h.store.set_run_state("r_live", "running")
         h.outcomes = ["completed"]
         h.loop.recover()
-        assert len(calls) == 3
+        assert len(calls) == 2
         assert h.runs == [("r_live", True)]
 
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
