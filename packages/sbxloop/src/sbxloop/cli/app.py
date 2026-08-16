@@ -2008,6 +2008,8 @@ mem_abort = 0.0
 # backlog_label = "sbxloop:backlog"
 # delivered_label = "sbxloop:delivered"
 # audit_label = "sbxloop:audit"    # discovery lane: investigate, file findings, no PR
+# postmortems = true             # file a post-mortem audit when a patch item fails
+# postmortems_per_day = 3
 # What a delivered run does to the tracker. Defaults are task-queue
 # semantics: close the source issue (the PR is the reviewable object) and
 # open a per-run tracking issue. For a design/discussion tracker set both

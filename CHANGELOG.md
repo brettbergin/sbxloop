@@ -26,6 +26,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   contract in the outcome text, and an audit-success comment that names what
   it filed (`RunReport.filed`) and always closes the audit issue. Discord
   cards and `daemon items` show the kind. Promotion stays a human label swap.
+- **Post-mortems the daemon files itself** (`[daemon] postmortems`, default
+  on): when a patch item is abandoned or completes without delivering, the
+  daemon opens a `sbxloop:audit` issue carrying a dossier — plan and verify
+  commands, the last verify transcript, failure events, recent event tail,
+  and the `SBXLOOP_STATE_DIR=… sbxloop logs <run>` line — so the discovery
+  lane turns its own failures into evidenced findings. Once per run, never
+  for audit items (no recursion), `postmortems_per_day` (3) cap.
 
 ## [0.7.0] — 2026-08-16
 

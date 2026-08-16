@@ -364,6 +364,12 @@ class DaemonConfig(_ConfigModel):
     # Discovery lane: an issue carrying this label is a charter — the run
     # investigates and files findings as backlog issues, never a PR.
     audit_label: str = "sbxloop:audit"
+    # When a patch item is abandoned (or delivers nothing), file a post-mortem
+    # charter carrying the plan, verify transcripts and failure events, so the
+    # discovery lane turns the daemon's own failures into evidenced findings.
+    # Never for audit items (no recursion); capped per rolling day.
+    postmortems: bool = True
+    postmortems_per_day: int = 3
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
@@ -410,6 +416,7 @@ class DaemonConfig(_ConfigModel):
             "max_attempts_per_item",
             "max_consecutive_failures",
             "backlog_max_per_run",
+            "postmortems_per_day",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"daemon.{name} must be >= 1")

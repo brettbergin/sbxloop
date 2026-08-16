@@ -277,6 +277,12 @@ never deliver a PR, close on completion with a `Filed: #…` comment, and an
 audit that finds nothing real says so. Promoting a finding is a label swap
 (`sbxloop:backlog` → `sbxloop:run`) — a human decision, so the loop's
 precision is visible before anyone hands it the keys.
+When a patch item is abandoned (or completes without delivering) the daemon
+files a **post-mortem** as an audit charter — the plan, the last verify
+transcript, the failure events, all in the issue body, because the auditor
+works in a fresh clone and cannot read the daemon's state — so the loop's own
+failures become findings too (`[daemon] postmortems`, capped per day, never
+for audit items).
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;

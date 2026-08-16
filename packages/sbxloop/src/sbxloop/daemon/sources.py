@@ -30,6 +30,7 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
+from sbxloop.daemon.postmortem import postmortem_marker
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
 from sbxloop.gh.ops import GithubOps
 
@@ -617,6 +618,21 @@ class GitHubIssueSource:
             self._comment(ops, n, f"Re-queued by {by}; a fresh run will start shortly.")
 
         self._guard("requeue report", go)
+
+    def file_postmortem(self, item: WorkItem, dossier: str, run_id: str) -> str:
+        """Open a post-mortem as an audit-lane charter and return its ref.
+
+        Labelled with the audit label so the daemon picks it up like any
+        other charter; the marker lets the store (and a human) tie it back
+        to the run it dissects."""
+        ref = self._ops().issue_create(
+            self.repo,
+            f"post-mortem: {' '.join(item.title.split())[:80]} (run {run_id})",
+            f"{dossier}\n\n{postmortem_marker(run_id)}\n---\nFiled by the sbxloop daemon "
+            f"after `{item.item_id}` failed (run `{run_id}`).",
+            labels=[self.labels.audit],
+        )
+        return f"gh:{ref.number}"
 
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         labels = [self.labels.trigger] if trigger else [self.labels.backlog]

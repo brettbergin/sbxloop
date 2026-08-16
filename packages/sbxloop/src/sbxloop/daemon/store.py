@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS daemon_backlog_filed (
     filed_at    REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS daemon_postmortems (
+    run_id     TEXT PRIMARY KEY,
+    item_id    TEXT NOT NULL,
+    filed_as   TEXT NOT NULL,
+    filed_at   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS daemon_discord_threads (
     run_id      TEXT PRIMARY KEY,
     channel_id  INTEGER NOT NULL,
@@ -579,6 +586,44 @@ class DaemonStore:
                 "INSERT OR IGNORE INTO daemon_backlog_filed "
                 "(fingerprint, run_id, filed_as, filed_at) VALUES (?, ?, ?, ?)",
                 (fingerprint, run_id, filed_as, now),
+            )
+            self._conn.commit()
+
+    # -- post-mortems (discovery lane) ---------------------------------------
+
+    def runs_for_item(self, item_id: str) -> list[str]:
+        """Run ids the item has been dispatched under, oldest first."""
+        with self._lock:
+            return [
+                str(r["run_id"])
+                for r in self._conn.execute(
+                    "SELECT run_id FROM daemon_runs WHERE item_id = ? ORDER BY started_at",
+                    (item_id,),
+                )
+            ]
+
+    def postmortem_filed(self, run_id: str) -> bool:
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM daemon_postmortems WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is not None
+            )
+
+    def postmortems_since(self, ts: float) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_postmortems WHERE filed_at >= ?", (ts,)
+            ).fetchone()
+            return int(row["n"])
+
+    def record_postmortem(self, run_id: str, item_id: str, filed_as: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_postmortems (run_id, item_id, filed_as, filed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, item_id, filed_as, now),
             )
             self._conn.commit()
 

@@ -28,6 +28,7 @@ from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
 from sbxloop.daemon.backlog import AUDIT_INSTRUCTIONS, BACKLOG_INSTRUCTIONS, collect_backlog
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
+from sbxloop.daemon.postmortem import build_dossier
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
@@ -661,6 +662,7 @@ class DaemonLoop:
             source.report_delivery_failed(item, report)
             self._frontend_finished(item, report)
             self._notify(f"⚠ {item.item_id} completed but delivery failed: {report.delivery_error}")
+            self._file_postmortem(item, run_id, f"delivery failed: {report.delivery_error}")
             return "delivery_failed"
         reason = str(error) if error is not None else f"run ended {report.state}"
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
@@ -675,6 +677,7 @@ class DaemonLoop:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=False)
             source.report_abandoned(item, reason)
             self._notify(f"❌ {item.item_id} abandoned after {item.attempts} attempt(s): {reason}")
+            self._file_postmortem(item, run_id, f"abandoned: {reason}")
             outcome = "abandoned"
         self._frontend_finished(item, report)
         if self._consecutive_failures >= self.config.daemon.max_consecutive_failures:
@@ -859,6 +862,36 @@ class DaemonLoop:
             pass
         workspace = str(result.workspace) if result is not None and result.workspace else None
         return RunReport(run_id, state, summary, tracking, delivery, delivery_error, workspace)
+
+    def _file_postmortem(self, item: WorkItem, run_id: str, reason: str) -> None:
+        """Turn the daemon's own failure into a discovery-lane charter.
+
+        Only for patch items — a failed audit filing a post-mortem that is
+        itself an audit would recurse — only once per run, and capped per
+        rolling day so a bad night cannot flood the tracker. Best-effort:
+        the item is already settled; this must never change that."""
+        daemon = self.config.daemon
+        if not daemon.postmortems or item.kind != "patch":
+            return
+        github = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "file_postmortem"):
+            return
+        now = self.clock()
+        try:
+            if self.dstore.postmortem_filed(run_id):
+                return
+            if self.dstore.postmortems_since(now - DAY_S) >= daemon.postmortems_per_day:
+                logger.info("post-mortem for %s skipped: daily cap reached", run_id)
+                return
+            run_ids = self.dstore.runs_for_item(item.item_id) or [run_id]
+            dossier = build_dossier(
+                self.store, item, run_ids, reason, state_dir=str(self.config.state_dir)
+            )
+            ref = github.file_postmortem(item, dossier, run_id)
+            self.dstore.record_postmortem(run_id, item.item_id, ref, now)
+            self._notify(f"🔎 post-mortem filed for {item.item_id}: {ref}")
+        except Exception:
+            logger.warning("post-mortem for %s could not be filed", run_id, exc_info=True)
 
     def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:
         """File the run's backlog items; returns their refs (``gh:<n>``)."""
