@@ -29,6 +29,21 @@ logger = logging.getLogger(__name__)
 
 BACKLOG_SUBDIR = Path(".sbxloop") / "backlog"
 
+# The audit lane's contract (discovery on GitHub): the deliverable is issues.
+AUDIT_INSTRUCTIONS = (
+    "This is an AUDIT: your deliverable is a set of well-evidenced findings, not "
+    "code. Do not modify the tree except to write findings under "
+    "`.sbxloop/backlog/` in the workspace — one markdown file per finding, first "
+    "line `# <short, specific title>`, then these sections: **Evidence** (file:line "
+    "references and quoted lines that show the problem), **Repro / how to observe** "
+    "(a command, a test, or the exact scenario), **Proposal** (a one-line remedy), "
+    "**Size** (small | medium | large), **Kind** (bug | test | docs | refactor). "
+    "No finding without evidence. At most 5 findings — pick the ones that matter. "
+    "If the charter turns up nothing real, write no files and say so in your "
+    "summary: an empty result is a valid, honest outcome. Each file becomes a "
+    "GitHub issue for a human to triage."
+)
+
 BACKLOG_INSTRUCTIONS = (
     "If you identify follow-up work that is OUT OF SCOPE for this outcome, do "
     "not expand scope. Write each such item as its own markdown file under "

@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS daemon_work_items (
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
     pending_report TEXT,
+    kind        TEXT NOT NULL DEFAULT 'patch',
     UNIQUE(source, source_key)
 );
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);
@@ -90,6 +91,13 @@ _MIGRATIONS = (
         "pending_report",
         "ALTER TABLE daemon_work_items ADD COLUMN pending_report TEXT",
     ),
+    # Discovery lane: audit items investigate and file issues, patch items
+    # deliver PRs. Rows from before the column are patches.
+    (
+        "daemon_work_items",
+        "kind",
+        "ALTER TABLE daemon_work_items ADD COLUMN kind TEXT NOT NULL DEFAULT 'patch'",
+    ),
 )
 
 
@@ -107,6 +115,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         item_id=row["item_id"],
         source=row["source"],
         source_key=row["source_key"],
+        kind=row["kind"] or "patch",
         title=row["title"],
         body=row["body"],
         url=row["url"],
@@ -170,13 +179,14 @@ class DaemonStore:
                     "DELETE FROM daemon_work_items WHERE item_id = ?", (row["item_id"],)
                 )
             self._conn.execute(
-                "INSERT INTO daemon_work_items (item_id, source, source_key, title, body, "
+                "INSERT INTO daemon_work_items (item_id, source, source_key, kind, title, body, "
                 "url, state, attempts, claimed, run_id, last_error, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?)",
                 (
                     item.item_id,
                     item.source,
                     item.source_key,
+                    item.kind,
                     item.title,
                     item.body,
                     item.url,

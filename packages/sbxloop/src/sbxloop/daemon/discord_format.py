@@ -891,7 +891,8 @@ def format_for_discord(
 def _origin(item: WorkItem) -> tuple[str, str]:
     """(label, kind) for where a work item came from."""
     if item.source == "github":
-        return f"issue #{item.source_key}", "github"
+        prefix = "audit" if item.kind == "audit" else "issue"
+        return f"{prefix} #{item.source_key}", "github"
     return f"inbox {code(item.source_key)}", "inbox"
 
 
@@ -1037,6 +1038,8 @@ def items_lines(items: list[WorkItem], limit: int = 20) -> str:
     rows = []
     for i in items[:limit]:
         row = f"{ITEM_STATE_MARKER.get(i.state, '•')} {code(i.item_id)} {i.state} · "
+        if i.kind == "audit":
+            row += "🔎 audit · "
         row += link(_one_line(i.title, 60), i.url) if i.url else _one_line(i.title, 60)
         row += f" · attempts {i.attempts}"
         if i.run_id:

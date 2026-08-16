@@ -26,7 +26,7 @@ from typing import Any, NamedTuple, Protocol
 
 from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
-from sbxloop.daemon.backlog import BACKLOG_INSTRUCTIONS, collect_backlog
+from sbxloop.daemon.backlog import AUDIT_INSTRUCTIONS, BACKLOG_INSTRUCTIONS, collect_backlog
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore
@@ -638,7 +638,8 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         if result is not None and report.succeeded:
-            self._collect_backlog(run_id, source)
+            filed = self._collect_backlog(run_id, source)
+            report = report._replace(filed=tuple(filed))
             self.dstore.mark_done(item.item_id, now)
             self.dstore.finish_ledger(run_id, "done", now)
             self._set_breaker(None, 0)
@@ -647,6 +648,7 @@ class DaemonLoop:
             self._notify(
                 f"✅ {item.item_id} done ({report.task_summary})"
                 + (f" · PR {report.delivery[1]}" if report.delivery else "")
+                + (f" · filed {len(report.filed)} finding(s)" if item.kind == "audit" else "")
             )
             return "done"
         if result is not None and result.state == "completed" and report.delivery_error:
@@ -738,7 +740,10 @@ class DaemonLoop:
                     # issue already is one (#251); the summary comment there
                     # carries the same information.
                     "report": self.config.daemon.tracking_issue,
-                    "deliver": True,
+                    # An audit's output is the issues it files; delivering
+                    # its (deliberately unchanged) tree would only raise
+                    # "nothing to deliver" and mis-settle it as failed.
+                    "deliver": item.kind != "audit",
                     "deliver_draft": self.config.daemon.deliver_draft,
                     "create_repo": False,
                 }
@@ -807,7 +812,9 @@ class DaemonLoop:
         else:
             origin = f"inbox file `{item.source_key}`"
         parts.append(f"---\nThis work item came from: {origin}.")
-        if self.config.daemon.backlog != "off":
+        if item.kind == "audit":
+            parts.append(AUDIT_INSTRUCTIONS)
+        elif self.config.daemon.backlog != "off":
             parts.append(BACKLOG_INSTRUCTIONS)
         return "\n\n".join(parts)
 
@@ -853,14 +860,15 @@ class DaemonLoop:
         workspace = str(result.workspace) if result is not None and result.workspace else None
         return RunReport(run_id, state, summary, tracking, delivery, delivery_error, workspace)
 
-    def _collect_backlog(self, run_id: str, source: WorkSource) -> None:
+    def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:
+        """File the run's backlog items; returns their refs (``gh:<n>``)."""
         mode = self.config.daemon.backlog
         if mode == "off":
-            return
+            return []
         target = next((s for s in self.sources if s.name == mode), None)
         if target is None:
             logger.warning("backlog mode %r but no such source is active", mode)
-            return
+            return []
         try:
             record = self.store.get_run(run_id)
             filed = collect_backlog(
@@ -873,9 +881,10 @@ class DaemonLoop:
             )
         except SbxloopError:
             logger.warning("backlog collection failed for %s", run_id, exc_info=True)
-            return
+            return []
         if filed:
             self._notify(f"filed {len(filed)} backlog item(s) from {run_id}: {', '.join(filed)}")
+        return list(filed)
 
     # -- recovery ------------------------------------------------------------------------
 

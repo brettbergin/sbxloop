@@ -361,6 +361,9 @@ class DaemonConfig(_ConfigModel):
     failed_label: str = "sbxloop:failed"
     backlog_label: str = "sbxloop:backlog"
     delivered_label: str = "sbxloop:delivered"
+    # Discovery lane: an issue carrying this label is a charter — the run
+    # investigates and files findings as backlog issues, never a PR.
+    audit_label: str = "sbxloop:audit"
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
@@ -394,6 +397,7 @@ class DaemonConfig(_ConfigModel):
             self.failed_label,
             self.backlog_label,
             self.delivered_label,
+            self.audit_label,
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")

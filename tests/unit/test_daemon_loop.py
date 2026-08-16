@@ -144,6 +144,16 @@ class TestTick:
         assert h.dstore.runs_started_since(0) == 1
         assert h.loop.tick().idle_reason == "no_work"
 
+    def test_success_report_carries_the_filed_backlog_refs(self, tmp_path: Path) -> None:
+        """An audit's deliverable is what it filed: the refs ride on the
+        RunReport so the source can name them in the closing comment."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        h.loop._collect_backlog = lambda run_id, source: ["inbox:finding-a", "inbox:finding-b"]  # type: ignore[method-assign]
+        assert h.loop.tick().outcome == "done"
+        report = h.source.calls[-1][1]
+        assert report.filed == ("inbox:finding-a", "inbox:finding-b")
+
     def test_daily_cap_blocks_dispatch(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
@@ -270,6 +280,40 @@ class TestOutcomeAndConfig:
         assert gh.github.create_repo is False and gh.keep_on_failure is False
         inbox = h.loop._item_config(inbox_item())
         assert inbox.github.deliver is False and inbox.keep_on_failure is False
+
+    def test_audit_items_carry_the_audit_contract_and_never_deliver(self, tmp_path: Path) -> None:
+        """The discovery lane: an audit's output is the issues it files. Its
+        tree is deliberately unchanged, so delivery would only raise
+        "nothing to deliver" and mis-settle it as failed — it is forced off;
+        the outcome text swaps the backlog note for the audit contract."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": {"backlog": "github"},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        audit = WorkItem(
+            item_id="gh:9",
+            source="github",
+            source_key="9",
+            kind="audit",
+            title="Audit X",
+            body="look at Y",
+            url="https://x/9",
+        )
+        conf = h.loop._item_config(audit)
+        assert conf.github.deliver is False and conf.github.report is True
+        text = h.loop.outcome_text(audit)
+        assert "This is an AUDIT" in text and ".sbxloop/backlog/" in text
+        assert "**Evidence**" in text and "empty result is a valid" in text
+        assert "OUT OF SCOPE" not in text  # the patch-lane note is not appended twice
+        # a patch item is unchanged
+        patch = h.loop._item_config(
+            WorkItem(item_id="gh:1", source="github", source_key="1", title="x")
+        )
+        assert patch.github.deliver is True
 
     def test_item_config_skips_tracking_issue_when_disabled(self, tmp_path: Path) -> None:
         """tracking_issue=false (#251): the source issue already is the

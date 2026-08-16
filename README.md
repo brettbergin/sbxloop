@@ -267,6 +267,17 @@ discover (`--backlog github|inbox`) — those land in **triage** (the
 `sbxloop:backlog` label / `inbox/triage/`) and never run until a human
 promotes them, unless `backlog_auto_trigger` is set.
 
+**The discovery lane.** An issue carrying `sbxloop:audit` (`[daemon] audit_label`) is a *charter*, not a change: the run investigates — "review
+`daemon/loop.py` for guardrail holes", "post-mortem run rXXXX" — and its
+deliverable is findings, each written as one file under `.sbxloop/backlog/`
+with **Evidence** (file:line), **Repro**, **Proposal**, **Size** and
+**Kind**, which the daemon files as `sbxloop:backlog` issues (so
+`--backlog github` is required for the lane to produce anything). Audits
+never deliver a PR, close on completion with a `Filed: #…` comment, and an
+audit that finds nothing real says so. Promoting a finding is a label swap
+(`sbxloop:backlog` → `sbxloop:run`) — a human decision, so the loop's
+precision is visible before anyone hands it the keys.
+
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
 an interrupted run (SIGTERM, crash) is resumed on the next start — through

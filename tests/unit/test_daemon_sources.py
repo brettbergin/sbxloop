@@ -152,7 +152,20 @@ class RecordingOps:
 
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         self.searches.append(query)
-        return list(self.issues.values())
+        # Honour the label clause the way GitHub does, so the two-lane poll
+        # (trigger label, then audit label) sees each issue in its lane only.
+        wanted = None
+        if 'label:"' in query:
+            wanted = query.split('label:"', 1)[1].split('"', 1)[0]
+        return [
+            i
+            for i in self.issues.values()
+            if wanted is None
+            or any(
+                (lb.get("name") if isinstance(lb, dict) else lb) == wanted
+                for lb in i.get("labels") or []
+            )
+        ]
 
     def raw(self, method: str, path: str, body: Any = None) -> Any:
         if method in self.fail_on:
@@ -210,9 +223,58 @@ class TestGitHubSource:
     def test_poll_uses_trigger_label_query(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})
         items = self.make(ops).poll()
-        assert ops.searches == ['repo:o/r is:issue is:open label:"sbxloop:run"']
+        assert ops.searches == [
+            'repo:o/r is:issue is:open label:"sbxloop:run"',
+            'repo:o/r is:issue is:open label:"sbxloop:audit"',
+        ]
         assert [i.item_id for i in items] == ["gh:4"]
+        assert items[0].kind == "patch"
         assert items[0].url == "https://x/issues/4" and items[0].body == "please do it"
+
+    def test_poll_audit_lane_stamps_kind_and_both_labels_read_as_patch(self) -> None:
+        """The discovery lane: an issue carrying the audit label is an audit
+        item; one carrying both labels is a patch (the safer reading)."""
+        ops = RecordingOps(
+            {
+                "5": issue(5, "sbxloop:audit"),
+                "6": issue(6, "sbxloop:run", "sbxloop:audit"),
+            }
+        )
+        items = {i.item_id: i for i in self.make(ops).poll()}
+        assert items["gh:5"].kind == "audit"
+        assert items["gh:6"].kind == "patch"
+
+    def test_audit_claim_swaps_the_audit_label(self) -> None:
+        ops = RecordingOps({"5": issue(5, "sbxloop:audit")})
+        item = self.make(ops).poll()[0]
+        assert self.make(ops).claim(item) is True
+        deleted = [p for m, p, _ in ops.raw_calls if m == "DELETE"]
+        assert any(p.endswith("sbxloop%3Aaudit") for p in deleted), deleted
+        assert not any(p.endswith("sbxloop%3Arun") for p in deleted)
+
+    def test_audit_success_closes_and_lists_filed_findings(self) -> None:
+        """An audit is a chore whose output is the issues it filed: it closes
+        on completion even in keep-open mode, and the comment names them."""
+        ops = RecordingOps({"5": issue(5, "sbxloop:audit")})
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
+        item = src.poll()[0]
+        src.report_success(item, report(filed=("gh:12", "gh:13")))
+        assert any("Filed: #12, #13" in body for _, body in ops.comments)
+        assert any(
+            m == "PATCH" and b == {"state": "closed", "state_reason": "completed"}
+            for m, _, b in ops.raw_calls
+        )
+        # a patch item in the same mode stays open (unchanged semantics)
+        ops2 = RecordingOps({"4": issue(4, "sbxloop:run")})
+        src2 = GitHubIssueSource(lambda: ops2, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
+        src2.report_success(src2.poll()[0], report())
+        assert not any(m == "PATCH" for m, _, _ in ops2.raw_calls)
+
+    def test_audit_with_no_findings_says_so(self) -> None:
+        ops = RecordingOps({"5": issue(5, "sbxloop:audit")})
+        item = self.make(ops).poll()[0]
+        self.make(ops).report_success(item, report())
+        assert any("filed no findings" in body for _, body in ops.comments)
 
     def test_claim_reverifies_then_swaps_labels_and_comments(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})

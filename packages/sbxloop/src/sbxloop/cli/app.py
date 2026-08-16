@@ -1477,6 +1477,14 @@ def daemon(
     if config.daemon.backlog == "github" and not github_active:
         console.print("[bold red]--backlog github needs a GitHub repository[/] (--repo).")
         raise typer.Exit(2)
+    if github_active and config.daemon.backlog != "github":
+        # The audit lane is always on when issues are a source; its
+        # findings only have somewhere to go with backlog = "github".
+        console.print(
+            f"[yellow]note:[/] audit issues (`{config.daemon.audit_label}`) file their "
+            "findings as backlog issues, which needs [cyan]--backlog github[/]; with "
+            f"backlog={config.daemon.backlog!r} an audit run completes but files nothing."
+        )
 
     # Say where the state went: with the anchored default, `sbxloop status`
     # in the runner dir shows nothing unless SBXLOOP_STATE_DIR points here.
@@ -1500,6 +1508,7 @@ def daemon(
             config.daemon.failed_label,
             config.daemon.backlog_label,
             config.daemon.delivered_label,
+            config.daemon.audit_label,
         )
         sources.append(
             GitHubIssueSource(
@@ -1998,6 +2007,7 @@ mem_abort = 0.0
 # failed_label = "sbxloop:failed"
 # backlog_label = "sbxloop:backlog"
 # delivered_label = "sbxloop:delivered"
+# audit_label = "sbxloop:audit"    # discovery lane: investigate, file findings, no PR
 # What a delivered run does to the tracker. Defaults are task-queue
 # semantics: close the source issue (the PR is the reviewable object) and
 # open a per-run tracking issue. For a design/discussion tracker set both

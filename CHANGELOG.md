@@ -15,6 +15,18 @@ All notable changes to sbxloop are documented here. The project adheres to
   `git status | awk '{print $2}'` guard printed whole lines and failed every
   revision and the replan of a correct change. The plan prompt says so too.
 
+### Added
+
+- **Discovery lane for the daemon**: issues carrying `[daemon] audit_label`
+  (`sbxloop:audit`) are charters — the run investigates and files findings
+  as `sbxloop:backlog` issues (evidence / repro / proposal / size / kind
+  per finding, at most 5, "nothing real" is a valid outcome) instead of
+  delivering a PR. `WorkItem.kind` (`patch` | `audit`, persisted) drives a
+  two-label poll, a kind-aware claim, `deliver=False` for audits, the audit
+  contract in the outcome text, and an audit-success comment that names what
+  it filed (`RunReport.filed`) and always closes the audit issue. Discord
+  cards and `daemon items` show the kind. Promotion stays a human label swap.
+
 ## [0.7.0] — 2026-08-16
 
 The "run sbxloop on sbxloop" release. Everything a readiness audit

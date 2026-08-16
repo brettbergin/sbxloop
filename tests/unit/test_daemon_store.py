@@ -172,6 +172,18 @@ class TestResumeAndBreaker:
         store.mark_failed("gh:7", "boom", now=5.0, requeue=False)
         assert store.get("gh:7").run_id == "r2"  # type: ignore[union-attr]
 
+    def test_item_kind_roundtrips_and_defaults_to_patch(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(
+            WorkItem(item_id="gh:9", source="github", source_key="9", kind="audit", title="A"),
+            now=1.0,
+        )
+        store.upsert_new(
+            WorkItem(item_id="gh:1", source="github", source_key="1", title="P"), now=1.0
+        )
+        assert store.get("gh:9").kind == "audit"  # type: ignore[union-attr]
+        assert store.get("gh:1").kind == "patch"  # type: ignore[union-attr]
+
     def test_breaker_roundtrip(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         assert store.breaker() == (None, 0)
