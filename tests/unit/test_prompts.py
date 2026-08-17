@@ -255,6 +255,7 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "`sbxloop:backlog`" in text and "`sbxloop:run`" in text
     assert "ask the person whether to add" in text
     assert "`label_issue_for_run` only after they explicitly say yes" in text
+    assert "`list_issues`" in text and "ask which, if any, should be worked" in text
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:

@@ -8,6 +8,13 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Concierge: **`list_issues`** lists the repo's open issues — by default
+  the `backlog_label` ones (the triage backlog), `all=true` for every open
+  issue, `label=` to narrow — with labels, age, author, comments and url,
+  flagging those already queued (`trigger_label`) or running; the prompt
+  then has it ask which, if any, should be worked, labelling only the ones
+  named.
+
 - Concierge: **`create_issue`** files a feature/bug the person described as
   an issue in the configured repo, created with the `[daemon] backlog_label`
   (triage) and attributed to the Discord user; the prompt then has it ask

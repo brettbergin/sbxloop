@@ -431,7 +431,9 @@ details through the github-ops sandbox, queues new work as an inbox
 item with a self-contained title and body, and files issues in the
 configured repo from a described feature or bug — created with the
 `sbxloop:backlog` label (triage), after which it **asks you** whether to
-add `sbxloop:run` and labels only on your yes. Actions are direct — it acts
+add `sbxloop:run` and labels only on your yes; "what's in the backlog?"
+lists the open `sbxloop:backlog` issues and asks which, if any, to work.
+Actions are direct — it acts
 with the same authority as `!sbx`, so anyone who can mention it drives the
 daemon; restrict the channel accordingly — and every tool it used is
 listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
