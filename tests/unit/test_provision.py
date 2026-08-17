@@ -422,6 +422,58 @@ class TestGithubOnly:
         assert not any("sbxloop-daemon-github" in s for s in fake_sbx.secrets())
 
 
+class TestAgentOnly:
+    """The daemon's long-lived concierge sandbox: one agent-role microVM
+    outside any run — Copilot token, no GH_TOKEN, prompt-advertised
+    baseline allows, and the pair's rollback discipline."""
+
+    def test_creates_one_agent_sandbox_with_copilot_secret_and_allows(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        sandbox = provisioner.ensure_agent_only("sbxloop-concierge-abcd1234", tmp_path / "ws")
+        try:
+            assert sandbox.name == "sbxloop-concierge-abcd1234"
+            created = [c[1].removeprefix("--name=") for c in fake_sbx.invocations("create")]
+            assert created == ["sbxloop-concierge-abcd1234"]
+            allows = fake_sbx.policies()
+            assert any("api.githubcopilot.com" in c for c in allows)
+            assert any("pypi.org" in c for c in allows)
+            assert not any("uploads.github.com" in c for c in allows)
+            secret_args = [" ".join(s["args"]) for s in fake_sbx.secrets()]
+            assert any("COPILOT_GITHUB_TOKEN" in a for a in secret_args)
+            assert not any("set github" in a or "--service" in a for a in secret_args)
+            # The host-tool response directory exists from the start.
+            fs = fake_sbx.sandbox_fs(sandbox.name)
+            assert (fs / "home/agent/.sbxloop/tools").is_dir()
+        finally:
+            sandbox.rm()
+
+    def test_missing_copilot_token_fails_before_create(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path, env={"GH_TOKEN": "x"})
+        with pytest.raises(ProvisionError, match="COPILOT_GITHUB_TOKEN"):
+            provisioner.ensure_agent_only("sbxloop-concierge-abcd1234", tmp_path / "ws")
+        assert fake_sbx.invocations("create") == []
+
+    def test_post_create_failure_rolls_back_sandbox_and_secrets(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+
+        def boom(sandbox: object, role: str) -> None:
+            raise RuntimeError("worker install exploded")
+
+        with pytest.raises(ProvisionError, match="worker install exploded"):
+            provisioner.ensure_agent_only(
+                "sbxloop-concierge-abcd1234", tmp_path / "ws", post_create=boom
+            )
+        assert fake_sbx.invocations("rm") != []
+        # secrets registered for the sandbox were unregistered again
+        assert fake_sbx.invocations("secret rm") != []
+
+
 class TestWorkspaceIsolation:
     """Runs against a git-checkout workspace work in a per-run clone; the
     checkout's working tree and branches are never disturbed."""

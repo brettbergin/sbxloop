@@ -8,6 +8,36 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Worker protocol: **host tools** for `agent.session` jobs. `JobRequest`
+  gains `host_tools` (name, description, JSON-schema `parameters`),
+  `host_tools_dir`, `host_tool_timeout_s` and `available_tools`; the worker
+  registers each host tool as a custom SDK tool and relays every call to
+  the host as an `agent.tool_request` event, then waits for the host's
+  `HostToolResponse` file at `<host_tools_dir>/<call_id>.json`
+  (`sbxloop_worker.hosttools`, `agent.tool_response` on completion). This
+  is the transport the daemon's Discord concierge uses to let an in-sandbox
+  session drive the daemon. The echo backend scripts `host_tool_calls`, so
+  the round trip is testable without the SDK. See
+  `docs/worker-protocol.md`, "Host tools".
+- Host side of the same round trip: `WorkerClient.submit(job, tool_handler=…)` answers a job's host-tool requests through a
+  `HostToolBroker` (`sbxloop.worker.hosttools`). The handler runs on a
+  small host thread pool, never on the thread draining the event stream,
+  and its `HostToolResponse` is `sbx cp`'d into
+  `~/.sbxloop/tools/<job_id>/<call_id>.json`; handler exceptions become
+  `ok=false` answers the model can read. `WorkerClient.verify_installed()`
+  is the cheap "is a matching worker already in this sandbox?" probe for
+  reusing a long-lived sandbox.
+- `Provisioner.ensure_agent_only` / `agent_only_spec`: one agent-role
+  sandbox (Copilot token, no `GH_TOKEN`, prompt-advertised baseline allows)
+  outside a run's pair, sharing `ensure_github_only`'s fail-fast/rollback
+  path. `sbxloop.daemon.agentbox.DaemonAgent` wraps it as the daemon's
+  long-lived **concierge sandbox** (`sbxloop-concierge-<state-dir digest>`):
+  provisioned lazily, dropped and re-provisioned on failure at most once
+  per five minutes, and — unlike the github-ops box — **reused across
+  daemon restarts** when `verify_installed()` still matches this host (the
+  SDK's session store, i.e. the concierge's memory, lives inside the VM).
+  `sbxloop sandbox prune` reports both daemon-owned families and never
+  touches them; `sbxloop sandbox rm` removes them explicitly.
 - The daemon's log is structured ([structlog](https://www.structlog.org/)
   routed through the standard library, `sbxloop.log`) and configurable:
   `--log-level` / `[daemon] log_level` / `SBXLOOP_DAEMON__LOG_LEVEL`

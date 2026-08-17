@@ -9,10 +9,15 @@ Response object shape (all fields optional):
 ``{"text": str, "json": dict|list, "session_id": str, "sleep_s": float,
 "events": [{"type": str, "data": {...}}], "fail": str,
 "files": {"relative/path": "content"},
+"host_tool_calls": [{"name": str, "arguments": {...}, "call_id": str}],
 "health": {"permission_denials": {...}, "tool_failures": {...}}}``
 
 ``files`` are written relative to the worker process cwd — modelling an
-executor that produces artifacts in the run workspace.
+executor that produces artifacts in the run workspace. ``host_tool_calls``
+go through the real host-tool round trip (``sbxloop_worker.hosttools``):
+each response's text is appended to the output, so a host round-trip test
+can assert what the "model" saw; a host timeout fails the job like any
+other backend error.
 """
 
 from __future__ import annotations
@@ -25,7 +30,8 @@ from typing import Any
 
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, EmitFn
-from sbxloop_worker.protocol import EventTypes, JobRequest, SessionHealth, Usage
+from sbxloop_worker.hosttools import request_tool, safe_call_id
+from sbxloop_worker.protocol import EventTypes, HostToolCall, JobRequest, SessionHealth, Usage
 
 SCRIPT_ENV = "SBXLOOP_ECHO_SCRIPT"
 
@@ -85,6 +91,8 @@ class EchoBackend:
         for scripted_event in response.get("events", []):
             emit(scripted_event["type"], **scripted_event.get("data", {}))
         text = str(response.get("text", ""))
+        for tool_text in self._host_tool_calls(job, emit, response.get("host_tool_calls", [])):
+            text = f"{text}\n{tool_text}" if text else tool_text
         if text:
             emit(EventTypes.AGENT_MESSAGE, content=text, model="echo")
         output_json = response.get("json")
@@ -98,3 +106,23 @@ class EchoBackend:
             usage=Usage(model="echo"),
             health=SessionHealth.model_validate(health) if health is not None else None,
         )
+
+    @staticmethod
+    def _host_tool_calls(job: JobRequest, emit: EmitFn, calls: list[dict[str, Any]]) -> list[str]:
+        if not calls:
+            return []
+        if not job.host_tools_dir:
+            raise RuntimeError("echo script has host_tool_calls but the job has no host_tools_dir")
+        texts: list[str] = []
+        for entry in calls:
+            call = HostToolCall(
+                call_id=safe_call_id(entry.get("call_id")),
+                name=str(entry["name"]),
+                arguments=dict(entry.get("arguments", {})),
+            )
+            response = request_tool(emit, job.host_tools_dir, call, job.host_tool_timeout_s)
+            if response.ok:
+                texts.append(response.text)
+            else:
+                texts.append(f"[{call.name} failed: {response.error}]")
+        return texts

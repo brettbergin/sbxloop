@@ -37,6 +37,11 @@ DEFAULT_MIN_AGE_S = 3600.0
 
 _NAME_RE = re.compile(r"^sbxloop-(?P<run>[^-]+)-(?P<role>agent|github)$")
 
+# Sandboxes the daemon owns for its whole lifetime (not tied to a run):
+# the github-ops box and the concierge box. Never pruned here — the daemon
+# manages them; `sbxloop sandbox rm` removes them explicitly.
+DAEMON_OWNED_PREFIXES = ("sbxloop-daemon-github-", "sbxloop-concierge-")
+
 
 class SandboxVerdict(BaseModel):
     """One sandbox's classification: what we know and whether it is prunable."""
@@ -96,6 +101,12 @@ def _classify_one(
     include_kept: bool,
     now: float,
 ) -> SandboxVerdict:
+    if name.startswith(DAEMON_OWNED_PREFIXES):
+        return SandboxVerdict(
+            name=name,
+            reason="daemon-owned sandbox (github-ops / concierge); not touched — "
+            "`sbxloop sandbox rm` removes it explicitly",
+        )
     match = _NAME_RE.match(name)
     if match is None or not is_run_id(match.group("run")):
         return SandboxVerdict(

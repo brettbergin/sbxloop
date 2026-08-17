@@ -43,7 +43,15 @@ from sbxloop.sbx.conformance import (
 )
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
 from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.sandbox import ENV_FILE, EVENTS_DIR, JOBS_DIR, RESULTS_DIR, WORK_DIR, Sandbox
+from sbxloop.sbx.sandbox import (
+    ENV_FILE,
+    EVENTS_DIR,
+    JOBS_DIR,
+    RESULTS_DIR,
+    TOOLS_DIR,
+    WORK_DIR,
+    Sandbox,
+)
 from sbxloop.sbx.secretstate import (
     COPILOT_TOKEN_ENV,
     COPILOT_TOKEN_HOST,
@@ -373,7 +381,7 @@ class Provisioner:
             with rollback_lock:
                 registered_secret_rms.extend(rms)
             self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
-            sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
+            sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             if self.post_create is not None:
                 self.post_create(sandbox, spec.role)
             self.bus.emit("sandbox.ready", run_id, name=spec.name, role=spec.role)
@@ -477,6 +485,23 @@ class Provisioner:
             secrets=[SecretSpec(kind="service", service="github")],
         )
 
+    def agent_only_spec(self, name: str, workspace: Path) -> SandboxSpec:
+        """An agent-role spec that is not tied to a run — the daemon's
+        long-lived concierge sandbox (Copilot token, no GH_TOKEN). Mirrors
+        the pair's agent spec, including the prompt-advertised baseline."""
+        return SandboxSpec(
+            name=name,
+            role="agent",
+            workspace=workspace,
+            template=self.config.sandbox.template,
+            policy_allows=[
+                *AGENT_ALLOW_DOMAINS,
+                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.config.policy.deny),
+                *self.config.sandbox.extra_allow_domains,
+            ],
+            secrets=[SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)],
+        )
+
     def ensure_github_only(
         self,
         name: str,
@@ -501,7 +526,33 @@ class Provisioner:
         """
         token = self.gh_token()
         spec = self.github_only_spec(name, workspace)
-        workspace.mkdir(parents=True, exist_ok=True)
+        return self._ensure_single(spec, token, post_create=post_create, run_id=run_id)
+
+    def ensure_agent_only(
+        self,
+        name: str,
+        workspace: Path,
+        *,
+        post_create: PostCreate | None = None,
+        run_id: str | None = None,
+    ) -> Sandbox:
+        """Provision one agent-role sandbox (Copilot token only) outside a
+        run's pair — the daemon's concierge box. Same discipline as
+        :meth:`ensure_github_only`."""
+        token = self.copilot_token()
+        spec = self.agent_only_spec(name, workspace)
+        return self._ensure_single(spec, token, post_create=post_create, run_id=run_id)
+
+    def _ensure_single(
+        self,
+        spec: SandboxSpec,
+        token: str,
+        *,
+        post_create: PostCreate | None,
+        run_id: str | None,
+    ) -> Sandbox:
+        name = spec.name
+        spec.workspace.mkdir(parents=True, exist_ok=True)
         label = run_id or f"daemon:{name}"
         created: Sandbox | None = None
         registered_secret_rms: list[Callable[[], bool]] = []
@@ -512,7 +563,7 @@ class Provisioner:
             self._apply_policy(spec)
             registered_secret_rms.extend(self._apply_secrets(spec, created, token))
             self._verify_secret_env(label, spec, created, token)
-            created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR)
+            created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             hook = post_create or self.post_create
             if hook is not None:
                 hook(created, spec.role)

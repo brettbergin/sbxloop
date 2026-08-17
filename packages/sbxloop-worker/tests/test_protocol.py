@@ -8,6 +8,9 @@ from sbxloop_worker.protocol import (
     ErrorInfo,
     Event,
     EventTypes,
+    HostToolCall,
+    HostToolResponse,
+    HostToolSpec,
     JobRequest,
     JobResult,
     SessionHealth,
@@ -54,6 +57,45 @@ class TestJobRequest:
     def test_shell_batch_requires_commands(self) -> None:
         with pytest.raises(ValidationError, match="non-empty commands"):
             JobRequest(job_id="j1", run_id="r1", kind="shell.batch")
+
+    def test_host_tools_only_for_agent_session(self) -> None:
+        with pytest.raises(ValidationError, match="must not set host_tools"):
+            JobRequest(
+                job_id="j1", run_id="r1", kind="shell.check", argv=["ls"], available_tools=[]
+            )
+        with pytest.raises(ValidationError, match="must not set host_tools"):
+            JobRequest(
+                job_id="j1", run_id="r1", kind="shell.batch", commands=["true"], host_tools_dir="/t"
+            )
+
+    def test_host_tools_defaults(self) -> None:
+        tool = HostToolSpec(name="sbx_control", description="run a daemon verb")
+        # host_tools_dir is filled in by the host's WorkerClient at submit
+        # time, so the model itself does not require it.
+        assert agent_job(host_tools=[tool]).host_tools_dir is None
+        job = agent_job(host_tools=[tool], host_tools_dir="/home/agent/.sbxloop/tools/j1")
+        assert job.host_tools[0].parameters == {"type": "object", "properties": {}}
+        assert job.host_tool_timeout_s == 120.0
+        assert job.available_tools is None
+
+    def test_duplicate_host_tool_names_rejected(self) -> None:
+        tool = HostToolSpec(name="dup", description="x")
+        with pytest.raises(ValidationError, match="duplicate host tool name"):
+            agent_job(host_tools=[tool, tool], host_tools_dir="/t")
+
+    def test_host_tool_name_alphabet(self) -> None:
+        with pytest.raises(ValidationError):
+            HostToolSpec(name="not ok!", description="x")
+
+    def test_host_tool_response_roundtrip(self) -> None:
+        call = HostToolCall(call_id="c1", name="list_runs", arguments={"limit": 3})
+        event = Event.now(EventTypes.AGENT_TOOL_REQUEST, "r1", "j1", **call.model_dump())
+        assert HostToolCall.model_validate(event.data) == call
+        response = HostToolResponse(call_id="c1", ok=False, text="", error="boom")
+        restored = HostToolResponse.model_validate_json(response.model_dump_json())
+        assert restored == response and restored.v == PROTOCOL_VERSION
+        with pytest.raises(ValidationError):
+            HostToolResponse.model_validate({"call_id": "c1", "ok": True, "extra": 1})
 
     def test_shell_batch_rejects_argv(self) -> None:
         with pytest.raises(ValidationError, match="must not set prompt, argv, or op"):

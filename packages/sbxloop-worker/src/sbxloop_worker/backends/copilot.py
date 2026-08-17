@@ -26,7 +26,15 @@ from typing import Any, get_args
 
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, BackendUnavailableError, EmitFn
-from sbxloop_worker.protocol import EventTypes, JobRequest, SessionHealth, Usage
+from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
+from sbxloop_worker.protocol import (
+    EventTypes,
+    HostToolCall,
+    HostToolSpec,
+    JobRequest,
+    SessionHealth,
+    Usage,
+)
 
 # The SDK's permission-request ``kind`` vocabulary, field-verified against
 # github-copilot-sdk 1.0.9 (2026-08-13): ``copilot.session.PermissionRequest``
@@ -143,6 +151,20 @@ def installed_sdk_permission_kinds() -> frozenset[str] | None:
         if isinstance(kind, str):
             kinds.add(kind)
     return frozenset(kinds)
+
+
+def _arguments_dict(raw: Any) -> dict[str, Any]:
+    """Tool arguments as a plain dict: the SDK hands over parsed JSON, but a
+    JSON string or None must not crash the relay."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {"input": raw}
+        return parsed if isinstance(parsed, dict) else {"input": parsed}
+    return {}
 
 
 def _auth_diagnostic() -> str:
@@ -523,6 +545,7 @@ class CopilotBackend:
             # name is unverified against the SDK (e2e-validated), so an
             # unsupported signature must not fail the session.
             kwargs["working_directory"] = job.cwd
+        kwargs.update(self._tool_kwargs(job, emit))
         try:
             return await self._open(client, job, kwargs)
         except TypeError:
@@ -530,6 +553,70 @@ class CopilotBackend:
                 raise
             del kwargs["working_directory"]
             return await self._open(client, job, kwargs)
+
+    def _tool_kwargs(self, job: JobRequest, emit: EmitFn | None) -> dict[str, Any]:
+        """Session kwargs for host tools and the built-in tool allowlist.
+
+        Host tools are registered as SDK custom tools whose handler relays
+        the call to the host (``sbxloop_worker.hosttools``). The SDK's
+        ``available_tools`` allowlist covers custom tools too, so host tool
+        names are appended whenever the caller restricts built-ins.
+        """
+        kwargs: dict[str, Any] = {}
+        if job.host_tools:
+            if emit is None or not job.host_tools_dir:
+                raise RuntimeError("host_tools need an event emitter and host_tools_dir")
+            kwargs["tools"] = [self._host_tool(spec, job, emit) for spec in job.host_tools]
+        if job.available_tools is not None:
+            kwargs["available_tools"] = [
+                *job.available_tools,
+                *(spec.name for spec in job.host_tools),
+            ]
+        return kwargs
+
+    @staticmethod
+    def _host_tool(spec: HostToolSpec, job: JobRequest, emit: EmitFn) -> Any:
+        """One SDK ``Tool`` whose handler round-trips to the host.
+
+        ``skip_permission`` — the host decided which tools exist, and the
+        read-only allowlist would otherwise turn every ``custom-tool``
+        request away. The wait runs in a thread so the SDK's event loop
+        keeps streaming while the host works.
+        """
+        from copilot.tools import Tool, ToolResult
+
+        assert job.host_tools_dir is not None
+        tools_dir = job.host_tools_dir
+
+        async def handler(invocation: Any) -> Any:
+            call = HostToolCall(
+                call_id=safe_call_id(getattr(invocation, "tool_call_id", None)),
+                name=spec.name,
+                arguments=_arguments_dict(getattr(invocation, "arguments", None)),
+            )
+            try:
+                response = await asyncio.to_thread(
+                    request_tool, emit, tools_dir, call, job.host_tool_timeout_s
+                )
+            except HostToolTimeout as exc:
+                return ToolResult(
+                    text_result_for_llm=str(exc), result_type="timeout", error=str(exc)
+                )
+            if response.ok:
+                return ToolResult(text_result_for_llm=response.text)
+            return ToolResult(
+                text_result_for_llm=response.text or response.error or f"{spec.name} failed",
+                result_type="failure",
+                error=response.error,
+            )
+
+        return Tool(
+            name=spec.name,
+            description=spec.description,
+            parameters=spec.parameters,
+            handler=handler,
+            skip_permission=True,
+        )
 
     @staticmethod
     async def _open(client: Any, job: JobRequest, kwargs: dict[str, Any]) -> Any:

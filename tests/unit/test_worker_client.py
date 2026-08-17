@@ -1341,3 +1341,95 @@ class TestResourceTelemetry:
         assert result.status == "ok"
         samples = [e for e in seen if e.type == EventTypes.SANDBOX_RESOURCES]
         assert samples and samples[0].data["level"] == "ok"  # thresholds disabled
+
+
+class TestHostTools:
+    """Host-tool round trip through the real worker + fake sbx: the echo
+    script calls a host tool, the broker answers it by copying a response
+    file into the sandbox, and the model's text shows what came back."""
+
+    def _script(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls: list[dict]) -> None:
+        script = tmp_path / "script.json"
+        script.write_text(json.dumps([{"text": "asked", "host_tool_calls": calls}]))
+        monkeypatch.setenv("SBXLOOP_ECHO_SCRIPT", str(script))
+
+    def _job(self, **overrides: object) -> JobRequest:
+        from sbxloop_worker.protocol import HostToolSpec
+
+        return agent_job(
+            host_tools=[HostToolSpec(name="answer", description="the host answers")],
+            **overrides,
+        )
+
+    def test_stream_round_trip(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import threading
+
+        from sbxloop_worker.protocol import HostToolCall, HostToolResponse
+
+        self._script(tmp_path, monkeypatch, [{"name": "answer", "arguments": {"n": 41}}])
+        bus = EventBus()
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        threads: list[str] = []
+
+        def handler(call: HostToolCall) -> HostToolResponse:
+            threads.append(threading.current_thread().name)
+            return HostToolResponse(
+                call_id=call.call_id, ok=True, text=str(call.arguments["n"] + 1)
+            )
+
+        client = make_client(sandbox, bus)
+        result = client.submit(self._job(), agent="concierge", tool_handler=handler)
+
+        assert result.status == "ok"
+        assert result.output_text == "asked\n42"
+        requests = [e for e in seen if e.type == EventTypes.AGENT_TOOL_REQUEST]
+        responses = [e for e in seen if e.type == EventTypes.AGENT_TOOL_RESPONSE]
+        assert len(requests) == 1 and requests[0].data["name"] == "answer"
+        assert requests[0].data["agent"] == "concierge"
+        assert responses and responses[0].data["ok"] is True
+        # The handler ran on the broker's pool, never on the submit thread.
+        assert threads and all(t.startswith("sbxloop-hosttool") for t in threads)
+        # host_tools_dir was filled in per job; the broker is gone once submit returns,
+        # and its close() removed the job's tools directory from the sandbox.
+        assert client._brokers == {}
+        assert not (fake_sbx.sandbox_fs("boxa") / "home/agent/.sbxloop/tools/j1").exists()
+
+    def test_poll_round_trip(
+        self, sandbox: Sandbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop_worker.protocol import HostToolCall, HostToolResponse
+
+        self._script(tmp_path, monkeypatch, [{"name": "answer", "arguments": {}}])
+
+        def handler(call: HostToolCall) -> HostToolResponse:
+            return HostToolResponse(call_id=call.call_id, ok=True, text="polled")
+
+        client = make_client(sandbox, EventBus(), transport="poll", poll_interval=0.1)
+        result = client.submit(self._job(job_id="jp"), tool_handler=handler)
+        assert result.status == "ok" and result.output_text == "asked\npolled"
+
+    def test_handler_exception_becomes_error_response(
+        self, sandbox: Sandbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._script(tmp_path, monkeypatch, [{"name": "answer", "arguments": {}}])
+
+        def handler(call: object) -> object:
+            raise RuntimeError("store is locked")
+
+        result = make_client(sandbox, EventBus()).submit(self._job(), tool_handler=handler)  # type: ignore[arg-type]
+        assert result.status == "ok"
+        assert result.output_text == "asked\n[answer failed: RuntimeError: store is locked]"
+
+    def test_host_tools_and_handler_travel_together(self, sandbox: Sandbox) -> None:
+        client = make_client(sandbox, EventBus())
+        with pytest.raises(WorkerError, match="must be given together"):
+            client.submit(self._job())
+        with pytest.raises(WorkerError, match="must be given together"):
+            client.submit(agent_job(), tool_handler=lambda call: None)  # type: ignore[arg-type,return-value]
