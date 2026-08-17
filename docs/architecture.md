@@ -94,6 +94,30 @@ removes the run's sandboxes and exits 130 with a `sbxloop resume` hint
 `sbxloop sandbox prune`. Sandboxes are **cattle** — `resume` always
 provisions a fresh pair.
 
+### The daemon's own sandboxes
+
+`sbxloop daemon` owns two long-lived sandboxes outside any run's pair, both
+named per state dir (`sbxloop-daemon-github-<digest>`,
+`sbxloop-concierge-<digest>`) and both reported-but-never-pruned by
+`sandbox prune`:
+
+- the **github-ops box** (`daemon/github.py`) — polling and issue lifecycle
+  with `GH_TOKEN`, provisioned lazily, dropped and re-provisioned on
+  failure at most once per five minutes, removed at daemon start/stop;
+- the **concierge box** (`daemon/agentbox.py`) — the control channel's
+  agent (`daemon/concierge.py`), a Copilot session with the agent token
+  and **no built-in tools**: everything it can do is a *host tool*
+  (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
+  run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads
+  through the ops box — relayed as `agent.tool_request` events and answered
+  by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
+  polls for. It is **kept across daemon restarts** when the installed worker
+  still matches the host, because the SDK session store — the conversation's
+  memory, resumed via `resume_session_id` — lives inside the VM.
+
+The credential split holds for both: the host never holds a PAT in a
+process that also talks to a model, and neither box holds both tokens.
+
 ## The loop
 
 ```

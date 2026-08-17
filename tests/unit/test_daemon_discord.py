@@ -84,15 +84,35 @@ class TestFormat:
 # -- fake discord objects --------------------------------------------------------------
 
 
+class FakeUser:
+    def __init__(self, uid: int, name: str = "brett", *, bot: bool = False) -> None:
+        self.id = uid
+        self.name = name
+        self.bot = bot
+
+
+BOT_USER = FakeUser(777, "sbxloop", bot=True)
+
+
 class FakeMessage:
     def __init__(
-        self, content: str, channel: FakeChannel, *, bot: bool = False, mid: int = 500
+        self,
+        content: str,
+        channel: FakeChannel,
+        *,
+        bot: bool = False,
+        mid: int = 500,
+        mentions: list[FakeUser] | None = None,
+        reply_to: FakeMessage | None = None,
     ) -> None:
         self.content = content
         self.channel = channel
         self.id = mid
-        self.author = type("A", (), {"bot": bot, "name": "brett"})()
+        self.author = BOT_USER if bot else FakeUser(1, "brett")
         self.reactions: list[str] = []
+        self.mentions = list(mentions or [])
+        # discord.py: message.reference.resolved is the replied-to Message
+        self.reference = type("Ref", (), {"resolved": reply_to})() if reply_to else None
 
     async def add_reaction(self, emoji: str) -> None:
         self.reactions.append(emoji)
@@ -124,7 +144,7 @@ class FakeChannel:
         self.sent.append(text or "")
         self.sent_kwargs.append(kwargs)
         self._next_id += 1
-        msg = FakeMessage(text or "", self, mid=self._next_id)
+        msg = FakeMessage(text or "", self, bot=True, mid=self._next_id)
         msg.embed = kwargs.get("embed")
         self.messages[msg.id] = msg
         return msg
@@ -143,6 +163,7 @@ class FakeClient:
         self.channels: dict[int, FakeChannel] = {control_id: FakeChannel(self, control_id)}
         self.closed = False
         self.bridge: DiscordBridge | None = None
+        self.user = BOT_USER
 
     def get_channel(self, cid: int) -> FakeChannel | None:
         return self.channels.get(cid)
@@ -213,7 +234,7 @@ class FakeLoop:
 
 
 def make_bridge(
-    tmp_path: Path, *, channel_id: int = 42, **discord: Any
+    tmp_path: Path, *, channel_id: int = 42, concierge: Any = None, **discord: Any
 ) -> tuple[DiscordBridge, FakeClient, FakeLoop]:
     config = Config.model_validate(
         {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": channel_id, **discord}}
@@ -226,8 +247,46 @@ def make_bridge(
         client.bridge = b
         return client
 
-    bridge = DiscordBridge(config, dstore, loop_ref=floop, client_factory=factory, token="tok")
+    bridge = DiscordBridge(
+        config, dstore, loop_ref=floop, client_factory=factory, token="tok", concierge=concierge
+    )
     return bridge, client, floop
+
+
+class FakeConcierge:
+    """Concierge stand-in: answers from a script; can call on_tool first."""
+
+    def __init__(self, replies: list[Any] | None = None) -> None:
+        from sbxloop.daemon.concierge import ConciergeReply
+
+        self.replies = list(replies or [ConciergeReply("hello from the concierge")])
+        self.turns: list[tuple[str, str]] = []
+        self.pending = 0
+        self.tool_calls: list[tuple[str, dict[str, Any], bool]] = []
+        self.gate = threading.Event()
+        self.gate.set()
+
+    def submit_turn(self, text: str, *, author: str, on_tool: Any = None) -> Any:
+        import concurrent.futures
+
+        from sbxloop_worker.protocol import HostToolResponse
+
+        self.turns.append((text, author))
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+
+        def run() -> None:
+            self.gate.wait(5)
+            for name, args, ok in self.tool_calls:
+                if on_tool is not None:
+                    on_tool(name, args, HostToolResponse(call_id="c", ok=ok, text="t"))
+            reply = self.replies.pop(0)
+            if isinstance(reply, BaseException):
+                future.set_exception(reply)
+            else:
+                future.set_result(reply)
+
+        threading.Thread(target=run, daemon=True).start()
+        return future
 
 
 def wait_for(pred: Any, timeout: float = 5.0) -> bool:
@@ -459,26 +518,134 @@ class TestBridge:
         finally:
             bridge.close()
 
-    def test_plain_control_channel_message_gets_steering_hint(self, tmp_path: Path) -> None:
-        """Field: both of Brett's steering attempts landed in the control
-        channel, not the run's thread. A plain message there must answer
-        with where to type, naming the live run's thread."""
+    def test_plain_control_channel_message_is_ignored(self, tmp_path: Path) -> None:
+        """People talk among themselves in the control channel; the bot
+        answers only commands and mentions (the old canned "steer in the
+        thread" hint is gone — the concierge explains that when asked)."""
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
             control = client.channels[42]
-            # nothing running: generic hint
-            bridge._handle_message(FakeMessage("hello there", control))
-            assert wait_for(lambda: any("Nothing is running" in s for s in control.sent))
-            # live run: hint names its thread
             item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
-            thread_id = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
+            before = len(control.sent)
+            bridge._handle_message(FakeMessage("hello there", control))
             bridge._handle_message(FakeMessage("also add a docstring", control))
-            assert wait_for(lambda: any(f"<#{thread_id}>" in s and "r1" in s for s in control.sent))
+            time.sleep(0.3)
+            assert len(control.sent) == before
             assert engine.posted == []  # never treated as steering
+        finally:
+            bridge.close()
+
+    def test_mention_without_concierge_says_chat_is_off(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            bridge._handle_message(FakeMessage("<@777> status?", control, mentions=[BOT_USER]))
+            assert wait_for(lambda: any("chat is off" in s for s in control.sent))
+            assert "`!sbx status`" in control.sent[-1]
+        finally:
+            bridge.close()
+
+    def test_mention_goes_to_the_concierge_and_the_reply_is_posted(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.concierge import ConciergeReply
+
+        concierge = FakeConcierge([ConciergeReply("two runs today; `r1` is live")])
+        concierge.tool_calls = [("sbx_control", {"command": "status"}, True)]
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            msg = FakeMessage("<@777> what's running?", control, mentions=[BOT_USER], mid=900)
+            bridge._handle_message(msg)
+            assert wait_for(lambda: "✅" in msg.reactions)
+            assert msg.reactions == ["⏳", "✅"]
+            # the mention token was stripped; attribution names the user
+            assert concierge.turns == [("what's running?", "Discord user `brett`")]
+            # tool-note audit line, then the reply threaded under the question
+            assert any(s.startswith("🛠 concierge: sbx_control(status)") for s in control.sent)
+            idx = control.sent.index("two runs today; `r1` is live")
+            assert control.sent_kwargs[idx].get("reference") is msg
+            assert control.sent_kwargs[idx].get("mention_author") is False
+        finally:
+            bridge.close()
+
+    def test_reply_to_bot_message_goes_to_the_concierge(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            asyncio.run(control.send("earlier bot message"))
+            bot_msg = control.messages[max(control.messages)]
+            bridge._handle_message(FakeMessage("and then?", control, reply_to=bot_msg))
+            assert wait_for(lambda: concierge.turns == [("and then?", "Discord user `brett`")])
+        finally:
+            bridge.close()
+
+    def test_concierge_error_reply_gets_a_warning(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.concierge import ConciergeReply
+
+        concierge = FakeConcierge(
+            [ConciergeReply("", ok=False, error="that took longer than 180s")]
+        )
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            msg = FakeMessage("<@777> hi", control, mentions=[BOT_USER])
+            bridge._handle_message(msg)
+            assert wait_for(lambda: "⚠" in msg.reactions)
+            assert any("⚠ concierge: that took longer than 180s" in s for s in control.sent)
+        finally:
+            bridge.close()
+
+    def test_long_concierge_reply_is_split(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.concierge import ConciergeReply
+
+        long = "\n\n".join(f"paragraph {i} " + "x" * 300 for i in range(12))
+        concierge = FakeConcierge([ConciergeReply(long)])
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge, max_message_chars=1000)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            msg = FakeMessage("<@777> tell me everything", control, mentions=[BOT_USER])
+            bridge._handle_message(msg)
+            assert wait_for(lambda: "✅" in msg.reactions)
+            chunks = [s for s in control.sent if s.startswith("paragraph")]
+            assert len(chunks) >= 3 and all(len(c) <= 1000 for c in chunks)
+            # only the first chunk is a threaded reply
+            refs = [
+                control.sent_kwargs[i].get("reference")
+                for i, s in enumerate(control.sent)
+                if s.startswith("paragraph")
+            ]
+            assert refs[0] is msg and all(r is None for r in refs[1:])
+        finally:
+            bridge.close()
+
+    def test_queued_turn_says_so(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        concierge.pending = 2
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            bridge._handle_message(FakeMessage("<@777> hi", control, mentions=[BOT_USER]))
+            assert wait_for(lambda: any("queued behind 2" in s for s in control.sent))
+        finally:
+            bridge.close()
+
+    def test_unknown_verb_mentions_the_concierge(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path, concierge=FakeConcierge())
+        bridge.start()
+        try:
+            control = client.channels[42]
+            bridge._handle_message(FakeMessage("!sbx dance", control))
+            assert wait_for(lambda: any("@mention me" in s for s in control.sent))
         finally:
             bridge.close()
 

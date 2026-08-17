@@ -420,6 +420,31 @@ executed": once the daemon has taken a request it keeps running (item verbs
 cross the ops sandbox), and `ctl` reports it as pending (exit 1) rather than
 absent (exit 2).
 
+**Chat with the daemon.** @mention the bot in the control channel (or reply
+to one of its messages) and the **concierge** answers — the channel's own
+agent, which knows how to operate sbxloop and what it is building. Ask
+"what's running?", "why did `r7…` fail?", "show me the diff of that PR",
+"pause after this one", or "also please add retries to the fetch client"
+— it runs the same `!sbx` verbs through the same dispatcher, reads the
+run store (runs, tasks, chronology, reports), fetches PR/issue/diff/file
+details through the github-ops sandbox, and queues new work as an inbox
+item with a self-contained title and body. Actions are direct — it acts
+with the same authority as `!sbx`, so anyone who can mention it drives the
+daemon; restrict the channel accordingly — and every tool it used is
+listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
+line under your question, so nothing happens invisibly. Steering a live
+run still happens in that run's thread; asked from the control channel,
+the concierge points at the thread. It runs as a Copilot session in a
+**long-lived agent sandbox** the daemon owns (`sbxloop-concierge-<digest>`,
+reused across daemon restarts so the conversation keeps its memory; the
+SDK session is rotated after `[concierge] session_turns` messages) and
+reaches the daemon only through host tools — the same
+`COPILOT_GITHUB_TOKEN` a run needs must be on the daemon host.
+`[concierge] enabled | model | timeout_s | max_tool_calls | session_turns | github_tools`
+tune it (`sbxloop init` documents them; `sbxloop doctor` shows the row).
+Plain messages in the control channel are left alone — people talk among
+themselves without the bot answering.
+
 Bot setup, once: create an application in the Discord Developer Portal, add
 a bot, enable the **Message Content** privileged intent, copy the token, and
 invite the bot to your server with View Channel, Send Messages, Create
