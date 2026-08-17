@@ -427,8 +427,13 @@ agent, which knows how to operate sbxloop and what it is building. Ask
 "pause after this one", or "also please add retries to the fetch client"
 — it runs the same `!sbx` verbs through the same dispatcher, reads the
 run store (runs, tasks, chronology, reports), fetches PR/issue/diff/file
-details through the github-ops sandbox, and queues new work as an inbox
-item with a self-contained title and body. Actions are direct — it acts
+details through the github-ops sandbox, queues new work as an inbox
+item with a self-contained title and body, and files issues in the
+configured repo from a described feature or bug — created with the
+`sbxloop:backlog` label (triage), after which it **asks you** whether to
+add `sbxloop:run` and labels only on your yes; "what's in the backlog?"
+lists the open `sbxloop:backlog` issues and asks which, if any, to work.
+Actions are direct — it acts
 with the same authority as `!sbx`, so anyone who can mention it drives the
 daemon; restrict the channel accordingly — and every tool it used is
 listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
@@ -440,7 +445,7 @@ reused across daemon restarts so the conversation keeps its memory; the
 SDK session is rotated after `[concierge] session_turns` messages) and
 reaches the daemon only through host tools — the same
 `COPILOT_GITHUB_TOKEN` a run needs must be on the daemon host.
-`[concierge] enabled | model | timeout_s | max_tool_calls | session_turns | github_tools`
+`[concierge] enabled | model | timeout_s | max_tool_calls | session_turns | github_tools | create_issues`
 tune it (`sbxloop init` documents them; `sbxloop doctor` shows the row).
 Plain messages in the control channel are left alone — people talk among
 themselves without the bot answering.

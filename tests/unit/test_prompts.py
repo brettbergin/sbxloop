@@ -235,6 +235,8 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "model": "auto",
         "tool_notes": "- `sbx_control` — run a verb",
         "daemon_notes": "- poll interval 60s",
+        "backlog_label": "sbxloop:backlog",
+        "trigger_label": "sbxloop:run",
     },
 }
 
@@ -245,10 +247,15 @@ def test_concierge_prompt_carries_contract() -> None:
     actions it did not perform (see the template header)."""
     text = render("concierge", **RENDER_CONTEXTS["concierge"])
     assert text.startswith("# You are the sbxloop concierge")
-    assert "`sbx_control`" in text and "`enqueue_work`" in text
+    assert "`sbx_control`" in text and "`enqueue_work`" in text and "`create_issue`" in text
     assert "thread" in text and "not here" in text
     assert "Never claim to have done something you did not do" in text
     assert "!sbx" in text  # the configured prefix reaches the model
+    # issues: created in triage, a run only after the person is asked
+    assert "`sbxloop:backlog`" in text and "`sbxloop:run`" in text
+    assert "ask the person whether to add" in text
+    assert "`label_issue_for_run` only after they explicitly say yes" in text
+    assert "`list_issues`" in text and "ask which, if any, should be worked" in text
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:

@@ -36,7 +36,9 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
 from sbxloop.config import Config
@@ -329,6 +331,8 @@ class Concierge:
             repo=self.config.github.repo or "(no GitHub repository configured)",
             inbox_dir=self.config.daemon.inbox_dir or "(no inbox configured)",
             model=self.config.concierge.model or self.config.model,
+            backlog_label=self.config.daemon.backlog_label,
+            trigger_label=self.config.daemon.trigger_label,
             tool_notes=bullet_list(
                 [f"`{t.spec.name}` — {t.spec.description}" for t in self._tools.values()]
             ),
@@ -517,6 +521,74 @@ class Concierge:
                         ),
                     ),
                     self._tool_github_get,
+                )
+            )
+        if (
+            self.github is not None
+            and self.config.github.repo
+            and self.config.concierge.create_issues
+        ):
+            backlog = self.config.daemon.backlog_label
+            trigger = self.config.daemon.trigger_label
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="create_issue",
+                        description=(
+                            f"File a NEW issue in {self.config.github.repo} describing a "
+                            "feature or bug the person asked for. Write a clear title and a "
+                            f"self-contained body. The issue gets the `{backlog}` label "
+                            f"(triage); it does NOT run until the `{trigger}` label is added "
+                            "— after creating it, ask the person whether to add that label."
+                        ),
+                        parameters=_schema(
+                            {
+                                "title": {"type": "string", "maxLength": 200},
+                                "body": {"type": "string"},
+                            },
+                            ["title", "body"],
+                        ),
+                    ),
+                    self._tool_create_issue,
+                )
+            )
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="list_issues",
+                        description=(
+                            f"Open issues in {self.config.github.repo}: by default the ones "
+                            f"carrying the `{backlog}` label (the triage backlog — work that "
+                            "is waiting for someone to say run it); all=true lists every open "
+                            "issue; label narrows to one label. Each line: number, title, "
+                            "labels, age, author, comments, url. After listing the backlog, "
+                            "ask the person whether any of them should be worked."
+                        ),
+                        parameters=_schema(
+                            {
+                                "all": {"type": "boolean"},
+                                "label": {"type": "string"},
+                                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                            }
+                        ),
+                    ),
+                    self._tool_list_issues,
+                )
+            )
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="label_issue_for_run",
+                        description=(
+                            f"Add the `{trigger}` label to an issue so the daemon claims and "
+                            "runs it on its next poll. Only after the person explicitly said "
+                            "yes to running it."
+                        ),
+                        parameters=_schema(
+                            {"number": {"type": "integer", "minimum": 1}}, ["number"]
+                        ),
+                    ),
+                    self._tool_label_issue_for_run,
                 )
             )
         return tools
@@ -716,6 +788,106 @@ class Concierge:
             return f"GitHub read failed: {_one_line(str(exc), 300)}"
         return f"unknown what {what!r}"
 
+    def _tool_create_issue(self, args: dict[str, Any], by: str) -> str:
+        assert self.github is not None
+        repo = self.config.github.repo
+        assert repo is not None
+        title = _one_line(str(args.get("title", "")).strip(), 200)
+        body = str(args.get("body", "")).strip()
+        if not title or not body:
+            return "both title and body are required"
+        backlog = self.config.daemon.backlog_label
+        trigger = self.config.daemon.trigger_label
+        full_body = f"{body}\n\n---\nFiled by {by} via the sbxloop concierge\n"
+        try:
+            ref = self.github.call(
+                lambda ops: ops.issue_create(repo, title, full_body, labels=[backlog])
+            )
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"creating the issue failed: {_one_line(str(exc), 300)}"
+        log.info("concierge.issue_created", number=ref.number, by=by, title=title[:80])
+        return (
+            f"created issue #{ref.number} {ref.url} with the `{backlog}` label. It will NOT "
+            f"run until it carries `{trigger}` — ask the person whether to add it, and call "
+            f"label_issue_for_run({ref.number}) only if they say yes."
+        )
+
+    def _tool_list_issues(self, args: dict[str, Any], by: str) -> str:
+        assert self.github is not None
+        repo = self.config.github.repo
+        daemon = self.config.daemon
+        limit = _int_arg(args, "limit", 20, 1, 50)
+        label = str(args.get("label") or "").strip()
+        if not label and not args.get("all"):
+            label = daemon.backlog_label
+        query = f"state=open&per_page={limit}&sort=updated&direction=desc"
+        if label:
+            query += f"&labels={quote(label, safe='')}"
+        try:
+            data = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/issues?{query}"))
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"listing issues failed: {_one_line(str(exc), 300)}"
+        if not isinstance(data, list):
+            return json.dumps(data, default=str)[:2000]
+        issues = [d for d in data if isinstance(d, dict) and "pull_request" not in d]
+        if not issues:
+            return f"no open issues in {repo}" + (f" with label `{label}`" if label else "")
+        now = self.clock()
+        lines = [
+            f"{len(issues)} open issue(s) in {repo}"
+            + (f" with `{label}`" if label else "")
+            + f" (newest activity first, max {limit}):"
+        ]
+        for issue in issues:
+            labels = [
+                str(lb.get("name")) for lb in issue.get("labels") or [] if isinstance(lb, dict)
+            ]
+            flags = []
+            if daemon.trigger_label in labels:
+                flags.append("QUEUED for a run")
+            if daemon.in_progress_label in labels:
+                flags.append("RUNNING")
+            if daemon.failed_label in labels:
+                flags.append("failed before")
+            created = _iso_age(str(issue.get("created_at") or ""), now)
+            user = (issue.get("user") or {}).get("login", "?")
+            lines.append(
+                f"- #{issue.get('number')} {_one_line(str(issue.get('title') or ''), 100)} · "
+                f"[{', '.join(labels) or 'no labels'}] · {created} old · by {user} · "
+                f"{issue.get('comments', 0)} comments · {issue.get('html_url')}"
+                + (f" · {' / '.join(flags)}" if flags else "")
+            )
+        lines.append(
+            f"Issues without `{daemon.trigger_label}` are not queued: ask the person which, "
+            "if any, should be worked, and label_issue_for_run those they name."
+        )
+        return "\n".join(lines)
+
+    def _tool_label_issue_for_run(self, args: dict[str, Any], by: str) -> str:
+        assert self.github is not None
+        repo = self.config.github.repo
+        try:
+            number = int(args.get("number", 0))
+        except (TypeError, ValueError):
+            number = 0
+        if number <= 0:
+            return "number is required"
+        trigger = self.config.daemon.trigger_label
+        try:
+            self.github.call(
+                lambda ops: ops.raw(
+                    "POST", f"/repos/{repo}/issues/{number}/labels", {"labels": [trigger]}
+                )
+            )
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"labelling #{number} failed: {_one_line(str(exc), 300)}"
+        log.info("concierge.issue_labelled_for_run", number=number, by=by, label=trigger)
+        return (
+            f"added `{trigger}` to #{number} — the daemon claims it on its next poll "
+            f"(every {self.config.daemon.poll_interval_s:g}s) and runs it after anything "
+            "already queued."
+        )
+
     # -- helpers ------------------------------------------------------------------
 
     @property
@@ -767,6 +939,15 @@ def _age(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds / 3600:.1f}h"
     return f"{seconds / 86400:.1f}d"
+
+
+def _iso_age(stamp: str, now: float) -> str:
+    """``2026-08-17T05:35:00Z`` → ``3d`` (or ``?`` for anything unparseable)."""
+    try:
+        then = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return "?"
+    return _age(now - then)
 
 
 def _looks_like_lost_session(exc: BaseException) -> bool:
