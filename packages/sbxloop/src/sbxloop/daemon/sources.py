@@ -412,6 +412,7 @@ class GitHubIssueSource:
             }
             if trigger not in names:
                 return False
+            stale_delivered = self.labels.delivered in names
             epoch = self._trigger_epoch(ops, number, trigger)
             token = uuid.uuid4().hex
             self._comment(
@@ -449,10 +450,14 @@ class GitHubIssueSource:
         # mode was configured *then*, and a daemon restarted with
         # close_on_success back on would otherwise leave it beside
         # in-progress. Best-effort — a leftover label must not un-claim.
-        self._guard(
-            "clear delivered label",
-            lambda ops: self._remove_label(ops, number, self.labels.delivered),
-        )
+        # Only when the re-GET actually showed it: a blind DELETE 404s on
+        # every fresh issue and the event stream renders each as an error
+        # panel (field noise on every audit claim).
+        if stale_delivered:
+            self._guard(
+                "clear delivered label",
+                lambda ops: self._remove_label(ops, number, self.labels.delivered),
+            )
         return True
 
     def _trigger_epoch(self, ops: GithubOps, number: str, trigger: str | None = None) -> str:
