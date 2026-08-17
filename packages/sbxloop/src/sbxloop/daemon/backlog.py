@@ -47,7 +47,12 @@ AUDIT_INSTRUCTIONS = (
     "the tool that ran you: its planner, prompts, verify lint, delivery, daemon — "
     "go under `.sbxloop/backlog/tool/` instead; they are filed to the tool's own "
     "tracker when the operator configured one, otherwise only noted in the closing "
-    "comment, never filed as issues of this project."
+    "comment, never filed as issues of this project. VERIFICATION: an audit changes "
+    "no code, so its tasks need NO verify_commands (leave the list empty) — or at "
+    "most a check on the findings you wrote (e.g. `ls .sbxloop/backlog/*.md`). Never "
+    "the project's test suite, build or lint: an audit whose charter is to find a "
+    "failing test cannot also promise the suite is green (field failure rakvqn6fr, "
+    "where exactly that verify command sank the audit and its findings)."
 )
 
 TOOL_SUBDIR = BACKLOG_SUBDIR / "tool"

@@ -687,6 +687,17 @@ class DaemonLoop:
             self._file_postmortem(item, run_id, f"delivery failed: {report.delivery_error}")
             return "delivery_failed"
         reason = str(error) if error is not None else f"run ended {report.state}"
+        if item.kind == "audit" and result is not None:
+            # An audit that failed on the harness (a verify command it never
+            # needed) still wrote its findings; they are evidence, not code,
+            # so file them rather than lose them (field: rakvqn6fr).
+            filed = self._collect_backlog(run_id, source)
+            tool = self._collect_tool_findings(run_id, source)
+            if filed or tool.filed:
+                self._notify(
+                    f"🔎 {item.item_id} failed but its findings were filed: "
+                    f"{len(filed) + len(tool.filed)} issue(s)"
+                )
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
         self._set_breaker(self._breaker_opened_at, self._consecutive_failures + 1)
         self.dstore.finish_ledger(run_id, "failed", now)
