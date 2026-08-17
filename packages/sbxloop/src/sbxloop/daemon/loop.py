@@ -399,7 +399,7 @@ class DaemonLoop:
             "runs_today": self.dstore.runs_started_since(day_start),
             "runs_today_resets_at": day_end,
             "run_cap_timezone": self.config.daemon.run_cap_timezone,
-            "resumes_today": self.dstore.resumes_since(now - DAY_S),
+            "resumes_today": self.dstore.resumes_since(day_start),
             "max_runs_per_day": self.config.daemon.max_runs_per_day,
             "breaker_open": self._breaker_open(now),
             "consecutive_failures": self._consecutive_failures,
@@ -1341,12 +1341,13 @@ class DaemonLoop:
         try:
             if self.dstore.review_filed(run_id):
                 return
-            if self.dstore.reviews_since(now - DAY_S) >= daemon.reviews_per_day:
+            day_start, _ = day_window(now, daemon.run_cap_timezone)
+            if self.dstore.reviews_since(day_start) >= daemon.reviews_per_day:
                 log.info(
                     "review.skipped",
                     item=item.item_id,
                     run=run_id,
-                    reason="daily cap reached",
+                    reason="calendar-day cap reached",
                     cap=daemon.reviews_per_day,
                 )
                 return
@@ -1386,12 +1387,13 @@ class DaemonLoop:
         try:
             if self.dstore.postmortem_filed(run_id):
                 return
-            if self.dstore.postmortems_since(now - DAY_S) >= daemon.postmortems_per_day:
+            day_start, _ = day_window(now, daemon.run_cap_timezone)
+            if self.dstore.postmortems_since(day_start) >= daemon.postmortems_per_day:
                 log.info(
                     "postmortem.skipped",
                     item=item.item_id,
                     run=run_id,
-                    reason="daily cap reached",
+                    reason="calendar-day cap reached",
                     cap=daemon.postmortems_per_day,
                 )
                 return
