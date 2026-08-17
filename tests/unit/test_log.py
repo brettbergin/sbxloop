@@ -71,6 +71,24 @@ class TestConfigure:
         assert "run=r1" in line
         assert "[sbxloop.test]" in line
 
+    def test_none_valued_fields_are_dropped(self, restore_logging: None) -> None:
+        """Field: `worker.job_done … error=None exit_code=None cwd=None` on
+        every line — an absent optional fact must not render at all."""
+        stream = io.StringIO()
+        configure_logging("INFO", stream=stream)
+        get_logger("sbxloop.test").info(
+            "worker.job_done", job="j1", error=None, exit_code=None, status="ok"
+        )
+        line = stream.getvalue()
+        assert "job=j1" in line and "status=ok" in line
+        assert "None" not in line
+        # JSON output drops them too (absence is the record)
+        stream2 = io.StringIO()
+        configure_logging("INFO", fmt="json", stream=stream2)
+        get_logger("sbxloop.test").info("x", cwd=None, keep=0)
+        record = json.loads(stream2.getvalue().strip().splitlines()[-1])
+        assert "cwd" not in record and record["keep"] == 0
+
     def test_json_renders_one_object_per_line(self, restore_logging: None) -> None:
         stream = io.StringIO()
         configure_logging("INFO", fmt="json", stream=stream)
