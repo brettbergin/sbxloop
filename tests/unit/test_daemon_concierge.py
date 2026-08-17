@@ -27,9 +27,10 @@ from sbxloop.daemon.concierge import (
     Concierge,
     ConciergeReply,
 )
-from sbxloop.daemon.model import RunReport
+from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.sources import InboxSource
 from sbxloop.daemon.store import DaemonStore
+from sbxloop.engine.model import TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import DaemonError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
@@ -108,6 +109,26 @@ class FakeHost:
         self.closed = True
 
 
+class FakeGithub:
+    def __init__(self, answers: dict[str, Any] | None = None) -> None:
+        self.answers = answers or {}
+        self.paths: list[str] = []
+
+    def call(self, fn: Callable[[Any], Any]) -> Any:
+        return fn(self)
+
+    def raw(self, method: str, path: str, body: Any = None) -> Any:
+        self.paths.append(path)
+        for key, value in self.answers.items():
+            if key in path:
+                return value
+        return {}
+
+    def contents_read(self, repo: str, path: str, ref: str | None = None) -> str:
+        self.paths.append(f"contents:{path}@{ref}")
+        return "print('hi')\n"
+
+
 class LoopWithRuns(FakeLoop):
     """FakeLoop plus the report/current surface the concierge's tools use."""
 
@@ -124,7 +145,7 @@ def make(
     tmp_path: Path,
     scripts: list[Script],
     *,
-    github: Any = None,
+    github: FakeGithub | None = None,
     inbox: bool = True,
     config: dict[str, Any] | None = None,
 ) -> tuple[Concierge, FakeClient, FakeHost, LoopWithRuns, DaemonStore]:
@@ -176,7 +197,14 @@ class TestJobShape:
         assert job.resume_session_id is None
         assert job.timeout_s == 180.0 and job.max_tool_calls == 16
         names = [t.name for t in job.host_tools]
-        assert names == ["sbx_control", "enqueue_work"]
+        assert names == [
+            "sbx_control",
+            "list_runs",
+            "run_detail",
+            "run_events",
+            "item_detail",
+            "enqueue_work",
+        ]  # no github_get: no repo configured
         assert job.host_tools_dir is None  # the WorkerClient fills it in
         assert job.system_message and "sbxloop concierge" in job.system_message
         assert "`sbx_control`" in job.system_message
@@ -202,6 +230,16 @@ class TestJobShape:
         assert client.jobs[2].resume_session_id is None
         assert dstore.get_value(STATE_SESSION_ID) == "sB"
         assert dstore.get_value(STATE_SESSION_TURNS) == "1"
+
+    def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
+        turn(concierge)
+        assert "github_get" in [t.name for t in client.jobs[0].host_tools]
+        concierge2, client2, *_ = make(
+            tmp_path / "b", [{}], github=FakeGithub(), config={"concierge": {"github_tools": False}}
+        )
+        turn(concierge2)
+        assert "github_get" not in [t.name for t in client2.jobs[0].host_tools]
 
     def test_reply_is_clipped(self, tmp_path: Path) -> None:
         concierge, *_ = make(
@@ -278,6 +316,122 @@ class TestTools:
         turn(concierge)
         assert "PAUSED" in client.responses[0].text
 
+    def _seed_run(self, tmp_path: Path, dstore: DaemonStore, loop: LoopWithRuns) -> StateStore:
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r1abcdefg", "Ship the widget")
+        store.save_tasks(
+            "r1abcdefg",
+            [TaskSpec(id="t1", title="Build widget"), TaskSpec(id="t2", title="Test widget")],
+        )
+        store.set_run_state("r1abcdefg", "completed")
+        from sbxloop.events import Event
+
+        for i in range(3):
+            store.append_event(
+                Event.now("agent.message", "r1abcdefg", content=f"msg {i}", agent="executor")
+            )
+        store.append_event(Event.now("task.end", "r1abcdefg", task="t1", state="done"))
+        store.append_run_guidance("r1abcdefg", "prefer small commits")
+        item = WorkItem(item_id="inbox:w.md", source="inbox", source_key="w.md", title="Widget")
+        dstore.upsert_new(item, 1.0)
+        dstore.mark_running("inbox:w.md", "r1abcdefg", 2.0)
+        dstore.record_discord_thread("r1abcdefg", 42, 4242, None)
+        loop.reports["r1abcdefg"] = RunReport(
+            "r1abcdefg", "completed", "2/2 tasks done", delivery=(7, "https://gh/pr/7")
+        )
+        return store
+
+    def test_list_runs_run_detail_and_events(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, dstore = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("list_runs", {"limit": 5}),
+                        ("run_detail", {"run_id": "r1abcdefg"}),
+                        (
+                            "run_events",
+                            {"run_id": "r1abcdefg", "type_prefix": "agent.message", "tail": 2},
+                        ),
+                        ("run_detail", {"run_id": "nope"}),
+                        ("item_detail", {"item_id": "inbox:w.md"}),
+                    ]
+                }
+            ],
+        )
+        self._seed_run(tmp_path, dstore, loop)
+        turn(concierge)
+        listing, detail, events, missing, item = client.responses
+        assert "r1abcdefg · completed" in listing.text and "inbox:w.md · Widget" in listing.text
+        assert "outcome: Ship the widget" in detail.text
+        assert "- t1 [pending] Build widget" in detail.text
+        assert "delivered PR: #7 https://gh/pr/7" in detail.text
+        assert "prefer small commits" in detail.text
+        assert "work item: inbox:w.md [running]" in detail.text
+        assert "Discord thread: <#4242>" in detail.text
+        assert events.text.startswith("(4 events; showing last 2)") or "msg 2" in events.text
+        assert "msg 2" in events.text and "msg 0" not in events.text
+        assert missing.text.startswith("no run 'nope'")
+        assert "inbox:w.md: patch from inbox · state running" in item.text
+        assert "runs: r1abcdefg" in item.text and "<#4242>" in item.text
+
+    def test_github_get_reads_through_the_ops_sandbox(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            {
+                "/pulls/7/files": [
+                    {
+                        "filename": "a.py",
+                        "status": "modified",
+                        "additions": 1,
+                        "deletions": 0,
+                        "patch": "+x",
+                    }
+                ],
+                "/pulls/7": {
+                    "number": 7,
+                    "title": "T",
+                    "state": "open",
+                    "html_url": "u",
+                    "head": {"ref": "h"},
+                    "base": {"ref": "main"},
+                },
+                "/issues/3/comments": [
+                    {"user": {"login": "ana"}, "created_at": "now", "body": "hi"}
+                ],
+                "/issues/3": {
+                    "number": 3,
+                    "title": "I",
+                    "state": "open",
+                    "labels": [{"name": "bug"}],
+                },
+            }
+        )
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("github_get", {"what": "pr", "number": 7}),
+                        ("github_get", {"what": "pr_diff", "number": 7}),
+                        ("github_get", {"what": "issue", "number": 3}),
+                        ("github_get", {"what": "issue_comments", "number": 3}),
+                        ("github_get", {"what": "file", "path": "src/a.py", "ref": "main"}),
+                        ("github_get", {"what": "pr"}),
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge)
+        pr, diff, issue, comments, file, bad = client.responses
+        assert "PR #7: T" in pr.text and "h → main" in pr.text
+        assert "modified a.py" in diff.text and "+x" in diff.text
+        assert "issue #3: I [open]" in issue.text and "labels: bug" in issue.text
+        assert "- ana (now): hi" in comments.text
+        assert file.text.startswith("src/a.py@main:")
+        assert bad.text == "pr needs number"
+        assert github.paths[0] == "/repos/owner/repo/pulls/7"
+
     def test_tool_exception_becomes_error_response_and_turn_survives(self, tmp_path: Path) -> None:
         concierge, client, _, loop, _ = make(
             tmp_path, [{"calls": [("sbx_control", {"command": "status"})], "text": "sorry"}]
@@ -296,6 +450,21 @@ class TestTools:
         concierge, client, *_ = make(tmp_path, [{"calls": [("teleport", {})]}])
         turn(concierge)
         assert client.responses[0].error == "unknown tool 'teleport'"
+
+    def test_tool_result_is_clipped(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, dstore = make(
+            tmp_path,
+            [{"calls": [("run_events", {"run_id": "r1abcdefg", "tail": 200})]}],
+            config={"concierge": {"max_tool_result_chars": 1000}},
+        )
+        store = self._seed_run(tmp_path, dstore, loop)
+        from sbxloop.events import Event
+
+        for _i in range(200):
+            store.append_event(Event.now("agent.message", "r1abcdefg", content="y" * 50))
+        turn(concierge)
+        text = client.responses[0].text
+        assert len(text) <= 1000 and text.endswith("(truncated)")
 
     def test_on_tool_callback_sees_every_call(self, tmp_path: Path) -> None:
         concierge, *_ = make(

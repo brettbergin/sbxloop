@@ -38,6 +38,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from sbxloop.cli.tui import format_event
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch, plain
 from sbxloop.daemon.store import DaemonStore
@@ -45,6 +46,7 @@ from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     DaemonError,
+    GithubOpsError,
     ProvisionError,
     SbxError,
     SbxloopError,
@@ -71,6 +73,8 @@ CONCIERGE_RUN_ID = "concierge"
 # daemon_state keys
 STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
+
+_RUN_STATES = ["pending", "running", "completed", "failed", "cancelled"]
 
 
 class ConciergeReply(NamedTuple):
@@ -391,7 +395,7 @@ class Concierge:
 
     def _build_tools(self) -> list[HostTool]:
         prefix = self.config.discord.command_prefix
-        return [
+        tools = [
             HostTool(
                 HostToolSpec(
                     name="sbx_control",
@@ -405,6 +409,61 @@ class Concierge:
                     parameters=_schema({"command": {"type": "string"}}, ["command"]),
                 ),
                 self._tool_sbx_control,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="list_runs",
+                    description="Recent runs, newest first: run id, state, age, work item, title.",
+                    parameters=_schema(
+                        {
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                            "state": {"type": "string", "enum": _RUN_STATES},
+                        }
+                    ),
+                ),
+                self._tool_list_runs,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="run_detail",
+                    description=(
+                        "Everything known about one run: outcome, state, tasks, tracking "
+                        "issue / PR / delivery error, standing guidance, its work item and "
+                        "the Discord thread where it can be steered."
+                    ),
+                    parameters=_schema({"run_id": {"type": "string"}}, ["run_id"]),
+                ),
+                self._tool_run_detail,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="run_events",
+                    description=(
+                        "The last N events of a run's chronology, one line each (agent "
+                        "messages, tool calls, phase/task/run lifecycle). Filter with a "
+                        "type prefix such as 'agent.message', 'task.', 'run.', 'chat.'."
+                    ),
+                    parameters=_schema(
+                        {
+                            "run_id": {"type": "string"},
+                            "type_prefix": {"type": "string"},
+                            "tail": {"type": "integer", "minimum": 1, "maximum": 200},
+                        },
+                        ["run_id"],
+                    ),
+                ),
+                self._tool_run_events,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="item_detail",
+                    description=(
+                        "One work item (ids look like gh:12 or inbox:name.md): source, kind, "
+                        "state, attempts, last error, its runs and the latest run's thread."
+                    ),
+                    parameters=_schema({"item_id": {"type": "string"}}, ["item_id"]),
+                ),
+                self._tool_item_detail,
             ),
             HostTool(
                 HostToolSpec(
@@ -426,6 +485,41 @@ class Concierge:
                 self._tool_enqueue_work,
             ),
         ]
+        if self.github is not None and self.config.github.repo:
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="github_get",
+                        description=(
+                            f"Read from GitHub repository {self.config.github.repo}: "
+                            "what=pr (summary), pr_files (changed files), pr_diff (patches), "
+                            "issue, issue_comments — with number; what=file with path "
+                            "(and optional ref)."
+                        ),
+                        parameters=_schema(
+                            {
+                                "what": {
+                                    "type": "string",
+                                    "enum": [
+                                        "pr",
+                                        "pr_files",
+                                        "pr_diff",
+                                        "issue",
+                                        "issue_comments",
+                                        "file",
+                                    ],
+                                },
+                                "number": {"type": "integer", "minimum": 1},
+                                "path": {"type": "string"},
+                                "ref": {"type": "string"},
+                            },
+                            ["what"],
+                        ),
+                    ),
+                    self._tool_github_get,
+                )
+            )
+        return tools
 
     # tool implementations — each returns text for the model
 
@@ -442,6 +536,120 @@ class Concierge:
         if not reply.ok:
             text = f"(command not accepted) {text}"
         return text
+
+    def _tool_list_runs(self, args: dict[str, Any], by: str) -> str:
+        limit = _int_arg(args, "limit", 10, 1, 50)
+        state = args.get("state")
+        runs = sorted(self.store.list_runs(), key=lambda r: r.created_at, reverse=True)
+        if state:
+            runs = [r for r in runs if r.state == state]
+        if not runs:
+            return "no runs recorded" + (f" in state {state}" if state else "")
+        now = self.clock()
+        lines = []
+        for run in runs[:limit]:
+            item_id = self.dstore.item_for_run(run.run_id)
+            item = self.dstore.get(item_id) if item_id else None
+            title = _one_line(item.title if item else run.outcome, 80)
+            lines.append(
+                f"{run.run_id} · {run.state} · {_age(now - run.updated_at)} ago · "
+                f"{item_id or '(cli)'} · {title}"
+            )
+        more = len(runs) - limit
+        return "\n".join(lines) + (f"\n… {more} more" if more > 0 else "")
+
+    def _tool_run_detail(self, args: dict[str, Any], by: str) -> str:
+        run_id = str(args.get("run_id", "")).strip()
+        if not run_id:
+            return "run_id is required"
+        try:
+            run = self.store.get_run(run_id)
+        except SbxloopError:
+            return f"no run {run_id!r} in this daemon's state store"
+        tasks = self.store.get_tasks(run_id)
+        report = self.loop.report_for(run_id)
+        item_id = self.dstore.item_for_run(run_id)
+        item = self.dstore.get(item_id) if item_id else None
+        thread = self.dstore.discord_thread(run_id)
+        lines = [
+            f"run {run.run_id}: state={run.state}, created {_age(self.clock() - run.created_at)} "
+            f"ago, updated {_age(self.clock() - run.updated_at)} ago",
+            f"outcome: {_one_line(run.outcome, 400)}",
+            f"tasks: {report.task_summary}",
+        ]
+        for task in tasks:
+            lines.append(
+                f"  - {task.spec.id} [{task.state}] {_one_line(task.spec.title, 100)}"
+                f" (revisions {task.revisions}, replans {task.replans})"
+            )
+        if report.tracking_issue:
+            lines.append(f"tracking issue: #{report.tracking_issue[0]} {report.tracking_issue[1]}")
+        if report.delivery:
+            lines.append(f"delivered PR: #{report.delivery[0]} {report.delivery[1]}")
+        if report.delivery_error:
+            lines.append(f"delivery error: {_one_line(report.delivery_error, 300)}")
+        if report.filed:
+            lines.append(f"filed backlog: {', '.join(report.filed)}")
+        guidance = self.store.get_run_guidance(run_id)
+        if guidance:
+            lines.append("standing guidance:")
+            lines.extend(f"  - {_one_line(g, 200)}" for g in guidance)
+        if item is not None:
+            lines.append(
+                f"work item: {item.item_id} [{item.state}] {item.kind} · attempts {item.attempts}"
+                + (f" · last error: {_one_line(item.last_error, 200)}" if item.last_error else "")
+                + (f" · {item.url}" if item.url else "")
+            )
+        live = self.loop.current
+        if live is not None and live.run_id == run_id:
+            lines.append("this run is LIVE right now")
+        if thread is not None:
+            lines.append(
+                f"Discord thread: <#{thread.thread_id}> — steering messages go there, "
+                "not in the control channel"
+            )
+        return "\n".join(lines)
+
+    def _tool_run_events(self, args: dict[str, Any], by: str) -> str:
+        run_id = str(args.get("run_id", "")).strip()
+        if not run_id:
+            return "run_id is required"
+        prefix = args.get("type_prefix") or None
+        tail = _int_arg(args, "tail", 40, 1, 200)
+        try:
+            events = [event for _seq, event in self.store.events(run_id, type_prefix=prefix)]
+        except SbxloopError as exc:
+            return f"cannot read events for {run_id}: {_one_line(str(exc), 200)}"
+        if not events:
+            return f"no events for {run_id}" + (f" with prefix {prefix!r}" if prefix else "")
+        shown = events[-tail:]
+        lines = [format_event(e) for e in shown]
+        head = f"({len(events)} events; showing last {len(shown)})\n" if len(events) > tail else ""
+        return head + "\n".join(lines)
+
+    def _tool_item_detail(self, args: dict[str, Any], by: str) -> str:
+        item_id = str(args.get("item_id", "")).strip()
+        item = self.dstore.get(item_id) if item_id else None
+        if item is None:
+            return f"no work item {item_id!r} (ids look like gh:12 or inbox:name.md)"
+        runs = self.dstore.runs_for_item(item_id)
+        lines = [
+            f"{item.item_id}: {item.kind} from {item.source} · state {item.state} · "
+            f"attempts {item.attempts}",
+            f"title: {_one_line(item.title, 200)}",
+        ]
+        if item.url:
+            lines.append(f"url: {item.url}")
+        if item.last_error:
+            lines.append(f"last error: {_one_line(item.last_error, 300)}")
+        if item.body:
+            lines.append(f"body: {_one_line(item.body, 600)}")
+        lines.append(f"runs: {', '.join(runs) if runs else '(none yet)'}")
+        if runs:
+            thread = self.dstore.discord_thread(runs[-1])
+            if thread is not None:
+                lines.append(f"latest run's Discord thread: <#{thread.thread_id}>")
+        return "\n".join(lines)
 
     def _tool_enqueue_work(self, args: dict[str, Any], by: str) -> str:
         if self.inbox is None:
@@ -466,6 +674,48 @@ class Concierge:
             f"already queued.{note}"
         )
 
+    def _tool_github_get(self, args: dict[str, Any], by: str) -> str:
+        assert self.github is not None
+        repo = self.config.github.repo
+        what = str(args.get("what", ""))
+        number = args.get("number")
+        path = args.get("path")
+        ref = args.get("ref")
+        if what in {"pr", "pr_files", "pr_diff", "issue", "issue_comments"} and not number:
+            return f"{what} needs number"
+        try:
+            n = int(number) if number is not None else 0
+        except (TypeError, ValueError):
+            return f"number must be an integer, got {number!r}"
+        try:
+            if what == "pr":
+                data = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}"))
+                return _pr_summary(data)
+            if what in ("pr_files", "pr_diff"):
+                files = self.github.call(
+                    lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}/files?per_page=100")
+                )
+                return _pr_files(files, with_patch=what == "pr_diff")
+            if what == "issue":
+                data = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/issues/{n}"))
+                return _issue_summary(data)
+            if what == "issue_comments":
+                data = self.github.call(
+                    lambda ops: ops.raw("GET", f"/repos/{repo}/issues/{n}/comments?per_page=50")
+                )
+                return _issue_comments(data)
+            if what == "file":
+                if not path:
+                    return "file needs path"
+                assert repo is not None
+                content = self.github.call(
+                    lambda ops: ops.contents_read(repo, str(path), str(ref) if ref else None)
+                )
+                return f"{path}@{ref or 'default'}:\n{content}"
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"GitHub read failed: {_one_line(str(exc), 300)}"
+        return f"unknown what {what!r}"
+
     # -- helpers ------------------------------------------------------------------
 
     @property
@@ -489,6 +739,14 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
     return schema
 
 
+def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(args.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
+
+
 def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -500,8 +758,85 @@ def _one_line(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: max(0, limit - 1)].rstrip() + "…"
 
 
+def _age(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
 def _looks_like_lost_session(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "session" in text and any(
         word in text for word in ("not found", "unknown", "expired", "no such", "does not exist")
     )
+
+
+def _pr_summary(data: Any) -> str:
+    if not isinstance(data, dict):
+        return json.dumps(data, default=str)[:2000]
+    head = data.get("head") or {}
+    base = data.get("base") or {}
+    return "\n".join(
+        [
+            f"PR #{data.get('number')}: {data.get('title')}",
+            f"state: {data.get('state')}{' (merged)' if data.get('merged') else ''} · "
+            f"draft: {data.get('draft')} · mergeable: {data.get('mergeable')}",
+            f"{head.get('ref')} → {base.get('ref')} · +{data.get('additions')} "
+            f"-{data.get('deletions')} in {data.get('changed_files')} files",
+            f"url: {data.get('html_url')}",
+            f"body: {_one_line(str(data.get('body') or ''), 1500)}",
+        ]
+    )
+
+
+def _pr_files(files: Any, *, with_patch: bool) -> str:
+    if not isinstance(files, list):
+        return json.dumps(files, default=str)[:2000]
+    lines = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        lines.append(
+            f"{entry.get('status')} {entry.get('filename')} "
+            f"(+{entry.get('additions')} -{entry.get('deletions')})"
+        )
+        if with_patch and entry.get("patch"):
+            patch = str(entry["patch"])
+            if len(patch) > 1500:
+                patch = patch[:1500] + "\n… (patch truncated)"
+            lines.append(patch)
+    return "\n".join(lines) or "(no files)"
+
+
+def _issue_summary(data: Any) -> str:
+    if not isinstance(data, dict):
+        return json.dumps(data, default=str)[:2000]
+    labels = ", ".join(
+        str(lb.get("name")) for lb in data.get("labels") or [] if isinstance(lb, dict)
+    )
+    return "\n".join(
+        [
+            f"issue #{data.get('number')}: {data.get('title')} [{data.get('state')}]",
+            f"labels: {labels or '(none)'} · comments: {data.get('comments')}",
+            f"url: {data.get('html_url')}",
+            f"body: {_one_line(str(data.get('body') or ''), 2000)}",
+        ]
+    )
+
+
+def _issue_comments(data: Any) -> str:
+    if not isinstance(data, list):
+        return json.dumps(data, default=str)[:2000]
+    lines = []
+    for comment in data:
+        if not isinstance(comment, dict):
+            continue
+        user = (comment.get("user") or {}).get("login", "?")
+        body = _one_line(str(comment.get("body") or ""), 400)
+        lines.append(f"- {user} ({comment.get('created_at')}): {body}")
+    return "\n".join(lines) or "(no comments)"
