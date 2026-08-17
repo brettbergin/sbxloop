@@ -191,8 +191,7 @@ persisting — a crash and a `kill -9` look identical to the store — and
 
 ## Daemon guardrails
 
-The daemon's **run cap** is a wall-clock calendar-day gate, not a rolling
-window: it counts the runs whose start time falls on the current day in
+The daemon's **run cap** is a wall-clock calendar-day gate: it counts the runs whose start time falls on the current day in
 `[daemon] run_cap_timezone` (any IANA zone, default `UTC`) and compares that
 against `[daemon] max_runs_per_day` (default 12, key name unchanged). The
 count resets at 00:00 in that zone, so a run started at 23:59 still occupies

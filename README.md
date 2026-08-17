@@ -262,9 +262,9 @@ spend guardrails in `[daemon]` are the safety net: a calendar-day run cap
 (`max_runs_per_day`, default 12 — the name and default are unchanged) that
 counts the runs *started* since 00:00 in `[daemon] run_cap_timezone` (any
 IANA zone, default `UTC`) and resets at that boundary, so a run started just
-before midnight does not free a slot early — earlier releases counted a
-trailing 24-hour window instead, in which runs aged out continuously —
-a per-item attempt cap, a per-item resume cap, and a consecutive-failure
+before midnight does not free a slot early (earlier releases aged each run
+out individually a fixed period after it started rather than at the day
+boundary); a per-item attempt cap, a per-item resume cap, and a consecutive-failure
 circuit breaker (persisted, so a restart cannot reset it). Treat the
 trigger label as "execute arbitrary instructions with GH_TOKEN's repo scope"
 and restrict who can apply it. Inner agents can file follow-up work they
@@ -808,7 +808,7 @@ The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
 | `[daemon] workspace_isolation` | `clone` | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning). |
 | `[daemon] refresh_workspace` | `true` | `git fetch` + fast-forward the workspace checkout before each fresh daemon run. |
 | `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
-| `[daemon] max_runs_per_day` | `12` | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there (previously a trailing 24h window). |
+| `[daemon] max_runs_per_day` | `12` | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there. |
 | `[daemon] run_cap_timezone` | `UTC` | IANA timezone defining the run cap's day boundary (also used by the per-day review and post-mortem caps). |
 
 ## Repository layout
