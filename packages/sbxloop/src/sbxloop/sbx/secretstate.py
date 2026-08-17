@@ -21,7 +21,6 @@ one implementation.
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Callable
 from functools import partial
@@ -33,10 +32,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from sbxloop.config import Config
 from sbxloop.errors import SbxError, SecretStateError
+from sbxloop.log import get_logger
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 COPILOT_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"  # nosec B105 - env var name, not a secret
 
@@ -174,7 +174,7 @@ def set_secret_replacing(
             f"secret {describe} already exists and could not be replaced "
             f"(sbx said: {' '.join(stderr.split())})"
         )
-    logger.warning(
+    log.warning(
         "secret %s already exists and could not be replaced; keeping the "
         "existing value (it may be stale if the token was rotated)",
         describe,
@@ -253,7 +253,7 @@ def probe_custom_secret(cli: SbxCLI, env: str, *, host: str) -> CustomSecretStat
         env=env, sandbox=None
     )
     if not removed:
-        logger.warning(
+        log.warning(
             "probe: sbx rejected removing the transient sentinel registration for %s; "
             "the next provisioning will replace it",
             env,
@@ -405,16 +405,16 @@ def verify_secret_visibility(
     try:
         cli.create(spec)
     except SbxError:
-        logger.warning("secret visibility check: could not create %s", name, exc_info=True)
+        log.warning("secret visibility check: could not create %s", name, exc_info=True)
         return None
     try:
         result = cli.exec(name, ["sh", "-lc", f'test -n "${{{env}}}"'])
         return result.ok
     except SbxError:
-        logger.warning("secret visibility check failed in %s", name, exc_info=True)
+        log.warning("secret visibility check failed in %s", name, exc_info=True)
         return None
     finally:
         try:
             cli.rm(name)
         except SbxError:
-            logger.warning("secret visibility check: failed to remove %s", name, exc_info=True)
+            log.warning("secret visibility check: failed to remove %s", name, exc_info=True)

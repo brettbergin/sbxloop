@@ -22,7 +22,6 @@ import binascii
 import codecs
 import contextlib
 import json
-import logging
 import queue
 import shlex
 import threading
@@ -36,6 +35,7 @@ from sbxloop import toolchains
 from sbxloop.config import Limits, WorkerTransport
 from sbxloop.errors import SbxError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
+from sbxloop.log import get_logger
 from sbxloop.sbx.models import ExecResult
 from sbxloop.sbx.sandbox import (
     BAKE_MANIFEST,
@@ -129,7 +129,7 @@ if smoke is None or smoke.returncode != 64:
 emit("ok", python=python, git=shutil.which("git") is not None)
 """
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def _output_tail(result: ExecResult, limit: int = 2000) -> str:
@@ -318,20 +318,20 @@ class WorkerClient:
                 pass
         stage = verdict.get("stage")
         if stage is None:
-            logger.warning(
+            log.warning(
                 "prebake probe produced no verdict (rc=%s): %s — running install ladder",
                 probe.returncode,
                 _output_tail(probe),
             )
             return False
         if stage == "no-manifest":
-            logger.info("no bake manifest in template (%s); running install ladder", BAKE_MANIFEST)
+            log.info("no bake manifest in template (%s); running install ladder", BAKE_MANIFEST)
             return False
         if stage == "bad-manifest":
-            logger.warning("unreadable bake manifest %s; running install ladder", BAKE_MANIFEST)
+            log.warning("unreadable bake manifest %s; running install ladder", BAKE_MANIFEST)
             return False
         if stage == "stale":
-            logger.warning(
+            log.warning(
                 "template worker %s does not match host %s — stale template, running "
                 "install ladder (re-run `sbxloop bake` to refresh)",
                 verdict.get("baked"),
@@ -339,7 +339,7 @@ class WorkerClient:
             )
             return False
         if stage == "import-failed":
-            logger.warning(
+            log.warning(
                 "prebaked worker failed the import/version probe (rc=%s): %s — "
                 "running install ladder",
                 verdict.get("rc"),
@@ -347,7 +347,7 @@ class WorkerClient:
             )
             return False
         if stage == "smoke-failed":
-            logger.warning(
+            log.warning(
                 "prebaked worker failed the entrypoint probe (rc=%s, expected 64): %s — "
                 "running install ladder",
                 verdict.get("rc"),
@@ -356,7 +356,7 @@ class WorkerClient:
             return False
         python = verdict.get("python")
         if stage != "ok" or not isinstance(python, str) or not python:
-            logger.warning(
+            log.warning(
                 "prebake probe returned unrecognized verdict %r — running install ladder", stage
             )
             return False
@@ -365,7 +365,7 @@ class WorkerClient:
         # apt call, whereas trusting a malformed answer leaves the agent
         # without git for the whole run (#252).
         self._prebake_missing = [] if verdict.get("git") is True else [toolchains.GIT]
-        logger.info("prebaked worker %s verified; install ladder skipped", sbxloop.__version__)
+        log.info("prebaked worker %s verified; install ladder skipped", sbxloop.__version__)
         return True
 
     def _ensure_dev_tools(self, timeout: float, languages: Sequence[str] = ()) -> None:
@@ -403,7 +403,7 @@ class WorkerClient:
         )
         missing = [tc for tc in selected if not self.sandbox.exec(["sh", "-c", tc.probe]).ok]
         if not missing:
-            logger.debug("dev tools already present; skipping toolchain ensure")
+            log.debug("dev tools already present; skipping toolchain ensure")
             return
         self._provision_toolchains(missing, timeout)
 
@@ -413,7 +413,7 @@ class WorkerClient:
         """Install already-probed-missing toolchains: one pooled apt call,
         then each entry's install script. Best-effort and loud, see
         ``_ensure_dev_tools``."""
-        logger.info("provisioning agent toolchains: %s", ", ".join(tc.name for tc in missing))
+        log.info("provisioning agent toolchains: %s", ", ".join(tc.name for tc in missing))
         packages = toolchains.apt_packages(missing)
         if packages:
             apt_for = [tc for tc in missing if tc.apt_packages]
@@ -427,7 +427,7 @@ class WorkerClient:
                 timeout=timeout,
             )
             if not result.ok:
-                logger.warning(
+                log.warning(
                     "dev-tools ensure failed for %s (rc=%s) — the agent may not "
                     "have %s and has to bootstrap them itself. rc=100 usually "
                     "means apt could not reach its mirrors; check the sandbox "
@@ -445,7 +445,7 @@ class WorkerClient:
                 timeout=timeout,
             )
             if not result.ok:
-                logger.warning(
+                log.warning(
                     "dev-tools ensure failed for %s (rc=%s) — the agent may not "
                     "have %s and has to bootstrap them itself. A blocked "
                     "installer domain is the usual cause; check the sandbox "
@@ -487,7 +487,7 @@ class WorkerClient:
             timeout=timeout,
         )
         if not result.ok:
-            logger.warning(
+            log.warning(
                 "search-fallback ensure failed (rc=%s) — this guest's page size "
                 "is not 4096 and no system ripgrep could be installed, so the "
                 "agent's glob/grep tools will abort (jemalloc 'Unsupported "
@@ -521,7 +521,7 @@ class WorkerClient:
             result = self.sandbox.exec(venv_cmd, timeout=timeout)
             if result.ok:
                 return True
-        logger.warning(
+        log.warning(
             "venv creation failed (rc=%s): %s — falling back to a user-site install "
             "with the system python3",
             result.returncode,
@@ -790,7 +790,7 @@ class _PollDrain:
         try:
             raw = base64.b64decode(chunk.stdout) if chunk.stdout else b""
         except binascii.Error:
-            logger.warning(
+            log.warning(
                 "poll drain: undecodable chunk from %s; retrying next poll", self.events_path
             )
             return False

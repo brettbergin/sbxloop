@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import logging
 import signal
 import threading
 import types
@@ -22,11 +21,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from sbxloop.log import get_logger
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.prune import remove_run_sandbox_secrets
 from sbxloop.sbx.sandbox import WORK_DIR, Sandbox
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class SandboxPair:
@@ -91,15 +91,15 @@ class SandboxPair:
             try:
                 sandbox.stop()
             except Exception:
-                logger.warning("failed to stop sandbox %s", sandbox.name, exc_info=True)
+                log.warning("failed to stop sandbox %s", sandbox.name, exc_info=True)
             try:
                 sandbox.rm()
             except Exception:
-                logger.warning("failed to remove sandbox %s", sandbox.name, exc_info=True)
+                log.warning("failed to remove sandbox %s", sandbox.name, exc_info=True)
             try:
                 remove_run_sandbox_secrets(sandbox.cli, sandbox.name, role)
             except Exception:
-                logger.warning("failed to remove secrets of %s", sandbox.name, exc_info=True)
+                log.warning("failed to remove secrets of %s", sandbox.name, exc_info=True)
 
 
 class CleanupRegistry:
@@ -158,7 +158,7 @@ class CleanupRegistry:
             try:
                 pair.cleanup()
             except Exception:
-                logger.warning("cleanup failed for run %s", pair.run_id, exc_info=True)
+                log.warning("cleanup failed for run %s", pair.run_id, exc_info=True)
 
     def _install_handlers(self) -> None:
         if self._installed:
@@ -178,13 +178,13 @@ class CleanupRegistry:
                 self._previous[signum] = signal.signal(signum, self._handle_signal)
 
     def _handle_signal(self, signum: int, frame: types.FrameType | None) -> None:
-        logger.info("signal %s received; cleaning up sandboxes", signum)
+        log.info("signal %s received; cleaning up sandboxes", signum)
         quiesce = self._quiesce
         if quiesce is not None:
             try:
                 quiesce()
             except Exception:
-                logger.warning("quiesce before signal cleanup failed", exc_info=True)
+                log.warning("quiesce before signal cleanup failed", exc_info=True)
         self.cleanup_all()
         previous = self._previous.get(signum)
         if callable(previous):

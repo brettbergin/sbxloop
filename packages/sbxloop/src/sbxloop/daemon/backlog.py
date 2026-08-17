@@ -18,15 +18,15 @@ flood the daemon.
 from __future__ import annotations
 
 import hashlib
-import logging
 from pathlib import Path
 from typing import NamedTuple
 
 from sbxloop.daemon.sources import WorkSource, parse_markdown_item
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunRecord
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 BACKLOG_SUBDIR = Path(".sbxloop") / "backlog"
 
@@ -100,7 +100,7 @@ def collect_tool_findings(
         try:
             ref = filer(title, body, run.run_id)
         except Exception:
-            logger.warning(
+            log.warning(
                 "tool finding %r from run %s could not be filed", title, run.run_id, exc_info=True
             )
             unfiled.append(title)
@@ -137,7 +137,7 @@ def collect_backlog(
 ) -> list[str]:
     """File the run's backlog items via ``source``; returns the refs filed."""
     if not run.mounted or run.workspace is None:
-        logger.warning(
+        log.warning(
             "backlog skipped for run %s: workspace not mounted (agent-filed backlog "
             "requires the mounted-workspace mode)",
             run.run_id,
@@ -162,14 +162,12 @@ def collect_backlog(
         try:
             ref = source.file_backlog(title, body, run.run_id, trigger=trigger)
         except Exception:
-            logger.warning(
-                "backlog: filing %r from run %s failed", title, run.run_id, exc_info=True
-            )
+            log.warning("backlog: filing %r from run %s failed", title, run.run_id, exc_info=True)
             continue
         dstore.backlog_record(fp, run.run_id, ref, now)
         filed.append(ref)
     if skipped:
-        logger.warning(
+        log.warning(
             "backlog: run %s produced %d item(s) beyond the per-run cap of %d; deferred "
             "(not fingerprint-recorded, so the next collection pass files them)",
             run.run_id,

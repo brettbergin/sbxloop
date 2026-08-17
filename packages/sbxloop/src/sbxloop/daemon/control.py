@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import getpass
 import json
-import logging
 import os
 import threading
 import time
@@ -33,8 +32,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from sbxloop.daemon.discord_format import code, items_lines, queue_lines
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # Verbs both surfaces accept, in usage-line form. The item-level controls
 # (#229) and `cancel --retry` (#246) live here too, so Discord and ctl gain
@@ -355,7 +355,7 @@ class ControlServer:
                     by=str(payload.get("by") or "sbxloop daemon ctl"),
                 )
             except Exception as exc:  # a broken command must not kill the server
-                logger.warning("ctl command %r failed", cmd, exc_info=True)
+                log.warning("ctl command %r failed", cmd, exc_info=True)
                 reply = CommandReply(f"error: {exc}", ok=False)
             self._answer(request, reply)
             served += 1

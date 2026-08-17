@@ -12,7 +12,6 @@ picked up transparently.
 from __future__ import annotations
 
 import hashlib
-import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -22,12 +21,13 @@ from sbxloop.config import Config
 from sbxloop.errors import DaemonError, GithubOpsError, SbxError, SbxloopError, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.gh.ops import GithubOps
+from sbxloop.log import get_logger
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.worker.client import WorkerClient
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 T = TypeVar("T")
 
@@ -85,7 +85,7 @@ class DaemonGithub:
         """Drop a same-named sandbox left by a previous daemon process."""
         try:
             Sandbox(self.sbx, self.name).rm()
-            logger.info("removed stale daemon sandbox %s", self.name)
+            log.info("removed stale daemon sandbox %s", self.name)
         except SbxError:
             pass
 
@@ -114,13 +114,13 @@ class DaemonGithub:
         now = self.clock()
         last = self._last_reprovision_at
         if last is not None and now - last < REPROVISION_MIN_INTERVAL_S:
-            logger.warning(
+            log.warning(
                 "daemon github op failed (%s); sandbox re-provisioned %.0fs ago, not again yet",
                 exc,
                 now - last,
             )
             return False
-        logger.warning("daemon github op failed (%s); dropping the sandbox to re-provision", exc)
+        log.warning("daemon github op failed (%s); dropping the sandbox to re-provision", exc)
         self._last_reprovision_at = now
         self.close()
         return True
@@ -138,7 +138,7 @@ class DaemonGithub:
             try:
                 sandbox.rm()
             except SbxError:
-                logger.warning("failed to remove daemon sandbox %s", self.name, exc_info=True)
+                log.warning("failed to remove daemon sandbox %s", self.name, exc_info=True)
 
     def _provision(self) -> GithubOps:
         clients: list[WorkerClient] = []

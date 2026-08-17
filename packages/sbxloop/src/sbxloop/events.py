@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import contextlib
-import logging
 import threading
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
+from sbxloop.log import get_logger
 from sbxloop_worker.protocol import Event
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 Subscriber = Callable[[Event], None]
 
@@ -64,7 +64,7 @@ class EventBus:
                 try:
                     fn(event)
                 except Exception:
-                    logger.exception("event subscriber %r failed for %s", fn, event.type)
+                    log.exception("event subscriber %r failed for %s", fn, event.type)
 
     def emit(
         self,
@@ -77,6 +77,67 @@ class EventBus:
         event = Event.now(type, run_id, job_id=job_id, **data)
         self.publish(event)
         return event
+
+
+# The data keys worth surfacing in a one-line summary, first present wins:
+# the "what happened" of the event (a state, some text, a tool, an outcome …).
+SUMMARY_KEYS: tuple[str, ...] = (
+    "state",
+    "content",
+    "text",
+    "reply",
+    "tool",
+    "op",
+    "line",
+    "message",
+    "outcome",
+    "error",
+    "url",
+    "path",
+)
+SUMMARY_CLIP = 160
+
+
+def _clip(value: Any, limit: int) -> str:
+    flat = " ".join(str(value).split())
+    if len(flat) <= limit:
+        return flat
+    keep = (limit - 1) // 2
+    return f"{flat[:keep]}…{flat[-keep:]}"
+
+
+def summarize_event(event: Event) -> dict[str, Any]:
+    """The dense one-line reading of an event as structured fields — what
+    ``sbxloop logs`` prints and what the daemon's log sink emits: task/agent
+    ids, the first present :data:`SUMMARY_KEYS` value (as ``summary``, with
+    the key it came from as ``summary_key``), the resource snapshot, tool
+    args and any error — each clipped to a display line."""
+    data = event.data
+    out: dict[str, Any] = {}
+    if data.get("task_id"):
+        out["task"] = data["task_id"]
+    if data.get("agent"):
+        out["agent"] = data["agent"]
+    picked = ""
+    for key in SUMMARY_KEYS:
+        if data.get(key):
+            picked = key
+            out["summary_key"] = key
+            out["summary"] = str(data[key]).replace("\n", " ")[:SUMMARY_CLIP]
+            break
+    if data.get("disk_used_pct") is not None:
+        out["disk"] = f"{data['disk_used_pct']}%"
+        if data.get("mem_used_pct") is not None:
+            out["mem"] = f"{data['mem_used_pct']}%"
+        if data.get("load1") is not None:
+            out["load"] = data["load1"]
+        if data.get("level"):
+            out["resource_level"] = data["level"]
+    if data.get("args"):
+        out["args"] = _clip(data["args"], 120)
+    if picked != "error" and data.get("error"):
+        out["error"] = _clip(data["error"], SUMMARY_CLIP)
+    return out
 
 
 class HostEventTypes:
@@ -112,4 +173,12 @@ class HostEventTypes:
     DAEMON_GC = "daemon.gc"
 
 
-__all__ = ["Event", "EventBus", "Hook", "HostEventTypes", "Subscriber"]
+__all__ = [
+    "SUMMARY_KEYS",
+    "Event",
+    "EventBus",
+    "Hook",
+    "HostEventTypes",
+    "Subscriber",
+    "summarize_event",
+]

@@ -18,7 +18,6 @@ where the experimental ``set-custom`` proxy rewriting is unavailable.
 
 from __future__ import annotations
 
-import logging
 import os
 import secrets
 import shlex
@@ -33,6 +32,7 @@ from sbxloop.config import Config
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.ids import branch_name
+from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
@@ -51,7 +51,7 @@ from sbxloop.sbx.secretstate import (
     set_secret_replacing,
 )
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 GH_TOKEN_ENVS = ("GH_TOKEN", "GITHUB_TOKEN")
 
@@ -156,7 +156,7 @@ class Provisioner:
                     self.config.state_dir, self._sbx_version, probe_id, verdict, detail
                 )
         except Exception:
-            logger.debug("conformance verdict recording failed", exc_info=True)
+            log.debug("conformance verdict recording failed", exc_info=True)
 
     # -- spec construction -------------------------------------------------
 
@@ -251,7 +251,7 @@ class Provisioner:
         if git is None:
             if mode == "clone":
                 raise ProvisionError("workspace_isolation = 'clone' but no git binary is on PATH")
-            logger.debug("no git binary on PATH; workspace %s used in place", source)
+            log.debug("no git binary on PATH; workspace %s used in place", source)
             return source
         root = hostgit.repo_toplevel(source)
         if root is None:
@@ -313,7 +313,7 @@ class Provisioner:
         message = f"cloned {source} at {sha[:12]} onto branch {branch}"
         if dirty:
             message += " — source tree has uncommitted changes; they are NOT in the run workspace"
-            logger.warning("workspace %s is dirty; %s", source, message)
+            log.warning("workspace %s is dirty; %s", source, message)
         self.bus.emit(
             "sandbox.workspace_clone",
             run_id,
@@ -404,7 +404,7 @@ class Provisioner:
                 try:
                     sandbox.rm()
                 except SbxError:
-                    logger.warning("rollback: failed to remove %s", sandbox.name, exc_info=True)
+                    log.warning("rollback: failed to remove %s", sandbox.name, exc_info=True)
             # Symmetric with sandbox removal: best-effort unregister the
             # secrets THIS attempt registered. Left behind, they would be
             # owned by a now-deleted sandbox scope, and the next run's
@@ -413,9 +413,9 @@ class Provisioner:
             for rm in registered_secret_rms:
                 try:
                     if not rm():
-                        logger.warning("rollback: sbx rejected removing a registered secret")
+                        log.warning("rollback: sbx rejected removing a registered secret")
                 except SbxError:
-                    logger.warning("rollback: failed to remove a registered secret", exc_info=True)
+                    log.warning("rollback: failed to remove a registered secret", exc_info=True)
             if isinstance(exc, ProvisionError):
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
@@ -478,13 +478,13 @@ class Provisioner:
                 try:
                     created.rm()
                 except SbxError:
-                    logger.warning("rollback: failed to remove %s", created.name, exc_info=True)
+                    log.warning("rollback: failed to remove %s", created.name, exc_info=True)
             for rm in registered_secret_rms:
                 try:
                     if not rm():
-                        logger.warning("rollback: sbx rejected removing a registered secret")
+                        log.warning("rollback: sbx rejected removing a registered secret")
                 except SbxError:
-                    logger.warning("rollback: failed to remove a registered secret", exc_info=True)
+                    log.warning("rollback: failed to remove a registered secret", exc_info=True)
             if isinstance(exc, ProvisionError):
                 raise
             raise ProvisionError(f"provisioning {name} failed: {exc}") from exc
@@ -609,7 +609,7 @@ class Provisioner:
             f"{env_name}: sbx proxy secret invisible to exec — using in-VM env file "
             f'(secret_strategy="plain-env" silences this)'
         )
-        logger.info("%s: %s", spec.name, message)
+        log.info("%s: %s", spec.name, message)
         self._apply_plain_env(spec, sandbox, token)
         self.bus.emit(
             "sandbox.secret_env_fallback",
@@ -639,7 +639,7 @@ class Provisioner:
         try:
             (workspace / marker).write_text("")
         except OSError:
-            logger.warning("mount discovery: cannot write marker into %s", workspace)
+            log.warning("mount discovery: cannot write marker into %s", workspace)
             return None
         probe_error = ""
         try:
@@ -651,7 +651,7 @@ class Provisioner:
                 # nonzero exit means the probe itself broke — not "no mount".
                 probe_error = f"probe exited {result.returncode}: {result.stderr.strip()}"
         except SbxError as exc:
-            logger.warning("mount discovery failed for %s", sandbox.name, exc_info=True)
+            log.warning("mount discovery failed for %s", sandbox.name, exc_info=True)
             hit = ""
             probe_error = str(exc)
         finally:

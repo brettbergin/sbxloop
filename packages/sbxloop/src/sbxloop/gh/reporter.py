@@ -17,12 +17,11 @@ the EventBus isolates ``on_event`` anyway.
 
 from __future__ import annotations
 
-import logging
-
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.gh.ops import GithubOps, IssueRef, PrRef
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class GithubReporterHook:
@@ -39,7 +38,7 @@ class GithubReporterHook:
         try:
             self.issue = self._find_existing(run_id) or self._create(run_id, outcome)
         except Exception:
-            logger.warning("github reporting: opening tracking issue failed", exc_info=True)
+            log.warning("github reporting: opening tracking issue failed", exc_info=True)
 
     def close_run(self, run_id: str, state: str) -> None:
         """Post the final summary comment; call before sandbox teardown.
@@ -65,7 +64,7 @@ class GithubReporterHook:
                     {"state": "closed", "state_reason": "completed"},
                 )
         except Exception:
-            logger.warning("github reporting: final summary failed", exc_info=True)
+            log.warning("github reporting: final summary failed", exc_info=True)
 
     def note_delivery(self, run_id: str, pr: PrRef) -> None:
         """Refresh the tracking issue after an out-of-run delivery (``sbxloop
@@ -88,7 +87,7 @@ class GithubReporterHook:
                 {"state": "closed", "state_reason": "completed"},
             )
         except Exception:
-            logger.warning("github reporting: delivery note failed", exc_info=True)
+            log.warning("github reporting: delivery note failed", exc_info=True)
 
     # -- Hook protocol (task progress only) ----------------------------------
 
@@ -97,7 +96,7 @@ class GithubReporterHook:
             if event.type == HostEventTypes.TASK_END:
                 self._on_task_end(event)
         except Exception:
-            logger.warning("github reporting failed for %s", event.type, exc_info=True)
+            log.warning("github reporting failed for %s", event.type, exc_info=True)
 
     # -- internals -----------------------------------------------------------
 

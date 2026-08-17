@@ -25,7 +25,6 @@ Failure semantics:
 from __future__ import annotations
 
 import json
-import logging
 import queue
 import tarfile
 import tempfile
@@ -69,6 +68,7 @@ from sbxloop.gc import workspace_pruned
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop.ids import new_message_id, new_run_id
+from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
@@ -77,7 +77,7 @@ from sbxloop.sbx.prune import remove_run_sandbox_secrets
 from sbxloop.sbx.sandbox import SBXLOOP_DIR, Sandbox
 from sbxloop.worker.client import WorkerClient
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class ChatMessage(NamedTuple):
@@ -112,7 +112,7 @@ class _GithubOnly:
             try:
                 step()
             except Exception:
-                logger.warning("teardown of %s failed", self.sandbox.name, exc_info=True)
+                log.warning("teardown of %s failed", self.sandbox.name, exc_info=True)
 
 
 class LoopEngine:
@@ -401,7 +401,7 @@ class LoopEngine:
                 "changed since the run started?); resuming with the current "
                 f"config instead: {exc}"
             )
-            logger.warning("run %s: %s", run_id, message)
+            log.warning("run %s: %s", run_id, message)
             self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
             return
         stored = stored.model_copy(
@@ -417,7 +417,7 @@ class LoopEngine:
                 "resuming with the run's original config; the current config "
                 "differs: " + "; ".join(drift)
             )
-            logger.warning("run %s: %s", run_id, message)
+            log.warning("run %s: %s", run_id, message)
             self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
         self.config = stored
         if self._worker_python_from_config:
@@ -701,7 +701,7 @@ class LoopEngine:
                 with tarfile.open(host_tar) as tf:
                     tf.extractall(target, filter="data")
         except SbxError:
-            logger.warning("artifact harvest failed for run %s", run_id, exc_info=True)
+            log.warning("artifact harvest failed for run %s", run_id, exc_info=True)
 
     def _report_artifacts(self, run_id: str, pair: SandboxPair) -> None:
         target = (
@@ -723,7 +723,7 @@ class LoopEngine:
             # artifacts may be truncated or missing.
             extra["disk_used_pct"] = sample.get("disk_used_pct")
             extra["resources_level"] = sample.get("level")
-            logger.warning(
+            log.warning(
                 "run %s: sandbox disk was at %s%% at the last sample — "
                 "harvested artifacts may be incomplete",
                 run_id,
@@ -797,7 +797,7 @@ class LoopEngine:
             # SbxError from the op jobs themselves. Anything narrower lets an
             # infra hiccup during this optional post-completion step escape
             # _drive and leave the completed run looking failed (#59).
-            logger.warning("delivery to %s failed for run %s", repo, run_id, exc_info=True)
+            log.warning("delivery to %s failed for run %s", repo, run_id, exc_info=True)
             self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
             return
         self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, pr=pr.number, url=pr.url)
@@ -1270,7 +1270,7 @@ class LoopEngine:
             try:
                 verdict = phases.steer(message.text, tasks=self.store.get_tasks(run_id), task=task)
             except WorkerError as exc:
-                logger.warning("steer failed for run %s", run_id, exc_info=True)
+                log.warning("steer failed for run %s", run_id, exc_info=True)
                 self.store.record_phase(
                     run_id,
                     "steer",

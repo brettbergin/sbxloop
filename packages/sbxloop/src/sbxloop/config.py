@@ -37,6 +37,7 @@ from pydantic import (
 )
 
 from sbxloop.errors import ConfigError
+from sbxloop.log import LogFormat, LogLevel
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
 
 ENV_PREFIX = "SBXLOOP_"
@@ -409,6 +410,23 @@ class DaemonConfig(_ConfigModel):
     # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
     # rows are never removed. See sbxloop.gc for what is exempt.
     prune_runs_after_days: float = Field(default=14.0, ge=0)
+    # The daemon's own log stream (stderr → journald under systemd). INFO is
+    # the lifecycle tier: startup summary, claims, run dispatch/finish, task
+    # and phase transitions, operator commands; DEBUG adds every tool call,
+    # sbx invocation and poll. ``json`` renders one object per line for log
+    # shippers; ``console`` is key=value for humans and journalctl.
+    log_level: LogLevel = "INFO"
+    log_format: LogFormat = "console"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _upper_level(cls, value: Any) -> Any:
+        return value.upper() if isinstance(value, str) else value
+
+    @field_validator("log_format", mode="before")
+    @classmethod
+    def _lower_format(cls, value: Any) -> Any:
+        return value.lower() if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def _check(self) -> DaemonConfig:

@@ -17,7 +17,6 @@ tick resumes it through the same guardrails as any dispatch.
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -42,6 +41,7 @@ from sbxloop.daemon.discord_format import (
     link,
     refs_text,
 )
+from sbxloop.daemon.logsink import event_log_subscriber
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.postmortem import build_dossier
 from sbxloop.daemon.sources import WorkSource
@@ -59,11 +59,12 @@ from sbxloop.errors import (
 from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ids import new_run_id
+from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # How often the audit scheduler fast-forwards the checkout to see new charters.
 AUDIT_REFRESH_S = 600.0
@@ -146,6 +147,7 @@ class DaemonLoop:
         # reset it (#254). These attributes are the write-through cache.
         self._breaker_opened_at, self._consecutive_failures = self.dstore.breaker()
         self._last_cap_log = 0.0
+        self._last_idle_kind: str | None = None
         # Per-source poll backoff: consecutive failures and the earliest
         # next poll, so a source that is down (GitHub outage, dead github
         # sandbox) is not hammered every tick.
@@ -207,7 +209,13 @@ class DaemonLoop:
         now = self.clock()
         fresh = self.dstore.abandon(item_id, why, now)
         if self._cancel_if_current(item_id):
-            self._notify(f"abandoning {item_id}: cancelling its run {fresh.run_id}")
+            self._notify(
+                f"abandoning {item_id}: cancelling its run {fresh.run_id}",
+                "item.abandon_cancelling",
+                item=item_id,
+                run=fresh.run_id,
+                reason=why,
+            )
             return fresh
         if fresh.run_id is not None:
             # A pinned run that is not the one in flight is dead (a pending
@@ -224,6 +232,7 @@ class DaemonLoop:
         label)."""
         who = by or "operator"
         fresh = self.dstore.retry(item_id, self.clock(), f"re-queued by {who}")
+        log.info("item.retry", item=item_id, by=who)
         self._deliver_report(fresh, by=who)
         return fresh
 
@@ -235,12 +244,22 @@ class DaemonLoop:
         now = self.clock()
         fresh = self.dstore.requeue(item_id, now)
         if self._cancel_if_current(item_id):
-            self._notify(f"requeue: {item_id} — cancelling its run {pinned}")
+            self._notify(
+                f"requeue: {item_id} — cancelling its run {pinned}",
+                "item.requeue_cancelling",
+                item=item_id,
+                run=pinned,
+            )
         elif pinned is not None:
             self._close_dead_run(pinned, "requeued", now)
-            self._notify(f"requeue: {item_id} unpinned from {pinned}")
+            self._notify(
+                f"requeue: {item_id} unpinned from {pinned}",
+                "item.requeue_unpinned",
+                item=item_id,
+                run=pinned,
+            )
         else:
-            self._notify(f"requeue: {item_id} re-queued")
+            self._notify(f"requeue: {item_id} re-queued", "item.requeued", item=item_id)
         return fresh
 
     def _close_dead_run(self, run_id: str, result: str, now: float) -> None:
@@ -276,12 +295,24 @@ class DaemonLoop:
         if kind == "abandoned":
             why = item.last_error or "abandoned by operator"
             source.report_abandoned(item, why)
-            self._notify(f"❌ {item.item_id} abandoned by operator: {why}")
+            self._notify(
+                f"❌ {item.item_id} abandoned by operator: {why}",
+                "item.abandoned_by_operator",
+                item=item.item_id,
+                source=source.name,
+                reason=why,
+            )
         else:
             # A row-only retry records who asked as its last_error.
             who = by or (item.last_error or "").removeprefix("re-queued by ") or "operator"
             source.report_requeued(item, who)
-            self._notify(f"↻ {item.item_id} re-queued by {who} (attempts reset)")
+            self._notify(
+                f"↻ {item.item_id} re-queued by {who} (attempts reset)",
+                "item.requeued_by_operator",
+                item=item.item_id,
+                source=source.name,
+                by=who,
+            )
 
     def _cancel_if_current(self, item_id: str) -> bool:
         with self._current_lock:
@@ -309,10 +340,25 @@ class DaemonLoop:
         with self._current_lock:
             handle = self._current
         if handle is not None:
+            log.info(
+                "daemon.quiesce",
+                item=handle.item.item_id,
+                run=handle.run_id,
+                grace_s=self.config.daemon.shutdown_grace_s,
+            )
             handle.engine.request_cancel()
+        else:
+            log.info("daemon.quiesce", run=None)
         thread = getattr(self, "_engine_thread", None)
         if thread is not None and thread.is_alive():
             thread.join(timeout=self.config.daemon.shutdown_grace_s)
+            if thread.is_alive():
+                log.warning(
+                    "daemon.quiesce_timeout",
+                    run=handle.run_id if handle is not None else None,
+                    grace_s=self.config.daemon.shutdown_grace_s,
+                    hint="engine still running past shutdown grace; the run stays resumable",
+                )
 
     def status(self) -> dict[str, Any]:
         now = self.clock()
@@ -339,14 +385,50 @@ class DaemonLoop:
     # -- main loop --------------------------------------------------------------------
 
     def run_forever(self) -> None:
-        self._notify("daemon started")
+        self._notify(
+            "daemon started",
+            "daemon.started",
+            poll_interval_s=self.config.daemon.poll_interval_s,
+            sources=[s.name for s in self.sources],
+        )
+        ticks = 0
         try:
             while not self._stop.is_set():
+                started = time.monotonic()
                 result = self.tick()
+                ticks += 1
+                self._log_tick(result, time.monotonic() - started)
                 if result.dispatched is None:
                     self._stop.wait(self.config.daemon.poll_interval_s)
         finally:
-            self._notify("daemon stopped")
+            self._notify("daemon stopped", "daemon.stopped", ticks=ticks)
+
+    def _log_tick(self, result: TickResult, duration_s: float) -> None:
+        """Every tick at DEBUG; a *change* of why the daemon is idle at INFO,
+        so a journal at the default level says once that the daemon is
+        paused / breaker-open / backing off / capped — and once when work
+        resumes — instead of nothing at all (or the same line each poll)."""
+        log.debug(
+            "daemon.tick",
+            discovered=result.discovered,
+            dispatched=result.dispatched,
+            outcome=result.outcome,
+            idle=result.idle_kind,
+            idle_detail=result.idle_detail,
+            duration_s=round(duration_s, 3),
+        )
+        kind = result.idle_kind if result.dispatched is None else None
+        if kind != self._last_idle_kind:
+            if kind is None:
+                log.info("daemon.active", item=result.dispatched, outcome=result.outcome)
+            else:
+                log.info(
+                    "daemon.idle",
+                    idle=kind,
+                    idle_detail=result.idle_detail,
+                    queued=len(self.dstore.queued()),
+                )
+            self._last_idle_kind = kind
 
     def tick(self) -> TickResult:
         now = self.clock()
@@ -364,7 +446,10 @@ class DaemonLoop:
                 self._last_cap_log = now
                 cap = self.config.daemon.max_runs_per_day
                 self._notify(
-                    f"daily run cap reached ({started_today}/{cap}); idling until the window rolls"
+                    f"daily run cap reached ({started_today}/{cap}); idling until the window rolls",
+                    "daemon.daily_cap",
+                    started_today=started_today,
+                    cap=cap,
                 )
             return TickResult(idle_kind="daily_cap")
         self._schedule_audits(now)
@@ -389,15 +474,28 @@ class DaemonLoop:
         source = self._source_for(item)
         if source is None:
             self.dstore.mark_failed(item.item_id, "no source for item", now, requeue=False)
+            log.warning(
+                "item.abandoned",
+                item=item.item_id,
+                source=item.source,
+                reason="no such source is active this start",
+            )
             return TickResult(discovered=discovered, idle_kind="no_work")
         if not item.claimed:
             if not source.claim(item):
                 self.dstore.mark_failed(item.item_id, "claim failed", now, requeue=False)
-                self._notify(f"could not claim {item.item_id} ({item.title}); dropped")
+                self._notify(
+                    f"could not claim {item.item_id} ({item.title}); dropped",
+                    "item.claim_failed",
+                    item=item.item_id,
+                    source=source.name,
+                    title=item.title,
+                )
                 return TickResult(
                     discovered=discovered, dispatched=item.item_id, outcome="abandoned"
                 )
             self.dstore.mark_claimed(item.item_id, now)
+            log.info("item.claimed", item=item.item_id, source=source.name, title=item.title)
         if item.run_id is not None:
             outcome = self._resume(item, source, now)
         else:
@@ -416,7 +514,12 @@ class DaemonLoop:
         if resumes >= budget:
             self._notify(
                 f"{item.item_id}: {run_id} interrupted again after {resumes} resume(s) "
-                f"(budget {budget}); settling as a failed attempt"
+                f"(budget {budget}); settling as a failed attempt",
+                "run.resume_budget_exhausted",
+                item=item.item_id,
+                run=run_id,
+                resumes=resumes,
+                budget=budget,
             )
             return self._settle(
                 item,
@@ -430,7 +533,14 @@ class DaemonLoop:
         # (field: SIGKILL mid-run → 'sandbox already exists' on the very
         # next start).
         self._remove_stale_run_sandboxes(run_id)
-        self._notify(f"resuming {run_id} for {item.item_id} (resume {resumes + 1}/{budget})")
+        self._notify(
+            f"resuming {run_id} for {item.item_id} (resume {resumes + 1}/{budget})",
+            "run.resuming",
+            item=item.item_id,
+            run=run_id,
+            resume=resumes + 1,
+            budget=budget,
+        )
         return self._dispatch(item, source, resume_run_id=run_id)
 
     # -- state-dir retention -------------------------------------------------------
@@ -460,10 +570,15 @@ class DaemonLoop:
                 actor="daemon",
             )
         except Exception:
-            logger.warning("daemon.gc: sweep failed", exc_info=True)
+            log.warning(
+                "daemon.gc_failed",
+                state_dir=str(self.config.state_dir),
+                retention_days=days,
+                exc_info=True,
+            )
             return
         if not result.pruned and not result.failed:
-            logger.debug("daemon.gc: nothing to prune (retention %sd)", days)
+            log.debug("daemon.gc_nothing_to_prune", retention_days=days)
             return
         text = (
             f"daemon.gc: pruned {len(result.pruned)} run dir(s) older than {days:g}d, "
@@ -471,7 +586,14 @@ class DaemonLoop:
         )
         if result.failed:
             text += f"; {len(result.failed)} could not be removed ({', '.join(result.failed)})"
-        self._notify(text)
+        self._notify(
+            text,
+            "daemon.gc",
+            pruned=len(result.pruned),
+            failed=len(result.failed),
+            bytes_freed=result.bytes_freed,
+            retention_days=days,
+        )
 
     # -- discovery ---------------------------------------------------------------------
 
@@ -483,8 +605,11 @@ class DaemonLoop:
     def _discover(self, now: float) -> int:
         new = 0
         for source in self.sources:
-            if now < self._source_next_poll.get(source.name, 0.0):
+            next_poll = self._source_next_poll.get(source.name, 0.0)
+            if now < next_poll:
+                log.debug("source.poll_skipped", source=source.name, backoff_left_s=next_poll - now)
                 continue
+            started = time.monotonic()
             try:
                 found = source.poll()
             except Exception:
@@ -494,21 +619,43 @@ class DaemonLoop:
                     self.config.daemon.poll_interval_s * 2**failures, self.SOURCE_BACKOFF_MAX_S
                 )
                 self._source_next_poll[source.name] = now + delay
-                logger.warning(
-                    "source %s poll failed (%d in a row); next poll in %.0fs",
-                    source.name,
-                    failures,
-                    delay,
+                log.warning(
+                    "source.poll_failed",
+                    source=source.name,
+                    failures=failures,
+                    next_poll_in_s=round(delay),
+                    duration_s=round(time.monotonic() - started, 2),
                     exc_info=True,
                 )
                 continue
-            if self._source_failures.pop(source.name, 0):
+            if failures_cleared := self._source_failures.pop(source.name, 0):
                 self._source_next_poll.pop(source.name, None)
-                self._notify(f"source {source.name} polling recovered")
+                self._notify(
+                    f"source {source.name} polling recovered",
+                    "source.poll_recovered",
+                    source=source.name,
+                    after_failures=failures_cleared,
+                )
+            fresh = 0
             for item in found:
                 if self.dstore.upsert_new(item, now):
-                    new += 1
-                    self._notify(f"queued {item.item_id}: {item.title}")
+                    fresh += 1
+                    self._notify(
+                        f"queued {item.item_id}: {item.title}",
+                        "item.queued",
+                        item=item.item_id,
+                        source=source.name,
+                        kind=item.kind,
+                        title=item.title,
+                    )
+            new += fresh
+            log.debug(
+                "source.polled",
+                source=source.name,
+                found=len(found),
+                new=fresh,
+                duration_s=round(time.monotonic() - started, 2),
+            )
         return new
 
     def _source_for(self, item: WorkItem) -> WorkSource | None:
@@ -522,6 +669,7 @@ class DaemonLoop:
         """Run one item (fresh, or resuming its interrupted run) and settle it."""
         now = self.clock()
         run_id = resume_run_id or new_run_id()
+        started = time.monotonic()
         if resume_run_id is None:
             self.dstore.mark_running(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
@@ -532,8 +680,20 @@ class DaemonLoop:
         else:
             self.dstore.mark_resuming(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
+        log.info(
+            "run.dispatch",
+            item=item.item_id,
+            run=run_id,
+            source=source.name,
+            kind=item.kind,
+            attempt=item.attempts,
+            max_attempts=self.config.daemon.max_attempts_per_item,
+            resume=resume_run_id is not None,
+            title=item.title,
+        )
         item_config = self._item_config(item)
         bus = EventBus()
+        bus.subscribe(event_log_subscriber)
         engine = LoopEngine(
             item_config,
             store=self.store,
@@ -549,17 +709,24 @@ class DaemonLoop:
             try:
                 self.frontend.run_started(item, run_id, engine, bus)
             except Exception:
-                logger.warning("frontend run_started failed", exc_info=True)
+                log.warning(
+                    "frontend.run_started_failed", item=item.item_id, run=run_id, exc_info=True
+                )
 
         result_box: dict[str, Any] = {}
 
         def target() -> None:
+            # Context vars are per-thread: stamp run/item on everything the
+            # engine logs from here (provisioning, worker client, phases).
+            bind_run(run_id, item.item_id, source=item.source)
             try:
                 result_box["result"] = self._runner(
                     item, item_config, run_id, bus, resume_run_id is not None
                 )
             except BaseException as exc:
                 result_box["error"] = exc
+            finally:
+                clear_run()
 
         thread = threading.Thread(target=target, name=f"sbxloop-daemon-run-{run_id}", daemon=True)
         self._engine_thread = thread
@@ -572,14 +739,37 @@ class DaemonLoop:
             if (
                 not cancel_sent
                 and thread.is_alive()
-                and self._operator_override(item.item_id, run_id) is not None
+                and (override := self._operator_override(item.item_id, run_id)) is not None
             ):
+                log.info(
+                    "run.cancel_requested",
+                    item=item.item_id,
+                    run=run_id,
+                    reason=f"operator override: item now {override.state}",
+                )
                 engine.request_cancel()
                 cancel_sent = True
         with self._current_lock:
             self._current = None
 
         error = result_box.get("error")
+        result = result_box.get("result")
+        log.info(
+            "run.finished",
+            item=item.item_id,
+            run=run_id,
+            outcome=(
+                result.state
+                if result is not None
+                else "interrupted"
+                if self._stop.is_set()
+                else type(error).__name__
+                if error is not None
+                else "unknown"
+            ),
+            duration_s=round(time.monotonic() - started, 1),
+            attempt=item.attempts,
+        )
         # An item-level operator decision (abandon/requeue, possibly from
         # another process) outranks a pending `!sbx cancel`: the row already
         # says what the item's fate is.
@@ -608,9 +798,23 @@ class DaemonLoop:
             # terminal persisted state and settles like any failure below —
             # shutdown must not mask genuine errors as "interrupted".
             self.dstore.finish_ledger(run_id, "interrupted", self.clock())
+            log.warning(
+                "run.interrupted",
+                item=item.item_id,
+                run=run_id,
+                resumable=True,
+                hint="shutdown at a phase boundary; recovery queues it for resume",
+            )
             return "interrupted"
         if error is not None and not isinstance(error, SbxloopError | StateError):
-            logger.error("run %s crashed", run_id, exc_info=error)
+            log.error(
+                "run.crashed",
+                item=item.item_id,
+                run=run_id,
+                attempt=item.attempts,
+                duration_s=round(time.monotonic() - started, 1),
+                exc_info=error,
+            )
         return self._settle(item, source, run_id, result_box.get("result"), error)
 
     def _settle_override(
@@ -634,7 +838,13 @@ class DaemonLoop:
             return "abandoned"
         self.dstore.finish_ledger(run_id, "requeued", now)
         self._frontend_finished(item, report)
-        self._notify(f"{item.item_id} requeued by operator; run {run_id} ended {report.state}")
+        self._notify(
+            f"{item.item_id} requeued by operator; run {run_id} ended {report.state}",
+            "run.requeued_by_operator",
+            item=item.item_id,
+            run=run_id,
+            state=report.state,
+        )
         return "requeued"
 
     def _run_is_resumable(self, run_id: str) -> bool:
@@ -647,6 +857,7 @@ class DaemonLoop:
         except SbxloopError:
             # No persisted run yet (died before create_run): nothing to
             # resume, but nothing failed either — recovery re-queues it.
+            log.debug("run.no_record", run=run_id, hint="died before create_run")
             return True
 
     def _settle(
@@ -667,6 +878,8 @@ class DaemonLoop:
             )
             self.dstore.mark_done(item.item_id, now)
             self.dstore.finish_ledger(run_id, "done", now)
+            if self._consecutive_failures:
+                log.info("breaker.reset", after_failures=self._consecutive_failures)
             self._set_breaker(None, 0)
             source.report_success(item, report)
             self._frontend_finished(item, report)
@@ -674,7 +887,14 @@ class DaemonLoop:
             self._notify(
                 f"✅ {item.item_id} done ({report.task_summary})"
                 + (f" · PR {report.delivery[1]}" if report.delivery else "")
-                + (f" · {findings}" if findings else "")
+                + (f" · {findings}" if findings else ""),
+                "run.done",
+                item=item.item_id,
+                run=run_id,
+                tasks=report.task_summary,
+                pr=report.delivery[1] if report.delivery else None,
+                filed=len(report.filed),
+                attempt=item.attempts,
             )
             self._file_review(item, run_id, report)
             return "done"
@@ -690,7 +910,13 @@ class DaemonLoop:
             findings = findings_summary(report._replace(filed=tuple(filed)), repo=self._repo)
             self._notify(
                 f"⚠ {item.item_id} completed but delivery failed: {report.delivery_error}"
-                + (f" · {findings}" if findings else "")
+                + (f" · {findings}" if findings else ""),
+                "run.delivery_failed",
+                level="error",
+                item=item.item_id,
+                run=run_id,
+                error=report.delivery_error,
+                hint="work is done but no PR; a human must look — retrying would redo the work",
             )
             self._file_postmortem(item, run_id, f"delivery failed: {report.delivery_error}")
             return "delivery_failed"
@@ -704,7 +930,11 @@ class DaemonLoop:
             if filed or tool.filed:
                 self._notify(
                     f"🔎 {item.item_id} failed but its findings were filed · "
-                    f"{refs_text([*filed, *tool.filed], self._repo)}"
+                    f"{refs_text([*filed, *tool.filed], self._repo)}",
+                    "run.audit_findings_filed",
+                    item=item.item_id,
+                    run=run_id,
+                    filed=len(filed) + len(tool.filed),
                 )
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
         self._set_breaker(self._breaker_opened_at, self._consecutive_failures + 1)
@@ -712,12 +942,32 @@ class DaemonLoop:
         if attempts_left > 0:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=True)
             source.report_retry(item, reason, attempts_left)
-            self._notify(f"❌ {item.item_id} failed ({reason}); {attempts_left} attempt(s) left")
+            self._notify(
+                f"❌ {item.item_id} failed ({reason}); {attempts_left} attempt(s) left",
+                "run.failed",
+                level="warning",
+                item=item.item_id,
+                run=run_id,
+                reason=reason,
+                attempt=item.attempts,
+                attempts_left=attempts_left,
+                retry_backoff_s=self.config.daemon.retry_backoff_s,
+                consecutive_failures=self._consecutive_failures,
+            )
             outcome: TickOutcome = "retry"
         else:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=False)
             source.report_abandoned(item, reason)
-            self._notify(f"❌ {item.item_id} abandoned after {item.attempts} attempt(s): {reason}")
+            self._notify(
+                f"❌ {item.item_id} abandoned after {item.attempts} attempt(s): {reason}",
+                "run.abandoned",
+                level="error",
+                item=item.item_id,
+                run=run_id,
+                reason=reason,
+                attempts=item.attempts,
+                consecutive_failures=self._consecutive_failures,
+            )
             self._file_postmortem(item, run_id, f"abandoned: {reason}")
             outcome = "abandoned"
         self._frontend_finished(item, report)
@@ -725,7 +975,11 @@ class DaemonLoop:
             self._set_breaker(now, self._consecutive_failures)
             self._notify(
                 f"🛑 circuit breaker opened after {self._consecutive_failures} consecutive "
-                f"failures; pausing dispatch for {self.config.daemon.breaker_cooldown_s:.0f}s"
+                f"failures; pausing dispatch for {self.config.daemon.breaker_cooldown_s:.0f}s",
+                "breaker.opened",
+                level="error",
+                consecutive_failures=self._consecutive_failures,
+                cooldown_s=self.config.daemon.breaker_cooldown_s,
             )
         return outcome
 
@@ -746,11 +1000,23 @@ class DaemonLoop:
             self.dstore.retry(item.item_id, now, reason)
             # report_cancelled(requeued=True) below is the source-side report.
             self.dstore.take_pending_report(item.item_id)
-            self._notify(f"⏹ {item.item_id} {reason}; re-queued to run again fresh")
+            self._notify(
+                f"⏹ {item.item_id} {reason}; re-queued to run again fresh",
+                "run.cancelled",
+                item=item.item_id,
+                run=run_id,
+                by=cancel.requester,
+                requeued=True,
+            )
         else:
             self._notify(
                 f"⏹ {item.item_id} {reason} — `sbxloop resume {run_id}` continues it, "
-                f"`!sbx retry {item.item_id}` reruns it fresh"
+                f"`!sbx retry {item.item_id}` reruns it fresh",
+                "run.cancelled",
+                item=item.item_id,
+                run=run_id,
+                by=cancel.requester,
+                requeued=False,
             )
         source.report_cancelled(item, report)
         self._frontend_finished(item, report)
@@ -768,7 +1034,11 @@ class DaemonLoop:
             # Half-open: allow one item through; a success resets, a failure
             # re-opens via the counter.
             self._set_breaker(None, max(self._consecutive_failures - 1, 0))
-            self._notify("circuit breaker half-open; allowing one item")
+            self._notify(
+                "circuit breaker half-open; allowing one item",
+                "breaker.half_open",
+                consecutive_failures=self._consecutive_failures,
+            )
             return False
         return True
 
@@ -835,15 +1105,35 @@ class DaemonLoop:
         source = self._workspace_checkout()
         if source is None:
             return
+        log.debug("workspace.refresh_start", path=str(source))
+        started = time.monotonic()
         try:
             result = hostgit.refresh_from_origin(source)
         except ProvisionError as exc:
-            self._notify(f"⚠ workspace refresh failed; running from local HEAD: {exc}")
+            self._notify(
+                f"⚠ workspace refresh failed; running from local HEAD: {exc}",
+                "workspace.refresh_failed",
+                level="warning",
+                path=str(source),
+                error=str(exc),
+                duration_s=round(time.monotonic() - started, 1),
+            )
             return
         if result.advanced:
-            self._notify(f"refreshed workspace: {result.message}")
+            self._notify(
+                f"refreshed workspace: {result.message}",
+                "workspace.refreshed",
+                path=str(source),
+                detail=result.message,
+                duration_s=round(time.monotonic() - started, 1),
+            )
         else:
-            logger.info("workspace refresh: %s", result.message)
+            log.info(
+                "workspace.refresh_unchanged",
+                path=str(source),
+                detail=result.message,
+                duration_s=round(time.monotonic() - started, 1),
+            )
 
     def outcome_text(self, item: WorkItem) -> str:
         parts = [item.title.strip()]
@@ -900,7 +1190,14 @@ class DaemonLoop:
                         delivery = (int(data.get("pr", 0)), str(data["url"]))
                         delivery_error = None
         except SbxloopError:
-            pass
+            # The report then claims no delivery — say so, or the settle
+            # path's "delivery failed" verdict has no explanation.
+            log.warning(
+                "run.report_events_unreadable",
+                run=run_id,
+                hint="tracking issue / PR / delivery error unknown for this report",
+                exc_info=True,
+            )
         workspace = str(result.workspace) if result is not None and result.workspace else None
         return RunReport(run_id, state, summary, tracking, delivery, delivery_error, workspace)
 
@@ -933,7 +1230,13 @@ class DaemonLoop:
         for problem in problems:
             if problem not in self._audit_problems_seen:
                 self._audit_problems_seen.add(problem)
-                self._notify(charter_skipped_notice(problem, daemon.audit_dir))
+                self._notify(
+                    charter_skipped_notice(problem, daemon.audit_dir),
+                    "audit.charter_skipped",
+                    level="warning",
+                    audit_dir=str(daemon.audit_dir),
+                    problem=problem,
+                )
         for charter in due_charters(charters, self.dstore.audit_last_filed(), now):
             try:
                 since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - charter.every_s))
@@ -941,6 +1244,12 @@ class DaemonLoop:
                 if is_open or filed_recently:
                     # Someone (or a previous process) already filed it: sync
                     # the cache so we stop asking GitHub every tick.
+                    log.info(
+                        "audit.already_filed",
+                        charter=charter.name,
+                        is_open=is_open,
+                        filed_recently=filed_recently,
+                    )
                     self.dstore.record_audit(charter.name, "gh:existing", now)
                     continue
                 ref = github.file_audit(
@@ -954,10 +1263,14 @@ class DaemonLoop:
                         repo=self._repo,
                         target=f"charter {code(charter.name)}",
                         detail=charter.title,
-                    )
+                    ),
+                    "audit.filed",
+                    charter=charter.name,
+                    ref=ref,
+                    every_s=charter.every_s,
                 )
             except Exception:
-                logger.warning("scheduled audit %s could not be filed", charter.name, exc_info=True)
+                log.warning("audit.file_failed", charter=charter.name, exc_info=True)
 
     def _collect_tool_findings(self, run_id: str, source: WorkSource) -> ToolFindings:
         """Findings addressed to the tool: filed upstream when tool_repo is
@@ -976,7 +1289,7 @@ class DaemonLoop:
                 now=self.clock(),
             )
         except SbxloopError:
-            logger.warning("tool-finding collection failed for %s", run_id, exc_info=True)
+            log.warning("backlog.tool_findings_failed", run=run_id, exc_info=True)
             return ToolFindings([], [])
 
     def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> None:
@@ -994,7 +1307,13 @@ class DaemonLoop:
             if self.dstore.review_filed(run_id):
                 return
             if self.dstore.reviews_since(now - DAY_S) >= daemon.reviews_per_day:
-                logger.info("delivery review for %s skipped: daily cap reached", run_id)
+                log.info(
+                    "review.skipped",
+                    item=item.item_id,
+                    run=run_id,
+                    reason="daily cap reached",
+                    cap=daemon.reviews_per_day,
+                )
                 return
             number, url = report.delivery
             ref = github.file_review(item, number, url, run_id)
@@ -1005,10 +1324,15 @@ class DaemonLoop:
                     ref,
                     repo=self._repo,
                     target=f"PR {link(f'#{number}', url)} · {item.item_id}",
-                )
+                ),
+                "review.filed",
+                item=item.item_id,
+                run=run_id,
+                pr=number,
+                ref=ref,
             )
         except Exception:
-            logger.warning("delivery review for %s could not be filed", run_id, exc_info=True)
+            log.warning("review.file_failed", item=item.item_id, run=run_id, exc_info=True)
 
     def _file_postmortem(self, item: WorkItem, run_id: str, reason: str) -> None:
         """Turn the daemon's own failure into a discovery-lane charter.
@@ -1028,7 +1352,13 @@ class DaemonLoop:
             if self.dstore.postmortem_filed(run_id):
                 return
             if self.dstore.postmortems_since(now - DAY_S) >= daemon.postmortems_per_day:
-                logger.info("post-mortem for %s skipped: daily cap reached", run_id)
+                log.info(
+                    "postmortem.skipped",
+                    item=item.item_id,
+                    run=run_id,
+                    reason="daily cap reached",
+                    cap=daemon.postmortems_per_day,
+                )
                 return
             run_ids = self.dstore.runs_for_item(item.item_id) or [run_id]
             dossier = build_dossier(
@@ -1039,10 +1369,16 @@ class DaemonLoop:
             self._notify(
                 filed_notice(
                     "post-mortem", ref, repo=self._repo, target=item.item_id, detail=reason
-                )
+                ),
+                "postmortem.filed",
+                item=item.item_id,
+                run=run_id,
+                ref=ref,
+                reason=reason,
+                runs=len(run_ids),
             )
         except Exception:
-            logger.warning("post-mortem for %s could not be filed", run_id, exc_info=True)
+            log.warning("postmortem.file_failed", item=item.item_id, run=run_id, exc_info=True)
 
     def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:
         """File the run's backlog items; returns their refs (``gh:<n>``)."""
@@ -1051,7 +1387,9 @@ class DaemonLoop:
             return []
         target = next((s for s in self.sources if s.name == mode), None)
         if target is None:
-            logger.warning("backlog mode %r but no such source is active", mode)
+            # Startup already warned once (daemon.backlog_needs_github /
+            # source list); per run this is only worth a debug trace.
+            log.debug("backlog.no_target_source", run=run_id, backlog=mode)
             return []
         try:
             record = self.store.get_run(run_id)
@@ -1064,8 +1402,10 @@ class DaemonLoop:
                 now=self.clock(),
             )
         except SbxloopError:
-            logger.warning("backlog collection failed for %s", run_id, exc_info=True)
+            log.warning("backlog.collect_failed", run=run_id, backlog=mode, exc_info=True)
             return []
+        if filed:
+            log.info("backlog.filed", run=run_id, backlog=mode, count=len(filed), refs=list(filed))
         return list(filed)
 
     # -- recovery ------------------------------------------------------------------------
@@ -1084,21 +1424,51 @@ class DaemonLoop:
             now = self.clock()
             if source is None:
                 self.dstore.mark_failed(item.item_id, "no source on recovery", now, requeue=False)
+                log.warning(
+                    "recovery.item_abandoned",
+                    item=item.item_id,
+                    run=item.run_id,
+                    source=item.source,
+                    reason="no such source is active this start",
+                )
                 continue
             if item.run_id is None:
                 self.dstore.mark_requeued_unstarted(item.item_id, now)
-                self._notify(f"recovery: {item.item_id} re-queued (claimed, never started)")
+                self._notify(
+                    f"recovery: {item.item_id} re-queued (claimed, never started)",
+                    "recovery.requeued",
+                    item=item.item_id,
+                    reason="claimed, never started",
+                )
                 continue
             try:
                 record = self.store.get_run(item.run_id)
             except SbxloopError:
                 self.dstore.mark_requeued_unstarted(item.item_id, now)
+                log.warning(
+                    "recovery.requeued",
+                    item=item.item_id,
+                    run=item.run_id,
+                    reason="run record missing; starting over",
+                )
                 continue
             if record.state == "completed":
-                self._notify(f"recovery: {item.run_id} had completed; settling {item.item_id}")
+                self._notify(
+                    f"recovery: {item.run_id} had completed; settling {item.item_id}",
+                    "recovery.settling",
+                    item=item.item_id,
+                    run=item.run_id,
+                    state=record.state,
+                )
                 self._settle(item, source, item.run_id, self._result_from_record(item.run_id), None)
             elif record.state in TERMINAL_RUN_STATES:
-                self._notify(f"recovery: {item.run_id} ended {record.state}; applying failure path")
+                self._notify(
+                    f"recovery: {item.run_id} ended {record.state}; applying failure path",
+                    "recovery.settling",
+                    item=item.item_id,
+                    run=item.run_id,
+                    state=record.state,
+                )
                 self._settle(
                     item, source, item.run_id, None, StateError(f"run ended {record.state}")
                 )
@@ -1108,11 +1478,23 @@ class DaemonLoop:
                     f"recovery: {item.run_id} for {item.item_id} queued for resume "
                     f"(last activity {self.clock() - last:.0f}s ago)"
                     if last
-                    else f"recovery: {item.run_id} for {item.item_id} queued for resume"
+                    else f"recovery: {item.run_id} for {item.item_id} queued for resume",
+                    "recovery.resume_pending",
+                    item=item.item_id,
+                    run=item.run_id,
+                    state=record.state,
+                    idle_s=round(self.clock() - last) if last else None,
                 )
                 self.dstore.mark_resume_pending(item.item_id, now)
             else:
                 self.dstore.mark_requeued_unstarted(item.item_id, now)
+                log.warning(
+                    "recovery.requeued",
+                    item=item.item_id,
+                    run=item.run_id,
+                    state=record.state,
+                    reason="run state neither terminal nor resumable; starting over",
+                )
         self._settle_offline_overrides()
 
     def _settle_offline_overrides(self) -> None:
@@ -1132,12 +1514,22 @@ class DaemonLoop:
             now = self.clock()
             if item.state == "abandoned" and item.run_id == run_id:
                 self._close_dead_run(run_id, "abandoned", now)
-                self._notify(f"recovery: {item_id} abandoned offline; run {run_id} closed")
+                self._notify(
+                    f"recovery: {item_id} abandoned offline; run {run_id} closed",
+                    "recovery.offline_abandon",
+                    item=item_id,
+                    run=run_id,
+                )
             elif item.state == "queued" and item.run_id != run_id:
                 # Requeued (unpinned) offline: the run is dead and will not be
                 # resumed — close its ledger and drop its sandboxes.
                 self._close_dead_run(run_id, "requeued", now)
-                self._notify(f"recovery: {item_id} requeued offline; run {run_id} closed")
+                self._notify(
+                    f"recovery: {item_id} requeued offline; run {run_id} closed",
+                    "recovery.offline_requeue",
+                    item=item_id,
+                    run=run_id,
+                )
             # A queued item still pinned to this run is a pending resume; a
             # running one was reconciled above.
         self._deliver_pending_reports()
@@ -1154,10 +1546,17 @@ class DaemonLoop:
             name = sandbox_name(run_id, role)
             try:
                 remove_run_sandbox(self.sbx, name, role)
-                self._notify(f"recovery: removed stale sandbox {name} (and its secrets)")
+                self._notify(
+                    f"recovery: removed stale sandbox {name} (and its secrets)",
+                    "recovery.stale_sandbox_removed",
+                    run=run_id,
+                    sandbox=name,
+                    role=role,
+                )
             except SbxError:
                 # No such sandbox — the common case — but a secret may
                 # still linger from a rollback race; clearing it is cheap.
+                log.debug("recovery.no_stale_sandbox", run=run_id, sandbox=name, role=role)
                 remove_run_sandbox_secrets(self.sbx, name, role)
 
     def _result_from_record(self, run_id: str) -> RunResult:
@@ -1177,17 +1576,27 @@ class DaemonLoop:
         """The GitHub repo filed refs point into (``gh:12`` → a link)."""
         return self.config.github.repo
 
-    def _notify(self, text: str) -> None:
-        logger.info("%s", text)
+    def _notify(
+        self, text: str, event: str = "daemon.notice", *, level: str = "info", **fields: Any
+    ) -> None:
+        """Narrate to the humans (Discord) *and* the journal: ``text`` is the
+        prose the frontend shows; ``event`` and ``fields`` are the structured
+        record the log keeps (``level`` picks its severity)."""
+        getattr(log, level)(event, text=text, **fields)
         if self.frontend is not None:
             try:
                 self.frontend.daemon_event(text)
             except Exception:
-                logger.debug("frontend daemon_event failed", exc_info=True)
+                log.warning("frontend.daemon_event_failed", notice=event, exc_info=True)
 
     def _frontend_finished(self, item: WorkItem, report: RunReport) -> None:
         if self.frontend is not None:
             try:
                 self.frontend.run_finished(item, report)
             except Exception:
-                logger.warning("frontend run_finished failed", exc_info=True)
+                log.warning(
+                    "frontend.run_finished_failed",
+                    item=item.item_id,
+                    run=report.run_id,
+                    exc_info=True,
+                )

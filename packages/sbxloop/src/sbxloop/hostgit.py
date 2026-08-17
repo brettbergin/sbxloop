@@ -18,7 +18,6 @@ behind that probe.
 
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import subprocess
@@ -31,8 +30,9 @@ from typing import Literal
 from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
 
 from sbxloop.errors import DeliveryError, ProvisionError
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # Ref pinning the commit a run clone was cut from. Lives inside the clone's
 # own .git so it survives resumes and travels nowhere else (refs outside
@@ -241,7 +241,7 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
         except (subprocess.CalledProcessError, OSError):
             # Not a usable repo (a bare `.git` marker, corrupt HEAD, …):
             # fall through to the self-contained probe.
-            logger.debug("in-place gitignore probe failed in %s", root, exc_info=True)
+            log.debug("in-place gitignore probe failed in %s", root, exc_info=True)
     try:
         with tempfile.TemporaryDirectory(prefix="sbxloop-gitignore-") as tmp:
             subprocess.run(  # nosec B603 - list argv, git binary, no shell
@@ -251,9 +251,7 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
             env["GIT_WORK_TREE"] = str(root)
             return _ls_files(argv, root, env)
     except (subprocess.CalledProcessError, OSError):
-        logger.warning(
-            "gitignore probe failed in %s; ignore rules not applied", root, exc_info=True
-        )
+        log.warning("gitignore probe failed in %s; ignore rules not applied", root, exc_info=True)
         return None
 
 

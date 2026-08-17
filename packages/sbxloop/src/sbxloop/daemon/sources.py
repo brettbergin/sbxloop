@@ -19,7 +19,6 @@ mistaking an outage for an empty queue.
 from __future__ import annotations
 
 import hashlib
-import logging
 import re
 import socket
 import time
@@ -33,8 +32,9 @@ from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
 from sbxloop.daemon.postmortem import postmortem_marker
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
 from sbxloop.gh.ops import GithubOps
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # A file still being written must not be claimed half-way; operators are
 # told to write elsewhere and rename, but a small mtime guard costs nothing.
@@ -190,7 +190,7 @@ class InboxSource:
                 "\n".join(lines) + "\n"
             )
         except OSError:
-            logger.warning("inbox: could not record result for %s", item.source_key, exc_info=True)
+            log.warning("inbox: could not record result for %s", item.source_key, exc_info=True)
 
     def report_success(self, item: WorkItem, report: RunReport) -> None:
         self._finish(item, "done", _report_lines(report))
@@ -201,9 +201,7 @@ class InboxSource:
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
         # The file stays in running/ across retries; only the terminal move
         # records an outcome.
-        logger.info(
-            "inbox: %s failed (%s); %d attempt(s) left", item.source_key, error, attempts_left
-        )
+        log.info("inbox: %s failed (%s); %d attempt(s) left", item.source_key, error, attempts_left)
 
     def report_abandoned(self, item: WorkItem, error: str) -> None:
         self._finish(item, "failed", [f"Abandoned after retries: {error}"])
@@ -211,7 +209,7 @@ class InboxSource:
     def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
         if report.requeued:
             # Still work: the file stays in running/, like a retry.
-            logger.info("inbox: %s cancelled and re-queued", item.source_key)
+            log.info("inbox: %s cancelled and re-queued", item.source_key)
             return
         self._finish(item, "failed", _cancel_lines(report))
 
@@ -226,7 +224,7 @@ class InboxSource:
                 src.replace(self._dir("running") / item.source_key)
                 note.unlink(missing_ok=True)
         except OSError:
-            logger.warning("inbox: could not requeue %s", item.source_key, exc_info=True)
+            log.warning("inbox: could not requeue %s", item.source_key, exc_info=True)
 
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         fingerprint = hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()[:8]
@@ -312,7 +310,7 @@ class GitHubIssueSource:
         try:
             return fn(self._ops())
         except (GithubOpsError, WorkerError, SbxError) as exc:
-            logger.warning("github source: %s failed for %s", what, self.repo, exc_info=True)
+            log.warning("github source: %s failed for %s", what, self.repo, exc_info=True)
             self._failed(exc)
             return None
 
@@ -423,7 +421,7 @@ class GitHubIssueSource:
             )
             comment_id, first_token = self._first_claim(ops, number, epoch, token)
             if first_token != token:
-                logger.info(
+                log.info(
                     "github source: lost the claim race for #%s (claim %s was first)",
                     number,
                     first_token,
@@ -434,7 +432,7 @@ class GitHubIssueSource:
             added_in_progress = True
             self._remove_label(ops, number, trigger)
         except (GithubOpsError, WorkerError, SbxError) as exc:
-            logger.warning("github source: claim failed for #%s", number, exc_info=True)
+            log.warning("github source: claim failed for #%s", number, exc_info=True)
             self._failed(exc)
             if added_in_progress:
                 # Best-effort: leave the issue exactly as we found it.
