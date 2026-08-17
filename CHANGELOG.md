@@ -42,7 +42,15 @@ All notable changes to sbxloop are documented here. The project adheres to
   reads: outcome, tasks, tracking issue / PR / delivery error, guidance,
   the run's Discord thread) and `github_get` (PR / files / diff / issue /
   comments / file reads through the github-ops sandbox, configured repo
-  only, on when `[concierge] github_tools`). The Discord routing follows.
+  only, on when `[concierge] github_tools`).
+- Discord: **@mention the bot (or reply to it) in the control channel to
+  talk to the concierge.** Routing is a pure function
+  (`sbxloop.daemon.discord_routing.route_message`: command / concierge /
+  steer / ignore); the reply is threaded under the question, split at
+  paragraph and fence boundaries, with ⏳ → ✅/⚠ reactions and one edited
+  `🛠 concierge: sbx_control(status) · run_detail(r7…)` audit line naming
+  every tool used. The daemon wiring that attaches a concierge to the
+  bridge follows; without one, a mention answers "chat is off".
 - Foundations for the Discord concierge (the control channel's agent,
   landing in follow-up PRs): `[concierge]` config (`ConciergeConfig`, in
   the `sbxloop init` template), `DaemonStore.get_value` / `set_value` on
@@ -83,6 +91,12 @@ All notable changes to sbxloop are documented here. The project adheres to
   credential-named fields.
 
 ### Changed
+
+- Discord: a plain (non-command, non-mention) message in the control
+  channel is now **ignored** — the canned "type in the run's thread to
+  steer" reply is gone; people can talk among themselves, and the concierge
+  explains where steering happens when asked. `!sbx <unknown verb>` now
+  also suggests @mentioning the bot.
 
 - Daemon-path operator narration moved from Rich `console.print` on stdout
   to the log (validation errors, the state-dir line, "daemon interrupted"),
