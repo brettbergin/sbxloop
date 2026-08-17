@@ -49,8 +49,9 @@ All notable changes to sbxloop are documented here. The project adheres to
   steer / ignore); the reply is threaded under the question, split at
   paragraph and fence boundaries, with ⏳ → ✅/⚠ reactions and one edited
   `🛠 concierge: sbx_control(status) · run_detail(r7…)` audit line naming
-  every tool used. The daemon wiring that attaches a concierge to the
-  bridge follows; without one, a mention answers "chat is off".
+  every tool used. `sbxloop daemon` wires it when `[discord]` and
+  `[concierge]` are enabled (not with `--once`), warms the sandbox up in
+  the background, and `sbxloop doctor` grows a "discord concierge" row.
 - Foundations for the Discord concierge (the control channel's agent,
   landing in follow-up PRs): `[concierge]` config (`ConciergeConfig`, in
   the `sbxloop init` template), `DaemonStore.get_value` / `set_value` on

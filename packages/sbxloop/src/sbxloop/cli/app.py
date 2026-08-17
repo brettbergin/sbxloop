@@ -1434,6 +1434,8 @@ def daemon(
     daemon instead."""
     if ctx.invoked_subcommand is not None:
         return
+    from sbxloop.daemon.agentbox import DaemonAgent
+    from sbxloop.daemon.concierge import Concierge
     from sbxloop.daemon.control import ControlServer
     from sbxloop.daemon.discord import DiscordBridge
     from sbxloop.daemon.github import DaemonGithub
@@ -1514,8 +1516,10 @@ def daemon(
     bus.subscribe(event_log_subscriber)
     sources: list[WorkSource] = []
     github: DaemonGithub | None = None
+    inbox_source: InboxSource | None = None
     if inbox_active:
-        sources.append(InboxSource(Path(config.daemon.inbox_dir)))
+        inbox_source = InboxSource(Path(config.daemon.inbox_dir))
+        sources.append(inbox_source)
     if github_active:
         assert config.github.repo is not None
         github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
@@ -1568,6 +1572,7 @@ def daemon(
         review_deliveries=config.daemon.review_deliveries,
         discord=("on" if config.discord.enabled else "off"),
         discord_channel=config.discord.channel_id if config.discord.enabled else None,
+        concierge=("on" if config.discord.enabled and config.concierge.enabled else "off"),
         log_level=config.daemon.log_level,
         log_format=config.daemon.log_format,
         once=once,
@@ -1605,6 +1610,7 @@ def daemon(
 
     loop = DaemonLoop(config, store=store, dstore=dstore, sources=sources, sbx=sbx)
     bridge: DiscordBridge | None = None
+    concierge: Concierge | None = None
     if config.discord.enabled:
         try:
             bridge = DiscordBridge(config, dstore, loop_ref=loop)
@@ -1613,6 +1619,26 @@ def daemon(
             log.error("discord.bridge_failed", error=str(exc), exc_info=True)
             raise typer.Exit(2) from exc
         loop.frontend = bridge
+        if config.concierge.enabled and not once:
+            # The control channel's agent: its own event bus (the log sink
+            # sees its turns like any agent session) and a long-lived agent
+            # sandbox provisioned in the background, so the first mention
+            # does not pay the microVM boot. Built after the bridge so a
+            # missing bot token exits before any sandbox work starts.
+            concierge_bus = EventBus()
+            concierge_bus.subscribe(event_log_subscriber)
+            concierge = Concierge(
+                config,
+                loop=loop,
+                dstore=dstore,
+                store_factory=lambda: _store(config),
+                inbox=inbox_source,
+                github=github,
+                host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
+                bus=concierge_bus,
+            )
+            bridge.concierge = concierge
+            concierge.warm_up()
 
     ctl = ControlServer(loop, config.state_dir)
     cleanup_registry.install_handlers()
@@ -1653,6 +1679,11 @@ def daemon(
         if bridge is not None:
             log.debug("daemon.shutdown", step="discord bridge")
             bridge.close()
+        if concierge is not None:
+            # Forgets the handle; the concierge sandbox itself is kept for
+            # the next daemon process (conversation memory lives in it).
+            log.debug("daemon.shutdown", step="concierge")
+            concierge.close()
         if github is not None:
             log.debug("daemon.shutdown", step="github sandbox")
             github.close()

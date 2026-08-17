@@ -331,6 +331,25 @@ def collect_checks(
                 hard=False,
             )
         )
+        # ...and its concierge: an agent session on the daemon host's behalf,
+        # so the agent token must be here (the run pair needs it too, but a
+        # Discord-only operator may not have noticed).
+        if config.concierge.enabled:
+            has_token = bool(env.get("COPILOT_GITHUB_TOKEN"))
+            checks.append(
+                Check(
+                    "discord concierge",
+                    has_token,
+                    f"model {config.concierge.model or config.model}, "
+                    f"{config.concierge.timeout_s:.0f}s per message: "
+                    + (
+                        "COPILOT_GITHUB_TOKEN present"
+                        if has_token
+                        else "COPILOT_GITHUB_TOKEN not set (mentions will fail)"
+                    ),
+                    hard=False,
+                )
+            )
 
     # worker wheel
     wheel = resolve_worker_wheel()
