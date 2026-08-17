@@ -410,9 +410,8 @@ class TestInvocationLogging:
         import logging
 
         fake_sbx.fail_next("rm", returncode=1, stderr="no such sandbox")
-        with caplog.at_level(logging.DEBUG, logger="sbxloop.sbx.cli"):
-            with pytest.raises(SbxError):
-                cli.rm("nope")
+        with caplog.at_level(logging.DEBUG, logger="sbxloop.sbx.cli"), pytest.raises(SbxError):
+            cli.rm("nope")
         (line,) = [r.getMessage() for r in caplog.records if "sbx.invoke" in r.getMessage()]
         assert "'command': 'rm'" in line and "'rc': 1" in line
         assert "no such sandbox" in line
