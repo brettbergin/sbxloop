@@ -96,6 +96,20 @@ def redact_secrets(
     return event_dict
 
 
+def drop_none_fields(
+    _logger: Any, _method: str, event_dict: structlog.typing.EventDict
+) -> structlog.typing.EventDict:
+    """Drop keys whose value is ``None``.
+
+    Call sites pass optional facts straight through (``error=result.error``,
+    ``cwd=job.cwd``, ``template=spec.template``); an absent fact rendered
+    as ``error=None cwd=None template=None`` on every line is noise that
+    hides the fields that do carry information. Absence is the record."""
+    for key in [k for k, v in event_dict.items() if v is None]:
+        del event_dict[key]
+    return event_dict
+
+
 def bind_run(run_id: str, item_id: str | None = None, **extra: Any) -> None:
     """Stamp ``run=`` (and ``item=``) on every record logged from this
     thread until :func:`clear_run`. Context vars do not cross
@@ -135,6 +149,7 @@ def configure_logging(
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         redact_secrets,
+        drop_none_fields,
     ]
     structlog.configure(
         processors=[

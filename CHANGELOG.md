@@ -125,6 +125,9 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Logging: fields whose value is `None` are dropped before rendering
+  (`sbxloop.log.drop_none_fields`) — `worker.job_done … error=None exit_code=None`, `job_submit … cwd=None`, `provision_start … template=None` and every host event's `job=None` no longer clutter the
+  daemon's log; absence is the record.
 - Audit runs no longer sink on a verify command they never needed: the
   audit contract now tells the planner an audit changes no code and needs
   no `verify_commands` (never the project's suite/build/lint — field failure
