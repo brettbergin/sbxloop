@@ -27,6 +27,31 @@ All notable changes to sbxloop are documented here. The project adheres to
   `ok=false` answers the model can read. `WorkerClient.verify_installed()`
   is the cheap "is a matching worker already in this sandbox?" probe for
   reusing a long-lived sandbox.
+- **Discord concierge** core — the control channel's agent
+  (`sbxloop.daemon.concierge.Concierge`, prompt
+  `engine/prompts/concierge.md`). It runs as a Copilot session in the
+  daemon's long-lived agent sandbox and reaches the daemon only through
+  host tools; this PR ships the service (one turn at a time; the SDK
+  session resumed message after message with its id in `daemon_state`,
+  rotated after `session_turns`; a dead sandbox or lost session costs one
+  retry; timeouts and a missing `COPILOT_GITHUB_TOKEN` become actionable
+  replies) with its first two tools: `sbx_control` (every `!sbx` verb via
+  the same `control.dispatch`, attributed `… (via concierge)`) and
+  `enqueue_work` (a pending inbox item), plus the inspection tools
+  `list_runs` / `run_detail` / `run_events` / `item_detail` (state-store
+  reads: outcome, tasks, tracking issue / PR / delivery error, guidance,
+  the run's Discord thread) and `github_get` (PR / files / diff / issue /
+  comments / file reads through the github-ops sandbox, configured repo
+  only, on when `[concierge] github_tools`).
+- Discord: **@mention the bot (or reply to it) in the control channel to
+  talk to the concierge.** Routing is a pure function
+  (`sbxloop.daemon.discord_routing.route_message`: command / concierge /
+  steer / ignore); the reply is threaded under the question, split at
+  paragraph and fence boundaries, with ⏳ → ✅/⚠ reactions and one edited
+  `🛠 concierge: sbx_control(status) · run_detail(r7…)` audit line naming
+  every tool used. `sbxloop daemon` wires it when `[discord]` and
+  `[concierge]` are enabled (not with `--once`), warms the sandbox up in
+  the background, and `sbxloop doctor` grows a "discord concierge" row.
 - Foundations for the Discord concierge (the control channel's agent,
   landing in follow-up PRs): `[concierge]` config (`ConciergeConfig`, in
   the `sbxloop init` template), `DaemonStore.get_value` / `set_value` on
@@ -67,6 +92,12 @@ All notable changes to sbxloop are documented here. The project adheres to
   credential-named fields.
 
 ### Changed
+
+- Discord: a plain (non-command, non-mention) message in the control
+  channel is now **ignored** — the canned "type in the run's thread to
+  steer" reply is gone; people can talk among themselves, and the concierge
+  explains where steering happens when asked. `!sbx <unknown verb>` now
+  also suggests @mentioning the bot.
 
 - Daemon-path operator narration moved from Rich `console.print` on stdout
   to the log (validation errors, the state-dir line, "daemon interrupted"),

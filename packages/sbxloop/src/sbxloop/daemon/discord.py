@@ -6,7 +6,11 @@ headline in one control channel, and relays messages typed in that thread
 to the running agent as steering — the same ``post_user_message`` /
 ``chat.reply`` contract the CLI's ``--chat`` uses (engine.py), so no
 engine changes are needed. Daemon-level events (queueing, breaker, cap,
-recovery) go to the control channel itself.
+recovery) go to the control channel itself. In the control channel,
+``!sbx <verb>`` runs an operator command and @mentioning the bot (or
+replying to it) talks to the **concierge** — the channel's agent
+(``sbxloop.daemon.concierge``); routing rules live in
+``sbxloop.daemon.discord_routing``.
 
 Two rules make this safe to bolt onto the engine:
 
@@ -31,8 +35,9 @@ import functools
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sbxloop.config import Config
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
@@ -54,14 +59,20 @@ from sbxloop.daemon.discord_format import (
     format_for_discord,
     headline_embed,
     headline_text,
+    split_markdown,
     status_embed,
 )
+from sbxloop.daemon.discord_routing import route_message
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.errors import DaemonError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.log import get_logger
+
+if TYPE_CHECKING:
+    from sbxloop.daemon.concierge import Concierge, ConciergeReply
+    from sbxloop_worker.protocol import HostToolResponse
 
 log = get_logger(__name__)
 
@@ -83,6 +94,8 @@ DIGEST_EDIT_MIN_S = 3.0
 # --once daemon can finish its run before the gateway is even up, and its
 # chronology must not end wherever the process happened to exit.
 DRAIN_WAIT_S = 20.0
+# The concierge's "🛠 …" tool-note line is edited at most this often.
+CONCIERGE_NOTE_EDIT_MIN_S = 1.5
 
 # Re-exported for callers/tests that import the formatting names from here.
 __all__ = [
@@ -115,6 +128,29 @@ class _Pending:
         self.state = "queued"
 
 
+class _ConciergeTurn:
+    """Per-turn UI state for one concierge answer (discord thread only)."""
+
+    def __init__(self, message: Any) -> None:
+        self.message = message
+        self.channel = message.channel
+        self.note: Any = None  # the "🛠 …" line, posted on the first tool call
+        self.calls: list[str] = []
+        self.failed = 0
+        self.last_edit = 0.0
+        self.edit_task: asyncio.Task[None] | None = None
+
+    def render(self) -> str:
+        shown = self.calls[-6:]
+        more = len(self.calls) - len(shown)
+        text = "🛠 concierge: " + " · ".join(shown)
+        if more > 0:
+            text += f" (+{more} earlier)"
+        if self.failed:
+            text += f" ⚠ {self.failed} failed"
+        return text
+
+
 class DiscordBridge:
     """Runs a discord.py client on its own thread; the daemon loop calls
     the ``Frontend`` methods from its threads and never blocks on Discord.
@@ -131,11 +167,14 @@ class DiscordBridge:
         loop_ref: Any = None,
         client_factory: Callable[[DiscordBridge], Any] | None = None,
         token: str | None = None,
+        concierge: Concierge | None = None,
     ) -> None:
         self.config = config
         self.discord = config.discord
         self.dstore = dstore
         self.loop_ref = loop_ref  # DaemonLoop, for !sbx commands + steering
+        # The control channel's agent (None: mentions get a "chat is off" reply).
+        self.concierge = concierge
         self.token = token if token is not None else os.environ.get(TOKEN_ENV, "")
         self._client_factory = client_factory or self._default_client
         self.client: Any = None
@@ -356,26 +395,45 @@ class DiscordBridge:
     # -- steering (called from the discord thread) --------------------------------
 
     def _handle_message(self, message: Any) -> None:
-        """Route an inbound Discord message: command, steering, or ignore."""
-        if getattr(getattr(message, "author", None), "bot", False):
-            return
-        text = str(getattr(message, "content", "") or "").strip()
-        channel = getattr(message, "channel", None)
-        channel_id = getattr(channel, "id", None)
-        if channel_id == self.discord.channel_id:
-            if text.startswith(self.discord.command_prefix):
-                self._schedule(
-                    self._command(message, text[len(self.discord.command_prefix) :].strip())
-                )
-            elif text:
-                # A plain message in the control channel is almost always
-                # someone trying to steer (field: "hello there" in the
-                # channel while a run was live). Point them at the thread.
-                self._schedule(self._hint_where_to_steer(message))
-            return
-        if channel_id is None:
-            return
-        thread_id = int(channel_id)
+        """Route an inbound Discord message: command, concierge, steering, or ignore."""
+        channel_id = getattr(getattr(message, "channel", None), "id", None)
+        route = route_message(
+            content=str(getattr(message, "content", "") or ""),
+            channel_id=int(channel_id) if channel_id is not None else None,
+            author_is_bot=bool(getattr(getattr(message, "author", None), "bot", False)),
+            mentioned_ids=frozenset(
+                int(m.id) for m in getattr(message, "mentions", None) or () if hasattr(m, "id")
+            ),
+            reply_to_bot=self._is_reply_to_bot(message),
+            control_channel_id=self.discord.channel_id,
+            prefix=self.discord.command_prefix,
+            bot_user_id=self._bot_user_id(),
+        )
+        if route.kind == "command":
+            self._schedule(self._command(message, route.text))
+        elif route.kind == "concierge":
+            self._schedule(self._concierge_turn(message, route.text))
+        elif route.kind == "steer":
+            assert channel_id is not None
+            self._steer(message, int(channel_id), route.text)
+
+    def _bot_user_id(self) -> int | None:
+        user = getattr(self.client, "user", None)
+        uid = getattr(user, "id", None)
+        return int(uid) if uid is not None else None
+
+    def _is_reply_to_bot(self, message: Any) -> bool:
+        """A reply to one of the bot's own messages counts as talking to it."""
+        bot_id = self._bot_user_id()
+        if bot_id is None:
+            return False
+        resolved = getattr(getattr(message, "reference", None), "resolved", None)
+        author_id = getattr(getattr(resolved, "author", None), "id", None)
+        return author_id is not None and int(author_id) == bot_id
+
+    def _steer(self, message: Any, thread_id: int, text: str) -> None:
+        """A message in a run's thread: relay it to the running agent."""
+        channel = message.channel
         run_id = self.dstore.run_for_thread(thread_id)
         if run_id is None:
             return
@@ -409,25 +467,100 @@ class DiscordBridge:
         self._schedule(self._react(message, "⏳"))
         self._schedule(self._post_steer_status(run_id, mid, channel))
 
-    async def _hint_where_to_steer(self, message: Any) -> None:
-        with self._lock:
-            run_id = self._active_run
-            item = self._active_item
-        if run_id is not None and item is not None:
-            known = self.dstore.discord_thread(run_id)
-            where = f"<#{known.thread_id}>" if known else f"the thread for {code(run_id)}"
-            text = (
-                f"To steer the running agent, type inside its thread: {where} "
-                f"({code(run_id)} — {_one_line(item.title, 80)}). Daemon commands start with "
-                f"`{self.discord.command_prefix}` (try `{self.discord.command_prefix} status`)."
+    # -- concierge (the control channel's agent) --------------------------------------
+
+    async def _concierge_turn(self, message: Any, text: str) -> None:
+        channel = message.channel
+        prefix = self.discord.command_prefix
+        if self.concierge is None:
+            await self._send(
+                channel,
+                f"chat is off for this daemon — use `{prefix} status` and friends "
+                "(`[concierge] enabled` turns the agent on).",
+                reply_to=message,
             )
-        else:
-            text = (
-                "Nothing is running right now. Steering happens inside a run's thread once "
-                f"one starts; daemon commands start with `{self.discord.command_prefix}` "
-                f"(try `{self.discord.command_prefix} status`)."
+            return
+        await self._react(message, "⏳")
+        turn = _ConciergeTurn(message)
+        behind = self.concierge.pending
+        if behind > 0:
+            await self._send(channel, f"⏳ queued behind {behind} other question(s)…")
+
+        def on_tool(name: str, args: dict[str, Any], response: HostToolResponse) -> None:
+            self._schedule(self._concierge_tool_note(turn, name, args, response))
+
+        author = _author_name(message)
+        log.info("discord.concierge_turn", by=author, chars=len(text))
+        try:
+            async with _typing(channel):
+                future = self.concierge.submit_turn(text, author=author, on_tool=on_tool)
+                reply = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A closed concierge (shutdown race) or a lost future: say so, once.
+            log.warning("discord.concierge_turn_failed", by=author, error=str(exc), exc_info=True)
+            await self._react(message, "⚠")
+            await self._send(channel, f"⚠ concierge: {_one_line(str(exc), 300)}", reply_to=message)
+            return
+        await self._finish_concierge_note(turn)
+        await self._post_concierge_reply(message, reply)
+
+    async def _post_concierge_reply(self, message: Any, reply: ConciergeReply) -> None:
+        channel = message.channel
+        if not reply.ok:
+            await self._react(message, "⚠")
+            await self._send(
+                channel, f"⚠ concierge: {reply.error or 'no answer'}", reply_to=message
             )
-        await self._send(message.channel, text)
+            return
+        text = reply.text or "(the concierge had nothing to say)"
+        first = True
+        for chunk in split_markdown(text, self.discord.max_message_chars):
+            await self._send(channel, chunk, reply_to=message if first else None)
+            first = False
+        await self._react(message, "✅")
+
+    async def _concierge_tool_note(
+        self, turn: _ConciergeTurn, name: str, args: dict[str, Any], response: HostToolResponse
+    ) -> None:
+        """One edited line per turn listing the tools the concierge used —
+        the audit trail for actions taken without a confirmation step."""
+        if self.discord.chronology_level == "quiet":
+            return
+        turn.calls.append(_tool_call_summary(name, args))
+        if not response.ok:
+            turn.failed += 1
+        if turn.note is None:
+            turn.note = await self._send(turn.channel, turn.render(), suppress_embeds=True)
+            turn.last_edit = time.monotonic()
+            return
+        self._schedule_note_edit(turn)
+
+    def _schedule_note_edit(self, turn: _ConciergeTurn) -> None:
+        if turn.edit_task is not None and not turn.edit_task.done():
+            return
+        turn.edit_task = asyncio.ensure_future(self._note_edit_later(turn))
+
+    async def _note_edit_later(self, turn: _ConciergeTurn) -> None:
+        wait = CONCIERGE_NOTE_EDIT_MIN_S - (time.monotonic() - turn.last_edit)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        await self._edit_concierge_note(turn)
+
+    async def _edit_concierge_note(self, turn: _ConciergeTurn) -> None:
+        if turn.note is None:
+            return
+        try:
+            await turn.note.edit(content=_clip(turn.render(), self.discord.max_message_chars))
+            turn.last_edit = time.monotonic()
+        except Exception:
+            log.warning("discord.concierge_note_edit_failed", exc_info=True)
+
+    async def _finish_concierge_note(self, turn: _ConciergeTurn) -> None:
+        if turn.edit_task is not None and not turn.edit_task.done():
+            turn.edit_task.cancel()
+        await self._edit_concierge_note(turn)
 
     async def _command(self, message: Any, cmd: str) -> None:
         loop = self.loop_ref
@@ -453,9 +586,10 @@ class DiscordBridge:
         if reply.status is not None:
             await self._send(channel, reply.text, embed=status_embed(reply.status))
         elif not reply.known:
-            await self._send(
-                channel, f"{reply.text} — or type in a run's thread to steer that run."
-            )
+            hint = " — or type in a run's thread to steer that run"
+            if self.concierge is not None:
+                hint += ", or @mention me to ask in plain language"
+            await self._send(channel, f"{reply.text}{hint}.")
         else:
             await self._send(channel, reply.text, suppress_embeds=True)
 
@@ -985,12 +1119,19 @@ class DiscordBridge:
         *,
         embed: EmbedSpec | None = None,
         suppress_embeds: bool = False,
+        reply_to: Any = None,
     ) -> Any:
         """The single send seam: content is clipped, mentions are always
         disabled (agent prose can contain @everyone), embeds are converted
-        here and dropped — text-only retry — if Discord rejects them."""
+        here and dropped — text-only retry — if Discord rejects them.
+        ``reply_to`` threads the message under a human's message
+        (``send(reference=…)``); if Discord rejects the reference the text
+        is sent plainly instead."""
         content = _clip(text, self.discord.max_message_chars) if text else None
         kwargs: dict[str, Any] = {}
+        if reply_to is not None:
+            kwargs["reference"] = reply_to
+            kwargs["mention_author"] = False
         mentions = _allowed_mentions_none()
         if mentions is not None:
             kwargs["allowed_mentions"] = mentions
@@ -1008,6 +1149,16 @@ class DiscordBridge:
             return await target.send(content, **kwargs)
         except Exception:
             target_id = getattr(target, "id", None)
+            if "reference" in kwargs:
+                # A deleted/unknown message reference fails the send outright;
+                # answer in the channel instead of not at all.
+                kwargs.pop("reference")
+                kwargs.pop("mention_author", None)
+                try:
+                    return await target.send(content, **kwargs)
+                except Exception:
+                    log.warning("discord.reply_send_failed", target=target_id, exc_info=True)
+                    return None
             if "embed" in kwargs and embed is not None:
                 log.warning(
                     "discord.embed_send_failed",
@@ -1173,6 +1324,37 @@ class DiscordBridge:
         client.event(on_resumed)
         client.event(on_message)
         return client
+
+
+class _NoTyping:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _typing(channel: Any) -> Any:
+    """``channel.typing()`` when the client offers it, else a no-op context."""
+    typing = getattr(channel, "typing", None)
+    if callable(typing):
+        try:
+            return typing()
+        except Exception:
+            return _NoTyping()
+    return _NoTyping()
+
+
+def _tool_call_summary(name: str, args: dict[str, Any]) -> str:
+    """``sbx_control(status)`` / ``run_detail(r1abc)`` — the one-argument
+    shape covers most concierge tools; anything else is key=value."""
+    if not args:
+        return f"{name}()"
+    if len(args) == 1:
+        (value,) = args.values()
+        return f"{name}({_one_line(str(value), 40)})"
+    inner = ", ".join(f"{k}={_one_line(str(v), 24)}" for k, v in args.items())
+    return f"{name}({_one_line(inner, 60)})"
 
 
 def _author_name(message: Any) -> str:
