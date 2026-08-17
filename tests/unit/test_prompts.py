@@ -228,7 +228,27 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "user_guidance": "(none)",
         "user_message": "how is it going?",
     },
+    "concierge": {
+        "command_prefix": "!sbx",
+        "repo": "owner/repo",
+        "inbox_dir": ".sbxloop/inbox",
+        "model": "auto",
+        "tool_notes": "- `sbx_control` — run a verb",
+        "daemon_notes": "- poll interval 60s",
+    },
 }
+
+
+def test_concierge_prompt_carries_contract() -> None:
+    """The concierge is trusted with the operator surface: the prompt must
+    name its tools, keep steering in the run thread, and forbid claiming
+    actions it did not perform (see the template header)."""
+    text = render("concierge", **RENDER_CONTEXTS["concierge"])
+    assert text.startswith("# You are the sbxloop concierge")
+    assert "`sbx_control`" in text and "`enqueue_work`" in text
+    assert "thread" in text and "not here" in text
+    assert "Never claim to have done something you did not do" in text
+    assert "!sbx" in text  # the configured prefix reaches the model
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:
