@@ -37,8 +37,12 @@ All notable changes to sbxloop are documented here. The project adheres to
   retry; timeouts and a missing `COPILOT_GITHUB_TOKEN` become actionable
   replies) with its first two tools: `sbx_control` (every `!sbx` verb via
   the same `control.dispatch`, attributed `… (via concierge)`) and
-  `enqueue_work` (a pending inbox item). Inspection tools and the Discord
-  routing follow.
+  `enqueue_work` (a pending inbox item), plus the inspection tools
+  `list_runs` / `run_detail` / `run_events` / `item_detail` (state-store
+  reads: outcome, tasks, tracking issue / PR / delivery error, guidance,
+  the run's Discord thread) and `github_get` (PR / files / diff / issue /
+  comments / file reads through the github-ops sandbox, configured repo
+  only, on when `[concierge] github_tools`). The Discord routing follows.
 - Foundations for the Discord concierge (the control channel's agent,
   landing in follow-up PRs): `[concierge]` config (`ConciergeConfig`, in
   the `sbxloop init` template), `DaemonStore.get_value` / `set_value` on
