@@ -49,6 +49,15 @@ class TestClassification:
         assert [v.orphan for v in verdicts] == [False, False]
         assert all("unrecognized" in v.reason for v in verdicts)
 
+    def test_daemon_owned_names_are_reported_not_pruned(self, store: StateStore) -> None:
+        verdicts = classify_sandboxes(
+            [info("sbxloop-daemon-github-0badf00d"), info("sbxloop-concierge-0badf00d")],
+            store,
+            min_age_s=0.0,
+        )
+        assert [v.orphan for v in verdicts] == [False, False]
+        assert all("daemon-owned" in v.reason for v in verdicts)
+
     def test_unknown_run_is_orphan_with_multi_host_honesty(self, store: StateStore) -> None:
         (verdict,) = classify_sandboxes([info("sbxloop-rabc12345-agent")], store)
         assert verdict.orphan

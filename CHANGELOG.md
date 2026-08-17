@@ -27,6 +27,17 @@ All notable changes to sbxloop are documented here. The project adheres to
   `ok=false` answers the model can read. `WorkerClient.verify_installed()`
   is the cheap "is a matching worker already in this sandbox?" probe for
   reusing a long-lived sandbox.
+- `Provisioner.ensure_agent_only` / `agent_only_spec`: one agent-role
+  sandbox (Copilot token, no `GH_TOKEN`, prompt-advertised baseline allows)
+  outside a run's pair, sharing `ensure_github_only`'s fail-fast/rollback
+  path. `sbxloop.daemon.agentbox.DaemonAgent` wraps it as the daemon's
+  long-lived **concierge sandbox** (`sbxloop-concierge-<state-dir digest>`):
+  provisioned lazily, dropped and re-provisioned on failure at most once
+  per five minutes, and — unlike the github-ops box — **reused across
+  daemon restarts** when `verify_installed()` still matches this host (the
+  SDK's session store, i.e. the concierge's memory, lives inside the VM).
+  `sbxloop sandbox prune` reports both daemon-owned families and never
+  touches them; `sbxloop sandbox rm` removes them explicitly.
 - The daemon's log is structured ([structlog](https://www.structlog.org/)
   routed through the standard library, `sbxloop.log`) and configurable:
   `--log-level` / `[daemon] log_level` / `SBXLOOP_DAEMON__LOG_LEVEL`
