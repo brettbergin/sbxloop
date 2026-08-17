@@ -91,17 +91,52 @@ def usage(prefix: str) -> str:
     return f"commands: `{prefix} {'|'.join(COMMANDS)}`"
 
 
-def dispatch(loop: Any, cmd: str, *, prefix: str = "!sbx", by: str | None = None) -> CommandReply:
+# Read-only commands: answered constantly by dashboards and humans checking
+# in, so they trace at DEBUG; every mutating command is an INFO audit line.
+_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items"})
+
+
+def dispatch(
+    loop: Any,
+    cmd: str,
+    *,
+    prefix: str = "!sbx",
+    by: str | None = None,
+    via: str = "ctl",
+) -> CommandReply:
     """Run one operator command against the daemon loop.
 
     ``loop`` is a :class:`~sbxloop.daemon.loop.DaemonLoop` (or a fake with
     the same control surface); ``cmd`` is the text after the prefix;
     ``prefix`` is only echoed in the usage line; ``by`` names the operator
-    for the source-facing attribution of cancel/retry (#246).
+    for the source-facing attribution of cancel/retry (#246); ``via`` says
+    which channel carried it (``ctl`` / ``discord``) for the audit line.
+
+    Every command leaves a host-side record — who asked for what, over
+    which channel, and whether it was accepted — so a cancel or abandon
+    seen on the source can always be traced back in the journal.
     """
     words = cmd.split()
     word = words[0].lower() if words else ""
     args = words[1:]
+    reply = _dispatch(loop, word, args, prefix=prefix, by=by)
+    level = "debug" if word in _READ_ONLY_COMMANDS and reply.ok else "info"
+    getattr(log, level)(
+        "operator.command",
+        via=via,
+        by=by,
+        command=word or None,
+        args=args or None,
+        ok=reply.ok,
+        known=reply.known,
+        reply=reply.text[:200],
+    )
+    return reply
+
+
+def _dispatch(
+    loop: Any, word: str, args: list[str], *, prefix: str, by: str | None
+) -> CommandReply:
     if word == "status":
         s = loop.status()
         cur = s["current"]
@@ -286,11 +321,15 @@ class ControlServer:
         self._refuse_stale()
         self._thread = threading.Thread(target=self._main, name="sbxloop-daemon-ctl", daemon=True)
         self._thread.start()
+        log.debug("ctl.started", dir=str(self.dir), poll_s=self.poll_s)
 
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                log.warning("ctl.close_timeout", dir=str(self.dir))
+        log.debug("ctl.closed", dir=str(self.dir))
 
     def _requests(self) -> list[Path]:
         try:
@@ -311,10 +350,20 @@ class ControlServer:
     def _refuse_stale(self) -> None:
         # A claim left by a daemon that died mid-command: its client has long
         # since reported "pending"; nothing to answer, nothing to replay.
+        orphans = 0
         for p in self.dir.glob(f"*{_CLAIMED_SUFFIX}"):
             p.unlink(missing_ok=True)
-        for request in self._requests():
+            orphans += 1
+        stale = self._requests()
+        for request in stale:
             self._answer(request, self._STALE)
+        if orphans or stale:
+            log.warning(
+                "ctl.stale_requests_refused",
+                refused=len(stale),
+                orphaned_claims=orphans,
+                hint="submitted before this daemon started; resend",
+            )
 
     def _is_stale(self, payload: dict[str, Any]) -> bool:
         # No stamp (hand-written file) counts as stale: executing a command
@@ -337,25 +386,30 @@ class ControlServer:
             try:
                 request.rename(claimed)
                 payload = json.loads(claimed.read_text())
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
                 # Withdrawn between listing and claiming, or half-written.
+                log.warning("ctl.request_dropped", request=request.name, error=str(exc))
                 claimed.unlink(missing_ok=True)
                 continue
             request = claimed
             cmd = str(payload.get("cmd", ""))
+            by = str(payload.get("by") or "sbxloop daemon ctl")
             if self._is_stale(payload):
+                log.warning(
+                    "ctl.stale_request_refused",
+                    by=by,
+                    command=cmd[:200],
+                    submitted_at=payload.get("submitted_at"),
+                )
                 self._answer(request, self._STALE)
                 served += 1
                 continue
             try:
                 reply = dispatch(
-                    self.loop,
-                    cmd,
-                    prefix=str(payload.get("prefix", "!sbx")),
-                    by=str(payload.get("by") or "sbxloop daemon ctl"),
+                    self.loop, cmd, prefix=str(payload.get("prefix", "!sbx")), by=by, via="ctl"
                 )
             except Exception as exc:  # a broken command must not kill the server
-                log.warning("ctl command %r failed", cmd, exc_info=True)
+                log.warning("ctl.command_crashed", by=by, command=cmd[:200], exc_info=True)
                 reply = CommandReply(f"error: {exc}", ok=False)
             self._answer(request, reply)
             served += 1
@@ -370,9 +424,13 @@ class ControlServer:
 
     def _sweep_replies(self) -> None:
         cutoff = time.time() - _REPLY_TTL_S
+        swept = 0
         try:
             for p in self.dir.iterdir():
                 if p.name.endswith(_REPLY_SUFFIX) and p.stat().st_mtime < cutoff:
                     p.unlink(missing_ok=True)
+                    swept += 1
         except FileNotFoundError:
             pass
+        if swept:
+            log.debug("ctl.replies_swept", swept=swept, ttl_s=_REPLY_TTL_S)

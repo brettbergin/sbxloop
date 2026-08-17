@@ -87,6 +87,7 @@ def collect_tool_findings(
         try:
             title, body = parse_markdown_item(path.read_text(), path.stem)
         except OSError:
+            log.warning("backlog.finding_unreadable", run=run.run_id, path=str(path), exc_info=True)
             continue
         if filer is None:
             unfiled.append(title)
@@ -100,9 +101,7 @@ def collect_tool_findings(
         try:
             ref = filer(title, body, run.run_id)
         except Exception:
-            log.warning(
-                "tool finding %r from run %s could not be filed", title, run.run_id, exc_info=True
-            )
+            log.warning("backlog.tool_finding_failed", run=run.run_id, title=title, exc_info=True)
             unfiled.append(title)
             continue
         if ref is None:
@@ -138,9 +137,9 @@ def collect_backlog(
     """File the run's backlog items via ``source``; returns the refs filed."""
     if not run.mounted or run.workspace is None:
         log.warning(
-            "backlog skipped for run %s: workspace not mounted (agent-filed backlog "
-            "requires the mounted-workspace mode)",
-            run.run_id,
+            "backlog.skipped",
+            run=run.run_id,
+            reason="workspace not mounted; agent-filed backlog needs the mounted-workspace mode",
         )
         return []
     folder = run.workspace / BACKLOG_SUBDIR
@@ -148,13 +147,16 @@ def collect_backlog(
         return []
     filed: list[str] = []
     skipped = 0
+    seen = 0
     for path in sorted(folder.glob("*.md")):
         try:
             title, body = parse_markdown_item(path.read_text(), path.stem)
         except OSError:
+            log.warning("backlog.finding_unreadable", run=run.run_id, path=str(path), exc_info=True)
             continue
         fp = fingerprint(title, body)
         if dstore.backlog_seen(fp):
+            seen += 1
             continue
         if len(filed) >= max_items:
             skipped += 1
@@ -162,16 +164,24 @@ def collect_backlog(
         try:
             ref = source.file_backlog(title, body, run.run_id, trigger=trigger)
         except Exception:
-            log.warning("backlog: filing %r from run %s failed", title, run.run_id, exc_info=True)
+            log.warning("backlog.file_failed", run=run.run_id, title=title, exc_info=True)
             continue
         dstore.backlog_record(fp, run.run_id, ref, now)
         filed.append(ref)
+    log.debug(
+        "backlog.collected",
+        run=run.run_id,
+        filed=len(filed),
+        already_seen=seen,
+        deferred=skipped,
+        trigger=trigger,
+    )
     if skipped:
         log.warning(
-            "backlog: run %s produced %d item(s) beyond the per-run cap of %d; deferred "
-            "(not fingerprint-recorded, so the next collection pass files them)",
-            run.run_id,
-            skipped,
-            max_items,
+            "backlog.cap_deferred",
+            run=run.run_id,
+            deferred=skipped,
+            cap=max_items,
+            hint="not fingerprint-recorded, so the next collection pass files them",
         )
     return filed

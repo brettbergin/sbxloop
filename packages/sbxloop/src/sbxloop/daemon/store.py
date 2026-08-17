@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 from sbxloop.daemon.model import ItemState, WorkItem
+from sbxloop.log import get_logger
+
+log = get_logger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS daemon_work_items (
@@ -150,6 +153,16 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
     )
 
 
+def _loggable(fields: dict[str, object]) -> dict[str, object]:
+    """Column assignments as log fields: ``state`` first, long text clipped."""
+    out: dict[str, object] = {}
+    for key, value in fields.items():
+        if key == "state":
+            continue  # already logged from the re-read row
+        out[key] = value[:120] if isinstance(value, str) else value
+    return out
+
+
 class DaemonStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -165,7 +178,9 @@ class DaemonStore:
             existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 self._conn.execute(ddl)
+                log.info("store.migrated", db=str(path), table=table, column=column)
         self._conn.commit()
+        log.debug("store.opened", db=str(path))
         # One connection shared by the daemon, bridge and CLI threads:
         # sqlite3 rejects concurrent use of a connection from two threads
         # ("bad parameter or other API misuse"), so EVERY statement — reads
@@ -195,6 +210,12 @@ class DaemonStore:
                 changed = (row["title"], row["body"]) != (item.title, item.body)
                 if not (terminal and changed):
                     return False
+                log.debug(
+                    "store.item_superseded",
+                    item=row["item_id"],
+                    previous_state=row["state"],
+                    reason="terminal row, content changed",
+                )
                 self._conn.execute(
                     "DELETE FROM daemon_work_items WHERE item_id = ?", (row["item_id"],)
                 )
@@ -374,8 +395,18 @@ class DaemonStore:
             )
             self._conn.commit()
             if cursor.rowcount == 1:
-                return self._require(item_id)
-            raise ValueError(refuse(self._require(item_id)))
+                fresh = self._require(item_id)
+                log.debug("store.transition", item=item_id, state=fresh.state, **_loggable(fields))
+                return fresh
+            current = self._require(item_id)
+            log.debug(
+                "store.transition_refused",
+                item=item_id,
+                state=current.state,
+                allowed=list(allowed),
+                wanted=_loggable(fields),
+            )
+            raise ValueError(refuse(current))
 
     def pending_reports(self) -> list[WorkItem]:
         """Items whose operator decision (abandon / retry) the source has
@@ -496,6 +527,7 @@ class DaemonStore:
                 (*fields.values(), now, item_id),
             )
             self._conn.commit()
+        log.debug("store.update", item=item_id, **_loggable(fields))
 
     def set_state(self, item_id: str, state: ItemState, now: float) -> None:
         self._update(item_id, now, state=state)
@@ -551,6 +583,7 @@ class DaemonStore:
                 (now, result, run_id),
             )
             self._conn.commit()
+        log.debug("store.ledger_closed", run=run_id, result=result)
 
     # -- circuit breaker ---------------------------------------------------------
 
@@ -574,6 +607,11 @@ class DaemonStore:
         )
 
     def set_breaker(self, opened_at: float | None, consecutive_failures: int) -> None:
+        log.debug(
+            "store.breaker",
+            open=opened_at is not None,
+            consecutive_failures=consecutive_failures,
+        )
         with self._lock:
             self._conn.executemany(
                 "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",

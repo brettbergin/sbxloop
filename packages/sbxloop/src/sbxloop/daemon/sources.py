@@ -146,9 +146,11 @@ class InboxSource:
         for path in sorted(self._dir("pending").glob("*.md")):
             try:
                 if now - path.stat().st_mtime < INBOX_SETTLE_S:
+                    log.debug("inbox.settling", path=str(path), settle_s=INBOX_SETTLE_S)
                     continue
                 text = path.read_text()
             except OSError:
+                log.warning("inbox.unreadable", path=str(path), exc_info=True)
                 continue
             title, body = parse_markdown_item(text, path.stem)
             items.append(
@@ -167,9 +169,11 @@ class InboxSource:
         dst = self._dir("running") / item.source_key
         try:
             src.rename(dst)
-        except OSError:
+        except OSError as exc:
             # Deleted by the operator, or taken by another instance.
+            log.warning("inbox.claim_failed", item=item.item_id, path=str(src), error=str(exc))
             return False
+        log.debug("inbox.claimed", item=item.item_id, path=str(dst))
         return True
 
     def report_started(self, item: WorkItem, run_id: str) -> None:
@@ -190,7 +194,7 @@ class InboxSource:
                 "\n".join(lines) + "\n"
             )
         except OSError:
-            log.warning("inbox: could not record result for %s", item.source_key, exc_info=True)
+            log.warning("inbox.record_failed", item=item.item_id, target=str(dst), exc_info=True)
 
     def report_success(self, item: WorkItem, report: RunReport) -> None:
         self._finish(item, "done", _report_lines(report))
@@ -201,7 +205,7 @@ class InboxSource:
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
         # The file stays in running/ across retries; only the terminal move
         # records an outcome.
-        log.info("inbox: %s failed (%s); %d attempt(s) left", item.source_key, error, attempts_left)
+        log.info("inbox.retry", item=item.item_id, error=error, attempts_left=attempts_left)
 
     def report_abandoned(self, item: WorkItem, error: str) -> None:
         self._finish(item, "failed", [f"Abandoned after retries: {error}"])
@@ -209,7 +213,7 @@ class InboxSource:
     def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
         if report.requeued:
             # Still work: the file stays in running/, like a retry.
-            log.info("inbox: %s cancelled and re-queued", item.source_key)
+            log.info("inbox.cancelled_requeued", item=item.item_id)
             return
         self._finish(item, "failed", _cancel_lines(report))
 
@@ -224,7 +228,7 @@ class InboxSource:
                 src.replace(self._dir("running") / item.source_key)
                 note.unlink(missing_ok=True)
         except OSError:
-            log.warning("inbox: could not requeue %s", item.source_key, exc_info=True)
+            log.warning("inbox.requeue_failed", item=item.item_id, path=str(src), exc_info=True)
 
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         fingerprint = hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()[:8]
@@ -310,7 +314,7 @@ class GitHubIssueSource:
         try:
             return fn(self._ops())
         except (GithubOpsError, WorkerError, SbxError) as exc:
-            log.warning("github source: %s failed for %s", what, self.repo, exc_info=True)
+            log.warning("github.op_failed", op=what, repo=self.repo, exc_info=True)
             self._failed(exc)
             return None
 
@@ -350,13 +354,31 @@ class GitHubIssueSource:
             (self.labels.trigger, "patch"),
             (self.labels.audit, "audit"),
         )
+        started = time.monotonic()
         for label, kind in lanes:
             query = f'repo:{self.repo} is:issue is:open label:"{label}"'
+            log.debug("github.poll_start", repo=self.repo, lane=kind, label=label)
             try:
                 found = self._ops().search_issues(query, per_page=50)
             except (GithubOpsError, WorkerError, SbxError) as exc:
+                log.warning(
+                    "github.poll_failed",
+                    repo=self.repo,
+                    lane=kind,
+                    label=label,
+                    duration_s=round(time.monotonic() - started, 2),
+                    error=str(exc),
+                )
                 self._failed(exc)
                 raise
+            log.debug(
+                "github.poll_lane",
+                repo=self.repo,
+                lane=kind,
+                label=label,
+                issues=len(found),
+                duration_s=round(time.monotonic() - started, 2),
+            )
             for issue in found:
                 number = issue.get("number")
                 if not number or str(number) in seen:
@@ -373,6 +395,12 @@ class GitHubIssueSource:
                         url=str(issue.get("html_url") or ""),
                     )
                 )
+        log.debug(
+            "github.polled",
+            repo=self.repo,
+            issues=len(items),
+            duration_s=round(time.monotonic() - started, 2),
+        )
         return items
 
     def claim(self, item: WorkItem) -> bool:
@@ -400,15 +428,30 @@ class GitHubIssueSource:
         trigger = self.labels.trigger_for(item.kind)
         added_in_progress = False
         comment_id: int | None = None
+        started = time.monotonic()
+        log.debug("github.claim_start", item=item.item_id, repo=self.repo, trigger=trigger)
         try:
             ops = self._ops()
             issue = ops.raw("GET", self._issue_path(number))
             if not isinstance(issue, dict) or issue.get("state") != "open":
+                log.info(
+                    "github.claim_declined",
+                    item=item.item_id,
+                    reason="issue no longer open",
+                    state=issue.get("state") if isinstance(issue, dict) else None,
+                )
                 return False
             names = {
                 label.get("name") for label in issue.get("labels") or [] if isinstance(label, dict)
             }
             if trigger not in names:
+                log.info(
+                    "github.claim_declined",
+                    item=item.item_id,
+                    reason="trigger label gone (search lag or already claimed)",
+                    trigger=trigger,
+                    labels=sorted(str(n) for n in names if n),
+                )
                 return False
             stale_delivered = self.labels.delivered in names
             epoch = self._trigger_epoch(ops, number, trigger)
@@ -422,9 +465,10 @@ class GitHubIssueSource:
             comment_id, first_token = self._first_claim(ops, number, epoch, token)
             if first_token != token:
                 log.info(
-                    "github source: lost the claim race for #%s (claim %s was first)",
-                    number,
-                    first_token,
+                    "github.claim_lost_race",
+                    item=item.item_id,
+                    winner=first_token,
+                    duration_s=round(time.monotonic() - started, 2),
                 )
                 self._delete_comment_quietly(number, comment_id)
                 return False
@@ -432,7 +476,14 @@ class GitHubIssueSource:
             added_in_progress = True
             self._remove_label(ops, number, trigger)
         except (GithubOpsError, WorkerError, SbxError) as exc:
-            log.warning("github source: claim failed for #%s", number, exc_info=True)
+            log.warning(
+                "github.claim_failed",
+                item=item.item_id,
+                repo=self.repo,
+                rolling_back_label=added_in_progress,
+                duration_s=round(time.monotonic() - started, 2),
+                exc_info=True,
+            )
             self._failed(exc)
             if added_in_progress:
                 # Best-effort: leave the issue exactly as we found it.
@@ -456,6 +507,13 @@ class GitHubIssueSource:
                 "clear delivered label",
                 lambda ops: self._remove_label(ops, number, self.labels.delivered),
             )
+        log.info(
+            "github.claimed",
+            item=item.item_id,
+            repo=self.repo,
+            stale_delivered_cleared=stale_delivered,
+            duration_s=round(time.monotonic() - started, 2),
+        )
         return True
 
     def _trigger_epoch(self, ops: GithubOps, number: str, trigger: str | None = None) -> str:
@@ -651,11 +709,22 @@ class GitHubIssueSource:
         def exact(rows: list[dict[str, Any]]) -> bool:
             return any(str(r.get("title") or "") == title for r in rows)
 
+        log.debug(
+            "github.audit_issue_state",
+            repo=self.repo,
+            title=title,
+            open_matches=len(opened),
+            recent_matches=len(recent),
+        )
         return exact(opened), exact(recent)
+
+    def _filed(self, kind: str, ref: str, **fields: Any) -> str:
+        log.info("github.issue_filed", kind=kind, ref=ref, **fields)
+        return ref
 
     def file_audit(self, title: str, body: str) -> str:
         ref = self._ops().issue_create(self.repo, title, body, labels=[self.labels.audit])
-        return f"gh:{ref.number}"
+        return self._filed("audit", f"gh:{ref.number}", repo=self.repo, title=title)
 
     def file_postmortem(self, item: WorkItem, dossier: str, run_id: str) -> str:
         """Open a post-mortem as an audit-lane charter and return its ref.
@@ -670,7 +739,9 @@ class GitHubIssueSource:
             f"after `{item.item_id}` failed (run `{run_id}`).",
             labels=[self.labels.audit],
         )
-        return f"gh:{ref.number}"
+        return self._filed(
+            "post-mortem", f"gh:{ref.number}", repo=self.repo, item=item.item_id, run=run_id
+        )
 
     def file_tool_backlog(self, title: str, body: str, origin_run_id: str) -> str | None:
         """A finding about the TOOL, filed to ``tool_repo`` (None → caller notes it)."""
@@ -683,7 +754,13 @@ class GitHubIssueSource:
             f"`{self.repo}` (a finding about the tool, routed upstream).",
             labels=[self.labels.backlog],
         )
-        return f"{self.tool_repo}#{ref.number}"
+        return self._filed(
+            "tool-backlog",
+            f"{self.tool_repo}#{ref.number}",
+            repo=self.tool_repo,
+            run=origin_run_id,
+            title=title,
+        )
 
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
         """Open a review of a PR the loop just delivered, as an audit charter:
@@ -707,7 +784,14 @@ class GitHubIssueSource:
             body,
             labels=[self.labels.audit],
         )
-        return f"gh:{ref.number}"
+        return self._filed(
+            "review",
+            f"gh:{ref.number}",
+            repo=self.repo,
+            item=item.item_id,
+            run=run_id,
+            pr=pr_number,
+        )
 
     def file_backlog(self, title: str, body: str, origin_run_id: str, *, trigger: bool) -> str:
         labels = [self.labels.trigger] if trigger else [self.labels.backlog]
@@ -717,4 +801,11 @@ class GitHubIssueSource:
             f"{body}\n\n---\nFiled by sbxloop run `{origin_run_id}`.",
             labels=labels,
         )
-        return f"gh:{ref.number}"
+        return self._filed(
+            "backlog",
+            f"gh:{ref.number}",
+            repo=self.repo,
+            run=origin_run_id,
+            title=title,
+            trigger=trigger,
+        )
