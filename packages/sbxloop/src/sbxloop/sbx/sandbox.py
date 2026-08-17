@@ -20,6 +20,9 @@ SBXLOOP_DIR = f"{SANDBOX_HOME}/.sbxloop"
 JOBS_DIR = f"{SBXLOOP_DIR}/jobs"
 RESULTS_DIR = f"{SBXLOOP_DIR}/results"
 EVENTS_DIR = f"{SBXLOOP_DIR}/events"
+# Host-tool responses land under here, one directory per job
+# (``<TOOLS_DIR>/<job_id>/<call_id>.json``; see sbxloop.worker.hosttools).
+TOOLS_DIR = f"{SBXLOOP_DIR}/tools"
 ENV_FILE = f"{SBXLOOP_DIR}/env.sh"
 VENV_DIR = f"{SBXLOOP_DIR}/venv"
 VENV_PYTHON = f"{VENV_DIR}/bin/python"

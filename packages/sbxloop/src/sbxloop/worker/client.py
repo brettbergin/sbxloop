@@ -43,10 +43,12 @@ from sbxloop.sbx.sandbox import (
     EVENTS_DIR,
     JOBS_DIR,
     RESULTS_DIR,
+    TOOLS_DIR,
     VENV_DIR,
     Sandbox,
 )
 from sbxloop.sbx.sandbox import VENV_PYTHON as DEFAULT_PYTHON
+from sbxloop.worker.hosttools import HostToolBroker, HostToolHandler
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult
 
@@ -174,6 +176,9 @@ class WorkerClient:
         # can say who is speaking (the worker doesn't know which phase it
         # serves).
         self._job_agents: dict[str, str] = {}
+        # job_id -> the broker answering that job's host-tool requests
+        # (see sbxloop.worker.hosttools); registered for the life of submit().
+        self._brokers: dict[str, HostToolBroker] = {}
 
     # -- install -----------------------------------------------------------
 
@@ -292,6 +297,27 @@ class WorkerClient:
                 "worker entrypoint check failed "
                 f"(rc={smoke.returncode}, expected 64): {_output_tail(smoke)}"
             )
+
+    def verify_installed(self) -> bool:
+        """Is a matching worker already installed under ``self.python``?
+
+        The two checks the install ladder ends with — version equals the
+        host's, entrypoint exits 64 — as a cheap probe for reusing a
+        long-lived sandbox (the daemon's concierge box survives restarts;
+        a host upgrade must re-install rather than trust it).
+        """
+        try:
+            verify = self.sandbox.exec(
+                [self.python, "-c", "import sbxloop_worker; print(sbxloop_worker.__version__)"]
+            )
+        except SbxError:
+            return False
+        if not verify.ok or verify.stdout.strip() != sbxloop.__version__:
+            return False
+        try:
+            return self._entrypoint_smoke(self.python).returncode == 64
+        except SbxError:
+            return False
 
     def _entrypoint_smoke(self, python: str) -> ExecResult:
         """Run the worker entrypoint against a missing job file; a healthy
@@ -606,7 +632,39 @@ class WorkerClient:
 
     # -- submit ------------------------------------------------------------
 
-    def submit(self, job: JobRequest, *, agent: str | None = None) -> JobResult:
+    def submit(
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        tool_handler: HostToolHandler | None = None,
+    ) -> JobResult:
+        """Run one job to completion.
+
+        ``tool_handler`` answers the job's host-tool calls (``job.host_tools``)
+        from a host thread pool while the session runs; the two must travel
+        together — a tool the model can call but nobody answers would only
+        time out. ``host_tools_dir`` is filled in here (per-job directory
+        under TOOLS_DIR) unless the caller set it.
+        """
+        if bool(job.host_tools) != (tool_handler is not None):
+            raise WorkerError(
+                "job.host_tools and tool_handler must be given together "
+                f"(host_tools={len(job.host_tools)}, handler={tool_handler is not None})"
+            )
+        if tool_handler is not None:
+            if job.host_tools_dir is None:
+                job = job.model_copy(update={"host_tools_dir": f"{TOOLS_DIR}/{job.job_id}"})
+            broker = HostToolBroker(self.sandbox, job, tool_handler)
+            self._brokers[job.job_id] = broker
+            try:
+                return self._submit_as(job, agent)
+            finally:
+                self._brokers.pop(job.job_id, None)
+                broker.close()
+        return self._submit_as(job, agent)
+
+    def _submit_as(self, job: JobRequest, agent: str | None) -> JobResult:
         if agent is not None:
             self._job_agents[job.job_id] = agent
         try:
@@ -638,6 +696,8 @@ class WorkerClient:
         # process itself chdirs there — agent SDK sessions inherit it.
         if job.cwd:
             argv += ["--cwd", job.cwd]
+        if job.host_tools_dir:
+            argv += ["--tools-dir", job.host_tools_dir]
         if self.limits is not None:
             argv += [
                 "--disk-warn",
@@ -763,6 +823,10 @@ class WorkerClient:
         if agent is not None and event.type.startswith("agent."):
             event.data.setdefault("agent", agent)
         self.bus.publish(event)
+        if event.type == EventTypes.AGENT_TOOL_REQUEST:
+            broker = self._brokers.get(job.job_id)
+            if broker is not None:
+                broker.dispatch(event)
         return event
 
     # -- poll transport ----------------------------------------------------

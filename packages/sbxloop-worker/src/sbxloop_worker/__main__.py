@@ -66,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--heartbeat", type=float, default=15.0)
     run.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     run.add_argument("--cwd", type=Path, default=None)
+    # Where host-tool responses land (mirrors job.host_tools_dir on the argv
+    # so path-rewriting sandbox shims see it, exactly like --cwd).
+    run.add_argument("--tools-dir", type=Path, default=None)
     # Resource guardrail thresholds (percent used; 0 disables). Sampling on
     # the heartbeat always happens — thresholds only add warn/abort levels.
     run.add_argument("--disk-warn", type=float, default=0.0)
@@ -94,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"sbxloop_worker: cannot chdir to {args.cwd}: {exc}", file=sys.stderr)
             return 64
         job = job.model_copy(update={"cwd": str(Path.cwd())})
+    if args.tools_dir is not None:
+        job = job.model_copy(update={"host_tools_dir": str(args.tools_dir)})
 
     try:
         JobRunner(

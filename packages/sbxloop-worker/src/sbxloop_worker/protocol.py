@@ -191,8 +191,9 @@ class JobRequest(ProtocolModel):
     max_tool_calls: int | None = None
     # Host-implemented tools exposed to the session (see HostToolSpec). The
     # host sets ``host_tools_dir`` (in-sandbox directory where it drops
-    # response files) — an explicit field rather than a derived path so a
-    # worker run outside a sandbox never writes into a developer's $HOME.
+    # response files) when it submits — an explicit field rather than a
+    # derived path so a worker run outside a sandbox never writes into a
+    # developer's $HOME; backends refuse host_tools without it at run time.
     host_tools: list[HostToolSpec] = Field(default_factory=list)
     host_tools_dir: str | None = None
     # How long one host tool call may take before the session sees a timeout.
@@ -246,8 +247,6 @@ class JobRequest(ProtocolModel):
                 raise ValueError("agent.session requires a non-empty prompt")
             if self.argv is not None or self.commands is not None or self.op is not None:
                 raise ValueError("agent.session must not set argv, commands, or op")
-            if self.host_tools and not self.host_tools_dir:
-                raise ValueError("agent.session with host_tools requires host_tools_dir")
         elif self._has_host_tool_fields:
             raise ValueError(
                 f"{self.kind} must not set host_tools, host_tools_dir, or available_tools"

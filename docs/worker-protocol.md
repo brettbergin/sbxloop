@@ -78,7 +78,8 @@ tool; when the model invokes one:
 2. The host runs the tool and copies a `HostToolResponse` JSON
    (`{v, call_id, ok, text, error?}`) to `<host_tools_dir>/<call_id>.json`
    inside the sandbox — `host_tools_dir` is set by the host
-   (`~/.sbxloop/tools/<job_id>`), never derived by the worker.
+   (`~/.sbxloop/tools/<job_id>`, also passed as `--tools-dir` on the worker
+   argv like `--cwd`), never derived by the worker.
 3. The worker polls for the file (`sbx cp` is not atomic: a file that does
    not yet validate is still being written) and hands `text` back to the
    model; `ok=false` becomes a failed tool result the model can adapt to.

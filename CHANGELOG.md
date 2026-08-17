@@ -19,6 +19,14 @@ All notable changes to sbxloop are documented here. The project adheres to
   session drive the daemon. The echo backend scripts `host_tool_calls`, so
   the round trip is testable without the SDK. See
   `docs/worker-protocol.md`, "Host tools".
+- Host side of the same round trip: `WorkerClient.submit(job, tool_handler=…)` answers a job's host-tool requests through a
+  `HostToolBroker` (`sbxloop.worker.hosttools`). The handler runs on a
+  small host thread pool, never on the thread draining the event stream,
+  and its `HostToolResponse` is `sbx cp`'d into
+  `~/.sbxloop/tools/<job_id>/<call_id>.json`; handler exceptions become
+  `ok=false` answers the model can read. `WorkerClient.verify_installed()`
+  is the cheap "is a matching worker already in this sandbox?" probe for
+  reusing a long-lived sandbox.
 - The daemon's log is structured ([structlog](https://www.structlog.org/)
   routed through the standard library, `sbxloop.log`) and configurable:
   `--log-level` / `[daemon] log_level` / `SBXLOOP_DAEMON__LOG_LEVEL`

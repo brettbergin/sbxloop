@@ -68,10 +68,11 @@ class TestJobRequest:
                 job_id="j1", run_id="r1", kind="shell.batch", commands=["true"], host_tools_dir="/t"
             )
 
-    def test_host_tools_require_dir(self) -> None:
+    def test_host_tools_defaults(self) -> None:
         tool = HostToolSpec(name="sbx_control", description="run a daemon verb")
-        with pytest.raises(ValidationError, match="requires host_tools_dir"):
-            agent_job(host_tools=[tool])
+        # host_tools_dir is filled in by the host's WorkerClient at submit
+        # time, so the model itself does not require it.
+        assert agent_job(host_tools=[tool]).host_tools_dir is None
         job = agent_job(host_tools=[tool], host_tools_dir="/home/agent/.sbxloop/tools/j1")
         assert job.host_tools[0].parameters == {"type": "object", "properties": {}}
         assert job.host_tool_timeout_s == 120.0
