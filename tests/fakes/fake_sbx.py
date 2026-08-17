@@ -282,6 +282,16 @@ def cmd_exec(root: Path, args: list[str]) -> int:
     home = fs / "home/agent"
     home.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    # A real `sbx exec` process starts inside the microVM and never inherits
+    # the developer's shell environment. The fake runs on the host, so a
+    # host-side GH_TOKEN/COPILOT_GITHUB_TOKEN would leak into exec'd
+    # processes and make provisioning's secret-visibility probe report
+    # "visible-under-exec" purely because the operator has tokens exported.
+    # Tests that want to model a hypothetical secret-injecting sbx opt in
+    # with SBX_FAKE_SECRET_ENV_VISIBLE.
+    if not os.environ.get("SBX_FAKE_SECRET_ENV_VISIBLE"):
+        for leaked in ("GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"):
+            env.pop(leaked, None)
     env["HOME"] = str(home)
     env["SBX_FAKE_FS"] = str(fs)
     # A real sandbox is a Linux microVM. On a macOS host, bsdtar serializes

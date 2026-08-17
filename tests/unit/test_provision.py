@@ -817,6 +817,8 @@ class TestSecretEnvVerification:
     ) -> None:
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_x")
         monkeypatch.setenv("GH_TOKEN", "github_pat_y")
+        # model a hypothetical sbx that does inject secrets into `sbx exec`
+        monkeypatch.setenv("SBX_FAKE_SECRET_ENV_VISIBLE", "1")
         bus = EventBus()
         events: list[Event] = []
         bus.subscribe(events.append)

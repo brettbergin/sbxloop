@@ -81,8 +81,11 @@ class TestLifecycle:
         assert client.sandbox.name == agent.name and client.role == "agent"
         assert created_names(fake_sbx) == [agent.name]
         assert any("api.githubcopilot.com" in c for c in fake_sbx.policies())
+        # sbx proxy secrets are invisible to `sbx exec`, so provisioning
+        # auto-heals to the in-VM env file and says so.
         assert [e.type for e in events if e.type.startswith("sandbox.")] == [
             "sandbox.provision_start",
+            "sandbox.secret_env_fallback",
             "sandbox.ready",
         ]
         assert all(e.run_id == "concierge" for e in events)
