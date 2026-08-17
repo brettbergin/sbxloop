@@ -5,8 +5,8 @@ single-use: their cancel flag never clears), one shared daemon-owned
 :class:`StateStore`, a fresh :class:`EventBus` per run (each engine adds
 permanent subscribers to its bus). Spend guardrails — a calendar-day run
 cap that counts runs started since 00:00 in ``daemon.run_cap_timezone``
-(default ``UTC``) and resets at the next midnight there, rather than
-ageing runs out of a rolling 24h window; a per-item attempt cap; a
+(default ``UTC``) and resets at the next midnight there; a per-item
+attempt cap; a
 consecutive-failure circuit breaker — are
 the daemon's only defense against a mislabeled issue in a fully autonomous
 setup, so they are enforced in the tick, not left to configuration hope.
@@ -1330,7 +1330,7 @@ class DaemonLoop:
     def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> None:
         """The loop evaluating the code it just wrote: after a patch item
         delivers a PR, open a review audit of that PR. Once per run, patch
-        items only (an audit has no PR), capped per rolling day, best-effort."""
+        items only (an audit has no PR), capped per calendar day, best-effort."""
         daemon = self.config.daemon
         if not daemon.review_deliveries or item.kind != "patch" or report.delivery is None:
             return
@@ -1375,7 +1375,7 @@ class DaemonLoop:
 
         Only for patch items — a failed audit filing a post-mortem that is
         itself an audit would recurse — only once per run, and capped per
-        rolling day so a bad night cannot flood the tracker. Best-effort:
+        calendar day so a bad night cannot flood the tracker. Best-effort:
         the item is already settled; this must never change that."""
         daemon = self.config.daemon
         if not daemon.postmortems or item.kind != "patch":

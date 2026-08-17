@@ -474,6 +474,14 @@ class TestDaemonCommand:
         # and the run tick + orderly shutdown follow it
         assert "daemon.tick" in result.output and "daemon.stopped" in result.output
 
+    def test_max_runs_per_day_help_names_the_calendar_day(self) -> None:
+        """The flag gates a calendar day, so its help must not read as a
+        trailing window (operators read ``10/10`` and expected no more runs)."""
+        out = runner.invoke(app, ["daemon", "--help"]).output
+        help_text = out[out.index("--max-runs-per-day") :][:400]
+        assert "Calendar-day" in help_text and "run_cap_timezone" in help_text
+        assert "24h" not in help_text and "olling" not in help_text
+
     def test_log_level_flag_beats_env(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:

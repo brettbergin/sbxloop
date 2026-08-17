@@ -319,7 +319,9 @@ class Concierge:
         daemon = self.config.daemon
         notes = [
             f"poll interval {daemon.poll_interval_s:g}s; at most {daemon.max_runs_per_day} "
-            "runs per day; a consecutive-failure breaker pauses dispatch",
+            f"runs per calendar day in {daemon.run_cap_timezone} (the count resets at "
+            f"00:00 {daemon.run_cap_timezone}, not on a rolling window); "
+            "a consecutive-failure breaker pauses dispatch",
             f"backlog mode: {daemon.backlog}",
             "Discord: one thread per run"
             if self.config.discord.thread_per_run
@@ -352,8 +354,10 @@ class Concierge:
         return (
             f"[situation @ {stamp}] current: {current} | queued: {status.get('queued', 0)} | "
             f"paused: {status.get('paused', False)} | breaker: "
-            f"{'open' if status.get('breaker_open') else 'closed'} | runs today: "
-            f"{status.get('runs_today', 0)}/{status.get('max_runs_per_day', '?')} | "
+            f"{'open' if status.get('breaker_open') else 'closed'} | runs today "
+            f"({status.get('run_cap_timezone', 'UTC')}): "
+            f"{status.get('runs_today', 0)}/{status.get('max_runs_per_day', '?')}, resets "
+            f"00:00 {status.get('run_cap_timezone', 'UTC')} | "
             f"speaker: {author}"
         )
 

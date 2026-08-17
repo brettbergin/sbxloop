@@ -258,7 +258,8 @@ work came from, and keeps going. Two work sources, usable together:
   with a `<name>.result.md` beside it.
 
 It is **fully autonomous** — a label or a file alone starts a run — so the
-spend guardrails in `[daemon]` are the safety net: a rolling daily run cap,
+spend guardrails in `[daemon]` are the safety net: a calendar-day run cap
+(counted in `run_cap_timezone`, default UTC, resetting at 00:00 there),
 a per-item attempt cap, a per-item resume cap, and a consecutive-failure
 circuit breaker (persisted, so a restart cannot reset it). Treat the
 trigger label as "execute arbitrary instructions with GH_TOKEN's repo scope"

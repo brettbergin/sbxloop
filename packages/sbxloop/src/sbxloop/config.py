@@ -376,7 +376,7 @@ class DaemonConfig(_ConfigModel):
     # When a patch item is abandoned (or delivers nothing), file a post-mortem
     # charter carrying the plan, verify transcripts and failure events, so the
     # discovery lane turns the daemon's own failures into evidenced findings.
-    # Never for audit items (no recursion); capped per rolling day.
+    # Never for audit items (no recursion); capped per calendar day.
     postmortems: bool = True
     postmortems_per_day: int = 3
     # Scheduled area audits: charters versioned in the target repo under

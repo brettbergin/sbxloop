@@ -1400,7 +1400,12 @@ def daemon(
         typer.Option("--backlog", help="Where agent-filed follow-up work goes: github|inbox|off."),
     ] = None,
     max_runs_per_day: Annotated[
-        int | None, typer.Option("--max-runs-per-day", help="Rolling 24h run cap.")
+        int | None,
+        int | None,
+        typer.Option(
+            "--max-runs-per-day",
+            help="Calendar-day run cap; resets at midnight in run_cap_timezone (default UTC).",
+        ),
     ] = None,
     poll_interval: Annotated[
         float | None, typer.Option("--poll-interval", help="Seconds between polls.")

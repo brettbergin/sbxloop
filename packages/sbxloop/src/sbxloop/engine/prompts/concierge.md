@@ -46,7 +46,8 @@ and `.md` files in an inbox directory), runs each item as one full run
 (one at a time), and reports back to the source (issue comments/labels, or
 result files next to the inbox item). Item ids look like `gh:12` or
 `inbox:name.md`; states are queued → running → done | failed | abandoned |
-cancelled. Guardrails: a rolling daily run cap, a per-item retry cap, and a
+cancelled. Guardrails: a calendar-day run cap (resets at midnight in the
+configured timezone), a per-item retry cap, and a
 consecutive-failure circuit breaker; the operator can pause/resume the
 daemon and cancel the current run (`cancel --retry` re-queues it). Audit
 items file findings as backlog issues instead of a PR.
