@@ -174,8 +174,8 @@ class TestTick:
         second = h.loop.tick()
         assert second.idle_reason == "daily_cap" and second.dispatched is None
         assert h.dstore.get("inbox:b.md").state == "queued"  # type: ignore[union-attr]
-        # window rolls → dispatch resumes
-        h.clock.t += 90_000
+        # the calendar day rolls (local midnight passes) → dispatch resumes
+        h.clock.t = day_window(h.clock.t, cfg.daemon.run_cap_timezone)[1]
         assert h.loop.tick().outcome == "done"
 
     def test_retry_then_abandon_at_cap(self, tmp_path: Path) -> None:
@@ -1549,6 +1549,55 @@ class TestRunCapDayWindow:
         assert status["run_cap_timezone"] == "America/New_York"
         assert status["runs_today_resets_at"] == day_window(h.clock(), "America/New_York")[1]
         assert h.loop.tick().idle_reason == "daily_cap"
-        # After the reset instant the counter is visibly back to zero.
+        # One second before the reset instant the count still stands...
+        h.clock.t = status["runs_today_resets_at"] - 1
+        assert h.loop.status()["runs_today"] == 1
+        # ...and at the reset instant the counter is visibly back to zero.
         h.clock.t = status["runs_today_resets_at"]
         assert h.loop.status()["runs_today"] == 0
+        assert h.loop.status()["runs_today_resets_at"] == status["runs_today_resets_at"] + 86400
+
+    def test_day_window_fall_back_day_is_25h(self) -> None:
+        """A US fall-back day is 25h long — the boundary is local midnight,
+        not start+86400."""
+        noon = datetime(2024, 11, 3, 16, 0, tzinfo=UTC).timestamp()
+        start, nxt = day_window(noon, "America/New_York")
+        assert nxt - start == 25 * 3600
+
+    def test_day_window_boundary_is_idempotent(self) -> None:
+        """The next boundary is itself the start of its own day, so the
+        windows tile the timeline without gaps or overlap."""
+        for tz in ("UTC", "America/New_York", "Asia/Tokyo"):
+            _, nxt = day_window(datetime(2024, 3, 5, 12, 0, tzinfo=UTC).timestamp(), tz)
+            assert day_window(nxt, tz)[0] == nxt
+
+    def test_run_at_exactly_midnight_counts_toward_the_new_day(self, tmp_path: Path) -> None:
+        """A run started at 23:59:59 belongs to the old day; one started at
+        exactly 00:00:00 spends the new day's single slot."""
+        h = self._capped_harness(tmp_path)
+        h.clock.t = datetime(2024, 3, 5, 23, 59, 59, tzinfo=UTC).timestamp()
+        assert h.loop.tick().outcome == "done"
+        assert h.loop.tick().idle_reason == "daily_cap"
+        # Exactly local midnight: the old run aged out, this one takes the slot.
+        h.clock.t = datetime(2024, 3, 6, 0, 0, 0, tzinfo=UTC).timestamp()
+        assert h.loop.status()["runs_today"] == 0
+        assert h.loop.tick().outcome == "done"
+        assert h.loop.status()["runs_today"] == 1
+        # ...so the new day is now full, one second in.
+        h.source.items = [*h.source.items, inbox_item("c.md")]
+        h.clock.t += 1
+        assert h.loop.tick().idle_reason == "daily_cap"
+
+    def test_positive_offset_timezone_resets_before_utc_midnight(self, tmp_path: Path) -> None:
+        """Tokyo is UTC+9, so its local midnight is 15:00Z the day before —
+        the cap resets then, not at 00:00Z."""
+        h = self._capped_harness(tmp_path, tz="Asia/Tokyo")
+        h.clock.t = datetime(2024, 3, 5, 16, 0, tzinfo=UTC).timestamp()  # 2024-03-06 01:00 JST
+        assert h.loop.tick().outcome == "done"
+        assert h.loop.tick().idle_reason == "daily_cap"
+        # 00:00Z is still the same Tokyo day (09:00 JST) — no reset.
+        h.clock.t = datetime(2024, 3, 6, 0, 0, tzinfo=UTC).timestamp()
+        assert h.loop.tick().idle_reason == "daily_cap"
+        # 15:00Z is the next Tokyo midnight — reset.
+        h.clock.t = datetime(2024, 3, 6, 15, 0, tzinfo=UTC).timestamp()
+        assert h.loop.tick().outcome == "done"
