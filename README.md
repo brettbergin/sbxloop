@@ -259,7 +259,11 @@ work came from, and keeps going. Two work sources, usable together:
 
 It is **fully autonomous** — a label or a file alone starts a run — so the
 spend guardrails in `[daemon]` are the safety net: a calendar-day run cap
-(counted in `run_cap_timezone`, default UTC, resetting at 00:00 there),
+(`max_runs_per_day`, default 12 — the name and default are unchanged) that
+counts the runs *started* since 00:00 in `[daemon] run_cap_timezone` (any
+IANA zone, default `UTC`) and resets at that boundary, so a run started just
+before midnight does not free a slot early — earlier releases counted a
+trailing 24-hour window instead, in which runs aged out continuously —
 a per-item attempt cap, a per-item resume cap, and a consecutive-failure
 circuit breaker (persisted, so a restart cannot reset it). Treat the
 trigger label as "execute arbitrary instructions with GH_TOKEN's repo scope"
@@ -282,8 +286,8 @@ When a patch item is abandoned (or completes without delivering) the daemon
 files a **post-mortem** as an audit charter — the plan, the last verify
 transcript, the failure events, all in the issue body, because the auditor
 works in a fresh clone and cannot read the daemon's state — so the loop's own
-failures become findings too (`[daemon] postmortems`, capped per day, never
-for audit items).
+failures become findings too (`[daemon] postmortems`, capped per calendar day
+in `run_cap_timezone`, never for audit items).
 And with `[daemon] audits = true`, **charters versioned in the repository**
 (`.github/sbxloop/audits/<name>.md`, front-matter `every: 7d`) are opened as
 `audit: <name>` issues on schedule — reviewed like code, visible as issues,
@@ -804,6 +808,8 @@ The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
 | `[daemon] workspace_isolation` | `clone` | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning). |
 | `[daemon] refresh_workspace` | `true` | `git fetch` + fast-forward the workspace checkout before each fresh daemon run. |
 | `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
+| `[daemon] max_runs_per_day` | `12` | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there (previously a trailing 24h window). |
+| `[daemon] run_cap_timezone` | `UTC` | IANA timezone defining the run cap's day boundary (also used by the per-day review and post-mortem caps). |
 
 ## Repository layout
 

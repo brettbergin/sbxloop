@@ -113,6 +113,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- Daemon: the **run cap is now a wall-clock calendar-day gate**, not a
+  trailing 24-hour rolling window. Dispatch counts the runs whose start
+  time falls within the current day in the new `[daemon] run_cap_timezone`
+  (any IANA zone, default `UTC`, validated at config load) and the count
+  resets at 00:00 in that zone — so a run started just before midnight no
+  longer frees a slot 24 hours later, it frees it at the boundary.
+  `max_runs_per_day` keeps its name and its default of 12, so existing
+  configs need no migration; the per-day review and post-mortem caps share
+  the same day window. Status lines, logs and Discord/GitHub messaging now
+  state the semantics unambiguously
+  (`runs today (UTC): 7/10, resets at 00:00 UTC`).
+
 - Discord: a plain (non-command, non-mention) message in the control
   channel is now **ignored** — the canned "type in the run's thread to
   steer" reply is gone; people can talk among themselves, and the concierge

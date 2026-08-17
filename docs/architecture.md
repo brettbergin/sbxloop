@@ -189,6 +189,20 @@ persisting — a crash and a `kill -9` look identical to the store — and
 4. continues from the last committed transition. A phase whose result was
    never committed re-runs from its start; nothing is replayed.
 
+## Daemon guardrails
+
+The daemon's **run cap** is a wall-clock calendar-day gate, not a rolling
+window: it counts the runs whose start time falls on the current day in
+`[daemon] run_cap_timezone` (any IANA zone, default `UTC`) and compares that
+against `[daemon] max_runs_per_day` (default 12, key name unchanged). The
+count resets at 00:00 in that zone, so a run started at 23:59 still occupies
+a slot for the remaining minute and frees it only at the boundary; the same
+day window backs the per-day review and post-mortem caps. This gate is
+distinct from the per-item attempt cap, the per-item resume cap and the
+persisted consecutive-failure circuit breaker, which are unaffected by the
+day boundary. Operator strings name both the day and the zone
+(`runs today (UTC): 7/10, resets at 00:00 UTC`).
+
 ## Events
 
 Everything observable is an `Event` (versioned JSONL envelope, shared model
