@@ -613,6 +613,23 @@ class TestDoctor:
         assert "sbx binary" in result.output
         assert "FAIL" not in result.output
 
+    def test_doctor_reports_the_concierge_when_discord_is_on(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.cli.doctor import collect_checks
+
+        (workdir / "sbxloop.toml").write_text("[discord]\nchannel_id = 42\n")
+        env = {"GH_TOKEN": "tok", "DISCORD_BOT_TOKEN": "tok"}
+        (row,) = [c for c in collect_checks(env) if c.name == "discord concierge"]
+        assert not row.ok and not row.hard and "COPILOT_GITHUB_TOKEN not set" in row.detail
+        env["COPILOT_GITHUB_TOKEN"] = "tok"
+        (row,) = [c for c in collect_checks(env) if c.name == "discord concierge"]
+        assert row.ok and "180s per message" in row.detail
+        (workdir / "sbxloop.toml").write_text(
+            "[discord]\nchannel_id = 42\n[concierge]\nenabled = false\n"
+        )
+        assert not [c for c in collect_checks(env) if c.name == "discord concierge"]
+
     def test_doctor_hints_at_legacy_relative_state_dir(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
