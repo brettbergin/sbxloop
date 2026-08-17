@@ -383,10 +383,9 @@ refused egress called out; and a finished report card (the headline turns
 ✅/❌/⚠) that also names what the run filed — an audit's findings, linked
 (`Filed`, `Upstream` for findings routed to `[daemon] tool_repo`, or
 `no findings`). Audit-lane notices in the control channel follow the same
-shape: `🔎 audit [#701](…) filed for charter \`flakes\` · audit: flakes`,
-`🔎 review [#801](…) filed for PR [#9](…) · gh:4`, `🔎 post-mortem [#901](…)
-filed for gh:4 · abandoned: …`, and `✅ gh:9 done (2/2 tasks done) · filed
-[#50](…)`. Mentions are always disabled, so model output can never ping the
+shape — `🔎 audit #701 filed for charter flakes · audit: flakes`,
+`🔎 review #801 filed for PR #9 · gh:4`, `🔎 post-mortem #901 filed for gh:4 · abandoned: …`, `✅ gh:9 done (2/2 tasks done) · filed #50` — with every
+issue number a link. Mentions are always disabled, so model output can never ping the
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
 `chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next

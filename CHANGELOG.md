@@ -15,7 +15,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   `sbxloop.daemon.discord_format` (`filed_notice`, `findings_summary`,
   `filed_lines`, `charter_skipped_notice`, `ref_link`); the scheduled-audit,
   delivery-review and post-mortem notices name the item so the bridge threads
-  them, and use ` · ` fields rather than `:`/`→`; the finish card (and its
+  them, and use `·`-separated fields rather than `:`/`→`; the finish card (and its
   text fallback) gains `Filed` / `Upstream` / `Noted` fields, so an audit's
   deliverable is on the card next to the PR (`no findings` when clean); the
   `✅ … done` notice lists what the run filed and the separate
