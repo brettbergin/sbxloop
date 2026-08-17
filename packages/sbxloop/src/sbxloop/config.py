@@ -26,6 +26,7 @@ import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
     BaseModel,
@@ -317,8 +318,13 @@ class DaemonConfig(_ConfigModel):
     as a full inner-loop run, and reports back to the source. It is fully
     autonomous — a label or a file alone starts a run — so the spend
     guardrails here are the only thing standing between a mislabeled issue
-    and an empty Copilot budget: a rolling daily run cap, a per-item retry
+    and an empty Copilot budget: a calendar-day run cap, a per-item retry
     cap, and a consecutive-failure circuit breaker.
+
+    The run cap (``max_runs_per_day``) is a wall-clock daily gate, not a
+    rolling 24h window: it counts the runs *started* during the current
+    calendar day in ``run_cap_timezone`` (default ``UTC``) and resets at
+    00:00 in that zone.
 
     ``backlog`` lets the inner agent file follow-up work it discovers
     (written to ``.sbxloop/backlog/*.md`` in the run workspace) into either
@@ -391,6 +397,9 @@ class DaemonConfig(_ConfigModel):
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
+    # The day boundary for max_runs_per_day. An explicit IANA zone rather
+    # than the process's ambient local time; the counter resets at 00:00 here.
+    run_cap_timezone: str = "UTC"
     max_attempts_per_item: int = 2
     # Resumes (after a restart/crash) are not attempts, but each one gets a
     # fresh engine wall clock; past this many per item the interrupted run is
@@ -456,6 +465,13 @@ class DaemonConfig(_ConfigModel):
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"daemon.{name} must be >= 1")
+        try:
+            ZoneInfo(self.run_cap_timezone)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            raise ValueError(
+                "daemon.run_cap_timezone must be a valid IANA timezone, "
+                f"got {self.run_cap_timezone!r}"
+            ) from None
         if self.tool_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", self.tool_repo):
             raise ValueError(f"daemon.tool_repo must be owner/name, got {self.tool_repo!r}")
         return self

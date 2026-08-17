@@ -1,4 +1,5 @@
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -430,3 +431,26 @@ def test_daemon_log_level_and_format(tmp_path: Path) -> None:
         load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_LEVEL": "LOUD"})
     with pytest.raises(ConfigError, match="log_format"):
         load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_FORMAT": "xml"})
+
+
+def test_run_cap_timezone_defaults_to_utc(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.run_cap_timezone == "UTC"
+    assert config.daemon.max_runs_per_day == 12
+
+
+def test_run_cap_timezone_explicit_zone(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\nrun_cap_timezone = "America/New_York"\n')
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.run_cap_timezone == "America/New_York"
+    assert ZoneInfo(config.daemon.run_cap_timezone) is not None
+    # the cap itself keeps its name and default (backward compatibility)
+    assert config.daemon.max_runs_per_day == 12
+    over = load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__RUN_CAP_TIMEZONE": "Europe/Berlin"})
+    assert over.daemon.run_cap_timezone == "Europe/Berlin"
+
+
+def test_run_cap_timezone_rejects_bogus_zone(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\nrun_cap_timezone = "Mars/Olympus"\n')
+    with pytest.raises(ConfigError, match="run_cap_timezone"):
+        load_config(cwd=tmp_path, env={})
