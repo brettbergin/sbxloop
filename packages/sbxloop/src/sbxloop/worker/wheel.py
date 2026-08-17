@@ -84,7 +84,7 @@ def _workspace_build() -> Path | None:
             env=env,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        log.warning("workspace worker wheel build failed: %s", exc)
+        log.warning("worker.wheel_build_failed", error=str(exc), out_dir=str(out_dir))
         return None
     wheels = sorted(out_dir.glob("sbxloop_worker-*.whl"))
     return wheels[-1] if wheels else None

@@ -367,4 +367,45 @@ class TestDaemonCtlCommand:
         # `daemon` became a group so `ctl` could hang off it; the bare
         # invocation must keep its old behaviour (exit 2 without sources).
         result = runner.invoke(app, ["daemon", "--inbox", ""])
-        assert result.exit_code == 2 and "no work sources" in result.output
+        assert result.exit_code == 2 and "daemon.no_work_sources" in result.output
+
+
+class TestCommandAudit:
+    """Every operator command leaves a host-side record: who, what, over
+    which channel, and whether it was accepted (mutations at INFO,
+    read-only status/queue/items at DEBUG)."""
+
+    def test_mutating_command_logged_at_info_with_by_and_via(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        floop = FakeLoop(_dstore(tmp_path))
+        with caplog.at_level(logging.INFO, logger="sbxloop.daemon.control"):
+            dispatch(floop, "pause", by="brett", via="discord")
+        (record,) = [r for r in caplog.records if "operator.command" in r.getMessage()]
+        assert record.levelno == logging.INFO
+        text = record.getMessage()
+        assert "'by': 'brett'" in text and "'via': 'discord'" in text
+        assert "'command': 'pause'" in text and "'ok': True" in text
+
+    def test_read_only_command_logged_at_debug(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        floop = FakeLoop(_dstore(tmp_path))
+        with caplog.at_level(logging.DEBUG, logger="sbxloop.daemon.control"):
+            dispatch(floop, "status")
+        (record,) = [r for r in caplog.records if "operator.command" in r.getMessage()]
+        assert record.levelno == logging.DEBUG
+
+    def test_unknown_command_logged_as_not_ok(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="sbxloop.daemon.control"):
+            dispatch(FakeLoop(_dstore(tmp_path)), "bogus", by="x")
+        (record,) = [r for r in caplog.records if "operator.command" in r.getMessage()]
+        assert "'ok': False" in record.getMessage() and "'known': False" in record.getMessage()

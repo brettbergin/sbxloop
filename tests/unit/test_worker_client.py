@@ -577,7 +577,7 @@ class TestInstallFallbacks:
         )
         with caplog.at_level("WARNING"):
             client.install(wheel=wheel, ensure_dev_tools=True)
-        assert any("dev-tools ensure failed" in r.getMessage() for r in caplog.records)
+        assert any("worker.dev_tools_ensure_failed" in r.getMessage() for r in caplog.records)
         assert any("apt exploded" in r.getMessage() for r in caplog.records)
 
     def test_ensure_dev_tools_default_is_python(
@@ -741,7 +741,9 @@ class TestInstallFallbacks:
         with caplog.at_level("WARNING"):
             client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])
         messages = [r.getMessage() for r in caplog.records]
-        assert any("dev-tools ensure failed for java" in m for m in messages), messages
+        assert any("worker.dev_tools_ensure_failed" in m and "'java'" in m for m in messages), (
+            messages
+        )
         # the warning names what is now missing, not just that something broke
         assert any("JAVA_HOME" in m for m in messages), messages
         assert any("tee: permission denied" in m for m in messages), messages
@@ -829,7 +831,7 @@ class TestInstallFallbacks:
         self._script_happy_install(fake_sbx)
         with caplog.at_level("WARNING"):
             client.install(wheel=wheel, ensure_dev_tools=True)
-        assert any("search-fallback ensure failed" in r.getMessage() for r in caplog.records)
+        assert any("worker.search_fallback_ensure_failed" in r.getMessage() for r in caplog.records)
         assert any("Unsupported system page size" in r.getMessage() for r in caplog.records)
 
     def test_install_without_flag_skips_dev_tools(
@@ -1105,7 +1107,7 @@ class TestPrebakedTemplate:
         with caplog.at_level("WARNING"):
             client.install(wheel=wheel, expect_prebaked=True)
         assert not client.prebaked
-        assert any("stale template" in r.getMessage() for r in caplog.records)
+        assert any("worker.prebake_stale_template" in r.getMessage() for r in caplog.records)
         assert any("sbxloop bake" in r.getMessage() for r in caplog.records)
 
     def test_corrupt_manifest_falls_back(

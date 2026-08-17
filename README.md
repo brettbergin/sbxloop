@@ -336,9 +336,22 @@ no credentials leave the host). And the daemon keeps its state
 an explicitly configured `state_dir`, else a pre-existing legacy
 `./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`
 (`~/.local/state/…`) — so a checkout never accretes one full clone per run.
-The daemon prints the resolved location at start; the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule, while
+The daemon logs the resolved location at start (in its `daemon.starting`
+summary); the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule, while
 `sbxloop status`/`logs`/`gc` from the runner directory need
 `SBXLOOP_STATE_DIR` pointed at it.
+
+The daemon's log stream (stderr → journald under systemd) is structured:
+`--log-level DEBUG|INFO|WARNING|ERROR` (`[daemon] log_level`,
+`SBXLOOP_DAEMON__LOG_LEVEL`; default `INFO`) and `--log-format console|json`
+(`[daemon] log_format`; `json` is one object per line for log shippers). At
+`INFO` you get the startup config summary, every claim, `run.dispatch` /
+`run.finished` with durations, the run's own lifecycle mirrored under the
+`sbxloop.run` logger (task/phase transitions, sandbox provisioning, worker
+jobs, steering), operator commands, and why the daemon is idle (paused,
+breaker open, backing off, capped) whenever that changes; `DEBUG` adds every
+tool call, `sbx` invocation and poll. See
+[docs/architecture.md → Logging](docs/architecture.md#logging).
 
 #### Working a design tracker
 

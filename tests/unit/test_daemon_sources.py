@@ -663,6 +663,44 @@ class TestGitHubSource:
         assert ops.created[-1] == ("Now", ["sbxloop:run"])
 
 
+class TestGitHubSourceLogging:
+    """The poll and claim protocol narrate themselves: a lost race and a
+    successful claim are both INFO lines carrying the item; polls are DEBUG."""
+
+    def make(self, ops: RecordingOps) -> GitHubIssueSource:
+        return GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+
+    def test_poll_and_claim_are_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        with caplog.at_level(logging.DEBUG, logger="sbxloop.daemon.sources"):
+            item = self.make(ops).poll()[0]
+            assert self.make(ops).claim(item) is True
+        messages = [r.getMessage() for r in caplog.records]
+        polled = [m for m in messages if "'event': 'github.polled'" in m]
+        assert polled and "'issues': 1" in polled[0]
+        (claimed,) = [m for m in messages if "'event': 'github.claimed'" in m]
+        assert "'item': 'gh:4'" in claimed and "'duration_s'" in claimed
+
+    def test_claim_declined_when_trigger_gone_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.issues["4"]["labels"] = []  # someone else swapped the label meanwhile
+        with caplog.at_level(logging.INFO, logger="sbxloop.daemon.sources"):
+            assert self.make(ops).claim(item) is False
+        (declined,) = [
+            r.getMessage()
+            for r in caplog.records
+            if "'event': 'github.claim_declined'" in r.getMessage()
+        ]
+        assert "'item': 'gh:4'" in declined and "trigger label gone" in declined
+
+
 class TestDaemonGithubInstance:
     def test_sandbox_name_is_per_state_dir(self, tmp_path: Path) -> None:
         """A fixed name plus remove_stale() at startup meant a second daemon

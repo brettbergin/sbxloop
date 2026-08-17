@@ -13,7 +13,7 @@ so aborted runs do not leak microVMs.
 from __future__ import annotations
 
 import atexit
-import contextlib
+import os
 import signal
 import threading
 import types
@@ -91,15 +91,15 @@ class SandboxPair:
             try:
                 sandbox.stop()
             except Exception:
-                log.warning("failed to stop sandbox %s", sandbox.name, exc_info=True)
+                log.warning("sandbox.stop_failed", sandbox=sandbox.name, exc_info=True)
             try:
                 sandbox.rm()
             except Exception:
-                log.warning("failed to remove sandbox %s", sandbox.name, exc_info=True)
+                log.warning("sandbox.remove_failed", sandbox=sandbox.name, exc_info=True)
             try:
                 remove_run_sandbox_secrets(sandbox.cli, sandbox.name, role)
             except Exception:
-                log.warning("failed to remove secrets of %s", sandbox.name, exc_info=True)
+                log.warning("sandbox.secrets_remove_failed", sandbox=sandbox.name, exc_info=True)
 
 
 class CleanupRegistry:
@@ -158,7 +158,7 @@ class CleanupRegistry:
             try:
                 pair.cleanup()
             except Exception:
-                log.warning("cleanup failed for run %s", pair.run_id, exc_info=True)
+                log.warning("sandbox.pair_cleanup_failed", run=pair.run_id, exc_info=True)
 
     def _install_handlers(self) -> None:
         if self._installed:
@@ -174,17 +174,31 @@ class CleanupRegistry:
         self._installed = True
         for signum in (signal.SIGINT, signal.SIGTERM):
             # ValueError/OSError: not installable in this context (e.g. no tty)
-            with contextlib.suppress(ValueError, OSError):
+            try:
                 self._previous[signum] = signal.signal(signum, self._handle_signal)
+            except (ValueError, OSError) as exc:
+                # Loud: without the handler SIGTERM kills the process with
+                # its microVMs still running (see the class docstring).
+                log.warning(
+                    "signals.handler_not_installed",
+                    signal=signal.Signals(signum).name,
+                    error=str(exc),
+                    hint="a SIGTERM will not clean up sandboxes",
+                )
 
     def _handle_signal(self, signum: int, frame: types.FrameType | None) -> None:
-        log.info("signal %s received; cleaning up sandboxes", signum)
+        log.info(
+            "signals.received",
+            signal=signal.Signals(signum).name,
+            pid=os.getpid(),
+            live_pairs=len(self._pairs),
+        )
         quiesce = self._quiesce
         if quiesce is not None:
             try:
                 quiesce()
             except Exception:
-                log.warning("quiesce before signal cleanup failed", exc_info=True)
+                log.warning("signals.quiesce_failed", exc_info=True)
         self.cleanup_all()
         previous = self._previous.get(signum)
         if callable(previous):

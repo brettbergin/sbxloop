@@ -37,8 +37,10 @@ from pydantic import (
 )
 
 from sbxloop.errors import ConfigError
-from sbxloop.log import LogFormat, LogLevel
+from sbxloop.log import LogFormat, LogLevel, get_logger
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
+
+log = get_logger(__name__)
 
 ENV_PREFIX = "SBXLOOP_"
 
@@ -726,6 +728,15 @@ def load_config_with_sources(
 
     for dotted in _flatten(config.model_dump()):
         sources.setdefault(dotted, "default")
+    # Which layer set which key — never the values (tokens live in env).
+    overridden = {k: v for k, v in sources.items() if v != "default"}
+    log.debug(
+        "config.loaded",
+        cwd=str(cwd),
+        state_dir=str(config.state_dir),
+        layers={name: len(_flatten(layer)) for name, layer in layers},
+        overrides=overridden,
+    )
     return config, sources
 
 

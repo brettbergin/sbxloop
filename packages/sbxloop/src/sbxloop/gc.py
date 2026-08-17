@@ -234,7 +234,11 @@ def prune_run_dirs(
         if not store.append_event_if_state(
             _gc_event(verdict.run_id, now, data), TERMINAL_RUN_STATES
         ):
-            log.info("gc: %s left the terminal states since classification; kept", verdict.run_id)
+            log.info(
+                "gc.kept",
+                run=verdict.run_id,
+                reason="left the terminal states since classification",
+            )
             continue
         if not _remove(verdict.path, state_dir):
             failed.append(verdict.run_id)
@@ -283,11 +287,11 @@ def _remove(path: Path, state_dir: Path) -> bool:
             _rmtree_quiet(staged)
         path.rename(staged)
     except OSError:
-        log.debug("gc: could not stage %s; removing in place", path, exc_info=True)
+        log.debug("gc.stage_failed", path=str(path), action="removing in place", exc_info=True)
         try:
             shutil.rmtree(path)
         except OSError:
-            log.warning("gc: could not remove %s", path, exc_info=True)
+            log.warning("gc.remove_failed", path=str(path), exc_info=True)
             return False
         return True
     _rmtree_quiet(staged)
@@ -310,7 +314,7 @@ def _rmtree_quiet(path: Path) -> None:
     try:
         shutil.rmtree(path)
     except OSError:
-        log.warning("gc: could not remove %s", path, exc_info=True)
+        log.warning("gc.remove_failed", path=str(path), staged=True, exc_info=True)
 
 
 def _is_within(path: Path, root: Path) -> bool:

@@ -64,7 +64,12 @@ class EventBus:
                 try:
                     fn(event)
                 except Exception:
-                    log.exception("event subscriber %r failed for %s", fn, event.type)
+                    log.exception(
+                        "events.subscriber_failed",
+                        subscriber=repr(fn),
+                        event_type=event.type,
+                        run=event.run_id,
+                    )
 
     def emit(
         self,

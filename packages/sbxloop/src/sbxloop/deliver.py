@@ -63,6 +63,9 @@ from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, exclusion_hit, scan_
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
+from sbxloop.log import get_logger
+
+log = get_logger(__name__)
 
 FILE_MODE = "100644"
 BODY_FILE_LIST_CAP = 50
@@ -168,6 +171,13 @@ def deliver_workspace(
         base = str(ops.repo_get(repo).get("default_branch") or "main")
     base_sha = _base_commit_sha(ops, repo, base)
     if base_sha is None:
+        log.warning(
+            "deliver.bootstrap_empty_repo",
+            run=run_id,
+            repo=repo,
+            base=base,
+            hint="base branch has no commit; creating an initial one",
+        )
         # An existing-but-empty repository has a default branch name and no
         # ref behind it (GitHub answers 409; an absent branch on a non-empty
         # repo — unusual explicit `base` — answers 404; the worker folds
@@ -185,10 +195,26 @@ def deliver_workspace(
         # A checkout with nothing to diff against (the agent git-init-ed
         # the workspace itself): the snapshot is still the right delivery,
         # said out loud in the PR body rather than silently.
+        log.warning(
+            "deliver.snapshot_fallback",
+            run=run_id,
+            repo=repo,
+            reason="no base commit to diff against",
+        )
         plan = _plan_snapshot(source_dir, exclude)
         plan.note = "delivered as a workspace snapshot: no base commit to diff against"
 
-    shas = _create_blobs(ops, repo, plan.uploads)
+    log.info(
+        "deliver.plan",
+        run=run_id,
+        repo=repo,
+        base=base,
+        base_sha=base_sha[:12],
+        entries=len(plan.entries),
+        uploads=len(plan.uploads),
+        upload_bytes=sum(len(raw) for raw in plan.uploads.values()),
+    )
+    shas = _create_blobs(ops, repo, plan.uploads, run_id=run_id)
     entries = [
         {**entry, "sha": shas[entry["path"]]} if entry["path"] in shas else entry
         for entry in plan.entries
@@ -211,9 +237,10 @@ def deliver_workspace(
     )
     branch = branch_name(run_id)
     _point_branch(ops, repo, branch, commit)
+    log.info("deliver.branch_pushed", run=run_id, repo=repo, branch=branch, commit=commit[:12])
 
     try:
-        return ops.pr_create(
+        pr = ops.pr_create(
             repo,
             base=base,
             head=branch,
@@ -227,7 +254,17 @@ def deliver_workspace(
         existing = _find_open_pr(ops, repo, branch)
         if existing is None:
             raise
+        log.info(
+            "deliver.pr_reused",
+            run=run_id,
+            repo=repo,
+            pr=existing.number,
+            url=existing.url,
+            hint="a re-delivery refreshed the branch behind an existing open PR",
+        )
         return existing
+    log.info("deliver.pr_opened", run=run_id, repo=repo, pr=pr.number, url=pr.url, draft=draft)
+    return pr
 
 
 def _point_branch(ops: GithubOps, repo: str, branch: str, commit: str) -> None:
@@ -245,6 +282,12 @@ def _point_branch(ops: GithubOps, repo: str, branch: str, commit: str) -> None:
     except GithubOpsError as exc:
         if not _is_ref_collision(exc):
             raise
+        log.info(
+            "deliver.branch_force_moved",
+            repo=repo,
+            branch=branch,
+            hint="a prior attempt for this run created the branch",
+        )
         ops.raw("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": commit, "force": True})
 
 
@@ -372,10 +415,22 @@ def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:
         raise DeliveryError(f"cannot read base commit {commit_sha} of {repo}") from exc
 
 
-def _create_blobs(ops: GithubOps, repo: str, uploads: dict[str, bytes]) -> dict[str, str]:
+def _create_blobs(
+    ops: GithubOps, repo: str, uploads: dict[str, bytes], *, run_id: str | None = None
+) -> dict[str, str]:
     """Create all blobs via batched worker jobs; returns relative path -> sha."""
     shas: dict[str, str] = {}
-    for chunk in _manifest_chunks(uploads):
+    chunks = _manifest_chunks(uploads)
+    for index, chunk in enumerate(chunks, start=1):
+        log.debug(
+            "deliver.blob_batch",
+            run=run_id,
+            repo=repo,
+            batch=index,
+            batches=len(chunks),
+            files=len(chunk),
+            b64_bytes=sum(len(entry["content_b64"]) for entry in chunk),
+        )
         shas.update(ops.blobs_create_many(repo, chunk))
     missing = [path for path in uploads if path not in shas]
     if missing:

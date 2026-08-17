@@ -156,7 +156,7 @@ def bake_template(
                 try:
                     sandbox.rm()
                 except SbxError:
-                    log.warning("failed to remove bake sandbox %s", name, exc_info=True)
+                    log.warning("bake.sandbox_remove_failed", sandbox=name, exc_info=True)
 
     record = BakeRecord(
         ref=ref,
@@ -178,13 +178,15 @@ def _cache_copilot_runtime(sandbox: Sandbox, python: str) -> bool:
     try:
         result = sandbox.exec([python, "-m", "copilot", "download-runtime"], timeout=600.0)
     except SbxError:
-        log.warning("copilot runtime pre-cache failed", exc_info=True)
+        log.warning("bake.runtime_precache_failed", sandbox=sandbox.name, exc_info=True)
         return False
     if not result.ok:
         combined = "\n".join(p.strip() for p in (result.stderr, result.stdout) if p.strip())
         log.warning(
-            "copilot runtime pre-cache failed (rc=%s): %s — sessions will download on demand",
-            result.returncode,
-            combined[-2000:] or "(no output)",
+            "bake.runtime_precache_failed",
+            sandbox=sandbox.name,
+            rc=result.returncode,
+            output=combined[-2000:] or "(no output)",
+            hint="sessions will download the runtime on demand",
         )
     return result.ok

@@ -7,14 +7,18 @@ the only environment holding ``GH_TOKEN``.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from pydantic import BaseModel
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.ids import new_job_id
+from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import JobRequest
+
+log = get_logger(__name__)
 
 
 class IssueRef(BaseModel):
@@ -48,7 +52,19 @@ class GithubOps:
             params=params,
             timeout_s=timeout_s if timeout_s is not None else self.timeout_s,
         )
+        started = time.monotonic()
         result = self.client.submit(job)
+        error = result.error
+        log.debug(
+            "gh.op",
+            run=self.run_id,
+            job=job.job_id,
+            op=op,
+            repo=params.get("repo"),
+            status=result.status,
+            http_status=error.http_status if error is not None else None,
+            duration_s=round(time.monotonic() - started, 2),
+        )
         if result.status != "ok":
             assert result.error is not None
             raise GithubOpsError(

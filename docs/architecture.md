@@ -175,3 +175,59 @@ are persisted to SQLite — the CLI TUI, `logs --follow`, and hooks like
 `GithubReporterHook` are all just bus subscribers.
 
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
+
+## Logging
+
+Events are the run's record; the **log** is the daemon's — what the process
+did between and around runs, rendered for an operator reading `journalctl`
+(or a log shipper). It is [structlog](https://www.structlog.org/) routed
+through the standard library (`sbxloop.log`), so third-party stdlib loggers
+(discord.py, httpx) render in the same shape and pytest's `caplog` sees
+every record.
+
+`sbxloop daemon` configures the pipeline once from `[daemon] log_level`
+(`--log-level`, `SBXLOOP_DAEMON__LOG_LEVEL`; default `INFO`) and
+`[daemon] log_format` (`console` key=value for humans and journald, `json`
+one object per line for ingestion). Third-party loggers are held at
+`WARNING` unless `DEBUG` is requested (then `INFO` — never their own DEBUG
+firehose). Other CLI commands log at `WARNING` only.
+
+**The run's events are mirrored into the log** by `sbxloop.daemon.logsink`,
+subscribed to every run's bus under the logger `sbxloop.run`
+(`journalctl … | grep sbxloop.run`), tiered by event type:
+
+- `WARNING` — the run degraded or something was refused: `worker.error`,
+  `sandbox.tooling_warning`, `sandbox.resources_warning`,
+  `agent.permission_denied`, `agent.tool_cap`, `run.config_drift`.
+- `INFO` — lifecycle: `run.*`, task and phase start/state/end, sandbox
+  provisioning, worker job start/end/result, GitHub op start/end, policy
+  denials, chat (steering) traffic, gc.
+- `DEBUG` — everything else: individual tool calls, agent messages and
+  deltas, usage, heartbeats, stdout, resource samples, policy allows.
+
+Each record carries the same summary fields `sbxloop logs` prints
+(`summarize_event`), plus `run=` and `job=`.
+
+House style for host code:
+
+- `log = get_logger(__name__)`; log **events, not prose** — a stable dotted
+  event name (`subsystem.verb_object`: `run.dispatch`, `github.claimed`,
+  `sbx.invoke`) and keyword fields for everything that varies. Never format
+  values into the event string, never pass f-strings.
+- Levels: DEBUG is per-call chatter (tool calls, sbx invocations, polls that
+  found nothing, store transitions); INFO is lifecycle (the `daemon.starting`
+  config summary, claims, `run.dispatch`/`run.finished` with duration,
+  operator commands); WARNING is degraded-but-continuing (retry, fallback,
+  a swallowed error, breaker open); ERROR means a human has to look (a
+  crash, `run.delivery_failed`, `run.abandoned`, `breaker.opened`, Discord
+  gone for the process lifetime).
+- Catching an exception and carrying on? Log it with `exc_info=True`.
+- Correlation ids are fields — `run=`, `item=`, `job=`, `task=`,
+  `sandbox=`. Inside the run thread `bind_run()` stamps `run`/`item` on
+  every record via contextvars (they do not cross threads; bind inside the
+  thread).
+- Never log a secret: subprocess argv goes through `redacted_argv()`, and the
+  `redact_secrets` processor masks any field whose name says it is a
+  credential (`token`, `secret`, `password`, `api_key`, …).
+- `DaemonLoop._notify(text, event, **fields)` is the seam that both narrates
+  to Discord (`text`) and logs a structured record (`event`, `fields`).

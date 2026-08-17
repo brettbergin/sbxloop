@@ -385,3 +385,34 @@ class TestExecFailureClassification:
     )
     def test_sbx_level_failures_still_raise(self, stderr: str) -> None:
         assert _exec_failed_at_sbx_level(stderr)
+
+
+class TestInvocationLogging:
+    """Every sbx call is a DEBUG line (verb, redacted argv, rc, duration);
+    a failing one carries its stderr; secrets never reach the log."""
+
+    def test_invoke_logged_with_redacted_argv(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="sbxloop.sbx.cli"):
+            cli.secret_set_custom(host="h", env="E", value="github_pat_SECRET")
+        lines = [r.getMessage() for r in caplog.records if "sbx.invoke" in r.getMessage()]
+        assert lines, [r.getMessage() for r in caplog.records]
+        assert all("github_pat_SECRET" not in line for line in lines)
+        assert any("'command': 'secret set-custom'" in line for line in lines)
+        assert any("'rc': 0" in line and "'duration_s'" in line for line in lines)
+
+    def test_failed_invoke_carries_stderr(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        fake_sbx.fail_next("rm", returncode=1, stderr="no such sandbox")
+        with caplog.at_level(logging.DEBUG, logger="sbxloop.sbx.cli"):
+            with pytest.raises(SbxError):
+                cli.rm("nope")
+        (line,) = [r.getMessage() for r in caplog.records if "sbx.invoke" in r.getMessage()]
+        assert "'command': 'rm'" in line and "'rc': 1" in line
+        assert "no such sandbox" in line

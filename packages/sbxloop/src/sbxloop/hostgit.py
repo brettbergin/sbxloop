@@ -241,7 +241,7 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
         except (subprocess.CalledProcessError, OSError):
             # Not a usable repo (a bare `.git` marker, corrupt HEAD, …):
             # fall through to the self-contained probe.
-            log.debug("in-place gitignore probe failed in %s", root, exc_info=True)
+            log.debug("gitignore.in_place_probe_failed", root=str(root), exc_info=True)
     try:
         with tempfile.TemporaryDirectory(prefix="sbxloop-gitignore-") as tmp:
             subprocess.run(  # nosec B603 - list argv, git binary, no shell
@@ -251,7 +251,12 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
             env["GIT_WORK_TREE"] = str(root)
             return _ls_files(argv, root, env)
     except (subprocess.CalledProcessError, OSError):
-        log.warning("gitignore probe failed in %s; ignore rules not applied", root, exc_info=True)
+        log.warning(
+            "gitignore.probe_failed",
+            root=str(root),
+            hint="ignore rules not applied",
+            exc_info=True,
+        )
         return None
 
 
