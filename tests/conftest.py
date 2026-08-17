@@ -113,6 +113,17 @@ def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
     return FakeSbx(binary=shim, state=state)
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _structlog_through_stdlib() -> None:
+    """Route structlog through ``logging`` for the whole session so ``caplog``
+    captures every record with its structured fields rendered. Tests that
+    assert on a level below WARNING should say so with ``caplog.at_level``:
+    CLI tests reconfigure the root level as the real entrypoint does."""
+    from sbxloop.log import configure_logging
+
+    configure_logging("DEBUG")
+
+
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point HOME at the test's tmp dir.

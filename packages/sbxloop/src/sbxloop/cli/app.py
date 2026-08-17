@@ -41,6 +41,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
+from sbxloop.log import configure_logging, get_logger
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
@@ -100,6 +101,11 @@ def _main_callback(
     ] = False,
 ) -> None:
     """sbxloop — agentic loops on Docker Sandboxes."""
+    # Library warnings (provisioning rollbacks, worker install fallbacks)
+    # render through the same pipeline as the daemon's instead of falling
+    # through to logging's bare last-resort handler. The daemon re-configures
+    # with its own level/format once its config is loaded.
+    configure_logging("WARNING")
     # Every command sees ./.env (tokens + SBXLOOP_* settings); real
     # environment variables always take precedence.
     load_dotenv_file()
@@ -1409,6 +1415,17 @@ def daemon(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Poll and print candidates; claim and run nothing.")
     ] = False,
+    log_level: Annotated[
+        str | None,
+        typer.Option(
+            "--log-level",
+            help="Daemon log level: DEBUG|INFO|WARNING|ERROR (also SBXLOOP_DAEMON__LOG_LEVEL).",
+        ),
+    ] = None,
+    log_format: Annotated[
+        str | None,
+        typer.Option("--log-format", help="Daemon log rendering: console|json."),
+    ] = None,
 ) -> None:
     """Run the always-on outer loop: discover work (labeled GitHub issues,
     inbox files), run each item through the inner loop, report back, and
@@ -1417,18 +1434,16 @@ def daemon(
     daemon instead."""
     if ctx.invoked_subcommand is not None:
         return
-    import logging
-
     from sbxloop.daemon.control import ControlServer
     from sbxloop.daemon.discord import DiscordBridge
     from sbxloop.daemon.github import DaemonGithub
+    from sbxloop.daemon.logsink import event_log_subscriber
     from sbxloop.daemon.loop import DaemonLoop
     from sbxloop.daemon.paths import resolve_state_dir
     from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels, InboxSource, WorkSource
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    log = get_logger("sbxloop.daemon")
+    started_at = time.monotonic()
     config, config_sources = load_config_with_sources()
     # The daemon's state lives at an absolute path outside the workspace
     # (#255): a relative `.sbxloop` inside the checkout it works on would
@@ -1444,6 +1459,8 @@ def daemon(
             ("backlog", backlog),
             ("max_runs_per_day", max_runs_per_day),
             ("poll_interval_s", poll_interval),
+            ("log_level", log_level),
+            ("log_format", log_format),
         )
         if v is not None
     }
@@ -1462,38 +1479,39 @@ def daemon(
             )
             config = config.model_copy(update={"discord": discord_cfg})
     except ValidationError as exc:
-        console.print(f"[bold red]invalid daemon option:[/] {exc.errors()[0]['msg']}")
+        # Before the pipeline is configured with the daemon's own settings:
+        # the WARNING-level default from the app callback carries this.
+        log.error("daemon.invalid_option", error=exc.errors()[0]["msg"])
         raise typer.Exit(2) from exc
+    configure_logging(config.daemon.log_level, fmt=config.daemon.log_format)
 
     github_active = config.github.enabled
     inbox_active = bool(config.daemon.inbox_dir)
     if not github_active and not inbox_active:
-        console.print(
-            "[bold red]no work sources:[/] set [cyan]--repo owner/name[/] (or "
-            "[cyan]\\[github] repo[/]) to poll issues, and/or an inbox directory "
-            "([cyan]--inbox DIR[/] / [cyan]\\[daemon] inbox_dir[/])."
+        log.error(
+            "daemon.no_work_sources",
+            hint="set --repo owner/name (or [github] repo) to poll issues, and/or an "
+            "inbox directory (--inbox DIR / [daemon] inbox_dir)",
         )
         raise typer.Exit(2)
     if config.daemon.backlog == "github" and not github_active:
-        console.print("[bold red]--backlog github needs a GitHub repository[/] (--repo).")
+        log.error("daemon.backlog_needs_github", hint="--backlog github needs --repo owner/name")
         raise typer.Exit(2)
     if github_active and config.daemon.backlog != "github":
         # The audit lane is always on when issues are a source; its
         # findings only have somewhere to go with backlog = "github".
-        console.print(
-            f"[yellow]note:[/] audit issues (`{config.daemon.audit_label}`) file their "
-            "findings as backlog issues, which needs [cyan]--backlog github[/]; with "
-            f"backlog={config.daemon.backlog!r} an audit run completes but files nothing."
+        log.warning(
+            "daemon.audit_findings_unfiled",
+            audit_label=config.daemon.audit_label,
+            backlog=config.daemon.backlog,
+            hint="audit runs complete but file nothing without --backlog github",
         )
 
-    # Say where the state went: with the anchored default, `sbxloop status`
-    # in the runner dir shows nothing unless SBXLOOP_STATE_DIR points here.
-    console.print(f"state dir: [cyan]{config.state_dir}[/] ({state_choice.reason})")
     store = _store(config)
     dstore = DaemonStore(config.state_dir / "state.db")
     sbx = SbxCLI(app_name=config.app_name or None)
     bus = EventBus()
-    bus.subscribe(plain_printer(console))
+    bus.subscribe(event_log_subscriber)
     sources: list[WorkSource] = []
     github: DaemonGithub | None = None
     if inbox_active:
@@ -1521,17 +1539,64 @@ def daemon(
             )
         )
 
+    # One line an operator can read back from the journal to know exactly
+    # what this daemon is: where its state went (with the anchored default,
+    # `sbxloop status` in the runner dir shows nothing unless
+    # SBXLOOP_STATE_DIR points here), what it polls, and every guardrail.
+    log.info(
+        "daemon.starting",
+        version=sbxloop.__version__,
+        pid=os.getpid(),
+        state_dir=str(config.state_dir),
+        state_dir_reason=state_choice.reason,
+        sources=[s.name for s in sources],
+        repo=config.github.repo,
+        trigger_label=config.daemon.trigger_label if github_active else None,
+        inbox_dir=config.daemon.inbox_dir or None,
+        poll_interval_s=config.daemon.poll_interval_s,
+        max_runs_per_day=config.daemon.max_runs_per_day,
+        max_attempts_per_item=config.daemon.max_attempts_per_item,
+        max_resumes_per_item=config.daemon.max_resumes_per_item,
+        retry_backoff_s=config.daemon.retry_backoff_s,
+        max_consecutive_failures=config.daemon.max_consecutive_failures,
+        breaker_cooldown_s=config.daemon.breaker_cooldown_s,
+        workspace_isolation=config.daemon.workspace_isolation,
+        refresh_workspace=config.daemon.refresh_workspace,
+        backlog=config.daemon.backlog,
+        audits=config.daemon.audits,
+        postmortems=config.daemon.postmortems,
+        review_deliveries=config.daemon.review_deliveries,
+        discord=("on" if config.discord.enabled else "off"),
+        discord_channel=config.discord.channel_id if config.discord.enabled else None,
+        log_level=config.daemon.log_level,
+        log_format=config.daemon.log_format,
+        once=once,
+        dry_run=dry_run,
+    )
+
     if dry_run:
         code = 0
         try:
             for source in sources:
+                found = 0
                 for item in source.poll():
+                    found += 1
+                    # The listing IS this command's output: stdout, so it
+                    # pipes and greps; the log keeps the structured record.
                     console.print(
                         f"[cyan]{item.item_id}[/]  {item.title}"
                         + (f"  {item.url}" if item.url else "")
                     )
+                    log.debug(
+                        "daemon.dry_run_candidate",
+                        source=source.name,
+                        item=item.item_id,
+                        title=item.title,
+                        url=item.url or None,
+                    )
+                log.info("daemon.dry_run_polled", source=source.name, candidates=found)
         except SbxloopError as exc:
-            console.print(f"[bold red]poll failed:[/] {exc}")
+            log.error("daemon.poll_failed", error=str(exc), exc_info=True)
             code = 1
         finally:
             if github is not None:
@@ -1545,13 +1610,14 @@ def daemon(
             bridge = DiscordBridge(config, dstore, loop_ref=loop)
             bridge.start()
         except SbxloopError as exc:
-            console.print(f"[bold red]discord bridge:[/] {exc}")
+            log.error("discord.bridge_failed", error=str(exc), exc_info=True)
             raise typer.Exit(2) from exc
         loop.frontend = bridge
 
     ctl = ControlServer(loop, config.state_dir)
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
+    stop_reason = "finished"
     try:
         loop.recover()
         # Only now: an `abandon`/`requeue` served while recover() is still
@@ -1561,19 +1627,41 @@ def daemon(
         ctl.start()
         if once:
             result = loop.tick()
+            # --once is a smoke/cron probe: its one-line verdict stays on
+            # stdout for the human or script that invoked it.
             console.print(f"tick: {result}")
+            log.info(
+                "daemon.tick",
+                discovered=result.discovered,
+                dispatched=result.dispatched,
+                outcome=result.outcome,
+                idle=result.idle_kind,
+                idle_detail=result.idle_detail,
+            )
         else:
             loop.run_forever()
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]daemon interrupted[/]")
+        stop_reason = "interrupted"
+        log.warning("daemon.interrupted", hint="KeyboardInterrupt; shutting down")
+    except BaseException as exc:
+        stop_reason = type(exc).__name__
+        raise
     finally:
         cleanup_registry.set_quiesce(None)
+        log.debug("daemon.shutdown", step="control server")
         ctl.close()
         if bridge is not None:
+            log.debug("daemon.shutdown", step="discord bridge")
             bridge.close()
         if github is not None:
+            log.debug("daemon.shutdown", step="github sandbox")
             github.close()
         dstore.close()
+        log.info(
+            "daemon.stopped",
+            reason=stop_reason,
+            uptime_s=round(time.monotonic() - started_at, 1),
+        )
 
 
 def _daemon_state_dir() -> Path:

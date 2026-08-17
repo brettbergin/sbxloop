@@ -7,13 +7,22 @@ invisible to the user's interactive sbx usage.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from collections.abc import Sequence
 
 from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.log import get_logger
 from sbxloop.sbx.models import ExecResult, SandboxInfo, SandboxSpec
 from sbxloop.sbx.parse import parse_ls, parse_version
+
+log = get_logger(__name__)
+
+# An sbx call slower than this is worth an INFO line of its own even when
+# nothing failed: a microVM boot or a wedged exec explains a run's wall
+# clock, and nothing else in the journal would.
+SLOW_CALL_S = 60.0
 
 _NOT_FOUND_MARKERS = ("not found", "no such sandbox", "does not exist", "unknown sandbox")
 
@@ -72,6 +81,14 @@ def _exec_failed_at_sbx_level(stderr: str) -> bool:
     return "sandbox" in lowered and any(marker in lowered for marker in _NOT_FOUND_MARKERS)
 
 
+def _command_of(args: Sequence[str]) -> str:
+    """``create`` / ``exec`` / ``secret set`` — the sbx verb, for the log."""
+    words = [a for a in args if not a.startswith("-")]
+    if words and words[0] in ("secret", "policy") and len(words) > 1:
+        return f"{words[0]} {words[1]}"
+    return words[0] if words else ""
+
+
 class SbxCLI:
     """Blocking, typed access to the sbx CLI."""
 
@@ -124,6 +141,12 @@ class SbxCLI:
                 argv=safe_argv,
             ) from exc
         except subprocess.TimeoutExpired as exc:
+            log.warning(
+                "sbx.timeout",
+                command=_command_of(args),
+                argv=safe_argv,
+                timeout_s=timeout or self.default_timeout,
+            )
             raise SbxError(
                 f"sbx invocation timed out after {timeout or self.default_timeout:.0f}s",
                 argv=safe_argv,
@@ -137,12 +160,22 @@ class SbxCLI:
             stderr=proc.stderr,
             duration_s=time.monotonic() - started,
         )
+        log.log(
+            logging.INFO if result.duration_s >= SLOW_CALL_S else logging.DEBUG,
+            "sbx.invoke",
+            command=_command_of(args),
+            argv=safe_argv,
+            rc=result.returncode,
+            duration_s=round(result.duration_s, 2),
+            stderr=result.stderr.strip()[:200] if not result.ok else None,
+        )
         if check and not result.ok:
             raise self._error_for(result)
         return result
 
     def popen(self, *args: str) -> subprocess.Popen[str]:
         """Start a streaming sbx invocation (stdout piped, line-buffered)."""
+        log.debug("sbx.popen", command=_command_of(args), argv=redacted_argv(self.argv(*args)))
         argv = self.argv(*args)
         try:
             return subprocess.Popen(  # nosec B603 - list argv, sbx CLI, no shell

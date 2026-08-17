@@ -16,7 +16,6 @@ Resolution order:
 
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import subprocess
@@ -27,8 +26,9 @@ from importlib import resources
 from pathlib import Path
 
 import sbxloop
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # lru_cache does not lock: without this, the parallel worker installs
 # (#127) would each run their own `uv build` before either result lands
@@ -84,7 +84,7 @@ def _workspace_build() -> Path | None:
             env=env,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        logger.warning("workspace worker wheel build failed: %s", exc)
+        log.warning("worker.wheel_build_failed", error=str(exc), out_dir=str(out_dir))
         return None
     wheels = sorted(out_dir.glob("sbxloop_worker-*.whl"))
     return wheels[-1] if wheels else None

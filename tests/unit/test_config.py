@@ -401,3 +401,19 @@ class TestUserConfigLayer:
         # though Path.home() (the autouse tmp HOME) has a file.
         self._write_user(tmp_path, 'model = "leak"\n')
         assert load_config(cwd=tmp_path, env={}).model == "auto"
+
+
+def test_daemon_log_level_and_format(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.log_level == "INFO"
+    assert config.daemon.log_format == "console"
+    over = load_config(
+        cwd=tmp_path,
+        env={"SBXLOOP_DAEMON__LOG_LEVEL": "debug", "SBXLOOP_DAEMON__LOG_FORMAT": "JSON"},
+    )
+    assert over.daemon.log_level == "DEBUG"  # case-insensitive
+    assert over.daemon.log_format == "json"
+    with pytest.raises(ConfigError, match="log_level"):
+        load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_LEVEL": "LOUD"})
+    with pytest.raises(ConfigError, match="log_format"):
+        load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_FORMAT": "xml"})

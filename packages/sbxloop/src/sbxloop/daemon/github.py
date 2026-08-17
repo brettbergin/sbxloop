@@ -12,7 +12,6 @@ picked up transparently.
 from __future__ import annotations
 
 import hashlib
-import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -22,12 +21,13 @@ from sbxloop.config import Config
 from sbxloop.errors import DaemonError, GithubOpsError, SbxError, SbxloopError, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.gh.ops import GithubOps
+from sbxloop.log import get_logger
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.worker.client import WorkerClient
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 T = TypeVar("T")
 
@@ -85,12 +85,16 @@ class DaemonGithub:
         """Drop a same-named sandbox left by a previous daemon process."""
         try:
             Sandbox(self.sbx, self.name).rm()
-            logger.info("removed stale daemon sandbox %s", self.name)
+            log.info("github_sandbox.stale_removed", sandbox=self.name)
         except SbxError:
-            pass
+            log.debug("github_sandbox.no_stale", sandbox=self.name)
 
     def ops(self) -> GithubOps:
         if self._ops is None:
+            # Lazy: the first GitHub call of the process (or the first after
+            # a drop) pays for a microVM boot + worker install here — say
+            # so, or that call looks like a hang.
+            log.info("github_sandbox.provision_needed", sandbox=self.name)
             self._ops = self._provision()
         return self._ops
 
@@ -114,13 +118,21 @@ class DaemonGithub:
         now = self.clock()
         last = self._last_reprovision_at
         if last is not None and now - last < REPROVISION_MIN_INTERVAL_S:
-            logger.warning(
-                "daemon github op failed (%s); sandbox re-provisioned %.0fs ago, not again yet",
-                exc,
-                now - last,
+            log.warning(
+                "github_sandbox.op_failed",
+                sandbox=self.name,
+                error=str(exc),
+                reprovisioned_ago_s=round(now - last),
+                min_interval_s=REPROVISION_MIN_INTERVAL_S,
+                action="keeping the sandbox; re-provisioned too recently",
             )
             return False
-        logger.warning("daemon github op failed (%s); dropping the sandbox to re-provision", exc)
+        log.warning(
+            "github_sandbox.op_failed",
+            sandbox=self.name,
+            error=str(exc),
+            action="dropping the sandbox; the next call re-provisions",
+        )
         self._last_reprovision_at = now
         self.close()
         return True
@@ -129,7 +141,8 @@ class DaemonGithub:
         try:
             self.ops().raw("GET", "/rate_limit")
             return True
-        except (GithubOpsError, WorkerError, SbxError):
+        except (GithubOpsError, WorkerError, SbxError) as exc:
+            log.warning("github_sandbox.unhealthy", sandbox=self.name, error=str(exc))
             return False
 
     def close(self) -> None:
@@ -137,8 +150,9 @@ class DaemonGithub:
         if sandbox is not None:
             try:
                 sandbox.rm()
+                log.info("github_sandbox.removed", sandbox=self.name)
             except SbxError:
-                logger.warning("failed to remove daemon sandbox %s", self.name, exc_info=True)
+                log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
 
     def _provision(self) -> GithubOps:
         clients: list[WorkerClient] = []
@@ -159,6 +173,13 @@ class DaemonGithub:
                 client.install(extras="")
             clients.append(client)
 
+        started = time.monotonic()
+        log.info(
+            "github_sandbox.provision_start",
+            sandbox=self.name,
+            workspace=str(self.workspace),
+            install_workers=self.install_workers,
+        )
         try:
             sandbox = self.provisioner.ensure_github_only(
                 self.name, self.workspace, post_create=install
@@ -166,6 +187,17 @@ class DaemonGithub:
         except SbxloopError as exc:
             # ProvisionError, WorkerError, SbxError alike: one daemon-level
             # error, and nothing left behind.
+            log.error(
+                "github_sandbox.provision_failed",
+                sandbox=self.name,
+                duration_s=round(time.monotonic() - started, 1),
+                error=str(exc),
+            )
             raise DaemonError(f"cannot provision the daemon github sandbox: {exc}") from exc
         self._sandbox, self._client = sandbox, clients[0]
+        log.info(
+            "github_sandbox.ready",
+            sandbox=self.name,
+            duration_s=round(time.monotonic() - started, 1),
+        )
         return GithubOps(clients[0], DAEMON_RUN_ID)

@@ -1314,3 +1314,127 @@ class TestWorkspacePosture:
         assert h.loop.tick().outcome == "done"
         assert h.runs == [("rres", True)]
         assert hostgit.head_commit(checkout) == stale
+
+
+class TestLogging:
+    """The journal answers the questions it could not before: what was
+    dispatched and how long it took, why the daemon is idle (once, not per
+    tick), what shutdown interrupted, and what a report could not read."""
+
+    @staticmethod
+    def _events(caplog: pytest.LogCaptureFixture, name: str) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "sbxloop.daemon.loop" and f"'event': '{name}'" in r.getMessage()
+        ]
+
+    def test_dispatch_and_finish_are_logged_with_ids_and_duration(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        with caplog.at_level(logging.INFO):
+            assert h.loop.tick().outcome == "done"
+        (dispatch,) = self._events(caplog, "run.dispatch")
+        assert "'item': 'inbox:a.md'" in dispatch and "'source': 'inbox'" in dispatch
+        assert "'resume': False" in dispatch and "'attempt': 1" in dispatch
+        (finished,) = self._events(caplog, "run.finished")
+        assert "'outcome': 'completed'" in finished and "'duration_s'" in finished
+        assert self._events(caplog, "item.claimed")
+        (done,) = self._events(caplog, "run.done")
+        assert "'pr': 'https://x/pull/9'" in done
+
+    def test_run_thread_records_carry_the_bound_run_id(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from sbxloop.log import get_logger
+
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        seen: list[str] = []
+
+        def runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            get_logger("sbxloop.test.inside").info("inside.run")
+            seen.append(run_id)
+            h.store.create_run(run_id, "outcome")
+            h.store.set_run_state(run_id, "completed")
+            return RunResult(run_id=run_id, state="completed")
+
+        h.loop._runner = runner
+        with caplog.at_level(logging.INFO):
+            h.loop.tick()
+        (inside,) = [r.getMessage() for r in caplog.records if r.name == "sbxloop.test.inside"]
+        assert f"'run': '{seen[0]}'" in inside and "'item': 'inbox:a.md'" in inside
+
+    def test_idle_reason_logged_on_change_not_every_tick(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        h = Harness(tmp_path)
+        h.loop.pause()
+        with caplog.at_level(logging.INFO):
+            for _ in range(3):
+                h.loop._log_tick(h.loop.tick(), 0.01)
+            h.loop.unpause()
+            h.loop._log_tick(h.loop.tick(), 0.01)
+        idles = self._events(caplog, "daemon.idle")
+        assert len(idles) == 2
+        assert "'idle': 'paused'" in idles[0]
+        assert "'idle': 'no_work'" in idles[1]
+
+    def test_shutdown_interruption_is_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            started.set()
+            release.wait(5)
+            raise WorkerError("cancelled at boundary")
+
+        h.loop._runner = slow_runner
+        with caplog.at_level(logging.INFO):
+            t = threading.Thread(target=h.loop.tick)
+            t.start()
+            assert started.wait(5)
+            h.loop.request_stop()
+            release.set()
+            t.join(5)
+        (interrupted,) = self._events(caplog, "run.interrupted")
+        assert "'item': 'inbox:a.md'" in interrupted and "'resumable': True" in interrupted
+        (finished,) = self._events(caplog, "run.finished")
+        assert "'outcome': 'interrupted'" in finished
+
+    def test_report_mining_failure_is_a_warning_not_silence(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from sbxloop.errors import StateError
+
+        h = Harness(tmp_path)
+
+        def broken_events(*a: Any, **k: Any) -> Any:
+            raise StateError("events table gone")
+
+        h.store.events = broken_events  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING):
+            report = h.loop._report("r-x", None)
+        assert report.delivery is None
+        (warned,) = self._events(caplog, "run.report_events_unreadable")
+        assert "'run': 'r-x'" in warned

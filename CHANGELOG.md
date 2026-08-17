@@ -6,7 +6,42 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- The daemon's log is structured ([structlog](https://www.structlog.org/)
+  routed through the standard library, `sbxloop.log`) and configurable:
+  `--log-level` / `[daemon] log_level` / `SBXLOOP_DAEMON__LOG_LEVEL`
+  (default `INFO`) and `--log-format console|json` (`[daemon] log_format`).
+  Third-party loggers (discord.py, httpx) are held at `WARNING` unless
+  `DEBUG` is asked for. Every run's event stream is mirrored into the log
+  under the `sbxloop.run` logger (`sbxloop.daemon.logsink`): lifecycle at
+  `INFO`, worker/tooling failures at `WARNING`, tool calls at `DEBUG` —
+  a daemon without Discord no longer goes silent between claim and settle.
+  New messages cover what the journal could not answer before: a
+  `daemon.starting` config summary (state dir and why, sources, guardrails,
+  Discord on/off), `run.dispatch` / `run.finished` with duration,
+  `run.interrupted` at shutdown, why the daemon is idle whenever that
+  changes (paused, breaker, backoff with queue depth, daily cap), claims and
+  lost claim races, GitHub polls, every operator command (`operator.command`
+  with `by=`/`via=`), Discord steers, the github-ops sandbox's lazy
+  provisioning with duration, `sbx` subprocess invocations (redacted argv,
+  rc, duration; slow calls at `INFO`), worker install/job submit/timeouts/
+  kills, Copilot phase calls with duration and token usage, delivery steps
+  and PR URL, and store transitions at `DEBUG`. Fields carry correlation ids
+  (`run=`, `item=`, `job=`, `sandbox=`); a `redact_secrets` processor masks
+  credential-named fields.
+
 ### Changed
+
+- Daemon-path operator narration moved from Rich `console.print` on stdout
+  to the log (validation errors, the state-dir line, "daemon interrupted"),
+  so journald has one stream in one format; `--dry-run`'s candidate listing
+  and `--once`'s `tick:` line stay on stdout (they are the command's output)
+  and are logged as well. Several Discord failures that were logged at `DEBUG`
+  (dropped work, digest/status/headline edits, embed fallback) are now
+  `WARNING`; the gateway connect failure and an unreachable channel are
+  `ERROR`; `run.delivery_failed`, `run.abandoned` and `breaker.opened` are
+  `ERROR`. Log messages are event names with fields (`github.claim_failed item=gh:12 …`) rather than prose.
 
 - The audit lane's Discord messages follow the bridge's formatting pattern
   instead of ad hoc strings: filed refs render as masked links

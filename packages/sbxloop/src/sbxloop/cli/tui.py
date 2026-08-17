@@ -35,7 +35,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from sbxloop.events import Event, HostEventTypes
+from sbxloop.events import Event, HostEventTypes, summarize_event
 from sbxloop_worker.protocol import EventTypes
 
 TASK_STATE_STYLES = {
@@ -474,47 +474,29 @@ class Dashboard:
 
 def format_event(event: Event) -> str:
     """Dense single-line form (used by `sbxloop logs` and lifecycle lines)."""
+    fields = summarize_event(event)
     parts = [_stamp(event), event.type]
-    if event.data.get("task_id"):
-        parts.append(f"[{event.data['task_id']}]")
-    if event.data.get("agent"):
-        parts.append(f"[{event.data['agent']}]")
-    keys = (
-        "state",
-        "content",
-        "text",
-        "reply",
-        "tool",
-        "op",
-        "line",
-        "message",
-        "outcome",
-        "error",
-        "url",
-        "path",
-    )
-    picked = ""
-    for key in keys:
-        if event.data.get(key):
-            picked = key
-            value = str(event.data[key]).replace("\n", " ")
-            parts.append(value[:160])
-            break
-    if event.data.get("disk_used_pct") is not None:
+    if "task" in fields:
+        parts.append(f"[{fields['task']}]")
+    if "agent" in fields:
+        parts.append(f"[{fields['agent']}]")
+    if "summary" in fields:
+        parts.append(fields["summary"])
+    if "disk" in fields:
         # Resource samples: make `sbxloop logs --type-prefix sandbox.resources`
         # answer "what did disk look like before the failure" at a glance.
-        summary = [f"disk={event.data['disk_used_pct']}%"]
-        if event.data.get("mem_used_pct") is not None:
-            summary.append(f"mem={event.data['mem_used_pct']}%")
-        if event.data.get("load1") is not None:
-            summary.append(f"load={event.data['load1']}")
-        if event.data.get("level"):
-            summary.append(str(event.data["level"]))
+        summary = [f"disk={fields['disk']}"]
+        if "mem" in fields:
+            summary.append(f"mem={fields['mem']}")
+        if "load" in fields:
+            summary.append(f"load={fields['load']}")
+        if "resource_level" in fields:
+            summary.append(str(fields["resource_level"]))
         parts.append(" ".join(summary))
-    if event.data.get("args"):
-        parts.append(_one_line(str(event.data["args"]), 120))
-    if picked != "error" and event.data.get("error"):
-        parts.append(_one_line(str(event.data["error"]), 160))
+    if "args" in fields:
+        parts.append(fields["args"])
+    if "error" in fields:
+        parts.append(fields["error"])
     return " ".join(parts)
 
 

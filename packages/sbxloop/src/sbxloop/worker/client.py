@@ -22,7 +22,6 @@ import binascii
 import codecs
 import contextlib
 import json
-import logging
 import queue
 import shlex
 import threading
@@ -36,6 +35,7 @@ from sbxloop import toolchains
 from sbxloop.config import Limits, WorkerTransport
 from sbxloop.errors import SbxError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
+from sbxloop.log import get_logger
 from sbxloop.sbx.models import ExecResult
 from sbxloop.sbx.sandbox import (
     BAKE_MANIFEST,
@@ -129,7 +129,7 @@ if smoke is None or smoke.returncode != 64:
 emit("ok", python=python, git=shutil.which("git") is not None)
 """
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def _output_tail(result: ExecResult, limit: int = 2000) -> str:
@@ -219,10 +219,26 @@ class WorkerClient:
         the AGENT's own work (see _ensure_dev_tools) — the engine sets it
         for the agent sandbox only, passing the configured ``languages``.
         """
+        started = time.monotonic()
+        log.info(
+            "worker.install_start",
+            sandbox=self.sandbox.name,
+            role=self.role,
+            expect_prebaked=expect_prebaked,
+            ensure_dev_tools=ensure_dev_tools,
+            languages=list(languages) or None,
+        )
         if expect_prebaked and self._verify_prebaked():
             self.prebaked = True
             if ensure_dev_tools and self._prebake_missing:
                 self._provision_toolchains(self._prebake_missing, timeout)
+            log.info(
+                "worker.installed",
+                sandbox=self.sandbox.name,
+                role=self.role,
+                prebaked=True,
+                duration_s=round(time.monotonic() - started, 1),
+            )
             return
         if ensure_dev_tools:
             self._ensure_dev_tools(timeout, languages)
@@ -255,6 +271,15 @@ class WorkerClient:
             raise WorkerError(
                 f"worker version {installed!r} does not match host {sbxloop.__version__!r}"
             )
+        log.info(
+            "worker.installed",
+            sandbox=self.sandbox.name,
+            role=self.role,
+            prebaked=False,
+            python=self.python,
+            version=installed,
+            duration_s=round(time.monotonic() - started, 1),
+        )
 
         # Entrypoint smoke check: importing the package proves nothing about
         # `python -m sbxloop_worker` actually executing under sbx exec. A run
@@ -317,47 +342,68 @@ class WorkerClient:
             except ValueError:
                 pass
         stage = verdict.get("stage")
+        fallback = "running the install ladder"
         if stage is None:
-            logger.warning(
-                "prebake probe produced no verdict (rc=%s): %s — running install ladder",
-                probe.returncode,
-                _output_tail(probe),
+            log.warning(
+                "worker.prebake_no_verdict",
+                sandbox=self.sandbox.name,
+                rc=probe.returncode,
+                output=_output_tail(probe),
+                action=fallback,
             )
             return False
         if stage == "no-manifest":
-            logger.info("no bake manifest in template (%s); running install ladder", BAKE_MANIFEST)
+            log.info(
+                "worker.prebake_no_manifest",
+                sandbox=self.sandbox.name,
+                manifest=BAKE_MANIFEST,
+                action=fallback,
+            )
             return False
         if stage == "bad-manifest":
-            logger.warning("unreadable bake manifest %s; running install ladder", BAKE_MANIFEST)
+            log.warning(
+                "worker.prebake_bad_manifest",
+                sandbox=self.sandbox.name,
+                manifest=BAKE_MANIFEST,
+                action=fallback,
+            )
             return False
         if stage == "stale":
-            logger.warning(
-                "template worker %s does not match host %s — stale template, running "
-                "install ladder (re-run `sbxloop bake` to refresh)",
-                verdict.get("baked"),
-                sbxloop.__version__,
+            log.warning(
+                "worker.prebake_stale_template",
+                sandbox=self.sandbox.name,
+                baked=verdict.get("baked"),
+                host=sbxloop.__version__,
+                action=fallback,
+                hint="re-run `sbxloop bake` to refresh the template",
             )
             return False
         if stage == "import-failed":
-            logger.warning(
-                "prebaked worker failed the import/version probe (rc=%s): %s — "
-                "running install ladder",
-                verdict.get("rc"),
-                verdict.get("output") or "(no output)",
+            log.warning(
+                "worker.prebake_import_failed",
+                sandbox=self.sandbox.name,
+                rc=verdict.get("rc"),
+                output=verdict.get("output") or "(no output)",
+                action=fallback,
             )
             return False
         if stage == "smoke-failed":
-            logger.warning(
-                "prebaked worker failed the entrypoint probe (rc=%s, expected 64): %s — "
-                "running install ladder",
-                verdict.get("rc"),
-                verdict.get("output") or "(no output)",
+            log.warning(
+                "worker.prebake_smoke_failed",
+                sandbox=self.sandbox.name,
+                rc=verdict.get("rc"),
+                expected_rc=64,
+                output=verdict.get("output") or "(no output)",
+                action=fallback,
             )
             return False
         python = verdict.get("python")
         if stage != "ok" or not isinstance(python, str) or not python:
-            logger.warning(
-                "prebake probe returned unrecognized verdict %r — running install ladder", stage
+            log.warning(
+                "worker.prebake_unrecognized_verdict",
+                sandbox=self.sandbox.name,
+                stage=stage,
+                action=fallback,
             )
             return False
         self.python = python
@@ -365,7 +411,13 @@ class WorkerClient:
         # apt call, whereas trusting a malformed answer leaves the agent
         # without git for the whole run (#252).
         self._prebake_missing = [] if verdict.get("git") is True else [toolchains.GIT]
-        logger.info("prebaked worker %s verified; install ladder skipped", sbxloop.__version__)
+        log.info(
+            "worker.prebake_verified",
+            sandbox=self.sandbox.name,
+            version=sbxloop.__version__,
+            python=python,
+            git=verdict.get("git") is True,
+        )
         return True
 
     def _ensure_dev_tools(self, timeout: float, languages: Sequence[str] = ()) -> None:
@@ -403,7 +455,7 @@ class WorkerClient:
         )
         missing = [tc for tc in selected if not self.sandbox.exec(["sh", "-c", tc.probe]).ok]
         if not missing:
-            logger.debug("dev tools already present; skipping toolchain ensure")
+            log.debug("worker.dev_tools_present", sandbox=self.sandbox.name)
             return
         self._provision_toolchains(missing, timeout)
 
@@ -413,7 +465,11 @@ class WorkerClient:
         """Install already-probed-missing toolchains: one pooled apt call,
         then each entry's install script. Best-effort and loud, see
         ``_ensure_dev_tools``."""
-        logger.info("provisioning agent toolchains: %s", ", ".join(tc.name for tc in missing))
+        log.info(
+            "worker.toolchains_provisioning",
+            sandbox=self.sandbox.name,
+            toolchains=[tc.name for tc in missing],
+        )
         packages = toolchains.apt_packages(missing)
         if packages:
             apt_for = [tc for tc in missing if tc.apt_packages]
@@ -427,15 +483,16 @@ class WorkerClient:
                 timeout=timeout,
             )
             if not result.ok:
-                logger.warning(
-                    "dev-tools ensure failed for %s (rc=%s) — the agent may not "
-                    "have %s and has to bootstrap them itself. rc=100 usually "
-                    "means apt could not reach its mirrors; check the sandbox "
-                    "network policy allows the Ubuntu/Debian apt hosts: %s",
-                    ", ".join(tc.name for tc in apt_for),
-                    result.returncode,
-                    "; ".join(tc.wanted for tc in apt_for),
-                    _output_tail(result),
+                log.warning(
+                    "worker.dev_tools_ensure_failed",
+                    sandbox=self.sandbox.name,
+                    toolchains=[tc.name for tc in apt_for],
+                    rc=result.returncode,
+                    wanted="; ".join(tc.wanted for tc in apt_for),
+                    output=_output_tail(result),
+                    hint="the agent has to bootstrap these itself; rc=100 usually means apt "
+                    "could not reach its mirrors — check the sandbox network policy allows "
+                    "the Ubuntu/Debian apt hosts",
                 )
         for toolchain in missing:
             if toolchain.install_script is None:
@@ -445,15 +502,15 @@ class WorkerClient:
                 timeout=timeout,
             )
             if not result.ok:
-                logger.warning(
-                    "dev-tools ensure failed for %s (rc=%s) — the agent may not "
-                    "have %s and has to bootstrap them itself. A blocked "
-                    "installer domain is the usual cause; check the sandbox "
-                    "network policy: %s",
-                    toolchain.name,
-                    result.returncode,
-                    toolchain.wanted,
-                    _output_tail(result),
+                log.warning(
+                    "worker.dev_tools_ensure_failed",
+                    sandbox=self.sandbox.name,
+                    toolchains=[toolchain.name],
+                    rc=result.returncode,
+                    wanted=toolchain.wanted,
+                    hint="the agent has to bootstrap this itself; a blocked installer "
+                    "domain is the usual cause — check the sandbox network policy",
+                    output=_output_tail(result),
                 )
 
     # The worker reroutes the Copilot CLI's glob/grep tools to a PATH ripgrep
@@ -487,13 +544,14 @@ class WorkerClient:
             timeout=timeout,
         )
         if not result.ok:
-            logger.warning(
-                "search-fallback ensure failed (rc=%s) — this guest's page size "
-                "is not 4096 and no system ripgrep could be installed, so the "
-                "agent's glob/grep tools will abort (jemalloc 'Unsupported "
-                "system page size'): %s",
-                result.returncode,
-                _output_tail(result),
+            log.warning(
+                "worker.search_fallback_ensure_failed",
+                sandbox=self.sandbox.name,
+                rc=result.returncode,
+                output=_output_tail(result),
+                hint="this guest's page size is not 4096 and no system ripgrep could be "
+                "installed, so the agent's glob/grep tools will abort (jemalloc "
+                "'Unsupported system page size')",
             )
 
     def _create_venv(self, timeout: float, system_site_packages: bool) -> bool:
@@ -521,11 +579,12 @@ class WorkerClient:
             result = self.sandbox.exec(venv_cmd, timeout=timeout)
             if result.ok:
                 return True
-        logger.warning(
-            "venv creation failed (rc=%s): %s — falling back to a user-site install "
-            "with the system python3",
-            result.returncode,
-            _output_tail(result),
+        log.warning(
+            "worker.venv_failed",
+            sandbox=self.sandbox.name,
+            rc=result.returncode,
+            output=_output_tail(result),
+            action="falling back to a user-site install with the system python3",
         )
         return False
 
@@ -595,12 +654,34 @@ class WorkerClient:
         # login shell so the sandbox environment is fully loaded.
         wrapped = ["sh", "-lc", shlex.join(argv)]
         deadline = time.monotonic() + job.timeout_s + self.grace_s
+        started = time.monotonic()
+        log.info(
+            "worker.job_submit",
+            job=job.job_id,
+            kind=job.kind,
+            sandbox=self.sandbox.name,
+            role=self.role,
+            transport=self.transport,
+            timeout_s=job.timeout_s,
+            cwd=job.cwd,
+        )
         if self.transport == "poll":
             self._run_poll(job, wrapped, events_path, result_path, deadline)
             diagnostics = ""
         else:
             diagnostics = self._run_stream(job, wrapped, deadline)
-        return self._fetch_result(job, result_path, events_path, diagnostics)
+        result = self._fetch_result(job, result_path, events_path, diagnostics)
+        log.info(
+            "worker.job_done",
+            job=job.job_id,
+            kind=job.kind,
+            sandbox=self.sandbox.name,
+            status=result.status,
+            error=result.error.message[:200] if result.error is not None else None,
+            exit_code=result.exit_code,
+            duration_s=round(time.monotonic() - started, 1),
+        )
+        return result
 
     # -- stream transport --------------------------------------------------
 
@@ -632,6 +713,14 @@ class WorkerClient:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    log.warning(
+                        "worker.job_timeout",
+                        job=job.job_id,
+                        sandbox=self.sandbox.name,
+                        transport="stream",
+                        timeout_s=job.timeout_s,
+                        grace_s=self.grace_s,
+                    )
                     self._kill(job, proc)
                     raise WorkerTimeoutError(
                         f"job {job.job_id} exceeded {job.timeout_s}s (+{self.grace_s}s grace)"
@@ -689,13 +778,35 @@ class WorkerClient:
         quoted = shlex.join(argv)
         launch = self.sandbox.exec(["sh", "-c", f"nohup {quoted} >/dev/null 2>&1 & echo $!"])
         if not launch.ok:
+            log.warning(
+                "worker.launch_failed",
+                job=job.job_id,
+                sandbox=self.sandbox.name,
+                rc=launch.returncode,
+                stderr=launch.stderr.strip()[:500],
+            )
             raise WorkerError(f"failed to launch worker: {launch.stderr.strip()[:2000]}")
         pid = launch.stdout.strip().splitlines()[-1] if launch.stdout.strip() else ""
+        log.debug(
+            "worker.launched",
+            job=job.job_id,
+            sandbox=self.sandbox.name,
+            pid=pid or None,
+            poll_interval_s=self.poll_interval,
+        )
 
         drain = _PollDrain(self, job, events_path).drain
 
         while True:
             if time.monotonic() > deadline:
+                log.warning(
+                    "worker.job_timeout",
+                    job=job.job_id,
+                    sandbox=self.sandbox.name,
+                    transport="poll",
+                    timeout_s=job.timeout_s,
+                    grace_s=self.grace_s,
+                )
                 self._kill(job, None)
                 raise WorkerTimeoutError(
                     f"job {job.job_id} exceeded {job.timeout_s}s (+{self.grace_s}s grace)"
@@ -709,6 +820,7 @@ class WorkerClient:
                 )
                 if "dead" in alive.stdout:
                     # Worker exited between polls: drain whatever remains.
+                    log.debug("worker.exited", job=job.job_id, pid=pid)
                     drain()
                     break
 
@@ -716,11 +828,16 @@ class WorkerClient:
 
     def _kill(self, job: JobRequest, proc: object) -> None:
         # Pattern is job-id scoped so concurrent workers are never collateral.
-        with contextlib.suppress(Exception):
+        log.warning("worker.kill", job=job.job_id, sandbox=self.sandbox.name)
+        try:
             self.sandbox.exec(["pkill", "-f", f"sbxloop_worker.*{job.job_id}"])
+        except Exception:
+            log.warning("worker.kill_failed", job=job.job_id, exc_info=True)
         if proc is not None:
-            with contextlib.suppress(Exception):
+            try:
                 proc.kill()  # type: ignore[attr-defined]
+            except Exception:
+                log.debug("worker.kill_proc_failed", job=job.job_id, exc_info=True)
 
     def _events_tail(self, events_path: str, lines: int = 5) -> str:
         if not events_path:
@@ -790,8 +907,8 @@ class _PollDrain:
         try:
             raw = base64.b64decode(chunk.stdout) if chunk.stdout else b""
         except binascii.Error:
-            logger.warning(
-                "poll drain: undecodable chunk from %s; retrying next poll", self.events_path
+            log.warning(
+                "worker.poll_chunk_undecodable", events=self.events_path, action="retry next poll"
             )
             return False
         if not raw:

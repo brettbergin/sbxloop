@@ -46,7 +46,14 @@
    ```bash
    journalctl --user -u sbxloop-daemon -f
    systemctl --user status sbxloop-daemon
+   # only the runs' own lifecycle (tasks, phases, sandboxes, worker jobs):
+   journalctl --user -u sbxloop-daemon -f | grep sbxloop.run
    ```
+
+   The log is structured (`event key=value …`); `Environment=SBXLOOP_DAEMON__LOG_LEVEL=DEBUG`
+   in the unit turns on the per-call firehose, and
+   `SBXLOOP_DAEMON__LOG_FORMAT=json` renders one JSON object per line for a
+   log shipper.
 
 `systemctl --user stop` sends SIGTERM: the daemon stops claiming work, asks
 the in-flight run to cancel at its next task boundary, waits up to

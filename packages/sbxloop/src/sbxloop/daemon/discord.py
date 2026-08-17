@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import logging
 import os
 import queue
 import threading
@@ -62,8 +61,9 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.errors import DaemonError
 from sbxloop.events import Event, EventBus, HostEventTypes
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 TOKEN_ENV = "DISCORD_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 INSTALL_HINT = (
@@ -196,13 +196,26 @@ class DiscordBridge:
             target=self._thread_main, name="sbxloop-discord", daemon=True
         )
         self._thread.start()
+        log.info(
+            "discord.bridge_starting",
+            channel=self.discord.channel_id,
+            chronology_level=self.discord.chronology_level,
+            thread_per_run=self.discord.thread_per_run,
+            connect_wait_s=connect_wait_s,
+        )
         # The asyncio loop exists only once the thread runs; callers may
         # schedule work immediately after start(), so wait for it.
-        self._loop_up.wait(timeout=10)
+        if not self._loop_up.wait(timeout=10):
+            log.warning("discord.loop_not_up", waited_s=10)
         # Give the gateway a moment to connect so a short-lived process
         # (--once) can still post; a slow or failed connect never blocks
         # the daemon — the pump waits for readiness on its own.
-        self._ready.wait(timeout=connect_wait_s)
+        if not self._ready.wait(timeout=connect_wait_s):
+            log.warning(
+                "discord.not_ready_yet",
+                waited_s=connect_wait_s,
+                hint="gateway still connecting; the pump posts once it is",
+            )
 
     def close(self, *, drain_wait_s: float = DRAIN_WAIT_S) -> None:
         """Ask the bridge thread to shut down and wait for it. The client is
@@ -219,6 +232,14 @@ class DiscordBridge:
             self._aloop.call_soon_threadsafe(self._stop_event_set)
         if self._thread is not None:
             self._thread.join(timeout=20 + drain_wait_s)
+            if self._thread.is_alive():
+                log.warning(
+                    "discord.close_timeout",
+                    waited_s=20 + drain_wait_s,
+                    unsent=self._events.qsize(),
+                )
+            else:
+                log.info("discord.bridge_closed")
 
     def _stop_event_set(self) -> None:
         if self._stop_evt is not None:
@@ -233,7 +254,11 @@ class DiscordBridge:
         try:
             self._aloop.run_until_complete(self._amain())
         except Exception:
-            logger.warning("discord bridge stopped", exc_info=True)
+            log.error(
+                "discord.loop_crashed",
+                hint="the asyncio loop died; chronology is off until the daemon restarts",
+                exc_info=True,
+            )
         finally:
             # Let cancelled tasks (aiohttp connector, gateway) finish
             # unwinding before the loop goes away — otherwise asyncio logs
@@ -261,10 +286,10 @@ class DiscordBridge:
                 # must consume them or the queue grows for the rest of the
                 # process (review). The pump drops events while degraded.
                 exc = gateway.exception()
-                logger.warning(
-                    "discord bridge could not connect (%s); chronology is off until the "
-                    "daemon restarts",
-                    exc if exc is not None else "gateway exited",
+                log.error(
+                    "discord.connect_failed",
+                    error=str(exc) if exc is not None else "gateway exited",
+                    hint="chronology is off until the daemon restarts (token? network?)",
                 )
                 self._degraded = True
                 self._gateway_ready.set()  # unblock the pump so it drains
@@ -276,9 +301,10 @@ class DiscordBridge:
                 try:
                     await asyncio.wait_for(self._drained.wait(), timeout=self._drain_wait_s)
                 except TimeoutError:
-                    logger.warning(
-                        "discord bridge closed with %d event(s) still unsent",
-                        self._events.qsize(),
+                    log.warning(
+                        "discord.drain_timeout",
+                        unsent=self._events.qsize(),
+                        drain_wait_s=self._drain_wait_s,
                     )
         finally:
             pump.cancel()
@@ -286,7 +312,7 @@ class DiscordBridge:
             try:
                 await self.client.close()
             except Exception:
-                logger.debug("discord client close failed", exc_info=True)
+                log.debug("discord.client_close_failed", exc_info=True)
             if not gateway.done():
                 gateway.cancel()
             await asyncio.gather(pump, stopper, gateway, return_exceptions=True)
@@ -357,6 +383,12 @@ class DiscordBridge:
             live = run_id == self._active_run
             engine = getattr(self, "_engine", None)
         if not live or engine is None:
+            log.info(
+                "discord.steer_rejected",
+                run=run_id,
+                author=_author_name(message),
+                reason="run finished",
+            )
             self._schedule(
                 self._send(
                     channel, f"run {code(run_id)} has finished; steering is no longer possible."
@@ -364,6 +396,14 @@ class DiscordBridge:
             )
             return
         mid = engine.post_user_message(text)
+        log.info(
+            "discord.steer",
+            run=run_id,
+            author=_author_name(message),
+            message=mid,
+            chars=len(text),
+            text=text[:200],
+        )
         with self._lock:
             self._pending[mid] = _Pending(run_id, thread_id, int(getattr(message, "id", 0)))
         self._schedule(self._react(message, "⏳"))
@@ -406,10 +446,10 @@ class DiscordBridge:
             # sandbox — seconds, not milliseconds — so keep it off the
             # gateway's event loop.
             reply = await asyncio.get_event_loop().run_in_executor(
-                None, functools.partial(dispatch, loop, cmd, prefix=prefix, by=by)
+                None, functools.partial(dispatch, loop, cmd, prefix=prefix, by=by, via="discord")
             )
         else:
-            reply = dispatch(loop, cmd, prefix=prefix, by=by)
+            reply = dispatch(loop, cmd, prefix=prefix, by=by, via="discord")
         if reply.status is not None:
             await self._send(channel, reply.text, embed=status_embed(reply.status))
         elif not reply.known:
@@ -497,7 +537,12 @@ class DiscordBridge:
                     buffer = await self._flush_all(run_id, buffer)
                     last_flush = now
             except Exception:
-                logger.warning("discord pump: send failed", exc_info=True)
+                log.warning(
+                    "discord.pump_failed",
+                    run=run_id,
+                    queued=self._events.qsize(),
+                    exc_info=True,
+                )
 
     def _render(self, run_id: str, event: Event) -> list[Chunk]:
         """Chunks for one event, routing tool events through the run's
@@ -645,7 +690,7 @@ class DiscordBridge:
                     await msg.edit(content=text)
                 self._digest_last_edit[run_id] = now
             except Exception:
-                logger.debug("discord: digest send/edit failed", exc_info=True)
+                log.warning("discord.digest_edit_failed", run=run_id, exc_info=True)
         if close:
             self._digests[run_id] = ToolDigest(cancel_hint=digest.cancel_hint)
             self._digest_msg.pop(run_id, None)
@@ -794,7 +839,7 @@ class DiscordBridge:
             await msg.edit(content=text)
             self._status_last_edit[run_id] = asyncio.get_event_loop().time()
         except Exception:
-            logger.debug("discord: status edit failed", exc_info=True)
+            log.warning("discord.status_edit_failed", run=run_id, exc_info=True)
 
     # -- steer status note ------------------------------------------------------------
 
@@ -847,7 +892,9 @@ class DiscordBridge:
                 content=_clip(progress.render(state=state), self.discord.max_message_chars)
             )
         except Exception:
-            logger.debug("discord: steer status edit failed", exc_info=True)
+            log.warning(
+                "discord.steer_status_edit_failed", run=pending.run_id, state=state, exc_info=True
+            )
 
     async def _steer_picked_up(self, event: Event) -> None:
         mid = str(event.data.get("message_id") or "")
@@ -870,7 +917,13 @@ class DiscordBridge:
             msg = await channel.fetch_message(pending.discord_message_id)
             await msg.add_reaction("✅")
         except Exception:
-            logger.debug("discord: could not react to steering message", exc_info=True)
+            log.warning(
+                "discord.steer_react_failed",
+                run=pending.run_id,
+                message=mid,
+                hint="the human never sees the ✅ that their steer landed",
+                exc_info=True,
+            )
 
     # -- discord primitives -----------------------------------------------------------
 
@@ -896,7 +949,7 @@ class DiscordBridge:
             asyncio.run_coroutine_threadsafe(coro, self._aloop)
         else:
             coro.close()
-            logger.debug("discord: dropped work scheduled before the loop was up")
+            log.warning("discord.work_dropped", reason="scheduled before the asyncio loop was up")
 
     async def _channel(self) -> Any:
         """The control channel, or None when the bot cannot reach it.
@@ -915,13 +968,13 @@ class DiscordBridge:
         except Exception as exc:
             if not self._channel_error_logged:
                 self._channel_error_logged = True
-                logger.warning(
-                    "discord: cannot access channel %s (%s) — check [discord] channel_id "
-                    "(right-click the channel → Copy Channel ID) and that the bot is "
-                    "invited to the server with View Channel on it; chronology is off "
+                log.error(
+                    "discord.channel_unreachable",
+                    channel=cid,
+                    error=str(exc),
+                    hint="check [discord] channel_id (right-click the channel → Copy Channel "
+                    "ID) and that the bot is invited with View Channel; chronology is off "
                     "until the daemon restarts",
-                    cid,
-                    exc,
                 )
             return None
 
@@ -954,16 +1007,33 @@ class DiscordBridge:
         try:
             return await target.send(content, **kwargs)
         except Exception:
+            target_id = getattr(target, "id", None)
             if "embed" in kwargs and embed is not None:
-                logger.debug("discord: embed send failed; retrying text-only", exc_info=True)
+                log.warning(
+                    "discord.embed_send_failed",
+                    target=target_id,
+                    action="retrying text-only",
+                    exc_info=True,
+                )
                 kwargs.pop("embed")
                 fallback = content or _clip(embed.as_text(), self.discord.max_message_chars)
                 try:
                     return await target.send(fallback, **kwargs)
                 except Exception:
-                    logger.warning("discord: text-only retry failed too", exc_info=True)
+                    log.warning(
+                        "discord.send_failed",
+                        target=target_id,
+                        chars=len(fallback),
+                        text_only_retry=True,
+                        exc_info=True,
+                    )
                     return None
-            logger.warning("discord: send failed", exc_info=True)
+            log.warning(
+                "discord.send_failed",
+                target=target_id,
+                chars=len(content or ""),
+                exc_info=True,
+            )
             return None
 
     async def _send_channel(self, text: str, *, embed: EmbedSpec | None = None) -> None:
@@ -975,7 +1045,7 @@ class DiscordBridge:
         try:
             await message.add_reaction(emoji)
         except Exception:
-            logger.debug("discord: react failed", exc_info=True)
+            log.debug("discord.react_failed", emoji=emoji, exc_info=True)
 
     async def _ensure_thread(self, run_id: str) -> Any:
         """The run's thread, creating headline + thread on first sight;
@@ -988,7 +1058,7 @@ class DiscordBridge:
                     thread_id
                 )
             except Exception:
-                logger.warning("discord: lost thread %s for %s", thread_id, run_id, exc_info=True)
+                log.warning("discord.thread_lost", run=run_id, thread=thread_id, exc_info=True)
                 return None
         with self._lock:
             item = self._items.get(run_id)
@@ -1010,9 +1080,16 @@ class DiscordBridge:
             self.dstore.record_discord_thread(
                 run_id, int(self.discord.channel_id or 0), int(thread.id), int(headline.id)
             )
+            log.info(
+                "discord.thread_created",
+                run=run_id,
+                item=item.item_id,
+                thread=int(thread.id),
+                headline=int(headline.id),
+            )
             return thread
         except Exception:
-            logger.warning("discord: could not create thread for %s", run_id, exc_info=True)
+            log.warning("discord.thread_create_failed", run=run_id, exc_info=True)
             return None
 
     async def _refresh_headline(
@@ -1057,7 +1134,7 @@ class DiscordBridge:
                     kwargs["embed"] = converted
             await msg.edit(**kwargs)
         except Exception:
-            logger.debug("discord: headline edit failed", exc_info=True)
+            log.warning("discord.headline_edit_failed", run=run_id, exc_info=True)
 
     # -- default client -----------------------------------------------------------------
 
@@ -1072,8 +1149,19 @@ class DiscordBridge:
         client: Any = discordpy.Client(intents=intents)
 
         async def on_ready() -> None:
-            logger.info("discord bridge connected as %s", client.user)
+            log.info(
+                "discord.connected",
+                user=str(client.user),
+                guilds=len(getattr(client, "guilds", ()) or ()),
+                channel=bridge.discord.channel_id,
+            )
             bridge.mark_ready()
+
+        async def on_disconnect() -> None:
+            log.warning("discord.disconnected", hint="discord.py reconnects on its own")
+
+        async def on_resumed() -> None:
+            log.info("discord.resumed")
 
         async def on_message(message: Any) -> None:
             bridge._handle_message(message)
@@ -1081,6 +1169,8 @@ class DiscordBridge:
         # discord.py's `@client.event` registers by function name; calling it
         # directly is the same registration without an untyped decorator.
         client.event(on_ready)
+        client.event(on_disconnect)
+        client.event(on_resumed)
         client.event(on_message)
         return client
 

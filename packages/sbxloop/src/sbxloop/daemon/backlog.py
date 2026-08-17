@@ -18,15 +18,15 @@ flood the daemon.
 from __future__ import annotations
 
 import hashlib
-import logging
 from pathlib import Path
 from typing import NamedTuple
 
 from sbxloop.daemon.sources import WorkSource, parse_markdown_item
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunRecord
+from sbxloop.log import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 BACKLOG_SUBDIR = Path(".sbxloop") / "backlog"
 
@@ -87,6 +87,7 @@ def collect_tool_findings(
         try:
             title, body = parse_markdown_item(path.read_text(), path.stem)
         except OSError:
+            log.warning("backlog.finding_unreadable", run=run.run_id, path=str(path), exc_info=True)
             continue
         if filer is None:
             unfiled.append(title)
@@ -100,9 +101,7 @@ def collect_tool_findings(
         try:
             ref = filer(title, body, run.run_id)
         except Exception:
-            logger.warning(
-                "tool finding %r from run %s could not be filed", title, run.run_id, exc_info=True
-            )
+            log.warning("backlog.tool_finding_failed", run=run.run_id, title=title, exc_info=True)
             unfiled.append(title)
             continue
         if ref is None:
@@ -137,10 +136,10 @@ def collect_backlog(
 ) -> list[str]:
     """File the run's backlog items via ``source``; returns the refs filed."""
     if not run.mounted or run.workspace is None:
-        logger.warning(
-            "backlog skipped for run %s: workspace not mounted (agent-filed backlog "
-            "requires the mounted-workspace mode)",
-            run.run_id,
+        log.warning(
+            "backlog.skipped",
+            run=run.run_id,
+            reason="workspace not mounted; agent-filed backlog needs the mounted-workspace mode",
         )
         return []
     folder = run.workspace / BACKLOG_SUBDIR
@@ -148,13 +147,16 @@ def collect_backlog(
         return []
     filed: list[str] = []
     skipped = 0
+    seen = 0
     for path in sorted(folder.glob("*.md")):
         try:
             title, body = parse_markdown_item(path.read_text(), path.stem)
         except OSError:
+            log.warning("backlog.finding_unreadable", run=run.run_id, path=str(path), exc_info=True)
             continue
         fp = fingerprint(title, body)
         if dstore.backlog_seen(fp):
+            seen += 1
             continue
         if len(filed) >= max_items:
             skipped += 1
@@ -162,18 +164,24 @@ def collect_backlog(
         try:
             ref = source.file_backlog(title, body, run.run_id, trigger=trigger)
         except Exception:
-            logger.warning(
-                "backlog: filing %r from run %s failed", title, run.run_id, exc_info=True
-            )
+            log.warning("backlog.file_failed", run=run.run_id, title=title, exc_info=True)
             continue
         dstore.backlog_record(fp, run.run_id, ref, now)
         filed.append(ref)
+    log.debug(
+        "backlog.collected",
+        run=run.run_id,
+        filed=len(filed),
+        already_seen=seen,
+        deferred=skipped,
+        trigger=trigger,
+    )
     if skipped:
-        logger.warning(
-            "backlog: run %s produced %d item(s) beyond the per-run cap of %d; deferred "
-            "(not fingerprint-recorded, so the next collection pass files them)",
-            run.run_id,
-            skipped,
-            max_items,
+        log.warning(
+            "backlog.cap_deferred",
+            run=run.run_id,
+            deferred=skipped,
+            cap=max_items,
+            hint="not fingerprint-recorded, so the next collection pass files them",
         )
     return filed

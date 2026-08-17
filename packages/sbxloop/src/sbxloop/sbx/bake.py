@@ -22,7 +22,6 @@ network policy is applied per-sandbox at provision time as always.
 from __future__ import annotations
 
 import json
-import logging
 import secrets
 import tempfile
 import time
@@ -35,6 +34,7 @@ import sbxloop
 from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.errors import BakeError, SbxError, SbxloopError
+from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
@@ -42,7 +42,7 @@ from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
 from sbxloop.sbx.sandbox import BAKE_MANIFEST, SBXLOOP_DIR, Sandbox
 from sbxloop.worker.client import WorkerClient
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 DEFAULT_TEMPLATE_REF = "sbxloop-baked:latest"
 
@@ -156,7 +156,7 @@ def bake_template(
                 try:
                     sandbox.rm()
                 except SbxError:
-                    logger.warning("failed to remove bake sandbox %s", name, exc_info=True)
+                    log.warning("bake.sandbox_remove_failed", sandbox=name, exc_info=True)
 
     record = BakeRecord(
         ref=ref,
@@ -178,13 +178,15 @@ def _cache_copilot_runtime(sandbox: Sandbox, python: str) -> bool:
     try:
         result = sandbox.exec([python, "-m", "copilot", "download-runtime"], timeout=600.0)
     except SbxError:
-        logger.warning("copilot runtime pre-cache failed", exc_info=True)
+        log.warning("bake.runtime_precache_failed", sandbox=sandbox.name, exc_info=True)
         return False
     if not result.ok:
         combined = "\n".join(p.strip() for p in (result.stderr, result.stdout) if p.strip())
-        logger.warning(
-            "copilot runtime pre-cache failed (rc=%s): %s — sessions will download on demand",
-            result.returncode,
-            combined[-2000:] or "(no output)",
+        log.warning(
+            "bake.runtime_precache_failed",
+            sandbox=sandbox.name,
+            rc=result.returncode,
+            output=combined[-2000:] or "(no output)",
+            hint="sessions will download the runtime on demand",
         )
     return result.ok

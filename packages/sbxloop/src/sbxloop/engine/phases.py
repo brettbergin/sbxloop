@@ -19,6 +19,7 @@ Session strategy per phase (a deliberate design decision):
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
@@ -30,6 +31,7 @@ from sbxloop.engine.model import Issue, PlanModel, SteerVerdict, TaskGraph, Task
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
+from sbxloop.log import get_logger
 from sbxloop.verifylint import UV_LOCKFILE, lint_verify_commands
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
@@ -66,6 +68,8 @@ AGENT_NAMES = {
     "validate": "validator",
     "steer": "steering",
 }
+
+log = get_logger(__name__)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -185,7 +189,30 @@ class PhaseRunner:
             timeout_s=self.config.budgets.per_job_timeout_s,
             max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
         )
+        started = time.monotonic()
+        log.info(
+            "phase.agent_call",
+            run=self.run_id,
+            job=job.job_id,
+            agent=agent_name,
+            model=self.config.model,
+            permission_mode=permission_mode,
+            expect=expect,
+            prompt_chars=len(prompt),
+        )
         result = self.agent.submit(job, agent=agent_name)
+        usage = result.usage
+        log.info(
+            "phase.agent_done",
+            run=self.run_id,
+            job=job.job_id,
+            agent=agent_name,
+            status=result.status,
+            duration_s=round(time.monotonic() - started, 1),
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
+            error=result.error.message[:200] if result.error is not None else None,
+        )
         if result.status != "ok":
             assert result.error is not None
             raise WorkerError(f"agent job failed ({result.error.type}): {result.error.message}")
@@ -234,6 +261,12 @@ class PhaseRunner:
                 if "ExpectedJsonMissing" not in str(exc):
                     raise
                 last_error = exc
+                log.warning(
+                    "phase.retry",
+                    run=self.run_id,
+                    prompt=prompt_name,
+                    reason="reply contained no JSON",
+                )
                 retry_context = preamble + (
                     "\n## Previous attempt was invalid\n\n"
                     "Your previous response contained no parseable JSON. Respond "
@@ -248,11 +281,21 @@ class PhaseRunner:
                 return model, result
             except ValueError as exc:  # includes pydantic's ValidationError
                 last_error = exc
+                log.warning(
+                    "phase.retry",
+                    run=self.run_id,
+                    prompt=prompt_name,
+                    reason="output failed validation",
+                    error=str(exc)[:300],
+                )
                 retry_context = preamble + (
                     "\n## Previous attempt was invalid\n\n"
                     "Your previous response failed validation with:\n\n"
                     f"```\n{exc}\n```\n\nFix the structure and respond again."
                 )
+        log.warning(
+            "phase.invalid_twice", run=self.run_id, prompt=prompt_name, error=str(last_error)[:300]
+        )
         raise WorkerError(f"{prompt_name} produced invalid output twice: {last_error}")
 
     def shell_batch(
@@ -277,7 +320,22 @@ class PhaseRunner:
             timeout_s=per_command * len(commands),
             cwd=cwd or self.workdir,
         )
+        started = time.monotonic()
+        log.debug(
+            "phase.shell_batch",
+            run=self.run_id,
+            job=job.job_id,
+            commands=len(commands),
+            cwd=cwd or self.workdir,
+        )
         result = self.agent.submit(job)
+        log.debug(
+            "phase.shell_batch_done",
+            run=self.run_id,
+            job=job.job_id,
+            status=result.status,
+            duration_s=round(time.monotonic() - started, 1),
+        )
         if result.status != "ok":
             assert result.error is not None
             raise WorkerError(f"shell batch failed ({result.error.type}): {result.error.message}")
@@ -434,6 +492,13 @@ class PhaseRunner:
             evidence = self.shell_batch([command for _, command in EVIDENCE_COMMANDS])
         except WorkerError:
             # Evidence is best-effort context for the critic, never fatal.
+            log.warning(
+                "phase.evidence_failed",
+                run=self.run_id,
+                task=task.spec.id,
+                hint="the critic judges without repo evidence",
+                exc_info=True,
+            )
             evidence = []
         evidence_parts: list[str] = []
         for (label, _), result in zip(EVIDENCE_COMMANDS, evidence, strict=False):

@@ -378,12 +378,12 @@ class TestDaemonCommand:
         monkeypatch.setenv("SBXLOOP_DAEMON__INBOX_DIR", "")
         result = runner.invoke(app, ["daemon"])
         assert result.exit_code == 2
-        assert "no work sources" in result.output
+        assert "daemon.no_work_sources" in result.output
 
     def test_backlog_github_without_repo_exits_2(self, workdir: Path) -> None:
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--backlog", "github"])
         assert result.exit_code == 2
-        assert "needs a GitHub repository" in result.output
+        assert "daemon.backlog_needs_github" in result.output
 
     def test_nonpositive_poll_interval_exits_2(self, workdir: Path) -> None:
         # review: Event.wait(<= 0) returns immediately → the loop would spin
@@ -392,12 +392,12 @@ class TestDaemonCommand:
                 app, ["daemon", "--inbox", "inbox", "--poll-interval", value, "--once"]
             )
             assert result.exit_code == 2, result.output
-            assert "invalid daemon option" in result.output
+            assert "daemon.invalid_option" in result.output
 
     def test_bad_backlog_value_exits_2(self, workdir: Path) -> None:
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--backlog", "yolo"])
         assert result.exit_code == 2
-        assert "invalid daemon option" in result.output
+        assert "daemon.invalid_option" in result.output
 
     def test_dry_run_lists_inbox_candidates_without_claiming(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch
@@ -413,7 +413,8 @@ class TestDaemonCommand:
         os.utime(f, (old, old))
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--dry-run"])
         assert result.exit_code == 0, result.output
-        assert "inbox:thing.md" in result.output and "Do the thing" in result.output
+        # the listing is stdout output (pipeable), not only a log line
+        assert "inbox:thing.md" in result.stdout and "Do the thing" in result.stdout
         assert f.exists()  # not claimed
 
     def test_discord_configured_without_token_exits_2(
@@ -432,6 +433,7 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
         assert result.exit_code == 0, result.output
         assert "tick:" in result.output and "no_work" in result.output
+        assert "daemon.tick" in result.output  # and the structured record
 
     def test_state_dir_defaults_outside_cwd_and_is_announced(
         self, workdir: Path, fake_sbx: FakeSbx
@@ -444,7 +446,62 @@ class TestDaemonCommand:
         expected = (workdir / "xdg-state" / "sbxloop" / workdir.name).resolve()
         assert (expected / "state.db").is_file()
         assert not (workdir / ".sbxloop" / "state.db").exists()
-        assert "state dir:" in result.output and str(expected) in result.output.replace("\n", "")
+        assert "daemon.starting" in result.output
+        assert str(expected) in result.output.replace("\n", "")
+
+    def test_startup_summary_names_the_configuration(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(
+            app, ["daemon", "--inbox", "inbox", "--once", "--max-runs-per-day", "7"]
+        )
+        assert result.exit_code == 0, result.output
+        (line,) = [ln for ln in result.output.splitlines() if "daemon.starting" in ln]
+        for field in (
+            "sources=['inbox']",
+            "max_runs_per_day=7",
+            "poll_interval_s=",
+            "backlog=off",
+            "discord=off",
+            "log_level=INFO",
+            "state_dir_reason=",
+        ):
+            assert field in line, line
+        # and the run tick + orderly shutdown follow it
+        assert "daemon.tick" in result.output and "daemon.stopped" in result.output
+
+    def test_log_level_flag_beats_env(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        monkeypatch.setenv("SBXLOOP_DAEMON__LOG_LEVEL", "WARNING")
+        quiet = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert quiet.exit_code == 0, quiet.output
+        assert "daemon.starting" not in quiet.output  # INFO suppressed by env
+        loud = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once", "--log-level", "debug"])
+        assert loud.exit_code == 0, loud.output
+        assert "daemon.starting" in loud.output and "log_level=DEBUG" in loud.output
+        assert "store.opened" in loud.output  # a DEBUG-only line
+
+    def test_log_format_json(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        import json
+
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(
+            app, ["daemon", "--inbox", "inbox", "--once", "--log-format", "json"]
+        )
+        assert result.exit_code == 0, result.output
+        objects = [json.loads(ln) for ln in result.output.splitlines() if ln.startswith("{")]
+        events = [o["event"] for o in objects]
+        assert "daemon.starting" in events and "daemon.tick" in events
+        tick = next(o for o in objects if o["event"] == "daemon.tick")
+        assert tick["idle"] == "no_work" and tick["level"] == "info"
+
+    def test_bad_log_level_exits_2(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--log-level", "loud"])
+        assert result.exit_code == 2
+        assert "daemon.invalid_option" in result.output
 
     def test_legacy_state_dir_keeps_being_used(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         seed_store(workdir)  # an existing ./.sbxloop/state.db from before the change
