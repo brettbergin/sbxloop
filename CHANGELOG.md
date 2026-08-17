@@ -8,6 +8,17 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Worker protocol: **host tools** for `agent.session` jobs. `JobRequest`
+  gains `host_tools` (name, description, JSON-schema `parameters`),
+  `host_tools_dir`, `host_tool_timeout_s` and `available_tools`; the worker
+  registers each host tool as a custom SDK tool and relays every call to
+  the host as an `agent.tool_request` event, then waits for the host's
+  `HostToolResponse` file at `<host_tools_dir>/<call_id>.json`
+  (`sbxloop_worker.hosttools`, `agent.tool_response` on completion). This
+  is the transport the daemon's Discord concierge uses to let an in-sandbox
+  session drive the daemon. The echo backend scripts `host_tool_calls`, so
+  the round trip is testable without the SDK. See
+  `docs/worker-protocol.md`, "Host tools".
 - The daemon's log is structured ([structlog](https://www.structlog.org/)
   routed through the standard library, `sbxloop.log`) and configurable:
   `--log-level` / `[daemon] log_level` / `SBXLOOP_DAEMON__LOG_LEVEL`

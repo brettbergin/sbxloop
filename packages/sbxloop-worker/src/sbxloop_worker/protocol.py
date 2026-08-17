@@ -14,9 +14,13 @@ import json
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PROTOCOL_VERSION = 1
+
+# Host tool names double as SDK tool names and as response-file stems, so
+# they are kept to a conservative identifier alphabet.
+HOST_TOOL_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 
 JobKind = Literal["agent.session", "shell.check", "shell.batch", "github.op"]
 JobStatus = Literal["ok", "error", "timeout"]
@@ -125,6 +129,43 @@ class ErrorInfo(ProtocolModel):
     http_status: int | None = None
 
 
+class HostToolSpec(ProtocolModel):
+    """A tool the HOST implements for an in-sandbox agent session.
+
+    The worker registers it as a custom SDK tool; each invocation is relayed
+    to the host as an ``agent.tool_request`` event and answered through a
+    response file (see :class:`HostToolResponse` and
+    ``sbxloop_worker.hosttools``). ``parameters`` is a JSON Schema object.
+    """
+
+    name: str = Field(pattern=HOST_TOOL_NAME_RE)
+    description: str
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
+
+
+class HostToolCall(ProtocolModel):
+    """One host-tool invocation — the ``data`` of an ``agent.tool_request`` event."""
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class HostToolResponse(ProtocolModel):
+    """The host's answer to a :class:`HostToolCall`, written to
+    ``<host_tools_dir>/<call_id>.json`` inside the sandbox.
+
+    ``text`` is what the model sees; ``ok=False`` marks a failed call (the
+    text/error still reaches the model so it can adapt).
+    """
+
+    v: int = PROTOCOL_VERSION
+    call_id: str
+    ok: bool
+    text: str = ""
+    error: str | None = None
+
+
 class JobRequest(ProtocolModel):
     """One unit of work the host submits to a worker.
 
@@ -148,6 +189,17 @@ class JobRequest(ProtocolModel):
     # Per-phase tool-call ceiling (#228): calls past it are turned away with
     # an in-session nudge to stop investigating and report. None = unbounded.
     max_tool_calls: int | None = None
+    # Host-implemented tools exposed to the session (see HostToolSpec). The
+    # host sets ``host_tools_dir`` (in-sandbox directory where it drops
+    # response files) — an explicit field rather than a derived path so a
+    # worker run outside a sandbox never writes into a developer's $HOME.
+    host_tools: list[HostToolSpec] = Field(default_factory=list)
+    host_tools_dir: str | None = None
+    # How long one host tool call may take before the session sees a timeout.
+    host_tool_timeout_s: float = 120.0
+    # SDK built-in tool allowlist: None = the SDK's default set, [] = no
+    # built-ins (host tools only). Host tool names are always allowed.
+    available_tools: list[str] | None = None
 
     # kind == "shell.check"
     argv: list[str] | None = None
@@ -171,6 +223,22 @@ class JobRequest(ProtocolModel):
     op: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("host_tools")
+    @classmethod
+    def _unique_host_tool_names(cls, tools: list[HostToolSpec]) -> list[HostToolSpec]:
+        seen: set[str] = set()
+        for tool in tools:
+            if tool.name in seen:
+                raise ValueError(f"duplicate host tool name {tool.name!r}")
+            seen.add(tool.name)
+        return tools
+
+    @property
+    def _has_host_tool_fields(self) -> bool:
+        return bool(
+            self.host_tools or self.host_tools_dir is not None or self.available_tools is not None
+        )
+
     @model_validator(mode="after")
     def _check_kind_fields(self) -> JobRequest:
         if self.kind == "agent.session":
@@ -178,7 +246,13 @@ class JobRequest(ProtocolModel):
                 raise ValueError("agent.session requires a non-empty prompt")
             if self.argv is not None or self.commands is not None or self.op is not None:
                 raise ValueError("agent.session must not set argv, commands, or op")
-        elif self.kind == "shell.check":
+            if self.host_tools and not self.host_tools_dir:
+                raise ValueError("agent.session with host_tools requires host_tools_dir")
+        elif self._has_host_tool_fields:
+            raise ValueError(
+                f"{self.kind} must not set host_tools, host_tools_dir, or available_tools"
+            )
+        if self.kind == "shell.check":
             if not self.argv:
                 raise ValueError("shell.check requires a non-empty argv")
             if self.prompt is not None or self.commands is not None or self.op is not None:
@@ -283,6 +357,11 @@ class EventTypes:
     # The per-phase tool-call ceiling was reached; further calls are turned
     # away with a nudge (#228). Emitted once per session.
     AGENT_TOOL_CAP = "agent.tool_cap"
+    # Host-tool round trip: the session invoked a host-implemented tool
+    # (data = HostToolCall) / the response file arrived or the wait timed
+    # out (data = call_id, name, ok, elapsed_s, error?).
+    AGENT_TOOL_REQUEST = "agent.tool_request"
+    AGENT_TOOL_RESPONSE = "agent.tool_response"
 
     GH_OP_START = "gh.op_start"
     GH_OP_PROGRESS = "gh.op_progress"

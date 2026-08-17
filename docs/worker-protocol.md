@@ -65,6 +65,31 @@ another. Each command runs via `sh -c` sequentially in the job's `cwd` with
 `command_timeout_s` (default `timeout_s`) as its individual cap; `timeout_s`
 bounds the whole job.
 
+## Host tools (agent.session)
+
+An `agent.session` job may carry `host_tools: [HostToolSpec]` — tools the
+**host** implements (daemon control, run inspection, work enqueueing) that
+the in-sandbox session can call. The worker registers each as a custom SDK
+tool; when the model invokes one:
+
+1. The worker emits `agent.tool_request` (data = `HostToolCall`:
+   `call_id`, `name`, `arguments`) on its event stream, which the host is
+   already tailing.
+2. The host runs the tool and copies a `HostToolResponse` JSON
+   (`{v, call_id, ok, text, error?}`) to `<host_tools_dir>/<call_id>.json`
+   inside the sandbox — `host_tools_dir` is set by the host
+   (`~/.sbxloop/tools/<job_id>`), never derived by the worker.
+3. The worker polls for the file (`sbx cp` is not atomic: a file that does
+   not yet validate is still being written) and hands `text` back to the
+   model; `ok=false` becomes a failed tool result the model can adapt to.
+   `agent.tool_response` records the outcome (`ok`, `elapsed_s`, `error`).
+
+`host_tool_timeout_s` (default 120) bounds one call; on expiry the session
+sees a timeout result. `available_tools` restricts the SDK's built-in tools
+(`[]` = host tools only; host tool names are always allowed). The echo
+backend honours `host_tool_calls` in its script so the round trip is
+testable without the SDK.
+
 ## Transports
 
 - **stream** (default): one blocking `sbx exec` per job; the host parses
