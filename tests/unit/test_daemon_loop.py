@@ -9,6 +9,7 @@ from __future__ import annotations
 import shutil
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ import pytest
 
 from sbxloop import hostgit
 from sbxloop.config import Config
-from sbxloop.daemon.loop import DaemonLoop
+from sbxloop.daemon.loop import DaemonLoop, day_window
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunResult, TaskRecord, TaskSpec
@@ -1438,3 +1439,116 @@ class TestLogging:
         assert report.delivery is None
         (warned,) = self._events(caplog, "run.report_events_unreadable")
         assert "'run': 'r-x'" in warned
+
+
+class TestRunCapDayWindow:
+    """The run cap is a wall-clock calendar day in a configured timezone,
+    not a trailing 24h window (#: operators saw ``10/10`` and then runs
+    starting minutes later as old runs aged out)."""
+
+    def test_day_window_utc_boundaries(self) -> None:
+        # 2024-03-05T12:00:00Z
+        noon = datetime(2024, 3, 5, 12, 0, tzinfo=UTC).timestamp()
+        start, nxt = day_window(noon, "UTC")
+        assert start == datetime(2024, 3, 5, 0, 0, tzinfo=UTC).timestamp()
+        assert nxt == datetime(2024, 3, 6, 0, 0, tzinfo=UTC).timestamp()
+
+    def test_day_window_at_exact_midnight_starts_the_new_day(self) -> None:
+        midnight = datetime(2024, 3, 5, 0, 0, tzinfo=UTC).timestamp()
+        start, nxt = day_window(midnight, "UTC")
+        assert start == midnight  # 00:00 belongs to the day it opens
+        assert nxt == midnight + 86400
+        # one microsecond earlier is still the previous day
+        prev_start, prev_next = day_window(midnight - 0.001, "UTC")
+        assert prev_next == midnight and prev_start == midnight - 86400
+
+    def test_day_window_honors_non_utc_zone(self) -> None:
+        noon = datetime(2024, 3, 5, 12, 0, tzinfo=UTC).timestamp()
+        start, nxt = day_window(noon, "America/New_York")
+        # EST is UTC-5 in early March 2024 → local midnight is 05:00Z
+        assert start == datetime(2024, 3, 5, 5, 0, tzinfo=UTC).timestamp()
+        assert nxt == datetime(2024, 3, 6, 5, 0, tzinfo=UTC).timestamp()
+        assert start != day_window(noon, "UTC")[0]
+
+    def test_day_window_spans_dst_transition(self) -> None:
+        """A US spring-forward day is 23h long; the next boundary is still
+        local midnight, not start+86400."""
+        noon = datetime(2024, 3, 10, 16, 0, tzinfo=UTC).timestamp()
+        start, nxt = day_window(noon, "America/New_York")
+        assert nxt - start == 23 * 3600
+
+    @staticmethod
+    def _capped_harness(tmp_path: Path, tz: str = "UTC") -> Harness:
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "daemon": {"max_runs_per_day": 1, "run_cap_timezone": tz},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        # A known absolute instant so calendar boundaries are deterministic.
+        h.clock.t = datetime(2024, 3, 5, 12, 0, tzinfo=UTC).timestamp()
+        h.source.items = [inbox_item("a.md"), inbox_item("b.md")]
+        return h
+
+    def test_cap_reached_mid_day_blocks_then_resets_at_boundary(self, tmp_path: Path) -> None:
+        h = self._capped_harness(tmp_path)
+        assert h.loop.tick().outcome == "done"
+        assert h.loop.tick().idle_reason == "daily_cap"
+        # Just before the boundary: still capped.
+        h.clock.t = datetime(2024, 3, 5, 23, 59, 59, tzinfo=UTC).timestamp()
+        assert h.loop.tick().idle_reason == "daily_cap"
+        # Crossing local midnight resets the count.
+        h.clock.t = datetime(2024, 3, 6, 0, 0, tzinfo=UTC).timestamp()
+        assert h.loop.tick().outcome == "done"
+
+    def test_not_a_trailing_24h_window(self, tmp_path: Path) -> None:
+        """23h after a 00:30 run it is still the same calendar day, so the
+        slot is not freed — a rolling window would have released it."""
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.clock.t = datetime(2024, 3, 5, 0, 30, tzinfo=UTC).timestamp()
+        h.source.items = [inbox_item("a.md"), inbox_item("b.md")]
+        assert h.loop.tick().outcome == "done"
+        h.clock.t += 23 * 3600  # 23:30 the same day
+        assert h.loop.tick().idle_reason == "daily_cap"
+        h.clock.t += 1800  # 00:00 the next day
+        assert h.loop.tick().outcome == "done"
+
+    def test_run_just_before_boundary_does_not_free_a_slot_early(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
+        )
+        h = Harness(tmp_path, cfg)
+        h.clock.t = datetime(2024, 3, 5, 23, 30, tzinfo=UTC).timestamp()
+        h.source.items = [inbox_item("a.md"), inbox_item("b.md")]
+        assert h.loop.tick().outcome == "done"
+        assert h.loop.tick().idle_reason == "daily_cap"
+        # 30 minutes later the day has rolled even though 24h have not passed.
+        h.clock.t += 1801
+        assert h.loop.tick().outcome == "done"
+
+    def test_timezone_setting_is_honored(self, tmp_path: Path) -> None:
+        """With the cap day pinned to New York, 00:00 UTC does not reset —
+        05:00 UTC (local midnight) does."""
+        h = self._capped_harness(tmp_path, tz="America/New_York")
+        assert h.loop.tick().outcome == "done"
+        h.clock.t = datetime(2024, 3, 6, 0, 0, tzinfo=UTC).timestamp()
+        assert h.loop.tick().idle_reason == "daily_cap"
+        h.clock.t = datetime(2024, 3, 6, 5, 0, tzinfo=UTC).timestamp()
+        assert h.loop.tick().outcome == "done"
+
+    def test_status_agrees_with_the_gate_and_reports_the_reset(self, tmp_path: Path) -> None:
+        h = self._capped_harness(tmp_path, tz="America/New_York")
+        assert h.loop.tick().outcome == "done"
+        status = h.loop.status()
+        assert status["runs_today"] == 1
+        assert status["max_runs_per_day"] == 1
+        assert status["run_cap_timezone"] == "America/New_York"
+        assert status["runs_today_resets_at"] == day_window(h.clock(), "America/New_York")[1]
+        assert h.loop.tick().idle_reason == "daily_cap"
+        # After the reset instant the counter is visibly back to zero.
+        h.clock.t = status["runs_today_resets_at"]
+        assert h.loop.status()["runs_today"] == 0
