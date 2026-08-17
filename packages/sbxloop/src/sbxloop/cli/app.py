@@ -1581,7 +1581,13 @@ def daemon(
                 found = 0
                 for item in source.poll():
                     found += 1
-                    log.info(
+                    # The listing IS this command's output: stdout, so it
+                    # pipes and greps; the log keeps the structured record.
+                    console.print(
+                        f"[cyan]{item.item_id}[/]  {item.title}"
+                        + (f"  {item.url}" if item.url else "")
+                    )
+                    log.debug(
                         "daemon.dry_run_candidate",
                         source=source.name,
                         item=item.item_id,
@@ -1621,6 +1627,9 @@ def daemon(
         ctl.start()
         if once:
             result = loop.tick()
+            # --once is a smoke/cron probe: its one-line verdict stays on
+            # stdout for the human or script that invoked it.
+            console.print(f"tick: {result}")
             log.info(
                 "daemon.tick",
                 discovered=result.discovered,

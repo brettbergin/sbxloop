@@ -33,10 +33,11 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
-- Daemon-path operator output moved from Rich `console.print` on stdout to
-  the log (validation errors, the state-dir line, `--once`'s tick result,
-  `--dry-run` candidates, "daemon interrupted"), so journald has one stream
-  in one format. Several Discord failures that were logged at `DEBUG`
+- Daemon-path operator narration moved from Rich `console.print` on stdout
+  to the log (validation errors, the state-dir line, "daemon interrupted"),
+  so journald has one stream in one format; `--dry-run`'s candidate listing
+  and `--once`'s `tick:` line stay on stdout (they are the command's output)
+  and are logged as well. Several Discord failures that were logged at `DEBUG`
   (dropped work, digest/status/headline edits, embed fallback) are now
   `WARNING`; the gateway connect failure and an unreachable channel are
   `ERROR`; `run.delivery_failed`, `run.abandoned` and `breaker.opened` are

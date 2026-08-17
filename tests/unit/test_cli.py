@@ -413,7 +413,8 @@ class TestDaemonCommand:
         os.utime(f, (old, old))
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--dry-run"])
         assert result.exit_code == 0, result.output
-        assert "inbox:thing.md" in result.output and "Do the thing" in result.output
+        # the listing is stdout output (pipeable), not only a log line
+        assert "inbox:thing.md" in result.stdout and "Do the thing" in result.stdout
         assert f.exists()  # not claimed
 
     def test_discord_configured_without_token_exits_2(
@@ -431,7 +432,8 @@ class TestDaemonCommand:
         (workdir / "inbox" / "pending").mkdir(parents=True)
         result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
         assert result.exit_code == 0, result.output
-        assert "daemon.tick" in result.output and "no_work" in result.output
+        assert "tick:" in result.output and "no_work" in result.output
+        assert "daemon.tick" in result.output  # and the structured record
 
     def test_state_dir_defaults_outside_cwd_and_is_announced(
         self, workdir: Path, fake_sbx: FakeSbx
