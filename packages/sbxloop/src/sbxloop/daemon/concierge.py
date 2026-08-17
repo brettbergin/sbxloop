@@ -320,7 +320,7 @@ class Concierge:
         notes = [
             f"poll interval {daemon.poll_interval_s:g}s; at most {daemon.max_runs_per_day} "
             f"runs per calendar day in {daemon.run_cap_timezone} (the count resets at "
-            f"00:00 {daemon.run_cap_timezone}, not on a rolling window); "
+            f"00:00 {daemon.run_cap_timezone}); "
             "a consecutive-failure breaker pauses dispatch",
             f"backlog mode: {daemon.backlog}",
             "Discord: one thread per run"

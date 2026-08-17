@@ -80,9 +80,8 @@ def day_window(now: float, tz: str) -> tuple[float, float]:
     """The calendar day containing epoch ``now`` in IANA zone ``tz``, as
     ``(start_epoch, next_start_epoch)``.
 
-    This is a wall-clock day, not a trailing 24h window: every instant in
-    the same local calendar date maps to the same ``start_epoch``, and the
-    count only resets when local midnight passes. ``next_start_epoch`` is
+    Every instant in the same local calendar date maps to the same
+    ``start_epoch``, and the count only resets when local midnight passes. ``next_start_epoch`` is
     the next local midnight (which is not always 86400s later — DST days
     are 23 or 25 hours long)."""
     zone = ZoneInfo(tz)

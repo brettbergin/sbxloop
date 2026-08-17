@@ -321,10 +321,10 @@ class DaemonConfig(_ConfigModel):
     and an empty Copilot budget: a calendar-day run cap, a per-item retry
     cap, and a consecutive-failure circuit breaker.
 
-    The run cap (``max_runs_per_day``) is a wall-clock daily gate, not a
-    rolling 24h window: it counts the runs *started* during the current
-    calendar day in ``run_cap_timezone`` (default ``UTC``) and resets at
-    00:00 in that zone.
+    The run cap (``max_runs_per_day``) is a wall-clock daily gate: it
+    counts the runs *started* during the current calendar day in
+    ``run_cap_timezone`` (default ``UTC``) and resets at 00:00 in that
+    zone.
 
     ``backlog`` lets the inner agent file follow-up work it discovers
     (written to ``.sbxloop/backlog/*.md`` in the run workspace) into either
