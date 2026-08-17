@@ -303,6 +303,9 @@ class TestConfigAndInit:
         config = load_config(cwd=workdir, env={})
         assert config.daemon.close_on_success is True
         assert config.daemon.tracking_issue is True
+        # the concierge block documents its knobs and stays commented (defaults)
+        assert "[concierge]" in text and "session_turns" in text
+        assert config.concierge.enabled is True and config.concierge.model is None
 
 
 class TestSandboxCommands:

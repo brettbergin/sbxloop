@@ -1166,6 +1166,11 @@ class DaemonLoop:
 
     # -- reporting -----------------------------------------------------------------------
 
+    def report_for(self, run_id: str) -> RunReport:
+        """The report card of any run this daemon's store knows — the same
+        mining the settle path does, for the concierge and other readers."""
+        return self._report(run_id, None)
+
     def _report(self, run_id: str, result: RunResult | None) -> RunReport:
         try:
             record = self.store.get_run(run_id)

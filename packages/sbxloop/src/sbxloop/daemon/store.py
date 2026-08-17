@@ -585,6 +585,37 @@ class DaemonStore:
             self._conn.commit()
         log.debug("store.ledger_closed", run=run_id, result=result)
 
+    # -- generic daemon state ---------------------------------------------------
+
+    def get_value(self, key: str) -> str | None:
+        """One ``daemon_state`` value (small process-level facts such as the
+        concierge's SDK session id)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM daemon_state WHERE key = ?", (key,)
+            ).fetchone()
+            return None if row is None or row["value"] is None else str(row["value"])
+
+    def set_value(self, key: str, value: str | None) -> None:
+        """Set (or, with ``None``, delete) one ``daemon_state`` value."""
+        with self._lock:
+            if value is None:
+                self._conn.execute("DELETE FROM daemon_state WHERE key = ?", (key,))
+            else:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+            self._conn.commit()
+
+    def item_for_run(self, run_id: str) -> str | None:
+        """The work item a run was dispatched for (ledger lookup)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT item_id FROM daemon_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return None if row is None else str(row["item_id"])
+
     # -- circuit breaker ---------------------------------------------------------
 
     def breaker(self) -> tuple[float | None, int]:

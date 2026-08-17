@@ -140,6 +140,18 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     assert over.daemon.workspace_isolation == "in-place"
     assert over.daemon.state_dir == Path("/var/lib/sbxloop")
     assert over.discord.enabled is True and over.discord.channel_id == 123456789
+    # [concierge]: on by default (effective only with [discord]), model falls
+    # back to the top-level model, env overrides reach it.
+    assert config.concierge.enabled is True and config.concierge.model is None
+    assert config.concierge.timeout_s == 180.0 and config.concierge.session_turns == 40
+    over2 = load_config(
+        cwd=tmp_path,
+        env={"SBXLOOP_CONCIERGE__MODEL": "gpt-5", "SBXLOOP_CONCIERGE__TIMEOUT_S": "300"},
+    )
+    assert over2.concierge.model == "gpt-5" and over2.concierge.timeout_s == 300.0
+    (tmp_path / "sbxloop.toml").write_text("[concierge]\ntimeout_s = 5\n")
+    with pytest.raises(ConfigError):
+        load_config(cwd=tmp_path, env={})
     assert config.daemon.close_on_success is True and config.daemon.tracking_issue is True
     assert config.daemon.delivered_label == "sbxloop:delivered"
     (tmp_path / "sbxloop.toml").write_text(

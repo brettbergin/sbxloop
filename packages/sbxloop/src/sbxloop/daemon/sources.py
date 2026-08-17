@@ -237,6 +237,19 @@ class InboxSource:
         target.write_text(f"# {title}\n\n{body}\n\n---\nFiled by sbxloop run {origin_run_id}\n")
         return f"inbox:{name}"
 
+    def enqueue(self, title: str, body: str, *, by: str) -> str:
+        """Queue a new work item on behalf of a human (the concierge's write
+        path): a pending ``.md`` the next poll picks up. The fingerprint
+        includes the clock, so asking twice queues twice — that is what
+        was asked; ``!sbx abandon`` undoes it."""
+        stamp = f"{title}\n{body}\n{self.clock():.3f}"
+        fingerprint = hashlib.sha256(stamp.encode()).hexdigest()[:8]
+        name = f"{slugify(title)}-{fingerprint}.md"
+        target = self._dir("pending") / name
+        target.write_text(f"# {title}\n\n{body}\n\n---\nRequested by {by} via the concierge\n")
+        log.info("inbox.enqueued", item=f"inbox:{name}", by=by, title=title[:80])
+        return f"inbox:{name}"
+
 
 # -- github issues -----------------------------------------------------------------
 
