@@ -27,6 +27,11 @@ All notable changes to sbxloop are documented here. The project adheres to
   `ok=false` answers the model can read. `WorkerClient.verify_installed()`
   is the cheap "is a matching worker already in this sandbox?" probe for
   reusing a long-lived sandbox.
+- Foundations for the Discord concierge (the control channel's agent,
+  landing in follow-up PRs): `[concierge]` config (`ConciergeConfig`, in
+  the `sbxloop init` template), `DaemonStore.get_value` / `set_value` on
+  the generic `daemon_state` table and `item_for_run`, `InboxSource.enqueue`
+  (queue a work item on a human's behalf), `DaemonLoop.report_for`.
 - `Provisioner.ensure_agent_only` / `agent_only_spec`: one agent-role
   sandbox (Copilot token, no `GH_TOKEN`, prompt-advertised baseline allows)
   outside a run's pair, sharing `ensure_github_only`'s fail-fast/rollback

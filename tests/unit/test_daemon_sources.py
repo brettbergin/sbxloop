@@ -130,6 +130,32 @@ class TestInbox:
         assert list((root / "pending").glob("add-caching-*.md"))
 
 
+class TestInboxEnqueue:
+    def test_enqueue_writes_pending_with_attribution(self, tmp_path: Path) -> None:
+        clock = [1000.0]
+        src = InboxSource(tmp_path / "inbox", clock=lambda: clock[0])
+        ref = src.enqueue("Add caching", "it is slow", by="Discord user `ana` (via concierge)")
+        assert ref.startswith("inbox:add-caching-")
+        (path,) = list((tmp_path / "inbox" / "pending").glob("add-caching-*.md"))
+        text = path.read_text()
+        assert text.startswith("# Add caching\n\nit is slow\n")
+        assert "Requested by Discord user `ana` (via concierge) via the concierge" in text
+        # Asking twice queues twice (the fingerprint includes the clock).
+        clock[0] += 1
+        ref2 = src.enqueue("Add caching", "it is slow", by="x")
+        assert ref2 != ref
+        assert len(list((tmp_path / "inbox" / "pending").glob("add-caching-*.md"))) == 2
+        # Once settled (mtime older than the settle window against the real
+        # clock the source compares with), poll() sees ordinary work items.
+        import os
+        import time
+
+        for written in (tmp_path / "inbox" / "pending").glob("*.md"):
+            os.utime(written, (time.time() - 30, time.time() - 30))
+        titles = [i.title for i in InboxSource(tmp_path / "inbox").poll()]
+        assert titles == ["Add caching", "Add caching"]
+
+
 class RecordingOps:
     """GithubOps stand-in for the issue source: scripted GET, recorded writes."""
 

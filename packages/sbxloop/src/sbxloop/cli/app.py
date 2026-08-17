@@ -2157,6 +2157,20 @@ mem_abort = 0.0
 # embeds = true                    # headline / finished / status as embed cards
 # status_line = true               # one per-run message edited as tasks progress
 # tool_batch_lines = 8             # verbose: consecutive tool calls per code block
+
+[concierge]
+# The control channel's agent: @mention the bot (or reply to it) to ask
+# about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue
+# new work in plain language. Runs as a Copilot session in a long-lived
+# agent sandbox and reaches the daemon only through host tools; needs
+# COPILOT_GITHUB_TOKEN on the daemon host. Acts with the same authority as
+# !sbx. Effective only when [discord] is enabled.
+# enabled = true
+# model = ""                       # empty = the top-level model
+# timeout_s = 180                  # one message's wall-clock budget
+# max_tool_calls = 16
+# session_turns = 40               # rotate the resumed SDK session after N turns
+# github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
 """
 
 

@@ -192,6 +192,18 @@ class TestResumeAndBreaker:
         store.set_breaker(None, 1)
         assert DaemonStore(tmp_path / "state.db").breaker() == (None, 1)
 
+    def test_generic_state_values(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.get_value("concierge_session_id") is None
+        store.set_value("concierge_session_id", "sess-1")
+        assert DaemonStore(tmp_path / "state.db").get_value("concierge_session_id") == "sess-1"
+        store.set_value("concierge_session_id", None)
+        assert store.get_value("concierge_session_id") is None
+        # coexists with the breaker rows on the same table
+        store.set_breaker(1.0, 2)
+        store.set_value("k", "v")
+        assert store.breaker() == (1.0, 2) and store.get_value("k") == "v"
+
 
 class TestLedgerBacklogThreads:
     def test_rolling_window(self, tmp_path: Path) -> None:
@@ -204,6 +216,13 @@ class TestLedgerBacklogThreads:
         assert store.runs_started_since(90000.0 - 86400) == 2
         assert store.runs_started_since(0) == 3
         store.finish_ledger("r0", "done", now=1500.0)
+
+    def test_item_for_run(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("5"), now=1.0)
+        store.mark_running("gh:5", "r5", now=2.0)
+        assert store.item_for_run("r5") == "gh:5"
+        assert store.item_for_run("r-unknown") is None
 
     def test_backlog_fingerprint_dedup(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")

@@ -495,6 +495,35 @@ class DiscordConfig(_ConfigModel):
         return self.channel_id is not None
 
 
+class ConciergeConfig(_ConfigModel):
+    """The control channel's agent: an LLM session that answers @mentions
+    in the Discord control channel, operates the daemon (every ``!sbx``
+    verb), enqueues new work and explains runs, PRs and diffs. It runs in
+    a long-lived agent-role sandbox and reaches the daemon only through
+    host tools. Effective only when ``[discord]`` is enabled; needs
+    ``COPILOT_GITHUB_TOKEN`` on the daemon host like any agent session.
+    It acts with the same authority as ``!sbx`` — anyone who can mention
+    the bot can drive the daemon; restrict the channel accordingly."""
+
+    enabled: bool = True
+    # None → the top-level ``model``.
+    model: str | None = None
+    # One message's wall-clock budget (the whole tool loop).
+    timeout_s: float = Field(default=180.0, ge=30, le=900)
+    # Replies longer than this are clipped before being split into
+    # Discord messages.
+    max_reply_chars: int = Field(default=4000, ge=500, le=8000)
+    # What one host tool may hand back to the model.
+    max_tool_result_chars: int = Field(default=6000, ge=1000, le=20000)
+    max_tool_calls: int = Field(default=16, ge=1, le=64)
+    # The SDK session is resumed message after message; after this many
+    # turns a fresh session is started so context does not grow forever.
+    session_turns: int = Field(default=40, ge=1, le=500)
+    # Expose the read-only GitHub tool (PR/issue/diff/file reads through
+    # the daemon's github-ops sandbox) when GitHub is configured.
+    github_tools: bool = True
+
+
 USER_CONFIG_SUBPATH = Path("sbxloop") / "sbxloop.toml"
 
 
@@ -562,6 +591,7 @@ class Config(_ConfigModel):
     limits: Limits = Field(default_factory=Limits)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
+    concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
 
     @field_validator("state_dir", mode="after")
     @classmethod
