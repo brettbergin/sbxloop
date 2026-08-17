@@ -240,7 +240,7 @@ def _operator() -> str:
     "cancelled by brett via sbxloop daemon ctl" rather than "operator"."""
     try:
         return f"{getpass.getuser()} via sbxloop daemon ctl"
-    except Exception:  # no passwd entry / no controlling identity (containers)
+    except Exception:  # no passwd entry / no login identity (containers)
         return "sbxloop daemon ctl"
 
 
