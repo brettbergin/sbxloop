@@ -150,9 +150,18 @@ class TestTick:
         h = Harness(tmp_path)
         h.source.items = [inbox_item()]
         h.loop._collect_backlog = lambda run_id, source: ["inbox:finding-a", "inbox:finding-b"]  # type: ignore[method-assign]
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
         assert h.loop.tick().outcome == "done"
         report = h.source.calls[-1][1]
         assert report.filed == ("inbox:finding-a", "inbox:finding-b")
+        # One notice per settle names them (no separate "filed N backlog item(s)" line).
+        done = [t for t in front.seen if t.startswith("✅ ")]
+        assert done == [
+            "✅ inbox:a.md done (no tasks ran) · PR https://x/pull/9"
+            " · filed `inbox:finding-a`, `inbox:finding-b`"
+        ]
+        assert not any(t.startswith("filed ") for t in front.seen)
 
     def test_daily_cap_blocks_dispatch(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
@@ -337,7 +346,13 @@ class TestOutcomeAndConfig:
         h.source.name = "github"  # type: ignore[misc]
         h.outcomes = ["failed"]
         h.loop._collect_backlog = lambda run_id, source: ["gh:50"]  # type: ignore[method-assign]
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
         assert h.loop.tick().outcome == "abandoned"
+        assert (
+            "🔎 gh:9 failed but its findings were filed · [#50](https://github.com/o/r/issues/50)"
+            in front.seen
+        )
 
     def test_item_config_skips_tracking_issue_when_disabled(self, tmp_path: Path) -> None:
         """tracking_issue=false (#251): the source issue already is the

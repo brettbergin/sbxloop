@@ -34,6 +34,14 @@ from sbxloop.daemon.backlog import (
     collect_backlog,
     collect_tool_findings,
 )
+from sbxloop.daemon.discord_format import (
+    charter_skipped_notice,
+    code,
+    filed_notice,
+    findings_summary,
+    link,
+    refs_text,
+)
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.postmortem import build_dossier
 from sbxloop.daemon.sources import WorkSource
@@ -662,28 +670,28 @@ class DaemonLoop:
             self._set_breaker(None, 0)
             source.report_success(item, report)
             self._frontend_finished(item, report)
+            findings = findings_summary(report, repo=self._repo, kind=item.kind)
             self._notify(
                 f"✅ {item.item_id} done ({report.task_summary})"
                 + (f" · PR {report.delivery[1]}" if report.delivery else "")
-                + (
-                    f" · filed {len(report.filed) + len(report.tool_filed)} finding(s)"
-                    + (f" ({len(report.tool_filed)} upstream)" if report.tool_filed else "")
-                    if item.kind == "audit"
-                    else ""
-                )
+                + (f" · {findings}" if findings else "")
             )
             self._file_review(item, run_id, report)
             return "done"
         if result is not None and result.state == "completed" and report.delivery_error:
             # Work done, PR failed: a human must look; retrying would redo the work.
-            self._collect_backlog(run_id, source)
+            filed = self._collect_backlog(run_id, source)
             self.dstore.mark_failed(
                 item.item_id, f"delivery failed: {report.delivery_error}", now, requeue=False
             )
             self.dstore.finish_ledger(run_id, "delivery_failed", now)
             source.report_delivery_failed(item, report)
             self._frontend_finished(item, report)
-            self._notify(f"⚠ {item.item_id} completed but delivery failed: {report.delivery_error}")
+            findings = findings_summary(report._replace(filed=tuple(filed)), repo=self._repo)
+            self._notify(
+                f"⚠ {item.item_id} completed but delivery failed: {report.delivery_error}"
+                + (f" · {findings}" if findings else "")
+            )
             self._file_postmortem(item, run_id, f"delivery failed: {report.delivery_error}")
             return "delivery_failed"
         reason = str(error) if error is not None else f"run ended {report.state}"
@@ -695,8 +703,8 @@ class DaemonLoop:
             tool = self._collect_tool_findings(run_id, source)
             if filed or tool.filed:
                 self._notify(
-                    f"🔎 {item.item_id} failed but its findings were filed: "
-                    f"{len(filed) + len(tool.filed)} issue(s)"
+                    f"🔎 {item.item_id} failed but its findings were filed · "
+                    f"{refs_text([*filed, *tool.filed], self._repo)}"
                 )
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
         self._set_breaker(self._breaker_opened_at, self._consecutive_failures + 1)
@@ -925,7 +933,7 @@ class DaemonLoop:
         for problem in problems:
             if problem not in self._audit_problems_seen:
                 self._audit_problems_seen.add(problem)
-                self._notify(f"⚠ audit charter skipped: {problem}")
+                self._notify(charter_skipped_notice(problem, daemon.audit_dir))
         for charter in due_charters(charters, self.dstore.audit_last_filed(), now):
             try:
                 since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - charter.every_s))
@@ -939,7 +947,15 @@ class DaemonLoop:
                     charter.title, issue_body(charter, audit_marker(charter.name))
                 )
                 self.dstore.record_audit(charter.name, ref, now)
-                self._notify(f"🔎 scheduled audit filed: {charter.title} → {ref}")
+                self._notify(
+                    filed_notice(
+                        "audit",
+                        ref,
+                        repo=self._repo,
+                        target=f"charter {code(charter.name)}",
+                        detail=charter.title,
+                    )
+                )
             except Exception:
                 logger.warning("scheduled audit %s could not be filed", charter.name, exc_info=True)
 
@@ -983,7 +999,14 @@ class DaemonLoop:
             number, url = report.delivery
             ref = github.file_review(item, number, url, run_id)
             self.dstore.record_review(run_id, number, ref, now)
-            self._notify(f"🔎 review audit filed for PR #{number}: {ref}")
+            self._notify(
+                filed_notice(
+                    "review",
+                    ref,
+                    repo=self._repo,
+                    target=f"PR {link(f'#{number}', url)} · {item.item_id}",
+                )
+            )
         except Exception:
             logger.warning("delivery review for %s could not be filed", run_id, exc_info=True)
 
@@ -1013,7 +1036,11 @@ class DaemonLoop:
             )
             ref = github.file_postmortem(item, dossier, run_id)
             self.dstore.record_postmortem(run_id, item.item_id, ref, now)
-            self._notify(f"🔎 post-mortem filed for {item.item_id}: {ref}")
+            self._notify(
+                filed_notice(
+                    "post-mortem", ref, repo=self._repo, target=item.item_id, detail=reason
+                )
+            )
         except Exception:
             logger.warning("post-mortem for %s could not be filed", run_id, exc_info=True)
 
@@ -1039,8 +1066,6 @@ class DaemonLoop:
         except SbxloopError:
             logger.warning("backlog collection failed for %s", run_id, exc_info=True)
             return []
-        if filed:
-            self._notify(f"filed {len(filed)} backlog item(s) from {run_id}: {', '.join(filed)}")
         return list(filed)
 
     # -- recovery ------------------------------------------------------------------------
@@ -1146,6 +1171,11 @@ class DaemonLoop:
         )
 
     # -- helpers ------------------------------------------------------------------------
+
+    @property
+    def _repo(self) -> str | None:
+        """The GitHub repo filed refs point into (``gh:12`` → a link)."""
+        return self.config.github.repo
 
     def _notify(self, text: str) -> None:
         logger.info("%s", text)

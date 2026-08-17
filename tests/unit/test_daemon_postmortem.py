@@ -12,7 +12,7 @@ from sbxloop.daemon.postmortem import DOSSIER_MAX_CHARS, build_dossier, postmort
 from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
-from tests.unit.test_daemon_loop import FakeSource, Harness, inbox_item
+from tests.unit.test_daemon_loop import FakeSource, Harness, RecordingFrontend, inbox_item
 
 
 def gh_item(kind: str = "patch") -> WorkItem:
@@ -136,12 +136,19 @@ def github_harness(tmp_path: Path, **daemon: Any) -> Harness:
 class TestFiling:
     def test_abandoned_patch_item_files_one_postmortem(self, tmp_path: Path) -> None:
         h = github_harness(tmp_path)
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
         h.source.items = [gh_item()]
         h.outcomes = ["failed"]
         assert h.loop.tick().outcome == "abandoned"
         assert len(h.source.postmortems) == 1  # type: ignore[attr-defined]
         item_id, run_id, dossier = h.source.postmortems[0]  # type: ignore[attr-defined]
         assert item_id == "gh:4" and dossier.startswith("# Post-mortem: Fix the thing")
+        # The notice names the item (so the bridge threads it) and links the charter.
+        assert front.seen[-1] == (
+            "🔎 post-mortem [#901](https://github.com/o/r/issues/901) filed for gh:4"
+            " · abandoned: run ended failed"
+        )
         assert h.dstore.postmortem_filed(run_id)
         # never twice for the same run
         h.loop._file_postmortem(gh_item(), run_id, "again")
@@ -205,9 +212,15 @@ class TestDeliveryReviews:
 
     def test_delivered_patch_files_one_review(self, tmp_path: Path) -> None:
         h = reviewing_harness(tmp_path)
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
         h.source.items = [gh_item()]
         assert h.loop.tick().outcome == "done"
         assert h.source.reviews == [("gh:4", 9, h.runs[0][0])]  # type: ignore[attr-defined]
+        assert front.seen[-1] == (
+            "🔎 review [#801](https://github.com/o/r/issues/801) filed for PR"
+            " [#9](https://x/pull/9) · gh:4"
+        )
         run_id = h.runs[0][0]
         assert h.dstore.review_filed(run_id)
         report = next(c[1] for c in h.source.calls if c[0] == "success")
