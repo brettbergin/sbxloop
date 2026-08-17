@@ -8,6 +8,13 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Concierge: **`create_issue`** files a feature/bug the person described as
+  an issue in the configured repo, created with the `[daemon] backlog_label`
+  (triage) and attributed to the Discord user; the prompt then has it ask
+  whether to add the `trigger_label`, and **`label_issue_for_run`** does so
+  only after an explicit yes. `[concierge] create_issues` (default on,
+  needs `github_tools` and `[github] repo`) gates both.
+
 - Worker protocol: **host tools** for `agent.session` jobs. `JobRequest`
   gains `host_tools` (name, description, JSON-schema `parameters`),
   `host_tools_dir`, `host_tool_timeout_s` and `available_tools`; the worker
@@ -19,6 +26,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   session drive the daemon. The echo backend scripts `host_tool_calls`, so
   the round trip is testable without the SDK. See
   `docs/worker-protocol.md`, "Host tools".
+
 - Host side of the same round trip: `WorkerClient.submit(job, tool_handler=…)` answers a job's host-tool requests through a
   `HostToolBroker` (`sbxloop.worker.hosttools`). The handler runs on a
   small host thread pool, never on the thread draining the event stream,
@@ -27,6 +35,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   `ok=false` answers the model can read. `WorkerClient.verify_installed()`
   is the cheap "is a matching worker already in this sandbox?" probe for
   reusing a long-lived sandbox.
+
 - **Discord concierge** core — the control channel's agent
   (`sbxloop.daemon.concierge.Concierge`, prompt
   `engine/prompts/concierge.md`). It runs as a Copilot session in the
@@ -43,6 +52,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   the run's Discord thread) and `github_get` (PR / files / diff / issue /
   comments / file reads through the github-ops sandbox, configured repo
   only, on when `[concierge] github_tools`).
+
 - Discord: **@mention the bot (or reply to it) in the control channel to
   talk to the concierge.** Routing is a pure function
   (`sbxloop.daemon.discord_routing.route_message`: command / concierge /
@@ -52,11 +62,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   every tool used. `sbxloop daemon` wires it when `[discord]` and
   `[concierge]` are enabled (not with `--once`), warms the sandbox up in
   the background, and `sbxloop doctor` grows a "discord concierge" row.
+
 - Foundations for the Discord concierge (the control channel's agent,
   landing in follow-up PRs): `[concierge]` config (`ConciergeConfig`, in
   the `sbxloop init` template), `DaemonStore.get_value` / `set_value` on
   the generic `daemon_state` table and `item_for_run`, `InboxSource.enqueue`
   (queue a work item on a human's behalf), `DaemonLoop.report_for`.
+
 - `Provisioner.ensure_agent_only` / `agent_only_spec`: one agent-role
   sandbox (Copilot token, no `GH_TOKEN`, prompt-advertised baseline allows)
   outside a run's pair, sharing `ensure_github_only`'s fail-fast/rollback
@@ -68,6 +80,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   SDK's session store, i.e. the concierge's memory, lives inside the VM).
   `sbxloop sandbox prune` reports both daemon-owned families and never
   touches them; `sbxloop sandbox rm` removes them explicitly.
+
 - The daemon's log is structured ([structlog](https://www.structlog.org/)
   routed through the standard library, `sbxloop.log`) and configurable:
   `--log-level` / `[daemon] log_level` / `SBXLOOP_DAEMON__LOG_LEVEL`

@@ -522,6 +522,9 @@ class ConciergeConfig(_ConfigModel):
     # Expose the read-only GitHub tool (PR/issue/diff/file reads through
     # the daemon's github-ops sandbox) when GitHub is configured.
     github_tools: bool = True
+    # Let the concierge file issues in the configured repo: created with the
+    # backlog label; the trigger label (a run) only after the person says so.
+    create_issues: bool = True
 
 
 USER_CONFIG_SUBPATH = Path("sbxloop") / "sbxloop.toml"

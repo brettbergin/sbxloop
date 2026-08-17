@@ -144,6 +144,7 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     # back to the top-level model, env overrides reach it.
     assert config.concierge.enabled is True and config.concierge.model is None
     assert config.concierge.timeout_s == 180.0 and config.concierge.session_turns == 40
+    assert config.concierge.github_tools is True and config.concierge.create_issues is True
     over2 = load_config(
         cwd=tmp_path,
         env={"SBXLOOP_CONCIERGE__MODEL": "gpt-5", "SBXLOOP_CONCIERGE__TIMEOUT_S": "300"},

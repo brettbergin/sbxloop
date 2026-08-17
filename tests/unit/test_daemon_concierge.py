@@ -128,6 +128,15 @@ class FakeGithub:
         self.paths.append(f"contents:{path}@{ref}")
         return "print('hi')\n"
 
+    def issue_create(
+        self, repo: str, title: str, body: str = "", labels: list[str] | None = None
+    ) -> Any:
+        from sbxloop.gh.ops import IssueRef
+
+        self.created = getattr(self, "created", [])
+        self.created.append((repo, title, body, labels))
+        return IssueRef(number=41, url="https://gh/i/41")
+
 
 class LoopWithRuns(FakeLoop):
     """FakeLoop plus the report/current surface the concierge's tools use."""
@@ -234,7 +243,18 @@ class TestJobShape:
     def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
         turn(concierge)
-        assert "github_get" in [t.name for t in client.jobs[0].host_tools]
+        names = [t.name for t in client.jobs[0].host_tools]
+        assert "github_get" in names
+        assert "create_issue" in names and "label_issue_for_run" in names
+        concierge3, client3, *_ = make(
+            tmp_path / "c",
+            [{}],
+            github=FakeGithub(),
+            config={"concierge": {"create_issues": False}},
+        )
+        turn(concierge3)
+        names3 = [t.name for t in client3.jobs[0].host_tools]
+        assert "github_get" in names3 and "create_issue" not in names3
         concierge2, client2, *_ = make(
             tmp_path / "b", [{}], github=FakeGithub(), config={"concierge": {"github_tools": False}}
         )
@@ -431,6 +451,40 @@ class TestTools:
         assert file.text.startswith("src/a.py@main:")
         assert bad.text == "pr needs number"
         assert github.paths[0] == "/repos/owner/repo/pulls/7"
+
+    def test_create_issue_files_in_triage_and_labels_only_on_request(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "create_issue",
+                            {"title": "Add retries to fetch", "body": "Wrap fetch()."},
+                        ),
+                        ("create_issue", {"title": "", "body": "x"}),
+                    ],
+                    "text": "Filed #41. Should I label it sbxloop:run?",
+                },
+                {"calls": [("label_issue_for_run", {"number": 41})], "text": "done"},
+            ],
+            github=github,
+        )
+        turn(concierge, "file an issue: add retries to fetch", author="Discord user `ana`")
+        created, bad = client.responses
+        assert created.ok and created.text.startswith("created issue #41 https://gh/i/41")
+        assert "`sbxloop:backlog`" in created.text and "ask the person" in created.text
+        assert bad.text == "both title and body are required"
+        (repo, title, body, labels) = github.created[0]
+        assert repo == "owner/repo" and title == "Add retries to fetch"
+        assert labels == ["sbxloop:backlog"]
+        assert body.startswith("Wrap fetch().\n\n---\nFiled by Discord user `ana` (via concierge)")
+        assert not any("/labels" in p for p in github.paths)  # not labelled for a run yet
+        turn(concierge, "yes", author="Discord user `ana`")
+        (labelled,) = client.responses[2:]
+        assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #41")
+        assert github.paths[-1] == "/repos/owner/repo/issues/41/labels"
 
     def test_tool_exception_becomes_error_response_and_turn_survives(self, tmp_path: Path) -> None:
         concierge, client, _, loop, _ = make(
