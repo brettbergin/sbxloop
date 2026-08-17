@@ -278,11 +278,20 @@ class TestBridge:
             assert control.sent_kwargs[0].get("embed") is not None
             bridge.run_finished(
                 item,
-                RunReport("r1", "completed", "1/1 tasks done", delivery=(3, "https://x/pull/3")),
+                RunReport(
+                    "r1",
+                    "completed",
+                    "1/1 tasks done",
+                    delivery=(3, "https://x/pull/3"),
+                    filed=("gh:12",),
+                ),
             )
             assert wait_for(
                 lambda: any(s.startswith("**finished: completed**") for s in thread.sent)
             )
+            # what the run filed rides on the finish text (no repo configured → plain #12)
+            finish_text = next(s for s in thread.sent if s.startswith("**finished"))
+            assert "\n🔀 PR #3 <https://x/pull/3>\n🔎 filed #12" in finish_text
             headline = control.messages[bridge.dstore.discord_thread("r1").headline_id]  # type: ignore[union-attr]
             assert wait_for(lambda: headline.content.startswith("✅"))
             # the finished card is an embed with the PR field
@@ -292,6 +301,7 @@ class TestBridge:
                 if t.startswith("**finished")
             ]
             assert finish_kwargs and finish_kwargs[0].get("embed") is not None
+            assert [f.name for f in finish_kwargs[0]["embed"].fields] == ["PR", "Filed"]
         finally:
             bridge.close()
 

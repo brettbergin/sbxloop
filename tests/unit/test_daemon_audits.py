@@ -127,9 +127,15 @@ def harness(tmp_path: Path, **daemon: Any) -> tuple[Harness, Path]:
 class TestScheduling:
     def test_due_charter_is_filed_once_then_waits_its_interval(self, tmp_path: Path) -> None:
         h, repo = harness(tmp_path)
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
         write_charter(repo, "guardrails", "1d")
         h.loop.tick()
         assert [t for t, _ in h.source.filed] == ["audit: guardrails"]  # type: ignore[attr-defined]
+        assert front.seen == [
+            "🔎 audit [#701](https://github.com/o/r/issues/701) filed for charter `guardrails`"
+            " · audit: guardrails"
+        ]
         assert "<!-- sbxloop-audit guardrails -->" in h.source.filed[0][1]  # type: ignore[attr-defined]
         h.loop.tick()  # cache says filed just now → nothing
         assert len(h.source.filed) == 1  # type: ignore[attr-defined]
@@ -181,6 +187,8 @@ class TestScheduling:
         h.loop.tick()
         assert [t for t, _ in h.source.filed][:1] == ["audit: good"]  # type: ignore[attr-defined]
         assert sum("audit charter skipped" in c for c in front.seen) == 1
+        skipped = next(c for c in front.seen if "audit charter skipped" in c)
+        assert skipped.endswith(" · fix or remove it under `.github/sbxloop/audits`")
 
 
 class TestRefreshBeforeSchedule:

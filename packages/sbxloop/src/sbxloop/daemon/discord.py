@@ -49,6 +49,7 @@ from sbxloop.daemon.discord_format import (
     _one_line,
     code,
     daemon_notice,
+    filed_lines,
     finish_embed,
     finish_text,
     format_for_discord,
@@ -707,6 +708,9 @@ class DiscordBridge:
             text += f"\n📋 tracking issue #{report.tracking_issue[0]} <{report.tracking_issue[1]}>"
         if report.delivery:
             text += f"\n🔀 PR #{report.delivery[0]} <{report.delivery[1]}>"
+        repo = self.config.github.repo
+        for extra in filed_lines(report, repo=repo):
+            text += f"\n{extra}"
         if report.delivery_error:
             text += f"\n⚠ delivery failed: {_one_line(report.delivery_error, 300)}"
         if unanswered:
@@ -716,7 +720,11 @@ class DiscordBridge:
             for pending in unanswered:
                 await self._edit_steer_status(pending, "unanswered")
         if thread is not None:
-            await self._send(thread, text, embed=finish_embed(item, report, state, len(unanswered)))
+            await self._send(
+                thread,
+                text,
+                embed=finish_embed(item, report, state, len(unanswered), repo=repo),
+            )
         facts = self._facts.setdefault(run_id, {})
         if report.tracking_issue:
             facts["tracking"] = report.tracking_issue

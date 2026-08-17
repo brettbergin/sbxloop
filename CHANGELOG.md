@@ -6,6 +6,22 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- The audit lane's Discord messages follow the bridge's formatting pattern
+  instead of ad hoc strings: filed refs render as masked links
+  (`gh:12` → `[#12](https://github.com/<repo>/issues/12)`, upstream
+  `owner/name#5` likewise) via shared builders in
+  `sbxloop.daemon.discord_format` (`filed_notice`, `findings_summary`,
+  `filed_lines`, `charter_skipped_notice`, `ref_link`); the scheduled-audit,
+  delivery-review and post-mortem notices name the item so the bridge threads
+  them, and use `·`-separated fields rather than `:`/`→`; the finish card (and its
+  text fallback) gains `Filed` / `Upstream` / `Noted` fields, so an audit's
+  deliverable is on the card next to the PR (`no findings` when clean); the
+  `✅ … done` notice lists what the run filed and the separate
+  `filed N backlog item(s)` notice is gone; `!sbx queue` marks audits like
+  `!sbx items` does; a broken charter's notice says where to fix it.
+
 ### Fixed
 
 - Audit runs no longer sink on a verify command they never needed: the

@@ -20,14 +20,21 @@ from sbxloop.daemon.discord_format import (
     ToolDigest,
     _clip,
     _fence_state,
+    charter_skipped_notice,
     daemon_notice,
+    filed_lines,
+    filed_notice,
+    findings_summary,
     finish_embed,
     finish_text,
     format_for_discord,
     headline_embed,
     headline_text,
+    issue_url,
     mask_urls,
     queue_lines,
+    ref_link,
+    refs_text,
     repetitive_streak,
     split_markdown,
     status_embed,
@@ -514,6 +521,34 @@ class TestEmbeds:
         )
         assert failed.color == COLOR_WARN and failed.fields[0][1].startswith("⚠ 409")
 
+    def test_finish_card_shows_what_the_run_filed(self) -> None:
+        """An audit's deliverable is its findings: they belong on the card
+        next to the PR, linked, with upstream/noted ones told apart."""
+        audit = WorkItem(item_id="gh:9", source="github", source_key="9", title="A", kind="audit")
+        report = RunReport(
+            "r1",
+            "completed",
+            "2/2 tasks done",
+            filed=("gh:12", "gh:13"),
+            tool_filed=("brettbergin/sbxloop#5",),
+            tool_noted=("X",),
+        )
+        card = finish_embed(audit, report, "completed", repo="o/r")
+        assert {n: v for n, v, _ in card.fields} == {
+            "Filed": "[#12](https://github.com/o/r/issues/12), [#13](https://github.com/o/r/issues/13)",
+            "Upstream": "[brettbergin/sbxloop#5](https://github.com/brettbergin/sbxloop/issues/5)",
+            "Noted": (
+                "1 finding(s) about sbxloop noted, not filed — "
+                "set `[daemon] tool_repo` to route them upstream"
+            ),
+        }
+        empty = finish_embed(audit, RunReport("r1", "completed", "x"), "completed", repo="o/r")
+        assert empty.fields == (("Filed", "no findings", True),)
+        patch = WorkItem(item_id="gh:4", source="github", source_key="4", title="P")
+        assert finish_embed(patch, RunReport("r1", "completed", "x"), "completed").fields == ()
+        # No repo known (bridge without a github section): plain #n, never a broken link.
+        assert finish_embed(patch, report, "completed").fields[0][1] == "#12, #13"
+
     def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
         """#246: a cancel is not a failure; the card must name the requester
         and tell the human the run is resumable (or already re-queued)."""
@@ -565,6 +600,15 @@ class TestEmbeds:
             queue_lines(items, limit=2)
             == "• `gh:0` [T0](https://x/0)\n• `gh:1` [T1](https://x/1)\n… and 1 more"
         )
+        audit = WorkItem(
+            item_id="gh:9",
+            source="github",
+            source_key="9",
+            title="A",
+            url="https://x/9",
+            kind="audit",
+        )
+        assert queue_lines([audit]) == "• `gh:9` 🔎 audit · [A](https://x/9)"
 
     def test_daemon_notice_masks_urls(self) -> None:
         assert mask_urls("PR https://x/pull/9 done") == "PR <https://x/pull/9> done"
@@ -574,6 +618,71 @@ class TestEmbeds:
         )
         assert daemon_notice("✅ gh:8 done · PR https://x/pull/9", thread_id=77) == (
             "✅ gh:8 done · PR <https://x/pull/9> · <#77>"
+        )
+
+
+class TestFiledRefs:
+    """Refs the daemon files (``gh:n``, ``owner/name#n``) rendered the way
+    every other link in the bridge is: masked, or plain when no URL is known."""
+
+    def test_ref_link_and_refs_text(self) -> None:
+        assert issue_url("gh:12", "o/r") == "https://github.com/o/r/issues/12"
+        assert issue_url("gh:12") is None
+        assert issue_url("o/x#5") == "https://github.com/o/x/issues/5"
+        assert issue_url("gh:existing", "o/r") is None
+        assert ref_link("gh:12", "o/r") == "[#12](https://github.com/o/r/issues/12)"
+        assert ref_link("gh:12") == "#12"
+        assert ref_link("o/x#5") == "[o/x#5](https://github.com/o/x/issues/5)"
+        assert ref_link("inbox:foo.md") == "`inbox:foo.md`"
+        assert ref_link("gh:existing") == "`gh:existing`"
+        assert refs_text(["gh:1", "gh:2"], "o/r") == (
+            "[#1](https://github.com/o/r/issues/1), [#2](https://github.com/o/r/issues/2)"
+        )
+        assert refs_text([f"gh:{i}" for i in range(8)], limit=6) == "#0, #1, #2, #3, #4, #5, … +2"
+
+    def test_filed_notice(self) -> None:
+        assert filed_notice(
+            "audit", "gh:701", repo="o/r", target="charter `flakes`", detail="audit: flakes"
+        ) == (
+            "🔎 audit [#701](https://github.com/o/r/issues/701) filed for charter `flakes`"
+            " · audit: flakes"
+        )
+        assert filed_notice("post-mortem", "gh:901", target="gh:4", detail="abandoned: boom") == (
+            "🔎 post-mortem #901 filed for gh:4 · abandoned: boom"
+        )
+        assert filed_notice("review", "gh:801") == "🔎 review #801 filed"
+
+    def test_findings_summary_and_filed_lines(self) -> None:
+        none = RunReport("r1", "completed", "x")
+        assert findings_summary(none) == ""
+        assert findings_summary(none, kind="audit") == "no findings"
+        assert filed_lines(none) == []
+        report = RunReport(
+            "r1", "completed", "x", filed=("gh:12",), tool_filed=("o/x#5",), tool_noted=("A", "B")
+        )
+        assert findings_summary(report, repo="o/r") == (
+            "filed [#12](https://github.com/o/r/issues/12)"
+            " · upstream [o/x#5](https://github.com/o/x/issues/5)"
+            " · noted 2 finding(s) about sbxloop — set `[daemon] tool_repo` to file them upstream"
+        )
+        assert filed_lines(report, repo="o/r") == [
+            "🔎 filed #12 <https://github.com/o/r/issues/12>",
+            "🔎 filed upstream o/x#5 <https://github.com/o/x/issues/5>",
+            "⚠ 2 finding(s) about sbxloop noted, not filed — "
+            "set `[daemon] tool_repo` to route them upstream",
+        ]
+        assert filed_lines(report._replace(tool_filed=(), tool_noted=())) == ["🔎 filed #12"]
+        # Masked links survive the control-channel URL masking.
+        assert daemon_notice(findings_summary(report, repo="o/r")) == findings_summary(
+            report, repo="o/r"
+        )
+
+    def test_charter_skipped_notice(self) -> None:
+        assert charter_skipped_notice(
+            "a/bad.md: charter body is empty", ".github/sbxloop/audits"
+        ) == (
+            "⚠ audit charter skipped: a/bad.md: charter body is empty"
+            " · fix or remove it under `.github/sbxloop/audits`"
         )
 
 

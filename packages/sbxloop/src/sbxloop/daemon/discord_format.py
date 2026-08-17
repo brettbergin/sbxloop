@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import socket
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -957,7 +958,14 @@ def _cancel_note(item_id: str | None, report: RunReport) -> str:
     return note
 
 
-def finish_embed(item: WorkItem, report: RunReport, state: str, unanswered: int = 0) -> EmbedSpec:
+def finish_embed(
+    item: WorkItem,
+    report: RunReport,
+    state: str,
+    unanswered: int = 0,
+    *,
+    repo: str | None = None,
+) -> EmbedSpec:
     fields: list[tuple[str, str, bool]] = []
     if report.cancelled_by:
         fields.append(("Cancelled", _cancel_note(item.item_id, report), False))
@@ -967,6 +975,16 @@ def finish_embed(item: WorkItem, report: RunReport, state: str, unanswered: int 
         )
     if report.delivery:
         fields.append(("PR", link(f"#{report.delivery[0]}", report.delivery[1]), True))
+    # What the run filed is an audit's deliverable (and a patch run's side
+    # findings): show it where the PR is shown.
+    if report.filed:
+        fields.append(("Filed", refs_text(report.filed, repo), True))
+    elif item.kind == "audit":
+        fields.append(("Filed", "no findings", True))
+    if report.tool_filed:
+        fields.append(("Upstream", refs_text(report.tool_filed, repo), True))
+    if report.tool_noted:
+        fields.append(("Noted", _noted_note(len(report.tool_noted)), False))
     if report.delivery_error:
         fields.append(("Delivery", f"⚠ {_one_line(report.delivery_error, 600)}", False))
     if unanswered:
@@ -1013,6 +1031,7 @@ def queue_lines(items: list[WorkItem], limit: int = 15) -> str:
         return "queue is empty."
     rows = [
         f"• {code(i.item_id)} "
+        + ("🔎 audit · " if i.kind == "audit" else "")
         + (link(_one_line(i.title, 80), i.url) if i.url else _one_line(i.title, 80))
         for i in items[:limit]
     ]
@@ -1060,6 +1079,113 @@ def daemon_notice(text: str, *, thread_id: int | None = None) -> str:
     return out
 
 
+# -- filed refs (audits, reviews, post-mortems, backlog) -----------------------------
+
+_GH_REF_RE = re.compile(r"^gh:(\d+)$")
+_UPSTREAM_REF_RE = re.compile(r"^([\w.-]+/[\w.-]+)#(\d+)$")
+
+
+def issue_url(ref: str, repo: str | None = None) -> str | None:
+    """The GitHub URL behind a filed ref: ``gh:12`` needs ``repo``; an
+    upstream ``owner/name#5`` ref carries its own; anything else has none."""
+    if (m := _GH_REF_RE.match(ref)) and repo:
+        return f"https://github.com/{repo}/issues/{m.group(1)}"
+    if m := _UPSTREAM_REF_RE.match(ref):
+        return f"https://github.com/{m.group(1)}/issues/{m.group(2)}"
+    return None
+
+
+def _ref_label(ref: str) -> str | None:
+    if m := _GH_REF_RE.match(ref):
+        return f"#{m.group(1)}"
+    if _UPSTREAM_REF_RE.match(ref):
+        return ref
+    return None
+
+
+def ref_link(ref: str, repo: str | None = None) -> str:
+    """A filed ref as Discord text: a masked link when the URL is known,
+    ``#12`` when the repo is not, inline code for anything else."""
+    label = _ref_label(ref)
+    if label is None:
+        return code(ref)
+    return link(label, issue_url(ref, repo))
+
+
+def _ref_plain(ref: str, repo: str | None = None) -> str:
+    """``#12 <url>`` — the no-unfurl form for text fallbacks."""
+    label = _ref_label(ref)
+    if label is None:
+        return code(ref)
+    url = issue_url(ref, repo)
+    return f"{label} {nolink(url)}" if url else label
+
+
+def refs_text(refs: Sequence[str], repo: str | None = None, *, limit: int = 6) -> str:
+    """Filed refs as a comma list (a list inside one field, not fields)."""
+    shown = [ref_link(r, repo) for r in refs[:limit]]
+    if len(refs) > limit:
+        shown.append(f"… +{len(refs) - limit}")
+    return ", ".join(shown)
+
+
+def _noted_note(n: int) -> str:
+    return (
+        f"{n} finding(s) about sbxloop noted, not filed — "
+        "set `[daemon] tool_repo` to route them upstream"
+    )
+
+
+def filed_notice(
+    kind: str, ref: str, *, repo: str | None = None, target: str = "", detail: str = ""
+) -> str:
+    """Control-channel notice for a charter the daemon opened: ``🔎 audit
+    [#701](…) filed for charter `x` · audit: x``."""
+    text = f"🔎 {kind} {ref_link(ref, repo)} filed"
+    if target:
+        text += f" for {target}"
+    if detail:
+        text += f" · {_one_line(detail, 80)}"
+    return text
+
+
+def findings_summary(report: RunReport, *, repo: str | None = None, kind: str = "patch") -> str:
+    """The ``·``-joinable tail saying what a run filed; empty when a patch
+    run filed nothing, ``no findings`` when an audit did."""
+    parts = []
+    if report.filed:
+        parts.append(f"filed {refs_text(report.filed, repo)}")
+    if report.tool_filed:
+        parts.append(f"upstream {refs_text(report.tool_filed, repo)}")
+    if report.tool_noted:
+        parts.append(
+            f"noted {len(report.tool_noted)} finding(s) about sbxloop — "
+            "set `[daemon] tool_repo` to file them upstream"
+        )
+    if not parts and kind == "audit":
+        return "no findings"
+    return " · ".join(parts)
+
+
+def filed_lines(report: RunReport, *, repo: str | None = None) -> list[str]:
+    """Finish-text fallback lines, in the ``🔀 PR #34 <url>`` style."""
+    out = []
+    if report.filed:
+        out.append("🔎 filed " + ", ".join(_ref_plain(r, repo) for r in report.filed))
+    if report.tool_filed:
+        out.append("🔎 filed upstream " + ", ".join(_ref_plain(r, repo) for r in report.tool_filed))
+    if report.tool_noted:
+        out.append(f"⚠ {_noted_note(len(report.tool_noted))}")
+    return out
+
+
+def charter_skipped_notice(problem: str, audit_dir: object) -> str:
+    return (
+        f"⚠ audit charter skipped: {_one_line(problem, 200)}"
+        f" · fix or remove it under {code(audit_dir)}"
+    )
+
+
 __all__ = [
     "COLOR_FAIL",
     "COLOR_OK",
@@ -1071,19 +1197,26 @@ __all__ = [
     "StatusLine",
     "ToolBatcher",
     "block",
+    "charter_skipped_notice",
     "code",
     "daemon_notice",
+    "filed_lines",
+    "filed_notice",
+    "findings_summary",
     "finish_embed",
     "finish_text",
     "format_for_discord",
     "headline_embed",
     "headline_text",
+    "issue_url",
     "items_lines",
     "line",
     "link",
     "mask_urls",
     "nolink",
     "queue_lines",
+    "ref_link",
+    "refs_text",
     "split_markdown",
     "status_embed",
 ]
