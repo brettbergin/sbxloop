@@ -280,3 +280,64 @@ class TestMultiLanguageRuns:
             ["pytest -q", "rspec spec/", "go test ./..."], ["python", "ruby", "go"]
         )
         assert len(problems) == 2  # go test is fine; the other two flagged
+
+
+class TestShellBranchBodies:
+    _CONDITIONAL = (
+        "server & sleep 2; if curl -fsS localhost:5000; then pytest -q; "
+        "else sudo apt-get install x; exit 1; fi"
+    )
+
+    def test_heads_see_through_control_keywords(self) -> None:
+        heads = command_heads(self._CONDITIONAL)
+        assert "pytest" in heads
+        assert "sudo" in heads
+        for keyword in ("then", "else", "fi", "if", "do", "done"):
+            assert keyword not in heads
+
+    def test_heads_of_reported_repro_command(self) -> None:
+        heads = command_heads("if true; then pytest -q; else sudo apt install x; exit 1; fi")
+        assert heads == ["true", "pytest", "sudo", "exit"]
+        assert not {"if", "then", "else", "elif", "do", "done", "fi", "in"} & set(heads)
+
+    def test_bare_runner_in_then_branch_reported_for_uv_project(self) -> None:
+        problems = lint_verify_commands(
+            ["if true; then pytest -q; else exit 1; fi"], ["python"], uv_project=True
+        )
+        assert any("pytest" in p and "uv run" in p for p in problems)
+
+    def test_mutating_command_in_else_branch_reported(self) -> None:
+        problems = lint_verify_commands(
+            ["if curl -fsS localhost:5000; then echo ok; else sudo apt-get install -y curl; fi"],
+            ["python"],
+            uv_project=True,
+        )
+        assert any("`sudo`" in p and "must not modify the environment" in p for p in problems)
+
+    def test_conditional_body_violations_reported(self) -> None:
+        problems = lint_verify_commands([self._CONDITIONAL], ["python"], uv_project=True)
+        joined = " ".join(problems)
+        assert "pytest" in joined
+        assert "`sudo`" in joined
+
+    def test_bashism_inside_then_branch_reported(self) -> None:
+        double_bracket = "[" + "["
+        command = f"if {double_bracket} -f README.md ]] ; then echo ok; else exit 1; fi"
+        problems = lint_verify_commands([command], ["python"])
+        assert any("bash test" in p for p in problems)
+
+    def test_violation_inside_for_do_body_reported(self) -> None:
+        problems = lint_verify_commands(["for f in a b; do sudo rm $f; done"], ["python"])
+        assert any("`sudo`" in p for p in problems)
+
+    def test_venv_path_inside_branch_reported_for_uv_project(self) -> None:
+        problems = lint_verify_commands(
+            ["if true; then .venv/bin/pytest -q; fi"], ["python"], uv_project=True
+        )
+        assert any(".venv/bin/pytest" in p for p in problems)
+
+    def test_existing_non_branching_behaviour_unchanged(self) -> None:
+        assert command_heads("pytest -q") == ["pytest"]
+        assert command_heads("cd app && pytest -q") == ["cd", "pytest"]
+        assert command_heads("FOO=1 python -c 'x'") == ["python"]
+        assert lint_verify_commands(["uv run pytest -q"], ["python"], uv_project=True) == []

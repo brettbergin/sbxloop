@@ -113,6 +113,14 @@ MUTATING_COMMANDS = frozenset({"sudo", "apt", "apt-get", "dnf", "yum", "apk"})
 _SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\||\$\(|`|\n")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+# Shell control keywords are not commands. Without skipping them, the head
+# of `if true; then pytest -q; fi` is `then` and the real command behind it
+# is never inspected — hiding bare runners, `sudo`/`apt` and bashisms inside
+# branch bodies from every rule in `lint_verify_commands`.
+_SHELL_KEYWORDS = frozenset(
+    {"if", "while", "until", "for", "then", "else", "elif", "do", "done", "fi", "in", "{", "}", "!"}
+)
+
 # Verify commands run under `sh -c` (POSIX sh, dash on Debian), NOT bash.
 # Bash-only syntax fails there in one of two ways, and neither is a check
 # the executor can fix (it may not edit verify commands): ANSI-C quoting
@@ -225,8 +233,9 @@ def bashisms(command: str) -> list[str]:
 def command_heads(command: str) -> list[str]:
     """The command-position words of a shell command line.
 
-    Splits on operators, skips env-var prefixes (``FOO=1 cmd``), and
-    returns the first real word of each segment. Bare names only carry
+    Splits on operators, skips env-var prefixes (``FOO=1 cmd``) and shell
+    control keywords (``if``/``then``/``else``/``do``/...), and returns
+    the first real word of each segment. Bare names only carry
     meaning for the rules: a pathed invocation (``.venv/bin/pytest``)
     contains a slash and never matches a bare-name rule.
     """
@@ -239,6 +248,13 @@ def command_heads(command: str) -> list[str]:
         for word in words:
             word = word.lstrip("(!{ ")
             if not word or _ENV_ASSIGNMENT.match(word):
+                continue
+            if word == "for":
+                # `for x in a b c` holds no command position at all.
+                break
+            if word in _SHELL_KEYWORDS:
+                # Not a command: keep scanning this segment so the real
+                # head behind `then` / `else` / `do` is inspected.
                 continue
             heads.append(word)
             break
