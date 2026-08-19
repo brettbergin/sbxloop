@@ -41,6 +41,10 @@ def make_agent(
 ) -> DaemonAgent:
     for key, value in TOKENS.items():
         monkeypatch.setenv(key, value)
+    # The fake sbx strips token env vars from sandbox exec by default (a
+    # host token is not a sandbox token). These lifecycle tests predate that
+    # and assert the no-fallback path, so opt into visible-secret semantics.
+    monkeypatch.setenv("SBX_FAKE_VISIBLE_SECRETS", "1")
     config = Config.model_validate({"state_dir": str(tmp_path / "state")})
     kwargs = {"clock": clock} if clock is not None else {}
     return DaemonAgent(

@@ -817,6 +817,10 @@ class TestSecretEnvVerification:
     ) -> None:
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_x")
         monkeypatch.setenv("GH_TOKEN", "github_pat_y")
+        # the fake strips token env vars from sandbox exec by default (a
+        # host GH_TOKEN is not a sandbox GH_TOKEN); this test is the one
+        # that wants them visible inside the guest.
+        monkeypatch.setenv("SBX_FAKE_VISIBLE_SECRETS", "1")
         bus = EventBus()
         events: list[Event] = []
         bus.subscribe(events.append)

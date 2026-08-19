@@ -119,6 +119,16 @@ exact whitespace, or exit codes is trivial and exact inside a test file
 one-liner — a wrong-but-runnable check burns revisions the executor cannot
 fix. The verify command then is just the test runner.
 
+A `python -c` verify payload must be a single line of `;`-separated *simple*
+statements. Any assertion that needs control flow — `try`/`except`, `if`,
+loops, `def`, an expected-exception context manager — belongs in a test file
+that the verify command invokes, never on the command line. Control flow
+cannot be expressed on one `-c` line, so the temptation is to emit `\n`
+escapes into the payload, and the interpreter then dies with
+`SyntaxError: unexpected character after line continuation character`
+regardless of whether the code under test is correct — a wrong-but-unrunnable
+check the executor cannot fix.
+
 Ecosystem notes — read only the entry matching this task's toolchain and
 ignore the rest. They are reference points, not a menu of defaults: a task
 in an ecosystem not listed here follows that ecosystem's own conventions,
@@ -132,7 +142,10 @@ and none of these is the "normal" choice.
   the venv your steps built, and a `python3 -m venv ... && ...` verify
   command is rejected outright (there is no compliant way to bootstrap a
   venv from inside one). Verify: `.venv/bin/pytest`, or
-  `cd app && .venv/bin/pytest` for a subdirectory build.
+  `cd app && .venv/bin/pytest` for a subdirectory build. A `python -c`
+  verify payload stays one line of `;`-separated simple statements; anything
+  needing `try`/`except`, `if`, loops, `def`, or `pytest.raises` goes in a
+  pytest test file the verify command runs.
   **uv projects** — if the workspace has a `uv.lock` (often a uv workspace
   with several members and a `requires-python` pin), do not build a venv by
   hand: `uv` and a managed Python 3.13 are on PATH, so `uv sync --all-packages` in your **steps** builds the locked environment, and
