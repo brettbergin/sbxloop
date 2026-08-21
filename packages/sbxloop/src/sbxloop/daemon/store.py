@@ -98,6 +98,11 @@ CREATE TABLE IF NOT EXISTS daemon_discord_threads (
     headline_id INTEGER,
     status_id   INTEGER
 );
+
+-- run_for_thread() runs per inbound Discord message in a non-control
+-- channel; without this it scans a row per run the daemon has ever done.
+CREATE INDEX IF NOT EXISTS idx_discord_threads_thread
+    ON daemon_discord_threads(thread_id);
 """
 
 # Columns added after a table first shipped; applied idempotently at open
