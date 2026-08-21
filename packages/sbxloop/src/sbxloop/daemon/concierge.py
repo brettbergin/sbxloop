@@ -44,6 +44,7 @@ from sbxloop.cli.tui import format_event
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch, plain
 from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
@@ -123,6 +124,7 @@ class Concierge:
         host: SessionHost,
         bus: EventBus,
         clock: Callable[[], float] = time.time,
+        versions: VersionProbe | None = None,
     ) -> None:
         self.config = config
         self.loop = loop
@@ -134,6 +136,10 @@ class Concierge:
         self.host = host
         self.bus = bus
         self.clock = clock
+        # The daemon builds one probe and shares it, so the startup drift
+        # check warms the PyPI memo for the first "are we up to date?".
+        # Injected whole in tests, so no unit test reaches PyPI or runs `sbx`.
+        self.versions = versions if versions is not None else VersionProbe()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sbxloop-concierge")
         self._pending = 0
         self._state_lock = threading.Lock()
@@ -494,6 +500,22 @@ class Concierge:
                 ),
                 self._tool_enqueue_work,
             ),
+            HostTool(
+                HostToolSpec(
+                    name="version_status",
+                    description=(
+                        "Is this daemon running current code? Reports the installed sbxloop, "
+                        "sbxloop-worker and sbx versions, the latest sbxloop/sbxloop-worker "
+                        "releases on PyPI, and whether the host is behind. Every merge to the "
+                        "project's main branch publishes a patch, while deploying to this host "
+                        "is manual, so drift is normal and worth checking. You cannot upgrade "
+                        "anything — that is a human step on the daemon host — so report what "
+                        "you find and say who has to act."
+                    ),
+                    parameters=_schema({}),
+                ),
+                self._tool_version_status,
+            ),
         ]
         if self.github is not None and self.config.github.repo:
             tools.append(
@@ -801,6 +823,15 @@ class Concierge:
             f"(every {self.config.daemon.poll_interval_s:g}s) and runs it after anything "
             f"already queued.{note}"
         )
+
+    def _tool_version_status(self, args: dict[str, Any], by: str) -> str:
+        """Installed versus latest. The PyPI half is best effort by
+        construction (see :mod:`sbxloop.daemon.versions`), so this returns a
+        report rather than failing when the network is unavailable."""
+        try:
+            return self.versions.summary()
+        except (WorkerError, SbxError, DaemonError) as exc:
+            return f"reading versions failed: {_one_line(str(exc), 300)}"
 
     def _tool_github_get(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None

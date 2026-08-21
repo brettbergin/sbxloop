@@ -260,6 +260,8 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "`comment_on_issue`" in text and "`close_issue`" in text
     assert "pass **their own words** as `confirmation`" in text
     assert "The one exception is\n  `close_issue`" in text
+    # drift: the concierge reports versions, a human does the upgrading
+    assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:

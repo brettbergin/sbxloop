@@ -433,6 +433,12 @@ configured repo from a described feature or bug — created with the
 `sbxloop:backlog` label (triage), after which it **asks you** whether to
 add `sbxloop:run` and labels only on your yes; "what's in the backlog?"
 lists the open `sbxloop:backlog` issues and asks which, if any, to work.
+Ask "are we up to date?" and it compares the installed `sbxloop` /
+`sbxloop-worker` / `sbx` versions against the latest releases on PyPI —
+every merge to `main` publishes a patch while upgrading this host is
+manual, so the daemon also says so once at startup when it is behind.
+(It only reports: upgrading is `pip install --upgrade sbxloop` plus a
+restart, by a human on the host.)
 It finishes triage too: "reply on #12 that we're waiting on upstream"
 posts a comment signed with your name, and "close #12 as a duplicate of
 #7" comments and closes it as *not planned* (or *completed*) — but only
