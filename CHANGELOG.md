@@ -8,6 +8,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Concierge: **`version_status`** answers "are we up to date?" — the
+  installed `sbxloop`, `sbxloop-worker` and `sbx` versions against the
+  latest releases on PyPI, with a `pip install --upgrade` hint when the host
+  is behind. Every merge to `main` auto-releases a patch while deploying to
+  a daemon host is manual, so the daemon now also posts one drift line to
+  the control channel at startup when it is behind — a tool only helps
+  whoever thinks to ask. Read-only and always available (no GitHub, no new
+  config knob); upgrading stays a human step on the host. The PyPI lookup is
+  the host's only outbound HTTP besides Discord: unauthenticated, bounded by
+  a 4s timeout and a response cap, memoised for five minutes, and degrading
+  to "could not reach PyPI" rather than failing a turn. A `.devN` build or a
+  `0.0.0` never-built tree is reported as such instead of being compared —
+  hatch-vcs names a dev build for the version it is heading *toward*, so
+  `0.7.12.dev0` is not the released `0.7.12`.
+
 - Concierge: **`comment_on_issue`** and **`close_issue`** finish triage from
   chat. The first posts a comment on an issue, attributed to the Discord
   user in a trailer like `create_issue`; the second closes one as
