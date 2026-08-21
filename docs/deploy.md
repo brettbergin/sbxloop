@@ -47,6 +47,16 @@ daemon host and takes **no** checkout — it installs from PyPI and needs nothin
     survives.
 10. **Reports to Discord** in the control channel, using the bot already there.
 
+## Relationship to `version_status`
+
+The concierge's `version_status` tool and the startup drift line report when a host is
+behind PyPI; this pipeline is what stops it happening. They stay complementary: the
+concierge deliberately cannot upgrade anything, and on a host without a runner
+(anyone following `contrib/systemd/` by hand) its `pip install --upgrade` advice is
+exactly right. On a host *with* the pipeline, a drift line means the deploy did not
+run or did not succeed — check the **Deploy to db** workflow before upgrading by hand,
+or the next deploy will roll you somewhere you did not expect.
+
 ## Host layout it assumes
 
 Set once, on the daemon host (`db`), by the user the daemon runs as:
