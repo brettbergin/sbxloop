@@ -400,7 +400,10 @@ shape — `🔎 audit #701 filed for charter flakes · audit: flakes`,
 `🔎 review #801 filed for PR #9 · gh:4`, `🔎 post-mortem #901 filed for gh:4 · abandoned: …`, `✅ gh:9 done (2/2 tasks done) · filed #50` — with every
 issue number a link. Mentions are always disabled, so model output can never ping the
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
-`chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
+`chronology_level` tune it. **@mention the bot in a run's thread to steer that run**
+(or reply to one of its messages there) — the same rule the control channel
+uses, so people can talk about a run in its own thread without derailing it.
+Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
@@ -410,7 +413,8 @@ the item as **cancelled** — attributed to you on the source, no automatic
 retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
 on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run
 instead, and `!sbx retry <item>` reruns any cancelled or abandoned item with
-its attempt budget reset. Anyone who can post in the channel
+its attempt budget reset. Those verbs work in a run's thread too, answered
+where you typed them. Anyone who can post in the channel
 can steer — that is the boundary to set. The bot ignores messages from bots
 (itself included), so scripts drive the daemon with `sbxloop daemon ctl <verb>`
 instead — the same verbs through the same dispatcher, no Discord needed; a
@@ -438,8 +442,8 @@ with the same authority as `!sbx`, so anyone who can mention it drives the
 daemon; restrict the channel accordingly — and every tool it used is
 listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
 line under your question, so nothing happens invisibly. Steering a live
-run still happens in that run's thread; asked from the control channel,
-the concierge points at the thread. It runs as a Copilot session in a
+run still happens by @mentioning the bot in that run's thread; asked from
+the control channel, the concierge points at the thread. It runs as a Copilot session in a
 **long-lived agent sandbox** the daemon owns (`sbxloop-concierge-<digest>`,
 reused across daemon restarts so the conversation keeps its memory; the
 SDK session is rotated after `[concierge] session_turns` messages) and

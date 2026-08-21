@@ -2,8 +2,8 @@
 
 A gateway bot posts each run's chronology (agent messages with persona
 attribution, tool lines, issue/PR links, verdicts) into a thread under a
-headline in one control channel, and relays messages typed in that thread
-to the running agent as steering — the same ``post_user_message`` /
+headline in one control channel, and relays messages that @mention it in
+that thread to the running agent as steering — the same ``post_user_message`` /
 ``chat.reply`` contract the CLI's ``--chat`` uses (engine.py), so no
 engine changes are needed. Daemon-level events (queueing, breaker, cap,
 recovery) go to the control channel itself. In the control channel,
@@ -196,6 +196,7 @@ class DiscordBridge:
         self._unsubscribe: Callable[[], None] | None = None
         self._active_run: str | None = None
         self._active_item: WorkItem | None = None
+        self._engine: LoopEngine | None = None
         # run_id -> item for every run whose events may still be queued. The
         # active pair above says "steering is possible"; this says "we can
         # still post the headline" — a short run (--once) can finish before
@@ -377,6 +378,9 @@ class DiscordBridge:
             unsubscribe, self._unsubscribe = self._unsubscribe, None
             self._active_run = None
             self._active_item = None
+            # Drop the handle with the run: the liveness check below is the
+            # gate, but a finished run's engine has no business being reachable.
+            self._engine = None
         if unsubscribe is not None:
             unsubscribe()
         state = (
@@ -396,18 +400,23 @@ class DiscordBridge:
 
     def _handle_message(self, message: Any) -> None:
         """Route an inbound Discord message: command, concierge, steering, or ignore."""
-        channel_id = getattr(getattr(message, "channel", None), "id", None)
+        raw = getattr(getattr(message, "channel", None), "id", None)
+        channel_id = int(raw) if raw is not None else None
+        author_is_bot = bool(getattr(getattr(message, "author", None), "bot", False))
+        # Our own chronology posts arrive here too, so settle the free facts
+        # before the one that costs a store lookup.
         route = route_message(
             content=str(getattr(message, "content", "") or ""),
-            channel_id=int(channel_id) if channel_id is not None else None,
-            author_is_bot=bool(getattr(getattr(message, "author", None), "bot", False)),
+            channel_id=channel_id,
+            author_is_bot=author_is_bot,
             mentioned_ids=frozenset(
                 int(m.id) for m in getattr(message, "mentions", None) or () if hasattr(m, "id")
             ),
-            reply_to_bot=self._is_reply_to_bot(message),
+            reply_to_bot=not author_is_bot and self._is_reply_to_bot(message),
             control_channel_id=self.discord.channel_id,
             prefix=self.discord.command_prefix,
             bot_user_id=self._bot_user_id(),
+            is_run_thread=not author_is_bot and self._is_run_thread(channel_id),
         )
         if route.kind == "command":
             self._schedule(self._command(message, route.text))
@@ -415,31 +424,55 @@ class DiscordBridge:
             self._schedule(self._concierge_turn(message, route.text))
         elif route.kind == "steer":
             assert channel_id is not None
-            self._steer(message, int(channel_id), route.text)
+            self._steer(message, channel_id, route.text)
 
     def _bot_user_id(self) -> int | None:
         user = getattr(self.client, "user", None)
         uid = getattr(user, "id", None)
         return int(uid) if uid is not None else None
 
+    def _is_run_thread(self, channel_id: int | None) -> bool:
+        """Is this channel a thread we opened for a run? The control channel
+        answers without touching the store; anything else is one indexed
+        point query, the same lookup ``_steer`` already makes for it."""
+        if channel_id is None or channel_id == self.discord.channel_id:
+            return False
+        return self.dstore.run_for_thread(channel_id) is not None
+
     def _is_reply_to_bot(self, message: Any) -> bool:
-        """A reply to one of the bot's own messages counts as talking to it."""
+        """A reply to one of the bot's own messages counts as talking to it.
+
+        discord.py fills ``reference.resolved`` from the gateway payload, but
+        leaves it None when the payload omitted the referenced message and
+        substitutes a ``DeletedReferencedMessage`` (no ``.author``) when it was
+        deleted. Fall back to the message cache before giving up: this gate
+        decides steers now, not just concierge turns.
+        """
         bot_id = self._bot_user_id()
         if bot_id is None:
             return False
-        resolved = getattr(getattr(message, "reference", None), "resolved", None)
-        author_id = getattr(getattr(resolved, "author", None), "id", None)
-        return author_id is not None and int(author_id) == bot_id
+        reference = getattr(message, "reference", None)
+        for referenced in (
+            getattr(reference, "resolved", None),
+            getattr(reference, "cached_message", None),
+        ):
+            author_id = getattr(getattr(referenced, "author", None), "id", None)
+            if author_id is not None:
+                return int(author_id) == bot_id
+        return False
 
     def _steer(self, message: Any, thread_id: int, text: str) -> None:
         """A message in a run's thread: relay it to the running agent."""
         channel = message.channel
         run_id = self.dstore.run_for_thread(thread_id)
         if run_id is None:
+            # Routing already confirmed this thread; losing the row between
+            # then and now is a race (state reset mid-message), not traffic.
+            log.debug("discord.steer_unknown_thread", thread=thread_id)
             return
         with self._lock:
             live = run_id == self._active_run
-            engine = getattr(self, "_engine", None)
+            engine = self._engine
         if not live or engine is None:
             log.info(
                 "discord.steer_rejected",
@@ -586,9 +619,9 @@ class DiscordBridge:
         if reply.status is not None:
             await self._send(channel, reply.text, embed=status_embed(reply.status))
         elif not reply.known:
-            hint = " — or type in a run's thread to steer that run"
+            hint = " — or @mention me in a run's thread to steer that run"
             if self.concierge is not None:
-                hint += ", or @mention me to ask in plain language"
+                hint += ", or here to ask in plain language"
             await self._send(channel, f"{reply.text}{hint}.")
         else:
             await self._send(channel, reply.text, suppress_embeds=True)
