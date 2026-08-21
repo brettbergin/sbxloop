@@ -129,6 +129,17 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- Discord: steering a run now takes an **@mention of the bot in that run's
+  thread** (or a reply to one of its messages there), the same rule the
+  control channel already used. Previously *every* message in a run thread
+  was relayed to the agent as steering, so watching a run and talking about
+  it in its own thread repeatedly paused and re-planned the run. The bot's
+  mention token is stripped before the text is relayed; plain messages in a
+  thread are ignored in silence, and a bare mention does nothing. `!sbx <verb>` now also works inside a run thread, answered where it was typed.
+  The bot listens on exactly two surfaces — the control channel and threads
+  it opened itself; a DM or an unrelated channel is ignored outright, mention
+  or not.
+
 - Discord: a plain (non-command, non-mention) message in the control
   channel is now **ignored** — the canned "type in the run's thread to
   steer" reply is gone; people can talk among themselves, and the concierge
@@ -161,6 +172,15 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Discord: a reply to the bot is still recognised when discord.py leaves
+  `reference.resolved` unset (the referenced message came only from the
+  cache), and a reply to a *deleted* message no longer counts as one. This
+  gate decides steers now, not just concierge turns.
+- Discord: `daemon_discord_threads` gains an index on `thread_id`, the
+  column `run_for_thread()` filters on — it is consulted per inbound message
+  in a non-control channel and was scanning a row per run the daemon had
+  ever done. The bridge also drops its engine handle when a run finishes
+  instead of leaving a finished run's engine reachable.
 - Logging: fields whose value is `None` are dropped before rendering
   (`sbxloop.log.drop_none_fields`) — `worker.job_done … error=None exit_code=None`, `job_submit … cwd=None`, `provision_start … template=None` and every host event's `job=None` no longer clutter the
   daemon's log; absence is the record.

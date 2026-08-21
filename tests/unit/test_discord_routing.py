@@ -6,6 +6,7 @@ from sbxloop.daemon.discord_routing import Route, route_message, strip_mentions
 
 BOT = 777
 CONTROL = 42
+THREAD = 4242
 
 
 def route(content: str, *, channel_id: int | None = CONTROL, **facts):  # type: ignore[no-untyped-def]
@@ -16,6 +17,7 @@ def route(content: str, *, channel_id: int | None = CONTROL, **facts):  # type: 
         "control_channel_id": CONTROL,
         "prefix": "!sbx",
         "bot_user_id": BOT,
+        "is_run_thread": False,
     }
     base.update(facts)
     return route_message(content=content, channel_id=channel_id, **base)
@@ -58,19 +60,71 @@ class TestControlChannel:
         assert route("!sbx status", bot_user_id=None) == Route("command", "status")
 
 
-class TestOtherChannels:
-    def test_thread_message_is_a_steer_verbatim(self) -> None:
-        assert route("  focus on tests  ", channel_id=4242) == Route("steer", "focus on tests")
-        # mentions are NOT stripped for steers: the agent sees what was typed
-        assert route(f"<@{BOT}> hurry", channel_id=4242, mentioned_ids={BOT}) == Route(
-            "steer", f"<@{BOT}> hurry"
+class TestRunThread:
+    """A run thread is gated exactly like the control channel: steering
+    pauses the agent and can rewrite the running task's plan, so it takes a
+    deliberate @mention — not any message that lands in the thread."""
+
+    def thread(self, content: str, **facts):  # type: ignore[no-untyped-def]
+        return route(content, channel_id=THREAD, is_run_thread=True, **facts)
+
+    def test_plain_thread_message_is_ignored(self) -> None:
+        # The bug: watching a run and talking about it used to steer it.
+        assert self.thread("  huh, that retry looks wrong  ") == Route("ignore", "")
+
+    def test_mention_steers_and_the_token_is_stripped(self) -> None:
+        assert self.thread(f"<@{BOT}> focus on tests", mentioned_ids={BOT}) == Route(
+            "steer", "focus on tests"
+        )
+        assert self.thread(f"hurry <@!{BOT}> up", mentioned_ids={BOT}) == Route("steer", "hurry up")
+
+    def test_someone_elses_mention_is_kept_and_is_not_a_trigger(self) -> None:
+        assert self.thread("<@123> look at this", mentioned_ids={123}) == Route("ignore", "")
+        assert self.thread(f"<@{BOT}> ask <@123>", mentioned_ids={BOT, 123}) == Route(
+            "steer", "ask <@123>"
         )
 
+    def test_reply_to_bot_steers(self) -> None:
+        assert self.thread("do that again") == Route("ignore", "")
+        assert self.thread("do that again", reply_to_bot=True) == Route("steer", "do that again")
+
+    def test_bare_mention_is_ignored(self) -> None:
+        assert self.thread(f"<@{BOT}>", mentioned_ids={BOT}) == Route("ignore", "")
+
+    def test_bot_author_is_ignored(self) -> None:
+        # The bridge's own chronology posts land in the thread it steers.
+        assert self.thread(f"<@{BOT}> go", mentioned_ids={BOT}, author_is_bot=True) == Route(
+            "ignore", ""
+        )
+
+    def test_unknown_bot_id_never_matches(self) -> None:
+        assert self.thread(f"<@{BOT}> go", mentioned_ids={BOT}, bot_user_id=None) == Route(
+            "ignore", ""
+        )
+
+    def test_commands_work_in_a_run_thread(self) -> None:
+        assert self.thread("!sbx status") == Route("command", "status")
+        assert self.thread(f"<@{BOT}> !sbx cancel --retry", mentioned_ids={BOT}) == Route(
+            "command", "cancel --retry"
+        )
+
+
+class TestOtherChannels:
     def test_no_channel_is_ignored(self) -> None:
         assert route("x", channel_id=None) == Route("ignore", "")
 
-    def test_control_channel_unset_means_every_channel_is_a_thread(self) -> None:
-        assert route("x", control_channel_id=None) == Route("steer", "x")
+    def test_a_channel_that_is_neither_is_never_ours(self) -> None:
+        # A DM or an unrelated guild channel: not even a mention or a command.
+        assert route("hello", channel_id=99) == Route("ignore", "")
+        assert route(f"<@{BOT}> hello", channel_id=99, mentioned_ids={BOT}) == Route("ignore", "")
+        assert route("!sbx status", channel_id=99) == Route("ignore", "")
+        assert route("x", channel_id=99, reply_to_bot=True) == Route("ignore", "")
+
+    def test_control_channel_unset_leaves_only_run_threads(self) -> None:
+        assert route("x", control_channel_id=None) == Route("ignore", "")
+        assert route(
+            f"<@{BOT}> x", control_channel_id=None, mentioned_ids={BOT}, is_run_thread=True
+        ) == Route("steer", "x")
 
 
 def test_strip_mentions() -> None:

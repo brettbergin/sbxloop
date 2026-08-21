@@ -289,6 +289,15 @@ class FakeConcierge:
         return future
 
 
+def steer_msg(content: str, thread: FakeChannel, *, mid: int = 777) -> FakeMessage:
+    """A message that steers: it @mentions the bot, exactly as the control
+    channel requires. Plain thread chatter is ignored, so every steering test
+    goes through here. The bridge strips the token before relaying."""
+    msg = FakeMessage(f"<@{BOT_USER.id}> {content}", thread, mid=mid, mentions=[BOT_USER])
+    thread.messages[mid] = msg
+    return msg
+
+
 def wait_for(pred: Any, timeout: float = 5.0) -> bool:
     end = time.time() + timeout
     while time.time() < end:
@@ -385,10 +394,9 @@ class TestBridge:
             bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
-            msg = FakeMessage("focus on auth first", thread, mid=777)
-            thread.messages[777] = msg
+            msg = steer_msg("focus on auth first", thread)
             bridge._handle_message(msg)
-            assert engine.posted == ["focus on auth first"]
+            assert engine.posted == ["focus on auth first"]  # mention token stripped
             assert wait_for(lambda: "⏳" in msg.reactions)
             # the matching chat.reply resolves it: ✅ reaction + reply text in thread
             bus.emit("chat.reply", "r1", message_id="m1", reply="Will do.", action="steer_task")
@@ -407,20 +415,112 @@ class TestBridge:
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
             bridge.run_finished(item, RunReport("r1", "completed", "done"))
-            bridge._handle_message(FakeMessage("too late?", thread))
+            bridge._handle_message(steer_msg("too late?", thread))
             assert engine.posted == []
             assert wait_for(lambda: any("has finished" in s for s in thread.sent))
+        finally:
+            bridge.close()
+
+    def test_plain_thread_message_never_steers(self, tmp_path: Path) -> None:
+        """The bug: a run thread used to steer on *every* message, so two
+        people discussing the run they were watching kept derailing it.
+        Steering takes an @mention now, exactly like the control channel."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            engine = FakeEngine()
+            bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            before = len(thread.sent)
+            chatter = FakeMessage("huh, that retry looks wrong", thread, mid=900)
+            bridge._handle_message(chatter)
+            bridge._handle_message(
+                FakeMessage(f"<@{BOT_USER.id}>", thread, mid=901, mentions=[BOT_USER])
+            )  # bare mention
+            # A mention right after proves the run was steerable all along.
+            bridge._handle_message(steer_msg("focus on auth first", thread))
+            assert wait_for(lambda: engine.posted == ["focus on auth first"])
+            assert chatter.reactions == []
+            assert not any("has finished" in s for s in thread.sent[before:])
+        finally:
+            bridge.close()
+
+    def test_reply_to_a_bot_message_in_a_thread_steers(self, tmp_path: Path) -> None:
+        """The chronology is all bot messages, so replying to one is the
+        other natural way to address the run — same rule as the concierge."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            engine = FakeEngine()
+            bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            chronology = FakeMessage("running tests…", thread, bot=True, mid=910)
+            reply = FakeMessage("skip the slow ones", thread, mid=911, reply_to=chronology)
+            thread.messages[911] = reply
+            bridge._handle_message(reply)
+            assert wait_for(lambda: engine.posted == ["skip the slow ones"])
+        finally:
+            bridge.close()
+
+    def test_a_reply_discord_only_left_in_the_cache_still_steers(self, tmp_path: Path) -> None:
+        """discord.py leaves reference.resolved None when the gateway payload
+        omitted the referenced message; the cache is the fallback."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            engine = FakeEngine()
+            bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            chronology = FakeMessage("running tests…", thread, bot=True, mid=920)
+            reply = FakeMessage("skip the slow ones", thread, mid=921)
+            reply.reference = type("Ref", (), {"resolved": None, "cached_message": chronology})()
+            thread.messages[921] = reply
+            bridge._handle_message(reply)
+            assert wait_for(lambda: engine.posted == ["skip the slow ones"])
+            # A deleted referenced message has neither, and must not steer.
+            gone = FakeMessage("and this?", thread, mid=922)
+            gone.reference = type("Ref", (), {"resolved": None, "cached_message": None})()
+            bridge._handle_message(gone)
+            assert engine.posted == ["skip the slow ones"]
+        finally:
+            bridge.close()
+
+    def test_commands_work_in_a_run_thread(self, tmp_path: Path) -> None:
+        """`!sbx <verb>` is answered wherever the bot listens, and answers
+        in the channel it was typed in."""
+        bridge, client, floop = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            engine = FakeEngine()
+            bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bridge._handle_message(FakeMessage("!sbx pause", thread, mid=930))
+            assert wait_for(lambda: any("paused" in s for s in thread.sent))
+            assert floop.paused is True
+            assert engine.posted == []  # a command is never relayed as steering
         finally:
             bridge.close()
 
     def test_bot_messages_and_unknown_channels_are_ignored(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
         engine = FakeEngine()
-        bridge._engine = engine  # type: ignore[attr-defined]
+        bridge._engine = engine
         other = FakeChannel(client, 999)
         bridge._handle_message(FakeMessage("hi", other))
         bridge._handle_message(FakeMessage("hi", client.channels[42], bot=True))
+        # Not the control channel and not a run thread: not ours, mention or not.
+        bridge._handle_message(FakeMessage(f"<@{BOT_USER.id}> steer", other, mentions=[BOT_USER]))
+        bridge._handle_message(FakeMessage("!sbx cancel", other))
         assert engine.posted == []
+        assert other.sent == []
 
     def test_commands_dispatch(self, tmp_path: Path) -> None:
         bridge, client, floop = make_bridge(tmp_path)
@@ -974,8 +1074,7 @@ class TestBridge:
                     and bridge._progress["r1"].tool_calls == 3
                 )
             )
-            msg = FakeMessage("focus on auth first", thread, mid=777)
-            thread.messages[777] = msg
+            msg = steer_msg("focus on auth first", thread)
             bridge._handle_message(msg)
             assert wait_for(lambda: any(s.startswith("⏳ steer queued") for s in thread.sent))
             note_id = next(
@@ -1008,8 +1107,7 @@ class TestBridge:
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
-            msg = FakeMessage("late thought", thread, mid=778)
-            thread.messages[778] = msg
+            msg = steer_msg("late thought", thread, mid=778)
             bridge._handle_message(msg)
             assert wait_for(lambda: any(s.startswith("⏳ steer queued") for s in thread.sent))
             note = next(m for m in thread.messages.values() if m.content.startswith("⏳ steer"))
