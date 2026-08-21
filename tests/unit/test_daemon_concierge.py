@@ -167,6 +167,18 @@ class FakeGithub:
         return IssueRef(number=41, url="https://gh/i/41")
 
 
+class FakeVersions:
+    """Stands in for VersionProbe: the tool is a thin wrapper over summary()."""
+
+    def __init__(self, text: str = "sbxloop 0.7.12 · 0.7.15 on PyPI · BEHIND") -> None:
+        self.text = text
+        self.calls = 0
+
+    def summary(self) -> str:
+        self.calls += 1
+        return self.text
+
+
 class LoopWithRuns(FakeLoop):
     """FakeLoop plus the report/current surface the concierge's tools use."""
 
@@ -186,6 +198,7 @@ def make(
     github: FakeGithub | None = None,
     inbox: bool = True,
     config: dict[str, Any] | None = None,
+    versions: Any = None,
 ) -> tuple[Concierge, FakeClient, FakeHost, LoopWithRuns, DaemonStore]:
     raw: dict[str, Any] = {
         "state_dir": str(tmp_path / "state"),
@@ -213,6 +226,7 @@ def make(
         host=host,
         bus=EventBus(),
         clock=lambda: 1_000_000.0,
+        versions=versions if versions is not None else FakeVersions(),
     )
     return concierge, client, host, loop, dstore
 
@@ -242,7 +256,8 @@ class TestJobShape:
             "run_events",
             "item_detail",
             "enqueue_work",
-        ]  # no github_get: no repo configured
+            "version_status",
+        ]  # no github_get: no repo configured; version_status needs nothing
         assert job.host_tools_dir is None  # the WorkerClient fills it in
         assert job.system_message and "sbxloop concierge" in job.system_message
         assert "`sbx_control`" in job.system_message
@@ -571,6 +586,31 @@ class TestTools:
         (labelled,) = client.responses[2:]
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #41")
         assert github.paths[-1] == "/repos/owner/repo/issues/41/labels"
+
+    def test_version_status_reports_drift(self, tmp_path: Path) -> None:
+        versions = FakeVersions("sbxloop 0.7.12 installed · 0.7.15 on PyPI · BEHIND")
+        concierge, client, *_ = make(
+            tmp_path, [{"calls": [("version_status", {})]}], versions=versions
+        )
+        turn(concierge, "are we up to date?")
+        (resp,) = client.responses
+        assert resp.ok and "0.7.15 on PyPI" in resp.text
+        assert versions.calls == 1
+
+    def test_version_status_survives_an_unreachable_pypi(self, tmp_path: Path) -> None:
+        """The real probe already degrades to text; this pins that an
+        exception from it still becomes a readable answer, not a dead turn."""
+
+        class Exploding:
+            def summary(self) -> str:
+                raise DaemonError("state dir vanished")
+
+        concierge, client, *_ = make(
+            tmp_path, [{"calls": [("version_status", {})]}], versions=Exploding()
+        )
+        turn(concierge)
+        (resp,) = client.responses
+        assert resp.ok and resp.text.startswith("reading versions failed:")
 
     def test_comment_on_issue_posts_signed_with_the_speaker(self, tmp_path: Path) -> None:
         github = FakeGithub()
