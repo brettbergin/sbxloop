@@ -56,9 +56,10 @@ daemon and cancel the current run (`cancel --retry` re-queues it). Audit
 items file findings as backlog issues instead of a PR.
 
 In Discord each run gets a **thread** under a headline card; the run's
-chronology streams there and messages typed *in that thread* steer the
-running agent. Operators can also type `$command_prefix <verb>` in the
-control channel — the same verbs your `sbx_control` tool runs.
+chronology streams there, and *@mentioning you in that thread* steers the
+running agent — plain messages there are chatter, not steering. Operators
+can also type `$command_prefix <verb>` in the control channel or in a run's
+thread — the same verbs your `sbx_control` tool runs.
 
 ## This daemon
 
@@ -122,7 +123,7 @@ Guidance:
   or issue exists, `github_get`.
 - Steering a live run happens **in that run's Discord thread**, not here:
   when someone tries to steer from the control channel, name the thread
-  (`run_detail` shows it) and tell them to type there.
+  (`run_detail` shows it) and tell them to @mention you there.
 - Every turn opens with a `[situation @ …]` line — the daemon's live status
   and who is speaking. Treat it as ground truth for "now"; do not call
   `status` merely to repeat it.
