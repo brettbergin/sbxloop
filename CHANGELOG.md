@@ -8,6 +8,26 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Automated deploys to the daemon host** (`.github/workflows/deploy.yml`).
+  Every merge to `main` already auto-released to PyPI, but getting that release
+  onto the running daemon was manual, so a host silently drifted behind its own
+  releases (#331). The new workflow chains off `Release` on a self-hosted runner
+  and does the last mile: pause the daemon and wait for the in-flight run to
+  finish (20 min cap, 15s poll floor — `status()` mutates the breaker, #309),
+  `pip install` the exact released version, `systemctl --user restart`, then
+  health-check it (unit active, `--version` matches, `sbxloop doctor`, `ctl status`, and a 45s settle against crash loops). A failed check rolls back to
+  the version that was running. The operator's pause state is recorded up front
+  and re-applied afterwards — required, because pause is in-memory only (#308)
+  and a restart otherwise resumes autonomous dispatch silently. Deploy start and
+  outcome are posted to the Discord control channel. See `docs/deploy.md`.
+
+- `contrib/systemd/github-runner.service` and `contrib/systemd/sbx-sandboxd.service`.
+  The runner is a **user** unit, not GitHub's `svc.sh` system unit: a system
+  service has no `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, so
+  `systemctl --user restart sbxloop-daemon` fails from one. `sbx-sandboxd`
+  supervises the sandbox backend, which was previously a bare process nothing
+  would restart; `sbxloop-daemon.service` now `Requires=` and is ordered after it.
+
 - Concierge: **`comment_on_issue`** and **`close_issue`** finish triage from
   chat. The first posts a comment on an issue, attributed to the Discord
   user in a trailer like `create_issue`; the second closes one as
