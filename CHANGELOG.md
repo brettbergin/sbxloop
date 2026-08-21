@@ -8,6 +8,22 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Concierge: **`comment_on_issue`** and **`close_issue`** finish triage from
+  chat. The first posts a comment on an issue, attributed to the Discord
+  user in a trailer like `create_issue`; the second closes one as
+  `completed` or `not_planned`, optionally posting the reason as a comment
+  first, and removes the `trigger_label` so a reopen does not silently
+  re-queue a run. A close is the one concierge action that is **not**
+  direct: the prompt requires an explicit yes naming the issue and the tool
+  requires a `confirmation` argument quoting what the person said, logged
+  with the close. The issue is read first, so a pull-request number, an
+  already-closed issue and one a run is working right now are refused
+  without writing anything, and the result names the title, the reason and
+  the url. Closing does not dequeue the daemon's own `gh:<n>` item, so the
+  result says whether that item was already claimed (a run can still start
+  — abandon it) or not (the loop re-checks and drops it). Gated by the same
+  `[concierge] create_issues` knob as the rest of the issue surface.
+
 - Concierge: **`list_issues`** lists the repo's open issues — by default
   the `backlog_label` ones (the triage backlog), `all=true` for every open
   issue, `label=` to narrow — with labels, age, author, comments and url,

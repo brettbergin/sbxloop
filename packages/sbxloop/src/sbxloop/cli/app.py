@@ -2202,7 +2202,7 @@ mem_abort = 0.0
 # max_tool_calls = 16
 # session_turns = 40               # rotate the resumed SDK session after N turns
 # github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
-# create_issues = true             # file issues (backlog label; the run label only on your yes)
+# create_issues = true             # file/list/comment/label/close issues (a close needs your yes)
 """
 
 

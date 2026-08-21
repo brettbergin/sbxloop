@@ -108,8 +108,9 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   agent (`daemon/concierge.py`), a Copilot session with the agent token
   and **no built-in tools**: everything it can do is a *host tool*
   (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
-  run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads
-  through the ops box — relayed as `agent.tool_request` events and answered
+  run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads and
+  issue triage (file, list, comment, label for a run, close) through the ops
+  box — relayed as `agent.tool_request` events and answered
   by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
   polls for. It is **kept across daemon restarts** when the installed worker
   still matches the host, because the SDK session store — the conversation's

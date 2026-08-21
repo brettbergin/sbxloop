@@ -64,7 +64,9 @@ from sbxloop_worker.protocol import HostToolCall, HostToolResponse, HostToolSpec
 if TYPE_CHECKING:
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.loop import DaemonLoop
+    from sbxloop.daemon.model import WorkItem
     from sbxloop.daemon.sources import InboxSource
+    from sbxloop.gh.ops import GithubOps
 
 log = get_logger(__name__)
 
@@ -77,6 +79,10 @@ STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
 
 _RUN_STATES = ["pending", "running", "completed", "failed", "cancelled"]
+# GitHub's ``state_reason`` for a close. ``completed`` means the thing was
+# actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
+# stale. Nothing else is accepted, so the model cannot invent a reason.
+CLOSE_REASONS = ("completed", "not_planned")
 
 
 class ConciergeReply(NamedTuple):
@@ -591,6 +597,56 @@ class Concierge:
                     self._tool_label_issue_for_run,
                 )
             )
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="comment_on_issue",
+                        description=(
+                            f"Post a comment on an issue in {self.config.github.repo}: a "
+                            "reply to whoever filed it, a triage note, a pointer to the "
+                            "issue it duplicates. Write it as it should read on GitHub — "
+                            "the author gets a notification and sees only the comment, not "
+                            "this conversation. It is attributed to the person who asked "
+                            "you. Labels and open/closed state are left untouched."
+                        ),
+                        parameters=_schema(
+                            {
+                                "number": {"type": "integer", "minimum": 1},
+                                "body": {"type": "string"},
+                            },
+                            ["number", "body"],
+                        ),
+                    ),
+                    self._tool_comment_on_issue,
+                )
+            )
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="close_issue",
+                        description=(
+                            f"Close an issue in {self.config.github.repo}. reason="
+                            "`completed` when the work is genuinely done, `not_planned` for "
+                            "a duplicate, a won't-fix or something stale. Pass `comment` to "
+                            "say why — that comment is the whole explanation the person who "
+                            "filed it ever sees, so name the duplicate or the reason there. "
+                            "ONLY after they explicitly said yes to closing THAT number: "
+                            "quote their words in `confirmation`. Never close on your own "
+                            "initiative and never merely to tidy the backlog."
+                        ),
+                        parameters=_schema(
+                            {
+                                "number": {"type": "integer", "minimum": 1},
+                                "reason": {"type": "string", "enum": list(CLOSE_REASONS)},
+                                "comment": {"type": "string"},
+                                "confirmation": {"type": "string"},
+                            },
+                            ["number", "reason", "confirmation"],
+                        ),
+                    ),
+                    self._tool_close_issue,
+                )
+            )
         return tools
 
     # tool implementations — each returns text for the model
@@ -839,9 +895,7 @@ class Concierge:
             + f" (newest activity first, max {limit}):"
         ]
         for issue in issues:
-            labels = [
-                str(lb.get("name")) for lb in issue.get("labels") or [] if isinstance(lb, dict)
-            ]
+            labels = _label_names(issue)
             flags = []
             if daemon.trigger_label in labels:
                 flags.append("QUEUED for a run")
@@ -866,10 +920,7 @@ class Concierge:
     def _tool_label_issue_for_run(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
         repo = self.config.github.repo
-        try:
-            number = int(args.get("number", 0))
-        except (TypeError, ValueError):
-            number = 0
+        number = _issue_number(args)
         if number <= 0:
             return "number is required"
         trigger = self.config.daemon.trigger_label
@@ -887,6 +938,127 @@ class Concierge:
             f"(every {self.config.daemon.poll_interval_s:g}s) and runs it after anything "
             "already queued."
         )
+
+    def _tool_comment_on_issue(self, args: dict[str, Any], by: str) -> str:
+        """Answer an issue in place. Same attribution trailer as
+        ``create_issue``: the comment arrives under the bot's token, so the
+        trailer is the only thing saying which human it came from."""
+        assert self.github is not None
+        repo = self.config.github.repo
+        assert repo is not None
+        number = _issue_number(args)
+        if number <= 0:
+            return "number is required"
+        body = str(args.get("body", "")).strip()
+        if not body:
+            return "body is required"
+        full_body = f"{body}\n\n---\nPosted by {by} via the sbxloop concierge\n"
+        try:
+            url = self.github.call(lambda ops: ops.issue_comment(repo, number, full_body))
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"commenting on #{number} failed: {_one_line(str(exc), 300)}"
+        log.info("concierge.issue_commented", number=number, by=by, chars=len(body))
+        return f"commented on #{number}" + (f" — {url}" if url else "")
+
+    def _tool_close_issue(self, args: dict[str, Any], by: str) -> str:
+        """Triage's last step, and the one concierge action that is *not*
+        direct: a close is outward-facing and carries a judgement the person
+        who filed the issue reads, so it happens only after an explicit yes
+        (``confirmation``, required — see the prompt). The daemon closes the
+        issues it finishes elsewhere (``[daemon] close_on_success``); this is
+        for duplicates, won't-fixes and stale items.
+
+        The issue is read first so the result can name what was closed, and
+        so three cases never become a write: a pull-request number, an
+        already-closed issue, and one a run is working on right now — closing
+        that would not stop the microVM. Each mutation is its own
+        :meth:`DaemonGithub.call`, because ``call`` replays its lambda once
+        after dropping a dead sandbox and a replayed comment is a duplicate.
+        """
+        assert self.github is not None
+        repo = self.config.github.repo
+        assert repo is not None
+        number = _issue_number(args)
+        if number <= 0:
+            return "number is required"
+        reason = str(args.get("reason", "")).strip()
+        if reason not in CLOSE_REASONS:
+            return f"reason must be one of {', '.join(CLOSE_REASONS)}, not {reason!r}"
+        confirmation = _one_line(str(args.get("confirmation", "")), 200)
+        if not confirmation:
+            return (
+                f"close_issue needs the person's own words agreeing that #{number} should be "
+                "closed. Ask them — naming the issue and what will happen — and pass what "
+                "they answered as `confirmation`."
+            )
+        comment = str(args.get("comment", "")).strip()
+        daemon = self.config.daemon
+        path = f"/repos/{repo}/issues/{number}"
+        try:
+            data = self.github.call(lambda ops: ops.raw("GET", path))
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"reading #{number} failed, so it was not closed: {_one_line(str(exc), 300)}"
+        if not isinstance(data, dict):
+            return f"#{number} did not come back as an issue: {_one_line(str(data), 200)}"
+        if "pull_request" in data:
+            return f"#{number} is a pull request, not an issue — close_issue only closes issues."
+        title = _one_line(str(data.get("title") or ""), 100)
+        url = str(data.get("html_url") or "")
+        if str(data.get("state")) == "closed":
+            was = str(data.get("state_reason") or "no reason recorded")
+            return f'#{number} "{title}" is already closed ({was}) — nothing to do. {url}'
+        labels = _label_names(data)
+        item = self.dstore.get(f"gh:{number}")
+        running = item is not None and item.state == "running"
+        if daemon.in_progress_label in labels or running:
+            run = f" (run `{item.run_id}`)" if item is not None and item.run_id else ""
+            return (
+                f'#{number} "{title}" is being worked right now{run} — closing it would not '
+                "stop the run. Cancel that first (`sbx_control` with `cancel`), then close it."
+            )
+        notes: list[str] = []
+        if comment:
+            body = f"{comment}\n\n---\nClosed as {reason} by {by} via the sbxloop concierge\n"
+            try:
+                self.github.call(lambda ops: ops.issue_comment(repo, number, body))
+            except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+                return (
+                    f"commenting on #{number} failed, so it was NOT closed: "
+                    f"{_one_line(str(exc), 300)}"
+                )
+            notes.append("posted the reason as a comment")
+        if daemon.trigger_label in labels:
+            # Removing it before the close also shuts the claim window: a poll
+            # landing mid-sequence declines on either signal (sources.claim).
+            try:
+                self.github.call(lambda ops: _remove_label(ops, path, daemon.trigger_label))
+            except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+                notes.append(
+                    f"could NOT remove `{daemon.trigger_label}` ({_one_line(str(exc), 120)}) — "
+                    "reopening it would queue a run"
+                )
+            else:
+                notes.append(f"removed `{daemon.trigger_label}`")
+        try:
+            self.github.call(
+                lambda ops: ops.raw("PATCH", path, {"state": "closed", "state_reason": reason})
+            )
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            done = f" (already done: {', '.join(notes)})" if notes else ""
+            return f"closing #{number} failed: {_one_line(str(exc), 300)}{done}"
+        log.info(
+            "concierge.issue_closed",
+            number=number,
+            reason=reason,
+            by=by,
+            confirmation=confirmation,
+            commented=bool(comment),
+        )
+        item_note = _work_item_note(item)
+        if item_note:
+            notes.append(item_note)
+        tail = "\n" + "\n".join(f"- {note}" for note in notes) if notes else ""
+        return f'closed #{number} "{title}" as {reason}' + (f" — {url}" if url else "") + tail
 
     # -- helpers ------------------------------------------------------------------
 
@@ -909,6 +1081,58 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
     if required:
         schema["required"] = required
     return schema
+
+
+def _issue_number(args: dict[str, Any]) -> int:
+    """The ``number`` argument as a positive int; 0 for missing or unparseable."""
+    try:
+        number = int(args.get("number", 0))
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _label_names(data: Any) -> list[str]:
+    """The label names on an issue payload, ignoring anything malformed."""
+    if not isinstance(data, dict):
+        return []
+    return [str(lb.get("name")) for lb in data.get("labels") or [] if isinstance(lb, dict)]
+
+
+def _remove_label(ops: GithubOps, issue_path: str, label: str) -> None:
+    """DELETE a label, treating "it was not there" (404 on the label
+    resource) as success — same tolerance as ``GitHubIssueSource``. Swallowed
+    inside the ``DaemonGithub.call`` lambda so a 404 never looks like a dead
+    sandbox and triggers its drop-and-retry."""
+    try:
+        ops.raw("DELETE", f"{issue_path}/labels/{quote(label, safe='')}")
+    except GithubOpsError as exc:
+        missing = exc.http_status == 404 if exc.http_status is not None else "HTTP 404" in str(exc)
+        if not missing:
+            raise
+
+
+def _work_item_note(item: WorkItem | None) -> str:
+    """Closing an issue does not remove the daemon's own work item, and the
+    two cases differ sharply. An **unclaimed** item is harmless: the loop
+    calls ``source.claim`` before dispatching, which re-reads the issue and
+    declines a closed one (``sources.py``), so the item is merely dropped. An
+    **already-claimed** one skips that check entirely (``loop.py``: ``if not
+    item.claimed``) and can still start a whole run on the issue that was
+    just closed — which is worth saying out loud."""
+    if item is None or item.state not in ("queued", "failed"):
+        return ""
+    if not item.claimed:
+        return (
+            f"the daemon still lists `{item.item_id}` as {item.state}, but it re-checks that "
+            "the issue is open before starting, so nothing will run — it reports the item as "
+            "dropped on its next poll"
+        )
+    return (
+        f"WARNING: the daemon still holds `{item.item_id}` ({item.state}, already claimed) and "
+        "closing the issue does NOT stop it — a run can still start. Say so, and use "
+        f"`sbx_control` with `abandon {item.item_id} issue closed` if it should be dropped"
+    )
 
 
 def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> int:
@@ -997,9 +1221,7 @@ def _pr_files(files: Any, *, with_patch: bool) -> str:
 def _issue_summary(data: Any) -> str:
     if not isinstance(data, dict):
         return json.dumps(data, default=str)[:2000]
-    labels = ", ".join(
-        str(lb.get("name")) for lb in data.get("labels") or [] if isinstance(lb, dict)
-    )
+    labels = ", ".join(_label_names(data))
     return "\n".join(
         [
             f"issue #{data.get('number')}: {data.get('title')} [{data.get('state')}]",
