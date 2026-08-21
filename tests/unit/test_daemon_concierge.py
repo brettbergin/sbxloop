@@ -32,7 +32,7 @@ from sbxloop.daemon.sources import InboxSource
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TaskSpec
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import DaemonError, WorkerError, WorkerTimeoutError
+from sbxloop.errors import DaemonError, GithubOpsError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
 from sbxloop_worker.protocol import (
     ErrorInfo,
@@ -41,6 +41,7 @@ from sbxloop_worker.protocol import (
     JobRequest,
     JobResult,
 )
+from tests.fakes.github_errors import github_error
 from tests.unit.test_daemon_discord import FakeLoop
 
 # One scripted "model": a list of host-tool calls to make, then the text
@@ -110,19 +111,47 @@ class FakeHost:
 
 
 class FakeGithub:
-    def __init__(self, answers: dict[str, Any] | None = None) -> None:
+    """Stands in for both ``DaemonGithub`` and the ``GithubOps`` it hands to
+    the lambda. ``paths`` is the raw-REST path log the read tests index into;
+    ``calls`` is the full ordered write ledger (comments included) the
+    close tests assert on. ``fail`` maps a ``"METHOD /path"`` substring to
+    the exception that call should raise — recorded first, so a failed
+    attempt is still visible."""
+
+    def __init__(
+        self,
+        answers: dict[str, Any] | None = None,
+        fail: dict[str, Exception] | None = None,
+    ) -> None:
         self.answers = answers or {}
+        self.fail = fail or {}
         self.paths: list[str] = []
+        self.calls: list[tuple[str, str, Any]] = []
+        self.comments: list[tuple[str, int, str]] = []
 
     def call(self, fn: Callable[[Any], Any]) -> Any:
         return fn(self)
 
+    def _maybe_fail(self, method: str, path: str) -> None:
+        for key, exc in self.fail.items():
+            if key in f"{method} {path}":
+                raise exc
+
     def raw(self, method: str, path: str, body: Any = None) -> Any:
         self.paths.append(path)
+        self.calls.append((method, path, body))
+        self._maybe_fail(method, path)
         for key, value in self.answers.items():
             if key in path:
                 return value
         return {}
+
+    def issue_comment(self, repo: str, number: int, body: str) -> str:
+        path = f"/repos/{repo}/issues/{number}/comments"
+        self.comments.append((repo, number, body))
+        self.calls.append(("POST", path, {"body": body}))
+        self._maybe_fail("POST", path)
+        return f"https://gh/i/{number}#c1"
 
     def contents_read(self, repo: str, path: str, ref: str | None = None) -> str:
         self.paths.append(f"contents:{path}@{ref}")
@@ -247,6 +276,7 @@ class TestJobShape:
         assert "github_get" in names
         assert "create_issue" in names and "label_issue_for_run" in names
         assert "list_issues" in names
+        assert "comment_on_issue" in names and "close_issue" in names
         concierge3, client3, *_ = make(
             tmp_path / "c",
             [{}],
@@ -256,6 +286,7 @@ class TestJobShape:
         turn(concierge3)
         names3 = [t.name for t in client3.jobs[0].host_tools]
         assert "github_get" in names3 and "create_issue" not in names3
+        assert "comment_on_issue" not in names3 and "close_issue" not in names3
         concierge2, client2, *_ = make(
             tmp_path / "b", [{}], github=FakeGithub(), config={"concierge": {"github_tools": False}}
         )
@@ -540,6 +571,323 @@ class TestTools:
         (labelled,) = client.responses[2:]
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #41")
         assert github.paths[-1] == "/repos/owner/repo/issues/41/labels"
+
+    def test_comment_on_issue_posts_signed_with_the_speaker(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("comment_on_issue", {"number": 12, "body": "On it — see #7."}),
+                        ("comment_on_issue", {"number": 12, "body": "   "}),
+                        ("comment_on_issue", {"number": 0, "body": "x"}),
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "reply on #12", author="Discord user `ana`")
+        posted, blank, no_number = client.responses
+        assert posted.ok and posted.text == "commented on #12 — https://gh/i/12#c1"
+        assert blank.text == "body is required" and no_number.text == "number is required"
+        (repo, number, body) = github.comments[0]
+        assert (repo, number) == ("owner/repo", 12) and len(github.comments) == 1
+        assert body.startswith(
+            "On it — see #7.\n\n---\nPosted by Discord user `ana` (via concierge)"
+        )
+        # a comment touches nothing else
+        assert [m for m, _, _ in github.calls] == ["POST"]
+
+    def test_comment_on_issue_reports_a_github_failure_as_text(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            fail={
+                "POST /repos/owner/repo/issues/12/comments": GithubOpsError(
+                    "gh api failed: forbidden"
+                )
+            }
+        )
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"calls": [("comment_on_issue", {"number": 12, "body": "hi"})]}],
+            github=github,
+        )
+        turn(concierge)
+        (resp,) = client.responses
+        assert resp.ok  # an expected failure is text the model can read, not a tool error
+        assert resp.text.startswith("commenting on #12 failed:")
+
+    def test_close_issue_comments_unlabels_then_closes(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            {
+                "/issues/12": {
+                    "number": 12,
+                    "title": "Retry the fetch client",
+                    "state": "open",
+                    "labels": [{"name": "sbxloop:backlog"}, {"name": "sbxloop:run"}],
+                    "html_url": "https://gh/i/12",
+                }
+            }
+        )
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "close_issue",
+                            {
+                                "number": 12,
+                                "reason": "not_planned",
+                                "comment": "Duplicate of #7.",
+                                "confirmation": "yes, close 12 as a dup of 7",
+                            },
+                        )
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "close #12 as a duplicate of #7", author="Discord user `ana`")
+        (closed,) = client.responses
+        # read first, then comment, then unlabel, then close — in that order
+        assert [(m, p) for m, p, _ in github.calls] == [
+            ("GET", "/repos/owner/repo/issues/12"),
+            ("POST", "/repos/owner/repo/issues/12/comments"),
+            ("DELETE", "/repos/owner/repo/issues/12/labels/sbxloop%3Arun"),
+            ("PATCH", "/repos/owner/repo/issues/12"),
+        ]
+        assert github.calls[-1][2] == {"state": "closed", "state_reason": "not_planned"}
+        assert github.comments[0][2].startswith(
+            "Duplicate of #7.\n\n---\nClosed as not_planned by Discord user `ana` (via concierge)"
+        )
+        assert closed.text.startswith(
+            'closed #12 "Retry the fetch client" as not_planned — https://gh/i/12'
+        )
+        assert "posted the reason as a comment" in closed.text
+        assert "removed `sbxloop:run`" in closed.text
+
+    def test_close_issue_refuses_without_confirmation_or_reason(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("close_issue", {"number": 12, "reason": "not_planned"}),
+                        (
+                            "close_issue",
+                            {"number": 12, "reason": "not_planned", "confirmation": "   "},
+                        ),
+                        (
+                            "close_issue",
+                            {"number": 12, "reason": "tidying", "confirmation": "go ahead"},
+                        ),
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "close #12")
+        missing, blank, bad_reason = client.responses
+        for resp in (missing, blank):
+            assert "close_issue needs the person's own words" in resp.text
+        assert bad_reason.text == "reason must be one of completed, not_planned, not 'tidying'"
+        assert github.calls == []  # the gate runs before anything is read or written
+
+    def test_close_issue_refuses_a_pr_a_closed_issue_and_a_running_one(
+        self, tmp_path: Path
+    ) -> None:
+        github = FakeGithub(
+            {
+                "/issues/12": {"number": 12, "title": "a PR", "state": "open", "pull_request": {}},
+                "/issues/13": {
+                    "number": 13,
+                    "title": "Done already",
+                    "state": "closed",
+                    "state_reason": "completed",
+                    "html_url": "https://gh/i/13",
+                },
+                "/issues/14": {
+                    "number": 14,
+                    "title": "Being worked",
+                    "state": "open",
+                    "labels": [{"name": "sbxloop:in-progress"}],
+                    "html_url": "https://gh/i/14",
+                },
+            }
+        )
+        yes = {"reason": "not_planned", "confirmation": "yes close it"}
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("close_issue", {"number": 12, **yes}),
+                        ("close_issue", {"number": 13, **yes}),
+                        ("close_issue", {"number": 14, **yes}),
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "close them")
+        pr, already, running = client.responses
+        assert pr.text == "#12 is a pull request, not an issue — close_issue only closes issues."
+        assert already.text.startswith('#13 "Done already" is already closed (completed)')
+        assert "is being worked right now" in running.text and "cancel" in running.text
+        assert [m for m, _, _ in github.calls] == ["GET", "GET", "GET"]  # no writes at all
+
+    def test_close_issue_tolerates_a_missing_label_and_skips_an_unlabelled_one(
+        self, tmp_path: Path
+    ) -> None:
+        github = FakeGithub(
+            {"/issues/12": {"number": 12, "title": "T", "state": "open", "labels": []}}
+        )
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "close_issue",
+                            {"number": 12, "reason": "completed", "confirmation": "yes"},
+                        )
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge)
+        (closed,) = client.responses
+        # no trigger label: no DELETE, and no comment because none was written
+        assert [m for m, _, _ in github.calls] == ["GET", "PATCH"]
+        assert github.calls[-1][2] == {"state": "closed", "state_reason": "completed"}
+        assert closed.text == 'closed #12 "T" as completed'
+
+    def test_close_issue_reports_a_partial_failure_without_claiming_success(
+        self, tmp_path: Path
+    ) -> None:
+        issue = {
+            "number": 12,
+            "title": "T",
+            "state": "open",
+            "labels": [{"name": "sbxloop:run"}],
+            "html_url": "https://gh/i/12",
+        }
+        args = {
+            "number": 12,
+            "reason": "not_planned",
+            "comment": "dup of #7",
+            "confirmation": "yes",
+        }
+        # the close itself fails after the comment landed
+        gh1 = FakeGithub(
+            {"/issues/12": issue}, fail={"PATCH ": GithubOpsError("gh api failed: server error")}
+        )
+        concierge, client, *_ = make(tmp_path, [{"calls": [("close_issue", args)]}], github=gh1)
+        turn(concierge)
+        (failed,) = client.responses
+        assert failed.text.startswith("closing #12 failed:")
+        assert "already done: posted the reason as a comment" in failed.text
+        assert not failed.text.startswith("closed #12")
+
+        # the comment fails: nothing else is attempted
+        gh2 = FakeGithub(
+            {"/issues/12": issue}, fail={"POST ": GithubOpsError("gh api failed: forbidden")}
+        )
+        concierge2, client2, *_ = make(
+            tmp_path / "b", [{"calls": [("close_issue", args)]}], github=gh2
+        )
+        turn(concierge2)
+        (no_comment,) = client2.responses
+        assert "so it was NOT closed" in no_comment.text
+        assert [m for m, _, _ in gh2.calls] == ["GET", "POST"]
+
+        # a 404 on the label DELETE is "already absent", not a failure
+        gh3 = FakeGithub({"/issues/12": issue}, fail={"DELETE ": github_error("label_missing_404")})
+        concierge3, client3, *_ = make(
+            tmp_path / "c", [{"calls": [("close_issue", args)]}], github=gh3
+        )
+        turn(concierge3)
+        (tolerated,) = client3.responses
+        assert tolerated.text.startswith('closed #12 "T" as not_planned')
+        assert "could NOT remove" not in tolerated.text
+
+        # any other label failure is reported, but the close still happens:
+        # a closed issue carrying the trigger label is not discovered anyway
+        gh4 = FakeGithub({"/issues/12": issue}, fail={"DELETE ": GithubOpsError("gh api: boom")})
+        concierge4, client4, *_ = make(
+            tmp_path / "d", [{"calls": [("close_issue", args)]}], github=gh4
+        )
+        turn(concierge4)
+        (noisy,) = client4.responses
+        assert noisy.text.startswith('closed #12 "T" as not_planned')
+        assert "could NOT remove `sbxloop:run`" in noisy.text
+        assert [m for m, _, _ in gh4.calls] == ["GET", "POST", "DELETE", "PATCH"]
+
+    def test_close_issue_reports_a_read_failure_and_a_bad_number(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            {"/issues/12": "not an issue at all"},
+            fail={"GET /repos/owner/repo/issues/13": GithubOpsError("gh api: gone")},
+        )
+        yes = {"reason": "completed", "confirmation": "yes"}
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("close_issue", {"number": 0, **yes}),
+                        ("close_issue", {"number": "twelve", **yes}),
+                        ("close_issue", {"number": 13, **yes}),
+                        ("close_issue", {"number": 12, **yes}),
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge)
+        zero, unparseable, unreadable, garbage = client.responses
+        assert zero.text == "number is required" and unparseable.text == "number is required"
+        assert unreadable.text.startswith("reading #13 failed, so it was not closed:")
+        assert garbage.text.startswith("#12 did not come back as an issue:")
+        assert [m for m, _, _ in github.calls] == ["GET", "GET"]  # nothing was written
+
+    def test_close_issue_warns_only_when_the_daemon_already_claimed_the_item(
+        self, tmp_path: Path
+    ) -> None:
+        def close(path: Path, claimed: bool) -> str:
+            github = FakeGithub(
+                {"/issues/12": {"number": 12, "title": "T", "state": "open", "labels": []}}
+            )
+            concierge, client, _, _, dstore = make(
+                path,
+                [
+                    {
+                        "calls": [
+                            (
+                                "close_issue",
+                                {"number": 12, "reason": "not_planned", "confirmation": "yes"},
+                            )
+                        ]
+                    }
+                ],
+                github=github,
+            )
+            item = WorkItem(item_id="gh:12", source="github", source_key="12", title="T")
+            dstore.upsert_new(item, 1.0)
+            if claimed:
+                dstore.mark_claimed("gh:12", 2.0)
+            turn(concierge)
+            return client.responses[0].text
+
+        # unclaimed: the loop re-reads the issue before dispatching, so the
+        # close alone is enough — say so without alarming anyone
+        unclaimed_text = close(tmp_path, claimed=False)
+        assert "nothing will run" in unclaimed_text and "WARNING" not in unclaimed_text
+        # claimed: the claim check is skipped, so a run can still start
+        claimed_text = close(tmp_path / "b", claimed=True)
+        assert "WARNING" in claimed_text and "abandon gh:12" in claimed_text
 
     def test_tool_exception_becomes_error_response_and_turn_survives(self, tmp_path: Path) -> None:
         concierge, client, _, loop, _ = make(

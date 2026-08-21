@@ -437,7 +437,12 @@ configured repo from a described feature or bug — created with the
 `sbxloop:backlog` label (triage), after which it **asks you** whether to
 add `sbxloop:run` and labels only on your yes; "what's in the backlog?"
 lists the open `sbxloop:backlog` issues and asks which, if any, to work.
-Actions are direct — it acts
+It finishes triage too: "reply on #12 that we're waiting on upstream"
+posts a comment signed with your name, and "close #12 as a duplicate of
+#7" comments and closes it as *not planned* (or *completed*) — but only
+after it has asked and you have said yes naming the issue, and never while
+a run is working that issue. `[concierge] create_issues` gates all of it.
+Actions are otherwise direct — it acts
 with the same authority as `!sbx`, so anyone who can mention it drives the
 daemon; restrict the channel accordingly — and every tool it used is
 listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
