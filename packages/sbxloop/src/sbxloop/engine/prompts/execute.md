@@ -18,7 +18,7 @@ tests/unit/test_prompts.py):
   prompt reaches the model; everything below it is sent verbatim.
 
 Variables: $outcome, $task_id, $task_title, $task_description,
-$plan_steps, $expected_artifacts, $feedback, $user_guidance;
+$plan_steps, $expected_artifacts, $prior_attempt, $feedback, $user_guidance;
 $baseline_registries and $declarable_registries are injected from policy.py,
 never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
 Section rules:
@@ -120,6 +120,17 @@ $plan_steps
 
 Expected artifacts:
 $expected_artifacts
+
+## What the previous attempt already did
+
+This is the previous attempt's own report on this task. Everything it says
+it established still holds unless the feedback below contradicts it or you
+have reason to believe the workspace changed. Build on it: do not re-run
+setup it already ran, re-check gates it already reported green, or
+rediscover where things live. Spend this attempt on what the feedback
+actually asks for.
+
+$prior_attempt
 
 ## Prior feedback to address
 

@@ -8,6 +8,39 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A revision no longer re-derives what its own previous attempt already
+  established.** Field failure (run `rrhb28j7n`, task t5): five executor
+  sessions on a single task, each with its own session id, each running
+  `uv sync --all-packages` and the whole lint gate from scratch, each
+  concluding "no changes needed" — in nearly the same words. A revision was
+  told what the critic objected to and nothing about what the last attempt had
+  found, so it went and found it again.
+
+  Two things were unwired, and they compounded. `task.session_id` was captured
+  and persisted but never passed back as `resume_session_id`, so every attempt
+  opened a cold session. And the previous attempt's own report — already
+  committed to `phase_attempts` — was never handed to the next one; the
+  execute prompt carried the plan, the critic's feedback and standing guidance,
+  but nothing about the work already done.
+
+  EXECUTE now resumes the previous attempt's session where the SDK still has
+  it, and receives that attempt's report either way. The report is the
+  load-bearing half: it survives a resumed run, a re-provisioned sandbox and an
+  expired session, all of which kill the session id. A replan clears the
+  session deliberately (`_discard_plan`) — a revision continues the same plan,
+  but a replan threw the approach away and a resumed session would carry the
+  discarded one forward as though it were still the intent. Only session ids
+  created by this process are resumable, since sandboxes are cattle and a
+  persisted id from a previous incarnation names a VM that no longer exists.
+
+  **The critics do not resume, by design.** A reviewer that inherited the
+  executor's session would inherit its conclusions, and that independence is
+  the loop's integrity check. A resume the SDK cannot honour falls back to a
+  fresh session rather than failing the job; the host notices, because the id
+  that comes back differs from the one it asked for (`phase.resume_missed`).
+
+### Fixed
+
 - **`ctl` no longer reports a starting daemon as an absent one** — which cost
   the 0.7.23 deploy a rollback of a perfectly healthy release. The control
   server starts only *after* `loop.recover()` (deliberately: an `abandon` or

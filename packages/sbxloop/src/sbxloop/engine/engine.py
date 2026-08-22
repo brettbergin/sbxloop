@@ -173,6 +173,13 @@ class LoopEngine:
         # whole workspace out). Concurrent lanes would otherwise interleave
         # inside them.
         self._sandbox_lock = threading.RLock()
+        # Agent-session ids this process created, so EXECUTE only ever
+        # resumes one that still exists. `task.session_id` is persisted, but
+        # sandboxes are cattle: a resumed run gets a fresh pair and every
+        # session id from the previous incarnation is dead. Membership here
+        # is the difference between "this session is one turn old" and "this
+        # session belonged to a VM that no longer exists".
+        self._live_sessions: set[str] = set()
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
@@ -1126,8 +1133,37 @@ class LoopEngine:
                 task.spec.id, [(egress.domain, egress.reason) for egress in task.plan.egress]
             )
         started = time.time()
-        result = phases.execute(task, task.plan)
+        # A revision continues the same agent's own work on the same task, so
+        # it resumes that session where the SDK still has it and is handed the
+        # previous attempt's report either way. Both answer the same waste:
+        # without them a revision re-establishes everything the last attempt
+        # already knew. Resume is the stronger of the two but the more
+        # fragile — it needs the session to still exist — so the report is
+        # passed unconditionally rather than only as a fallback.
+        resume = task.session_id if task.session_id in self._live_sessions else None
+        result = phases.execute(
+            task,
+            task.plan,
+            prior_report=self._prior_attempt_report(run_id, task),
+            resume_session_id=resume,
+        )
+        if resume and result.session_id != resume:
+            # The backend falls back to a fresh session when a resume fails
+            # rather than failing the job. It cannot say so (no logger in
+            # the worker), but a different id coming back is the tell — and
+            # without this line a silently-never-resuming pipeline would
+            # look identical to a working one.
+            log.info(
+                "phase.resume_missed",
+                run=run_id,
+                task=task.spec.id,
+                requested=resume,
+                got=result.session_id,
+                hint="the SDK could not resume; the prior report still carried the context",
+            )
         task.session_id = result.session_id
+        if result.session_id:
+            self._live_sessions.add(result.session_id)
         executor_report = clip(result.output_text)
         self.store.record_phase(
             run_id,
@@ -1243,8 +1279,7 @@ class LoopEngine:
         if not honored:
             return False
         task.replans += 1
-        task.plan = None
-        task.revisions = 0
+        self._discard_plan(task)
         task.last_feedback = (
             "the reviewer judged the work correct and the verify command itself "
             f"wrong: {reason}\n\nWrite a plan whose verify_commands check what "
@@ -1336,8 +1371,7 @@ class LoopEngine:
             self._set_task_state(run_id, task, "failed")
             return
         task.last_feedback = verdict.feedback or "validation rejected the result"
-        task.plan = None
-        task.revisions = 0
+        self._discard_plan(task)
         self._set_task_state(run_id, task, "planning")
 
     @staticmethod
@@ -1407,6 +1441,43 @@ class LoopEngine:
         results = json.loads(output).get("results")
         return results if isinstance(results, str) else None
 
+    @staticmethod
+    def _discard_plan(task: TaskRecord) -> None:
+        """Throw away the current approach so PLAN starts clean.
+
+        The executor's session goes with it. A *revision* continues the same
+        plan, so resuming that session is the whole point — it is what stops
+        the next attempt re-deriving what this one established. A *replan*
+        is the opposite: the approach itself was wrong, and a resumed
+        session would carry the discarded one forward as though it were
+        still the intent. Clearing the id here is what keeps those two
+        cases apart.
+        """
+        task.plan = None
+        task.revisions = 0
+        task.session_id = None
+
+    def _prior_attempt_report(self, run_id: str, task: TaskRecord) -> str:
+        """What the previous EXECUTE attempt on this task said it did.
+
+        Field failure (run rrhb28j7n, task t5): five executor sessions each
+        ran ``uv sync --all-packages`` and the whole lint gate from scratch
+        and each concluded "no changes needed", because a revision was told
+        only what the critic objected to and nothing about what the last
+        attempt had already established. The report is committed to
+        phase_attempts either way — this is the engine handing back work it
+        was already holding, so a revision starts from the last attempt's
+        findings instead of re-deriving them.
+
+        Read from the store rather than kept in memory so a resumed run's
+        revision gets the same context a fresh one would.
+        """
+        output = self.store.latest_phase_output(run_id, task.spec.id, "execute")
+        if output is None:
+            return ""
+        report = json.loads(output).get("report")
+        return report if isinstance(report, str) else ""
+
     def _register_revision(
         self, run_id: str, task: TaskRecord, feedback: str, *, verify_failure: bool = False
     ) -> None:
@@ -1422,8 +1493,7 @@ class LoopEngine:
             # regenerates its verify_commands and can route steps to where
             # the spec-level commands expect files.
             task.replans += 1
-            task.plan = None
-            task.revisions = 0
+            self._discard_plan(task)
             task.last_feedback = (
                 "every revision failed the same verify commands; write a plan "
                 "whose steps and verify_commands agree on file locations and "
@@ -1550,8 +1620,7 @@ class LoopEngine:
             # User direction, not a failure: the task re-plans with the
             # guidance as feedback, and neither budget counter is spent.
             task.last_feedback = f"user steering (must be honored): {verdict.guidance}"
-            task.plan = None
-            task.revisions = 0
+            self._discard_plan(task)
             self._set_task_state(run_id, task, "planning")
             self.bus.emit(
                 HostEventTypes.CHAT_ACTION,

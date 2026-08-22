@@ -758,7 +758,22 @@ class CopilotBackend:
     @staticmethod
     async def _open(client: Any, job: JobRequest, kwargs: dict[str, Any]) -> Any:
         if job.resume_session_id:
-            return await client.resume_session(job.resume_session_id, **kwargs)
+            try:
+                return await client.resume_session(job.resume_session_id, **kwargs)
+            except Exception:
+                # Resume is an optimisation, never a requirement: it saves a
+                # revision from re-deriving what its own previous attempt
+                # established. A session the SDK has expired, evicted, or
+                # never heard of must cost that saving and nothing more —
+                # falling through to a fresh session is exactly the
+                # behaviour before resume existed, and the prompt still
+                # carries the previous attempt's report either way.
+                #
+                # Not logged here (the worker has no logger; its channel is
+                # events): the host sees it for free, because a fresh
+                # session comes back with a different id than the one it
+                # asked to resume.
+                pass
         return await client.create_session(**kwargs)
 
     def _permission_handler(
