@@ -159,8 +159,15 @@ def deliver_workspace(
     base: str | None = None,
     draft: bool = False,
     exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES,
+    branch: str | None = None,
 ) -> PrRef:
-    """Publish source_dir as one commit on a new branch and open a PR."""
+    """Publish source_dir as one commit on a branch and open (or update) a PR.
+
+    ``branch`` overrides the per-run branch name so a fix round lands on the
+    pull request it was fixing: the refs POST 422s on the existing branch and
+    force-updates it, and the PR create 422s on the existing head and reuses
+    the open PR (see the module notes).
+    """
     plan: DeliveryPlan | None = None
     if not _is_checkout_root(source_dir):
         # Fail before any API call when there is nothing to send; the
@@ -235,7 +242,7 @@ def deliver_workspace(
         ),
         f"commit for {repo}",
     )
-    branch = branch_name(run_id)
+    branch = branch or branch_name(run_id)
     _point_branch(ops, repo, branch, commit)
     log.info("deliver.branch_pushed", run=run_id, repo=repo, branch=branch, commit=commit[:12])
 

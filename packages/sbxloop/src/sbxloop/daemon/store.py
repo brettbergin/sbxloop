@@ -87,6 +87,26 @@ CREATE TABLE IF NOT EXISTS daemon_reviews (
     rounds     INTEGER NOT NULL DEFAULT 0
 );
 
+-- The acceptance state of one item's delivered PR. Keyed on the item, not
+-- on a run: the PR belongs to the work item, and every fix round is a new
+-- run against the same PR.
+CREATE TABLE IF NOT EXISTS daemon_pr_state (
+    item_id    TEXT PRIMARY KEY,
+    pr_number  INTEGER NOT NULL,
+    branch     TEXT NOT NULL DEFAULT '',
+    rounds     INTEGER NOT NULL DEFAULT 0,
+    -- Whether the review that was actually posted can hold the merge; a
+    -- COMMENT cannot, and waiting for an approval nobody can give strands
+    -- the item forever.
+    gates      INTEGER NOT NULL DEFAULT 0,
+    reviewed   INTEGER NOT NULL DEFAULT 0,
+    -- The review charter in flight, or NULL when none is.
+    review_ref TEXT,
+    -- What the next fix round is for; NULL when no round is queued.
+    fix_brief  TEXT,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS daemon_audits (
     name       TEXT PRIMARY KEY,
     filed_as   TEXT NOT NULL,
@@ -142,6 +162,22 @@ _MIGRATIONS = (
         "ALTER TABLE daemon_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0",
     ),
 )
+
+
+class PrState(NamedTuple):
+    """Where one item's delivered PR stands on its way to being accepted."""
+
+    pr_number: int
+    branch: str
+    rounds: int
+    gates: bool
+    reviewed: int
+    review_ref: str | None
+    fix_brief: str | None
+
+    @property
+    def review_in_flight(self) -> bool:
+        return self.review_ref is not None
 
 
 class DiscordThread(NamedTuple):
@@ -760,6 +796,95 @@ class DaemonStore:
                 (filed_as,),
             ).fetchone()
         return (int(row["pr_number"]), str(row["run_id"])) if row is not None else None
+
+    # -- PR acceptance state ---------------------------------------------------
+
+    def record_delivery(self, item_id: str, pr_number: int, branch: str, now: float) -> None:
+        """This item delivered ``pr_number``; start tracking its acceptance.
+
+        Idempotent on the item: a re-delivery of the same PR (a fix round
+        pushing to the same branch) must not reset the round count, which is
+        the only thing bounding the loop.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
+                "pr_number = excluded.pr_number, branch = excluded.branch, "
+                "updated_at = excluded.updated_at",
+                (item_id, pr_number, branch, now),
+            )
+            self._conn.commit()
+
+    def pr_state(self, item_id: str) -> PrState | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM daemon_pr_state WHERE item_id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return PrState(
+            pr_number=int(row["pr_number"]),
+            branch=str(row["branch"] or ""),
+            rounds=int(row["rounds"]),
+            gates=bool(row["gates"]),
+            reviewed=int(row["reviewed"]),
+            review_ref=row["review_ref"],
+            fix_brief=row["fix_brief"],
+        )
+
+    def review_in_flight(self, item_id: str, review_ref: str | None) -> None:
+        """Record the review charter now running for this PR, or None when
+        it has finished. ``pr_state.review_ref`` being set is what stops a
+        second review being filed while one is already in flight."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET review_ref = ? WHERE item_id = ?",
+                (review_ref, item_id),
+            )
+            self._conn.commit()
+
+    def review_settled(self, item_id: str, *, gates: bool) -> None:
+        """A review has been posted: it is no longer in flight, and we now
+        know whether it can actually hold the merge."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET review_ref = NULL, gates = ?, "
+                "reviewed = reviewed + 1 WHERE item_id = ?",
+                (int(gates), item_id),
+            )
+            self._conn.commit()
+
+    def bump_pr_round(self, item_id: str) -> int:
+        """Count one fix round; returns the new total. A round is a real run,
+        so this is the spend control that stops the loop spinning."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET rounds = rounds + 1 WHERE item_id = ?", (item_id,)
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT rounds FROM daemon_pr_state WHERE item_id = ?", (item_id,)
+            ).fetchone()
+        return int(row["rounds"]) if row is not None else 0
+
+    def queue_fix(self, item_id: str, brief: str, now: float) -> None:
+        """Send the item back to the queue for one fix round against its own
+        PR branch. The run id is cleared: a fix is a fresh run, not a resume
+        of the one that delivered."""
+        self._set_fix_brief(item_id, brief)
+        self._update(item_id, now, state="queued", run_id=None, last_error=None)
+
+    def clear_fix(self, item_id: str) -> None:
+        """The fix round has been dispatched; the brief is spent."""
+        self._set_fix_brief(item_id, None)
+
+    def _set_fix_brief(self, item_id: str, brief: str | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET fix_brief = ? WHERE item_id = ?", (brief, item_id)
+            )
+            self._conn.commit()
 
     def review_pr(self, run_id: str) -> tuple[int, bool, int] | None:
         """(pr_number, gates_merge, rounds) for the review of ``run_id``.

@@ -181,6 +181,68 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
         ) from exc
 
 
+def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
+    """Clone ``source`` into ``target`` checked out on an existing ``branch``.
+
+    The counterpart to :func:`clone_for_run`, which starts fresh work: this
+    *continues* work that already exists on a branch — a fix round against
+    its own pull request. It checks out ``origin/<branch>`` (the state the
+    PR actually has, not whatever a stale local ref says) onto a local
+    branch of the same name, so a later delivery under that name updates
+    the same PR rather than opening a second one.
+
+    Raises :class:`ProvisionError` when the branch is not on the remote.
+    That refusal is the point: a fix round that silently fell back to the
+    default branch would rebuild from scratch, and its delivery would then
+    force-update the PR's branch with a tree that never contained the PR's
+    work — destroying it. Failing to provision is recoverable; that is not.
+    """
+    raw_upstream = origin_url(source)
+    upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
+    remote_ref = f"origin/{branch}"
+    try:
+        with Repo.clone_from(str(source), str(target)) as clone:
+            if remote_ref not in {r.name for r in clone.refs}:
+                # Cloning a clone copies the source's *local* branches into
+                # `origin/*`, not its remote-tracking refs — and the branch a
+                # PR lives on is only ever remote-tracking in the daemon's
+                # checkout (it fetched it; it never checked it out). Ask the
+                # source for that exact ref rather than mutating it.
+                try:
+                    clone.git.fetch(
+                        "origin", f"refs/remotes/origin/{branch}:refs/remotes/origin/{branch}"
+                    )
+                except GitCommandError as exc:
+                    raise ProvisionError(
+                        f"branch {branch!r} is not on {source} (neither a local branch "
+                        f"nor a fetched origin ref): {_describe(exc)}. Refusing to "
+                        "continue work on a branch that is not there — a fix round "
+                        "starting from the default branch would deliver a tree that "
+                        "never contained the pull request's work, and updating the "
+                        "branch with it destroys that work"
+                    ) from exc
+            clone.git.checkout("-B", branch, remote_ref)
+            if upstream is not None:
+                clone.git.remote("set-url", "origin", upstream)
+            sha = clone.head.commit.hexsha
+            clone.git.update_ref(CLONE_BASE_REF, sha)
+            return sha
+    except ProvisionError:
+        # The clone itself succeeded — it is the branch that is missing — so
+        # `.git` exists and the usual "only clean a half-clone" guard would
+        # leave a complete but useless checkout behind, which a resume would
+        # then reuse (`_clone_workspace` never re-clones over one). Remove
+        # it: nothing here is worth keeping.
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    except (GitCommandError, NoSuchPathError, OSError, ValueError) as exc:
+        if target.exists() and not (target / ".git").is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        raise ProvisionError(
+            f"cloning workspace {source} into {target} on branch {branch} failed: {_describe(exc)}"
+        ) from exc
+
+
 def gitignored_files(root: Path) -> frozenset[str] | None:
     """Relative POSIX paths under ``root`` that the tree's own ``.gitignore``
     rules ignore, or None when git is unavailable or the probe fails.

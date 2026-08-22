@@ -12,6 +12,7 @@ from sbxloop.daemon.postmortem import DOSSIER_MAX_CHARS, build_dossier, postmort
 from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
+from sbxloop.gh.ops import ChecksVerdict
 from tests.unit.test_daemon_loop import FakeSource, Harness, RecordingFrontend, inbox_item
 
 
@@ -193,10 +194,14 @@ class ReviewingSource(GithubLikeSource):
     def __init__(self) -> None:
         super().__init__()
         self.reviews: list[tuple[str, int, str]] = []
+        self.checks = ChecksVerdict("green", 1, (), ())
 
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
         self.reviews.append((item.item_id, pr_number, run_id))
         return f"gh:{800 + len(self.reviews)}"
+
+    def pr_state(self, pr_number: int) -> tuple[ChecksVerdict, str]:
+        return self.checks, "NONE"
 
 
 def reviewing_harness(tmp_path: Path, **daemon: Any) -> Harness:
@@ -207,39 +212,45 @@ def reviewing_harness(tmp_path: Path, **daemon: Any) -> Harness:
 
 
 class TestDeliveryReviews:
-    """The loop evaluating the code it wrote: a delivered PR gets a review
-    audit — once per run, patch items only, capped per day."""
+    """The loop evaluating the code it wrote — but only once the build has
+    reported. CI is GitHub's compute and costs nothing; a review run spent
+    on a red PR is spent on work that has to change anyway.
+    """
 
-    def test_delivered_patch_files_one_review(self, tmp_path: Path) -> None:
+    def test_a_review_is_filed_only_once_the_pr_is_green(self, tmp_path: Path) -> None:
         h = reviewing_harness(tmp_path)
         front = RecordingFrontend()
         h.loop.frontend = front  # type: ignore[assignment]
         h.source.items = [gh_item()]
-        # A delivered patch with a review queued is not done: it waits for
-        # that PR to be green and the review satisfied (the acceptance gate).
+        # Delivery alone reviews nothing: the item waits for its checks.
         assert h.loop.tick().outcome == "reviewing"
+        assert h.source.reviews == []  # type: ignore[attr-defined]
+        # Green: now the review run is worth spending, and exactly once.
+        h.loop.tick()
         assert h.source.reviews == [("gh:4", 9, h.runs[0][0])]  # type: ignore[attr-defined]
-        assert front.seen[-2] == (
-            "🔎 review [#801](https://github.com/o/r/issues/801) filed for PR"
-            " [#9](https://x/pull/9) · gh:4"
-        )
-        run_id = h.runs[0][0]
-        assert h.dstore.review_filed(run_id)
-        report = h.loop._report(run_id, None)
-        h.loop._file_review(gh_item(), run_id, report)  # never twice
+        h.loop.tick()
         assert len(h.source.reviews) == 1  # type: ignore[attr-defined]
+        assert any("review" in t and "#801" in t for t in front.seen)
 
-    def test_not_for_audits_no_delivery_or_disabled_and_capped(self, tmp_path: Path) -> None:
+    def test_a_red_pr_is_never_reviewed(self, tmp_path: Path) -> None:
+        """The saving: a red PR costs a fix round, not a review run and then
+        a fix round."""
+        h = reviewing_harness(tmp_path)
+        h.source.checks = ChecksVerdict("red", 1, (), ("lint",))  # type: ignore[attr-defined]
+        h.source.items = [gh_item()]
+        assert h.loop.tick().outcome == "reviewing"
+        h.loop.tick()
+        assert h.source.reviews == []  # type: ignore[attr-defined]
+        assert h.dstore.get("gh:4").state == "queued"  # type: ignore[union-attr]
+
+    def test_not_for_audits_no_delivery_or_disabled(self, tmp_path: Path) -> None:
         h = reviewing_harness(tmp_path)
         h.source.items = [gh_item(kind="audit")]
+        h.loop.tick()
         h.loop.tick()
         assert h.source.reviews == []  # type: ignore[attr-defined]  # audits have no PR
         h2 = reviewing_harness(tmp_path / "b", review_deliveries=False)
         h2.source.items = [gh_item()]
         h2.loop.tick()
+        h2.loop.tick()
         assert h2.source.reviews == []  # type: ignore[attr-defined]
-        h3 = reviewing_harness(tmp_path / "c", reviews_per_day=1)
-        h3.dstore.record_review("earlier", 1, "gh:1", h3.clock.t)
-        h3.source.items = [gh_item()]
-        h3.loop.tick()
-        assert h3.source.reviews == []  # type: ignore[attr-defined]

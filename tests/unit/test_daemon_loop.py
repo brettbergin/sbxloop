@@ -1878,10 +1878,12 @@ class ReviewingSource(FakeSource):
     def __init__(self) -> None:
         super().__init__()
         self.checks = ChecksVerdict("green", 2, (), ())
-        self.review_state = "APPROVED"
+        self.review_state = "NONE"
         self.polls = 0
+        self.reviews: list[int] = []
 
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
+        self.reviews.append(pr_number)
         self.calls.append(("file_review", pr_number))
         return f"gh:{pr_number + 100}"
 
@@ -1894,6 +1896,10 @@ class TestAcceptanceGate:
     """A delivered PR is not done until it is green and its review is
     satisfied. Settling on "a PR exists" is how #389 was marked done with
     `mdformat` and `security` failing.
+
+    The gates run cheapest-first: CI is GitHub's compute and costs nothing,
+    so it decides before a review run is spent — reviewing a red PR burns a
+    whole run on work that has to change anyway.
     """
 
     def _delivered(self, tmp_path: Path, **daemon: object) -> tuple[Harness, ReviewingSource]:
@@ -1912,75 +1918,98 @@ class TestAcceptanceGate:
         assert h.loop.tick().outcome == "reviewing"
         return h, source
 
-    def test_a_delivered_item_waits_instead_of_settling(self, tmp_path: Path) -> None:
+    def test_a_delivered_item_waits_and_spends_no_review_yet(self, tmp_path: Path) -> None:
+        """CI first: nothing is reviewed until the build has reported."""
         h, source = self._delivered(tmp_path)
         assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
-        # The source issue is NOT closed yet: the work is not accepted.
         assert not any(kind == "success" for kind, _ in source.calls)
-        assert ("file_review", 9) in [(k, v) for k, v in source.calls]
+        assert source.reviews == []  # no review run spent on an unchecked PR
 
-    def test_green_and_approved_is_accepted(self, tmp_path: Path) -> None:
-        h, source = self._delivered(tmp_path)
-        h.loop.tick()
-        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
-        assert any(kind == "success" for kind, _ in source.calls)
-
-    def test_pending_checks_keep_waiting(self, tmp_path: Path) -> None:
-        """Pending is not green. Reading "no failures yet" as success is the
-        whole bug."""
+    def test_pending_checks_keep_waiting_and_review_nothing(self, tmp_path: Path) -> None:
         h, source = self._delivered(tmp_path)
         source.checks = ChecksVerdict("pending", 2, ("test",), ())
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        assert source.reviews == []
 
-    def test_red_checks_keep_waiting(self, tmp_path: Path) -> None:
+    def test_green_files_the_review_once(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()
+        assert len(source.reviews) == 1
+        # A review in flight is not re-filed on the next poll.
+        h.loop.tick()
+        assert len(source.reviews) == 1
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_green_and_reviewed_and_approved_is_accepted(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()  # files the review
+        h.dstore.review_settled("gh:1", gates=True)
+        source.review_state = "APPROVED"
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert any(kind == "success" for kind, _ in source.calls)
+
+    def test_red_checks_queue_a_fix_round_without_reviewing(self, tmp_path: Path) -> None:
+        """The saving that matters: a red PR costs a fix run, not a review
+        run followed by a fix run."""
         h, source = self._delivered(tmp_path)
         source.checks = ChecksVerdict("red", 2, (), ("mdformat",))
         h.loop.tick()
-        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        item = h.dstore.get("gh:1")
+        assert item.state == "queued"  # type: ignore[union-attr]
+        assert item.run_id is None, "a fix is a fresh run, not a resume"  # type: ignore[union-attr]
+        assert source.reviews == []
+        brief = h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+        assert "mdformat" in brief and "#9" in brief
 
-    def test_changes_requested_keeps_waiting_even_when_green(self, tmp_path: Path) -> None:
+    def test_changes_requested_queues_a_fix_round(self, tmp_path: Path) -> None:
         h, source = self._delivered(tmp_path)
+        h.loop.tick()  # files the review
+        h.dstore.review_settled("gh:1", gates=True)
         source.review_state = "CHANGES_REQUESTED"
         h.loop.tick()
-        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert "requested changes" in h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
 
     def test_a_review_that_cannot_gate_does_not_wait_for_an_approval(self, tmp_path: Path) -> None:
         """A review the repo would only accept as a COMMENT never produces an
         approval; waiting for one would strand every item."""
         h, source = self._delivered(tmp_path)
-        h.dstore.set_review_gates(h.dstore.get("gh:1").run_id, False)  # type: ignore[union-attr,arg-type]
+        h.loop.tick()
+        h.dstore.review_settled("gh:1", gates=False)
         source.review_state = "NONE"
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
 
     def test_a_gating_review_does_wait_for_its_approval(self, tmp_path: Path) -> None:
         h, source = self._delivered(tmp_path)
-        h.dstore.set_review_gates(h.dstore.get("gh:1").run_id, True)  # type: ignore[union-attr,arg-type]
+        h.loop.tick()
+        h.dstore.review_settled("gh:1", gates=True)
         source.review_state = "NONE"
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
 
     def test_the_round_budget_hands_it_to_a_human(self, tmp_path: Path) -> None:
-        """Nothing may wait forever: past the budget the item fails with the
-        PR named, rather than sitting in the queue unnoticed."""
-        h, source = self._delivered(tmp_path, review_rounds=2)
+        """A round is a real run, so the budget is spend, not patience.
+        Nothing may spin: past it the PR is left open for a human."""
+        h, source = self._delivered(tmp_path, review_rounds=1)
         source.checks = ChecksVerdict("red", 1, (), ("security",))
         front = RecordingFrontend()
         h.loop.frontend = front  # type: ignore[assignment]
-        for _ in range(3):
-            h.loop.tick()
+        h.loop.tick()  # round 1: queued for a fix
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        h.dstore.mark_reviewing("gh:1", h.clock.t)  # pretend the fix delivered
+        h.loop.tick()  # round 2: over budget
         item = h.dstore.get("gh:1")
-        # ``abandoned``, the daemon's give-up state: terminal, no retry, and
-        # it keeps the run pinned for forensics.
+        # ``abandoned``: terminal, no retry, run kept pinned for forensics.
         assert item.state == "abandoned"  # type: ignore[union-attr]
         assert "#9" in (item.last_error or "")  # type: ignore[union-attr]
         assert any("not accepted" in t for t in front.seen)
 
-    def test_an_item_with_no_recorded_review_is_not_stranded(self, tmp_path: Path) -> None:
+    def test_an_item_with_no_delivery_record_is_not_stranded(self, tmp_path: Path) -> None:
         h, _ = self._delivered(tmp_path)
-        run_id = h.dstore.get("gh:1").run_id  # type: ignore[union-attr]
-        h.dstore._conn.execute("DELETE FROM daemon_reviews WHERE run_id = ?", (run_id,))
+        h.dstore._conn.execute("DELETE FROM daemon_pr_state WHERE item_id = 'gh:1'")
         h.dstore._conn.commit()
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
