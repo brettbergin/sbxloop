@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from sbxloop.engine.model import (
+    TERMINAL_RUN_STATES,
     PlanModel,
     RunRecord,
     RunState,
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS runs (
     workspace  TEXT,
     mounted    INTEGER NOT NULL DEFAULT 0,
     kept_reason TEXT,
-    user_guidance TEXT NOT NULL DEFAULT '[]'
+    user_guidance TEXT NOT NULL DEFAULT '[]',
+    reason     TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -78,6 +80,7 @@ _RUNS_MIGRATIONS = (
     ("workspace", "ALTER TABLE runs ADD COLUMN workspace TEXT"),
     ("mounted", "ALTER TABLE runs ADD COLUMN mounted INTEGER NOT NULL DEFAULT 0"),
     ("kept_reason", "ALTER TABLE runs ADD COLUMN kept_reason TEXT"),
+    ("reason", "ALTER TABLE runs ADD COLUMN reason TEXT"),
     (
         "user_guidance",
         "ALTER TABLE runs ADD COLUMN user_guidance TEXT NOT NULL DEFAULT '[]'",
@@ -185,7 +188,36 @@ class StateStore:
             workspace=Path(row["workspace"]) if row["workspace"] else None,
             mounted=bool(row["mounted"]),
             kept_reason=row["kept_reason"],
+            reason=row["reason"] if "reason" in set(row.keys()) else None,
         )
+
+    def non_terminal_runs(self) -> list[RunRecord]:
+        """Runs still recorded as in flight (created/provisioning/decomposing/
+        running/finalizing), oldest-updated first.
+
+        Callers must exclude the run genuinely executing in-process before
+        reconciling anything returned here.
+        """
+        rows = self._conn.execute("SELECT * FROM runs ORDER BY updated_at ASC").fetchall()
+        return [self._run_record(row) for row in rows if row["state"] not in TERMINAL_RUN_STATES]
+
+    def reconcile_run(self, run_id: str, state: RunState, reason: str) -> None:
+        """Force a run to a terminal state and record why, durably.
+
+        Only the ``runs`` row is written: events and phase_attempts are never
+        touched, so historical chronology is preserved. Reconciliation
+        chronology events are appended separately by callers via
+        :meth:`append_event`.
+        """
+        if state not in TERMINAL_RUN_STATES:
+            raise StateError(f"run state {state!r} is not terminal")
+        cursor = self._conn.execute(
+            "UPDATE runs SET state = ?, reason = ?, updated_at = ? WHERE run_id = ?",
+            (state, reason, time.time(), run_id),
+        )
+        if cursor.rowcount == 0:
+            raise StateError(f"unknown run {run_id}")
+        self._conn.commit()
 
     def get_run(self, run_id: str) -> RunRecord:
         row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()

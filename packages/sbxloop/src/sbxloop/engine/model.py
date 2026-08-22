@@ -37,7 +37,11 @@ TaskState = Literal[
 TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
 TERMINAL_RUN_STATES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
-    {"created", "provisioning", "decomposing", "running", "finalizing", "failed"}
+    # 'cancelled' is terminal for reporting/liveness purposes (nothing is in
+    # flight, so `list_runs` must not show it as active) yet an operator may
+    # still `sbxloop resume` a run they cancelled mid-flight — the same
+    # terminal+resumable combination 'failed' already has.
+    {"created", "provisioning", "decomposing", "running", "finalizing", "failed", "cancelled"}
 )
 
 Phase = Literal["decompose", "plan", "execute", "scrutinize", "verify", "validate"]
@@ -234,6 +238,10 @@ class RunRecord(_Model):
     # "manual"); None means normal teardown applied. `sandbox prune`
     # excludes kept runs unless asked to include them.
     kept_reason: str | None = None
+    # Why this run reached its terminal state: reconciliation of an
+    # orphaned run, or cancellation attribution. None for runs still in
+    # flight or terminated through the ordinary in-process path.
+    reason: str | None = None
 
 
 class RunResult(_Model):

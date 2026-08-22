@@ -678,13 +678,16 @@ def status(
     if run_id is None:
         table = Table(title="sbxloop runs")
         table.add_column("run")
-        table.add_column("state")
+        table.add_column("state", max_width=60)
         table.add_column("outcome", max_width=60)
         table.add_column("updated")
         for record in store.list_runs():
+            # Reconciled/cancelled runs carry *why* they are terminal (#374);
+            # showing it here is what makes `status` agree with the daemon.
+            state = f"{record.state} — [dim]{record.reason}[/]" if record.reason else record.state
             table.add_row(
                 record.run_id,
-                record.state,
+                state,
                 record.outcome[:60],
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(record.updated_at)),
             )
@@ -697,6 +700,8 @@ def status(
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     console.print(f"run [bold cyan]{record.run_id}[/]  state: [bold]{record.state}[/]")
+    if record.reason:
+        console.print(f"reason: {record.reason}")
     console.print(f"outcome: {record.outcome}")
     table = Table(title="tasks")
     for column in ("task", "title", "state", "revisions", "replans"):

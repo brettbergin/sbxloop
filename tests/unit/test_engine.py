@@ -17,7 +17,11 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES
+from sbxloop.engine.model import (
+    DEFAULT_ARTIFACT_EXCLUDES,
+    RESUMABLE_RUN_STATES,
+    TERMINAL_RUN_STATES,
+)
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import BudgetExceededError, StateError, WorkerError
 from sbxloop.events import Event, EventBus, HostEventTypes
@@ -668,14 +672,17 @@ class TestBudgetsAndCancel:
         with pytest.raises(BudgetExceededError, match="produced 4 tasks"):
             engine.start("too many")
 
-    def test_cancelled_run_stops_and_wont_resume(self, harness: Harness) -> None:
+    def test_cancelled_run_is_terminal_but_operator_resumable(self, harness: Harness) -> None:
+        """#374: a cancelled run is terminal for liveness/reporting (so it
+        never shows as active) yet an operator may still resume it, exactly
+        like a failed run."""
         harness.script([taskgraph(task("t1"))])
         engine = harness.engine()
         engine.store.create_run("rcancel", "x")
         engine.cancel("rcancel")
         assert engine.store.get_run("rcancel").state == "cancelled"
-        with pytest.raises(StateError, match="only unfinished runs"):
-            engine.resume("rcancel")
+        assert "cancelled" in RESUMABLE_RUN_STATES
+        assert "cancelled" in TERMINAL_RUN_STATES
 
     @pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
     def test_cancel_refuses_terminal_runs(self, harness: Harness, state: str) -> None:

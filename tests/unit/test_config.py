@@ -430,3 +430,15 @@ def test_daemon_log_level_and_format(tmp_path: Path) -> None:
         load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_LEVEL": "LOUD"})
     with pytest.raises(ConfigError, match="log_format"):
         load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_FORMAT": "xml"})
+
+
+def test_run_stale_after_s_default_override_and_validation(tmp_path: Path) -> None:
+    """#374 liveness safety net: conservative 6h default, 0 disables."""
+    assert load_config(cwd=tmp_path, env={}).daemon.run_stale_after_s == 21600.0
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\nrun_stale_after_s = 300\n")
+    assert load_config(cwd=tmp_path, env={}).daemon.run_stale_after_s == 300.0
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\nrun_stale_after_s = 0\n")
+    assert load_config(cwd=tmp_path, env={}).daemon.run_stale_after_s == 0.0
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\nrun_stale_after_s = -1\n")
+    with pytest.raises(ConfigError, match=r"run_stale_after_s"):
+        load_config(cwd=tmp_path, env={})

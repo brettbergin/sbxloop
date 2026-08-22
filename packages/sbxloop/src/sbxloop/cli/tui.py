@@ -350,6 +350,9 @@ class Dashboard:
     def __init__(self) -> None:
         self.run_id: str | None = None
         self.run_state: str = "starting"
+        # Why the run reached a terminal state (cancellation attribution or
+        # reconciliation of an orphan, #374); None while in flight.
+        self.run_reason: str | None = None
         self.outcome: str = ""
         self.tasks: dict[str, dict[str, Any]] = {}
         # Latest resource sample per sandbox role, rendered as one compact
@@ -384,6 +387,11 @@ class Dashboard:
             self.outcome = str(data.get("outcome", ""))
         elif event.type in (HostEventTypes.RUN_STATE, HostEventTypes.RUN_END):
             self.run_state = str(data.get("state", self.run_state))
+            if data.get("reason"):
+                self.run_reason = str(data["reason"])
+        elif event.type == HostEventTypes.RUN_RECONCILED:
+            self.run_state = str(data.get("state", self.run_state))
+            self.run_reason = str(data.get("reason", "")) or None
         elif event.type in (HostEventTypes.TASK_START, HostEventTypes.TASK_STATE):
             task_id = str(data.get("task_id"))
             entry = self.tasks.setdefault(task_id, {"title": "", "state": "pending"})
@@ -409,6 +417,8 @@ class Dashboard:
             ("  state: ", ""),
             (self.run_state, "bold yellow"),
         )
+        if self.run_reason:
+            header.append(f"  ({self.run_reason})", style="dim")
         outcome = Text(self.outcome[:200], style="italic dim")
 
         table = Table(expand=True, box=None, pad_edge=False)
