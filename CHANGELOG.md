@@ -6,6 +6,36 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **A review of a delivered PR now lands on that PR, not in the issue
+  tracker.** The loop reviewed its own work by filing issues: a charter issue
+  per delivered PR, and then one backlog issue per finding. In the field that
+  produced `PR #389 → #391 → #392, #393, #394, #395, #396` and
+  `PR #375 → #378 → #379 to #383` (two of those duplicates of each other) —
+  every one of them feedback about a diff, filed where the diff is not, with
+  nothing to converge on and a human left to triage the pile.
+
+  The review run now writes its verdict to `.sbxloop/review.json` — the same
+  shape the backlog lane already uses, and for the same reason: the agent
+  sandbox holds no `GH_TOKEN`, so the daemon posts it afterwards through the
+  github-ops sandbox. The verdict is the GitHub one: `REQUEST_CHANGES` or
+  `APPROVE`, with findings as inline comments anchored to the lines they are
+  about. A review item files no backlog issues at all — a reviewer with an
+  issue-shaped outlet will use it, which is the behaviour being replaced.
+  Anything genuinely out of scope goes in the review body as prose for a
+  human to decide on.
+
+  The parse is defensive, because the JSON is agent-authored, and its most
+  important property is what it does *not* do: an unparseable or verdict-less
+  review posts **nothing** rather than defaulting to an approval. Leaving a PR
+  visibly un-reviewed is honest; waving work through is not. One malformed
+  inline comment costs that comment, not the review, and comment overflow past
+  the cap is counted in the body rather than dropped silently.
+
+  The ordinary backlog lane is untouched: an item with no recorded review
+  target files exactly as before.
+
 ### Added
 
 - **A run must prove the project's own gate before it delivers.** PR #389 was

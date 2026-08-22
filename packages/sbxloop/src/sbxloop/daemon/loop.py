@@ -70,6 +70,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
+from sbxloop.gh.ops import SubmittedReview
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -955,7 +956,11 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         if result is not None and report.succeeded:
-            filed = self._collect_backlog(run_id, source)
+            posted = self._post_review(item, run_id)
+            # A review's findings go on the pull request, never into the
+            # tracker: filing them as issues is the behaviour being replaced,
+            # and a reviewer with an issue-shaped outlet will use it.
+            filed = [] if posted is not None else self._collect_backlog(run_id, source)
             tool = self._collect_tool_findings(run_id, source)
             report = report._replace(
                 filed=tuple(filed), tool_filed=tuple(tool.filed), tool_noted=tuple(tool.unfiled)
@@ -1481,6 +1486,46 @@ class DaemonLoop:
             )
         except Exception:
             log.warning("postmortem.file_failed", item=item.item_id, run=run_id, exc_info=True)
+
+    def _post_review(self, item: WorkItem, run_id: str) -> SubmittedReview | None:
+        """Post this run's review to the PR it reviewed, when it is one.
+
+        Returns None for every item that is not a review, which is what
+        keeps the ordinary backlog lane untouched. Best-effort: the run has
+        already succeeded, and a GitHub hiccup here must not turn that into
+        a failure — the review is visibly absent on the PR either way, which
+        is the honest signal.
+        """
+        target = self.dstore.review_target(item.item_id)
+        if target is None:
+            return None
+        pr_number, origin_run_id = target
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "post_review"):
+            log.warning("review.no_github_source", item=item.item_id, pr=pr_number)
+            return None
+        try:
+            posted = github.post_review(self.store.get_run(run_id), pr_number, origin_run_id)
+        except Exception:
+            log.warning(
+                "review.post_failed", item=item.item_id, run=run_id, pr=pr_number, exc_info=True
+            )
+            return None
+        if posted is None:
+            return None
+        verdict = "approved" if posted.event == "APPROVE" else "requested changes"
+        gate = "" if posted.gates_merge else " (as a comment — it does not gate the merge)"
+        self._notify(
+            f"🔎 review {verdict} on PR #{pr_number}{gate}: {posted.url}",
+            "review.posted",
+            item=item.item_id,
+            run=run_id,
+            pr=pr_number,
+            verdict=posted.event,
+            gates_merge=posted.gates_merge,
+        )
+        assert isinstance(posted, SubmittedReview)
+        return posted
 
     def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:
         """File the run's backlog items; returns their refs (``gh:<n>``)."""

@@ -24,6 +24,7 @@ from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, Tas
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
+from sbxloop.gh.ops import SubmittedReview
 from tests.fakes.github_errors import field_error
 from tests.unit.test_hostgit import make_repo, make_upstream_and_clone, push_upstream_commit
 
@@ -1826,3 +1827,44 @@ class TestStaleRunReconciliation:
         self._age(h, "r_resume", h.clock.t - 7200.0)
         h.loop._reconcile_stale_runs(h.clock.t)
         assert h.store.get_run("r_resume").state == "running"
+
+
+class TestReviewGoesToThePr:
+    """A review item's findings belong on the pull request, not in the
+    tracker. Filing them as issues is what produced #392-#396 for one PR.
+    """
+
+    def _reviewed(self, tmp_path: Path) -> tuple[Harness, list[tuple[int, str]]]:
+        h = Harness(tmp_path)
+        h.source.name = "github"  # type: ignore[misc]
+        item = WorkItem(
+            item_id="gh:391", source="github", source_key="391", kind="audit", title="R"
+        )
+        h.source.items = [item]
+        # This item IS the review of PR #7, as recorded when it was filed.
+        h.dstore.record_review("rorigin01", 7, "gh:391", 0.0)
+        posted: list[tuple[int, str]] = []
+
+        def post_review(run: object, pr_number: int, origin_run_id: str) -> SubmittedReview:
+            posted.append((pr_number, origin_run_id))
+            return SubmittedReview("https://gh/r/1", "REQUEST_CHANGES")
+
+        h.source.post_review = post_review  # type: ignore[attr-defined]
+        return h, posted
+
+    def test_a_review_item_posts_and_files_nothing(self, tmp_path: Path) -> None:
+        h, posted = self._reviewed(tmp_path)
+        h.loop._collect_backlog = lambda run_id, source: ["should:not:be:filed"]  # type: ignore[method-assign]
+        assert h.loop.tick().outcome == "done"
+        assert posted == [(7, "rorigin01")]
+        report = h.source.calls[-1][1]
+        assert report.filed == (), "a review must not file issues for its findings"
+
+    def test_an_ordinary_item_is_untouched(self, tmp_path: Path) -> None:
+        """No review recorded for this item, so the backlog lane runs as
+        before — the change must not reach the ordinary path."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        h.loop._collect_backlog = lambda run_id, source: ["inbox:finding-a"]  # type: ignore[method-assign]
+        assert h.loop.tick().outcome == "done"
+        assert h.source.calls[-1][1].filed == ("inbox:finding-a",)
