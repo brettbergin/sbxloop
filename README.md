@@ -450,8 +450,9 @@ add `sbxloop:run` and labels only on your yes; "what's in the backlog?"
 lists the open `sbxloop:backlog` issues and asks which, if any, to work.
 Ask what a run cost and it reports that run's input/output tokens per
 agent persona and totalled; "how much have we spent today?" totals the
-rolling 24 hours next to the daily run cap. Tokens are attributed to when
-they were spent, so a run spanning midnight counts on both days. The
+current calendar day in `run_cap_timezone` — the same day the run cap
+counts — next to that cap. Tokens are attributed to when they were spent,
+so a run spanning midnight counts on both days. The
 backend reports tokens but not cost, so it says that rather than
 converting to money — and a run from before usage reporting answers "not
 recorded", never zero.

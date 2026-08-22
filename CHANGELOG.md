@@ -188,7 +188,10 @@ All notable changes to sbxloop are documented here. The project adheres to
   configs need no migration; the per-day review and post-mortem caps share
   the same day window. Status lines, logs and Discord/GitHub messaging now
   state the semantics unambiguously
-  (`runs today (UTC): 7/10, resets at 00:00 UTC`).
+  (`runs today (UTC): 7/10, resets at 00:00 UTC`). The concierge's
+  `usage_today` totals that same calendar day rather than a trailing 24
+  hours, so the spend and the cap on its head line still describe one
+  period (`today (UTC) · 3 run(s) with usage · 7/10 runs today`).
 
 - **What the structured phases decided is now an event**, so it can be shown
   without showing the agent's JSON: `run.tasks` (the roster, re-announced on

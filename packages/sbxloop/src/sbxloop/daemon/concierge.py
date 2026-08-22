@@ -43,6 +43,7 @@ from urllib.parse import quote
 from sbxloop.cli.tui import format_event
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch, plain
+from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.prompts import bullet_list, render
@@ -57,7 +58,6 @@ from sbxloop.errors import (
     WorkerTimeoutError,
 )
 from sbxloop.events import EventBus
-from sbxloop.gc import DAY_S
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
@@ -916,9 +916,10 @@ class Concierge:
         return "\n".join(lines)
 
     def _tool_usage_today(self, args: dict[str, Any], by: str) -> str:
-        # The same rolling window the daily run cap uses (loop.py), so the two
-        # numbers on the last line always describe the same period.
-        since = self.clock() - DAY_S
+        # The same calendar day the run cap counts (loop.day_window), so the
+        # two numbers on the last line always describe the same period.
+        tz = self.config.daemon.run_cap_timezone
+        since, _ = day_window(self.clock(), tz)
         try:
             runs = [r for r in self.store.list_runs() if r.updated_at >= since]
         except SbxloopError as exc:
@@ -942,11 +943,11 @@ class Concierge:
             cap = "?"
         if not rows:
             return (
-                f"no usage recorded in the last 24h across {len(runs)} run(s) "
+                f"no usage recorded today ({tz}) across {len(runs)} run(s) "
                 f"({cap} runs today). Nothing has been spent, or these runs predate "
                 "usage reporting."
             )
-        head = f"last 24h · {len(rows)} run(s) with usage · {cap} runs today"
+        head = f"today ({tz}) · {len(rows)} run(s) with usage · {cap} runs today"
         if models:
             head += f" · {', '.join(models)}"
         lines = [head]
