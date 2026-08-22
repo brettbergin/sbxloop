@@ -34,10 +34,13 @@ every record.
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import logging
 import re
 import sys
-from typing import Any, Literal, TextIO
+from datetime import UTC, datetime
+from typing import Any, Literal, NamedTuple, TextIO
 
 import structlog
 
@@ -62,6 +65,92 @@ _SECRET_KEY = re.compile(
     r"(^|_)(token|secret|password|passwd|authorization|api_key|apikey|pat)($|_)", re.I
 )
 _HANDLER_MARK = "_sbxloop_log_handler"
+
+#: How many rendered log lines the in-process ring buffer keeps.
+LOG_BUFFER_MAXLEN = 2000
+
+
+class LogRecordLine(NamedTuple):
+    """One buffered, already-rendered log line."""
+
+    timestamp: str
+    level: str
+    logger: str
+    line: str
+
+
+class LogBuffer:
+    """A bounded, in-process ring of rendered log lines.
+
+    Backed by :class:`collections.deque` with a ``maxlen``, so a long-lived
+    daemon cannot grow memory: the oldest line is dropped as a new one
+    arrives. Appends are a single atomic deque operation — no locks, no I/O.
+    """
+
+    def __init__(self, maxlen: int = LOG_BUFFER_MAXLEN) -> None:
+        self._records: collections.deque[LogRecordLine] = collections.deque(maxlen=maxlen)
+
+    def append(self, record: LogRecordLine) -> None:
+        self._records.append(record)
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def clear(self) -> None:
+        self._records.clear()
+
+    def tail(
+        self, n: int = 50, level: str | None = None, grep: str | None = None
+    ) -> list[LogRecordLine]:
+        """The most recent ``n`` records that survive the filters.
+
+        ``level`` keeps records at or above that level (case-insensitive;
+        ``ValueError`` for an unknown name). ``grep`` is a plain
+        case-insensitive substring test against the rendered line — never a
+        regular expression. The result is oldest-first (most recent last).
+        """
+        if n <= 0:
+            return []
+        records = list(self._records)
+        if level is not None:
+            threshold = _level_no(level)
+            records = [r for r in records if _level_no_safe(r.level) >= threshold]
+        if grep:
+            needle = grep.lower()
+            records = [r for r in records if needle in r.line.lower()]
+        return records[-n:]
+
+
+_LOG_BUFFER = LogBuffer()
+
+
+def log_buffer() -> LogBuffer:
+    """The process-wide ring buffer that :func:`configure_logging` fills."""
+    return _LOG_BUFFER
+
+
+class _RingBufferHandler(logging.Handler):
+    """Renders each record into the bounded :class:`LogBuffer`.
+
+    Never raises and never blocks: formatting failures are swallowed so a bad
+    record can't take down a logging call on the hot path.
+    """
+
+    def __init__(self, buffer: LogBuffer) -> None:
+        super().__init__()
+        self._buffer = buffer
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with contextlib.suppress(Exception):  # defensive; never break logging
+            line = self.format(record).rstrip("\n")
+            self._buffer.append(
+                LogRecordLine(
+                    timestamp=datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+                    level=record.levelname,
+                    logger=record.name,
+                    line=line,
+                )
+            )
 
 
 class _StderrHandler(logging.StreamHandler):  # type: ignore[type-arg,unused-ignore]
@@ -131,6 +220,12 @@ def _level_no(level: str) -> int:
     return value
 
 
+def _level_no_safe(level: str) -> int:
+    """Numeric level for a buffered record's level name; 0 if unrecognised."""
+    value = logging.getLevelName(level.upper())
+    return value if isinstance(value, int) else 0
+
+
 def configure_logging(
     level: str = "INFO", *, fmt: LogFormat = "console", stream: TextIO | None = None
 ) -> None:
@@ -170,6 +265,7 @@ def configure_logging(
             structlog.processors.UnicodeDecoder(),
             renderer,
         ]
+        buffer_tail: list[Any] = tail
     else:
         target = stream if stream is not None else sys.stderr
         renderer = structlog.dev.ConsoleRenderer(
@@ -177,15 +273,33 @@ def configure_logging(
             exception_formatter=structlog.dev.plain_traceback,
         )
         tail = [renderer]
-    formatter = structlog.stdlib.ProcessorFormatter(
-        processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta, *tail],
-        foreign_pre_chain=shared,
-    )
+        # Plain text for the buffer: greppable, and safe to paste into chat.
+        buffer_tail = [
+            structlog.dev.ConsoleRenderer(
+                colors=False, exception_formatter=structlog.dev.plain_traceback
+            )
+        ]
+
+    def _formatter(tail_processors: list[Any]) -> structlog.stdlib.ProcessorFormatter:
+        return structlog.stdlib.ProcessorFormatter(
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                *tail_processors,
+            ],
+            foreign_pre_chain=shared,
+        )
+
+    formatter = _formatter(tail)
     handler: logging.Handler = (
         logging.StreamHandler(stream) if stream is not None else _StderrHandler()
     )
     handler.setFormatter(formatter)
     setattr(handler, _HANDLER_MARK, True)
+
+    ring_handler = _RingBufferHandler(_LOG_BUFFER)
+    ring_handler.setFormatter(_formatter(buffer_tail))
+    ring_handler.setLevel(level_no)
+    setattr(ring_handler, _HANDLER_MARK, True)
 
     root = logging.getLogger()
     for existing in list(root.handlers):
@@ -193,6 +307,7 @@ def configure_logging(
             root.removeHandler(existing)
             existing.close()
     root.addHandler(handler)
+    root.addHandler(ring_handler)
     root.setLevel(level_no)
     third_party = logging.INFO if level_no <= logging.DEBUG else logging.WARNING
     for name in THIRD_PARTY_LOGGERS:
@@ -200,13 +315,17 @@ def configure_logging(
 
 
 __all__ = [
+    "LOG_BUFFER_MAXLEN",
     "REDACTED",
     "THIRD_PARTY_LOGGERS",
+    "LogBuffer",
     "LogFormat",
     "LogLevel",
+    "LogRecordLine",
     "bind_run",
     "clear_run",
     "configure_logging",
     "get_logger",
+    "log_buffer",
     "redact_secrets",
 ]

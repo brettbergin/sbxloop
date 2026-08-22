@@ -110,11 +110,17 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
   run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads and
   issue triage (file, list, comment, label for a run, close) through the ops
-  box — relayed as `agent.tool_request` events and answered
+  box, and `daemon_log` over the process's own recent log lines — relayed as
+  `agent.tool_request` events and answered
   by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
   polls for. It is **kept across daemon restarts** when the installed worker
   still matches the host, because the SDK session store — the conversation's
   memory, resumed via `resume_session_id` — lives inside the VM.
+  `daemon_log` is served from a ring-buffer handler `configure_logging`
+  installs in `sbxloop/log.py` — a `deque` with a `maxlen`, so a long-lived
+  daemon's memory is bounded; the append is one atomic deque operation with
+  no locks or I/O, keeping it off the hot path, and it stores the line the
+  stderr handler already rendered and redacted.
 
 The credential split holds for both: the host never holds a PAT in a
 process that also talks to a model, and neither box holds both tokens.
