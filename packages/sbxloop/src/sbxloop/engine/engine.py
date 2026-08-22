@@ -1047,7 +1047,7 @@ class LoopEngine:
             # boundary cancellation uses — the agent pauses here, replies,
             # and any course change (re-plan, standing guidance) lands
             # before the next phase runs.
-            self._process_chat(run_id, phases, task)
+            self._process_chat(run_id, phases, self._steer_target(task))
             abort_reason = self._resource_abort_reason()
             if abort_reason:
                 # Fail the task with a diagnosis instead of letting the next
@@ -1515,6 +1515,22 @@ class LoopEngine:
                 reply=verdict.reply,
                 action=action,
             )
+
+    def _steer_target(self, task: TaskRecord) -> TaskRecord | None:
+        """The task a steer verdict may re-plan, or None for run-level only.
+
+        Only a lone lane offers itself. With several in flight there is no
+        "current task": the lane that wins the chat lock is whichever
+        reached a phase boundary first, so steering it would re-plan an
+        arbitrary task rather than the one the operator meant. None routes
+        the verdict through the existing ``steer_task`` -> ``steer_run``
+        downgrade in :meth:`_apply_steer`, recording the guidance for every
+        later prompt instead of gambling on a lane. Steering one task by
+        name under parallelism needs an explicit target plus a barrier
+        holding that lane at its boundary until the verdict lands — a
+        feature to design, not a default to fall into.
+        """
+        return task if self.config.budgets.max_parallel_tasks == 1 else None
 
     def _apply_steer(
         self,

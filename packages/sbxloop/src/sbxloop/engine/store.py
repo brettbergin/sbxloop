@@ -224,13 +224,14 @@ class StateStore:
         """
         if state not in TERMINAL_RUN_STATES:
             raise StateError(f"run state {state!r} is not terminal")
-        cursor = self._conn.execute(
-            "UPDATE runs SET state = ?, reason = ?, updated_at = ? WHERE run_id = ?",
-            (state, reason, time.time(), run_id),
-        )
-        if cursor.rowcount == 0:
-            raise StateError(f"unknown run {run_id}")
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET state = ?, reason = ?, updated_at = ? WHERE run_id = ?",
+                (state, reason, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
 
     def get_run(self, run_id: str) -> RunRecord:
         row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()

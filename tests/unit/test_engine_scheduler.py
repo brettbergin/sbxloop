@@ -157,6 +157,28 @@ class TestConcurrentLanes:
         assert peak == 3, f"expected exactly 3 lanes in flight, saw {peak}"
 
 
+class TestSteeringUnderParallelism:
+    """With several lanes in flight there is no single "current task": the
+    lane that wins the chat lock is whichever reached a phase boundary
+    first. Offering it as the steer target would re-plan an arbitrary task
+    rather than the one the operator meant."""
+
+    def test_a_lone_lane_offers_itself_as_the_target(self, tmp_path: Path) -> None:
+        """Unchanged at the default: one lane means the current task really
+        is the current task, and steer_task re-plans it."""
+        sched = Scheduler(tmp_path, [spec("t1")], lanes=1)
+        record = sched.engine.store.get_tasks(sched.run_id)[0]
+        assert sched.engine._steer_target(record) is record
+
+    def test_parallel_lanes_offer_no_target(self, tmp_path: Path) -> None:
+        """Otherwise steer_task would re-plan whichever lane happened to win
+        the chat lock. None routes it through the steer_task -> steer_run
+        downgrade instead, so the guidance reaches every later prompt."""
+        sched = Scheduler(tmp_path, [spec("t1"), spec("t2")], lanes=2)
+        record = sched.engine.store.get_tasks(sched.run_id)[0]
+        assert sched.engine._steer_target(record) is None
+
+
 class TestFailurePropagation:
     def test_a_failed_dependency_skips_its_dependents(self, tmp_path: Path) -> None:
         sched = Scheduler(

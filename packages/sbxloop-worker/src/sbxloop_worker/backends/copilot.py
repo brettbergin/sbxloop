@@ -437,12 +437,18 @@ def system_message_config(
     only the named sections, so the guardrails a ``replace`` would discard
     stay in place. Sections the installed SDK does not know are dropped from
     the request rather than sent: a host running ahead of the sandbox's SDK
-    then degrades to today's behaviour instead of failing the job on a name
-    the SDK would reject.
+    degrades to today's behaviour instead of failing the job on a name the
+    SDK would reject.
+
+    ``known_sections=None`` means the installed SDK reported no vocabulary at
+    all — it predates ``SYSTEM_MESSAGE_SECTIONS``, and an SDK that cannot
+    name the sections cannot be assumed to accept a ``customize`` config
+    either. That trims **nothing**: sending the request anyway would fail
+    every trimmed job, which is the opposite of the fallback this is for.
     """
-    wanted = list(dict.fromkeys(drop_sections))
-    if known_sections is not None:
-        wanted = [name for name in wanted if name in known_sections]
+    if known_sections is None:
+        return {"mode": "append", "content": content} if content else None
+    wanted = [name for name in dict.fromkeys(drop_sections) if name in known_sections]
     if not wanted:
         return {"mode": "append", "content": content} if content else None
     config: dict[str, Any] = {

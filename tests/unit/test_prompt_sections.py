@@ -100,16 +100,29 @@ class TestSystemMessageConfig:
     def test_sections_switch_to_customize(self) -> None:
         """``customize`` keeps the SDK-managed prompt structure — unlike
         ``replace``, which would discard the guardrails with it."""
-        assert system_message_config(None, ["code_change_rules"]) == {
+        assert system_message_config(None, ["code_change_rules"], SDK_SYSTEM_MESSAGE_SECTIONS) == {
             "mode": "customize",
             "sections": {"code_change_rules": {"action": "remove"}},
         }
 
     def test_content_rides_along_with_sections(self) -> None:
-        config = system_message_config("extra", ["guidelines"])
+        config = system_message_config("extra", ["guidelines"], SDK_SYSTEM_MESSAGE_SECTIONS)
         assert config is not None
         assert config["mode"] == "customize"
         assert config["content"] == "extra"
+
+    def test_an_sdk_that_reports_no_vocabulary_is_not_sent_a_customize(self) -> None:
+        """``installed_sdk_system_message_sections`` returns None for an SDK
+        predating ``SYSTEM_MESSAGE_SECTIONS``. One that cannot name the
+        sections cannot be assumed to accept a ``customize`` config either,
+        so trimming is abandoned rather than gambled — sending it anyway
+        would fail every trimmed job, which is the opposite of the fallback
+        this exists for."""
+        assert system_message_config(None, ["code_change_rules"], None) is None
+        assert system_message_config("extra", ["code_change_rules"], None) == {
+            "mode": "append",
+            "content": "extra",
+        }
 
     def test_sections_the_installed_sdk_does_not_know_are_dropped(self) -> None:
         """A host ahead of the sandbox's SDK degrades to today's behaviour
@@ -130,6 +143,6 @@ class TestSystemMessageConfig:
         }
 
     def test_duplicate_sections_collapse(self) -> None:
-        config = system_message_config(None, ["tone", "tone"])
+        config = system_message_config(None, ["tone", "tone"], SDK_SYSTEM_MESSAGE_SECTIONS)
         assert config is not None
         assert list(config["sections"]) == ["tone"]
