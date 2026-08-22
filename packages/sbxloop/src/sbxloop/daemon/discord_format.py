@@ -851,6 +851,18 @@ def format_for_discord(
         return [
             block(part) for part in split_markdown(content, max_chars, header=header, cont=cont)
         ]
+    if t == HostEventTypes.RUN_TASKS:
+        return [block(part) for part in split_markdown(roster_text(data), max_chars)]
+    if t == HostEventTypes.PHASE_PLAN:
+        return [
+            block(part)
+            for part in split_markdown(plan_text(data), max_chars, cont="🗺 *(cont. {i}/{n})*")
+        ]
+    if t == HostEventTypes.PHASE_VERDICT:
+        return [
+            block(part)
+            for part in split_markdown(verdict_text(data), max_chars, cont="🔎 *(cont. {i}/{n})*")
+        ]
     if t == HostEventTypes.RUN_REPORT:
         return [line(f"📋 tracking issue {link(f'#{data.get("issue")}', data.get('url'))}")]
     if t == HostEventTypes.RUN_DELIVER:
@@ -963,6 +975,107 @@ def format_for_discord(
             return []
         return [line(f"· {t} {_one_line(' '.join(f'{k}={v}' for k, v in data.items()), 200)}")]
     return []
+
+
+# -- what the structured phases decided ------------------------------------------------
+
+# The three phases that answer in JSON also decide the three things a human
+# watching a thread most wants to read: what the run will do, how a task will
+# be done, and why a critic sent it back. Their replies are not posted (see
+# strip_json_payload), so the engine emits the parsed decision as its own
+# event and these render it.
+
+TASK_STATE_MARKER = {"done": "✅", "failed": "❌", "skipped": "⏭"}
+VERDICT_MARKER = {  # nosec B105 - "pass" is the scrutinizer's verdict, not a credential
+    "pass": "✅",
+    "accept": "✅",
+    "revise": "♻",
+    "reject": "❌",
+}
+SEVERITY_MARKER = {"high": "🔴", "medium": "🟠", "low": "⚪"}
+# What a plan/verdict field is worth in the chronology before it is a wall of
+# text; the whole card is still split across messages if it needs to be.
+DECISION_ITEM_CLIP = 300
+
+
+def _list(data: dict[str, Any], key: str) -> list[Any]:
+    """``data[key]`` when it is a list — event data is agent-shaped, so a
+    renderer never assumes a field arrived in the shape it was emitted in."""
+    value = data.get(key)
+    return value if isinstance(value, list) else []
+
+
+def roster_text(data: dict[str, Any]) -> str:
+    """The task roster the run will work, one line per task.
+
+    Posted once when the graph is known (and again on resume, where each
+    task carries the state it was left in).
+    """
+    tasks = _list(data, "tasks")
+    lines = [f"🧩 **{len(tasks)} task(s)**"]
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            continue
+        marker = TASK_STATE_MARKER.get(str(task.get("state") or ""), "")
+        head = f"{index}. " + (f"{marker} " if marker else "")
+        after = [str(d) for d in _list(task, "depends_on") if d]
+        tail = f" — after {', '.join(code(d) for d in after)}" if after else ""
+        lines.append(
+            f"{head}{code(task.get('id'))} {_one_line(task.get('title') or '', 120)}{tail}"
+        )
+    return "\n".join(lines)
+
+
+def plan_text(data: dict[str, Any]) -> str:
+    """One task's plan: the steps, then what the plan promised about them."""
+    attempt = int(data.get("attempt") or 1)
+    head = f"🗺 **plan** · task {code(data.get('task_id'))}"
+    if attempt > 1:
+        head += f" *(replan {attempt})*"
+    lines = [head]
+    steps = _list(data, "steps")
+    for index, step in enumerate(steps, start=1):
+        text = _one_line(str(step or ""), DECISION_ITEM_CLIP)
+        if text:
+            lines.append(f"{index}. {text}")
+    if not steps:
+        lines.append("· (no steps)")
+    for label, key in (("expects", "expected_artifacts"), ("verify", "verify_commands")):
+        joined = " · ".join(
+            code(_one_line(str(v), 120)) for v in _list(data, key) if str(v).strip()
+        )
+        if joined:
+            lines.append(f"**{label}:** {joined}")
+    egress = _list(data, "egress")
+    for grant in egress:
+        if isinstance(grant, dict) and grant.get("domain"):
+            reason = _one_line(str(grant.get("reason") or ""), 160)
+            lines.append(
+                f"**egress:** {code(grant['domain'])}" + (f" — {reason}" if reason else "")
+            )
+    return "\n".join(lines)
+
+
+def verdict_text(data: dict[str, Any]) -> str:
+    """A critic's ruling: the call, what it found, and what it asked for."""
+    verdict = str(data.get("verdict") or "")
+    phase = str(data.get("phase") or "critic")
+    marker = VERDICT_MARKER.get(verdict, "🔎")
+    lines = [f"{marker} **{phase}: {verdict}** · task {code(data.get('task_id'))}"]
+    issues = _list(data, "issues")
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        detail = _one_line(str(issue.get("detail") or ""), DECISION_ITEM_CLIP)
+        if not detail:
+            continue
+        severity = str(issue.get("severity") or "medium")
+        lines.append(f"{SEVERITY_MARKER.get(severity, '·')} **{severity}** — {detail}")
+    feedback = str(data.get("feedback") or "").strip()
+    if feedback:
+        # Quoted: it is what the executor is about to be told, verbatim.
+        lines.append("\n".join(f"> {ln}" for ln in _clip(feedback, 900).splitlines()))
+    return "\n".join(lines)
 
 
 # -- headline / finish / status cards --------------------------------------------------
@@ -1293,10 +1406,13 @@ __all__ = [
     "link",
     "mask_urls",
     "nolink",
+    "plan_text",
     "queue_lines",
     "ref_link",
     "refs_text",
+    "roster_text",
     "split_markdown",
     "status_embed",
     "strip_json_payload",
+    "verdict_text",
 ]

@@ -32,13 +32,16 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     issue_url,
     mask_urls,
+    plan_text,
     queue_lines,
     ref_link,
     refs_text,
     repetitive_streak,
+    roster_text,
     split_markdown,
     status_embed,
     strip_json_payload,
+    verdict_text,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.events import Event
@@ -144,6 +147,119 @@ class TestStripJsonPayload:
         assert strip_json_payload("") == ""
         assert strip_json_payload("  \n ") == ""
         assert strip_json_payload("plain prose") == "plain prose"
+
+
+class TestDecisionCards:
+    """What the structured phases decided, rendered for humans — the other
+    half of dropping their JSON."""
+
+    def test_roster_lists_every_task_with_its_dependencies(self) -> None:
+        text = roster_text(
+            {
+                "tasks": [
+                    {"id": "t1", "title": "Add the parser", "state": "done", "depends_on": []},
+                    {"id": "t2", "title": "Wire the CLI", "state": "pending", "depends_on": ["t1"]},
+                    {"id": "t3", "title": "Docs", "state": "skipped", "depends_on": ["t1", "t2"]},
+                ]
+            }
+        )
+        assert text.splitlines() == [
+            "🧩 **3 task(s)**",
+            "1. ✅ `t1` Add the parser",
+            "2. `t2` Wire the CLI — after `t1`",
+            "3. ⏭ `t3` Docs — after `t1`, `t2`",
+        ]
+
+    def test_plan_numbers_its_steps_and_names_its_promises(self) -> None:
+        text = plan_text(
+            {
+                "task_id": "t2",
+                "attempt": 1,
+                "steps": ["write it", "test it"],
+                "expected_artifacts": ["out.txt"],
+                "verify_commands": ["uv run pytest -q"],
+                "egress": [{"domain": "pypi.org", "reason": "install deps"}],
+            }
+        )
+        assert text.splitlines() == [
+            "🗺 **plan** · task `t2`",
+            "1. write it",
+            "2. test it",
+            "**expects:** `out.txt`",
+            "**verify:** `uv run pytest -q`",
+            "**egress:** `pypi.org` — install deps",
+        ]
+
+    def test_replan_says_which_attempt_it_is(self) -> None:
+        text = plan_text({"task_id": "t2", "attempt": 3, "steps": ["try again"]})
+        assert text.splitlines() == ["🗺 **plan** · task `t2` *(replan 3)*", "1. try again"]
+
+    def test_verdict_carries_issues_and_the_feedback_verbatim(self) -> None:
+        text = verdict_text(
+            {
+                "task_id": "t1",
+                "phase": "scrutinize",
+                "verdict": "revise",
+                "issues": [
+                    {"severity": "high", "detail": "quoted fields are ignored"},
+                    {"severity": "low", "detail": "no empty-file test"},
+                ],
+                "feedback": "Handle quotes.\nThen add the test.",
+            }
+        )
+        assert text.splitlines() == [
+            "♻ **scrutinize: revise** · task `t1`",
+            "🔴 **high** — quoted fields are ignored",
+            "⚪ **low** — no empty-file test",
+            "> Handle quotes.",
+            "> Then add the test.",
+        ]
+
+    def test_a_clean_verdict_is_one_line(self) -> None:
+        assert verdict_text(
+            {
+                "task_id": "t1",
+                "phase": "validate",
+                "verdict": "accept",
+                "issues": [],
+                "feedback": "",
+            }
+        ) == ("✅ **validate: accept** · task `t1`")
+
+    def test_missing_and_misshapen_fields_do_not_break_a_card(self) -> None:
+        # Event data is agent-shaped: a renderer must not assume a list.
+        assert roster_text({}).splitlines() == ["🧩 **0 task(s)**"]
+        assert roster_text({"tasks": "nope"}).splitlines() == ["🧩 **0 task(s)**"]
+        assert plan_text({"task_id": "t1", "steps": []}).splitlines() == [
+            "🗺 **plan** · task `t1`",
+            "· (no steps)",
+        ]
+        assert verdict_text({}).splitlines() == ["🔎 **critic: ** · task ``"]
+
+    def test_events_render_at_every_level(self) -> None:
+        for level in ("quiet", "normal", "verbose"):
+            roster = format_for_discord(
+                ev("run.tasks", tasks=[{"id": "t1", "title": "T", "state": "pending"}]),
+                level=level,
+            )
+            assert texts(roster) == ["🧩 **1 task(s)**\n1. `t1` T"]
+            assert roster[0].kind == "block"
+            plan = format_for_discord(ev("phase.plan", task_id="t1", steps=["go"]), level=level)
+            assert texts(plan) == ["🗺 **plan** · task `t1`\n1. go"]
+            verdict = format_for_discord(
+                ev("phase.verdict", task_id="t1", phase="validate", verdict="reject"), level=level
+            )
+            assert texts(verdict) == ["❌ **validate: reject** · task `t1`"]
+
+    def test_a_long_plan_is_split_not_clipped(self) -> None:
+        chunks = format_for_discord(
+            ev("phase.plan", task_id="t1", steps=[f"step {i} " + "x" * 120 for i in range(40)]),
+            max_chars=400,
+        )
+        assert len(chunks) > 1
+        assert all(len(c.text) <= 400 for c in chunks)
+        assert chunks[1].text.startswith(f"🗺 *(cont. 2/{len(chunks)})*")
+        assert "step 39" in chunks[-1].text
 
 
 class TestFormat:

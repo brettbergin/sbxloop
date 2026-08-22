@@ -385,9 +385,13 @@ card per run in the control channel (source, run id, branch, tracking
 issue, PR, task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
-code-fence boundaries instead of clipped (their narration only — the JSON
-payload a structured phase returns is the engine's copy, and the thread
-already says what it means, so it is left to `sbxloop logs`); each burst of tool calls
+code-fence boundaries instead of clipped — their **narration only**, never the
+JSON payload a structured phase returns; what that payload *decided* is posted
+in its own words instead: the task roster (`🧩 3 task(s)`, re-announced with
+persisted state on resume), each task's plan (numbered steps, expected
+artifacts, verify commands, egress grants) and every critic verdict
+(`♻ scrutinize: revise`, its issues by severity, the feedback quoted as the
+executor will receive it); each burst of tool calls
 digested into **one line edited in place** (`⚙ 23 tool calls (bash x21, view x2) — last: pytest -q`, with a "may be stuck" nudge when the last
 calls are near-identical) — failed calls still get their own detail
 block, and `chronology_level = "verbose"` streams every call batched into

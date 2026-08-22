@@ -177,6 +177,16 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **What the structured phases decided is now an event**, so it can be shown
+  without showing the agent's JSON: `run.tasks` (the roster, re-announced on
+  resume with each task's persisted state), `phase.plan` (steps, expected
+  artifacts, verify commands, egress grants) and `phase.verdict` (a critic's
+  call, its issues by severity, and the feedback the executor is about to be
+  told). All three carry only what the agent's reply already said — the reply
+  was simply the sole carrier, so dropping it dropped the plan and the critic's
+  reasoning with it. Discord renders each as a card; the daemon log mirrors
+  them at `INFO`.
+
 - Discord: an agent's **JSON payload no longer reaches the channel**. Every
   structured phase — decompose, plan, scrutinize, validate, steer — asks its
   agent for one fenced JSON block and gets narration around it, and the bridge
@@ -188,7 +198,8 @@ All notable changes to sbxloop are documented here. The project adheres to
   mirrors `sbxloop_worker._json.extract_json` — fenced blocks tagged `json` or
   simply parsing as one, then a bare document running to the end of the reply —
   so an unfenced payload and a `bash` block the agent is talking about are told
-  apart. Nothing is lost: the block is still in the run's event store
+  apart. Nothing is lost: what the payload decided is posted as its own card
+  (above), and the block itself is still in the run's event store
   (`sbxloop logs`) and the phase ledger.
 
 - Concierge: the `sbx_control` tool no longer appends the raw status dict as

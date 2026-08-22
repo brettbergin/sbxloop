@@ -156,6 +156,74 @@ class TestHappyPath:
         ]
         assert roster == [("t1", "pending"), ("t2", "pending")]
 
+    def test_structured_phases_emit_what_they_decided(self, harness: Harness) -> None:
+        """The plan, the roster and the critics' rulings reach the bus as
+        parsed data. Their agents answer in JSON, so a surface that does not
+        show raw JSON (Discord) has no other way to say what was decided."""
+        harness.script(
+            [
+                taskgraph(task("t1"), task("t2", deps=["t1"])),
+                {
+                    "json": {
+                        "steps": ["write it", "test it"],
+                        "expected_artifacts": ["out.txt"],
+                        "verify_commands": ["true"],
+                    }
+                },
+                EXECUTE,
+                REVISE,
+                EXECUTE,
+                PASS,
+                ACCEPT,
+                *HAPPY_TASK,
+            ]
+        )
+        result = harness.engine().start("build the feature")
+        assert result.succeeded
+
+        (roster,) = [e for e in harness.events if e.type == HostEventTypes.RUN_TASKS]
+        assert [(t["id"], t["title"], t["state"]) for t in roster.data["tasks"]] == [
+            ("t1", "Task t1", "pending"),
+            ("t2", "Task t2", "pending"),
+        ]
+        assert roster.data["tasks"][1]["depends_on"] == ["t1"]
+
+        plans = [e for e in harness.events if e.type == HostEventTypes.PHASE_PLAN]
+        assert plans[0].data["task_id"] == "t1"
+        assert plans[0].data["steps"] == ["write it", "test it"]
+        assert plans[0].data["expected_artifacts"] == ["out.txt"]
+        assert plans[0].data["verify_commands"] == ["true"]
+        assert plans[0].data["attempt"] == 1
+
+        verdicts = [
+            (e.data["phase"], e.data["verdict"], e.data["feedback"])
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_VERDICT and e.data["task_id"] == "t1"
+        ]
+        assert verdicts == [
+            ("scrutinize", "revise", "missed an edge case"),
+            ("scrutinize", "pass", ""),
+            ("validate", "accept", ""),
+        ]
+
+    def test_roster_is_re_announced_with_persisted_state_on_resume(self, harness: Harness) -> None:
+        """A resumed run gets a fresh thread, so the roster is re-announced —
+        carrying the state each task was left in, not a fresh 'pending'."""
+        harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), PLAN, {"fail": "boom"}])
+        engine = harness.engine()
+        with pytest.raises(WorkerError, match="boom"):
+            engine.start("crashy run")
+        run_id = engine.store.list_runs()[0].run_id
+
+        mark = len(harness.events)
+        harness.script([EXECUTE, PASS, ACCEPT, *HAPPY_TASK])
+        assert harness.engine().resume(run_id).succeeded
+        (roster,) = [e for e in harness.events[mark:] if e.type == HostEventTypes.RUN_TASKS]
+        assert [(t["id"], t["state"]) for t in roster.data["tasks"]] == [
+            ("t1", "executing"),
+            ("t2", "pending"),
+        ]
+
     def test_agent_messages_carry_phase_persona(self, harness: Harness) -> None:
         """Every agent.message names the persona that produced it, so the
         transcript header says WHO responded (planner, executor, ...), not a

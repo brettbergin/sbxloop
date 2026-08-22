@@ -206,6 +206,15 @@ through the host `EventBus` (synchronous, subscriber-exception-isolated) and
 are persisted to SQLite — the CLI TUI, `logs --follow`, and hooks like
 `GithubReporterHook` are all just bus subscribers.
 
+The phases that ask their agent for JSON (decompose, plan, scrutinize,
+validate) also emit what they *decided*, parsed: `run.tasks` (the roster,
+re-announced on resume with each task's persisted state), `phase.plan` (the
+steps, expected artifacts, verify commands and egress grants a task will be
+executed against) and `phase.verdict` (a critic's call, its issues and the
+feedback the executor is about to be told). These carry no information the
+agent's reply did not — they exist so a surface can show the decision without
+showing the agent's JSON, which is what the Discord bridge does.
+
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
 
 ## Logging
@@ -231,7 +240,8 @@ subscribed to every run's bus under the logger `sbxloop.run`
 - `WARNING` — the run degraded or something was refused: `worker.error`,
   `sandbox.tooling_warning`, `sandbox.resources_warning`,
   `agent.permission_denied`, `agent.tool_cap`, `run.config_drift`.
-- `INFO` — lifecycle: `run.*`, task and phase start/state/end, sandbox
+- `INFO` — lifecycle: `run.*`, task and phase start/state/end, what the
+  structured phases decided (`phase.plan`, `phase.verdict`), sandbox
   provisioning, worker job start/end/result, GitHub op start/end, policy
   denials, chat (steering) traffic, gc.
 - `DEBUG` — everything else: individual tool calls, agent messages and
