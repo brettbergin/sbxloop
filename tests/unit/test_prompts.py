@@ -37,6 +37,7 @@ def test_execute_and_plan_carry_environment_notes() -> None:
         task_description="td",
         plan_steps="- s",
         expected_artifacts="- a",
+        prior_attempt="(none)",
         feedback="(none)",
         user_guidance="(none)",
     )
@@ -141,6 +142,7 @@ def test_prompts_carry_ecosystem_notes(
         task_description="d",
         plan_steps="- s",
         expected_artifacts="- a",
+        prior_attempt="(none)",
         feedback="(none)",
         user_guidance="(none)",
     )
@@ -199,6 +201,7 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "task_description": "d",
         "plan_steps": "- s",
         "expected_artifacts": "- a",
+        "prior_attempt": "p",
         "feedback": "f",
         "user_guidance": "g",
     },
@@ -331,6 +334,7 @@ def test_registry_tiers_are_injected_not_hardcoded() -> None:
         task_description="td",
         plan_steps="- s",
         expected_artifacts="- a",
+        prior_attempt="(none)",
         feedback="(none)",
         user_guidance="(none)",
     )
@@ -395,6 +399,7 @@ def test_plan_and_execute_render_standing_guidance() -> None:
         task_description="d",
         plan_steps="- s",
         expected_artifacts="- a",
+        prior_attempt="(none)",
         feedback="f",
         user_guidance="- always use postgres",
     )

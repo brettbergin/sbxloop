@@ -13,6 +13,7 @@ order" — so ordering and overlap are pinned here instead, deterministically.
 
 from __future__ import annotations
 
+import json
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -227,3 +228,66 @@ class TestFailurePropagation:
         failed, _skipped = sched.run(done)
         assert failed == {"t1"}
         assert sched.started == ["t2"]
+
+
+class TestExecutorContinuityWiring:
+    """The engine side of executor continuity: which session may be resumed,
+    and where the previous attempt's report comes from.
+
+    Field failure rrhb28j7n/t5 — five executor sessions on one task, each
+    re-running the same setup and the same gate because a revision was never
+    told what the last attempt had established.
+    """
+
+    def test_a_replan_drops_the_session(self, tmp_path: Path) -> None:
+        """A revision continues the same plan, so resuming is the point. A
+        replan threw the approach away — a resumed session would carry the
+        discarded approach forward as though it were still the intent."""
+        engine = Scheduler(tmp_path, [spec("t1")], lanes=1).engine
+        task = TaskRecord(spec=spec("t1"), session_id="sess-1", revisions=2)
+        engine._discard_plan(task)
+        assert task.session_id is None
+        assert task.plan is None and task.revisions == 0
+
+    def test_only_a_session_from_this_process_is_resumable(self, tmp_path: Path) -> None:
+        """`task.session_id` is persisted, but sandboxes are cattle: a resumed
+        run gets a fresh pair, and every session id from the previous
+        incarnation names a VM that no longer exists."""
+        engine = Scheduler(tmp_path, [spec("t1")], lanes=1).engine
+        assert engine._live_sessions == set()
+        engine._live_sessions.add("sess-live")
+        assert "sess-from-a-dead-sandbox" not in engine._live_sessions
+
+    def test_the_prior_report_comes_off_the_committed_attempt(self, tmp_path: Path) -> None:
+        """Read from the store rather than held in memory, so a resumed run's
+        revision gets the same context a fresh one would."""
+        sched = Scheduler(tmp_path, [spec("t1")], lanes=1)
+        engine, run_id = sched.engine, sched.run_id
+        task = engine.store.get_tasks(run_id)[0]
+        assert engine._prior_attempt_report(run_id, task) == ""
+
+        engine.store.record_phase(
+            run_id,
+            "execute",
+            task_id="t1",
+            attempt=1,
+            status="ok",
+            output_json=json.dumps({"report": "ran uv sync; gate green", "session_id": "s1"}),
+            started_at=0.0,
+        )
+        assert engine._prior_attempt_report(run_id, task) == "ran uv sync; gate green"
+
+    def test_a_row_without_a_report_yields_nothing(self, tmp_path: Path) -> None:
+        sched = Scheduler(tmp_path, [spec("t1")], lanes=1)
+        engine, run_id = sched.engine, sched.run_id
+        engine.store.record_phase(
+            run_id,
+            "execute",
+            task_id="t1",
+            attempt=1,
+            status="ok",
+            output_json=json.dumps({"session_id": "s1"}),
+            started_at=0.0,
+        )
+        task = engine.store.get_tasks(run_id)[0]
+        assert engine._prior_attempt_report(run_id, task) == ""

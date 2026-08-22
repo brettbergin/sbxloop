@@ -140,8 +140,12 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   DAG (unique ids, resolvable deps, acyclic; `max_tasks` budget).
 - **PLAN** — fresh session produces steps, expected artifacts, and
   verify commands for one task.
-- **EXECUTE** — fresh session with full tool access does the work in the
-  run workspace.
+- **EXECUTE** — full tool access, does the work in the run workspace. The
+  one phase that *continues* rather than starting fresh: a revision resumes
+  the previous attempt's session where the SDK still has it, and is handed
+  that attempt's report either way, so it builds on what was already
+  established instead of re-deriving it. A replan clears the session — the
+  approach it holds was the one thrown away.
 - **SCRUTINIZE** — a fresh session in the *same sandbox* with **read-only
   permissions** reviews the work against plan + acceptance criteria, with
   evidence gathered mechanically (`git status`, `git diff HEAD`). Fresh

@@ -2,8 +2,11 @@
 
 Session strategy per phase (a deliberate design decision):
 
-- DECOMPOSE / PLAN / EXECUTE run as fresh agent sessions with full ("auto")
-  permissions — the microVM is the security boundary.
+- DECOMPOSE / PLAN / EXECUTE run with full ("auto") permissions — the
+  microVM is the security boundary. DECOMPOSE and PLAN are always fresh;
+  EXECUTE is the one phase that continues, resuming its own previous attempt
+  on a revision so the work already done is not re-derived (a replan clears
+  it — the approach that session holds is the one being discarded).
 - SCRUTINIZE / VALIDATE run as **fresh sessions in the same agent sandbox
   with read-only permissions**: a fresh session removes conversational
   anchoring to the executor's claims, read-only permissions stop the critic
@@ -231,6 +234,7 @@ class PhaseRunner:
         phase: str,
         permission_mode: Literal["auto", "read_only"],
         expect: Literal["text", "json"],
+        resume_session_id: str | None = None,
     ) -> JobResult:
         agent_name = AGENT_NAMES[phase]
         job = JobRequest(
@@ -245,6 +249,11 @@ class PhaseRunner:
             timeout_s=self.config.budgets.per_job_timeout_s,
             max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
             drop_system_sections=self._drop_sections(phase),
+            # Only EXECUTE ever passes one. The critics are fresh by design
+            # (module docstring): a reviewer that inherited the executor's
+            # session would inherit its conclusions with it, and that
+            # independence is the loop's integrity check.
+            resume_session_id=resume_session_id,
         )
         started = time.monotonic()
         log.info(
@@ -257,6 +266,7 @@ class PhaseRunner:
             expect=expect,
             prompt_chars=len(prompt),
             dropped_sections=len(job.drop_system_sections) or None,
+            resumed=bool(resume_session_id),
         )
         result = self.agent.submit(job, agent=agent_name)
         usage = result.usage
@@ -484,7 +494,24 @@ class PhaseRunner:
                 "bounds, via [policy] allow in sbxloop.toml."
             )
 
-    def execute(self, task: TaskRecord, plan: PlanModel) -> JobResult:
+    def execute(
+        self,
+        task: TaskRecord,
+        plan: PlanModel,
+        *,
+        prior_report: str = "",
+        resume_session_id: str | None = None,
+    ) -> JobResult:
+        """Do the work for one task.
+
+        ``prior_report`` is what the previous attempt on this task said it
+        did, and ``resume_session_id`` continues that attempt's own agent
+        session where it still exists. Both exist to stop a revision
+        re-establishing what the last attempt already knew — the engine
+        holds that context either way and used to withhold it, so five
+        executor sessions on one task each re-ran the same setup and the
+        same gate from scratch (field failure rrhb28j7n/t5).
+        """
         prompt = render(
             "execute",
             outcome=self.outcome,
@@ -494,9 +521,16 @@ class PhaseRunner:
             plan_steps=bullet_list(plan.steps),
             expected_artifacts=bullet_list(plan.expected_artifacts),
             feedback=task.last_feedback or "(none — first attempt)",
+            prior_attempt=clip(prior_report) or "(none — this is the first attempt)",
             user_guidance=self._guidance(),
         )
-        return self._agent_job(prompt, phase="execute", permission_mode="auto", expect="text")
+        return self._agent_job(
+            prompt,
+            phase="execute",
+            permission_mode="auto",
+            expect="text",
+            resume_session_id=resume_session_id,
+        )
 
     def steer(
         self, message: str, *, tasks: Sequence[TaskRecord], task: TaskRecord | None

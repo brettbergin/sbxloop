@@ -175,3 +175,59 @@ class TestScrutinizeEvidenceBatching:
         assert outcome.verdict.verdict == "pass"
         prompt = next(j for j in agent.jobs if j.kind == "agent.session").prompt or ""
         assert "(no evidence gathered)" in prompt
+
+
+class TestExecutorContinuity:
+    """A revision continues the same agent's own work on the same task.
+
+    Field failure rrhb28j7n/t5: five executor sessions on one task, each with
+    its own session id, each re-running `uv sync --all-packages` and the whole
+    lint gate from scratch, each concluding "no changes needed". A revision
+    was told what the critic objected to and nothing about what the previous
+    attempt had already established — so it re-established it.
+    """
+
+    def test_the_prior_report_reaches_the_prompt(self) -> None:
+        agent = BatchStubAgent()
+        runner(agent).execute(record(), plan(), prior_report="already ran uv sync; gate is green")
+        prompt = next(j for j in agent.jobs if j.kind == "agent.session").prompt or ""
+        assert "already ran uv sync; gate is green" in prompt
+        assert "What the previous attempt already did" in prompt
+
+    def test_a_first_attempt_says_so_rather_than_leaving_a_hole(self) -> None:
+        agent = BatchStubAgent()
+        runner(agent).execute(record(), plan())
+        prompt = next(j for j in agent.jobs if j.kind == "agent.session").prompt or ""
+        assert "(none — this is the first attempt)" in prompt
+
+    def test_a_long_prior_report_is_clipped(self) -> None:
+        agent = BatchStubAgent()
+        runner(agent).execute(record(), plan(), prior_report="x" * 50_000)
+        prompt = next(j for j in agent.jobs if j.kind == "agent.session").prompt or ""
+        assert "(clipped)" in prompt
+
+    def test_the_session_id_rides_on_the_job(self) -> None:
+        agent = BatchStubAgent()
+        runner(agent).execute(record(), plan(), resume_session_id="sess-42")
+        job = next(j for j in agent.jobs if j.kind == "agent.session")
+        assert job.resume_session_id == "sess-42"
+
+    def test_execute_starts_fresh_when_not_given_one(self) -> None:
+        agent = BatchStubAgent()
+        runner(agent).execute(record(), plan())
+        job = next(j for j in agent.jobs if j.kind == "agent.session")
+        assert job.resume_session_id is None
+
+    def test_no_critic_phase_ever_resumes(self) -> None:
+        """The critics are fresh by design: a reviewer that inherited the
+        executor's session would inherit its conclusions, and that
+        independence is the loop's integrity check."""
+        scrutiny = BatchStubAgent()
+        runner(scrutiny).scrutinize(record(), plan(), "did the work")
+        validation = BatchStubAgent(verdict={"verdict": "accept"})
+        runner(validation).validate(record(), "(no verify commands)")
+        sessions = [
+            j for agent in (scrutiny, validation) for j in agent.jobs if j.kind == "agent.session"
+        ]
+        assert len(sessions) == 2
+        assert all(j.resume_session_id is None for j in sessions)
