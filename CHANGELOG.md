@@ -8,6 +8,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Concierge: **`run_usage`** and **`usage_today`** put Copilot spend in chat
+  (#334). The daily run cap was visible in `!sbx status` but token usage was
+  not visible anywhere — the worker has always emitted `agent.usage` events and
+  nothing read them. `run_usage` folds one run's samples into a per-persona
+  breakdown and a total; `usage_today` totals the rolling 24 hours next to
+  `runs_today/max_runs_per_day`. Tokens are attributed to when they were spent,
+  not to the day the run started, so a run spanning midnight counts on both
+  days. Two things are reported rather than invented: the Copilot backend emits
+  tokens but never `cost`, so the report says so instead of printing a zero the
+  model would repeat as fact, and a run with no samples answers "not recorded"
+  rather than zero — `Usage.merged` keeps None as None precisely so those stay
+  distinguishable.
+
 - **Automated deploys to the daemon host** (`.github/workflows/deploy.yml`).
   Every merge to `main` already auto-released to PyPI, but getting that release
   onto the running daemon was manual, so a host silently drifted behind its own

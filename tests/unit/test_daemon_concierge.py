@@ -257,7 +257,9 @@ class TestJobShape:
             "item_detail",
             "enqueue_work",
             "version_status",
-        ]  # no github_get: no repo configured; version_status needs nothing
+            "run_usage",
+            "usage_today",
+        ]  # no github_get: no repo configured; the rest need nothing
         assert job.host_tools_dir is None  # the WorkerClient fills it in
         assert job.system_message and "sbxloop concierge" in job.system_message
         assert "`sbx_control`" in job.system_message
@@ -407,6 +409,94 @@ class TestTools:
             "r1abcdefg", "completed", "2/2 tasks done", delivery=(7, "https://gh/pr/7")
         )
         return store
+
+    def test_run_usage_totals_by_persona(self, tmp_path: Path) -> None:
+        """#334: Copilot spend is invisible from chat otherwise. Tokens are
+        folded per agent persona — there is no phase field on a worker event,
+        the persona the host stamps on is the phase."""
+        concierge, client, _, loop, dstore = make(
+            tmp_path, [{"calls": [("run_usage", {"run_id": "r1abcdefg"})]}]
+        )
+        store = self._seed_run(tmp_path, dstore, loop)
+        from sbxloop.events import Event
+
+        for tokens in (1200, 800):
+            store.append_event(
+                Event.now(
+                    "agent.usage",
+                    "r1abcdefg",
+                    model="claude-opus-5",
+                    input_tokens=tokens,
+                    output_tokens=90,
+                    agent="executor",
+                )
+            )
+        store.append_event(
+            Event.now(
+                "agent.usage",
+                "r1abcdefg",
+                model="claude-opus-5",
+                input_tokens=300,
+                output_tokens=20,
+                agent="planner",
+            )
+        )
+        turn(concierge, "what did r1abcdefg cost?")
+        (resp,) = client.responses
+        assert resp.ok
+        assert "claude-opus-5" in resp.text and "3 sample(s)" in resp.text
+        # executor 2000+180 outranks planner 300+20, and sorts first.
+        assert resp.text.index("executor") < resp.text.index("planner")
+        assert "2,000 in" in resp.text and "180 out" in resp.text
+        assert "total" in resp.text and "2,300 in" in resp.text and "200 out" in resp.text
+        # The backend reports tokens, never cost: say so rather than show 0.
+        assert "cost: not reported" in resp.text and "0.00" not in resp.text
+
+    def test_a_run_without_usage_events_says_not_recorded(self, tmp_path: Path) -> None:
+        """Acceptance: runs predating usage reporting answer "not recorded",
+        which is not the same claim as zero spend."""
+        concierge, client, _, loop, dstore = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("run_usage", {"run_id": "r1abcdefg"}),
+                        ("run_usage", {"run_id": "nope"}),
+                    ]
+                }
+            ],
+        )
+        self._seed_run(tmp_path, dstore, loop)
+        turn(concierge)
+        recorded, missing = client.responses
+        assert "no usage recorded for r1abcdefg" in recorded.text
+        assert "not the same as zero" in recorded.text
+        assert missing.text.startswith("no run 'nope'")
+
+    def test_usage_today_totals_and_names_the_cap(self, tmp_path: Path) -> None:
+        """The daily view sits next to runs_today/max_runs_per_day, and counts
+        tokens by when they were spent — a sample older than the window is a
+        different day's spend even on a run that is still active."""
+        concierge, client, _, loop, dstore = make(tmp_path, [{"calls": [("usage_today", {})]}])
+        store = self._seed_run(tmp_path, dstore, loop)
+        from sbxloop.events import Event
+
+        fresh = Event.now(
+            "agent.usage", "r1abcdefg", model="claude-opus-5", input_tokens=500, output_tokens=40
+        )
+        fresh.ts = 1_000_000.0  # the frozen clock: inside the 24h window
+        store.append_event(fresh)
+        stale = Event.now(
+            "agent.usage", "r1abcdefg", model="claude-opus-5", input_tokens=9999, output_tokens=999
+        )
+        stale.ts = 1_000_000.0 - 200_000.0  # two days back
+        store.append_event(stale)
+        turn(concierge, "how much have we spent today?")
+        (resp,) = client.responses
+        assert resp.ok
+        assert "500 in" in resp.text and "40 out" in resp.text
+        assert "9,999" not in resp.text  # yesterday's spend is not today's
+        assert "runs today" in resp.text
 
     def test_list_runs_run_detail_and_events(self, tmp_path: Path) -> None:
         concierge, client, _, loop, dstore = make(
