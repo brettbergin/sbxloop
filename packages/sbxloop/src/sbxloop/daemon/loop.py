@@ -1581,7 +1581,16 @@ class DaemonLoop:
             try:
                 self._poll_one_review(item, github, now)
             except Exception:
+                # A poll that cannot reach GitHub still costs the item a
+                # round. Without that a persistent failure — a bad token, an
+                # API shape we read wrong, a repo that went private — parks
+                # the item in `reviewing` forever with nothing but a warning
+                # in the log, which is the one outcome an unattended daemon
+                # must never produce. Burning rounds means it ends the same
+                # way any other unaccepted PR does: handed to a human, out
+                # loud.
                 log.warning("review.poll_failed", item=item.item_id, exc_info=True)
+                self._poll_failed(item, now)
 
     def _poll_one_review(self, item: WorkItem, github: Any, now: float) -> None:
         """Advance one delivered PR by exactly one step.
@@ -1638,6 +1647,27 @@ class DaemonLoop:
             self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, review satisfied")
             return
         log.debug("review.waiting", item=item.item_id, pr=pr, on="approval")
+
+    def _poll_failed(self, item: WorkItem, now: float) -> None:
+        """Charge a failed poll a round, and hand the item over at the cap."""
+        spent = self.dstore.bump_pr_round(item.item_id)
+        budget = self.config.daemon.review_rounds
+        if spent <= budget:
+            return
+        state = self.dstore.pr_state(item.item_id)
+        pr = state.pr_number if state is not None else 0
+        self.dstore.mark_failed(
+            item.item_id, f"PR #{pr}: its state could not be read", now, requeue=False
+        )
+        self._notify(
+            f"⚠ {item.item_id}: could not read PR #{pr}'s state {spent - 1} time(s) in a row "
+            "— handing it over; the PR is open and the daemon log has the error.",
+            "review.poll_exhausted",
+            level="error",
+            item=item.item_id,
+            pr=pr,
+            rounds=spent - 1,
+        )
 
     def _fix_round(
         self,
