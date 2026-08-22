@@ -776,7 +776,7 @@ class DaemonLoop:
             resume=resume_run_id is not None,
             title=item.title,
         )
-        item_config = self._item_config(item)
+        item_config = self._fix_config(item, self._item_config(item))
         bus = EventBus()
         bus.subscribe(event_log_subscriber)
         engine = LoopEngine(
@@ -1157,6 +1157,21 @@ class DaemonLoop:
         return True
 
     # -- item -> run mapping ---------------------------------------------------------
+
+    def _fix_config(self, item: WorkItem, config: Config) -> Config:
+        """Point a fix round's workspace and delivery at its own PR branch.
+
+        Without this the round would clone the default branch and then
+        force-update the PR's branch with a tree that never contained the
+        PR's work — destroying it. The provisioner refuses outright when the
+        branch is not on the remote, which is the safe failure.
+        """
+        state = self.dstore.pr_state(item.item_id)
+        if state is None or not state.fix_brief or not state.branch:
+            return config
+        return config.model_copy(
+            update={"sandbox": config.sandbox.model_copy(update={"continue_branch": state.branch})}
+        )
 
     def _item_config(self, item: WorkItem) -> Config:
         gh = self.config.github

@@ -859,6 +859,9 @@ class LoopEngine:
                 source_dir=source,
                 base=gh.deliver_base,
                 draft=gh.deliver_draft,
+                # A fix round lands on the pull request it was fixing, not a
+                # new one: same branch in, same branch out.
+                branch=self.config.sandbox.continue_branch,
                 exclude=self.config.artifacts.exclude,
             )
         except SbxloopError as exc:

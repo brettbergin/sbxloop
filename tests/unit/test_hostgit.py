@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from git import Repo
 
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
@@ -546,3 +547,64 @@ class TestRefreshFromOrigin:
     def test_not_a_repo_raises_provision_error(self, tmp_path: Path) -> None:
         with pytest.raises(ProvisionError, match="cannot refresh"):
             hostgit.refresh_from_origin(tmp_path / "nope")
+
+
+class TestCloneExistingBranch:
+    """A fix round continues its own pull request, so its clone must start
+    from what that branch actually has.
+
+    The refusal is the safety property: a round that silently fell back to
+    the default branch would deliver a tree that never contained the PR's
+    work, and force-updating the branch with it destroys that work.
+    """
+
+    def _with_pr_branch(self, tmp_path: Path) -> tuple[Path, Path, str]:
+        upstream, checkout = make_upstream_and_clone(tmp_path)
+        other = tmp_path / "author"
+        git("clone", "-q", str(upstream), str(other), cwd=tmp_path)
+        git("checkout", "-q", "-b", "sbxloop/r1", cwd=other)
+        (other / "pr-work.txt").write_text("the PR's work\n")
+        git("add", ".", cwd=other)
+        git("commit", "-q", "-m", "pr work", cwd=other)
+        git("push", "-q", "origin", "sbxloop/r1", cwd=other)
+        sha = hostgit.head_commit(other) or ""
+        git("fetch", "-q", "origin", cwd=checkout)
+        return upstream, checkout, sha
+
+    def test_it_starts_from_the_branchs_own_commit(self, tmp_path: Path) -> None:
+        _, checkout, sha = self._with_pr_branch(tmp_path)
+        target = tmp_path / "run"
+        got = hostgit.clone_existing_branch(checkout, target, "sbxloop/r1")
+        assert got == sha
+        # The PR's work is present — this is the whole point.
+        assert (target / "pr-work.txt").read_text() == "the PR's work\n"
+
+    def test_it_checks_out_that_branch_by_name(self, tmp_path: Path) -> None:
+        """Same name in, same name out: the delivery force-updates this
+        branch, which is what updates the PR rather than opening a new one."""
+        _, checkout, _ = self._with_pr_branch(tmp_path)
+        target = tmp_path / "run"
+        hostgit.clone_existing_branch(checkout, target, "sbxloop/r1")
+        with Repo(target) as clone:
+            assert clone.active_branch.name == "sbxloop/r1"
+
+    def test_the_base_ref_is_pinned_for_the_delivery_diff(self, tmp_path: Path) -> None:
+        _, checkout, sha = self._with_pr_branch(tmp_path)
+        target = tmp_path / "run"
+        hostgit.clone_existing_branch(checkout, target, "sbxloop/r1")
+        with Repo(target) as clone:
+            assert clone.git.rev_parse(hostgit.CLONE_BASE_REF).strip() == sha
+
+    def test_a_missing_branch_refuses_rather_than_falling_back(self, tmp_path: Path) -> None:
+        """The failure that matters. Provisioning failing is recoverable;
+        delivering a tree that never had the PR's work is not."""
+        _, checkout = make_upstream_and_clone(tmp_path)
+        with pytest.raises(ProvisionError, match="is not on"):
+            hostgit.clone_existing_branch(checkout, tmp_path / "run", "sbxloop/nope")
+
+    def test_a_refusal_leaves_no_half_clone(self, tmp_path: Path) -> None:
+        _, checkout = make_upstream_and_clone(tmp_path)
+        target = tmp_path / "run"
+        with pytest.raises(ProvisionError):
+            hostgit.clone_existing_branch(checkout, target, "sbxloop/nope")
+        assert not target.exists() or not any(target.iterdir())

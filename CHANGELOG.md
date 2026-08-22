@@ -42,6 +42,20 @@ All notable changes to sbxloop are documented here. The project adheres to
   4 with one round, ~8 at the cap — against the previous shape, where a red PR
   burned a review before anyone looked at the build.
 
+  **A fix round runs on its pull request's own branch.**
+  `hostgit.clone_existing_branch` checks the run's workspace out at
+  `origin/<branch>` and the delivery targets that same branch, so the PR is
+  updated rather than a second one opened. A branch that is not on the remote
+  **fails provisioning** rather than falling back: a round starting from the
+  default branch would deliver a tree that never contained the PR's work, and
+  force-updating the branch with it destroys that work. A failed provision is
+  recoverable; that is not.
+
+  Cloning a clone copies the source's *local* branches into `origin/*`, not
+  its remote-tracking refs — and a PR's branch is only ever remote-tracking in
+  the daemon's checkout, which fetched it but never checked it out. The clone
+  therefore asks the source for that exact ref rather than mutating it.
+
 ### Added
 
 - **A delivered item is not done until its PR is accepted.** `_settle` used to

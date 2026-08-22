@@ -323,8 +323,18 @@ class Provisioner:
             )
             return clone_dir
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
-        sha = hostgit.clone_for_run(source, clone_dir, branch)
-        message = f"cloned {source} at {sha[:12]} onto branch {branch}"
+        existing = self.config.sandbox.continue_branch
+        if existing:
+            # A fix round continues its own pull request: start from what
+            # that branch actually has, so the delivery updates the PR
+            # instead of replacing it with work rebuilt from the default
+            # branch.
+            branch = existing
+            sha = hostgit.clone_existing_branch(source, clone_dir, branch)
+            message = f"cloned {source} at {sha[:12]} continuing branch {branch}"
+        else:
+            sha = hostgit.clone_for_run(source, clone_dir, branch)
+            message = f"cloned {source} at {sha[:12]} onto branch {branch}"
         if dirty:
             message += " — source tree has uncommitted changes; they are NOT in the run workspace"
             log.warning("workspace.dirty", path=str(source), detail=message)

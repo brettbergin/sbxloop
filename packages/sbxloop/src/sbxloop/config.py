@@ -85,6 +85,17 @@ class SandboxConfig(_ConfigModel):
     template: str | None = None
     workspace: Path | None = None
     workspace_isolation: WorkspaceIsolation = "auto"
+    # Continue existing work on this branch instead of starting fresh: the
+    # run's clone is checked out at ``origin/<branch>`` and its delivery
+    # updates that same branch, so the pull request already open on it is
+    # updated rather than a second one opened.
+    #
+    # Set per run by the daemon for a fix round; never configured by hand.
+    # An absent branch fails provisioning on purpose — a round that fell
+    # back to the default branch would deliver a tree that never contained
+    # the PR's work, and force-updating the branch with it destroys that
+    # work. A failed provision is recoverable; that is not.
+    continue_branch: str | None = None
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
 
