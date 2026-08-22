@@ -35,7 +35,7 @@ from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
-from sbxloop.verifylint import UV_LOCKFILE, lint_verify_commands
+from sbxloop.verifylint import UV_LOCKFILE, lint_verify_commands, project_gate
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
@@ -208,10 +208,10 @@ class PhaseRunner:
     def _lint_verify_commands(self, commands: Sequence[str]) -> list[str]:
         """Verify-command lint under this run's toolchains and project shape.
 
-        Re-checks the lockfile every time rather than once at construction:
-        on a mounted workspace the executor may have created ``uv.lock`` in
-        an earlier task, and later plans should be held to the convention
-        the workspace now has.
+        Re-checks the lockfile and the project gate every time rather than
+        once at construction: on a mounted workspace the executor may have
+        created ``uv.lock`` — or a Makefile — in an earlier task, and later
+        plans should be held to the convention the workspace now has.
         """
         uv_project = self.workspace is not None and (self.workspace / UV_LOCKFILE).is_file()
         return lint_verify_commands(
@@ -424,18 +424,33 @@ class PhaseRunner:
         return graph
 
     def _check_taskgraph_verify_commands(self, graph: TaskGraph) -> None:
-        """Reject task verify commands that violate toolchain conventions.
+        """Reject task verify commands that violate toolchain conventions,
+        and require the graph as a whole to run the project's own gate.
 
         The executor cannot edit verify commands, so a bare `python -m
         pytest` from the decomposer costs a revision cycle plus an in-VM
         workaround at verify time (field failure r12ygfd7t); rejecting at
         JSON acceptance costs one retry with the rule quoted.
+
+        The gate is checked **across the graph, not per task**. A delivered
+        PR (#389) failed `mdformat` and `security` — both plain `make check`
+        targets — because nothing in the run ran what CI enforces. But
+        demanding the gate of every task would run a multi-minute check once
+        per task for no extra signal, so one task carrying it is the
+        requirement; decompositions already tend to end with a "everything
+        green" task, which is exactly where it belongs.
         """
         problems = [
             f"- task {task.id}: {message}"
             for task in graph.tasks
             for message in self._lint_verify_commands(task.verify_commands)
         ]
+        gate = project_gate(self.workspace)
+        if gate:
+            every_command = [c for task in graph.tasks for c in task.verify_commands]
+            problems += [
+                f"- {message}" for message in lint_verify_commands(every_command, (), gate=gate)
+            ]
         if problems:
             raise ValueError(
                 "verify commands violate the sandbox's toolchain conventions:\n"

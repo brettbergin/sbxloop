@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from sbxloop.verifylint import command_heads, lint_verify_commands
+from pathlib import Path
+
+from sbxloop.verifylint import (
+    command_heads,
+    lint_verify_commands,
+    project_gate,
+    runs_gate,
+)
 
 
 class TestCommandHeads:
@@ -280,3 +287,88 @@ class TestMultiLanguageRuns:
             ["pytest -q", "rspec spec/", "go test ./..."], ["python", "ruby", "go"]
         )
         assert len(problems) == 2  # go test is fine; the other two flagged
+
+
+class TestProjectGate:
+    """A delivered PR (#389) failed `mdformat` and `security` — both plain
+    `make check` targets — because the plan's verify commands were a subset
+    of what the repository actually enforces. The run reported success and
+    the PR sat red. Rejecting that at JSON acceptance costs one retry; the
+    alternative costs a PR, a review round and a human noticing.
+    """
+
+    def test_a_check_target_is_the_gate(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").write_text("check: lint typecheck test\n\t@echo ok\n")
+        assert project_gate(tmp_path) == "make check"
+
+    def test_a_makefile_without_a_check_target_declares_no_gate(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").write_text("build:\n\t@echo ok\ntest:\n\t@echo ok\n")
+        assert project_gate(tmp_path) is None
+
+    def test_no_makefile_no_gate(self, tmp_path: Path) -> None:
+        """A project that declares no gate gets no requirement invented for
+        it — a wrong requirement is unfixable by the executor, which cannot
+        edit verify commands."""
+        assert project_gate(tmp_path) is None
+        assert project_gate(None) is None
+
+    def test_the_first_makefile_make_would_read_is_the_one_read(self, tmp_path: Path) -> None:
+        """GNU make reads only the first of GNUmakefile/makefile/Makefile, so
+        a `check` in a later one is not the gate make would run."""
+        (tmp_path / "GNUmakefile").write_text("build:\n\t@echo ok\n")
+        (tmp_path / "Makefile").write_text("check:\n\t@echo ok\n")
+        assert project_gate(tmp_path) is None
+
+    def test_a_lowercase_makefile_counts(self, tmp_path: Path) -> None:
+        (tmp_path / "makefile").write_text("check:\n\t@echo ok\n")
+        assert project_gate(tmp_path) == "make check"
+
+    def test_an_unreadable_makefile_is_not_fatal(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").mkdir()  # a directory, not a file
+        assert project_gate(tmp_path) is None
+
+
+class TestRunsGate:
+    def test_the_gate_is_matched_token_exact(self) -> None:
+        assert runs_gate("make check", "make check")
+        assert runs_gate("make -j4 check", "make check")
+        assert runs_gate("make check lint", "make check")
+
+    def test_a_similarly_named_target_is_not_the_gate(self) -> None:
+        assert not runs_gate("make check-fast", "make check")
+        assert not runs_gate("make precheck", "make check")
+        assert not runs_gate("make lint", "make check")
+
+    def test_an_unparseable_command_does_not_raise(self) -> None:
+        assert not runs_gate('make "unbalanced', "make check")
+
+
+class TestGateRule:
+    def test_skipping_the_gate_is_rejected(self) -> None:
+        problems = lint_verify_commands(
+            ["uv run pytest -q"], ["python"], uv_project=True, gate="make check"
+        )
+        assert len(problems) == 1
+        assert "make check" in problems[0] and "gate" in problems[0]
+
+    def test_running_the_gate_satisfies_it(self) -> None:
+        assert lint_verify_commands(["make check"], ["python"], gate="make check") == []
+
+    def test_narrower_commands_may_ride_along(self) -> None:
+        """A fast signal alongside the gate is fine — the rule is that the
+        gate is present, not that it is alone."""
+        commands = ["uv run pytest -q", "make check"]
+        assert lint_verify_commands(commands, ["python"], uv_project=True, gate="make check") == []
+
+    def test_no_gate_no_requirement(self) -> None:
+        assert lint_verify_commands(["uv run pytest -q"], ["python"], uv_project=True) == []
+
+    def test_the_gate_rule_stacks_with_the_toolchain_rules(self) -> None:
+        """A command can be wrong in more than one way, and the model should
+        hear about both in one retry rather than one per round."""
+        problems = lint_verify_commands(
+            ["pytest -q"], ["python"], uv_project=True, gate="make check"
+        )
+        assert len(problems) == 2
+        assert any("bare `pytest`" in p for p in problems)
+        assert any("make check" in p for p in problems)

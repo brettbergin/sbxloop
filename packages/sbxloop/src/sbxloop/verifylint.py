@@ -39,6 +39,7 @@ import re
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -245,8 +246,71 @@ def command_heads(command: str) -> list[str]:
     return heads
 
 
+# The project's own gate. Field failure: a delivered PR (#389) failed
+# `mdformat` and `security` — both plain `make check` targets — because the
+# plan's verify commands were a *subset* of what the repository actually
+# enforces. The run reported success, the PR sat red, and the review that
+# followed cut five style issues without noticing the build was broken.
+#
+# Checked here rather than after delivery because here it costs one retry
+# with the rule quoted, and there it costs a PR, a review round and a human
+# noticing. Polling the PR's checks still catches what this cannot (anything
+# that only fails in CI's environment); this is the cheap half.
+GATE_TARGET = "check"
+# GNU make's own search order, so the file make would actually read is the
+# file this reads.
+MAKEFILE_NAMES = ("GNUmakefile", "makefile", "Makefile")
+_GATE_RULE = re.compile(rf"^{GATE_TARGET}\s*:", re.M)
+
+
+def project_gate(workspace: Path | None) -> str | None:
+    """The command running the project's whole gate, or None if it has none.
+
+    Only a ``check`` target in the makefile today. Deliberately narrow: a
+    convention the repository already declares is a fact, whereas guessing a
+    gate out of CI workflow YAML would invent requirements the project never
+    made — and a wrong requirement is unfixable by the executor, which
+    cannot edit verify commands.
+    """
+    if workspace is None:
+        return None
+    for name in MAKEFILE_NAMES:
+        path = workspace / name
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _GATE_RULE.search(text):
+            return f"make {GATE_TARGET}"
+        # GNU make reads only the first makefile it finds; a later one with a
+        # check target is not the gate, so stop rather than keep looking.
+        return None
+    return None
+
+
+def runs_gate(command: str, gate: str) -> bool:
+    """Whether ``command`` invokes ``gate`` (``make check``).
+
+    Token-exact, so ``make check-fast`` and ``make precheck`` do not pass for
+    ``make check``. A command may carry flags and extra targets — ``make -j4
+    check lint`` is still running the gate.
+    """
+    program, _, target = gate.partition(" ")
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return any(word == program and target in words[index + 1 :] for index, word in enumerate(words))
+
+
 def lint_verify_commands(
-    commands: Sequence[str], languages: Sequence[str], *, uv_project: bool = False
+    commands: Sequence[str],
+    languages: Sequence[str],
+    *,
+    uv_project: bool = False,
+    gate: str | None = None,
 ) -> list[str]:
     """Violation messages for ``commands`` under the run's toolchains.
 
@@ -254,7 +318,9 @@ def lint_verify_commands(
     verbatim: they name the offending command, the bare word, and the
     ecosystem's remedy. ``uv_project`` says the workspace carries a
     ``uv.lock``, which swaps the Python convention from ``.venv/bin/...``
-    to ``uv run`` (see the module docstring).
+    to ``uv run`` (see the module docstring). ``gate`` is the project's own
+    full check (see :func:`project_gate`); when the project declares one,
+    the verify commands must run it.
     """
     uv_python = uv_project and "python" in languages
     rules = [
@@ -283,4 +349,11 @@ def lint_verify_commands(
                         f"verify command `{command}` invokes bare `{head}` — {rule.remedy}"
                     )
                     break
+    if gate and not any(runs_gate(command, gate) for command in commands):
+        problems.append(
+            f"none of the verify commands runs `{gate}`, this project's own gate — "
+            "the checks it bundles are what CI enforces on the pull request, so "
+            "work that skips it lands red. Add it as a verify command; keep the "
+            "narrower ones too if they give a faster signal."
+        )
     return problems
