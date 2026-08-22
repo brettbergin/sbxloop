@@ -30,8 +30,10 @@ from urllib.parse import quote
 
 from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
 from sbxloop.daemon.postmortem import postmortem_marker
+from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, collect_review
+from sbxloop.engine.model import RunRecord
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import GithubOps
+from sbxloop.gh.ops import GithubOps, SubmittedReview
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -775,6 +777,23 @@ class GitHubIssueSource:
             title=title,
         )
 
+    def post_review(
+        self, run: RunRecord, pr_number: int, origin_run_id: str
+    ) -> SubmittedReview | None:
+        """Post a finished review run's verdict to the PR it reviewed.
+
+        The counterpart to :meth:`file_review`, which queues the work: this
+        is where its output lands. On the PR, not in the tracker — filing
+        review findings as issues is the behaviour being replaced.
+        """
+        return collect_review(
+            run,
+            ops=self._ops(),
+            repo=self.repo,
+            pr_number=pr_number,
+            origin_run_id=origin_run_id,
+        )
+
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
         """Open a review of a PR the loop just delivered, as an audit charter:
         the loop evaluating the code it wrote."""
@@ -786,9 +805,8 @@ class GitHubIssueSource:
             "clone — check out the PR's branch to run its tests). Look for: defects and "
             "wrong behaviour, missing edge cases and tests, scope drift from the issue, "
             "unjustified claims in the PR body, style that contradicts the repository's "
-            "conventions, and anything a reviewer would block on. Each real problem is one "
-            "finding with Evidence (file:line in the diff), Repro, Proposal, Size, Kind. If "
-            "the PR is fine, say so and file nothing — a clean review is a valid result.\n\n"
+            "conventions, and anything a reviewer would block on.\n\n"
+            f"{REVIEW_INSTRUCTIONS}\n\n"
             f"<!-- sbxloop-review {run_id} -->"
         )
         ref = self._ops().issue_create(
