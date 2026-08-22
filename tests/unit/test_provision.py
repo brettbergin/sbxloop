@@ -323,7 +323,7 @@ class TestEnsurePair:
         # both sandboxes' secrets land; the github probe then dies at the
         # sbx level twice, which fails provisioning loudly
         fake_sbx.script(
-            "exec sbxloop-r1-github sh -lc test -n",
+            "exec sbxloop-r1-github sh -lc v=",
             returncode=1,
             stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
         )
@@ -837,7 +837,7 @@ class TestSecretEnvVerification:
         monkeypatch.delenv("GH_TOKEN", raising=False)
         # every probe attempt (including the retry) dies at the sbx level
         fake_sbx.script(
-            "exec sbxloop-r1-agent sh -lc test -n",
+            "exec sbxloop-r1-agent sh -lc v=",
             returncode=1,
             stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
         )
@@ -868,7 +868,7 @@ class TestSecretEnvVerification:
         # first probe attempt hits a transient sbx failure; the retry gets
         # the real fake's clean "invisible" answer -> normal fallback
         fake_sbx.fail_next(
-            "exec sbxloop-r1-agent sh -lc test -n",
+            "exec sbxloop-r1-agent sh -lc v=",
             returncode=1,
             stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
         )
@@ -887,11 +887,69 @@ class TestSecretEnvVerification:
         finally:
             pair.cleanup()
 
+    def test_a_proxy_sentinel_under_exec_falls_back_like_an_absent_one(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Field failure 2026-08-21: sbx exported its proxy sentinel into the
+        exec environment. `test -n` called that "visible" and skipped the
+        fallback, so the agent got a token-shaped hole and every session died
+        with a 401. A sentinel is not a credential — fall back."""
+        # The fake runs exec for real, so the host env IS the sandbox env.
+        # Both roles get a sentinel: the pair provisions in parallel and both
+        # probes write the same verdict key, so mixing answers would make the
+        # cached value a coin toss (the same race behind the long-standing
+        # flake in test_ensure_pair_records_field_verdicts).
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "sbx-cs-Xrz8X47IcldsQVJ0")
+        monkeypatch.setenv("GH_TOKEN", "sbx-cs-Xrz8X47IcldsQVJ0")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            fallback = [
+                e
+                for e in events
+                if e.type == "sandbox.secret_env_fallback"
+                and e.data["env"] == "COPILOT_GITHUB_TOKEN"
+            ]
+            assert fallback, "a sentinel must trigger the in-VM env-file fallback"
+            assert "sentinel" in fallback[0].data["message"]
+            assert not [e for e in events if e.type == "sandbox.secret_probe_error"]
+            from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, load_verdicts
+
+            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "sentinel-under-exec"
+        finally:
+            pair.cleanup()
+
+    def test_a_real_token_under_exec_keeps_it_out_of_the_vm(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other side of the same branch: when the proxy really does
+        deliver the value, there is nothing to heal and no env file."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_realtokenshapedvalue")
+        monkeypatch.setenv("GH_TOKEN", "gho_realtokenshapedvalue")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert not [e for e in events if e.type == "sandbox.secret_env_fallback"]
+            from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, load_verdicts
+
+            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "visible-under-exec"
+        finally:
+            pair.cleanup()
+
     def test_ambiguous_probe_exit_code_fails_loudly(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        # `test -n` answers with 0 or 1; anything else is not an answer
-        fake_sbx.script("exec sbxloop-r1-agent sh -lc test -n", returncode=3)
+        # the probe answers 0 (usable), 1 (unset) or 3 (sentinel); anything
+        # else is not an answer
+        fake_sbx.script("exec sbxloop-r1-agent sh -lc v=", returncode=5)
         provisioner = make_provisioner(fake_sbx, tmp_path)
         with pytest.raises(ProvisionError, match="without a clean answer"):
             provisioner.ensure_pair("r1")
@@ -913,7 +971,7 @@ class TestSecretEnvVerification:
         pair = provisioner.ensure_pair("r1")
         try:
             assert not [e for e in events if "secret_env" in e.type]
-            checks = [c for c in fake_sbx.invocations("exec") if any("test -n" in a for a in c)]
+            checks = [c for c in fake_sbx.invocations("exec") if any('v="$' in a for a in c)]
             assert checks == []
         finally:
             pair.cleanup()

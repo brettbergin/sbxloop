@@ -921,18 +921,20 @@ class TestDoctor:
         import time as time_module
 
         from sbxloop.sbx.conformance import (
-            PROBE_SECRET_ENV_VISIBILITY,
+            PROBE_WORKSPACE_MOUNT,
             ProbeRecord,
             save_verdicts,
         )
 
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        # A probe that still carries an `expected`; secret-env-visibility now
+        # carries None, since provisioning auto-heals every answer.
         save_verdicts(
             workdir / ".sbxloop",
             "0.38.0",
             {
-                PROBE_SECRET_ENV_VISIBILITY: ProbeRecord(
-                    verdict="visible-under-exec", checked_at=time_module.time()
+                PROBE_WORKSPACE_MOUNT: ProbeRecord(
+                    verdict="harvest-only", checked_at=time_module.time()
                 )
             },
         )
