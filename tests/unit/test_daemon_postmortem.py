@@ -215,15 +215,17 @@ class TestDeliveryReviews:
         front = RecordingFrontend()
         h.loop.frontend = front  # type: ignore[assignment]
         h.source.items = [gh_item()]
-        assert h.loop.tick().outcome == "done"
+        # A delivered patch with a review queued is not done: it waits for
+        # that PR to be green and the review satisfied (the acceptance gate).
+        assert h.loop.tick().outcome == "reviewing"
         assert h.source.reviews == [("gh:4", 9, h.runs[0][0])]  # type: ignore[attr-defined]
-        assert front.seen[-1] == (
+        assert front.seen[-2] == (
             "🔎 review [#801](https://github.com/o/r/issues/801) filed for PR"
             " [#9](https://x/pull/9) · gh:4"
         )
         run_id = h.runs[0][0]
         assert h.dstore.review_filed(run_id)
-        report = next(c[1] for c in h.source.calls if c[0] == "success")
+        report = h.loop._report(run_id, None)
         h.loop._file_review(gh_item(), run_id, report)  # never twice
         assert len(h.source.reviews) == 1  # type: ignore[attr-defined]
 

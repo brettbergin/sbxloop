@@ -420,6 +420,17 @@ class DaemonConfig(_ConfigModel):
     # drift) and filing findings for a human to promote.
     review_deliveries: bool = True
     reviews_per_day: int = 5
+    # Hold a delivered item open until its PR is green and its review is
+    # satisfied, instead of settling it the moment a PR exists. That
+    # settling is how PR #389 was marked done with `mdformat` and
+    # `security` failing.
+    #
+    # The item is never stuck: `review_rounds` bounds how many polls find
+    # the PR still unsatisfied before the item fails with the PR link and a
+    # notice, handing it to a human. A poll is one tick, so the wall-clock
+    # budget is roughly `review_rounds * poll_interval_s`.
+    await_review: bool = True
+    review_rounds: int = 20
     # Where findings ABOUT THE TOOL (sbxloop's planner, prompts, lint,
     # delivery) go — the tool's own tracker, never the project's. Unset:
     # such findings are only noted in the closing comment.
@@ -499,6 +510,7 @@ class DaemonConfig(_ConfigModel):
             "backlog_max_per_run",
             "postmortems_per_day",
             "reviews_per_day",
+            "review_rounds",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"daemon.{name} must be >= 1")

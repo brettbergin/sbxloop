@@ -24,7 +24,7 @@ from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, Tas
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
-from sbxloop.gh.ops import SubmittedReview
+from sbxloop.gh.ops import ChecksVerdict, SubmittedReview
 from tests.fakes.github_errors import field_error
 from tests.unit.test_hostgit import make_repo, make_upstream_and_clone, push_upstream_commit
 
@@ -1868,3 +1868,135 @@ class TestReviewGoesToThePr:
         h.loop._collect_backlog = lambda run_id, source: ["inbox:finding-a"]  # type: ignore[method-assign]
         assert h.loop.tick().outcome == "done"
         assert h.source.calls[-1][1].filed == ("inbox:finding-a",)
+
+
+class ReviewingSource(FakeSource):
+    """A github-shaped source that files reviews and answers PR state."""
+
+    name = "github"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.checks = ChecksVerdict("green", 2, (), ())
+        self.review_state = "APPROVED"
+        self.polls = 0
+
+    def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
+        self.calls.append(("file_review", pr_number))
+        return f"gh:{pr_number + 100}"
+
+    def pr_state(self, pr_number: int) -> tuple[ChecksVerdict, str]:
+        self.polls += 1
+        return self.checks, self.review_state
+
+
+class TestAcceptanceGate:
+    """A delivered PR is not done until it is green and its review is
+    satisfied. Settling on "a PR exists" is how #389 was marked done with
+    `mdformat` and `security` failing.
+    """
+
+    def _delivered(self, tmp_path: Path, **daemon: object) -> tuple[Harness, ReviewingSource]:
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": dict({"await_review": True}, **daemon),
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
+        assert h.loop.tick().outcome == "reviewing"
+        return h, source
+
+    def test_a_delivered_item_waits_instead_of_settling(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        # The source issue is NOT closed yet: the work is not accepted.
+        assert not any(kind == "success" for kind, _ in source.calls)
+        assert ("file_review", 9) in [(k, v) for k, v in source.calls]
+
+    def test_green_and_approved_is_accepted(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert any(kind == "success" for kind, _ in source.calls)
+
+    def test_pending_checks_keep_waiting(self, tmp_path: Path) -> None:
+        """Pending is not green. Reading "no failures yet" as success is the
+        whole bug."""
+        h, source = self._delivered(tmp_path)
+        source.checks = ChecksVerdict("pending", 2, ("test",), ())
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_red_checks_keep_waiting(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        source.checks = ChecksVerdict("red", 2, (), ("mdformat",))
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_changes_requested_keeps_waiting_even_when_green(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        source.review_state = "CHANGES_REQUESTED"
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_a_review_that_cannot_gate_does_not_wait_for_an_approval(self, tmp_path: Path) -> None:
+        """A review the repo would only accept as a COMMENT never produces an
+        approval; waiting for one would strand every item."""
+        h, source = self._delivered(tmp_path)
+        h.dstore.set_review_gates(h.dstore.get("gh:1").run_id, False)  # type: ignore[union-attr,arg-type]
+        source.review_state = "NONE"
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+
+    def test_a_gating_review_does_wait_for_its_approval(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        h.dstore.set_review_gates(h.dstore.get("gh:1").run_id, True)  # type: ignore[union-attr,arg-type]
+        source.review_state = "NONE"
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_the_round_budget_hands_it_to_a_human(self, tmp_path: Path) -> None:
+        """Nothing may wait forever: past the budget the item fails with the
+        PR named, rather than sitting in the queue unnoticed."""
+        h, source = self._delivered(tmp_path, review_rounds=2)
+        source.checks = ChecksVerdict("red", 1, (), ("security",))
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
+        for _ in range(3):
+            h.loop.tick()
+        item = h.dstore.get("gh:1")
+        # ``abandoned``, the daemon's give-up state: terminal, no retry, and
+        # it keeps the run pinned for forensics.
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "#9" in (item.last_error or "")  # type: ignore[union-attr]
+        assert any("not accepted" in t for t in front.seen)
+
+    def test_an_item_with_no_recorded_review_is_not_stranded(self, tmp_path: Path) -> None:
+        h, _ = self._delivered(tmp_path)
+        run_id = h.dstore.get("gh:1").run_id  # type: ignore[union-attr]
+        h.dstore._conn.execute("DELETE FROM daemon_reviews WHERE run_id = ?", (run_id,))
+        h.dstore._conn.commit()
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+
+    def test_the_gate_can_be_turned_off(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": {"await_review": False},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
+        assert h.loop.tick().outcome == "done"
+        assert source.polls == 0
