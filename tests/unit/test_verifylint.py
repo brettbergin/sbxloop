@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from sbxloop.verifylint import (
     command_heads,
+    gate_rule,
     lint_verify_commands,
     project_gate,
     runs_gate,
@@ -372,3 +374,93 @@ class TestGateRule:
         assert len(problems) == 2
         assert any("bare `pytest`" in p for p in problems)
         assert any("make check" in p for p in problems)
+
+
+class TestGateDetectionAcrossEcosystems:
+    """The gate is per-ecosystem knowledge, like LANGUAGE_RULES above.
+
+    Detecting only one project's convention would silently switch the whole
+    PR-validity guarantee off for every repository that does something else —
+    it would look like a feature and be a no-op.
+    """
+
+    def test_a_makefile_target(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").write_text("check: lint\n\t@echo\n")
+        assert project_gate(tmp_path) == "make check"
+
+    def test_ci_counts_as_a_gate_too(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").write_text("build:\n\t@echo\nci:\n\t@echo\n")
+        assert project_gate(tmp_path) == "make ci"
+
+    def test_test_alone_is_not_a_gate(self, tmp_path: Path) -> None:
+        """`check` and `ci` name the whole gate by convention; `test` is one
+        part of it, and demanding it would let a lint-failing PR through
+        while looking satisfied."""
+        (tmp_path / "Makefile").write_text("test:\n\t@echo\n")
+        assert project_gate(tmp_path) is None
+
+    def test_a_justfile(self, tmp_path: Path) -> None:
+        (tmp_path / "justfile").write_text("check:\n    echo hi\n")
+        assert project_gate(tmp_path) == "just check"
+
+    def test_a_taskfile(self, tmp_path: Path) -> None:
+        (tmp_path / "Taskfile.yml").write_text(
+            "version: '3'\ntasks:\n  ci:\n    cmds:\n      - echo\n"
+        )
+        assert project_gate(tmp_path) == "task ci"
+
+    def test_an_npm_script(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"check": "vitest"}}))
+        assert project_gate(tmp_path) == "npm run check"
+
+    def test_tox_and_nox_are_their_own_gate(self, tmp_path: Path) -> None:
+        (tmp_path / "tox.ini").write_text("[tox]\n")
+        assert project_gate(tmp_path) == "tox"
+        other = tmp_path / "n"
+        other.mkdir()
+        (other / "noxfile.py").write_text("import nox\n")
+        assert project_gate(other) == "nox"
+
+    def test_a_project_declaring_nothing_is_held_to_nothing(self, tmp_path: Path) -> None:
+        """A guessed requirement is worse than none: the executor cannot edit
+        verify commands, so a gate we invented is unsatisfiable."""
+        assert project_gate(tmp_path) is None
+
+    def test_malformed_declarations_do_not_raise(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text("{{{ not json")
+        assert project_gate(tmp_path) is None
+
+    def test_the_operator_override_wins(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").write_text("check:\n\t@echo\n")
+        assert project_gate(tmp_path, "cargo make ci") == "cargo make ci"
+
+    def test_an_empty_override_switches_the_requirement_off(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").write_text("check:\n\t@echo\n")
+        assert project_gate(tmp_path, "") is None
+
+
+class TestGateMatchingAcrossEcosystems:
+    def test_flags_and_extra_arguments_are_fine(self) -> None:
+        assert runs_gate("npm run check --silent", "npm run check")
+        assert runs_gate("make -j4 check lint", "make check")
+        assert runs_gate("tox -e py313", "tox")
+
+    def test_a_similarly_named_target_is_not_the_gate(self) -> None:
+        assert not runs_gate("npm run check-fast", "npm run check")
+        assert not runs_gate("just precheck", "just check")
+
+    def test_a_single_word_gate_needs_only_its_program(self) -> None:
+        assert runs_gate("tox", "tox")
+        assert runs_gate("nox", "nox")
+        assert not runs_gate("pytest", "tox")
+
+
+class TestGateRuleText:
+    def test_it_names_the_projects_actual_gate(self) -> None:
+        """A template that named one convention would be wrong everywhere
+        else — and would teach the model to invent it."""
+        assert "just ci" in gate_rule("just ci")
+        assert "make check" not in gate_rule("just ci")
+
+    def test_no_gate_says_so_rather_than_demanding_one(self) -> None:
+        assert "no single gate" in gate_rule(None)

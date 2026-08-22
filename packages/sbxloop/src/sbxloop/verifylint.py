@@ -35,9 +35,10 @@ shape and ``uv run`` is not demanded.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -246,35 +247,39 @@ def command_heads(command: str) -> list[str]:
     return heads
 
 
-# The project's own gate. Field failure: a delivered PR (#389) failed
-# `mdformat` and `security` — both plain `make check` targets — because the
-# plan's verify commands were a *subset* of what the repository actually
-# enforces. The run reported success, the PR sat red, and the review that
-# followed cut five style issues without noticing the build was broken.
+# The project's own gate: the one command that runs everything the project
+# holds itself to. Field failure: a delivered PR (#389) failed `mdformat` and
+# `security` because the plan's verify commands were a *subset* of what the
+# repository enforces. The run reported success, the PR sat red, and the
+# review that followed cut five style issues without noticing the build was
+# broken.
 #
-# Checked here rather than after delivery because here it costs one retry
-# with the rule quoted, and there it costs a PR, a review round and a human
+# Checked at JSON acceptance rather than after delivery: here it costs one
+# retry with the rule quoted, there it costs a PR, a review round and a human
 # noticing. Polling the PR's checks still catches what this cannot (anything
 # that only fails in CI's environment); this is the cheap half.
-GATE_TARGET = "check"
-# GNU make's own search order, so the file make would actually read is the
-# file this reads.
-MAKEFILE_NAMES = ("GNUmakefile", "makefile", "Makefile")
-_GATE_RULE = re.compile(rf"^{GATE_TARGET}\s*:", re.M)
+#
+# Detection is a table of conventions, like LANGUAGE_RULES above — a gate is
+# per-ecosystem knowledge, and hardcoding one project's shape would silently
+# switch the guarantee off for every repository that does something else.
+# Each detector answers only when the project *declares* the gate itself.
+# Nothing is inferred from CI workflow files: a requirement invented from a
+# YAML we half-understood is unfixable by the executor, which cannot edit
+# verify commands.
+#
+# `check` and `ci` only, never `test`: those two name the whole gate by
+# convention, whereas `test` is one part of it and demanding it would let a
+# lint-failing PR through while looking satisfied.
+GATE_TARGETS = ("check", "ci")
 
 
-def project_gate(workspace: Path | None) -> str | None:
-    """The command running the project's whole gate, or None if it has none.
+def _target_gate(workspace: Path, files: Sequence[str], pattern: str, command: str) -> str | None:
+    """First declared target in the first of ``files`` that exists.
 
-    Only a ``check`` target in the makefile today. Deliberately narrow: a
-    convention the repository already declares is a fact, whereas guessing a
-    gate out of CI workflow YAML would invent requirements the project never
-    made — and a wrong requirement is unfixable by the executor, which
-    cannot edit verify commands.
+    Only the first file is consulted: make, just and task each read one, so
+    a target in a shadowed file is not the gate the tool would run.
     """
-    if workspace is None:
-        return None
-    for name in MAKEFILE_NAMES:
+    for name in files:
         path = workspace / name
         try:
             if not path.is_file():
@@ -282,27 +287,141 @@ def project_gate(workspace: Path | None) -> str | None:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if _GATE_RULE.search(text):
-            return f"make {GATE_TARGET}"
-        # GNU make reads only the first makefile it finds; a later one with a
-        # check target is not the gate, so stop rather than keep looking.
+        for target in GATE_TARGETS:
+            if re.search(pattern.format(target=re.escape(target)), text, re.M):
+                return command.format(target=target)
         return None
     return None
 
 
+def _make_gate(workspace: Path) -> str | None:
+    # GNU make's own search order.
+    return _target_gate(
+        workspace, ("GNUmakefile", "makefile", "Makefile"), r"^{target}\s*:", "make {target}"
+    )
+
+
+def _just_gate(workspace: Path) -> str | None:
+    return _target_gate(
+        workspace, ("justfile", ".justfile", "Justfile"), r"^{target}\s*:", "just {target}"
+    )
+
+
+def _task_gate(workspace: Path) -> str | None:
+    # Taskfile targets are YAML keys under `tasks:`, so a two-space indent is
+    # the shape rather than a line start.
+    return _target_gate(
+        workspace, ("Taskfile.yml", "Taskfile.yaml"), r"^\s+{target}\s*:", "task {target}"
+    )
+
+
+def _npm_gate(workspace: Path) -> str | None:
+    path = workspace / "package.json"
+    try:
+        scripts = json.loads(path.read_text(encoding="utf-8", errors="replace")).get("scripts")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(scripts, dict):
+        return None
+    for target in GATE_TARGETS:
+        if target in scripts:
+            return f"npm run {target}"
+    return None
+
+
+def _tox_gate(workspace: Path) -> str | None:
+    # tox and nox declare the whole matrix in one file; running the bare
+    # command IS the gate, so presence is the whole signal.
+    return "tox" if (workspace / "tox.ini").is_file() else None
+
+
+def _nox_gate(workspace: Path) -> str | None:
+    return "nox" if (workspace / "noxfile.py").is_file() else None
+
+
+# Order matters only where a repo declares more than one; the first is taken.
+# Task runners come before language runners because a repo carrying both has
+# usually made the task runner the front door.
+GATE_DETECTORS: tuple[Callable[[Path], str | None], ...] = (
+    _make_gate,
+    _just_gate,
+    _task_gate,
+    _npm_gate,
+    _tox_gate,
+    _nox_gate,
+)
+
+
+def project_gate(workspace: Path | None, override: str | None = None) -> str | None:
+    """The command running this project's whole gate, or None if it has none.
+
+    ``override`` is the operator's answer (``[sandbox] gate_command``) and
+    wins over every detector — the escape hatch for a project whose gate no
+    convention describes, and, set to an empty string, the way to say "this
+    project has no gate" and switch the requirement off.
+
+    A project that declares nothing gets nothing required of it. A guessed
+    requirement is worse than none: the executor cannot edit verify commands,
+    so a gate we invented is unsatisfiable.
+    """
+    if override is not None:
+        return override.strip() or None
+    if workspace is None:
+        return None
+    for detect in GATE_DETECTORS:
+        gate = detect(workspace)
+        if gate:
+            return gate
+    return None
+
+
+def gate_rule(gate: str | None) -> str:
+    """The decompose prompt's gate paragraph, naming *this* project's gate.
+
+    Rendered rather than written into the template because the gate is not
+    a constant: `make check` here, `just ci` or `npm run check` elsewhere,
+    and nothing at all in a project that declares none. A template that
+    named one convention would be wrong everywhere else — and would teach
+    the model to invent that convention where it does not exist.
+    """
+    if not gate:
+        return (
+            "- This project declares no single gate command, so none is required. "
+            "Choose verify commands that actually check each task."
+        )
+    return (
+        f"- One task's `verify_commands` MUST run this project's own gate: "
+        f"`{gate}`. That gate is what CI enforces on the pull request, so work "
+        f"that never runs it lands red. One task carrying it is enough — the "
+        f"last task is usually the right one — and narrower commands on other "
+        f"tasks are still worth having for a faster signal. This is enforced "
+        f"mechanically, like the conventions above."
+    )
+
+
 def runs_gate(command: str, gate: str) -> bool:
-    """Whether ``command`` invokes ``gate`` (``make check``).
+    """Whether ``command`` invokes ``gate``.
 
     Token-exact, so ``make check-fast`` and ``make precheck`` do not pass for
-    ``make check``. A command may carry flags and extra targets — ``make -j4
-    check lint`` is still running the gate.
+    ``make check``. A command may carry flags and extra arguments — ``make
+    -j4 check lint`` and ``npm run check --silent`` both still run the gate.
+    A single-word gate (``tox``, ``nox``) needs only its program.
     """
-    program, _, target = gate.partition(" ")
     try:
         words = shlex.split(command)
+        wanted = shlex.split(gate)
     except ValueError:
         return False
-    return any(word == program and target in words[index + 1 :] for index, word in enumerate(words))
+    if not wanted:
+        return False
+    program, rest = wanted[0], wanted[1:]
+    for index, word in enumerate(words):
+        if word != program:
+            continue
+        after = words[index + 1 :]
+        if all(token in after for token in rest):
+            return True
+    return False
 
 
 def lint_verify_commands(

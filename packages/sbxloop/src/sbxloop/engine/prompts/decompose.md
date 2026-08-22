@@ -17,7 +17,7 @@ tests/unit/test_prompts.py):
 - This comment block is stripped by sbxloop.engine.prompts.render before the
   prompt reaches the model; everything below it is sent verbatim.
 
-Variables: $outcome, $max_tasks; $retry_context (defaulted to "" by render()).
+Variables: $outcome, $max_tasks, $project_gate; $retry_context (defaulted to "" by render()).
 -->
 
 # Decompose an outcome into a task graph
@@ -56,6 +56,7 @@ $outcome
   are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
   Never `sudo` or `apt` in a verify command: verification checks the work,
   it does not build the environment.
+  $project_gate
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
 

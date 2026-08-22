@@ -2029,3 +2029,41 @@ class TestAcceptanceGate:
         source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
         assert h.loop.tick().outcome == "done"
         assert source.polls == 0
+
+    def test_a_poll_that_keeps_failing_hands_the_item_over(self, tmp_path: Path) -> None:
+        """The one outcome an unattended daemon must never produce is a
+        silently parked item. A poll that cannot reach GitHub still costs a
+        round, so a persistent failure ends the way any unaccepted PR does:
+        handed to a human, out loud."""
+        h, source = self._delivered(tmp_path, review_rounds=1)
+
+        def boom(pr_number: int) -> tuple[ChecksVerdict, str]:
+            raise RuntimeError("github is down")
+
+        source.pr_state = boom  # type: ignore[assignment]
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "abandoned"  # type: ignore[union-attr]
+        assert any("could not read PR" in t for t in front.seen)
+
+    def test_one_failed_poll_does_not_give_up(self, tmp_path: Path) -> None:
+        """A blip is not a verdict: the item keeps waiting and recovers when
+        the next poll succeeds."""
+        h, source = self._delivered(tmp_path)
+        calls = {"n": 0}
+        real = source.pr_state
+
+        def flaky(pr_number: int) -> tuple[ChecksVerdict, str]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient")
+            return real(pr_number)
+
+        source.pr_state = flaky  # type: ignore[assignment]
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        h.loop.tick()  # recovers: files the review
+        assert source.reviews == [9]
