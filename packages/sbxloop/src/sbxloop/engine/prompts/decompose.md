@@ -56,6 +56,12 @@ $outcome
   are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
   Never `sudo` or `apt` in a verify command: verification checks the work,
   it does not build the environment.
+- A `python -c` verify payload must be one line of `;`-separated simple
+  statements; anything needing `try`/`except`, `if`, loops, `def`, or
+  `pytest.raises` goes in a pytest test file the verify command runs.
+  Multi-line `-c` payloads get emitted with `\n` escapes and die with
+  `SyntaxError: unexpected character after line continuation character`
+  no matter how correct the code under test is.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
 

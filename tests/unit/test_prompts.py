@@ -403,6 +403,34 @@ def test_plan_and_execute_render_standing_guidance() -> None:
         assert "always use postgres" in text
 
 
+def test_prompts_forbid_multi_statement_python_c_payloads() -> None:
+    """#353: in run rpjx3h89q task t2 the planner emitted a `-c` payload that
+    needed `try`/`except`, could not fit on one line, and was written with
+    `\\n` escapes — it died with a SyntaxError regardless of the code under
+    test. Both prompts that write verify commands must state the rule."""
+    plan = render(
+        "plan",
+        outcome="o",
+        task_id="t1",
+        task_title="T",
+        task_description="d",
+        acceptance_criteria="- c",
+        feedback="(none)",
+        user_guidance="(none)",
+    )
+    decompose = render("decompose", outcome="o", max_tasks="3")
+    for text in (plan, decompose):
+        assert "python -c" in text
+        assert "`;`-separated" in text
+        assert "single line" in text or "one line" in text
+        # control flow is named explicitly, not left to inference
+        for marker in ("`try`/`except`", "`if`", "loops", "`def`"):
+            assert marker in text, f"missing control-flow marker {marker!r}"
+        assert "pytest test file" in text
+        # the concrete consequence, so the rule reads as evidence not style
+        assert "SyntaxError: unexpected character after line continuation character" in text
+
+
 def test_bullet_list() -> None:
     assert bullet_list([]) == "(none)"
     assert bullet_list(["a", "b"]) == "- a\n- b"

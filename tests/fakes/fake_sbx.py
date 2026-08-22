@@ -282,6 +282,18 @@ def cmd_exec(root: Path, args: list[str]) -> int:
     home = fs / "home/agent"
     home.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    # A real sandbox is a separate microVM: the host's environment is not
+    # the guest's, and field-confirmed sbx proxy secrets never reach exec'd
+    # processes. Token env vars must therefore not leak in from the host —
+    # on a machine with GH_TOKEN exported, provisioning's visibility probe
+    # (`test -n "$GH_TOKEN"`) succeeded for a secret sbx never injected,
+    # recording "visible-under-exec" and failing the conformance test
+    # nondeterministically (the two sandboxes probe on parallel threads, so
+    # which verdict landed raced). Tests that need the visible-secret
+    # semantics opt in explicitly with SBX_FAKE_VISIBLE_SECRETS.
+    if not os.environ.get("SBX_FAKE_VISIBLE_SECRETS"):
+        for leaked in ("GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"):
+            env.pop(leaked, None)
     env["HOME"] = str(home)
     env["SBX_FAKE_FS"] = str(fs)
     # A real sandbox is a Linux microVM. On a macOS host, bsdtar serializes
