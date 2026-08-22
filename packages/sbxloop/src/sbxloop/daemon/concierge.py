@@ -716,7 +716,7 @@ class Concierge:
         )
         text = plain(reply.text)
         if reply.status is not None:
-            text += "\n" + json.dumps(reply.status, default=str)
+            text += "\n" + _status_detail(reply.status)
         if not reply.ok:
             text = f"(command not accepted) {text}"
         return text
@@ -1386,6 +1386,24 @@ def _iso_age(stamp: str, now: float) -> str:
     except ValueError:
         return "?"
     return _age(now - then)
+
+
+def _status_detail(status: dict[str, Any]) -> str:
+    """The ``status`` fields its reply text does not spell out, as prose.
+
+    The concierge answers the channel in chat markdown, so it is handed
+    prose rather than the raw status dict — a JSON blob in a tool result is
+    a JSON blob the model may paste into Discord, next to the same numbers
+    it just wrote in words.
+    """
+    current = status.get("current") or {}
+    bits: list[str] = []
+    if current.get("item_id"):
+        bits.append(f"current work item: {current['item_id']}")
+    bits.append(f"consecutive failures: {status.get('consecutive_failures', 0)}")
+    if status.get("stopping"):
+        bits.append("the daemon is shutting down")
+    return " · ".join(bits)
 
 
 def _looks_like_lost_session(exc: BaseException) -> bool:

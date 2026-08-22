@@ -38,6 +38,7 @@ from sbxloop.daemon.discord_format import (
     repetitive_streak,
     split_markdown,
     status_embed,
+    strip_json_payload,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.events import Event
@@ -105,6 +106,46 @@ class TestSplitMarkdown:
         assert all(not _fence_state(p)[0] for p in parts)
 
 
+class TestStripJsonPayload:
+    """The engine's copy of a structured reply never reaches the channel."""
+
+    def test_payload_only_reply_leaves_nothing(self) -> None:
+        assert strip_json_payload('```json\n{"verdict": "accept"}\n```') == ""
+        # untagged, but the body is a JSON document all the same
+        assert strip_json_payload('```\n{"steps": ["a"]}\n```') == ""
+        # an unterminated fence still runs to the end of the reply
+        assert strip_json_payload('here it is\n```json\n{"a": 1,') == "here it is"
+
+    def test_narration_survives_on_either_side(self) -> None:
+        assert (
+            strip_json_payload('The executor added a test.\n\n```json\n{"v": "accept"}\n```')
+            == "The executor added a test."
+        )
+        assert strip_json_payload('```json\n{"v": "reject"}\n```\n\nMy ruling.') == "My ruling."
+        assert (
+            strip_json_payload('a\n```json\n{"x":1}\n```\nb\n```json\n{"y":2}\n```\nc') == "a\nb\nc"
+        )
+
+    def test_unfenced_payload_is_stripped_only_when_it_ends_the_reply(self) -> None:
+        assert strip_json_payload('Here is the plan:\n{"steps": ["a"]}') == "Here is the plan:"
+        # mid-prose braces are prose, not a payload
+        text = 'The config uses {"a": 1} inline and continues after.'
+        assert strip_json_payload(text) == text
+
+    def test_code_the_agent_is_talking_about_is_not_a_payload(self) -> None:
+        shell = "Ran this:\n\n```bash\nuv run pytest\n```\n\nAll green."
+        assert strip_json_payload(shell) == shell
+        python = '```python\nd = {"a": 1}\n```'
+        assert strip_json_payload(python) == python
+        checklist = "Done:\n- [x] parser\n- [ ] docs"
+        assert strip_json_payload(checklist) == checklist
+
+    def test_empty_and_plain_text(self) -> None:
+        assert strip_json_payload("") == ""
+        assert strip_json_payload("  \n ") == ""
+        assert strip_json_payload("plain prose") == "plain prose"
+
+
 class TestFormat:
     def test_agent_message_header_and_split(self) -> None:
         chunks = format_for_discord(
@@ -117,6 +158,16 @@ class TestFormat:
         )
         assert len(many) > 1 and many[1].text.startswith(f"**executor** *(cont. 2/{len(many)})*")
         assert format_for_discord(ev("agent.message", content="  ")) == []
+        # a structured phase's payload is dropped; its narration is not
+        assert (
+            format_for_discord(ev("agent.message", content='```json\n{"verdict": "accept"}\n```'))
+            == []
+        )
+        assert texts(
+            format_for_discord(
+                ev("agent.message", content='Looks good.\n```json\n{"v": 1}\n```', agent="critic")
+            )
+        ) == ["**critic**\nLooks good."]
 
     def test_noise_dropped_at_every_level(self) -> None:
         for level in ("quiet", "normal", "verbose"):

@@ -16,6 +16,7 @@ bridge sends every message with mentions disabled instead, so a stray
 
 from __future__ import annotations
 
+import json
 import re
 import socket
 from collections import deque
@@ -307,6 +308,79 @@ def _close(chunks: list[list[str]], part: list[str], inside: bool) -> None:
     if inside:
         part.append("```")
     chunks.append(part)
+
+
+# -- structured payload -----------------------------------------------------------------
+
+# A bare JSON document starts at the left margin of its own line: models that
+# skip the fence write "Here is the plan:" and then the object.
+_JSON_OPENER_RE = re.compile(r"^[ \t]*([{\[])", re.MULTILINE)
+_json_decoder = json.JSONDecoder()
+
+
+def _is_json_doc(text: str) -> bool:
+    """True when ``text`` is exactly one JSON object or array."""
+    try:
+        return isinstance(json.loads(text.strip()), dict | list)
+    except (ValueError, RecursionError):
+        return False
+
+
+def strip_json_payload(text: str) -> str:
+    """``text`` without the machine-readable JSON the engine already read.
+
+    Every structured phase — decompose, plan, scrutinize, validate, steer —
+    asks its agent for one fenced JSON block, and agents narrate around it.
+    The engine parses that block and the bridge already renders what it
+    *means*: the status line, the phase lines, the steering reply, the
+    report card. Posting the block as well says the same thing twice, in
+    the shape a human reads least — so the thread keeps the narration and
+    drops the payload, and a reply that was payload only leaves nothing to
+    post at all. The block is not lost: it is in the run's event store
+    (``sbxloop logs``) and the phase ledger.
+
+    Mirrors :func:`sbxloop_worker._json.extract_json` in what it counts as
+    the payload — fenced blocks first (tagged ``json``, or simply parsing
+    as one), then a bare document running to the end of the reply.
+    """
+    lines = text.splitlines()
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        match = _FENCE_RE.match(lines[i])
+        if match is None:
+            kept.append(lines[i])
+            i += 1
+            continue
+        marker, lang = match.group(1), match.group(2)
+        close = i + 1
+        while close < len(lines) and not lines[close].strip().startswith(marker):
+            close += 1
+        # An unterminated fence runs to the end of the message; its body is
+        # everything after the opener and there is no closer to keep.
+        end = min(close + 1, len(lines))
+        if lang.lower() != "json" and not _is_json_doc("\n".join(lines[i + 1 : close])):
+            kept.extend(lines[i:end])
+        i = end
+    return _strip_bare_json("\n".join(kept)).strip()
+
+
+def _strip_bare_json(text: str) -> str:
+    """``text`` without an unfenced JSON document that ends it.
+
+    The fence scan alone would let the payload through when the agent skips
+    the fence — the field failure ``extract_json`` grew its prose fallback
+    for. Anchored at a line start and required to run to the end, so a list
+    item or a brace inside prose is never mistaken for it.
+    """
+    for match in _JSON_OPENER_RE.finditer(text):
+        try:
+            value, end = _json_decoder.raw_decode(text, match.start(1))
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, dict | list) and not text[end:].strip():
+            return text[: match.start()]
+    return text
 
 
 # -- tool batching --------------------------------------------------------------------------
@@ -755,6 +829,9 @@ def format_for_discord(
     (verbose: every call, batched into code blocks) or a ``ToolDigest``
     (normal: one summary line per burst, edited in place); the same goes
     for the task/phase events the ``StatusLine`` absorbs at the normal level.
+    Agent messages arrive without their JSON payload
+    (:func:`strip_json_payload`) — the channel gets the narration, not the
+    engine's copy of what it already rendered.
     """
     if event.type in _TRANSCRIPT_SKIP:
         return []
@@ -762,7 +839,9 @@ def format_for_discord(
     t = event.type
     verbose = level == "verbose"
     if t == "agent.message":
-        content = str(data.get("content") or "").strip()
+        # The narration only: the structured phases' JSON payload is the
+        # engine's copy, and the bridge renders what it means elsewhere.
+        content = strip_json_payload(str(data.get("content") or ""))
         if not content:
             return []
         who = str(data.get("agent") or "agent")
@@ -1219,4 +1298,5 @@ __all__ = [
     "refs_text",
     "split_markdown",
     "status_embed",
+    "strip_json_payload",
 ]

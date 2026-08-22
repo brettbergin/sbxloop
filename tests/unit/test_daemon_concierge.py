@@ -11,7 +11,6 @@ covered separately (test_worker_client / test_daemon_agentbox).
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -336,8 +335,10 @@ class TestTools:
         pause, status = client.responses
         assert pause.ok and "paused" in pause.text
         assert status.ok and "queued" in status.text
-        # status carries the raw dict as JSON on the second line
-        assert json.loads(status.text.splitlines()[-1])["paused"] is True
+        # what the reply text does not spell out follows it as prose, not as a
+        # JSON blob the concierge could paste into the channel
+        assert "{" not in status.text and "consecutive failures: 0" in status.text
+        assert "paused: True" in status.text
 
     def test_sbx_control_bad_verb_is_not_accepted(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(

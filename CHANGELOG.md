@@ -177,6 +177,27 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- Discord: an agent's **JSON payload no longer reaches the channel**. Every
+  structured phase — decompose, plan, scrutinize, validate, steer — asks its
+  agent for one fenced JSON block and gets narration around it, and the bridge
+  posted both: the block, and the rendering of what the engine parsed out of it
+  (the status line, the phase lines, the steering reply, the report card). The
+  same facts twice, one of them in the shape a human reads least, split across
+  several messages when the plan was large. Agent messages now arrive as their
+  narration only; a reply that was payload only posts nothing at all. Detection
+  mirrors `sbxloop_worker._json.extract_json` — fenced blocks tagged `json` or
+  simply parsing as one, then a bare document running to the end of the reply —
+  so an unfenced payload and a `bash` block the agent is talking about are told
+  apart. Nothing is lost: the block is still in the run's event store
+  (`sbxloop logs`) and the phase ledger.
+
+- Concierge: the `sbx_control` tool no longer appends the raw status dict as
+  JSON to its own reply text. A JSON blob in a tool result is a JSON blob the
+  model may paste into Discord, next to the same numbers it just wrote in
+  words; the two fields the text did not spell out (current work item,
+  consecutive failures) follow it as prose instead. The prompt's style rules
+  now say it outright: answer in prose, never in raw JSON.
+
 - Discord: steering a run now takes an **@mention of the bot in that run's
   thread** (or a reply to one of its messages there), the same rule the
   control channel already used. Previously *every* message in a run thread
