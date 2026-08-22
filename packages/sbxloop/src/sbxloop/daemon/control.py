@@ -79,6 +79,10 @@ class CommandReply(NamedTuple):
     # True: the daemon took the request but had not answered when the client
     # stopped waiting — the command is executing, its outcome is unknown.
     pending: bool = False
+    # True: refused for predating the daemon's start, never executed. Carried
+    # structurally rather than sniffed out of ``text`` so the client can
+    # resend without matching on prose.
+    stale: bool = False
 
 
 # Item verbs talk to GitHub through the ops sandbox (#229): a live `abandon`
@@ -234,6 +238,17 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _reply_from(data: dict[str, Any]) -> CommandReply:
+    """Decode a reply file. ``stale`` defaults False so a reply written by an
+    older daemon (which had no such field) reads as a normal refusal rather
+    than sending the client into a resend loop."""
+    return CommandReply(
+        str(data.get("text", "")),
+        bool(data.get("ok", True)),
+        stale=bool(data.get("stale", False)),
+    )
+
+
 def _operator() -> str:
     """Who to attribute a ctl cancel/retry to on the source (#246) — the
     login name when the OS knows it, so a GitHub comment reads
@@ -256,8 +271,34 @@ class ControlClient:
         act on it (module docstring). Returns a ``pending`` reply when the
         daemon claimed it but had not answered in time: the command is
         running (item verbs cross the ops sandbox) and cannot be withdrawn,
-        so the caller must not report "not executed"."""
+        so the caller must not report "not executed".
+
+        A request that lands while a daemon is still starting is refused as
+        stale and **resent** — with a fresh stamp — for as long as the
+        caller's budget lasts. The refusal exists to stop a command of
+        *unknown age* executing at boot, and its own text says "resend it";
+        a client that is still sitting here waiting is by definition
+        current, so resending preserves the guarantee rather than eroding
+        it. Without this a restart is a live trap for every caller: the
+        window runs from ``systemctl start`` until the control server
+        starts, which is deliberately after ``loop.recover()`` and so lasts
+        as long as recovery does — over a minute on a daemon with orphaned
+        runs to reconcile, which is exactly the state a restart creates. It
+        cost a good release a rollback (deploy of 0.7.23): the health check
+        submitted 56s before recovery finished, and the deploy read the
+        refusal as "the daemon never came up" while the daemon was healthy.
+        A daemon that never starts still fails, at the caller's deadline.
+        """
         self.dir.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            reply = self._attempt(cmd, deadline)
+            if reply is None or not reply.stale or time.monotonic() >= deadline:
+                return reply
+            log.debug("ctl.resending", cmd=cmd, reason="refused as stale; daemon was starting")
+
+    def _attempt(self, cmd: str, deadline: float) -> CommandReply | None:
+        """One submit-and-wait round, bounded by the shared ``deadline``."""
         # Time-prefixed so the server serves requests in submission order.
         req_id = f"{time.time():.6f}-{uuid.uuid4().hex[:8]}"
         request = self.dir / f"{req_id}{_REQUEST_SUFFIX}"
@@ -273,14 +314,13 @@ class ControlClient:
                 "submitted_at": time.time(),
             },
         )
-        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if reply.exists():
                 try:
                     data = json.loads(reply.read_text())
                 finally:
                     reply.unlink(missing_ok=True)
-                return CommandReply(str(data.get("text", "")), bool(data.get("ok", True)))
+                return _reply_from(data)
             time.sleep(0.05)
         try:
             request.unlink()
@@ -289,9 +329,9 @@ class ControlClient:
             if reply.exists():
                 data = json.loads(reply.read_text())
                 reply.unlink(missing_ok=True)
-                return CommandReply(str(data.get("text", "")), bool(data.get("ok", True)))
+                return _reply_from(data)
             return CommandReply(
-                f"the daemon took `{cmd}` but has not answered within {timeout_s:g}s; "
+                f"the daemon took `{cmd}` but has not answered in time; "
                 "it is still executing (item verbs go through the ops sandbox) — "
                 "check `sbxloop daemon ctl items`.",
                 ok=False,
@@ -350,7 +390,9 @@ class ControlServer:
         ]
 
     _STALE = CommandReply(
-        "ignored: this request was submitted before the daemon started; resend it.", ok=False
+        "ignored: this request was submitted before the daemon started; resend it.",
+        ok=False,
+        stale=True,
     )
 
     def _refuse_stale(self) -> None:
@@ -425,7 +467,15 @@ class ControlServer:
     def _answer(self, request: Path, reply: CommandReply) -> None:
         stem = request.name.removesuffix(_CLAIMED_SUFFIX).removesuffix(_REQUEST_SUFFIX)
         reply_path = request.with_name(stem + _REPLY_SUFFIX)
-        _write_atomic(reply_path, {"ok": reply.ok, "text": reply.text, "answered_at": time.time()})
+        _write_atomic(
+            reply_path,
+            {
+                "ok": reply.ok,
+                "text": reply.text,
+                "answered_at": time.time(),
+                "stale": reply.stale,
+            },
+        )
         request.unlink(missing_ok=True)
 
     def _sweep_replies(self) -> None:

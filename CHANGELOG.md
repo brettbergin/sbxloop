@@ -6,6 +6,34 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ctl` no longer reports a starting daemon as an absent one** — which cost
+  the 0.7.23 deploy a rollback of a perfectly healthy release. The control
+  server starts only *after* `loop.recover()` (deliberately: an `abandon` or
+  `requeue` served while recovery is still settling the item it snapshotted
+  would be overwritten by recovery's own verdict), so every request submitted
+  in between is swept as "submitted before the daemon started". That window is
+  as long as recovery takes — 67s on the failed deploy, which had four orphaned
+  runs to reconcile and a concierge sandbox to re-provision, and orphaned runs
+  are exactly what a restart creates. The deploy's health check submitted 56s
+  before recovery finished, read the refusal as "the daemon never came up", and
+  rolled back; the daemon reached `daemon.started` one millisecond after
+  refusing it.
+
+  A longer timeout could not have helped: the request is *answered*, not left
+  pending, so any budget failed the same way. `ControlClient` now resends —
+  with a fresh stamp — for as long as the caller's budget lasts, which is what
+  the refusal's own text ("resend it") always asked for and nothing did. The
+  stale verdict rides on the reply structurally (`CommandReply.stale`) rather
+  than being matched out of its prose, and a reply from a daemon predating the
+  field reads as a plain refusal rather than sending the client into a loop.
+  The guarantee is unchanged: the guard exists to stop a command of *unknown
+  age* firing at boot, and a client still sitting in `submit()` is by
+  definition current. A daemon that never starts still fails, at the deadline.
+  The deploy's own `ctl status` budget goes 60s → 300s to cover a slow
+  recovery.
+
 ### Added
 
 - Concierge: **`run_usage`** and **`usage_today`** put Copilot spend in chat
