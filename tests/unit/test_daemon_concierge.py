@@ -258,6 +258,7 @@ class TestJobShape:
             "version_status",
             "run_usage",
             "usage_today",
+            "daemon_log",
         ]  # no github_get: no repo configured; the rest need nothing
         assert job.host_tools_dir is None  # the WorkerClient fills it in
         assert job.system_message and "sbxloop concierge" in job.system_message
@@ -1213,3 +1214,153 @@ class TestQueueing:
         assert concierge._warm is not None
         concierge._warm.join(5)
         assert host.client_calls == 1
+
+
+class TestDaemonLogTool:
+    """The journal without ssh: the concierge quotes the daemon's own recent
+    log lines out of the bounded in-process ring buffer."""
+
+    @pytest.fixture(autouse=True)
+    def _buffer(self) -> Any:
+        from sbxloop.log import log_buffer
+
+        log_buffer().clear()
+        yield
+        log_buffer().clear()
+
+    def _seed(self) -> None:
+        from sbxloop.log import LogRecordLine, log_buffer
+
+        for level, logger, line in [
+            ("INFO", "sbxloop.daemon.loop", "daemon.idle queued=0 sbxq"),
+            ("WARNING", "sbxloop.daemon.loop", "breaker open failures=3 sbxq"),
+            ("ERROR", "sbxloop.gh.poll", "github.poll_failed status=502 sbxq"),
+        ]:
+            log_buffer().append(LogRecordLine("2026-01-01T00:00:00+00:00", level, logger, line))
+
+    def _call(self, tmp_path: Path, args: dict[str, Any]) -> str:
+        concierge, client, _, _, _ = make(tmp_path, [{"calls": [("daemon_log", args)]}])
+        turn(concierge, "why is nothing running?")
+        (response,) = client.responses
+        assert response.ok
+        return response.text or ""
+
+    def test_registered_and_quotes_recent_lines(self, tmp_path: Path) -> None:
+        self._seed()
+        text = self._call(tmp_path, {"grep": "sbxq"})
+        assert text.startswith("showing 3 of ")
+        assert "daemon.idle queued=0 sbxq" in text
+        assert "breaker open failures=3 sbxq" in text
+        assert "github.poll_failed status=502 sbxq" in text
+        # oldest-first, one record per line
+        lines = text.splitlines()[1:]
+        assert len(lines) == 3
+        assert "daemon.idle" in lines[0] and "github.poll_failed" in lines[2]
+        assert lines[0].startswith("2026-01-01T00:00:00+00:00 INFO sbxloop.daemon.loop ")
+
+    def test_level_filter_is_at_or_above(self, tmp_path: Path) -> None:
+        self._seed()
+        text = self._call(tmp_path, {"level": "error", "grep": "sbxq"})
+        assert "github.poll_failed" in text
+        assert "daemon.idle" not in text and "breaker open" not in text
+        assert "level=ERROR" in text
+
+    def test_grep_is_a_plain_substring(self, tmp_path: Path) -> None:
+        self._seed()
+        text = self._call(tmp_path, {"grep": "breaker open"})
+        assert "breaker open failures=3 sbxq" in text and "daemon.idle" not in text
+        # A regex-ish needle matches nothing rather than being compiled.
+        assert "no matching log records" in self._call(tmp_path, {"grep": "(a+)+b"})
+        assert "no matching log records" in self._call(tmp_path, {"grep": "daemon.*idle"})
+
+    def test_invalid_level_is_a_friendly_error(self, tmp_path: Path) -> None:
+        self._seed()
+        text = self._call(tmp_path, {"level": "TRACE", "grep": "sbxq"})
+        assert "unknown log level 'TRACE'" in text and "DEBUG, INFO, WARNING, ERROR" in text
+
+    def test_no_match_says_so(self, tmp_path: Path) -> None:
+        self._seed()
+        text = self._call(tmp_path, {"grep": "nothing-matches-this"})
+        assert text.startswith("no matching log records (grep='nothing-matches-this')")
+        assert "the buffer holds " in text
+
+    def test_tail_is_clamped(self, tmp_path: Path) -> None:
+        from sbxloop.log import LogRecordLine, log_buffer
+
+        for i in range(600):
+            log_buffer().append(LogRecordLine("t", "INFO", "l", f"sbxline {i}"))
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("daemon_log", {"tail": 9999, "grep": "sbxline"})]}],
+            config={"concierge": {"max_tool_result_chars": 20000}},
+        )
+        turn(concierge)
+        (response,) = client.responses
+        text = response.text or ""
+        assert len(text.splitlines()) == 501  # header + at most 500 records
+        assert "sbxline 599" in text and "sbxline 99 " not in text
+
+    def test_tool_result_is_clipped(self, tmp_path: Path) -> None:
+        from sbxloop.log import LogRecordLine, log_buffer
+
+        for i in range(400):
+            log_buffer().append(LogRecordLine("t", "INFO", "logger", f"line {i} " + "x" * 100))
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("daemon_log", {"tail": 500})]}],
+            config={"concierge": {"max_tool_result_chars": 1000}},
+        )
+        turn(concierge)
+        (response,) = client.responses
+        assert len(response.text or "") <= 1000  # _clip's hard bound
+        assert (response.text or "").endswith("… (truncated)")
+
+    @pytest.fixture
+    def _logging(self) -> Any:
+        """Real logging into the ring buffer, torn down afterwards."""
+        import io
+
+        from sbxloop.log import configure_logging
+
+        configure_logging("DEBUG", fmt="console", stream=io.StringIO())
+        yield
+        configure_logging("INFO")
+
+    def _emit(self) -> None:
+        from sbxloop.log import get_logger
+
+        log = get_logger("sbxloop.daemon.loop")
+        log.debug("daemon.tick", marker="sbxq")
+        log.info("daemon.idle", queued=0, marker="sbxq")
+        log.warning("breaker.open", failures=3, marker="sbxq")
+        get_logger("sbxloop.gh.poll").error("github.poll_failed", status=502, marker="sbxq")
+
+    def test_real_log_records_reach_the_tool(self, tmp_path: Path, _logging: Any) -> None:
+        self._emit()
+        text = self._call(tmp_path, {"grep": "sbxq", "tail": 50})
+        assert "daemon.idle" in text
+        assert "breaker.open" in text
+        assert "github.poll_failed" in text
+
+    def test_real_records_honour_the_level_filter(self, tmp_path: Path, _logging: Any) -> None:
+        self._emit()
+        text = self._call(tmp_path, {"level": "warning", "grep": "sbxq"})
+        assert "level=WARNING" in text
+        assert "breaker.open" in text and "github.poll_failed" in text
+        assert "daemon.idle" not in text and "daemon.tick" not in text
+
+    def test_real_records_grep_is_literal(self, tmp_path: Path, _logging: Any) -> None:
+        self._emit()
+        text = self._call(tmp_path, {"grep": "breaker.open"})
+        assert "breaker.open" in text
+        assert "daemon.idle" not in text and "github.poll_failed" not in text
+        regexish = self._call(tmp_path, {"grep": "breaker\\.op.*"})
+        assert regexish.startswith("no matching log records")
+
+    def test_daemon_log_is_advertised(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{}])
+        turn(concierge)
+        specs = {spec.name: spec for spec in client.jobs[0].host_tools}
+        assert "daemon_log" in specs
+        properties = specs["daemon_log"].parameters["properties"]
+        assert {"tail", "level", "grep"} <= set(properties)

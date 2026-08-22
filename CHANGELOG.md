@@ -38,6 +38,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **The concierge can read the daemon's recent log lines in chat.** "Why is
+  nothing running?" used to be answerable only over ssh — the state store
+  knows what a run is doing, but says nothing about `sbx` invocations, GitHub
+  polls, breaker state changes or worker errors, all of which live in the
+  journal. `configure_logging` now installs a bounded in-process ring buffer
+  handler (a `deque` of the last 2000 already-rendered, already-redacted
+  lines: no locks, no I/O, no unbounded growth in a long-lived daemon), and
+  the new `daemon_log(tail, level, grep)` host tool reads it. `level` filters
+  at or above a threshold, `grep` is a plain case-insensitive substring rather
+  than a regex, and the output is clipped to `[concierge] max_tool_result_chars` like every other tool result. It is the journal
+  without ssh, not a replacement for it: lines older than the buffer, or from
+  a previous daemon process, still need `journalctl`.
+
 - **A run must prove the project's own gate before it delivers.** PR #389 was
   delivered green-looking and sat red: `mdformat` and `security` failing, both
   plain `make check` targets. The plan's verify commands were a *subset* of
