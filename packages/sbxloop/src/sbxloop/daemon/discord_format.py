@@ -16,6 +16,7 @@ bridge sends every message with mentions disabled instead, so a stray
 
 from __future__ import annotations
 
+import json
 import re
 import socket
 from collections import deque
@@ -307,6 +308,79 @@ def _close(chunks: list[list[str]], part: list[str], inside: bool) -> None:
     if inside:
         part.append("```")
     chunks.append(part)
+
+
+# -- structured payload -----------------------------------------------------------------
+
+# A bare JSON document starts at the left margin of its own line: models that
+# skip the fence write "Here is the plan:" and then the object.
+_JSON_OPENER_RE = re.compile(r"^[ \t]*([{\[])", re.MULTILINE)
+_json_decoder = json.JSONDecoder()
+
+
+def _is_json_doc(text: str) -> bool:
+    """True when ``text`` is exactly one JSON object or array."""
+    try:
+        return isinstance(json.loads(text.strip()), dict | list)
+    except (ValueError, RecursionError):
+        return False
+
+
+def strip_json_payload(text: str) -> str:
+    """``text`` without the machine-readable JSON the engine already read.
+
+    Every structured phase — decompose, plan, scrutinize, validate, steer —
+    asks its agent for one fenced JSON block, and agents narrate around it.
+    The engine parses that block and the bridge already renders what it
+    *means*: the status line, the phase lines, the steering reply, the
+    report card. Posting the block as well says the same thing twice, in
+    the shape a human reads least — so the thread keeps the narration and
+    drops the payload, and a reply that was payload only leaves nothing to
+    post at all. The block is not lost: it is in the run's event store
+    (``sbxloop logs``) and the phase ledger.
+
+    Mirrors :func:`sbxloop_worker._json.extract_json` in what it counts as
+    the payload — fenced blocks first (tagged ``json``, or simply parsing
+    as one), then a bare document running to the end of the reply.
+    """
+    lines = text.splitlines()
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        match = _FENCE_RE.match(lines[i])
+        if match is None:
+            kept.append(lines[i])
+            i += 1
+            continue
+        marker, lang = match.group(1), match.group(2)
+        close = i + 1
+        while close < len(lines) and not lines[close].strip().startswith(marker):
+            close += 1
+        # An unterminated fence runs to the end of the message; its body is
+        # everything after the opener and there is no closer to keep.
+        end = min(close + 1, len(lines))
+        if lang.lower() != "json" and not _is_json_doc("\n".join(lines[i + 1 : close])):
+            kept.extend(lines[i:end])
+        i = end
+    return _strip_bare_json("\n".join(kept)).strip()
+
+
+def _strip_bare_json(text: str) -> str:
+    """``text`` without an unfenced JSON document that ends it.
+
+    The fence scan alone would let the payload through when the agent skips
+    the fence — the field failure ``extract_json`` grew its prose fallback
+    for. Anchored at a line start and required to run to the end, so a list
+    item or a brace inside prose is never mistaken for it.
+    """
+    for match in _JSON_OPENER_RE.finditer(text):
+        try:
+            value, end = _json_decoder.raw_decode(text, match.start(1))
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, dict | list) and not text[end:].strip():
+            return text[: match.start()]
+    return text
 
 
 # -- tool batching --------------------------------------------------------------------------
@@ -755,6 +829,9 @@ def format_for_discord(
     (verbose: every call, batched into code blocks) or a ``ToolDigest``
     (normal: one summary line per burst, edited in place); the same goes
     for the task/phase events the ``StatusLine`` absorbs at the normal level.
+    Agent messages arrive without their JSON payload
+    (:func:`strip_json_payload`) — the channel gets the narration, not the
+    engine's copy of what it already rendered.
     """
     if event.type in _TRANSCRIPT_SKIP:
         return []
@@ -762,7 +839,9 @@ def format_for_discord(
     t = event.type
     verbose = level == "verbose"
     if t == "agent.message":
-        content = str(data.get("content") or "").strip()
+        # The narration only: the structured phases' JSON payload is the
+        # engine's copy, and the bridge renders what it means elsewhere.
+        content = strip_json_payload(str(data.get("content") or ""))
         if not content:
             return []
         who = str(data.get("agent") or "agent")
@@ -771,6 +850,18 @@ def format_for_discord(
         cont = f"**{who}** *(cont. {{i}}/{{n}})*"
         return [
             block(part) for part in split_markdown(content, max_chars, header=header, cont=cont)
+        ]
+    if t == HostEventTypes.RUN_TASKS:
+        return [block(part) for part in split_markdown(roster_text(data), max_chars)]
+    if t == HostEventTypes.PHASE_PLAN:
+        return [
+            block(part)
+            for part in split_markdown(plan_text(data), max_chars, cont="🗺 *(cont. {i}/{n})*")
+        ]
+    if t == HostEventTypes.PHASE_VERDICT:
+        return [
+            block(part)
+            for part in split_markdown(verdict_text(data), max_chars, cont="🔎 *(cont. {i}/{n})*")
         ]
     if t == HostEventTypes.RUN_REPORT:
         return [line(f"📋 tracking issue {link(f'#{data.get("issue")}', data.get('url'))}")]
@@ -884,6 +975,107 @@ def format_for_discord(
             return []
         return [line(f"· {t} {_one_line(' '.join(f'{k}={v}' for k, v in data.items()), 200)}")]
     return []
+
+
+# -- what the structured phases decided ------------------------------------------------
+
+# The three phases that answer in JSON also decide the three things a human
+# watching a thread most wants to read: what the run will do, how a task will
+# be done, and why a critic sent it back. Their replies are not posted (see
+# strip_json_payload), so the engine emits the parsed decision as its own
+# event and these render it.
+
+TASK_STATE_MARKER = {"done": "✅", "failed": "❌", "skipped": "⏭"}
+VERDICT_MARKER = {  # nosec B105 - "pass" is the scrutinizer's verdict, not a credential
+    "pass": "✅",
+    "accept": "✅",
+    "revise": "♻",
+    "reject": "❌",
+}
+SEVERITY_MARKER = {"high": "🔴", "medium": "🟠", "low": "⚪"}
+# What a plan/verdict field is worth in the chronology before it is a wall of
+# text; the whole card is still split across messages if it needs to be.
+DECISION_ITEM_CLIP = 300
+
+
+def _list(data: dict[str, Any], key: str) -> list[Any]:
+    """``data[key]`` when it is a list — event data is agent-shaped, so a
+    renderer never assumes a field arrived in the shape it was emitted in."""
+    value = data.get(key)
+    return value if isinstance(value, list) else []
+
+
+def roster_text(data: dict[str, Any]) -> str:
+    """The task roster the run will work, one line per task.
+
+    Posted once when the graph is known (and again on resume, where each
+    task carries the state it was left in).
+    """
+    tasks = _list(data, "tasks")
+    lines = [f"🧩 **{len(tasks)} task(s)**"]
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            continue
+        marker = TASK_STATE_MARKER.get(str(task.get("state") or ""), "")
+        head = f"{index}. " + (f"{marker} " if marker else "")
+        after = [str(d) for d in _list(task, "depends_on") if d]
+        tail = f" — after {', '.join(code(d) for d in after)}" if after else ""
+        lines.append(
+            f"{head}{code(task.get('id'))} {_one_line(task.get('title') or '', 120)}{tail}"
+        )
+    return "\n".join(lines)
+
+
+def plan_text(data: dict[str, Any]) -> str:
+    """One task's plan: the steps, then what the plan promised about them."""
+    attempt = int(data.get("attempt") or 1)
+    head = f"🗺 **plan** · task {code(data.get('task_id'))}"
+    if attempt > 1:
+        head += f" *(replan {attempt})*"
+    lines = [head]
+    steps = _list(data, "steps")
+    for index, step in enumerate(steps, start=1):
+        text = _one_line(str(step or ""), DECISION_ITEM_CLIP)
+        if text:
+            lines.append(f"{index}. {text}")
+    if not steps:
+        lines.append("· (no steps)")
+    for label, key in (("expects", "expected_artifacts"), ("verify", "verify_commands")):
+        joined = " · ".join(
+            code(_one_line(str(v), 120)) for v in _list(data, key) if str(v).strip()
+        )
+        if joined:
+            lines.append(f"**{label}:** {joined}")
+    egress = _list(data, "egress")
+    for grant in egress:
+        if isinstance(grant, dict) and grant.get("domain"):
+            reason = _one_line(str(grant.get("reason") or ""), 160)
+            lines.append(
+                f"**egress:** {code(grant['domain'])}" + (f" — {reason}" if reason else "")
+            )
+    return "\n".join(lines)
+
+
+def verdict_text(data: dict[str, Any]) -> str:
+    """A critic's ruling: the call, what it found, and what it asked for."""
+    verdict = str(data.get("verdict") or "")
+    phase = str(data.get("phase") or "critic")
+    marker = VERDICT_MARKER.get(verdict, "🔎")
+    lines = [f"{marker} **{phase}: {verdict}** · task {code(data.get('task_id'))}"]
+    issues = _list(data, "issues")
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        detail = _one_line(str(issue.get("detail") or ""), DECISION_ITEM_CLIP)
+        if not detail:
+            continue
+        severity = str(issue.get("severity") or "medium")
+        lines.append(f"{SEVERITY_MARKER.get(severity, '·')} **{severity}** — {detail}")
+    feedback = str(data.get("feedback") or "").strip()
+    if feedback:
+        # Quoted: it is what the executor is about to be told, verbatim.
+        lines.append("\n".join(f"> {ln}" for ln in _clip(feedback, 900).splitlines()))
+    return "\n".join(lines)
 
 
 # -- headline / finish / status cards --------------------------------------------------
@@ -1214,9 +1406,13 @@ __all__ = [
     "link",
     "mask_urls",
     "nolink",
+    "plan_text",
     "queue_lines",
     "ref_link",
     "refs_text",
+    "roster_text",
     "split_markdown",
     "status_embed",
+    "strip_json_payload",
+    "verdict_text",
 ]

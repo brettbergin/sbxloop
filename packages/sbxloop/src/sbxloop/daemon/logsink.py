@@ -13,9 +13,10 @@ Tiers (:func:`level_for`):
 - WARNING — the run degraded or something was refused: worker errors,
   tooling/resource warnings, permission denials, the tool-call cap,
   config drift.
-- INFO — lifecycle: ``run.*``, task and phase start/state/end, sandbox
-  provisioning, worker job start/end/result, GitHub op start/end,
-  policy denials, chat (steering) traffic, gc.
+- INFO — lifecycle: ``run.*``, task and phase start/state/end, what the
+  structured phases decided (plan, critic verdict), sandbox provisioning,
+  worker job start/end/result, GitHub op start/end, policy denials, chat
+  (steering) traffic, gc.
 - DEBUG — everything else: individual tool calls, agent messages and
   deltas, usage, heartbeats, stdout, resource samples, policy allows,
   op progress.
@@ -57,6 +58,8 @@ INFO_TYPES: frozenset[str] = frozenset(
         HostEventTypes.TASK_END,
         HostEventTypes.PHASE_START,
         HostEventTypes.PHASE_END,
+        HostEventTypes.PHASE_PLAN,
+        HostEventTypes.PHASE_VERDICT,
         HostEventTypes.POLICY_DENY,
         HostEventTypes.SANDBOX_PROVISION_START,
         HostEventTypes.SANDBOX_READY,
