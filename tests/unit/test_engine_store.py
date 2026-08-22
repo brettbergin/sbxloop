@@ -290,3 +290,31 @@ class TestReconciliation:
         store.close()
 
         assert StateStore(db).get_run("old").state == "failed"
+
+
+class TestWriterSerialization:
+    """One connection is shared by every caller (``check_same_thread=False``),
+    and ``append_event_if_state`` holds an explicit ``BEGIN IMMEDIATE`` across
+    a state check and an insert. Any writer that commits without the lock ends
+    that transaction early and silently defeats the atomicity the claim needs
+    — which is how the daemon's ``reconcile_run`` (called from cancellation,
+    on a different thread from the engine) slipped through.
+    """
+
+    def test_every_committing_method_holds_the_lock(self) -> None:
+        import inspect
+        import re
+
+        from sbxloop.engine import store as store_module
+
+        source = inspect.getsource(store_module).split("\n")
+        current, lock_at, unguarded = None, -1, []
+        for i, line in enumerate(source):
+            match = re.match(r"    def (\w+)", line)
+            if match:
+                current, lock_at = match.group(1), -1
+            if "with self._lock:" in line:
+                lock_at = i
+            if "_conn.commit()" in line and lock_at < 0 and current != "__init__":
+                unguarded.append(current)
+        assert not unguarded, f"writers commit without self._lock: {unguarded}"

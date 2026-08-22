@@ -453,6 +453,42 @@ class TestTools:
         # The backend reports tokens, never cost: say so rather than show 0.
         assert "cost: not reported" in resp.text and "0.00" not in resp.text
 
+    def test_run_usage_breaks_spend_down_by_turns_jobs_and_cache(self, tmp_path: Path) -> None:
+        """Turns — not jobs — are what a run is billed and timed by: every turn
+        re-sends the whole session context. A persona that is expensive because
+        it takes many turns must be distinguishable from one that is expensive
+        because it runs many times, and the cache column says how much of the
+        input was actually re-billed."""
+        concierge, client, _, loop, dstore = make(
+            tmp_path, [{"calls": [("run_usage", {"run_id": "r1abcdefg"})]}]
+        )
+        store = self._seed_run(tmp_path, dstore, loop)
+        from sbxloop.events import Event
+
+        # One executor job of two turns, plus a second job of one turn.
+        for job, tokens in (("jaaa", 1200), ("jaaa", 800), ("jbbb", 500)):
+            store.append_event(
+                Event.now(
+                    "agent.usage",
+                    "r1abcdefg",
+                    job_id=job,
+                    model="claude-opus-5",
+                    input_tokens=tokens,
+                    output_tokens=90,
+                    cache_read_tokens=100,
+                    cost=0.25,
+                    agent="executor",
+                )
+            )
+        turn(concierge, "what did r1abcdefg cost?")
+        (resp,) = client.responses
+        assert resp.ok
+        assert "3 turns/2 jobs" in resp.text
+        assert "300 cached" in resp.text
+        # Cost is reported by the backend now, so it must be shown, not denied.
+        assert "cost: 0.7500" in resp.text
+        assert "cost: not reported" not in resp.text
+
     def test_a_run_without_usage_events_says_not_recorded(self, tmp_path: Path) -> None:
         """Acceptance: runs predating usage reporting answer "not recorded",
         which is not the same claim as zero spend."""

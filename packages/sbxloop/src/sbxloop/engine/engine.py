@@ -31,7 +31,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -161,6 +161,18 @@ class LoopEngine:
         # message happens on the engine thread when it is drained.
         self._chat_queue: queue.SimpleQueue[ChatMessage] = queue.SimpleQueue()
         self._steer_attempts = 0
+        # Held while one task lane drains the chat mailbox. Taken
+        # non-blocking: with several lanes in flight every one of them
+        # reaches a phase boundary, and the queue only needs draining once —
+        # a lane that finds the lock taken carries on rather than piling up
+        # behind an LLM round trip it does not need to wait for.
+        self._chat_lock = threading.Lock()
+        # Serialises the operations that act on the shared agent sandbox
+        # rather than on one task's own state: egress grants (which rewrite
+        # the sandbox's network policy) and artifact harvests (which copy the
+        # whole workspace out). Concurrent lanes would otherwise interleave
+        # inside them.
+        self._sandbox_lock = threading.RLock()
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
@@ -913,28 +925,95 @@ class LoopEngine:
                 for task in tasks
             ],
         )
-        failed_ids: set[str] = {t.spec.id for t in tasks if t.state == "failed"}
-        skipped_ids: set[str] = {t.spec.id for t in tasks if t.state == "skipped"}
-        for task in tasks:
-            if task.terminal:
-                failed_ids |= {task.spec.id} if task.state == "failed" else set()
-                continue
-            blocked = [d for d in task.spec.depends_on if d in failed_ids | skipped_ids]
-            if blocked:
-                task.state = "skipped"
-                skipped_ids.add(task.spec.id)
-                self.store.update_task(run_id, task)
-                self._emit_task_end(run_id, task)
-                continue
-            self._run_task(run_id, phases, task, deadline, pair, granter)
-            if task.state == "failed":
-                failed_ids.add(task.spec.id)
+        failed_ids, skipped_ids = self._schedule_tasks(
+            run_id, phases, tasks, deadline, pair, granter
+        )
 
         # Final drain: messages that arrived during the last phase still get
         # answered (as steer_run — there is no task left to steer).
         self._process_chat(run_id, phases, None)
         self._set_run_state(run_id, "finalizing")
         return "failed" if failed_ids or skipped_ids else "completed"
+
+    def _schedule_tasks(
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        tasks: Sequence[TaskRecord],
+        deadline: float,
+        pair: SandboxPair,
+        granter: EgressGranter,
+    ) -> tuple[set[str], set[str]]:
+        """Drive every non-terminal task, up to ``max_parallel_tasks`` at once.
+
+        ``tasks`` arrives in dependency order, so at ``max_parallel_tasks=1``
+        this walks it front to back and is exactly the serial loop it
+        replaces: the first non-terminal task always has its dependencies
+        behind it. Above 1, readiness is evaluated explicitly instead of
+        being implied by position — a task may start once every dependency
+        has *finished*, and is skipped if any of them failed or was skipped.
+
+        The first infrastructure error stops new launches but does not
+        abandon the lanes already running: they are allowed to finish so
+        their state is checkpointed (which is what makes the run resumable),
+        and the error is re-raised afterwards.
+        """
+        done_ids = {t.spec.id for t in tasks if t.state == "done"}
+        failed_ids = {t.spec.id for t in tasks if t.state == "failed"}
+        skipped_ids = {t.spec.id for t in tasks if t.state == "skipped"}
+        waiting = [t for t in tasks if not t.terminal]
+        lanes = max(1, self.config.budgets.max_parallel_tasks)
+
+        def finished(task: TaskRecord) -> None:
+            if task.state == "failed":
+                failed_ids.add(task.spec.id)
+            elif task.state == "skipped":
+                skipped_ids.add(task.spec.id)
+            else:
+                done_ids.add(task.spec.id)
+
+        def ready(task: TaskRecord) -> bool:
+            return all(dep in done_ids | failed_ids | skipped_ids for dep in task.spec.depends_on)
+
+        running: dict[Future[None], TaskRecord] = {}
+        failure: BaseException | None = None
+        pool = ThreadPoolExecutor(max_workers=lanes, thread_name_prefix=f"sbxloop-task-{run_id}")
+        try:
+            while waiting or running:
+                while waiting and len(running) < lanes and failure is None:
+                    task = next((t for t in waiting if ready(t)), None)
+                    if task is None:
+                        break
+                    waiting.remove(task)
+                    blocked = [d for d in task.spec.depends_on if d in failed_ids | skipped_ids]
+                    if blocked:
+                        task.state = "skipped"
+                        skipped_ids.add(task.spec.id)
+                        self.store.update_task(run_id, task)
+                        self._emit_task_end(run_id, task)
+                        continue
+                    running[
+                        pool.submit(self._run_task, run_id, phases, task, deadline, pair, granter)
+                    ] = task
+                if not running:
+                    # Nothing in flight and nothing launchable. Either every
+                    # task is accounted for, or a lane failed and stopped new
+                    # launches — the error is re-raised below. An acyclic
+                    # graph with no failure always leaves something ready, so
+                    # this is the normal exit, not a stall.
+                    break
+                for future in wait(running, return_when=FIRST_COMPLETED).done:
+                    task = running.pop(future)
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        failure = failure or exc
+                    finished(task)
+        finally:
+            pool.shutdown(wait=True)
+        if failure is not None:
+            raise failure
+        return failed_ids, skipped_ids
 
     # -- task state machine ------------------------------------------------
 
@@ -968,7 +1047,7 @@ class LoopEngine:
             # boundary cancellation uses — the agent pauses here, replies,
             # and any course change (re-plan, standing guidance) lands
             # before the next phase runs.
-            self._process_chat(run_id, phases, task)
+            self._process_chat(run_id, phases, self._steer_target(task))
             abort_reason = self._resource_abort_reason()
             if abort_reason:
                 # Fail the task with a diagnosis instead of letting the next
@@ -993,7 +1072,10 @@ class LoopEngine:
         # When harvest_mode is "final", skip the mid-run copy for cheaper
         # per-task cost on runs with large workspaces.
         if self.config.artifacts.harvest_mode == "per-task":
-            self._harvest(run_id, pair)
+            # Copies the whole workspace out of the shared sandbox; two lanes
+            # harvesting at once would interleave into the same directory.
+            with self._sandbox_lock:
+                self._harvest(run_id, pair)
         self._emit_task_end(run_id, task)
 
     def _phase_plan(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
@@ -1037,7 +1119,12 @@ class LoopEngine:
         # at plan time. Runs here (not in _phase_plan) so resumed tasks whose
         # persisted state skips planning still get their grants on the
         # freshly provisioned sandbox.
-        granter.apply(task.spec.id, [(egress.domain, egress.reason) for egress in task.plan.egress])
+        # The grant rewrites the shared sandbox's network policy, so lanes
+        # take it in turn rather than interleaving inside it.
+        with self._sandbox_lock:
+            granter.apply(
+                task.spec.id, [(egress.domain, egress.reason) for egress in task.plan.egress]
+            )
         started = time.time()
         result = phases.execute(task, task.plan)
         task.session_id = result.session_id
@@ -1354,7 +1441,22 @@ class LoopEngine:
         A failed steer never fails the run — the error rides on the
         ``chat.reply`` event and the message is dropped; real infrastructure
         breakage will surface loudly in the next phase anyway.
+
+        One lane at a time: every task lane reaches a phase boundary and
+        calls this, but the mailbox only needs draining once. The lock is
+        taken non-blocking so the lanes that lose the race carry straight on
+        into their next phase instead of queueing behind a steer session's
+        LLM round trip — the messages are still answered, by the lane that
+        holds it, and standing guidance lands before any lane's next prompt.
         """
+        if not self._chat_lock.acquire(blocking=False):
+            return
+        try:
+            self._drain_chat(run_id, phases, task)
+        finally:
+            self._chat_lock.release()
+
+    def _drain_chat(self, run_id: str, phases: PhaseRunner, task: TaskRecord | None) -> None:
         while True:
             try:
                 message = self._chat_queue.get_nowait()
@@ -1413,6 +1515,22 @@ class LoopEngine:
                 reply=verdict.reply,
                 action=action,
             )
+
+    def _steer_target(self, task: TaskRecord) -> TaskRecord | None:
+        """The task a steer verdict may re-plan, or None for run-level only.
+
+        Only a lone lane offers itself. With several in flight there is no
+        "current task": the lane that wins the chat lock is whichever
+        reached a phase boundary first, so steering it would re-plan an
+        arbitrary task rather than the one the operator meant. None routes
+        the verdict through the existing ``steer_task`` -> ``steer_run``
+        downgrade in :meth:`_apply_steer`, recording the guidance for every
+        later prompt instead of gambling on a lane. Steering one task by
+        name under parallelism needs an explicit target plus a barrier
+        holding that lane at its boundary until the verdict lands — a
+        feature to design, not a default to fall into.
+        """
+        return task if self.config.budgets.max_parallel_tasks == 1 else None
 
     def _apply_steer(
         self,

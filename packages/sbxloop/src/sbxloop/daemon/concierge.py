@@ -880,6 +880,12 @@ class Concierge:
         by_agent: dict[str, Usage] = {}
         models: list[str] = []
         samples = 0
+        # One `agent.usage` event is one assistant turn, and turns — not
+        # jobs — are what a run is billed and timed by: every turn re-sends
+        # the whole session context. Counting them per persona is how "where
+        # did it go?" gets an actionable answer instead of a token total.
+        turns: dict[str, int] = {}
+        jobs: dict[str, set[str]] = {}
         for _seq, event in self.store.events(run_id, type_prefix=EventTypes.AGENT_USAGE):
             if event.ts < since:
                 continue
@@ -887,10 +893,15 @@ class Concierge:
             total = total.merged(sample)
             who = str(event.data.get("agent") or "unknown")
             by_agent[who] = by_agent.get(who, Usage()).merged(sample)
+            turns[who] = turns.get(who, 0) + 1
+            if event.job_id:
+                jobs.setdefault(who, set()).add(event.job_id)
             if sample.model and sample.model not in models:
                 models.append(sample.model)
             samples += 1
-        return _RunUsage(total, by_agent, models, samples)
+        return _RunUsage(
+            total, by_agent, models, samples, turns, {k: len(v) for k, v in jobs.items()}
+        )
 
     def _tool_run_usage(self, args: dict[str, Any], by: str) -> str:
         run_id = str(args.get("run_id", "")).strip()
@@ -910,8 +921,8 @@ class Concierge:
                 "or its backend does not report it — this is not the same as zero spend."
             )
         lines = [f"run {run_id} · {usage.model_line} · {usage.samples} sample(s)"]
-        lines.extend(_usage_rows(usage.by_agent))
-        lines.append(_usage_row("total", usage.total))
+        lines.extend(_usage_rows(usage.by_agent, usage.turns_by_agent, usage.jobs_by_agent))
+        lines.append(_usage_row("total", usage.total, turns=usage.samples))
         lines.append(_cost_line(usage.total))
         return "\n".join(lines)
 
@@ -926,6 +937,7 @@ class Concierge:
             return f"cannot list runs: {_one_line(str(exc), 200)}"
         total = Usage()
         rows: dict[str, Usage] = {}
+        row_turns: dict[str, int] = {}
         models: list[str] = []
         samples = 0
         for record in runs:
@@ -934,6 +946,7 @@ class Concierge:
                 continue
             total = total.merged(usage.total)
             rows[record.run_id] = usage.total
+            row_turns[record.run_id] = usage.samples
             models.extend(m for m in usage.models if m not in models)
             samples += usage.samples
         try:
@@ -951,8 +964,8 @@ class Concierge:
         if models:
             head += f" · {', '.join(models)}"
         lines = [head]
-        lines.extend(_usage_rows(rows))
-        lines.append(_usage_row("total", total))
+        lines.extend(_usage_rows(rows, row_turns))
+        lines.append(_usage_row("total", total, turns=samples))
         lines.append(_cost_line(total))
         return "\n".join(lines)
 
@@ -1304,6 +1317,14 @@ class _RunUsage(NamedTuple):
     by_agent: dict[str, Usage]
     models: list[str]
     samples: int
+    # Turns and distinct jobs per persona. ``samples`` is the run's total
+    # turn count (one sample per turn); these break it down so a persona
+    # that is expensive because it takes many turns is distinguishable from
+    # one that is expensive because it runs many times. Required rather than
+    # defaulted: a shared mutable default on a NamedTuple is a trap, and the
+    # single producer always has both to hand.
+    turns_by_agent: dict[str, int]
+    jobs_by_agent: dict[str, int]
 
     @property
     def recorded(self) -> bool:
@@ -1340,23 +1361,51 @@ def _tokens(value: int | None) -> str:
     return f"{value:,}" if value is not None else "—"
 
 
-def _usage_row(label: str, usage: Usage) -> str:
-    return (
+def _usage_row(
+    label: str, usage: Usage, *, turns: int | None = None, jobs: int | None = None
+) -> str:
+    """One spend line, with the turn/job and cache columns appended only when
+    they are known — a run that predates turn counting or a backend that
+    reports no cache figures must not grow empty columns."""
+    row = (
         f"{label:<14} {_tokens(usage.input_tokens):>11} in · {_tokens(usage.output_tokens):>9} out"
     )
+    if turns is not None:
+        row += f" · {turns} turn{'s' if turns != 1 else ''}"
+        if jobs:
+            row += f"/{jobs} job{'s' if jobs != 1 else ''}"
+    if usage.cache_read_tokens is not None:
+        row += f" · {_tokens(usage.cache_read_tokens)} cached"
+    return row
 
 
-def _usage_rows(rows: dict[str, Usage]) -> list[str]:
+def _usage_rows(
+    rows: dict[str, Usage],
+    turns: dict[str, int] | None = None,
+    jobs: dict[str, int] | None = None,
+) -> list[str]:
     """Biggest spender first — the answer to "where did it go?" is the top line."""
     ordered = sorted(
         rows.items(), key=lambda kv: -((kv[1].input_tokens or 0) + (kv[1].output_tokens or 0))
     )
-    return [_usage_row(label, usage) for label, usage in ordered]
+    return [
+        _usage_row(
+            label,
+            usage,
+            turns=None if turns is None else turns.get(label, 0),
+            jobs=None if jobs is None else jobs.get(label, 0),
+        )
+        for label, usage in ordered
+    ]
 
 
 def _cost_line(usage: Usage) -> str:
-    """The Copilot backend reports tokens but never cost, so say that plainly
-    instead of printing a zero the model would repeat as fact."""
+    """Cost when the backend reports it, and otherwise a plain statement that
+    it did not — never a zero the model would go on to repeat as fact.
+
+    The Copilot SDK does report cost per turn, but the field is flagged
+    experimental and older runs predate sbxloop reading it, so "not
+    reported" stays a live answer rather than a dead branch."""
     if usage.cost is None:
         return "cost: not reported by the agent backend (tokens above are the whole record)"
     return f"cost: {usage.cost:.4f}"
