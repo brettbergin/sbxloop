@@ -9,12 +9,16 @@ import logging
 import pytest
 
 from sbxloop.log import (
+    LOG_BUFFER_MAXLEN,
     REDACTED,
     THIRD_PARTY_LOGGERS,
+    LogRecordLine,
+    _RingBufferHandler,
     bind_run,
     clear_run,
     configure_logging,
     get_logger,
+    log_buffer,
     redact_secrets,
 )
 
@@ -56,7 +60,8 @@ class TestConfigure:
             configure_logging("INFO")
             configure_logging("INFO")
             ours = [h for h in root.handlers if getattr(h, "_sbxloop_log_handler", False)]
-            assert len(ours) == 1
+            assert len(ours) == 2  # one stderr handler + one ring buffer handler
+            assert len([h for h in ours if isinstance(h, _RingBufferHandler)]) == 1
             assert foreign in root.handlers
         finally:
             root.removeHandler(foreign)
@@ -178,3 +183,115 @@ class TestContext:
         thread.start()
         thread.join()
         assert "run=r-main" not in stream.getvalue()
+
+
+class TestLogBuffer:
+    @pytest.fixture(autouse=True)
+    def _clean_buffer(self) -> None:
+        log_buffer().clear()
+        yield
+        log_buffer().clear()
+
+    def test_records_land_in_buffer(self, restore_logging: None) -> None:
+        configure_logging("DEBUG")
+        get_logger("sbxloop.test").info("x.event", foo=1)
+        records = log_buffer().tail(10)
+        assert records
+        last = records[-1]
+        assert last.level == "INFO"
+        assert last.logger == "sbxloop.test"
+        assert "x.event" in last.line and "foo=1" in last.line
+        assert "\x1b[" not in last.line
+
+    def test_bounded(self) -> None:
+        buffer = log_buffer()
+        for i in range(2500):
+            buffer.append(LogRecordLine("t", "INFO", "l", f"line {i}"))
+        assert len(buffer) == LOG_BUFFER_MAXLEN == 2000
+        lines = [r.line for r in buffer.tail(LOG_BUFFER_MAXLEN)]
+        assert "line 2499" in lines
+        assert "line 0" not in lines
+
+    def test_level_filter(self) -> None:
+        buffer = log_buffer()
+        for level in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            buffer.append(LogRecordLine("t", level, "l", f"a {level}"))
+        kept = [r.level for r in buffer.tail(level="warning")]
+        assert kept == ["WARNING", "ERROR"]
+
+    def test_unknown_level_rejected(self) -> None:
+        with pytest.raises(ValueError, match="unknown log level"):
+            log_buffer().tail(level="bogus")
+
+    def test_grep_is_plain_substring(self) -> None:
+        buffer = log_buffer()
+        buffer.append(LogRecordLine("t", "INFO", "l", "daemon.idle a.b here"))
+        assert log_buffer().tail(grep="A.B")
+        assert log_buffer().tail(grep="a[.]b") == []
+        assert log_buffer().tail(grep=".*") == []
+        buffer.append(LogRecordLine("t", "INFO", "l", "literal .* match"))
+        assert len(log_buffer().tail(grep=".*")) == 1
+
+    def test_tail_limit_and_order(self) -> None:
+        buffer = log_buffer()
+        for i in range(10):
+            buffer.append(LogRecordLine("t", "INFO", "l", f"line {i}"))
+        got = [r.line for r in buffer.tail(3)]
+        assert got == ["line 7", "line 8", "line 9"]
+        assert buffer.tail(0) == []
+
+    def test_emit_never_raises(self, restore_logging: None) -> None:
+        configure_logging("DEBUG")
+        root = logging.getLogger()
+        ring = [h for h in root.handlers if isinstance(h, _RingBufferHandler)]
+        assert len(ring) == 1
+
+        class Boom(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                raise RuntimeError("nope")
+
+        ring[0].setFormatter(Boom())
+        get_logger("sbxloop.test").info("still.fine")
+        assert log_buffer().tail(10) == []
+
+    def test_level_filter_end_to_end(self, restore_logging: None) -> None:
+        configure_logging("DEBUG")
+        log_buffer().clear()
+        log = get_logger("sbxloop.test")
+        log.debug("x.debug")
+        log.info("x.info")
+        log.warning("x.warn")
+        log.error("x.error")
+        kept = log_buffer().tail(level="WARNING")
+        assert [r.level for r in kept] == ["WARNING", "ERROR"]
+        blob = "\n".join(r.line for r in kept)
+        assert "x.debug" not in blob and "x.info" not in blob
+        assert "x.warn" in blob and "x.error" in blob
+
+    def test_grep_matches_metacharacters_literally(self, restore_logging: None) -> None:
+        configure_logging("DEBUG")
+        log_buffer().clear()
+        get_logger("sbxloop.test").info("daemon.idle", reason="a.b")
+        assert log_buffer().tail(grep="a.b")
+        assert log_buffer().tail(grep="a[.]b") == []
+        assert log_buffer().tail(grep="a.*b") == []
+
+    def test_configure_twice_does_not_duplicate_records(self, restore_logging: None) -> None:
+        configure_logging("DEBUG")
+        configure_logging("DEBUG")
+        log_buffer().clear()
+        get_logger("sbxloop.test").info("dup.check", marker="once")
+        assert len(log_buffer().tail(50, grep="dup.check")) == 1
+
+    def test_configure_twice_installs_one_ring_handler(self, restore_logging: None) -> None:
+        root = logging.getLogger()
+        foreign = logging.NullHandler()
+        root.addHandler(foreign)
+        try:
+            configure_logging("INFO")
+            configure_logging("DEBUG")
+            ring = [h for h in root.handlers if isinstance(h, _RingBufferHandler)]
+            assert len(ring) == 1
+            assert foreign in root.handlers
+        finally:
+            root.removeHandler(foreign)

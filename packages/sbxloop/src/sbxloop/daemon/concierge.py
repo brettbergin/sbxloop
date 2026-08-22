@@ -59,7 +59,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
-from sbxloop.log import get_logger
+from sbxloop.log import get_logger, log_buffer
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
     EventTypes,
@@ -88,6 +88,8 @@ STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
 
 _RUN_STATES = ["pending", "running", "completed", "failed", "cancelled"]
+#: Levels ``daemon_log`` accepts, coarsest last — the filter is at-or-above.
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 # GitHub's ``state_reason`` for a close. ``completed`` means the thing was
 # actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
 # stale. Nothing else is accepted, so the model cannot invent a reason.
@@ -554,6 +556,28 @@ class Concierge:
                 ),
                 self._tool_usage_today,
             ),
+            HostTool(
+                HostToolSpec(
+                    name="daemon_log",
+                    description=(
+                        "The daemon's own recent log lines, from its in-process ring "
+                        "buffer — the journal, without ssh. Use it to answer 'what is the "
+                        "daemon doing?' or 'why is nothing running?' by quoting the "
+                        "`daemon.idle`, `breaker` and `github.poll_failed` lines. "
+                        "tail: how many records (default 50, max 500). level: keep only "
+                        "records at or above DEBUG/INFO/WARNING/ERROR. grep: a plain "
+                        "case-insensitive substring, NOT a regular expression."
+                    ),
+                    parameters=_schema(
+                        {
+                            "tail": {"type": "integer", "minimum": 1, "maximum": 500},
+                            "level": {"type": "string", "enum": list(_LOG_LEVELS)},
+                            "grep": {"type": "string"},
+                        }
+                    ),
+                ),
+                self._tool_daemon_log,
+            ),
         ]
         if self.github is not None and self.config.github.repo:
             tools.append(
@@ -968,6 +992,28 @@ class Concierge:
         lines.append(_usage_row("total", total, turns=samples))
         lines.append(_cost_line(total))
         return "\n".join(lines)
+
+    def _tool_daemon_log(self, args: dict[str, Any], by: str) -> str:
+        tail = _int_arg(args, "tail", 50, 1, 500)
+        level = str(args.get("level") or "").strip().upper() or None
+        grep = str(args.get("grep") or "")
+        buffer = log_buffer()
+        size = len(buffer)
+        try:
+            records = buffer.tail(tail, level=level, grep=grep or None)
+        except ValueError:
+            return f"unknown log level {level!r} — use one of {', '.join(_LOG_LEVELS)}"
+        filters: list[str] = []
+        if level:
+            filters.append(f"level={level}")
+        if grep:
+            filters.append(f"grep={grep!r}")
+        suffix = f" ({', '.join(filters)})" if filters else ""
+        if not records:
+            return f"no matching log records{suffix}; the buffer holds {size} lines"
+        head = f"showing {len(records)} of {size} buffered log records{suffix}"
+        lines = [f"{r.timestamp} {r.level} {r.logger} {_one_line(r.line, 400)}" for r in records]
+        return "\n".join([head, *lines])
 
     def _tool_github_get(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
