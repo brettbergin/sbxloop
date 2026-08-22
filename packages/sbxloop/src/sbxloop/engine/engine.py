@@ -47,6 +47,7 @@ from sbxloop.engine.model import (
     RunState,
     SteerVerdict,
     TaskRecord,
+    TaskSpec,
     TaskState,
     Verdict,
     artifacts_dir,
@@ -201,10 +202,27 @@ class LoopEngine:
 
     # -- public API --------------------------------------------------------
 
-    def start(self, outcome: str, *, run_id: str | None = None) -> RunResult:
+    def start(
+        self,
+        outcome: str,
+        *,
+        run_id: str | None = None,
+        tasks: Sequence[TaskSpec] | None = None,
+    ) -> RunResult:
+        """Drive a fresh run to completion.
+
+        ``tasks`` pre-seeds the task graph and so skips DECOMPOSE. That is
+        for work that is *already* decomposed — a fix round whose brief is a
+        list of concrete CI failures and review comments is one task whose
+        acceptance criteria are those failures, and asking an agent to
+        decompose it costs a whole session to rediscover a structure the
+        caller already knows. A normal run passes nothing and decomposes.
+        """
         run_id = run_id or new_run_id()
         self.store.create_run(run_id, outcome, self.config.model_dump_json())
-        self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=outcome)
+        if tasks:
+            self.store.save_tasks(run_id, list(tasks))
+        self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=outcome, seeded=len(tasks or ()))
         return self._drive(run_id, outcome)
 
     def resume(self, run_id: str) -> RunResult:

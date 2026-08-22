@@ -2155,7 +2155,6 @@ mem_abort = 0.0
 # postmortems_per_day = 3
 # audits = false                 # open .github/sbxloop/audits/*.md charters on schedule
 # review_deliveries = true       # audit each PR the loop delivers (defects → backlog)
-# reviews_per_day = 5
 # tool_repo = "brettbergin/sbxloop"  # findings ABOUT sbxloop go here, never to the project
 # audit_dir = ".github/sbxloop/audits"
 # What a delivered run does to the tracker. Defaults are task-queue

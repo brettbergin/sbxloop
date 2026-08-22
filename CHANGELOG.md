@@ -6,6 +6,42 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The acceptance loop now runs its gates cheapest-first, and a fix round is
+  one task.** #399 shipped the gate; this makes it efficient enough to run.
+
+  - **CI decides before a review is spent.** A review was filed the moment a
+    PR was delivered, before the build had reported — so every red PR burned a
+    whole review run on work that had to change anyway. The order is now:
+    checks pending → wait (free); checks red → fix round, no review;
+    green and unreviewed → file the review; green and satisfied → accept.
+  - **A fix round is a single seeded task, not a decomposition.**
+    `LoopEngine.start(tasks=...)` pre-seeds the graph and skips DECOMPOSE. A
+    normal run is ~270 turns across ~5 phases per task; a round addressing
+    "`mdformat` failed" is already decomposed, because the failures *are* the
+    acceptance criteria. Its brief names them and tells the executor not to
+    redo the work already on the branch.
+  - **A round can be re-reviewed.** GitHub keeps a `CHANGES_REQUESTED` review
+    standing until the reviewer says otherwise — new commits do not clear it —
+    so the old once-per-run guard meant the loop could only ever run one
+    direction. It is now one review *in flight* at a time.
+  - **`[daemon] reviews_per_day` is removed.** Once reviews and fixes are
+    runs, they already count against `max_runs_per_day`, the real ceiling. A
+    second global counter for one lane starved other work for the wrong
+    reason: a stubborn PR eating today's reviews says nothing about whether
+    the next delivery deserves one. `review_rounds` (now 3, was 20) bounds any
+    single PR so one item cannot eat the day — it counts rounds, which are
+    runs, not polls.
+
+  The acceptance record moved from the run to the **item**, which is what it
+  always belonged to: the PR belongs to the work item, and every fix round is
+  a new run against the same PR.
+
+  Expected cost per accepted PR: 2 runs on the happy path (deliver, review),
+  4 with one round, ~8 at the cap — against the previous shape, where a red PR
+  burned a review before anyone looked at the build.
+
 ### Added
 
 - **A delivered item is not done until its PR is accepted.** `_settle` used to

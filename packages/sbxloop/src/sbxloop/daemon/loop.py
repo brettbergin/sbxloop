@@ -50,8 +50,9 @@ from sbxloop.daemon.discord_format import (
 from sbxloop.daemon.logsink import event_log_subscriber
 from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.postmortem import build_dossier
+from sbxloop.daemon.review import fix_brief, fix_tasks
 from sbxloop.daemon.sources import WorkSource
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import DaemonStore, PrState
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
@@ -71,7 +72,7 @@ from sbxloop.errors import (
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.gh.ops import SubmittedReview
-from sbxloop.ids import new_run_id
+from sbxloop.ids import branch_name, new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import sandbox_name
@@ -974,10 +975,11 @@ class DaemonLoop:
             if self._consecutive_failures:
                 log.info("breaker.reset", after_failures=self._consecutive_failures)
             self._set_breaker(None, 0)
-            # File first: whether a review is actually coming is what decides
-            # if there is anything to wait for.
-            reviewing = self._file_review(item, run_id, report)
-            if reviewing and self._hold_for_review(item, run_id, report, now):
+            # No review is filed here. The gates run cheapest-first: CI is
+            # GitHub's compute and costs nothing, so it reports before a
+            # review run is spent. Reviewing a red PR burns a whole run on
+            # work that has to change anyway.
+            if self._hold_for_review(item, run_id, report, now):
                 # Delivered, not accepted. The source issue stays open and
                 # the item stays in flight: settling on "a PR exists" is how
                 # #389 was marked done with mdformat and security failing.
@@ -1274,7 +1276,22 @@ class DaemonLoop:
         engine = handle.engine
         if resume:
             return engine.resume(run_id)
+        fix = self._pending_fix(item)
+        if fix is not None:
+            pr_number, brief, failed = fix
+            # A fix round is ONE task, seeded rather than decomposed: the
+            # failures already are the acceptance criteria, and decomposing
+            # them costs a whole session to rediscover a structure we have.
+            self.dstore.clear_fix(item.item_id)
+            return engine.start(brief, run_id=run_id, tasks=fix_tasks(pr_number, brief, failed))
         return engine.start(self.outcome_text(item), run_id=run_id)
+
+    def _pending_fix(self, item: WorkItem) -> tuple[int, str, tuple[str, ...]] | None:
+        """(pr, brief, failing checks) when this dispatch is a fix round."""
+        state = self.dstore.pr_state(item.item_id)
+        if state is None or not state.fix_brief:
+            return None
+        return state.pr_number, state.fix_brief, ()
 
     # -- reporting -----------------------------------------------------------------------
 
@@ -1427,21 +1444,18 @@ class DaemonLoop:
             return False
         now = self.clock()
         try:
-            if self.dstore.review_filed(run_id):
-                return False
-            day_start, _ = day_window(now, daemon.run_cap_timezone)
-            if self.dstore.reviews_since(day_start) >= daemon.reviews_per_day:
-                log.info(
-                    "review.skipped",
-                    item=item.item_id,
-                    run=run_id,
-                    reason="calendar-day cap reached",
-                    cap=daemon.reviews_per_day,
-                )
+            state = self.dstore.pr_state(item.item_id)
+            if state is not None and state.review_in_flight:
+                # One review in flight at a time — but not one review per
+                # *item*: a fix round has to be re-reviewed, because GitHub
+                # keeps the previous CHANGES_REQUESTED standing until the
+                # reviewer says otherwise (new commits do not clear it).
+                # Without a second review the loop could only run one way.
                 return False
             number, url = report.delivery
             ref = github.file_review(item, number, url, run_id)
             self.dstore.record_review(run_id, number, ref, now)
+            self.dstore.review_in_flight(item.item_id, ref)
             self._notify(
                 filed_notice(
                     "review",
@@ -1516,7 +1530,13 @@ class DaemonLoop:
         daemon = self.config.daemon
         if not daemon.await_review or item.kind != "patch" or report.delivery is None:
             return False
+        # Never hold what cannot be observed: without a source that can
+        # answer PR state, "waiting for acceptance" is just stranding.
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "pr_state"):
+            return False
         number, url = report.delivery
+        self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now)
         self.dstore.mark_reviewing(item.item_id, now)
         self._notify(
             f"⏳ {item.item_id} delivered PR {link(f'#{number}', url)} — "
@@ -1549,48 +1569,101 @@ class DaemonLoop:
                 log.warning("review.poll_failed", item=item.item_id, exc_info=True)
 
     def _poll_one_review(self, item: WorkItem, github: Any, now: float) -> None:
-        run_id = item.run_id
-        target = self.dstore.review_pr(run_id) if run_id else None
-        if target is None:
+        """Advance one delivered PR by exactly one step.
+
+        The gates are ordered by what they cost:
+
+        ===============================  ===========================
+        state                            action
+        ===============================  ===========================
+        checks pending                   wait (free)
+        checks red                       fix round
+        green, review in flight          wait
+        green, changes requested         fix round
+        green, not yet reviewed          file a review
+        green, review satisfied          accept
+        ===============================  ===========================
+
+        CI first is the point: it is GitHub's compute and costs nothing, so
+        a red PR never spends a review run on work that has to change
+        anyway.
+        """
+        state = self.dstore.pr_state(item.item_id)
+        if state is None:
             # Nothing recorded to wait on — do not strand the item.
-            log.warning("review.no_target", item=item.item_id, run=run_id)
-            self._accept(item, now, detail="no review was recorded for this delivery")
+            log.warning("review.no_target", item=item.item_id, run=item.run_id)
+            self._accept(item, now, detail="no delivered PR was recorded")
             return
-        pr_number, gates, _rounds = target
-        checks, review_state = github.pr_state(pr_number)
-        # An approval nobody can give is not worth waiting for: a review that
-        # could only be posted as a COMMENT never produces one.
-        review_ok = review_state == "APPROVED" if gates else review_state != "CHANGES_REQUESTED"
-        if checks.state == "green" and review_ok:
-            self._accept(item, now, detail=f"PR #{pr_number}: {checks.summary()}")
+        pr = state.pr_number
+        checks, review_state = github.pr_state(pr)
+        if checks.state == "pending":
+            log.debug("review.waiting", item=item.item_id, pr=pr, on="checks")
             return
-        spent = self.dstore.bump_review_round(run_id) if run_id else 0
+        if checks.state == "red":
+            self._fix_round(item, state, now, why=checks.summary(), failed=checks.failed)
+            return
+        if state.review_in_flight:
+            log.debug("review.waiting", item=item.item_id, pr=pr, on="review")
+            return
+        if review_state == "CHANGES_REQUESTED":
+            self._fix_round(item, state, now, why="the review requested changes", failed=())
+            return
+        if not state.reviewed:
+            # Green and unreviewed: only now is a review run worth spending.
+            report = self._report(item.run_id or "", None)
+            if not self._file_review(item, item.run_id or "", report):
+                # No reviewer for this deployment — green CI is the whole
+                # bar it has, so honour that rather than wait for nobody.
+                self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, no reviewer")
+            return
+        # An approval nobody can give is not worth waiting for: a review the
+        # repo would only accept as a COMMENT never produces one.
+        satisfied = review_state == "APPROVED" if state.gates else True
+        if satisfied:
+            self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, review satisfied")
+            return
+        log.debug("review.waiting", item=item.item_id, pr=pr, on="approval")
+
+    def _fix_round(
+        self,
+        item: WorkItem,
+        state: PrState,
+        now: float,
+        *,
+        why: str,
+        failed: Sequence[str],
+    ) -> None:
+        """Send the item back for one more round against its own PR branch.
+
+        The budget is spent per *round*, not per poll: a round is a real run,
+        so this is a spend control. Past it the item is handed to a human
+        with the PR left open — it must never spin.
+        """
+        spent = self.dstore.bump_pr_round(item.item_id)
         budget = self.config.daemon.review_rounds
-        if spent < budget:
-            log.debug(
-                "review.waiting",
+        if spent > budget:
+            self.dstore.mark_failed(
+                item.item_id, f"PR #{state.pr_number} not accepted: {why}", now, requeue=False
+            )
+            self._notify(
+                f"⚠ {item.item_id}: PR #{state.pr_number} still not accepted after "
+                f"{budget} round(s) — {why}. Handing it over; the PR is open.",
+                "review.not_accepted",
+                level="error",
                 item=item.item_id,
-                pr=pr_number,
-                checks=checks.state,
-                review=review_state,
-                round=spent,
-                budget=budget,
+                pr=state.pr_number,
+                rounds=budget,
             )
             return
-        why = f"{checks.summary()}; review {review_state.lower().replace('_', ' ')}"
-        self.dstore.mark_failed(
-            item.item_id, f"PR #{pr_number} not accepted: {why}", now, requeue=False
-        )
+        self.dstore.queue_fix(item.item_id, fix_brief(state.pr_number, why, failed), now)
         self._notify(
-            f"⚠ {item.item_id}: PR #{pr_number} still not accepted after {spent} check(s) "
-            f"— {why}. Handing it over; the PR is open.",
-            "review.not_accepted",
-            level="error",
+            f"🔁 {item.item_id}: PR #{state.pr_number} — {why}; fix round {spent}/{budget}",
+            "review.fix_round",
             item=item.item_id,
-            pr=pr_number,
-            checks=checks.state,
-            review=review_state,
-            rounds=spent,
+            pr=state.pr_number,
+            round=spent,
+            budget=budget,
+            why=why,
         )
 
     def _accept(self, item: WorkItem, now: float, *, detail: str) -> None:
@@ -1637,7 +1710,7 @@ class DaemonLoop:
             return None
         if posted is None:
             return None
-        self.dstore.set_review_gates(origin_run_id, posted.gates_merge)
+        self.dstore.review_settled(item.item_id, gates=posted.gates_merge)
         verdict = "approved" if posted.event == "APPROVE" else "requested changes"
         gate = "" if posted.gates_merge else " (as a comment — it does not gate the merge)"
         self._notify(

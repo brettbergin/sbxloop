@@ -26,10 +26,11 @@ loop can both read off the PR rather than something sbxloop merely believes.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
-from sbxloop.engine.model import RunRecord
+from sbxloop.engine.model import RunRecord, TaskSpec
 from sbxloop.gh.ops import GithubOps, ReviewComment, ReviewEvent, SubmittedReview
 from sbxloop.log import get_logger
 
@@ -64,6 +65,53 @@ REVIEW_INSTRUCTIONS = (
     "summary as prose. Do not file it anywhere: a human decides whether it "
     "becomes work."
 )
+
+
+# A fix round is ONE task, seeded rather than decomposed. The failures are
+# already the acceptance criteria: asking an agent to decompose "mdformat
+# failed" costs a whole session to rediscover a structure the caller already
+# knows, and a normal run is ~270 turns and the better part of an hour.
+FIX_TASK_TITLE = "Make the pull request acceptable"
+
+
+def fix_brief(pr_number: int, why: str, failed: Sequence[str] = ()) -> str:
+    """What one fix round is for, concretely.
+
+    Named failures rather than "make the PR acceptable": the round is one
+    task whose acceptance criteria are exactly these, and a vague brief is
+    what turns a small fix back into a full investigation.
+    """
+    parts = [
+        f"Pull request #{pr_number} is not yet acceptable: {why}.",
+        "You are working on that PR's own branch and its work is already "
+        "here. Change only what is needed to clear the problems below — do "
+        "not restructure or redo the existing work, and do not start over.",
+    ]
+    if failed:
+        parts.append(
+            "Failing checks: "
+            + ", ".join(failed)
+            + ". Run the project's own gate here and make it pass before you finish."
+        )
+    parts.append(
+        "Any unresolved review comments on the PR say what a reviewer "
+        "objected to; read them (`gh pr view --comments`) and address each one."
+    )
+    return "\n\n".join(parts)
+
+
+def fix_tasks(pr_number: int, why: str, failed: Sequence[str] = ()) -> list[TaskSpec]:
+    """The seeded task graph for a fix round — deliberately one task."""
+    criteria = [f"PR #{pr_number}'s checks pass", "the review's objections are addressed"]
+    criteria += [f"the `{name}` check passes" for name in failed]
+    return [
+        TaskSpec(
+            id="fix",
+            title=FIX_TASK_TITLE,
+            description=fix_brief(pr_number, why, failed),
+            acceptance_criteria=criteria,
+        )
+    ]
 
 
 class ReviewResult(NamedTuple):
