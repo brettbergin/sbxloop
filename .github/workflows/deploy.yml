@@ -258,7 +258,14 @@ jobs:
           (cd "${WORKDIR}" && "${SBXLOOP}" doctor) || fail "sbxloop doctor is unhappy"
 
           # ctl exit 2 = nothing claimed the request, i.e. the daemon never came up.
-          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 60) || fail "daemon did not answer ctl status"
+          # The budget has to cover the daemon's whole startup, not just the
+          # round trip: the control server starts only after loop.recover(),
+          # which took 67s on the 0.7.23 deploy (four orphaned runs to settle,
+          # a concierge sandbox to re-provision) against a 60s budget. The
+          # client resends across that window rather than reporting the
+          # refusal, so the only thing left to get wrong is being too stingy
+          # here — 300s is well inside the job's 60 min.
+          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 300) || fail "daemon did not answer ctl status"
 
           # Let it settle, then prove it is not crash-looping.
           before="$(systemctl --user show "${UNIT}" -p NRestarts --value)"

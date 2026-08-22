@@ -20,8 +20,10 @@ from sbxloop.cli.app import app
 from sbxloop.config import Config
 from sbxloop.daemon.control import (
     CTL_SUBDIR,
+    CommandReply,
     ControlClient,
     ControlServer,
+    _reply_from,
     dispatch,
     plain,
     usage,
@@ -244,6 +246,78 @@ class TestControlQueue:
             json.dumps({"cmd": "pause", "submitted_at": time.time()})
         )
         assert server.serve_once() == 1 and floop.paused
+
+    def test_a_request_that_races_a_starting_daemon_is_resent_not_failed(
+        self, tmp_path: Path
+    ) -> None:
+        """The regression that rolled back 0.7.23. The control server starts
+        only after ``loop.recover()``, so anything submitted while recovery
+        runs — over a minute on a daemon with orphaned runs to settle, which
+        is the state a restart creates — is swept as stale. The deploy's
+        health check read that refusal as "the daemon never came up" and
+        rolled back a daemon that was healthy. The client resends instead."""
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        replies: list[CommandReply | None] = []
+        caller = threading.Thread(
+            target=lambda: replies.append(ControlClient(tmp_path).submit("pause", timeout_s=10))
+        )
+        caller.start()
+        try:
+            # The request lands while there is no server, exactly as a health
+            # check racing recovery does; start() then sweeps it as stale.
+            time.sleep(0.2)
+            assert not floop.paused
+            server.start()
+            caller.join(timeout=10)
+        finally:
+            server.close()
+        assert not caller.is_alive()
+        assert replies and replies[0] is not None
+        assert replies[0].ok and "paused" in replies[0].text
+        assert floop.paused
+        # Nothing left behind to be replayed by a later daemon.
+        assert list((tmp_path / CTL_SUBDIR).iterdir()) == []
+
+    def test_resending_is_bounded_by_the_callers_budget(self, tmp_path: Path) -> None:
+        """A daemon that never finishes starting must still fail at the
+        deadline rather than spin — the refusal is the honest answer once
+        the caller is out of budget."""
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.start()
+        # Every request from here on looks pre-start, so each is refused.
+        server._started_at = time.time() + 3600
+        try:
+            started = time.monotonic()
+            reply = ControlClient(tmp_path).submit("pause", timeout_s=0.5)
+            elapsed = time.monotonic() - started
+        finally:
+            server.close()
+        assert reply is not None and not reply.ok and reply.stale
+        assert not floop.paused
+        assert elapsed < 5.0, f"resend loop did not respect the budget ({elapsed:.1f}s)"
+
+    def test_the_stale_verdict_rides_on_the_reply_file(self, tmp_path: Path) -> None:
+        """Carried structurally so the client never has to match on prose."""
+        floop = FakeLoop(_dstore(tmp_path))
+        ctl_dir = tmp_path / CTL_SUBDIR
+        ctl_dir.mkdir(parents=True)
+        (ctl_dir / "1.000000-stale.json").write_text(json.dumps({"cmd": "pause"}))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.start()
+        try:
+            reply = json.loads((ctl_dir / "1.000000-stale.reply.json").read_text())
+            assert reply["stale"] is True and reply["ok"] is False
+        finally:
+            server.close()
+
+    def test_a_reply_from_a_daemon_that_predates_the_flag_is_not_resent(self) -> None:
+        """An older daemon writes no ``stale`` key. That must read as a plain
+        refusal, not send the client into a resend loop against a daemon
+        that will never set the flag."""
+        assert _reply_from({"ok": False, "text": "no such item"}).stale is False
+        assert _reply_from({"ok": True, "text": "paused"}) == CommandReply("paused", True)
 
     def test_a_crashing_command_answers_with_an_error_and_keeps_serving(
         self, tmp_path: Path
