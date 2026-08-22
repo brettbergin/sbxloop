@@ -138,6 +138,12 @@ def dispatch(
     return reply
 
 
+def _tz(status: dict[str, Any]) -> str:
+    """The zone whose midnight resets the run cap (status dicts predating the
+    calendar-day gate have no such key)."""
+    return str(status.get("run_cap_timezone", "UTC"))
+
+
 def _dispatch(
     loop: Any, word: str, args: list[str], *, prefix: str, by: str | None
 ) -> CommandReply:
@@ -146,8 +152,8 @@ def _dispatch(
         cur = s["current"]
         lines = [
             f"**current:** {cur['run_id']} — {cur['title']}" if cur else "**current:** idle",
-            f"**queued:** {s['queued']} · **runs today:** "
-            f"{s['runs_today']}/{s['max_runs_per_day']}"
+            f"**queued:** {s['queued']} · **runs today ({_tz(s)}):** "
+            f"{s['runs_today']}/{s['max_runs_per_day']}, resets at 00:00 {_tz(s)}"
             f" (resumes {s.get('resumes_today', 0)})",
             f"**breaker:** {'open' if s['breaker_open'] else 'closed'} · **paused:** {s['paused']}",
         ]
@@ -249,7 +255,7 @@ def _operator() -> str:
     "cancelled by brett via sbxloop daemon ctl" rather than "operator"."""
     try:
         return f"{getpass.getuser()} via sbxloop daemon ctl"
-    except Exception:  # no passwd entry / no controlling identity (containers)
+    except Exception:  # no passwd entry / no login identity (containers)
         return "sbxloop daemon ctl"
 
 

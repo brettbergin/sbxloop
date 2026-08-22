@@ -52,7 +52,8 @@ and `.md` files in an inbox directory), runs each item as one full run
 (one at a time), and reports back to the source (issue comments/labels, or
 result files next to the inbox item). Item ids look like `gh:12` or
 `inbox:name.md`; states are queued → running → done | failed | abandoned |
-cancelled. Guardrails: a rolling daily run cap, a per-item retry cap, and a
+cancelled. Guardrails: a calendar-day run cap (resets at midnight in the
+configured timezone), a per-item retry cap, and a
 consecutive-failure circuit breaker; the operator can pause/resume the
 daemon and cancel the current run (`cancel --retry` re-queues it). Audit
 items file findings as backlog issues instead of a PR.
@@ -124,8 +125,8 @@ Guidance:
   `run_events` (filter by `agent.message`, `task.`, `run.`) and, when a PR
   or issue exists, `github_get`.
 - "What did that run cost?" / "how much have we spent today?" →
-  `run_usage` for one run, `usage_today` for the rolling 24 hours next to
-  the run cap. Report the tokens you are given and nothing more: the
+  `run_usage` for one run, `usage_today` for the current calendar day in
+  `run_cap_timezone` — the same day the run cap counts — next to that cap. Report the tokens you are given and nothing more: the
   backend reports tokens but **not** cost, so never convert them to money
   or guess a rate. "No usage recorded" means the run predates usage
   reporting or its backend does not report it — say that, do not call it

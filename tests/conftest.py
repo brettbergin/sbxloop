@@ -110,6 +110,12 @@ def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
     )
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", str(bin_dir), prepend=":")
+    # The fake execs on the host, so a real token in the operator's own
+    # environment would leak into the "sandbox" and make the secret-env
+    # visibility probe answer the opposite of field-observed sbx behavior.
+    # Tests that want the env visible set it explicitly.
+    for leaked in ("GH_TOKEN", "COPILOT_GITHUB_TOKEN"):
+        monkeypatch.delenv(leaked, raising=False)
     return FakeSbx(binary=shim, state=state)
 
 

@@ -511,9 +511,11 @@ class TestTools:
         assert missing.text.startswith("no run 'nope'")
 
     def test_usage_today_totals_and_names_the_cap(self, tmp_path: Path) -> None:
-        """The daily view sits next to runs_today/max_runs_per_day, and counts
-        tokens by when they were spent — a sample older than the window is a
-        different day's spend even on a run that is still active."""
+        """The daily view sits next to runs_today/max_runs_per_day and shares
+        its window — the calendar day in ``run_cap_timezone``, not a trailing
+        24 hours — so the two numbers on the head line describe one period. It
+        counts tokens by when they were spent, so a sample from before today
+        is a different day's spend even on a run that is still active."""
         concierge, client, _, loop, dstore = make(tmp_path, [{"calls": [("usage_today", {})]}])
         store = self._seed_run(tmp_path, dstore, loop)
         from sbxloop.events import Event
@@ -521,19 +523,27 @@ class TestTools:
         fresh = Event.now(
             "agent.usage", "r1abcdefg", model="claude-opus-5", input_tokens=500, output_tokens=40
         )
-        fresh.ts = 1_000_000.0  # the frozen clock: inside the 24h window
+        fresh.ts = 1_000_000.0  # the frozen clock: inside today's window
         store.append_event(fresh)
         stale = Event.now(
             "agent.usage", "r1abcdefg", model="claude-opus-5", input_tokens=9999, output_tokens=999
         )
         stale.ts = 1_000_000.0 - 200_000.0  # two days back
         store.append_event(stale)
+        last_night = Event.now(
+            "agent.usage", "r1abcdefg", model="claude-opus-5", input_tokens=7777, output_tokens=777
+        )
+        # Inside a trailing 24 hours of the frozen clock, but before today's
+        # midnight UTC — the boundary the run cap uses, so it is not today's.
+        last_night.ts = 930_000.0
+        store.append_event(last_night)
         turn(concierge, "how much have we spent today?")
         (resp,) = client.responses
         assert resp.ok
         assert "500 in" in resp.text and "40 out" in resp.text
         assert "9,999" not in resp.text  # yesterday's spend is not today's
-        assert "runs today" in resp.text
+        assert "7,777" not in resp.text  # nor is last night's, 24h window or no
+        assert "today (UTC)" in resp.text and "runs today" in resp.text
 
     def test_list_runs_run_detail_and_events(self, tmp_path: Path) -> None:
         concierge, client, _, loop, dstore = make(
