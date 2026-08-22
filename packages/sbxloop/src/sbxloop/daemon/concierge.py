@@ -57,10 +57,18 @@ from sbxloop.errors import (
     WorkerTimeoutError,
 )
 from sbxloop.events import EventBus
+from sbxloop.gc import DAY_S
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import HostToolCall, HostToolResponse, HostToolSpec, JobRequest
+from sbxloop_worker.protocol import (
+    EventTypes,
+    HostToolCall,
+    HostToolResponse,
+    HostToolSpec,
+    JobRequest,
+    Usage,
+)
 
 if TYPE_CHECKING:
     from sbxloop.daemon.github import DaemonGithub
@@ -516,6 +524,32 @@ class Concierge:
                 ),
                 self._tool_version_status,
             ),
+            HostTool(
+                HostToolSpec(
+                    name="run_usage",
+                    description=(
+                        "What one run spent: input/output tokens per agent persona and "
+                        "totalled, with the model(s) used. Copilot spend is otherwise "
+                        "invisible from chat. Runs from before usage reporting — or a "
+                        "backend that does not report it — say so rather than showing zero."
+                    ),
+                    parameters=_schema({"run_id": {"type": "string"}}, ["run_id"]),
+                ),
+                self._tool_run_usage,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="usage_today",
+                    description=(
+                        "Token spend across the last 24 hours, per run and totalled, next "
+                        "to the daily run cap. Use it for 'how much have we spent today?'. "
+                        "Tokens are attributed to when they were spent, so a run that "
+                        "started yesterday and continued today counts only today's half."
+                    ),
+                    parameters=_schema({}),
+                ),
+                self._tool_usage_today,
+            ),
         ]
         if self.github is not None and self.config.github.repo:
             tools.append(
@@ -832,6 +866,90 @@ class Concierge:
             return self.versions.summary()
         except (WorkerError, SbxError, DaemonError) as exc:
             return f"reading versions failed: {_one_line(str(exc), 300)}"
+
+    def _usage_for_run(self, run_id: str, *, since: float = 0.0) -> _RunUsage:
+        """Fold a run's ``agent.usage`` events into a total and a per-persona
+        breakdown. ``since`` drops samples older than an epoch stamp, which is
+        how ``usage_today`` attributes tokens to the day they were spent
+        rather than to the day the run started."""
+        total = Usage()
+        by_agent: dict[str, Usage] = {}
+        models: list[str] = []
+        samples = 0
+        for _seq, event in self.store.events(run_id, type_prefix=EventTypes.AGENT_USAGE):
+            if event.ts < since:
+                continue
+            sample = _usage_from_event(event.data)
+            total = total.merged(sample)
+            who = str(event.data.get("agent") or "unknown")
+            by_agent[who] = by_agent.get(who, Usage()).merged(sample)
+            if sample.model and sample.model not in models:
+                models.append(sample.model)
+            samples += 1
+        return _RunUsage(total, by_agent, models, samples)
+
+    def _tool_run_usage(self, args: dict[str, Any], by: str) -> str:
+        run_id = str(args.get("run_id", "")).strip()
+        if not run_id:
+            return "run_id is required"
+        try:
+            self.store.get_run(run_id)
+        except SbxloopError:
+            return f"no run {run_id!r} in this daemon's state store"
+        try:
+            usage = self._usage_for_run(run_id)
+        except SbxloopError as exc:
+            return f"cannot read usage for {run_id}: {_one_line(str(exc), 200)}"
+        if not usage.recorded:
+            return (
+                f"no usage recorded for {run_id}. Either the run predates usage reporting "
+                "or its backend does not report it — this is not the same as zero spend."
+            )
+        lines = [f"run {run_id} · {usage.model_line} · {usage.samples} sample(s)"]
+        lines.extend(_usage_rows(usage.by_agent))
+        lines.append(_usage_row("total", usage.total))
+        lines.append(_cost_line(usage.total))
+        return "\n".join(lines)
+
+    def _tool_usage_today(self, args: dict[str, Any], by: str) -> str:
+        # The same rolling window the daily run cap uses (loop.py), so the two
+        # numbers on the last line always describe the same period.
+        since = self.clock() - DAY_S
+        try:
+            runs = [r for r in self.store.list_runs() if r.updated_at >= since]
+        except SbxloopError as exc:
+            return f"cannot list runs: {_one_line(str(exc), 200)}"
+        total = Usage()
+        rows: dict[str, Usage] = {}
+        models: list[str] = []
+        samples = 0
+        for record in runs:
+            usage = self._usage_for_run(record.run_id, since=since)
+            if not usage.recorded:
+                continue
+            total = total.merged(usage.total)
+            rows[record.run_id] = usage.total
+            models.extend(m for m in usage.models if m not in models)
+            samples += usage.samples
+        try:
+            status = self.loop.status()
+            cap = f"{status.get('runs_today', '?')}/{status.get('max_runs_per_day', '?')}"
+        except Exception:
+            cap = "?"
+        if not rows:
+            return (
+                f"no usage recorded in the last 24h across {len(runs)} run(s) "
+                f"({cap} runs today). Nothing has been spent, or these runs predate "
+                "usage reporting."
+            )
+        head = f"last 24h · {len(rows)} run(s) with usage · {cap} runs today"
+        if models:
+            head += f" · {', '.join(models)}"
+        lines = [head]
+        lines.extend(_usage_rows(rows))
+        lines.append(_usage_row("total", total))
+        lines.append(_cost_line(total))
+        return "\n".join(lines)
 
     def _tool_github_get(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
@@ -1172,6 +1290,71 @@ def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> 
     except (TypeError, ValueError):
         return default
     return max(lo, min(hi, value))
+
+
+class _RunUsage(NamedTuple):
+    """One run's folded ``agent.usage`` samples."""
+
+    total: Usage
+    by_agent: dict[str, Usage]
+    models: list[str]
+    samples: int
+
+    @property
+    def recorded(self) -> bool:
+        """Did the backend actually report anything? ``Usage.merged`` keeps
+        None as None, so an all-None total means "never reported" — which is
+        not the same as zero and must not be shown as it."""
+        return self.samples > 0 and (
+            self.total.input_tokens is not None or self.total.output_tokens is not None
+        )
+
+    @property
+    def model_line(self) -> str:
+        return " + ".join(self.models) if self.models else "model not reported"
+
+
+# `agent.usage` payloads carry an `agent` key the host adds on the way through
+# (worker/client.py), and Usage forbids extras — so pick the fields out rather
+# than validating the whole dict.
+_USAGE_FIELDS = (
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cost",
+)
+
+
+def _usage_from_event(data: dict[str, Any]) -> Usage:
+    return Usage(**{k: data[k] for k in _USAGE_FIELDS if k in data})
+
+
+def _tokens(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "—"
+
+
+def _usage_row(label: str, usage: Usage) -> str:
+    return (
+        f"{label:<14} {_tokens(usage.input_tokens):>11} in · {_tokens(usage.output_tokens):>9} out"
+    )
+
+
+def _usage_rows(rows: dict[str, Usage]) -> list[str]:
+    """Biggest spender first — the answer to "where did it go?" is the top line."""
+    ordered = sorted(
+        rows.items(), key=lambda kv: -((kv[1].input_tokens or 0) + (kv[1].output_tokens or 0))
+    )
+    return [_usage_row(label, usage) for label, usage in ordered]
+
+
+def _cost_line(usage: Usage) -> str:
+    """The Copilot backend reports tokens but never cost, so say that plainly
+    instead of printing a zero the model would repeat as fact."""
+    if usage.cost is None:
+        return "cost: not reported by the agent backend (tokens above are the whole record)"
+    return f"cost: {usage.cost:.4f}"
 
 
 def _clip(text: str, limit: int) -> str:
