@@ -207,18 +207,30 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Deploy: wait on the PyPI **simple index**, not the JSON API. The two are
+  separate cache layers and the JSON one goes green first — the very first
+  automated deploy (v0.7.17) sailed past the readiness gate and then died in
+  `pip install`, which still saw 0.7.16 as the newest release. The gate now
+  looks for the wheel filename pip will actually fetch, and the install itself
+  retries, since it is the only authoritative test of "installable". The run
+  failed safe: restart and health check were skipped, the rollback restored the
+  running version, and the pause state survived.
+
 - Discord: a reply to the bot is still recognised when discord.py leaves
   `reference.resolved` unset (the referenced message came only from the
   cache), and a reply to a *deleted* message no longer counts as one. This
   gate decides steers now, not just concierge turns.
+
 - Discord: `daemon_discord_threads` gains an index on `thread_id`, the
   column `run_for_thread()` filters on — it is consulted per inbound message
   in a non-control channel and was scanning a row per run the daemon had
   ever done. The bridge also drops its engine handle when a run finishes
   instead of leaving a finished run's engine reachable.
+
 - Logging: fields whose value is `None` are dropped before rendering
   (`sbxloop.log.drop_none_fields`) — `worker.job_done … error=None exit_code=None`, `job_submit … cwd=None`, `provision_start … template=None` and every host event's `job=None` no longer clutter the
   daemon's log; absence is the record.
+
 - Audit runs no longer sink on a verify command they never needed: the
   audit contract now tells the planner an audit changes no code and needs
   no `verify_commands` (never the project's suite/build/lint — field failure
