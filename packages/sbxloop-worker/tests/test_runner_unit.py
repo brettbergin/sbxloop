@@ -318,13 +318,19 @@ class TestEnvFile:
     def test_the_real_environment_wins(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # apply_env_file writes straight to os.environ, so every name it will
+        # create has to be registered with monkeypatch first or it leaks into
+        # the rest of the worker process. Deliberately NOT the `SBXLOOP_`
+        # prefix: that is the config prefix, and a stray one makes every later
+        # Config() raise "Extra inputs are not permitted".
         path = tmp_path / "env.sh"
-        path.write_text("export SBXLOOP_TEST_TOK=from_file\nexport SBXLOOP_TEST_NEW=fresh\n")
-        monkeypatch.setenv("SBXLOOP_TEST_TOK", "gho_alreadyhere")
-        monkeypatch.delenv("SBXLOOP_TEST_NEW", raising=False)
+        path.write_text("export WORKER_ENVFILE_TOK=from_file\nexport WORKER_ENVFILE_NEW=fresh\n")
+        monkeypatch.setenv("WORKER_ENVFILE_TOK", "gho_alreadyhere")
+        monkeypatch.setenv("WORKER_ENVFILE_NEW", "")
+        monkeypatch.delenv("WORKER_ENVFILE_NEW")
         apply_env_file(path)
-        assert os.environ["SBXLOOP_TEST_TOK"] == "gho_alreadyhere"
-        assert os.environ["SBXLOOP_TEST_NEW"] == "fresh"
+        assert os.environ["WORKER_ENVFILE_TOK"] == "gho_alreadyhere"
+        assert os.environ["WORKER_ENVFILE_NEW"] == "fresh"
 
     def test_the_env_file_beats_an_sbx_proxy_sentinel(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
