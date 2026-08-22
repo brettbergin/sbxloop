@@ -895,8 +895,12 @@ class TestSecretEnvVerification:
         fallback, so the agent got a token-shaped hole and every session died
         with a 401. A sentinel is not a credential — fall back."""
         # The fake runs exec for real, so the host env IS the sandbox env.
+        # Both roles get a sentinel: the pair provisions in parallel and both
+        # probes write the same verdict key, so mixing answers would make the
+        # cached value a coin toss (the same race behind the long-standing
+        # flake in test_ensure_pair_records_field_verdicts).
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "sbx-cs-Xrz8X47IcldsQVJ0")
-        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("GH_TOKEN", "sbx-cs-Xrz8X47IcldsQVJ0")
         bus = EventBus()
         events: list[Event] = []
         bus.subscribe(events.append)
