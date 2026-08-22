@@ -252,6 +252,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Sandbox secrets: a proxy **sentinel** is no longer mistaken for a delivered
+  credential. sbx's secret proxy exports `sbx-cs-…` in place of the value and
+  swaps the real one in on the way out — which works for anything that just
+  puts it in a header, and not at all for a client that inspects it. The
+  provisioner's visibility probe was `test -n`, so when sbx began exporting the
+  sentinel into `sbx exec` login shells the probe read "visible", skipped the
+  in-VM env-file fallback, and handed the agent a token-shaped hole: every
+  Copilot session died with `401 Requires authentication`, the SDK validating
+  the format client-side. The probe now asks what the consumer asks — does this
+  look like a credential — and treats a sentinel exactly like an absent one,
+  recording a distinct `sentinel-under-exec` verdict. Two follow-on holes are
+  closed with it: the worker's `apply_env_file` used `os.environ.setdefault`,
+  so an injected sentinel beat the real token the fallback had just written and
+  the fallback silently did nothing; and the conformance probe now sets a
+  token-shaped value so it can tell the three answers apart, with `expected`
+  relaxed to None because provisioning handles all of them. Field failure on
+  the daemon host, 2026-08-21.
+
 - Deploy: install the wheels attached to the GitHub Release instead of pulling
   from PyPI at all. The simple index is Fastly-cached with `max-age=600`, so for
   up to ten minutes after a release pip can still be served an index page that

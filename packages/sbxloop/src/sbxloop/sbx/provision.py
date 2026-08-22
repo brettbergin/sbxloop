@@ -59,6 +59,7 @@ from sbxloop.sbx.secretstate import (
     service_rm_candidates,
     set_secret_replacing,
 )
+from sbxloop_worker.secrets import shell_token_case
 
 log = get_logger(__name__)
 
@@ -90,6 +91,10 @@ GITHUB_ALLOW_DOMAINS = (
 # host workspace inside the microVM is undocumented; probe, never assume.
 MOUNT_SEARCH_ROOTS = ("/workspace", "/home/agent", "/mnt", "/host", "/root")
 MOUNT_SEARCH_MAXDEPTH = 4
+
+# Secret-visibility probe exit code for "set, but not a credential" —
+# sbx's proxy sentinel. 0 is a usable token, 1 is unset/empty.
+_SENTINEL_EXIT = 3
 
 
 def mount_search_roots(workspace: Path | None) -> tuple[str, ...]:
@@ -659,6 +664,15 @@ class Provisioner:
         security tradeoff. If sbx later injects secrets into exec sessions,
         this check passes and the token stays out of the VM.
 
+        There is a third answer, and missing it cost a live outage
+        (2026-08-21): sbx can export its proxy *sentinel* (``sbx-cs-...``)
+        into the exec environment. That is non-empty, so a `test -n` probe
+        called it visible and skipped the fallback - but no GitHub client
+        can authenticate with a sentinel, so the agent got a token-shaped
+        hole. The probe therefore asks what the consumer asks, whether the
+        value looks like a credential, and treats a sentinel exactly like an
+        absent one.
+
         The downgrade is a security decision, so it only ever happens on a
         clean probe answer (`test -n` exiting 0 or 1). An sbx-level failure
         or any other exit code is retried once and then fails provisioning
@@ -670,7 +684,16 @@ class Provisioner:
             # visibility check can never pass and would only produce noise.
             return
         env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
-        probe = ["sh", "-lc", f'test -n "${{{env_name}}}"']
+        # 0 = a usable credential, 1 = unset/empty, SENTINEL_EXIT = set but
+        # not a credential (sbx's proxy placeholder). Classifying in the shell
+        # keeps the value inside the VM - it is never read back out here.
+        probe = [
+            "sh",
+            "-lc",
+            f'v="${{{env_name}}}"; [ -n "$v" ] || exit 1; '
+            f'case "$v" in {shell_token_case()}) exit 0 ;; *) exit {_SENTINEL_EXIT} ;; esac',
+        ]
+        clean = (0, 1, _SENTINEL_EXIT)
         error = ""
         for _attempt in range(2):
             try:
@@ -678,9 +701,12 @@ class Provisioner:
             except SbxError as exc:
                 error = str(exc)
                 continue
-            if result.returncode in (0, 1):
+            if result.returncode in clean:
                 break
-            error = f"probe exited {result.returncode} (expected 0 or 1): {result.stderr.strip()}"
+            error = (
+                f"probe exited {result.returncode} (expected one of {clean}): "
+                f"{result.stderr.strip()}"
+            )
         else:
             message = (
                 f"{env_name}: secret visibility probe failed twice without a clean answer — "
@@ -697,9 +723,16 @@ class Provisioner:
             raise ProvisionError(f"{spec.name}: {message} (last error: {error})")
         # A transient probe error must not clobber the cached knowledge of
         # sbx semantics, so only clean answers are recorded.
+        sentinel = result.returncode == _SENTINEL_EXIT
+        if result.ok:
+            verdict = "visible-under-exec"
+        elif sentinel:
+            verdict = "sentinel-under-exec"
+        else:
+            verdict = "invisible-under-exec"
         self._record_probe(
             PROBE_SECRET_ENV_VISIBILITY,
-            "visible-under-exec" if result.ok else "invisible-under-exec",
+            verdict,
             f"observed while provisioning {spec.name} ({env_name})",
         )
         if result.ok:
@@ -707,9 +740,13 @@ class Provisioner:
         # Auto-heal: fall back to the plain-env file for this sandbox. The
         # token value becomes visible inside the microVM (which the agent
         # already controls); egress remains bounded by the network policy.
+        seen = (
+            "sbx proxy secret is a sentinel under exec, which no GitHub client accepts"
+            if sentinel
+            else "sbx proxy secret invisible to exec"
+        )
         message = (
-            f"{env_name}: sbx proxy secret invisible to exec — using in-VM env file "
-            f'(secret_strategy="plain-env" silences this)'
+            f'{env_name}: {seen} — using in-VM env file (secret_strategy="plain-env" silences this)'
         )
         # A security-relevant downgrade, not routine progress.
         log.warning(
