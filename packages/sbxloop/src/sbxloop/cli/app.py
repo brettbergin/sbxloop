@@ -35,6 +35,7 @@ from sbxloop.config import (
 )
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
 from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.versions import VersionProbe, start_drift_check
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
 from sbxloop.engine.store import StateStore
@@ -1614,6 +1615,9 @@ def daemon(
         raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, sources=sources, sbx=sbx)
+    # One probe, shared: the startup drift check below warms its PyPI memo, so
+    # the concierge's first `version_status` answers without a network call.
+    versions = VersionProbe(sbx=sbx)
     bridge: DiscordBridge | None = None
     concierge: Concierge | None = None
     if config.discord.enabled:
@@ -1641,9 +1645,18 @@ def daemon(
                 github=github,
                 host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
                 bus=concierge_bus,
+                versions=versions,
             )
             bridge.concierge = concierge
             concierge.warm_up()
+
+    if not once:
+        # Merges to main auto-release a patch; deploying here is manual, so a
+        # long-lived daemon drifts behind silently. Check once in the
+        # background (never on the startup path) and narrate it only when
+        # behind — nobody has to remember to ask. `sbx_control`'s concierge
+        # tool `version_status` answers the same question on demand.
+        start_drift_check(versions, bridge.daemon_event if bridge is not None else None)
 
     ctl = ControlServer(loop, config.state_dir)
     cleanup_registry.install_handlers()
@@ -2208,7 +2221,7 @@ mem_abort = 0.0
 # max_tool_calls = 16
 # session_turns = 40               # rotate the resumed SDK session after N turns
 # github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
-# create_issues = true             # file issues (backlog label; the run label only on your yes)
+# create_issues = true             # file/list/comment/label/close issues (a close needs your yes)
 """
 
 

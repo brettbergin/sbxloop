@@ -390,7 +390,13 @@ card per run in the control channel (source, run id, branch, tracking
 issue, PR, task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
-code-fence boundaries instead of clipped; each burst of tool calls
+code-fence boundaries instead of clipped — their **narration only**, never the
+JSON payload a structured phase returns; what that payload *decided* is posted
+in its own words instead: the task roster (`🧩 3 task(s)`, re-announced with
+persisted state on resume), each task's plan (numbered steps, expected
+artifacts, verify commands, egress grants) and every critic verdict
+(`♻ scrutinize: revise`, its issues by severity, the feedback quoted as the
+executor will receive it); each burst of tool calls
 digested into **one line edited in place** (`⚙ 23 tool calls (bash x21, view x2) — last: pytest -q`, with a "may be stuck" nudge when the last
 calls are near-identical) — failed calls still get their own detail
 block, and `chronology_level = "verbose"` streams every call batched into
@@ -405,7 +411,10 @@ shape — `🔎 audit #701 filed for charter flakes · audit: flakes`,
 `🔎 review #801 filed for PR #9 · gh:4`, `🔎 post-mortem #901 filed for gh:4 · abandoned: …`, `✅ gh:9 done (2/2 tasks done) · filed #50` — with every
 issue number a link. Mentions are always disabled, so model output can never ping the
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
-`chronology_level` tune it. **Type in a run's thread to steer that run**: your message is
+`chronology_level` tune it. **@mention the bot in a run's thread to steer that run**
+(or reply to one of its messages there) — the same rule the control channel
+uses, so people can talk about a run in its own thread without derailing it.
+Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
@@ -415,7 +424,8 @@ the item as **cancelled** — attributed to you on the source, no automatic
 retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
 on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run
 instead, and `!sbx retry <item>` reruns any cancelled or abandoned item with
-its attempt budget reset. Anyone who can post in the channel
+its attempt budget reset. Those verbs work in a run's thread too, answered
+where you typed them. Anyone who can post in the channel
 can steer — that is the boundary to set. The bot ignores messages from bots
 (itself included), so scripts drive the daemon with `sbxloop daemon ctl <verb>`
 instead — the same verbs through the same dispatcher, no Discord needed; a
@@ -438,13 +448,31 @@ configured repo from a described feature or bug — created with the
 `sbxloop:backlog` label (triage), after which it **asks you** whether to
 add `sbxloop:run` and labels only on your yes; "what's in the backlog?"
 lists the open `sbxloop:backlog` issues and asks which, if any, to work.
-Actions are direct — it acts
+Ask what a run cost and it reports that run's input/output tokens per
+agent persona and totalled; "how much have we spent today?" totals the
+rolling 24 hours next to the daily run cap. Tokens are attributed to when
+they were spent, so a run spanning midnight counts on both days. The
+backend reports tokens but not cost, so it says that rather than
+converting to money — and a run from before usage reporting answers "not
+recorded", never zero.
+Ask "are we up to date?" and it compares the installed `sbxloop` /
+`sbxloop-worker` / `sbx` versions against the latest releases on PyPI —
+every merge to `main` publishes a patch while upgrading this host is
+manual, so the daemon also says so once at startup when it is behind.
+(It only reports: upgrading is `pip install --upgrade sbxloop` plus a
+restart, by a human on the host.)
+It finishes triage too: "reply on #12 that we're waiting on upstream"
+posts a comment signed with your name, and "close #12 as a duplicate of
+#7" comments and closes it as *not planned* (or *completed*) — but only
+after it has asked and you have said yes naming the issue, and never while
+a run is working that issue. `[concierge] create_issues` gates all of it.
+Actions are otherwise direct — it acts
 with the same authority as `!sbx`, so anyone who can mention it drives the
 daemon; restrict the channel accordingly — and every tool it used is
 listed in one edited `🛠 concierge: sbx_control(status) · run_detail(r7…)`
 line under your question, so nothing happens invisibly. Steering a live
-run still happens in that run's thread; asked from the control channel,
-the concierge points at the thread. It runs as a Copilot session in a
+run still happens by @mentioning the bot in that run's thread; asked from
+the control channel, the concierge points at the thread. It runs as a Copilot session in a
 **long-lived agent sandbox** the daemon owns (`sbxloop-concierge-<digest>`,
 reused across daemon restarts so the conversation keeps its memory; the
 SDK session is rotated after `[concierge] session_turns` messages) and
@@ -835,6 +863,7 @@ The real-sbx end-to-end suite runs in CI via a manually dispatched workflow.
 
 - [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume
 - [Worker protocol](docs/worker-protocol.md) — the host↔worker contract: job kinds, events, transports
+- [Deploying the daemon](docs/deploy.md) — merge to `main` releases, then deploys itself to the daemon host: drain, upgrade, restart, health check, roll back
 - [Spike: agent-session backend](docs/spikes/46-agent-session-backend.md) — feasibility study for proxy-held secrets via sbx native sessions (issue #46)
 - [Changelog](CHANGELOG.md)
 

@@ -8,6 +8,70 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- Concierge: **`run_usage`** and **`usage_today`** put Copilot spend in chat
+  (#334). The daily run cap was visible in `!sbx status` but token usage was
+  not visible anywhere — the worker has always emitted `agent.usage` events and
+  nothing read them. `run_usage` folds one run's samples into a per-persona
+  breakdown and a total; `usage_today` totals the rolling 24 hours next to
+  `runs_today/max_runs_per_day`. Tokens are attributed to when they were spent,
+  not to the day the run started, so a run spanning midnight counts on both
+  days. Two things are reported rather than invented: the Copilot backend emits
+  tokens but never `cost`, so the report says so instead of printing a zero the
+  model would repeat as fact, and a run with no samples answers "not recorded"
+  rather than zero — `Usage.merged` keeps None as None precisely so those stay
+  distinguishable.
+
+- **Automated deploys to the daemon host** (`.github/workflows/deploy.yml`).
+  Every merge to `main` already auto-released to PyPI, but getting that release
+  onto the running daemon was manual, so a host silently drifted behind its own
+  releases (#331). The new workflow chains off `Release` on a self-hosted runner
+  and does the last mile: pause the daemon and wait for the in-flight run to
+  finish (20 min cap, 15s poll floor — `status()` mutates the breaker, #309),
+  `pip install` the exact released version, `systemctl --user restart`, then
+  health-check it (unit active, `--version` matches, `sbxloop doctor`, `ctl status`, and a 45s settle against crash loops). A failed check rolls back to
+  the version that was running. The operator's pause state is recorded up front
+  and re-applied afterwards — required, because pause is in-memory only (#308)
+  and a restart otherwise resumes autonomous dispatch silently. Deploy start and
+  outcome are posted to the Discord control channel. See `docs/deploy.md`.
+
+- `contrib/systemd/github-runner.service` and `contrib/systemd/sbx-sandboxd.service`.
+  The runner is a **user** unit, not GitHub's `svc.sh` system unit: a system
+  service has no `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, so
+  `systemctl --user restart sbxloop-daemon` fails from one. `sbx-sandboxd`
+  supervises the sandbox backend, which was previously a bare process nothing
+  would restart; `sbxloop-daemon.service` now `Requires=` and is ordered after it.
+
+- Concierge: **`version_status`** answers "are we up to date?" — the
+  installed `sbxloop`, `sbxloop-worker` and `sbx` versions against the
+  latest releases on PyPI, with a `pip install --upgrade` hint when the host
+  is behind. Every merge to `main` auto-releases a patch while deploying to
+  a daemon host was manual, so the daemon now also posts one drift line to
+  the control channel at startup when it is behind — a tool only helps
+  whoever thinks to ask. Read-only and always available (no GitHub, no new
+  config knob); it reports drift rather than acting on it. The PyPI lookup is
+  the host's only outbound HTTP besides Discord: unauthenticated, bounded by
+  a 4s timeout and a response cap, memoised for five minutes, and degrading
+  to "could not reach PyPI" rather than failing a turn. A `.devN` build or a
+  `0.0.0` never-built tree is reported as such instead of being compared —
+  hatch-vcs names a dev build for the version it is heading *toward*, so
+  `0.7.12.dev0` is not the released `0.7.12`.
+
+- Concierge: **`comment_on_issue`** and **`close_issue`** finish triage from
+  chat. The first posts a comment on an issue, attributed to the Discord
+  user in a trailer like `create_issue`; the second closes one as
+  `completed` or `not_planned`, optionally posting the reason as a comment
+  first, and removes the `trigger_label` so a reopen does not silently
+  re-queue a run. A close is the one concierge action that is **not**
+  direct: the prompt requires an explicit yes naming the issue and the tool
+  requires a `confirmation` argument quoting what the person said, logged
+  with the close. The issue is read first, so a pull-request number, an
+  already-closed issue and one a run is working right now are refused
+  without writing anything, and the result names the title, the reason and
+  the url. Closing does not dequeue the daemon's own `gh:<n>` item, so the
+  result says whether that item was already claimed (a run can still start
+  — abandon it) or not (the loop re-checks and drops it). Gated by the same
+  `[concierge] create_issues` knob as the rest of the issue surface.
+
 - Concierge: **`list_issues`** lists the repo's open issues — by default
   the `backlog_label` ones (the triage backlog), `all=true` for every open
   issue, `label=` to narrow — with labels, age, author, comments and url,
@@ -126,6 +190,49 @@ All notable changes to sbxloop are documented here. The project adheres to
   state the semantics unambiguously
   (`runs today (UTC): 7/10, resets at 00:00 UTC`).
 
+- **What the structured phases decided is now an event**, so it can be shown
+  without showing the agent's JSON: `run.tasks` (the roster, re-announced on
+  resume with each task's persisted state), `phase.plan` (steps, expected
+  artifacts, verify commands, egress grants) and `phase.verdict` (a critic's
+  call, its issues by severity, and the feedback the executor is about to be
+  told). All three carry only what the agent's reply already said — the reply
+  was simply the sole carrier, so dropping it dropped the plan and the critic's
+  reasoning with it. Discord renders each as a card; the daemon log mirrors
+  them at `INFO`.
+
+- Discord: an agent's **JSON payload no longer reaches the channel**. Every
+  structured phase — decompose, plan, scrutinize, validate, steer — asks its
+  agent for one fenced JSON block and gets narration around it, and the bridge
+  posted both: the block, and the rendering of what the engine parsed out of it
+  (the status line, the phase lines, the steering reply, the report card). The
+  same facts twice, one of them in the shape a human reads least, split across
+  several messages when the plan was large. Agent messages now arrive as their
+  narration only; a reply that was payload only posts nothing at all. Detection
+  mirrors `sbxloop_worker._json.extract_json` — fenced blocks tagged `json` or
+  simply parsing as one, then a bare document running to the end of the reply —
+  so an unfenced payload and a `bash` block the agent is talking about are told
+  apart. Nothing is lost: what the payload decided is posted as its own card
+  (above), and the block itself is still in the run's event store
+  (`sbxloop logs`) and the phase ledger.
+
+- Concierge: the `sbx_control` tool no longer appends the raw status dict as
+  JSON to its own reply text. A JSON blob in a tool result is a JSON blob the
+  model may paste into Discord, next to the same numbers it just wrote in
+  words; the two fields the text did not spell out (current work item,
+  consecutive failures) follow it as prose instead. The prompt's style rules
+  now say it outright: answer in prose, never in raw JSON.
+
+- Discord: steering a run now takes an **@mention of the bot in that run's
+  thread** (or a reply to one of its messages there), the same rule the
+  control channel already used. Previously *every* message in a run thread
+  was relayed to the agent as steering, so watching a run and talking about
+  it in its own thread repeatedly paused and re-planned the run. The bot's
+  mention token is stripped before the text is relayed; plain messages in a
+  thread are ignored in silence, and a bare mention does nothing. `!sbx <verb>` now also works inside a run thread, answered where it was typed.
+  The bot listens on exactly two surfaces — the control channel and threads
+  it opened itself; a DM or an unrelated channel is ignored outright, mention
+  or not.
+
 - Discord: a plain (non-command, non-mention) message in the control
   channel is now **ignored** — the canned "type in the run's thread to
   steer" reply is gone; people can talk among themselves, and the concierge
@@ -158,9 +265,52 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- Sandbox secrets: a proxy **sentinel** is no longer mistaken for a delivered
+  credential. sbx's secret proxy exports `sbx-cs-…` in place of the value and
+  swaps the real one in on the way out — which works for anything that just
+  puts it in a header, and not at all for a client that inspects it. The
+  provisioner's visibility probe was `test -n`, so when sbx began exporting the
+  sentinel into `sbx exec` login shells the probe read "visible", skipped the
+  in-VM env-file fallback, and handed the agent a token-shaped hole: every
+  Copilot session died with `401 Requires authentication`, the SDK validating
+  the format client-side. The probe now asks what the consumer asks — does this
+  look like a credential — and treats a sentinel exactly like an absent one,
+  recording a distinct `sentinel-under-exec` verdict. Two follow-on holes are
+  closed with it: the worker's `apply_env_file` used `os.environ.setdefault`,
+  so an injected sentinel beat the real token the fallback had just written and
+  the fallback silently did nothing; and the conformance probe now sets a
+  token-shaped value so it can tell the three answers apart, with `expected`
+  relaxed to None because provisioning handles all of them. Field failure on
+  the daemon host, 2026-08-21.
+
+- Deploy: install the wheels attached to the GitHub Release instead of pulling
+  from PyPI at all. The simple index is Fastly-cached with `max-age=600`, so for
+  up to ten minutes after a release pip can still be served an index page that
+  predates it. Two consecutive deploys died on this — v0.7.17 on `sbxloop`, then
+  v0.7.18 on `sbxloop-worker`, a separate project whose index page is cached
+  independently, which is why the first attempt at a fix (waiting on the host
+  package's index entry) did not hold. `Release` attaches the same `dist/` it
+  publishes, so the wheels exist the moment it finishes; installing both
+  together also satisfies the host wheel's exact `sbxloop-worker==X` pin without
+  the index being consulted for it. Rollback still uses PyPI, where the older
+  version is never racing. Both failed runs failed safe — restart and health
+  check skipped, rollback restored the running version, pause state survived.
+
+- Discord: a reply to the bot is still recognised when discord.py leaves
+  `reference.resolved` unset (the referenced message came only from the
+  cache), and a reply to a *deleted* message no longer counts as one. This
+  gate decides steers now, not just concierge turns.
+
+- Discord: `daemon_discord_threads` gains an index on `thread_id`, the
+  column `run_for_thread()` filters on — it is consulted per inbound message
+  in a non-control channel and was scanning a row per run the daemon had
+  ever done. The bridge also drops its engine handle when a run finishes
+  instead of leaving a finished run's engine reachable.
+
 - Logging: fields whose value is `None` are dropped before rendering
   (`sbxloop.log.drop_none_fields`) — `worker.job_done … error=None exit_code=None`, `job_submit … cwd=None`, `provision_start … template=None` and every host event's `job=None` no longer clutter the
   daemon's log; absence is the record.
+
 - Audit runs no longer sink on a verify command they never needed: the
   audit contract now tells the planner an audit changes no code and needs
   no `verify_commands` (never the project's suite/build/lint — field failure

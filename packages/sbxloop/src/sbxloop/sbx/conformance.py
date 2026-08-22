@@ -47,6 +47,7 @@ from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.sbx.secretstate import SECRET_EXISTS_MARKERS, parsed_scope
 from sbxloop.toolchains import PYTHON_SERIES
+from sbxloop_worker.secrets import shell_token_case
 
 # -- probe ids (importable so provisioning hooks can't typo them) -----------
 
@@ -288,6 +289,8 @@ def _probe_page_size(ctx: ProbeContext) -> tuple[str, str]:
 
 
 _VIS_PROBE_ENV = "SBXLOOP_CONFORMANCE_VIS"
+# Token-shaped so the probe can tell a delivered value from sbx's sentinel.
+_VIS_PROBE_VALUE = "gho_conformanceprobe"  # nosec B105 - not a real credential
 _DUP_PROBE_ENV = "SBXLOOP_CONFORMANCE_DUP"
 _PROBE_SECRET_HOST = "example.com"  # nosec B105 - hostname, not a secret
 
@@ -301,17 +304,33 @@ def _cleanup_probe_secret(cli: SbxCLI, env: str, sandbox: str) -> None:
 
 
 def _probe_secret_env_visibility(ctx: ProbeContext) -> tuple[str, str]:
+    # Token-shaped on purpose: sbx may export its proxy *sentinel* instead of
+    # the value, and a bare `test -n` cannot tell the two apart — which is
+    # exactly the confusion that broke provisioning in the field (2026-08-21).
     assert ctx.sandbox is not None
     name = ctx.sandbox.name
     ctx.cli.secret_set_custom(
-        host=_PROBE_SECRET_HOST, env=_VIS_PROBE_ENV, value="conformance", sandbox=name
+        host=_PROBE_SECRET_HOST, env=_VIS_PROBE_ENV, value=_VIS_PROBE_VALUE, sandbox=name
     )
     try:
-        result = ctx.sandbox.exec(["sh", "-lc", f'test -n "${{{_VIS_PROBE_ENV}}}"'])
+        result = ctx.sandbox.exec(
+            [
+                "sh",
+                "-lc",
+                f'v="${{{_VIS_PROBE_ENV}}}"; [ -n "$v" ] || exit 1; '
+                f'case "$v" in {shell_token_case()}) exit 0 ;; *) exit 3 ;; esac',
+            ]
+        )
     finally:
         _cleanup_probe_secret(ctx.cli, _VIS_PROBE_ENV, name)
     if result.ok:
         return "visible-under-exec", "custom secret env visible to `sbx exec` login shells"
+    if result.returncode == 3:
+        return (
+            "sentinel-under-exec",
+            "custom secret env holds sbx's proxy sentinel, not the value — no GitHub "
+            "client can authenticate with it",
+        )
     return "invisible-under-exec", "custom secret env NOT visible to `sbx exec` processes"
 
 
@@ -442,9 +461,10 @@ CATALOG: tuple[Probe, ...] = (
         id=PROBE_SECRET_ENV_VISIBILITY,
         summary="whether sbx proxy secret injection reaches `sbx exec` processes",
         tier="sandbox",
-        expected="invisible-under-exec",
-        depends="provisioning's plain-env auto-heal; a visible verdict means the proxy "
-        "path may now work under exec and the in-VM env-file fallback may be unnecessary",
+        expected=None,  # provisioning auto-heals every answer; see _verify_secret_env
+        depends="provisioning's plain-env auto-heal: 'visible-under-exec' keeps the token "
+        "out of the VM, while both 'invisible-under-exec' and 'sentinel-under-exec' fall "
+        "back to the in-VM env file",
         run=_probe_secret_env_visibility,
     ),
     Probe(

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from sbxloop_worker.protocol import JobRequest
 from sbxloop_worker.runner import JobRunner
+from sbxloop_worker.secrets import is_sbx_sentinel
 
 DEFAULT_ENV_FILE = Path.home() / ".sbxloop" / "env.sh"
 # sbx documents this file as the place persistent sandbox env lives; load
@@ -29,8 +30,7 @@ def load_env_file(path: Path) -> dict[str, str]:
     """Parse ``export KEY=VALUE`` lines (shell-quoted values supported).
 
     Used by the plain-env secret strategy: the provisioner writes tokens to
-    ``~/.sbxloop/env.sh`` and the worker loads them at startup. Existing
-    process environment always wins.
+    ``~/.sbxloop/env.sh`` and the worker loads them at startup.
     """
     loaded: dict[str, str] = {}
     if not path.is_file():
@@ -52,8 +52,18 @@ def load_env_file(path: Path) -> dict[str, str]:
 
 
 def apply_env_file(path: Path) -> None:
+    """Existing process environment wins — except over an sbx proxy sentinel.
+
+    sbx exports ``sbx-cs-…`` in place of a proxy-bound secret, and nothing in
+    here can authenticate with one. Plain `setdefault` therefore let the
+    sentinel beat the real token the provisioner had just written, so the
+    plain-env fallback silently did nothing (field failure 2026-08-21: the
+    concierge could not open a session while the env file held a good token).
+    """
     for key, value in load_env_file(path).items():
-        os.environ.setdefault(key, value)
+        current = os.environ.get(key)
+        if current is None or is_sbx_sentinel(current):
+            os.environ[key] = value
 
 
 def main(argv: list[str] | None = None) -> int:
