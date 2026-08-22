@@ -60,3 +60,30 @@ the in-flight run to cancel at its next task boundary, waits up to
 `[daemon].shutdown_grace_s`, and exits. The interrupted run stays resumable
 and is picked up on the next start. After upgrading sbxloop, `systemctl --user restart sbxloop-daemon` so the new code (and a fresh github-ops
 sandbox) is used.
+
+## The other two units
+
+`sbx-sandboxd.service` supervises the sandbox backend. Without it `sbx daemon start` is a bare process: if it dies nothing restarts it, and every run fails
+with no systemd trace. The daemon unit `Requires=` it, so a manual
+`systemctl --user start sbxloop-daemon` brings the backend up first.
+
+`github-runner.service` runs a GitHub Actions runner as the *same user*, which
+is what lets a workflow do `systemctl --user restart sbxloop-daemon`. That is
+the deploy pipeline in [docs/deploy.md](../../docs/deploy.md) — merge to `main`,
+and the release that follows installs itself here and restarts the service.
+Both are user units, so `loginctl enable-linger "$USER"` covers all three.
+
+## Upgrading
+
+Automated, via that pipeline. By hand it is two commands as the daemon's user:
+
+```bash
+~/.sbxloop-venv/bin/pip install --upgrade 'sbxloop[discord]==X.Y.Z' 'sbxloop-worker==X.Y.Z'
+systemctl --user reset-failed sbxloop-daemon && systemctl --user restart sbxloop-daemon
+```
+
+`reset-failed` matters: `StartLimitBurst=5` per 600s leaves a unit that
+crash-looped in `failed`, where a plain `restart` will not revive it. Pause
+first (`sbxloop daemon ctl pause`, wait for `current: idle`) to avoid
+interrupting a run — and note the daemon comes back **unpaused** regardless,
+since pause is in-memory only.

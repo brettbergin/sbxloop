@@ -1,0 +1,343 @@
+name: Deploy to db
+
+# Deploys the release that Release just published to the daemon host (db), a
+# self-hosted runner. Merge to main -> Release tags + publishes to PyPI (~4 min)
+# -> this drains the daemon, upgrades it to that exact version, restarts the
+# service, health-checks it, and restores the operator's pause state. Any failed
+# check rolls back to the version that was running before.
+#
+# SECURITY INVARIANT — DO NOT BREAK:
+#   No job carrying the `self-hosted` label may be reachable from a
+#   fork-triggerable event (pull_request, pull_request_target, issue_comment).
+#   This repo is PUBLIC and the runner's user has passwordless root on db, so a
+#   fork-triggered job on this runner would be a full host compromise. The two
+#   triggers below are safe: `workflow_run` fires only from Release (push to
+#   main only, base-repo context), and `workflow_dispatch` needs write access.
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to deploy (X.Y.Z). Blank = latest on PyPI."
+        required: false
+        default: ""
+
+# Never cancel a deploy mid-restart; let a newer one queue behind it.
+concurrency:
+  group: deploy-db
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    # A failed/cancelled Release has nothing to deploy.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, db]
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        # Explicit: the runner user's login shell is zsh, where `status` is a
+        # read-only special variable. Actions defaults to bash on Linux anyway.
+        shell: bash
+
+    # No actions/checkout: the deploy installs from PyPI and needs nothing from
+    # the tree. Skipping it keeps the runner's _work empty and removes the
+    # largest supply-chain surface on a root-equivalent host.
+
+    env:
+      # Every host path the deploy touches, in one place.
+      VENV_PIP: /home/bergs/.sbxloop-venv/bin/pip
+      VENV_SBXLOOP: /home/bergs/.sbxloop-venv/bin/sbxloop
+      # The wrapper: sources ~/.config/sbxloop/env.sh for PATH (/usr/sbin for
+      # mkfs.ext4), dbus and secrets. `doctor` and `ctl` need it; pip does not.
+      SBXLOOP: /home/bergs/.local/bin/sbxloop
+      WORKDIR: /home/bergs/sbxloop-work
+      UNIT: sbxloop-daemon
+      SECRETS_ENV: /home/bergs/.config/sbxloop/secrets.env
+
+    steps:
+      - name: Resolve the target version
+        id: target
+        env:
+          # The host's secrets.env also exports GH_TOKEN (a PAT). Set it
+          # explicitly so gh talks to the API as this workflow, not as the host.
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INPUT_VERSION: ${{ inputs.version }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION#v}"
+            echo "dispatched: v${version}"
+          elif [ -n "${HEAD_SHA:-}" ]; then
+            # Annotated tags: use /tags (.commit.sha is the commit) rather than
+            # /git/refs/tags, whose .object.sha is the tag object.
+            version="$(gh api "repos/${REPO}/tags" --paginate \
+              --jq ".[] | select(.commit.sha==\"${HEAD_SHA}\") | .name" | head -n1)"
+            version="${version#v}"
+            if [ -z "${version}" ]; then
+              # Release's ancestor guard skipped tagging (nothing new to ship),
+              # or it tagged a newer tip. Fall back to the latest release.
+              version="$(gh release view --repo "${REPO}" --json tagName --jq .tagName)"
+              version="${version#v}"
+              echo "no tag on ${HEAD_SHA}; falling back to latest release v${version}"
+            else
+              echo "released commit ${HEAD_SHA} is v${version}"
+            fi
+          else
+            version="$(gh release view --repo "${REPO}" --json tagName --jq .tagName)"
+            version="${version#v}"
+          fi
+          [ -n "${version}" ] || { echo "::error::could not resolve a version to deploy"; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare against what is installed
+        id: installed
+        run: |
+          set -euo pipefail
+          current="$("${VENV_SBXLOOP}" --version | awk '{print $2}')"
+          echo "current=${current}" >> "$GITHUB_OUTPUT"
+          if [ "${current}" = "${{ steps.target.outputs.version }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::db is already at ${current} — nothing to deploy."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::deploying ${current} -> ${{ steps.target.outputs.version }}"
+          fi
+
+      - name: Announce in Discord
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          FROM: ${{ steps.installed.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          MSG="🚀 deploying sbxloop \`${FROM}\` → \`${VERSION}\` on \`db\` — [run](<${RUN_URL}>)"
+          # Inlined rather than a script: this job has no checkout, so nothing
+          # from the repo tree exists on the runner. Reuses the bot already in
+          # the channel — no new webhook or repo secret to manage.
+          # Sourced in a subshell so shell quoting is handled natively and no
+          # other secret leaks into this step's environment.
+          tok="$(set -a; . "${SECRETS_ENV}"; printf '%s' "${DISCORD_BOT_TOKEN:-}")"
+          ch="$(sed -n 's/^[[:space:]]*channel_id[[:space:]]*=[[:space:]]*//p' "${WORKDIR}/sbxloop.toml" | head -n1 | tr -dc '0-9')"
+          if [ -z "${tok}" ] || [ -z "${ch}" ]; then
+            echo "no discord bot token or channel_id — skipping notification"
+            exit 0
+          fi
+          echo "::add-mask::${tok}"
+          curl -sS -X POST \
+            -H "Authorization: Bot ${tok}" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg c "${MSG}" '{content:$c}')" \
+            "https://discord.com/api/v10/channels/${ch}/messages" >/dev/null
+
+      - name: Fetch the release wheels
+        id: wheels
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Install from the GitHub Release, not PyPI. Release attaches the
+          # same dist/ it uploads to PyPI, and it exists the moment Release
+          # finishes — whereas the PyPI simple index is Fastly-cached with
+          # `max-age=600`, so for up to ten minutes pip can still be served an
+          # index that predates the upload. Two deploys died that way: v0.7.17
+          # on `sbxloop`, then v0.7.18 on `sbxloop-worker`, which is a separate
+          # project with its own independently-cached index page.
+          dist="$(mktemp -d)"
+          echo "dist=${dist}" >> "$GITHUB_OUTPUT"
+          for attempt in 1 2 3 4 5; do
+            if gh release download "v${VERSION}" --repo "${REPO}" --dir "${dist}" \
+                 --pattern '*.whl' --clobber; then
+              ls -1 "${dist}"
+              exit 0
+            fi
+            echo "release v${VERSION} not downloadable yet (attempt ${attempt}); retrying in 15s"
+            sleep 15
+          done
+          echo "::error::could not download the wheels for v${VERSION}"
+          exit 1
+
+      - name: Record the daemon's pause state
+        id: state
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # `ctl` resolves state_dir from the cwd, so it must run in WORKDIR.
+          # Exit 2 = no daemon answered; treat that as "not paused" and let the
+          # health check below be the thing that fails.
+          ctl_out="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 30 || true)"
+          echo "${ctl_out}"
+          if grep -qi 'paused: true' <<<"${ctl_out}"; then
+            echo "paused=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::daemon is paused; the deploy will leave it paused."
+          else
+            echo "paused=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pause and drain the in-flight run
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cd "${WORKDIR}"
+          "${SBXLOOP}" daemon ctl pause --timeout 30 || true
+          # Poll no faster than 15s: issue #309, status() mutates the circuit
+          # breaker (it half-opens and decrements consecutive_failures).
+          for _ in $(seq 1 80); do   # 80 * 15s = 20 min
+            ctl_out="$("${SBXLOOP}" daemon ctl status --timeout 30 || true)"
+            if grep -qi '^current: idle' <<<"${ctl_out}"; then
+              echo "daemon is idle — safe to restart"
+              exit 0
+            fi
+            echo "run still in flight: $(grep -i '^current:' <<<"${ctl_out}" || echo unknown)"
+            sleep 15
+          done
+          # Not fatal: cancellation is honored at the next task boundary and an
+          # interrupted run is resumable, it just costs a resume-budget slot.
+          echo "::warning::run did not finish within 20 min — restarting anyway; the run will resume."
+
+      - name: Upgrade
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          DIST: ${{ steps.wheels.outputs.dist }}
+        run: |
+          set -euo pipefail
+          # Both wheels together, from the release: the host wheel pins
+          # sbxloop-worker==VERSION exactly, and naming the local worker wheel
+          # satisfies that pin without the index being consulted for it at all.
+          # [discord] is required — the daemon's bridge needs it. Everything
+          # else (pydantic, discord.py) still resolves from PyPI, which is fine:
+          # those are not racing a just-published version.
+          "${VENV_PIP}" install --upgrade \
+            "${DIST}/sbxloop_worker-${VERSION}-py3-none-any.whl" \
+            "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord]"
+          "${VENV_SBXLOOP}" --version
+
+      - name: Restart the daemon
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Without reset-failed, StartLimitBurst=5 / StartLimitIntervalSec=600
+          # leaves a previously crash-looping unit `failed` and NOT restartable.
+          systemctl --user reset-failed "${UNIT}" || true
+          # TimeoutStopSec=120 plus shutdown_grace_s=60: the stop half alone can
+          # take three minutes.
+          timeout 300 systemctl --user restart "${UNIT}"
+
+      - name: Health check
+        id: health
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::health check failed: $1"; exit 1; }
+
+          systemctl --user is-active --quiet "${UNIT}" || fail "unit is not active"
+
+          got="$("${VENV_SBXLOOP}" --version | awk '{print $2}')"
+          [ "${got}" = "${VERSION}" ] || fail "version is ${got}, expected ${VERSION}"
+
+          # Never --deep here: that boots a microVM. Plain doctor covers exactly
+          # what a restart can break — sbx login, tokens, template, worker
+          # wheel, state dir, discord bridge.
+          (cd "${WORKDIR}" && "${SBXLOOP}" doctor) || fail "sbxloop doctor is unhappy"
+
+          # ctl exit 2 = nothing claimed the request, i.e. the daemon never came up.
+          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 60) || fail "daemon did not answer ctl status"
+
+          # Let it settle, then prove it is not crash-looping.
+          before="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
+          sleep 45
+          systemctl --user is-active --quiet "${UNIT}" || fail "unit died within 45s of starting"
+          after="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
+          [ "${before}" = "${after}" ] || fail "unit restarted ${before} -> ${after} within 45s (crash loop)"
+
+          echo "::notice::db is healthy on ${VERSION}"
+
+      - name: Roll back
+        if: failure() && steps.installed.outputs.changed == 'true' && steps.state.outcome == 'success'
+        env:
+          PREV: ${{ steps.installed.outputs.current }}
+        run: |
+          set -euo pipefail
+          echo "::error::deploy failed — rolling back to ${PREV}"
+          # PyPI is safe here: PREV has been published for a while, so its index
+          # page is long since warm. No just-published version to race.
+          "${VENV_PIP}" install --upgrade "sbxloop[discord]==${PREV}" "sbxloop-worker==${PREV}"
+          systemctl --user reset-failed "${UNIT}" || true
+          timeout 300 systemctl --user restart "${UNIT}"
+          sleep 15
+          systemctl --user is-active --quiet "${UNIT}" \
+            && echo "rolled back to $("${VENV_SBXLOOP}" --version | awk '{print $2}')" \
+            || echo "::error::ROLLBACK ALSO FAILED — db needs a human"
+
+      - name: Restore the daemon's pause state
+        # Runs after a rollback too: whatever version is live, the operator's
+        # intent must survive. Required because pause is in-memory only (#308),
+        # so the daemon always comes back claiming work.
+        if: always() && steps.installed.outputs.changed == 'true' && steps.state.outcome == 'success'
+        env:
+          WAS_PAUSED: ${{ steps.state.outputs.paused }}
+        run: |
+          set -euo pipefail
+          cd "${WORKDIR}"
+          # Must run AFTER the restart: ControlServer refuses any request
+          # stamped before the daemon started ("resend it").
+          if [ "${WAS_PAUSED}" = "true" ]; then
+            "${SBXLOOP}" daemon ctl pause --timeout 60 || echo "::warning::could not re-pause"
+          else
+            "${SBXLOOP}" daemon ctl resume --timeout 60 || echo "::warning::could not resume"
+          fi
+          "${SBXLOOP}" daemon ctl status --timeout 60 || true
+
+      - name: Clean up the downloaded wheels
+        if: always() && steps.wheels.outputs.dist != ''
+        run: rm -rf -- "${{ steps.wheels.outputs.dist }}"
+
+      - name: Report to Discord
+        if: always() && steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          FROM: ${{ steps.installed.outputs.current }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ "${RESULT}" = "success" ]; then
+            MSG="✅ \`db\` deployed sbxloop \`${VERSION}\` — [run](<${RUN_URL}>)"
+          else
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`db\` **${RESULT}** — rolled back to \`${FROM}\`. [run](<${RUN_URL}>)"
+          fi
+          # Inlined rather than a script: this job has no checkout, so nothing
+          # from the repo tree exists on the runner. Reuses the bot already in
+          # the channel — no new webhook or repo secret to manage.
+          # Sourced in a subshell so shell quoting is handled natively and no
+          # other secret leaks into this step's environment.
+          tok="$(set -a; . "${SECRETS_ENV}"; printf '%s' "${DISCORD_BOT_TOKEN:-}")"
+          ch="$(sed -n 's/^[[:space:]]*channel_id[[:space:]]*=[[:space:]]*//p' "${WORKDIR}/sbxloop.toml" | head -n1 | tr -dc '0-9')"
+          if [ -z "${tok}" ] || [ -z "${ch}" ]; then
+            echo "no discord bot token or channel_id — skipping notification"
+            exit 0
+          fi
+          echo "::add-mask::${tok}"
+          curl -sS -X POST \
+            -H "Authorization: Bot ${tok}" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg c "${MSG}" '{content:$c}')" \
+            "https://discord.com/api/v10/channels/${ch}/messages" >/dev/null

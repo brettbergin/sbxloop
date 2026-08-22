@@ -35,6 +35,7 @@ from sbxloop_worker.protocol import (
     SessionHealth,
     Usage,
 )
+from sbxloop_worker.secrets import looks_like_github_token
 
 # The SDK's permission-request ``kind`` vocabulary, field-verified against
 # github-copilot-sdk 1.0.9 (2026-08-13): ``copilot.session.PermissionRequest``
@@ -73,7 +74,6 @@ SDK_PERMISSION_KINDS = frozenset(
 # effect (mcp, custom-tool, hook, extension-permission-access).
 READ_ONLY_ALLOWED_KINDS = frozenset({"read", "url", "shell"})
 
-_TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
 
 # -- bundled-ripgrep page-size guard (issue #122) ----------------------------
 # The Copilot CLI's glob/grep tools spawn a bundled ripgrep that is a
@@ -176,7 +176,7 @@ def _auth_diagnostic() -> str:
             "environment - sbx secret injection did not reach this process; "
             'try secret_strategy="plain-env"'
         )
-    if token.startswith(_TOKEN_PREFIXES):
+    if looks_like_github_token(token):
         return (
             "auth diagnostic: COPILOT_GITHUB_TOKEN is set with a recognized "
             "format; the failure is likely subscription/permissions "

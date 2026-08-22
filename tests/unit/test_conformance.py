@@ -325,20 +325,18 @@ class TestDrift:
     ) -> None:
         state = tmp_path / "state"
         # seed the CURRENT version's cache with a flipped verdict; a shallow
-        # run must still alarm on the cached value
+        # run must still alarm on the cached value. Any probe carrying an
+        # `expected` will do — secret-env-visibility deliberately carries None
+        # now, because provisioning auto-heals every answer it can give.
         save_verdicts(
             state,
             FAKE_VERSION,
-            {
-                PROBE_SECRET_ENV_VISIBILITY: ProbeRecord(
-                    verdict="visible-under-exec", checked_at=time.time()
-                )
-            },
+            {PROBE_WORKSPACE_MOUNT: ProbeRecord(verdict="harvest-only", checked_at=time.time())},
         )
         report = run_conformance(make_cli(fake_sbx), state, deep=False)
-        outcome = by_id(report)[PROBE_SECRET_ENV_VISIBILITY]
+        outcome = by_id(report)[PROBE_WORKSPACE_MOUNT]
         assert outcome.drifts
-        assert any("plain-env" in drift for drift in outcome.drifts)
+        assert any("mount discovery" in drift for drift in outcome.drifts)
 
     def test_same_verdict_across_versions_is_not_drift(
         self, fake_sbx: FakeSbx, tmp_path: Path

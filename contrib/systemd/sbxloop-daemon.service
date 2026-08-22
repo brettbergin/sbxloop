@@ -1,8 +1,11 @@
 [Unit]
 Description=sbxloop daemon — autonomous outer loop over labeled issues and inbox files
 Documentation=https://github.com/brettbergin/sbxloop
-After=network-online.target
+After=network-online.target sbx-sandboxd.service
 Wants=network-online.target
+# The sandbox backend must be up first — a run cannot provision without
+# it. Drop this if you supervise sandboxd some other way.
+Requires=sbx-sandboxd.service
 # Restart rate limiting is a [Unit] setting (under [Service] systemd ignores it).
 StartLimitIntervalSec=600
 StartLimitBurst=5

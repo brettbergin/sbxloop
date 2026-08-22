@@ -895,6 +895,24 @@ class LoopEngine:
                 revisions=task.revisions,
                 replans=task.replans,
             )
+        # The same roster as one event, for a surface that cannot hold a live
+        # table (Discord edits one status line, which has room for the current
+        # task only). Without it the decomposition reaches a human nowhere:
+        # the decomposer's own reply is JSON, and JSON is not posted.
+        self.bus.emit(
+            HostEventTypes.RUN_TASKS,
+            run_id,
+            message=f"{len(tasks)} task(s)",
+            tasks=[
+                {
+                    "id": task.spec.id,
+                    "title": task.spec.title,
+                    "state": task.state,
+                    "depends_on": list(task.spec.depends_on),
+                }
+                for task in tasks
+            ],
+        )
         failed_ids: set[str] = {t.spec.id for t in tasks if t.state == "failed"}
         skipped_ids: set[str] = {t.spec.id for t in tasks if t.state == "skipped"}
         for task in tasks:
@@ -982,6 +1000,20 @@ class LoopEngine:
         started = time.time()
         plan = phases.plan(task)
         task.plan = plan
+        # What the task will actually be executed against, as parsed data:
+        # the planner answers in JSON, so this is the only form of the plan a
+        # human ever sees.
+        self.bus.emit(
+            HostEventTypes.PHASE_PLAN,
+            run_id,
+            task_id=task.spec.id,
+            attempt=task.replans + 1,
+            message=f"{len(plan.steps)} step(s)",
+            steps=list(plan.steps),
+            expected_artifacts=list(plan.expected_artifacts),
+            verify_commands=list(plan.verify_commands),
+            egress=[{"domain": e.domain, "reason": e.reason} for e in plan.egress],
+        )
         self.store.record_phase(
             run_id,
             "plan",
@@ -1033,6 +1065,7 @@ class LoopEngine:
             output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
         )
+        self._emit_verdict(run_id, task, "scrutinize", verdict)
         self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
         if self._replan_suspect_verify(run_id, task, verdict):
             return
@@ -1205,6 +1238,7 @@ class LoopEngine:
             output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
         )
+        self._emit_verdict(run_id, task, "validate", verdict)
         self._emit_critic_degraded(run_id, task, "validate", outcome)
         if verdict.verdict == "accept":
             self._set_task_state(run_id, task, "done")
@@ -1231,6 +1265,26 @@ class LoopEngine:
         if outcome.downgraded:
             payload["downgraded"] = True
         return payload
+
+    def _emit_verdict(self, run_id: str, task: TaskRecord, phase: str, verdict: Verdict) -> None:
+        """Put a critic's ruling — and what it rested on — in the live stream.
+
+        The critics answer in JSON, so without this the reasoning behind a
+        revise/reject reaches a human nowhere: the task state says
+        ``executing`` again and the feedback only exists in the
+        ``phase_attempts`` ledger.
+        """
+        self.bus.emit(
+            HostEventTypes.PHASE_VERDICT,
+            run_id,
+            task_id=task.spec.id,
+            phase=phase,
+            verdict=verdict.verdict,
+            attempt=task.revisions + 1,
+            message=f"{phase}: {verdict.verdict}",
+            issues=[{"severity": i.severity, "detail": i.detail} for i in verdict.issues],
+            feedback=verdict.feedback,
+        )
 
     def _emit_critic_degraded(
         self, run_id: str, task: TaskRecord, phase: str, outcome: CriticOutcome

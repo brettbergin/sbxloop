@@ -438,6 +438,22 @@ class TestDaemonCommand:
         assert "tick:" in result.output and "no_work" in result.output
         assert "daemon.tick" in result.output  # and the structured record
 
+    def test_once_never_starts_the_version_check(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The drift check reaches PyPI, so it belongs to a long-running
+        daemon only — this is what keeps the unit suite off the network."""
+        from sbxloop.cli import app as app_mod
+
+        started: list[object] = []
+        # Patch where it is USED: app binds the name at import time, so
+        # patching sbxloop.daemon.versions would pass no matter what.
+        monkeypatch.setattr(app_mod, "start_drift_check", lambda *a, **k: started.append(a))
+        (workdir / "inbox" / "pending").mkdir(parents=True)
+        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        assert result.exit_code == 0, result.output
+        assert started == []
+
     def test_state_dir_defaults_outside_cwd_and_is_announced(
         self, workdir: Path, fake_sbx: FakeSbx
     ) -> None:
@@ -905,18 +921,20 @@ class TestDoctor:
         import time as time_module
 
         from sbxloop.sbx.conformance import (
-            PROBE_SECRET_ENV_VISIBILITY,
+            PROBE_WORKSPACE_MOUNT,
             ProbeRecord,
             save_verdicts,
         )
 
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        # A probe that still carries an `expected`; secret-env-visibility now
+        # carries None, since provisioning auto-heals every answer.
         save_verdicts(
             workdir / ".sbxloop",
             "0.38.0",
             {
-                PROBE_SECRET_ENV_VISIBILITY: ProbeRecord(
-                    verdict="visible-under-exec", checked_at=time_module.time()
+                PROBE_WORKSPACE_MOUNT: ProbeRecord(
+                    verdict="harvest-only", checked_at=time_module.time()
                 )
             },
         )

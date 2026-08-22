@@ -262,8 +262,14 @@ class SbxCLI:
             args.append("--force")
         self.run(*args, name)
 
-    def version(self) -> str | None:
-        return parse_version(self.run("version", check=False).stdout)
+    def version(self, *, timeout: float | None = None) -> str | None:
+        """The CLI's semver, or None when the output carries none.
+
+        ``timeout`` matters for callers on a latency budget: the default is
+        :attr:`default_timeout` (120s), so a hung ``sbx`` would otherwise
+        stall a concierge turn or a doctor run for two minutes.
+        """
+        return parse_version(self.run("version", check=False, timeout=timeout).stdout)
 
     # -- templates ---------------------------------------------------------
 

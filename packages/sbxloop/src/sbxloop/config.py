@@ -522,8 +522,10 @@ class ConciergeConfig(_ConfigModel):
     # Expose the read-only GitHub tool (PR/issue/diff/file reads through
     # the daemon's github-ops sandbox) when GitHub is configured.
     github_tools: bool = True
-    # Let the concierge file issues in the configured repo: created with the
-    # backlog label; the trigger label (a run) only after the person says so.
+    # Let the concierge write to issues in the configured repo: file them
+    # (backlog label), list them, comment on them, label one for a run, and
+    # close one. Every act that starts a run or closes an issue happens only
+    # after the person explicitly says so.
     create_issues: bool = True
 
 

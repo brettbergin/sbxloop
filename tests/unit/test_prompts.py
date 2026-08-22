@@ -256,6 +256,12 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "ask the person whether to add" in text
     assert "`label_issue_for_run` only after they explicitly say yes" in text
     assert "`list_issues`" in text and "ask which, if any, should be worked" in text
+    # triage's other half: a reply is direct, a close never is
+    assert "`comment_on_issue`" in text and "`close_issue`" in text
+    assert "pass **their own words** as `confirmation`" in text
+    assert "The one exception is\n  `close_issue`" in text
+    # drift: the concierge reports versions, a human does the upgrading
+    assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:

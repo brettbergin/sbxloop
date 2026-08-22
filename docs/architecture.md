@@ -108,8 +108,9 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   agent (`daemon/concierge.py`), a Copilot session with the agent token
   and **no built-in tools**: everything it can do is a *host tool*
   (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
-  run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads
-  through the ops box — relayed as `agent.tool_request` events and answered
+  run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads and
+  issue triage (file, list, comment, label for a run, close) through the ops
+  box — relayed as `agent.tool_request` events and answered
   by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
   polls for. It is **kept across daemon restarts** when the installed worker
   still matches the host, because the SDK session store — the conversation's
@@ -117,6 +118,13 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
 
 The credential split holds for both: the host never holds a PAT in a
 process that also talks to a model, and neither box holds both tokens.
+
+One deliberate exception to "the host does not talk to the network": the
+version check (`daemon/versions.py`, the concierge's `version_status` tool
+and the startup drift notice) reads `pypi.org` from the host process. It is
+unauthenticated and carries no credential, so the split above is untouched;
+it is bounded by a short timeout, a response cap and a five-minute memo, and
+every failure degrades to "could not reach PyPI" rather than raising.
 
 ## The loop
 
@@ -198,6 +206,15 @@ through the host `EventBus` (synchronous, subscriber-exception-isolated) and
 are persisted to SQLite — the CLI TUI, `logs --follow`, and hooks like
 `GithubReporterHook` are all just bus subscribers.
 
+The phases that ask their agent for JSON (decompose, plan, scrutinize,
+validate) also emit what they *decided*, parsed: `run.tasks` (the roster,
+re-announced on resume with each task's persisted state), `phase.plan` (the
+steps, expected artifacts, verify commands and egress grants a task will be
+executed against) and `phase.verdict` (a critic's call, its issues and the
+feedback the executor is about to be told). These carry no information the
+agent's reply did not — they exist so a surface can show the decision without
+showing the agent's JSON, which is what the Discord bridge does.
+
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
 
 ## Logging
@@ -223,7 +240,8 @@ subscribed to every run's bus under the logger `sbxloop.run`
 - `WARNING` — the run degraded or something was refused: `worker.error`,
   `sandbox.tooling_warning`, `sandbox.resources_warning`,
   `agent.permission_denied`, `agent.tool_cap`, `run.config_drift`.
-- `INFO` — lifecycle: `run.*`, task and phase start/state/end, sandbox
+- `INFO` — lifecycle: `run.*`, task and phase start/state/end, what the
+  structured phases decided (`phase.plan`, `phase.verdict`), sandbox
   provisioning, worker job start/end/result, GitHub op start/end, policy
   denials, chat (steering) traffic, gc.
 - `DEBUG` — everything else: individual tool calls, agent messages and
