@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -92,6 +93,13 @@ class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        # One connection is shared by every caller (check_same_thread=False),
+        # so writers serialise here rather than relying on SQLite's own
+        # per-statement mutex: `append_event_if_state` holds an explicit
+        # BEGIN IMMEDIATE across a check and an insert, and any other
+        # thread committing mid-transaction would end it early. Reentrant
+        # so a guarded method may call another.
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -108,65 +116,70 @@ class StateStore:
     # -- runs --------------------------------------------------------------
 
     def create_run(self, run_id: str, outcome: str, config_json: str = "{}") -> RunRecord:
-        now = time.time()
-        try:
-            self._conn.execute(
-                "INSERT INTO runs (run_id, outcome, state, config_json, created_at, updated_at)"
-                " VALUES (?, ?, 'created', ?, ?, ?)",
-                (run_id, outcome, config_json, now, now),
+        with self._lock:
+            now = time.time()
+            try:
+                self._conn.execute(
+                    "INSERT INTO runs (run_id, outcome, state, config_json, created_at, updated_at)"
+                    " VALUES (?, ?, 'created', ?, ?, ?)",
+                    (run_id, outcome, config_json, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StateError(f"run {run_id} already exists") from exc
+            self._conn.commit()
+            return RunRecord(
+                run_id=run_id, outcome=outcome, state="created", created_at=now, updated_at=now
             )
-        except sqlite3.IntegrityError as exc:
-            raise StateError(f"run {run_id} already exists") from exc
-        self._conn.commit()
-        return RunRecord(
-            run_id=run_id, outcome=outcome, state="created", created_at=now, updated_at=now
-        )
 
     def set_run_state(self, run_id: str, state: RunState) -> None:
-        cursor = self._conn.execute(
-            "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
-            (state, time.time(), run_id),
-        )
-        if cursor.rowcount == 0:
-            raise StateError(f"unknown run {run_id}")
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+                (state, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
 
     def set_run_workspace(self, run_id: str, workspace: Path, mounted: bool) -> None:
-        cursor = self._conn.execute(
-            "UPDATE runs SET workspace = ?, mounted = ?, updated_at = ? WHERE run_id = ?",
-            (str(workspace), int(mounted), time.time(), run_id),
-        )
-        if cursor.rowcount == 0:
-            raise StateError(f"unknown run {run_id}")
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET workspace = ?, mounted = ?, updated_at = ? WHERE run_id = ?",
+                (str(workspace), int(mounted), time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
 
     def set_run_kept(self, run_id: str, reason: str | None) -> None:
         """Mark a run's sandboxes as deliberately kept (``"debug"``,
         ``"manual"``), or clear the marker with None. ``sandbox prune``
         excludes kept runs unless explicitly told otherwise."""
-        cursor = self._conn.execute(
-            "UPDATE runs SET kept_reason = ? WHERE run_id = ?",
-            (reason, run_id),
-        )
-        if cursor.rowcount == 0:
-            raise StateError(f"unknown run {run_id}")
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET kept_reason = ? WHERE run_id = ?",
+                (reason, run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
 
     def append_run_guidance(self, run_id: str, text: str) -> None:
         """Append one standing chat-guidance entry (a ``steer_run`` verdict)
         to the run. Persisted so a resumed run re-applies it to its prompts."""
-        row = self._conn.execute(
-            "SELECT user_guidance FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        if row is None:
-            raise StateError(f"unknown run {run_id}")
-        items = json.loads(row["user_guidance"] or "[]")
-        items.append(text)
-        self._conn.execute(
-            "UPDATE runs SET user_guidance = ?, updated_at = ? WHERE run_id = ?",
-            (json.dumps(items), time.time(), run_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_guidance FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError(f"unknown run {run_id}")
+            items = json.loads(row["user_guidance"] or "[]")
+            items.append(text)
+            self._conn.execute(
+                "UPDATE runs SET user_guidance = ?, updated_at = ? WHERE run_id = ?",
+                (json.dumps(items), time.time(), run_id),
+            )
+            self._conn.commit()
 
     def get_run_guidance(self, run_id: str) -> list[str]:
         row = self._conn.execute(
@@ -242,32 +255,34 @@ class StateStore:
     # -- tasks -------------------------------------------------------------
 
     def save_tasks(self, run_id: str, specs: list[TaskSpec]) -> None:
-        for index, spec in enumerate(specs):
-            self._conn.execute(
-                "INSERT OR REPLACE INTO tasks (run_id, task_id, order_idx, state, spec_json)"
-                " VALUES (?, ?, ?, 'pending', ?)",
-                (run_id, spec.id, index, spec.model_dump_json()),
-            )
-        self._conn.commit()
+        with self._lock:
+            for index, spec in enumerate(specs):
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO tasks (run_id, task_id, order_idx, state, spec_json)"
+                    " VALUES (?, ?, ?, 'pending', ?)",
+                    (run_id, spec.id, index, spec.model_dump_json()),
+                )
+            self._conn.commit()
 
     def update_task(self, run_id: str, task: TaskRecord) -> None:
-        cursor = self._conn.execute(
-            "UPDATE tasks SET state = ?, plan_json = ?, revisions = ?, replans = ?,"
-            " last_feedback = ?, session_id = ? WHERE run_id = ? AND task_id = ?",
-            (
-                task.state,
-                task.plan.model_dump_json() if task.plan else None,
-                task.revisions,
-                task.replans,
-                task.last_feedback,
-                task.session_id,
-                run_id,
-                task.spec.id,
-            ),
-        )
-        if cursor.rowcount == 0:
-            raise StateError(f"unknown task {task.spec.id} in run {run_id}")
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE tasks SET state = ?, plan_json = ?, revisions = ?, replans = ?,"
+                " last_feedback = ?, session_id = ? WHERE run_id = ? AND task_id = ?",
+                (
+                    task.state,
+                    task.plan.model_dump_json() if task.plan else None,
+                    task.revisions,
+                    task.replans,
+                    task.last_feedback,
+                    task.session_id,
+                    run_id,
+                    task.spec.id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown task {task.spec.id} in run {run_id}")
+            self._conn.commit()
 
     def get_tasks(self, run_id: str) -> list[TaskRecord]:
         rows = self._conn.execute(
@@ -306,13 +321,14 @@ class StateStore:
         output_json: str | None,
         started_at: float,
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO phase_attempts"
-            " (run_id, task_id, phase, attempt, status, output_json, started_at, ended_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (run_id, task_id, phase, attempt, status, output_json, started_at, time.time()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO phase_attempts"
+                " (run_id, task_id, phase, attempt, status, output_json, started_at, ended_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, task_id, phase, attempt, status, output_json, started_at, time.time()),
+            )
+            self._conn.commit()
 
     def latest_phase_output(self, run_id: str, task_id: str, phase: str) -> str | None:
         """output_json of the task's most recent attempt of ``phase``."""
@@ -364,11 +380,12 @@ class StateStore:
         return row["ts"] if row and row["ts"] is not None else None
 
     def append_event(self, event: Event) -> None:
-        self._conn.execute(
-            "INSERT INTO events (run_id, ts, type, job_id, data_json) VALUES (?, ?, ?, ?, ?)",
-            (event.run_id, event.ts, event.type, event.job_id, json.dumps(event.data)),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO events (run_id, ts, type, job_id, data_json) VALUES (?, ?, ?, ?, ?)",
+                (event.run_id, event.ts, event.type, event.job_id, json.dumps(event.data)),
+            )
+            self._conn.commit()
 
     def append_event_if_state(self, event: Event, states: frozenset[str] | set[str]) -> bool:
         """Append ``event`` only if the run is currently in one of ``states``,
@@ -381,23 +398,25 @@ class StateStore:
         the state check and the marker are one atomic step against every
         other writer on the same state DB. Returns whether it was appended.
         """
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT state FROM runs WHERE run_id = ?", (event.run_id,)
-            ).fetchone()
-            if row is None or row["state"] not in states:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT state FROM runs WHERE run_id = ?", (event.run_id,)
+                ).fetchone()
+                if row is None or row["state"] not in states:
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    "INSERT INTO events (run_id, ts, type, job_id, data_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (event.run_id, event.ts, event.type, event.job_id, json.dumps(event.data)),
+                )
+                self._conn.commit()
+            except BaseException:
                 self._conn.rollback()
-                return False
-            self._conn.execute(
-                "INSERT INTO events (run_id, ts, type, job_id, data_json) VALUES (?, ?, ?, ?, ?)",
-                (event.run_id, event.ts, event.type, event.job_id, json.dumps(event.data)),
-            )
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
-        return True
+                raise
+            return True
 
     def events(
         self,

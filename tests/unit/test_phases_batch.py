@@ -140,11 +140,33 @@ class TestScrutinizeEvidenceBatching:
         assert outcome.verdict.verdict == "pass"
         batches = [j for j in agent.jobs if j.kind == "shell.batch"]
         assert len(batches) == 1
-        assert batches[0].commands == [command for _, command in EVIDENCE_COMMANDS]
+        assert batches[0].commands == [item.command for item in EVIDENCE_COMMANDS]
         # evidence output reaches the critic's prompt under its label
         prompt = next(j for j in agent.jobs if j.kind == "agent.session").prompt or ""
         assert "### git status" in prompt
         assert "output of git status --short 2>&1 | head -50" in prompt
+
+    def test_the_diff_gets_a_far_larger_budget_than_the_other_evidence(self) -> None:
+        """The critic is meant to judge from the diff rather than rediscover
+        the change by hand: every turn it spends hunting re-sends the whole
+        session context, so a patch that survives into the prompt is worth
+        far more than the bytes it costs. A 1.5k clip would have truncated
+        every real diff into uselessness."""
+        diff = next(item for item in EVIDENCE_COMMANDS if item.label == "git diff")
+        assert diff.command == "git diff HEAD 2>&1"  # staged work included
+        assert diff.limit >= 10 * max(
+            item.limit for item in EVIDENCE_COMMANDS if item.label != "git diff"
+        )
+
+        body = "\n".join(f"+line {i}" for i in range(4_000))
+        agent = BatchStubAgent(outputs={diff.command: body})
+        runner(agent).scrutinize(record(), plan(), "did the work")
+        prompt = next(j for j in agent.jobs if j.kind == "agent.session").prompt or ""
+
+        assert "### git diff" in prompt
+        assert "+line 0" in prompt  # head survives...
+        assert "+line 3999" in prompt  # ...and so does the tail
+        assert "(clipped" in prompt  # and the elision is declared
 
     def test_evidence_job_failure_is_not_fatal(self) -> None:
         agent = BatchStubAgent(batch_error=True)

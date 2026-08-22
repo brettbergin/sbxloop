@@ -51,6 +51,17 @@ $executor_report
 
 ## Workspace evidence
 
+The diff below is the work under review, gathered mechanically. Read it
+first and judge from it: it is the same change you would find by opening
+files yourself, already here. Only reach for a tool when the diff genuinely
+cannot answer a question — an untracked file named in `git status` whose
+contents you need, or a claim about behaviour you can settle by running a
+read-only command. Re-deriving what the diff already shows is the single
+most expensive thing you can do in this review, and it buys nothing.
+
+If the diff is marked as clipped, it was too large to include whole; read
+the elided files directly.
+
 $evidence
 
 ## Verify commands that run mechanically after your review
@@ -74,9 +85,10 @@ Respond with exactly one fenced JSON block:
 }
 ```
 
-`verdict` must be `"pass"` or `"revise"`. Verify claims yourself where
-possible instead of trusting the report. Only demand revisions for real
-problems that block the acceptance criteria — not stylistic preferences.
+`verdict` must be `"pass"` or `"revise"`. Check the executor's claims
+against the diff rather than taking the report at its word. Only demand
+revisions for real problems that block the acceptance criteria — not
+stylistic preferences.
 
 Judge the checks too, not only the work. If the prior feedback is a failed
 verify command and the work in the workspace genuinely satisfies the task,

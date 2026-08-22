@@ -144,9 +144,13 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   run workspace.
 - **SCRUTINIZE** — a fresh session in the *same sandbox* with **read-only
   permissions** reviews the work against plan + acceptance criteria, with
-  evidence gathered mechanically (`git status`, `git diff`). Fresh session:
-  no anchoring to the executor's claims. Read-only: the critic cannot "fix"
-  things. Same sandbox: the workspace under review is preserved.
+  evidence gathered mechanically (`git status`, `git diff HEAD`). Fresh
+  session: no anchoring to the executor's claims. Read-only: the critic
+  cannot "fix" things. Same sandbox: the workspace under review is
+  preserved. The diff is handed over in full (clipped head+tail at
+  `DIFF_CLIP`) rather than as a `--stat` summary: a critic that has to
+  rediscover the change by opening files spends turns, and turns are what a
+  run is billed and timed by.
 - **VERIFY** — mechanical: the union of task and plan `verify_commands` must
   all exit 0. No LLM.
 - **VALIDATE** — fresh read-only session judges each acceptance criterion.
@@ -159,6 +163,28 @@ whole run.
 
 Structured JSON phases are validated against pydantic models with one retry
 that feeds the validation error back to the agent.
+
+### What a run costs
+
+A run's spend and its wall clock are both governed by **turns**, not jobs.
+Every turn re-sends the whole session context, and field measurement (run
+`rews3ssdn`: 272 turns across 25 jobs) put ~22k tokens of fixed context on
+every one of them — roughly 62% of the run's input spend, against a phase
+prompt under 2k. Wall clock tracked the same count at ~10s/turn. Two knobs
+follow from that:
+
+- `[budgets] trim_system_message` (default **off**) drops the agent SDK's
+  system-message sections a phase cannot act on (`PHASE_DROP_SECTIONS` in
+  `sbxloop.engine.phases`), so they are not re-sent every turn. Only
+  `code_change_rules`, and only from the phases that write no code. Off until
+  a real run says whether that 22k is billed or cached, and whether the SDK
+  accepts the `customize` config shape — a rejection fails every agent job,
+  and the deploy health check would not catch it because it starts no run.
+- `[budgets] max_parallel_tasks` runs independent tasks concurrently. The
+  task DAG already knows which tasks are independent; above 1 they share one
+  agent sandbox and one workspace, so raising it is safe only for outcomes
+  whose tasks are genuinely file-disjoint — `depends_on` is agent-authored
+  and does not certify that.
 
 ### Prompt templates
 

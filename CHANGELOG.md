@@ -36,6 +36,60 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Run cost is governed by turns, not jobs** — and four changes act on that.
+  Field measurement of run `rews3ssdn` (7 tasks, 272 assistant turns across 25
+  jobs) put **~22,000 tokens of fixed context on every turn**, about 62% of the
+  run's input spend, against a phase prompt template of ~1,900 tokens; wall
+  clock tracked the same turn count at ~10s/turn (55 minutes). The run itself
+  was not thrashing — 1 revision and 0 replans, with scrutinize passing 6/6 and
+  validate accepting 5/5 — so the spend was baseline session cost, not rework.
+  Batching phases into fewer, longer sessions would have moved turns between
+  columns without removing any, so the per-task phase structure is unchanged.
+
+  - **Usage reporting reads the fields the SDK was already sending.** The
+    Copilot backend mapped only `model`/`input_tokens`/`output_tokens` off
+    `AssistantUsageData` and discarded `cost`, `cache_read_tokens`,
+    `cache_write_tokens` and the tool-schema count. Everything downstream
+    already carried them, so `run_usage` was reporting cost as "not reported by
+    the agent backend" while the backend reported it on every turn — and how
+    much of that 22k/turn is served from cache was unknowable. The mapping is
+    now a pure `usage_from_sdk_sample` (unit-tested despite the module being
+    coverage-omitted, like `read_only_denial` before it), and `run_usage` breaks
+    spend down by turns and jobs per persona.
+  - **`[budgets] trim_system_message`** (default **off**) drops the agent SDK
+    system-message sections a phase cannot act on, so they stop being re-sent
+    every turn. Deliberately narrow: only `code_change_rules`, and only from the
+    five phases that write no code — EXECUTE, the one phase with write
+    permission, keeps everything. Off by default until a field run answers two
+    questions the usage fields above now make answerable: whether that 22k is
+    billed or served from cache (an unmeasured optimisation should not be on),
+    and whether the SDK accepts the `customize` config shape — if it does not,
+    every agent job fails, and the deploy's health check would not catch it
+    because it never starts a run. `tool_instructions`/`tool_efficiency` make
+    sessions cheaper rather than dearer, `tone` governs output format (a
+    chattier reply costs a whole retry session), and `safety` is not worth
+    trimming for the bytes. `sbxloop doctor` gains a section-vocabulary drift
+    check mirroring the permission-kinds one, because a renamed section fails
+    silently — spend just returns to baseline.
+  - **`[budgets] max_parallel_tasks`** (default 1) runs independent tasks
+    concurrently. The task DAG already knew which tasks were independent; the
+    loop walked them one at a time regardless. Readiness is now evaluated
+    explicitly — a task starts once every dependency has *finished* — rather
+    than being implied by position, and a lane that dies stops new launches but
+    lets its siblings checkpoint before the error propagates, which is what
+    keeps the run resumable. **Raising it above 1 is an informed choice:**
+    concurrent tasks share one agent sandbox and one workspace, and
+    `depends_on` is agent-authored, so nothing guarantees two "independent"
+    tasks touch disjoint files. Safe today only for outcomes whose tasks are
+    genuinely file-disjoint; per-task workspace isolation is what would make it
+    unconditional.
+  - **SCRUTINIZE is handed the diff instead of sent to find it.** Evidence was
+    `git diff --stat` clipped to 1,500 characters while the prompt told the
+    critic to verify claims itself — an instruction to spend tool calls at
+    21.9s/turn, the most expensive turns in the run. It now receives
+    `git diff HEAD` (staged work included) clipped head-and-tail at 20,000
+    characters, and the prompt directs it to judge from the patch.
+
 - Concierge: **`run_usage`** and **`usage_today`** put Copilot spend in chat
   (#334). The daily run cap was visible in `!sbx status` but token usage was
   not visible anywhere — the worker has always emitted `agent.usage` events and
@@ -43,11 +97,10 @@ All notable changes to sbxloop are documented here. The project adheres to
   breakdown and a total; `usage_today` totals the rolling 24 hours next to
   `runs_today/max_runs_per_day`. Tokens are attributed to when they were spent,
   not to the day the run started, so a run spanning midnight counts on both
-  days. Two things are reported rather than invented: the Copilot backend emits
-  tokens but never `cost`, so the report says so instead of printing a zero the
-  model would repeat as fact, and a run with no samples answers "not recorded"
+  days. Nothing is invented: a run with no samples answers "not recorded"
   rather than zero — `Usage.merged` keeps None as None precisely so those stay
-  distinguishable.
+  distinguishable — and cost is shown only when the backend actually reports it
+  (see the usage-field fix below, which is what made it report).
 
 - **Automated deploys to the daemon host** (`.github/workflows/deploy.yml`).
   Every merge to `main` already auto-released to PyPI, but getting that release

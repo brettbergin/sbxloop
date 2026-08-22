@@ -304,6 +304,36 @@ class Budgets(_ConfigModel):
     # tool calls has further calls turned away with a nudge to stop
     # investigating and report. 0 disables.
     max_tool_calls_per_phase: int = Field(default=40, ge=0)
+    # Drop system-message sections a phase cannot use (see PHASE_DROP_SECTIONS
+    # in sbxloop.engine.phases). Field measurement put ~22k tokens of fixed
+    # context on EVERY turn of every session — roughly 62% of a run's input
+    # spend — and the phase prompt is under 2k of it; the rest is the agent
+    # SDK's system message and tool schemas.
+    #
+    # Off by default until two things are known, both of which the usage
+    # fields shipped alongside this now answer. First, whether that 22k is
+    # billed at all or served from cache — an unmeasured optimisation should
+    # not be on. Second, whether the SDK accepts the `customize` config shape
+    # in the field: if it does not, every agent job fails, and the deploy's
+    # health check would not catch it because it never starts a run. Turn it
+    # on once a real run has answered both, and watch the per-task revision
+    # rate — a trimmed phase producing worse work shows up there first.
+    trim_system_message: bool = False
+    # How many tasks may be in flight at once. A run's wall clock is
+    # essentially its turn count times the per-turn latency, and the task
+    # loop is otherwise strictly serial even where the task DAG says two
+    # tasks are independent.
+    #
+    # Raising this above 1 is an informed choice, not a free speed-up. Every
+    # concurrent task runs in the SAME agent sandbox against the SAME
+    # workspace, and ``depends_on`` is agent-authored — nothing guarantees
+    # two "independent" tasks touch disjoint files, so overlapping executors
+    # can clobber each other. It also multiplies agent runtimes inside a
+    # microVM sbxloop cannot size (#253), so raise ``mem_warn``/``mem_abort``
+    # awareness with it. Safe today for outcomes whose tasks are genuinely
+    # file-disjoint; per-task workspace isolation is what would make it
+    # unconditionally safe.
+    max_parallel_tasks: int = Field(default=1, ge=1)
 
 
 BacklogMode = Literal["off", "github", "inbox"]

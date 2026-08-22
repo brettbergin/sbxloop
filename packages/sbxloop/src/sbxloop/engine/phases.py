@@ -36,10 +36,34 @@ from sbxloop.verifylint import UV_LOCKFILE, lint_verify_commands
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
-EVIDENCE_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("git status", "git status --short 2>&1 | head -50"),
-    ("git diff stat", "git diff --stat 2>&1 | head -50"),
-    ("recent files", "find . -type f -newer /tmp -not -path './.git/*' 2>/dev/null | head -30"),
+
+class EvidenceCommand(NamedTuple):
+    """One mechanical command whose output is handed to the critic, with the
+    character budget its output gets in the prompt."""
+
+    label: str
+    command: str
+    limit: int = 1_500
+
+
+# The diff gets an order of magnitude more room than the other evidence
+# because it replaces work the critic would otherwise do by hand. Handing
+# over ~5k tokens of patch once is far cheaper than the ten-plus tool-call
+# turns it takes to rediscover the same thing: every turn re-sends the whole
+# session context (~22k tokens of fixed overhead measured in the field), so
+# a turn saved is worth vastly more than the bytes it costs to save it.
+DIFF_CLIP = 20_000
+
+EVIDENCE_COMMANDS: tuple[EvidenceCommand, ...] = (
+    EvidenceCommand("git status", "git status --short 2>&1 | head -50"),
+    # `git diff HEAD` (not bare `git diff`) so staged work is included — the
+    # executor is free to `git add` and frequently does, and a critic shown
+    # an empty diff concludes nothing was done.
+    EvidenceCommand("git diff", "git diff HEAD 2>&1", DIFF_CLIP),
+    EvidenceCommand(
+        "recent files",
+        "find . -type f -newer /tmp -not -path './.git/*' 2>/dev/null | head -30",
+    ),
 )
 
 OUTPUT_CLIP = 6_000
@@ -67,6 +91,30 @@ AGENT_NAMES = {
     "scrutinize": "scrutinizer",
     "validate": "validator",
     "steer": "steering",
+}
+
+# System-message sections dropped per phase (see Budgets.trim_system_message).
+# The whole system message is re-sent on every turn of a session, so a section
+# a phase cannot act on is charged once per turn for the life of the session —
+# and turns are what a run is billed and timed by.
+#
+# Only ``code_change_rules`` (coding rules, linting/testing, ecosystem tools,
+# style) is dropped, and only from the phases that write no code: EXECUTE is
+# the sole phase with write permission, and the critics are read-only by
+# construction. Everything else stays, deliberately:
+#
+# - ``tool_instructions`` and ``tool_efficiency`` make sessions cheaper, not
+#   dearer — a critic that cannot drive its tools is the #123 failure mode.
+# - ``tone`` governs output format; a chattier reply is an ExpectedJsonMissing
+#   retry, which costs a whole extra session.
+# - ``safety`` is not worth trimming for the bytes it saves.
+PHASE_DROP_SECTIONS: dict[str, tuple[str, ...]] = {
+    "decompose": ("code_change_rules",),
+    "plan": ("code_change_rules",),
+    "execute": (),
+    "scrutinize": ("code_change_rules",),
+    "validate": ("code_change_rules",),
+    "steer": ("code_change_rules",),
 }
 
 log = get_logger(__name__)
@@ -169,14 +217,22 @@ class PhaseRunner:
 
     # -- job plumbing ------------------------------------------------------
 
+    def _drop_sections(self, phase: str) -> list[str]:
+        """System-message sections this phase does not need, or nothing when
+        the operator has turned trimming off."""
+        if not self.config.budgets.trim_system_message:
+            return []
+        return list(PHASE_DROP_SECTIONS.get(phase, ()))
+
     def _agent_job(
         self,
         prompt: str,
         *,
-        agent_name: str,
+        phase: str,
         permission_mode: Literal["auto", "read_only"],
         expect: Literal["text", "json"],
     ) -> JobResult:
+        agent_name = AGENT_NAMES[phase]
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
@@ -188,6 +244,7 @@ class PhaseRunner:
             cwd=self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
             max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
+            drop_system_sections=self._drop_sections(phase),
         )
         started = time.monotonic()
         log.info(
@@ -199,6 +256,7 @@ class PhaseRunner:
             permission_mode=permission_mode,
             expect=expect,
             prompt_chars=len(prompt),
+            dropped_sections=len(job.drop_system_sections) or None,
         )
         result = self.agent.submit(job, agent=agent_name)
         usage = result.usage
@@ -253,7 +311,7 @@ class PhaseRunner:
             try:
                 result = self._agent_job(
                     prompt,
-                    agent_name=AGENT_NAMES[prompt_name],
+                    phase=prompt_name,
                     permission_mode=permission_mode,
                     expect="json",
                 )
@@ -438,9 +496,7 @@ class PhaseRunner:
             feedback=task.last_feedback or "(none — first attempt)",
             user_guidance=self._guidance(),
         )
-        return self._agent_job(
-            prompt, agent_name=AGENT_NAMES["execute"], permission_mode="auto", expect="text"
-        )
+        return self._agent_job(prompt, phase="execute", permission_mode="auto", expect="text")
 
     def steer(
         self, message: str, *, tasks: Sequence[TaskRecord], task: TaskRecord | None
@@ -489,7 +545,7 @@ class PhaseRunner:
 
     def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> CriticOutcome:
         try:
-            evidence = self.shell_batch([command for _, command in EVIDENCE_COMMANDS])
+            evidence = self.shell_batch([item.command for item in EVIDENCE_COMMANDS])
         except WorkerError:
             # Evidence is best-effort context for the critic, never fatal.
             log.warning(
@@ -501,10 +557,15 @@ class PhaseRunner:
             )
             evidence = []
         evidence_parts: list[str] = []
-        for (label, _), result in zip(EVIDENCE_COMMANDS, evidence, strict=False):
-            output = clip(result.output, 1_500).strip()
+        for item, result in zip(EVIDENCE_COMMANDS, evidence, strict=False):
+            # Head+tail rather than tail-only: a long diff's first hunk is as
+            # load-bearing as its last, and the same clip is a no-op for the
+            # short outputs, so one rule covers every evidence command.
+            output = clip_head_tail(
+                result.output, head=item.limit // 3, tail=item.limit - item.limit // 3
+            ).strip()
             if output:
-                evidence_parts.append(f"### {label}\n```\n{output}\n```")
+                evidence_parts.append(f"### {item.label}\n```\n{output}\n```")
         return self._critic_json(
             "scrutinize",
             {
