@@ -732,6 +732,20 @@ class DaemonStore:
             ).fetchone()
             return int(row["n"])
 
+    def review_target(self, filed_as: str) -> tuple[int, str] | None:
+        """(pr_number, origin run id) for the review filed as ``filed_as``.
+
+        The reverse of :meth:`record_review`: when that charter comes back
+        round as a work item, this is how the loop knows the item is a
+        review and which PR it belongs to — without parsing the issue body.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT pr_number, run_id FROM daemon_reviews WHERE filed_as = ?",
+                (filed_as,),
+            ).fetchone()
+        return (int(row["pr_number"]), str(row["run_id"])) if row is not None else None
+
     def record_review(self, run_id: str, pr_number: int, filed_as: str, now: float) -> None:
         with self._lock:
             self._conn.execute(
