@@ -35,6 +35,7 @@ every record.
 from __future__ import annotations
 
 import collections
+import contextlib
 import logging
 import re
 import sys
@@ -140,7 +141,7 @@ class _RingBufferHandler(logging.Handler):
         self._buffer = buffer
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
+        with contextlib.suppress(Exception):  # defensive; never break logging
             line = self.format(record).rstrip("\n")
             self._buffer.append(
                 LogRecordLine(
@@ -150,8 +151,6 @@ class _RingBufferHandler(logging.Handler):
                     line=line,
                 )
             )
-        except Exception:  # pragma: no cover - defensive; never break logging
-            pass
 
 
 class _StderrHandler(logging.StreamHandler):  # type: ignore[type-arg,unused-ignore]

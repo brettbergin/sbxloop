@@ -4,8 +4,12 @@ each cost ONE worker job, not one per command — the per-job round-trip
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from sbxloop.config import Config
-from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
+from sbxloop.engine.model import PlanModel, TaskGraph, TaskRecord, TaskSpec
 from sbxloop.engine.phases import (
     EVIDENCE_COMMANDS,
     VERIFY_HEAD_CLIP,
@@ -231,3 +235,49 @@ class TestExecutorContinuity:
         ]
         assert len(sessions) == 2
         assert all(j.resume_session_id is None for j in sessions)
+
+
+class TestProjectGateAtGraphScope:
+    """A delivered PR (#389) failed `mdformat` and `security` — both plain
+    `make check` targets — because nothing in the run ran what CI enforces.
+
+    The gate is required of the graph, not of each task: demanding it per
+    task would run a multi-minute check once per task for no extra signal.
+    """
+
+    def _graph(self, *per_task: list[str]) -> TaskGraph:
+        return TaskGraph(
+            tasks=[
+                TaskSpec(id=f"t{i}", title=f"T{i}", verify_commands=commands)
+                for i, commands in enumerate(per_task, start=1)
+            ]
+        )
+
+    def _runner(self, tmp_path: Path, *, gate: bool) -> PhaseRunner:
+        if gate:
+            (tmp_path / "Makefile").write_text("check:\n\t@echo ok\n")
+        agent = BatchStubAgent()
+        return PhaseRunner(  # type: ignore[arg-type]
+            agent, Config(), "r1", "ship it", workdir="/work", workspace=tmp_path
+        )
+
+    def test_one_task_carrying_the_gate_satisfies_the_graph(self, tmp_path: Path) -> None:
+        runner_ = self._runner(tmp_path, gate=True)
+        graph = self._graph(["uv run pytest -q"], ["make check"])
+        runner_._check_taskgraph_verify_commands(graph)  # does not raise
+
+    def test_a_graph_that_never_runs_the_gate_is_rejected(self, tmp_path: Path) -> None:
+        runner_ = self._runner(tmp_path, gate=True)
+        graph = self._graph(["uv run pytest -q"], ["uv run ruff check ."])
+        with pytest.raises(ValueError, match="make check"):
+            runner_._check_taskgraph_verify_commands(graph)
+
+    def test_a_project_without_a_gate_is_not_held_to_one(self, tmp_path: Path) -> None:
+        runner_ = self._runner(tmp_path, gate=False)
+        runner_._check_taskgraph_verify_commands(self._graph(["uv run pytest -q"]))
+
+    def test_the_gate_is_not_demanded_of_every_task(self, tmp_path: Path) -> None:
+        """The scope decision, pinned: a per-task rule would make a 4-minute
+        check run once per task."""
+        runner_ = self._runner(tmp_path, gate=True)
+        assert runner_._lint_verify_commands(["uv run pytest -q"]) == []
