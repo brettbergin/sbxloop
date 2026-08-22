@@ -147,18 +147,20 @@ jobs:
           VERSION: ${{ steps.target.outputs.version }}
         run: |
           set -euo pipefail
-          # Release publishes ~3m45s after merge, so this is usually immediate
-          # when chained off workflow_run — but never assume the CDN is warm.
+          # Poll the *simple index* — the thing pip actually resolves against.
+          # The JSON API is a separate cache layer and goes green first: on
+          # v0.7.17 it answered 200 while pip still saw 0.7.16 as the newest,
+          # so the deploy sailed past this gate and died in `pip install`.
           for _ in $(seq 1 20); do
-            code="$(curl -sS -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/sbxloop/${VERSION}/json")"
-            if [ "${code}" = "200" ]; then
-              echo "sbxloop ${VERSION} is on PyPI"
+            if curl -sS -H 'Cache-Control: no-cache' https://pypi.org/simple/sbxloop/ \
+                 | grep -q "sbxloop-${VERSION}-py3-none-any\.whl"; then
+              echo "sbxloop ${VERSION} is on the PyPI simple index"
               exit 0
             fi
-            echo "waiting for sbxloop ${VERSION} on PyPI (got ${code})…"
+            echo "waiting for sbxloop ${VERSION} on the PyPI simple index…"
             sleep 15
           done
-          echo "::error::sbxloop ${VERSION} never appeared on PyPI after 5 minutes"
+          echo "::error::sbxloop ${VERSION} never reached the PyPI simple index after 5 minutes"
           exit 1
 
       - name: Record the daemon's pause state
@@ -208,7 +210,21 @@ jobs:
           # [discord] is required — the daemon's bridge needs it. The worker is
           # already pinned exactly by the host wheel's injected
           # sbxloop-worker==VERSION; naming it is belt-and-braces.
-          "${VENV_PIP}" install --upgrade "sbxloop[discord]==${VERSION}" "sbxloop-worker==${VERSION}"
+          #
+          # Retry even though the gate above checked the index: pip and that
+          # check can hit different CDN nodes, and the install is the only
+          # authoritative test of "installable". Nothing here is destructive
+          # until it succeeds, so retrying is free.
+          for attempt in 1 2 3 4 5 6; do
+            if "${VENV_PIP}" install --upgrade \
+                 "sbxloop[discord]==${VERSION}" "sbxloop-worker==${VERSION}"; then
+              ok=yes
+              break
+            fi
+            echo "attempt ${attempt} failed — index may still be propagating; retrying in 15s"
+            sleep 15
+          done
+          [ "${ok:-no}" = yes ] || { echo "::error::pip install of ${VERSION} failed 6 times"; exit 1; }
           "${VENV_SBXLOOP}" --version
 
       - name: Restart the daemon
