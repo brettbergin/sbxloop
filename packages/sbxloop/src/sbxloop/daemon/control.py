@@ -291,11 +291,26 @@ class ControlClient:
         """
         self.dir.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + timeout_s
+        refused: CommandReply | None = None
         while True:
             reply = self._attempt(cmd, deadline)
-            if reply is None or not reply.stale or time.monotonic() >= deadline:
+            if reply is not None and reply.stale:
+                refused = reply
+                if time.monotonic() < deadline:
+                    log.debug(
+                        "ctl.resending", cmd=cmd, reason="refused as stale; daemon was starting"
+                    )
+                    continue
                 return reply
-            log.debug("ctl.resending", cmd=cmd, reason="refused as stale; daemon was starting")
+            if refused is not None and (reply is None or reply.pending):
+                # Out of budget after a run of stale refusals. The final
+                # attempt is the one the deadline interrupts, so it reports
+                # `pending` whenever the server had claimed it — telling the
+                # operator the daemon is executing a command it refused
+                # every single time, which is the exact lie the stale guard
+                # exists to prevent. The refusal is the truthful answer.
+                return refused
+            return reply
 
     def _attempt(self, cmd: str, deadline: float) -> CommandReply | None:
         """One submit-and-wait round, bounded by the shared ``deadline``."""
