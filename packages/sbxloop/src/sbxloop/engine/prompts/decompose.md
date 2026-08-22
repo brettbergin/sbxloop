@@ -17,7 +17,7 @@ tests/unit/test_prompts.py):
 - This comment block is stripped by sbxloop.engine.prompts.render before the
   prompt reaches the model; everything below it is sent verbatim.
 
-Variables: $outcome, $max_tasks; $retry_context (defaulted to "" by render()).
+Variables: $outcome, $max_tasks, $project_gate; $retry_context (defaulted to "" by render()).
 -->
 
 # Decompose an outcome into a task graph
@@ -56,12 +56,7 @@ $outcome
   are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
   Never `sudo` or `apt` in a verify command: verification checks the work,
   it does not build the environment.
-- If the project declares its own gate — a `check` target in its makefile —
-  one task's `verify_commands` must run it (`make check`). That gate is what
-  CI enforces on the pull request, so work that never runs it lands red. One
-  task carrying it is enough, and the last task is usually the right one;
-  narrower commands on other tasks are still worth having for a faster
-  signal. This is enforced mechanically, like the conventions above.
+  $project_gate
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
 

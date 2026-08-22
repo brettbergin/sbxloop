@@ -95,6 +95,17 @@ class SandboxConfig(_ConfigModel):
     # back to the default branch would deliver a tree that never contained
     # the PR's work, and force-updating the branch with it destroys that
     # work. A failed provision is recoverable; that is not.
+    # The one command that runs everything this project holds itself to.
+    # Unset: detected from what the project declares (a `check`/`ci` target in
+    # a makefile, justfile or Taskfile; an npm script; tox.ini; noxfile.py) —
+    # see `verifylint.GATE_DETECTORS`. Set it for a project whose gate no
+    # convention describes, or to `""` to say this project has no gate and
+    # switch the requirement off.
+    #
+    # Whatever it resolves to, one task's verify_commands must run it: that
+    # gate is what CI enforces on the pull request, so work that skips it
+    # lands red.
+    gate_command: str | None = None
     continue_branch: str | None = None
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)

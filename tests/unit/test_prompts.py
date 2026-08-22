@@ -10,7 +10,7 @@ from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAIN
 
 
 def test_render_decompose() -> None:
-    text = render("decompose", outcome="Build the thing", max_tasks="5")
+    text = render("decompose", outcome="Build the thing", max_tasks="5", project_gate="- gate")
     assert "Build the thing" in text
     assert "At most 5 tasks" in text
     assert "$outcome" not in text
@@ -20,7 +20,7 @@ def test_decompose_states_the_uv_project_convention() -> None:
     # #250: the decomposer writes verify commands too, and the lint holds
     # them to the uv convention when a lockfile is present — so the rule
     # has to be stated where the decomposer reads it, not only in plan.md.
-    text = render("decompose", outcome="o", max_tasks="5")
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
     assert "uv.lock" in text
     assert "uv run pytest" in text
 
@@ -184,7 +184,7 @@ def test_environment_facts_lead_language_neutral() -> None:
 # top of each prompts/*.md — that header is where an editor learns which
 # variables a template takes (#225).
 RENDER_CONTEXTS: dict[str, dict[str, str]] = {
-    "decompose": {"outcome": "o", "max_tasks": "3"},
+    "decompose": {"outcome": "o", "max_tasks": "3", "project_gate": "- gate rule"},
     "plan": {
         "outcome": "o",
         "task_id": "t1",
@@ -355,8 +355,14 @@ def test_render_missing_variable_fails_loudly() -> None:
 
 
 def test_retry_context_defaults_empty_and_substitutes() -> None:
-    base = render("decompose", outcome="o", max_tasks="3")
-    retried = render("decompose", outcome="o", max_tasks="3", retry_context="TRY AGAIN")
+    base = render("decompose", outcome="o", max_tasks="3", project_gate="- gate rule")
+    retried = render(
+        "decompose",
+        outcome="o",
+        max_tasks="3",
+        project_gate="- gate rule",
+        retry_context="TRY AGAIN",
+    )
     assert "TRY AGAIN" not in base
     assert "TRY AGAIN" in retried
 

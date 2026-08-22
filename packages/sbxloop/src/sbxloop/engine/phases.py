@@ -35,7 +35,7 @@ from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
-from sbxloop.verifylint import UV_LOCKFILE, lint_verify_commands, project_gate
+from sbxloop.verifylint import UV_LOCKFILE, gate_rule, lint_verify_commands, project_gate
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
 
@@ -418,10 +418,20 @@ class PhaseRunner:
             {
                 "outcome": self.outcome,
                 "max_tasks": str(self.config.budgets.max_tasks),
+                "project_gate": gate_rule(self.project_gate()),
             },
             check=self._check_taskgraph_verify_commands,
         )
         return graph
+
+    def project_gate(self) -> str | None:
+        """This project's own gate, honouring the operator's override.
+
+        Re-derived per call rather than cached: a run may create the
+        makefile (or the package.json) that declares it, and later plans
+        should be held to the convention the workspace now has.
+        """
+        return project_gate(self.workspace, self.config.sandbox.gate_command)
 
     def _check_taskgraph_verify_commands(self, graph: TaskGraph) -> None:
         """Reject task verify commands that violate toolchain conventions,
@@ -445,7 +455,7 @@ class PhaseRunner:
             for task in graph.tasks
             for message in self._lint_verify_commands(task.verify_commands)
         ]
-        gate = project_gate(self.workspace)
+        gate = self.project_gate()
         if gate:
             every_command = [c for task in graph.tasks for c in task.verify_commands]
             problems += [
