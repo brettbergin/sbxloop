@@ -156,6 +156,8 @@ class HostEventTypes:
     RUN_REPORT = "run.report"
     RUN_KEEP = "run.keep"
     RUN_END = "run.end"
+    # A non-terminal run closed out by daemon startup/staleness reconciliation.
+    RUN_RECONCILED = "run.reconciled"
     # The task roster as the run will work it (also re-announced on resume,
     # with each task's persisted state).
     RUN_TASKS = "run.tasks"

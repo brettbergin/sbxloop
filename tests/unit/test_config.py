@@ -454,3 +454,15 @@ def test_run_cap_timezone_rejects_bogus_zone(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text('[daemon]\nrun_cap_timezone = "Mars/Olympus"\n')
     with pytest.raises(ConfigError, match="run_cap_timezone"):
         load_config(cwd=tmp_path, env={})
+
+
+def test_run_stale_after_s_default_override_and_validation(tmp_path: Path) -> None:
+    """#374 liveness safety net: conservative 6h default, 0 disables."""
+    assert load_config(cwd=tmp_path, env={}).daemon.run_stale_after_s == 21600.0
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\nrun_stale_after_s = 300\n")
+    assert load_config(cwd=tmp_path, env={}).daemon.run_stale_after_s == 300.0
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\nrun_stale_after_s = 0\n")
+    assert load_config(cwd=tmp_path, env={}).daemon.run_stale_after_s == 0.0
+    (tmp_path / "sbxloop.toml").write_text("[daemon]\nrun_stale_after_s = -1\n")
+    with pytest.raises(ConfigError, match=r"run_stale_after_s"):
+        load_config(cwd=tmp_path, env={})

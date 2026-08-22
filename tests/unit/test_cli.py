@@ -136,6 +136,30 @@ class TestStatusAndLogs:
         result = runner.invoke(app, ["status", "rghost"])
         assert result.exit_code == 2
 
+    def test_status_lists_reconciliation_reason(self, workdir: Path) -> None:
+        """#374: a terminal run's persisted reason shows next to its state,
+        and a run without one renders no stray separator."""
+        store = seed_store(workdir)
+        store.create_run("rorphan01", "something abandoned")
+        store.reconcile_run("rorphan01", "cancelled", "work item cancelled")
+        result = runner.invoke(app, ["status"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "work item cancelled" in plain
+        # the run with reason=None keeps a bare state cell
+        assert "completed —" not in plain
+
+    def test_status_run_detail_shows_reason(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        store = seed_store(workdir)
+        store.create_run("rorphan02", "something abandoned")
+        store.reconcile_run(
+            "rorphan02", "failed", "orphaned: daemon restarted while run was in flight"
+        )
+        result = runner.invoke(app, ["status", "rorphan02"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "reason: orphaned: daemon restarted while run was in flight" in plain
+
     def test_logs_replay_and_filters(self, workdir: Path) -> None:
         seed_store(workdir)
         result = runner.invoke(app, ["logs", "rseeded11"])
@@ -1757,6 +1781,25 @@ class TestDashboard:
         assert "running" in text
         assert "First task" in text
         assert "executing" in text
+        # in flight: no reason suffix
+        assert "(" not in text.split("\n")[0]
+
+    def test_reconciled_run_header_shows_reason(self) -> None:
+        """#374: a reconciled run's reason appears in the TUI header."""
+        from rich.console import Console
+
+        from sbxloop.cli.tui import Dashboard
+
+        dashboard = Dashboard()
+        dashboard.on_event(Event.now("run.state", "r1", state="running"))
+        dashboard.on_event(
+            Event.now("run.reconciled", "r1", state="cancelled", reason="work item cancelled")
+        )
+        console = Console(record=True, width=100)
+        console.print(dashboard.renderable())
+        text = console.export_text()
+        assert "cancelled" in text
+        assert "work item cancelled" in text
 
     def test_roster_announcement_shows_all_tasks_waiting(self) -> None:
         """The engine announces every decomposed task up front; pending rows

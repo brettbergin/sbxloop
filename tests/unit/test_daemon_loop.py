@@ -11,16 +11,16 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from sbxloop import hostgit
 from sbxloop.config import Config
-from sbxloop.daemon.loop import DaemonLoop, day_window
+from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
-from sbxloop.engine.model import RunResult, TaskRecord, TaskSpec
+from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
@@ -428,8 +428,11 @@ class TestOperatorCancel:
         report = h.source.calls[-1][1]
         assert report.state == "cancelled" and report.cancelled_by == "Discord user `brett`"
         assert report.requeued is False
-        # The run itself stays resumable, and no fresh attempt is scheduled.
-        assert h.store.get_run(h.runs[0][0]).state == "running"
+        # The run record itself ends terminal (#374) with the operator in its
+        # reason — it stays resumable, but nothing reports it as active.
+        record = h.store.get_run(h.runs[0][0])
+        assert record.state == "cancelled"
+        assert record.reason is not None and "Discord user `brett`" in record.reason
         h.clock.t += 100_000
         assert h.loop.tick().idle_reason == "no_work"
         assert len(h.runs) == 1
@@ -449,6 +452,74 @@ class TestOperatorCancel:
         h.loop._runner = h.runner
         assert h.loop.tick().outcome == "done"
         assert h.runs[1][1] is False  # a fresh run, not a resume
+
+    def test_cancel_retry_leaves_run_cancelled_and_item_queued(self, tmp_path: Path) -> None:
+        """#374: `cancel --retry` requeues the item but the run record must
+        still end terminal."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        self._run_until_cancelled(h, requester="Discord user `brett`", retry=True)
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "queued"
+        record = h.store.get_run(h.runs[0][0])
+        assert record.state == "cancelled"
+        assert record.reason is not None and "Discord user `brett`" in record.reason
+
+    def test_cancel_appends_chronology_event(self, tmp_path: Path) -> None:
+        """Reconciliation chronology is append-only: existing events keep
+        their order and a `run.cancelled` event is added."""
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        self._run_until_cancelled(h, requester="Discord user `brett`")
+        run_id = h.runs[0][0]
+        events = [e for _, e in h.store.events(run_id)]
+        assert events[-1].type == "run.cancelled"
+        assert events[-1].data.get("by") == "Discord user `brett`"
+        # append-only: nothing before the new event was rewritten
+        assert [e.type for e in events[:-1]] == [
+            e.type for e in events if e.type != "run.cancelled"
+        ]
+
+    def test_abandon_current_run_ends_run_terminal(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        started = threading.Event()
+        release = threading.Event()
+
+        def runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            h.runs.append((run_id, resume))
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "running")
+            started.set()
+            assert release.wait(5)
+            raise RunCancelledError("cancelled")
+
+        h.loop._runner = runner
+        t = threading.Thread(target=h.loop.tick)
+        t.start()
+        assert started.wait(5)
+        h.loop.abandon_item("inbox:a.md", "operator says stop")
+        release.set()
+        t.join(5)
+        item = h.dstore.get("inbox:a.md")
+        assert item is not None and item.state == "abandoned"
+        assert h.store.get_run(h.runs[0][0]).state in TERMINAL_RUN_STATES
+
+    def test_requeue_of_pinned_dead_run_ends_run_terminal(self, tmp_path: Path) -> None:
+        """A pinned run that is not in flight is dead; requeue must not leave
+        it `running`."""
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), h.clock())
+        h.dstore.mark_claimed("inbox:a.md", h.clock())
+        h.dstore.mark_running("inbox:a.md", "rdead", h.clock())
+        h.store.create_run("rdead", "x")
+        h.store.set_run_state("rdead", "running")
+        h.loop.requeue_item("inbox:a.md")
+        record = h.store.get_run("rdead")
+        assert record.state == "cancelled"
+        assert record.reason is not None and "never resumed" in record.reason
 
     def test_infra_error_racing_a_cancel_is_still_a_failure(self, tmp_path: Path) -> None:
         """Review: an infra error is re-raised while the run is still resumable
@@ -1601,3 +1672,157 @@ class TestRunCapDayWindow:
         # 15:00Z is the next Tokyo midnight — reset.
         h.clock.t = datetime(2024, 3, 6, 15, 0, tzinfo=UTC).timestamp()
         assert h.loop.tick().outcome == "done"
+
+
+class TestOrphanRunReconciliation:
+    """#374: a dead process left run rows non-terminal forever."""
+
+    def test_recover_reconciles_cancelled_item_run(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_cx", now=2.0)
+        h.store.create_run("r_cx", "x")
+        h.store.set_run_state("r_cx", "running")
+        h.store.append_event(Event.now("run.started", "r_cx"))
+        before = len(list(h.store.events("r_cx")))
+        h.dstore.mark_cancelled(
+            "inbox:a.md", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
+        )
+        h.loop.recover()
+        record = h.store.get_run("r_cx")
+        assert record.state == "cancelled"
+        assert record.reason is not None
+        assert "work item cancelled" in record.reason
+        assert "brett.bergin" in record.reason
+        events = [e for _, e in h.store.events("r_cx")]
+        assert len(events) == before + 1
+        assert events[-1].type == "run.reconciled"
+        assert events[-1].data["previous_state"] == "running"
+
+    def test_recover_reconciles_orphan_run_failed(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        for run_id, state in (("r_orph", "running"), ("r_dec", "decomposing")):
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, state)
+        h.loop.recover()
+        for run_id in ("r_orph", "r_dec"):
+            record = h.store.get_run(run_id)
+            assert record.state == "failed"
+            assert record.reason is not None and "orphaned" in record.reason
+            assert [e.type for _, e in h.store.events(run_id)] == ["run.reconciled"]
+
+    def test_recover_leaves_live_and_resume_pending_runs(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        # Interrupted run: recover() queues it for resume and must not close it.
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_resume", now=2.0)
+        h.store.create_run("r_resume", "x")
+        h.store.set_run_state("r_resume", "running")
+        # Genuinely in-flight run in this process.
+        h.store.create_run("r_live", "x")
+        h.store.set_run_state("r_live", "running")
+        h.loop._current = RunHandle(inbox_item("b.md"), "r_live", cast(Any, None), EventBus())
+        h.loop.recover()
+        assert h.store.get_run("r_resume").state == "running"
+        assert h.store.get_run("r_live").state == "running"
+        pending = h.dstore.get("inbox:a.md")
+        assert pending is not None and pending.state == "queued" and pending.run_id == "r_resume"
+        for run_id in ("r_resume", "r_live"):
+            assert [e.type for _, e in h.store.events(run_id)] == []
+
+
+class TestStaleRunReconciliation:
+    """#374 safety net: a run nothing is executing goes stale and is closed."""
+
+    @staticmethod
+    def _age(h: Harness, run_id: str, updated_at: float) -> None:
+        h.store._conn.execute(
+            "UPDATE runs SET updated_at = ? WHERE run_id = ?", (updated_at, run_id)
+        )
+        h.store._conn.commit()
+
+    @staticmethod
+    def _stale_harness(tmp_path: Path) -> Harness:
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"run_stale_after_s": 3600.0}}
+        )
+        return Harness(tmp_path, config)
+
+    def test_stale_run_reconciled_fresh_one_left_alone(self, tmp_path: Path) -> None:
+        h = self._stale_harness(tmp_path)
+        now = h.clock.t
+        for run_id in ("r_stale", "r_fresh"):
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "running")
+        self._age(h, "r_stale", now - 7200.0)
+        self._age(h, "r_fresh", now - 60.0)
+        h.loop.tick()
+        stale = h.store.get_run("r_stale")
+        assert stale.state == "failed"
+        assert stale.reason is not None and "stale" in stale.reason
+        assert [e.type for _, e in h.store.events("r_stale")] == ["run.reconciled"]
+        assert h.store.get_run("r_fresh").state == "running"
+        assert [e.type for _, e in h.store.events("r_fresh")] == []
+
+    def test_sweep_runs_while_paused(self, tmp_path: Path) -> None:
+        h = self._stale_harness(tmp_path)
+        h.loop._paused = True
+        h.store.create_run("r_stale", "x")
+        h.store.set_run_state("r_stale", "decomposing")
+        self._age(h, "r_stale", h.clock.t - 99999.0)
+        assert h.loop.tick().idle_kind == "paused"
+        assert h.store.get_run("r_stale").state == "failed"
+
+    def test_current_run_is_never_stale(self, tmp_path: Path) -> None:
+        h = self._stale_harness(tmp_path)
+        for run_id in ("r_live", "r_other"):
+            h.store.create_run(run_id, "x")
+            h.store.set_run_state(run_id, "running")
+            self._age(h, run_id, h.clock.t - 99999.0)
+        h.loop._current = RunHandle(inbox_item("b.md"), "r_live", cast(Any, None), EventBus())
+        h.loop._reconcile_stale_runs(h.clock.t)
+        # A live run means the daemon is working: nothing is swept.
+        for run_id in ("r_live", "r_other"):
+            assert h.store.get_run(run_id).state == "running"
+            assert [e.type for _, e in h.store.events(run_id)] == []
+
+    def test_zero_threshold_disables_the_sweep(self, tmp_path: Path) -> None:
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"run_stale_after_s": 0}}
+        )
+        h = Harness(tmp_path, config)
+        h.store.create_run("r_stale", "x")
+        h.store.set_run_state("r_stale", "running")
+        self._age(h, "r_stale", h.clock.t - 10_000_000.0)
+        h.loop.tick()
+        assert h.store.get_run("r_stale").state == "running"
+
+    def test_stale_run_with_cancelled_item_keeps_operator_reason(self, tmp_path: Path) -> None:
+        h = self._stale_harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_cx", now=2.0)
+        h.store.create_run("r_cx", "x")
+        h.store.set_run_state("r_cx", "running")
+        h.dstore.mark_cancelled(
+            "inbox:a.md", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
+        )
+        self._age(h, "r_cx", h.clock.t - 7200.0)
+        h.loop.tick()
+        record = h.store.get_run("r_cx")
+        assert record.state == "cancelled"
+        assert record.reason is not None and "brett.bergin" in record.reason
+
+    def test_resume_pending_stale_run_is_left_for_tick(self, tmp_path: Path) -> None:
+        h = self._stale_harness(tmp_path)
+        h.dstore.upsert_new(inbox_item(), now=1.0)
+        h.dstore.mark_claimed("inbox:a.md", now=1.0)
+        h.dstore.mark_running("inbox:a.md", "r_resume", now=2.0)
+        h.store.create_run("r_resume", "x")
+        h.store.set_run_state("r_resume", "running")
+        h.dstore.mark_resume_pending("inbox:a.md", now=3.0)
+        self._age(h, "r_resume", h.clock.t - 7200.0)
+        h.loop._reconcile_stale_runs(h.clock.t)
+        assert h.store.get_run("r_resume").state == "running"

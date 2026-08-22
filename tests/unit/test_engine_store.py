@@ -1,5 +1,6 @@
 """StateStore tests."""
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -211,3 +212,81 @@ class TestUserGuidance:
         assert store.get_run_guidance("r1") == []
         store.append_run_guidance("r1", "g")
         assert StateStore(db).get_run_guidance("r1") == ["g"]
+
+
+class TestReconciliation:
+    def test_non_terminal_runs_filters_and_orders(self, store: StateStore) -> None:
+        for run_id, state in (
+            ("r_done", "completed"),
+            ("r_failed", "failed"),
+            ("r_cancelled", "cancelled"),
+            ("r_run", "running"),
+            ("r_dec", "decomposing"),
+        ):
+            store.create_run(run_id, run_id)
+            store.set_run_state(run_id, state)
+        store.create_run("r_created", "left as created")
+
+        records = store.non_terminal_runs()
+        assert {r.run_id for r in records} == {"r_run", "r_dec", "r_created"}
+        stamps = [r.updated_at for r in records]
+        assert stamps == sorted(stamps)
+
+    def test_reconcile_run_writes_state_and_reason(self, store: StateStore) -> None:
+        store.create_run("r_run", "o")
+        store.set_run_state("r_run", "running")
+
+        store.reconcile_run("r_run", "cancelled", "work item cancelled")
+
+        record = store.get_run("r_run")
+        assert record.state == "cancelled"
+        assert record.reason == "work item cancelled"
+        assert store.non_terminal_runs() == []
+
+    def test_reconcile_run_rejects_non_terminal_and_unknown(self, store: StateStore) -> None:
+        store.create_run("r_run", "o")
+        with pytest.raises(StateError):
+            store.reconcile_run("r_run", "running", "nope")
+        with pytest.raises(StateError):
+            store.reconcile_run("missing", "failed", "nope")
+
+    def test_reconcile_does_not_touch_events(self, store: StateStore) -> None:
+        store.create_run("r_run", "o")
+        store.set_run_state("r_run", "running")
+        store.append_event(Event(ts=1.0, run_id="r_run", type="run.start", data={"i": 1}))
+        before = list(store.events("r_run"))
+
+        store.reconcile_run("r_run", "failed", "orphaned")
+
+        after = list(store.events("r_run"))
+        assert after == before
+
+    def test_opens_db_missing_reason_column(self, tmp_path: Path) -> None:
+        db = tmp_path / "state.db"
+        StateStore(db).close()
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE runs")
+        conn.execute(
+            "CREATE TABLE runs ("
+            " run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, state TEXT NOT NULL,"
+            " config_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL,"
+            " updated_at REAL NOT NULL, workspace TEXT,"
+            " mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT,"
+            " user_guidance TEXT NOT NULL DEFAULT '[]')"
+        )
+        conn.execute(
+            "INSERT INTO runs (run_id, outcome, state, created_at, updated_at)"
+            " VALUES ('old', 'legacy', 'running', 1.0, 2.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = StateStore(db)
+        record = store.get_run("old")
+        assert record.state == "running"
+        assert record.reason is None
+        store.reconcile_run("old", "failed", "orphaned: daemon restarted")
+        assert store.get_run("old").reason == "orphaned: daemon restarted"
+        store.close()
+
+        assert StateStore(db).get_run("old").state == "failed"

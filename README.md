@@ -839,6 +839,7 @@ The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
 | `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
 | `[daemon] max_runs_per_day` | `12` | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there. |
 | `[daemon] run_cap_timezone` | `UTC` | IANA timezone defining the run cap's day boundary (also used by the per-day review and post-mortem caps). |
+| `[daemon] run_stale_after_s` | `21600` | With no run executing, non-terminal runs idle this long are reconciled to a terminal state (`0` disables). |
 
 ## Repository layout
 

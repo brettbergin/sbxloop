@@ -197,6 +197,35 @@ persisting — a crash and a `kill -9` look identical to the store — and
 4. continues from the last committed transition. A phase whose result was
    never committed re-runs from its start; nothing is replayed.
 
+### Run reconciliation
+
+Because the run row is only ever written by the in-process run loop, a dead
+process (or a cancelled work item) used to leave runs stuck in `running` or
+`decomposing` forever, so `list_runs` and `!sbx status` disagreed about what
+was active (#374). Two sweeps keep them honest, and both only ever *append*
+chronology (a `run.reconciled` event) — historical events are never mutated:
+
+- **Startup reconciliation** closes every non-terminal run (`created`,
+  `provisioning`, `decomposing`, `running`, `finalizing`) that is neither the
+  run executing in this process nor one pinned for resume.
+- **The staleness safety net** runs every tick — including while paused — and
+  closes any non-terminal run whose last activity (chronology, falling back to
+  the run row's `updated_at`) is older than `[daemon] run_stale_after_s` while
+  no run is executing. The default is 6h (`21600`); `0` disables this sweep.
+
+The reason recorded depends on the associated work item: a `cancelled` item
+gives run state `cancelled` with reason `work item cancelled` (plus the
+operator attribution from the item's last error), anything else gives `failed`
+with `orphaned: daemon restarted while run was in flight` (or, from the
+staleness sweep, `orphaned: stale, no activity for <n>s`). Cancellation itself
+transitions the run record alongside the work item, so the two cannot diverge.
+
+The run that is legitimately in flight is **never** reconciled: both sweeps
+skip the daemon's `current` run and any item queued for resume, and the
+staleness sweep does not run at all while a run is executing. The persisted
+reason is surfaced next to the state in `sbxloop status` / `list_runs` output,
+on the `reason:` line of `sbxloop status <run>`, and in the TUI run header.
+
 ## Daemon guardrails
 
 The daemon's **run cap** is a wall-clock calendar-day gate: it counts the runs whose start time falls on the current day in

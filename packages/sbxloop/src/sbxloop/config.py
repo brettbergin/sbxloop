@@ -421,6 +421,13 @@ class DaemonConfig(_ConfigModel):
     # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
     # rows are never removed. See sbxloop.gc for what is exempt.
     prune_runs_after_days: float = Field(default=14.0, ge=0)
+    # Liveness safety net for phantom active runs (#374). When the daemon has
+    # no run executing, any non-terminal run whose last activity (engine
+    # chronology, falling back to the run row's updated timestamp) is older
+    # than this is reconciled to a terminal state, so list_runs and
+    # `!sbx status` agree on what is active. The in-flight run is never
+    # considered stale. 0 disables the sweep.
+    run_stale_after_s: float = Field(default=21600.0, ge=0)
     # The daemon's own log stream (stderr → journald under systemd). INFO is
     # the lifecycle tier: startup summary, claims, run dispatch/finish, task
     # and phase transitions, operator commands; DEBUG adds every tool call,
