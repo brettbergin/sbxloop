@@ -6,6 +6,41 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **A delivered item is not done until its PR is accepted.** `_settle` used to
+  call `mark_done` the moment a run succeeded and a PR existed. Nothing looked
+  at CI: PR #389 was settled as done with `mdformat` and `security` failing,
+  and the review that followed cut five style issues without noticing the
+  build was red.
+
+  A patch item that delivers a PR *and* has a review queued for it now enters
+  a new non-terminal state, `reviewing`. Its source issue stays open. Each
+  tick polls the PR and settles it only when the checks are green **and** the
+  review is satisfied — `pending` is deliberately not `green`, since reading
+  "no failures yet" as success is the original bug.
+
+  The polling runs before the pause / breaker / daily-cap gates, on purpose:
+  it spends GitHub reads rather than engine wall clock, and a PR that went
+  green while the daemon was paused should settle when it resumes rather than
+  burn its budget waiting.
+
+  **Nothing waits forever.** `[daemon] review_rounds` (default 20) bounds how
+  many polls may find the PR unsatisfied; past it the item is abandoned with
+  the PR named in the notice and in `last_error`, and a human takes over. The
+  wall-clock budget is roughly `review_rounds × poll_interval_s`. `[daemon] await_review` turns the whole gate off.
+
+  Two cases that would otherwise strand an item are handled explicitly: a
+  review that could only be posted as a `COMMENT` (the identity is not an
+  accepted reviewer) never yields an approval, so the gate waits on checks
+  and a *non-blocking* review rather than on an approval nobody can give; and
+  an item whose review record is missing is accepted rather than left waiting
+  on nothing.
+
+  The gate is tied to a review actually being queued. No reviewer means no
+  verdict to converge on, and holding an item open for one that will never
+  arrive is how a queue silently stops.
+
 ### Changed
 
 - **A review of a delivered PR now lands on that PR, not in the issue

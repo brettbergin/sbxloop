@@ -82,7 +82,9 @@ CREATE TABLE IF NOT EXISTS daemon_reviews (
     run_id     TEXT PRIMARY KEY,
     pr_number  INTEGER NOT NULL,
     filed_as   TEXT NOT NULL,
-    filed_at   REAL NOT NULL
+    filed_at   REAL NOT NULL,
+    gates      INTEGER NOT NULL DEFAULT 0,
+    rounds     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS daemon_audits (
@@ -125,6 +127,19 @@ _MIGRATIONS = (
         "daemon_work_items",
         "kind",
         "ALTER TABLE daemon_work_items ADD COLUMN kind TEXT NOT NULL DEFAULT 'patch'",
+    ),
+    # The acceptance gate: whether the posted review can actually hold the
+    # merge (a COMMENT cannot), and how many polls have found the PR still
+    # unsatisfied.
+    (
+        "daemon_reviews",
+        "gates",
+        "ALTER TABLE daemon_reviews ADD COLUMN gates INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "daemon_reviews",
+        "rounds",
+        "ALTER TABLE daemon_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0",
     ),
 )
 
@@ -745,6 +760,50 @@ class DaemonStore:
                 (filed_as,),
             ).fetchone()
         return (int(row["pr_number"]), str(row["run_id"])) if row is not None else None
+
+    def review_pr(self, run_id: str) -> tuple[int, bool, int] | None:
+        """(pr_number, gates_merge, rounds) for the review of ``run_id``.
+
+        ``gates_merge`` is False when the posted review could only be a
+        COMMENT — the identity is not an accepted reviewer on the repo — in
+        which case no approval will ever arrive and the acceptance gate must
+        not wait for one.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT pr_number, gates, rounds FROM daemon_reviews WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (int(row["pr_number"]), bool(row["gates"]), int(row["rounds"]))
+
+    def set_review_gates(self, run_id: str, gates: bool) -> None:
+        """Record whether the review that was actually posted can hold the
+        merge; set once the review lands, not when it is queued."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_reviews SET gates = ? WHERE run_id = ?", (int(gates), run_id)
+            )
+            self._conn.commit()
+
+    def bump_review_round(self, run_id: str) -> int:
+        """Count one poll that found the PR still unsatisfied; returns the
+        new total. This is what stops an item waiting forever."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_reviews SET rounds = rounds + 1 WHERE run_id = ?", (run_id,)
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT rounds FROM daemon_reviews WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return int(row["rounds"]) if row is not None else 0
+
+    def mark_reviewing(self, item_id: str, now: float) -> None:
+        """Delivered, not accepted: in flight until its PR is green and its
+        review satisfied."""
+        self._update(item_id, now, state="reviewing", last_error=None)
 
     def record_review(self, run_id: str, pr_number: int, filed_as: str, now: float) -> None:
         with self._lock:

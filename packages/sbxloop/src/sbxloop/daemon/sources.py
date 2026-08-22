@@ -33,7 +33,7 @@ from sbxloop.daemon.postmortem import postmortem_marker
 from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, collect_review
 from sbxloop.engine.model import RunRecord
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import GithubOps, SubmittedReview
+from sbxloop.gh.ops import ChecksVerdict, GithubOps, SubmittedReview
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -776,6 +776,25 @@ class GitHubIssueSource:
             run=origin_run_id,
             title=title,
         )
+
+    def pr_state(self, pr_number: int) -> tuple[ChecksVerdict, str]:
+        """(checks, review state) for a PR — what the acceptance gate needs.
+
+        Two reads rather than one: the check runs hang off the *head commit*,
+        so the sha has to be fetched first, and fetching it fresh each poll
+        is what makes a PR that was pushed to since the last look report on
+        its new commit rather than the old one's checks.
+        """
+        pr = self._ops().pr_get(self.repo, pr_number)
+        sha = str(((pr.get("head") or {}).get("sha")) or "")
+        checks = (
+            self._ops().pr_checks(self.repo, sha)
+            if sha
+            # No head sha is not "green": it is an answer we could not get,
+            # and the gate must not read that as permission to merge.
+            else ChecksVerdict("pending", 0, ("unknown head commit",), ())
+        )
+        return checks, self._ops().pr_review_state(self.repo, pr_number)
 
     def post_review(
         self, run: RunRecord, pr_number: int, origin_run_id: str

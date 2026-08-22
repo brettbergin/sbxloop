@@ -510,6 +510,11 @@ class DaemonLoop:
         # Liveness safety net for phantom active runs (#374); sweeps even while
         # paused, the very state the field report was filed from.
         self._reconcile_stale_runs(now)
+        # Advance delivered-but-unaccepted items. Before the pause/breaker/cap
+        # gates on purpose: this spends GitHub reads rather than engine wall
+        # clock, and a PR that went green while the daemon was paused should
+        # be settled when it resumes, not left waiting.
+        self._poll_reviews(now)
         if self._paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -965,11 +970,19 @@ class DaemonLoop:
             report = report._replace(
                 filed=tuple(filed), tool_filed=tuple(tool.filed), tool_noted=tuple(tool.unfiled)
             )
-            self.dstore.mark_done(item.item_id, now)
             self.dstore.finish_ledger(run_id, "done", now)
             if self._consecutive_failures:
                 log.info("breaker.reset", after_failures=self._consecutive_failures)
             self._set_breaker(None, 0)
+            # File first: whether a review is actually coming is what decides
+            # if there is anything to wait for.
+            reviewing = self._file_review(item, run_id, report)
+            if reviewing and self._hold_for_review(item, run_id, report, now):
+                # Delivered, not accepted. The source issue stays open and
+                # the item stays in flight: settling on "a PR exists" is how
+                # #389 was marked done with mdformat and security failing.
+                return "reviewing"
+            self.dstore.mark_done(item.item_id, now)
             source.report_success(item, report)
             self._frontend_finished(item, report)
             findings = findings_summary(report, repo=self._repo, kind=item.kind)
@@ -985,7 +998,6 @@ class DaemonLoop:
                 filed=len(report.filed),
                 attempt=item.attempts,
             )
-            self._file_review(item, run_id, report)
             return "done"
         if result is not None and result.state == "completed" and report.delivery_error:
             # Work done, PR failed: a human must look; retrying would redo the work.
@@ -1397,20 +1409,26 @@ class DaemonLoop:
             log.warning("backlog.tool_findings_failed", run=run_id, exc_info=True)
             return ToolFindings([], [])
 
-    def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> None:
+    def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> bool:
         """The loop evaluating the code it just wrote: after a patch item
-        delivers a PR, open a review audit of that PR. Once per run, patch
-        items only (an audit has no PR), capped per calendar day, best-effort."""
+        delivers a PR, open a review of that PR. Once per run, patch items
+        only (an audit has no PR), capped per calendar day, best-effort.
+
+        Returns whether a review was actually queued — which is what the
+        acceptance gate keys on. No reviewer means no verdict to converge
+        on, and holding an item open for one that will never come is how a
+        queue silently stops.
+        """
         daemon = self.config.daemon
         if not daemon.review_deliveries or item.kind != "patch" or report.delivery is None:
-            return
+            return False
         github: Any = next((s for s in self.sources if s.name == "github"), None)
         if github is None or not hasattr(github, "file_review"):
-            return
+            return False
         now = self.clock()
         try:
             if self.dstore.review_filed(run_id):
-                return
+                return False
             day_start, _ = day_window(now, daemon.run_cap_timezone)
             if self.dstore.reviews_since(day_start) >= daemon.reviews_per_day:
                 log.info(
@@ -1420,7 +1438,7 @@ class DaemonLoop:
                     reason="calendar-day cap reached",
                     cap=daemon.reviews_per_day,
                 )
-                return
+                return False
             number, url = report.delivery
             ref = github.file_review(item, number, url, run_id)
             self.dstore.record_review(run_id, number, ref, now)
@@ -1437,8 +1455,10 @@ class DaemonLoop:
                 pr=number,
                 ref=ref,
             )
+            return True
         except Exception:
             log.warning("review.file_failed", item=item.item_id, run=run_id, exc_info=True)
+        return False
 
     def _file_postmortem(self, item: WorkItem, run_id: str, reason: str) -> None:
         """Turn the daemon's own failure into a discovery-lane charter.
@@ -1487,6 +1507,110 @@ class DaemonLoop:
         except Exception:
             log.warning("postmortem.file_failed", item=item.item_id, run=run_id, exc_info=True)
 
+    def _hold_for_review(self, item: WorkItem, run_id: str, report: RunReport, now: float) -> bool:
+        """Whether this finished run leaves its item awaiting acceptance.
+
+        Only a patch item that actually opened a PR: an audit has no PR, and
+        a run that delivered nothing has nothing to be accepted.
+        """
+        daemon = self.config.daemon
+        if not daemon.await_review or item.kind != "patch" or report.delivery is None:
+            return False
+        number, url = report.delivery
+        self.dstore.mark_reviewing(item.item_id, now)
+        self._notify(
+            f"⏳ {item.item_id} delivered PR {link(f'#{number}', url)} — "
+            "waiting for checks and review before it is done",
+            "item.reviewing",
+            item=item.item_id,
+            run=run_id,
+            pr=number,
+        )
+        return True
+
+    def _poll_reviews(self, now: float) -> None:
+        """Advance every item waiting on its PR.
+
+        Runs before the dispatch gates, and deliberately outside the daily
+        run cap: this spends GitHub reads, not engine wall clock, and an
+        item that cannot even be *checked* while the cap is spent would
+        sit past its round budget for reasons that have nothing to do with
+        it.
+        """
+        if not self.config.daemon.await_review:
+            return
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "pr_state"):
+            return
+        for item in self.dstore.items(["reviewing"]):
+            try:
+                self._poll_one_review(item, github, now)
+            except Exception:
+                log.warning("review.poll_failed", item=item.item_id, exc_info=True)
+
+    def _poll_one_review(self, item: WorkItem, github: Any, now: float) -> None:
+        run_id = item.run_id
+        target = self.dstore.review_pr(run_id) if run_id else None
+        if target is None:
+            # Nothing recorded to wait on — do not strand the item.
+            log.warning("review.no_target", item=item.item_id, run=run_id)
+            self._accept(item, now, detail="no review was recorded for this delivery")
+            return
+        pr_number, gates, _rounds = target
+        checks, review_state = github.pr_state(pr_number)
+        # An approval nobody can give is not worth waiting for: a review that
+        # could only be posted as a COMMENT never produces one.
+        review_ok = review_state == "APPROVED" if gates else review_state != "CHANGES_REQUESTED"
+        if checks.state == "green" and review_ok:
+            self._accept(item, now, detail=f"PR #{pr_number}: {checks.summary()}")
+            return
+        spent = self.dstore.bump_review_round(run_id) if run_id else 0
+        budget = self.config.daemon.review_rounds
+        if spent < budget:
+            log.debug(
+                "review.waiting",
+                item=item.item_id,
+                pr=pr_number,
+                checks=checks.state,
+                review=review_state,
+                round=spent,
+                budget=budget,
+            )
+            return
+        why = f"{checks.summary()}; review {review_state.lower().replace('_', ' ')}"
+        self.dstore.mark_failed(
+            item.item_id, f"PR #{pr_number} not accepted: {why}", now, requeue=False
+        )
+        self._notify(
+            f"⚠ {item.item_id}: PR #{pr_number} still not accepted after {spent} check(s) "
+            f"— {why}. Handing it over; the PR is open.",
+            "review.not_accepted",
+            level="error",
+            item=item.item_id,
+            pr=pr_number,
+            checks=checks.state,
+            review=review_state,
+            rounds=spent,
+        )
+
+    def _accept(self, item: WorkItem, now: float, *, detail: str) -> None:
+        """The PR earned its merge: settle the item the way a successful run
+        used to, now that "successful" means accepted."""
+        source = self._source_for(item)
+        self.dstore.mark_done(item.item_id, now)
+        if source is not None and item.run_id is not None:
+            report = self._report(item.run_id, None)
+            try:
+                source.report_success(item, report)
+            except Exception:
+                log.warning("review.report_failed", item=item.item_id, exc_info=True)
+        self._notify(
+            f"✅ {item.item_id} accepted — {detail}",
+            "item.accepted",
+            item=item.item_id,
+            run=item.run_id,
+        )
+
     def _post_review(self, item: WorkItem, run_id: str) -> SubmittedReview | None:
         """Post this run's review to the PR it reviewed, when it is one.
 
@@ -1513,6 +1637,7 @@ class DaemonLoop:
             return None
         if posted is None:
             return None
+        self.dstore.set_review_gates(origin_run_id, posted.gates_merge)
         verdict = "approved" if posted.event == "APPROVE" else "requested changes"
         gate = "" if posted.gates_merge else " (as a comment — it does not gate the merge)"
         self._notify(

@@ -16,7 +16,11 @@ ItemKind = Literal["patch", "audit"]
 # ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
 # it is terminal for the daemon (no retry, no breaker count) while the run
 # itself stays resumable from the CLI.
-ItemState = Literal["queued", "running", "done", "failed", "abandoned", "cancelled"]
+# ``reviewing`` is delivered-but-not-accepted: the run succeeded and opened a
+# PR, and the item stays in flight until that PR is green and its review is
+# satisfied. It is NOT terminal — settling on "a PR exists" is how a red one
+# (#389: mdformat and security failing) got marked done.
+ItemState = Literal["queued", "running", "reviewing", "done", "failed", "abandoned", "cancelled"]
 # An operator decision the source has not been told about yet: the row-only
 # CLI (another process) cannot report, so the loop owes and delivers it.
 PendingReport = Literal["abandoned", "requeued"]
@@ -80,7 +84,16 @@ class RunReport(NamedTuple):
 
 
 TickOutcome = Literal[
-    "done", "retry", "abandoned", "delivery_failed", "interrupted", "cancelled", "requeued"
+    "done",
+    "retry",
+    "abandoned",
+    "delivery_failed",
+    "interrupted",
+    "cancelled",
+    "requeued",
+    # The run finished and its PR is open; the item is now waiting on that
+    # PR's checks and review rather than being done.
+    "reviewing",
 ]
 IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work"]
 
