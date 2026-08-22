@@ -738,6 +738,7 @@ class TestEmbeds:
                 "queued": 2,
                 "runs_today": 1,
                 "max_runs_per_day": 12,
+                "run_cap_timezone": "UTC",
                 "breaker_open": False,
                 "paused": True,
             }
@@ -745,7 +746,7 @@ class TestEmbeds:
         assert {n: v for n, v, _ in card.fields} == {
             "Current": "`r1` — Fix",
             "Queued": "2",
-            "Runs today": "1/12",
+            "Runs today (UTC)": "1/12 · resets 00:00 UTC",
             "Breaker": "closed",
             "Paused": "yes",
         }
