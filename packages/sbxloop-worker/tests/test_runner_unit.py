@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from sbxloop_worker.__main__ import load_env_file, main
+from sbxloop_worker.__main__ import apply_env_file, load_env_file, main
 from sbxloop_worker.backends import BackendUnavailableError, get_backend
 from sbxloop_worker.backends.echo import EchoBackend
 from sbxloop_worker.protocol import Event, EventTypes, JobRequest
@@ -313,6 +314,30 @@ class TestEnvFile:
 
     def test_missing_file(self, tmp_path: Path) -> None:
         assert load_env_file(tmp_path / "nope.sh") == {}
+
+    def test_the_real_environment_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "env.sh"
+        path.write_text("export SBXLOOP_TEST_TOK=from_file\nexport SBXLOOP_TEST_NEW=fresh\n")
+        monkeypatch.setenv("SBXLOOP_TEST_TOK", "gho_alreadyhere")
+        monkeypatch.delenv("SBXLOOP_TEST_NEW", raising=False)
+        apply_env_file(path)
+        assert os.environ["SBXLOOP_TEST_TOK"] == "gho_alreadyhere"
+        assert os.environ["SBXLOOP_TEST_NEW"] == "fresh"
+
+    def test_the_env_file_beats_an_sbx_proxy_sentinel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Field failure 2026-08-21: `setdefault` let sbx's injected sentinel
+        win over the real token the provisioner had just written, so the
+        plain-env fallback did nothing and every session 401'd. Nothing can
+        authenticate with a sentinel, so the file has to win over one."""
+        path = tmp_path / "env.sh"
+        path.write_text("export COPILOT_GITHUB_TOKEN=gho_therealtoken\n")
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "sbx-cs-Xrz8X47IcldsQVJ0")
+        apply_env_file(path)
+        assert os.environ["COPILOT_GITHUB_TOKEN"] == "gho_therealtoken"
 
 
 class TestPersistentEnvFile:
