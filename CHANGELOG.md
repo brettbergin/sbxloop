@@ -207,14 +207,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
-- Deploy: wait on the PyPI **simple index**, not the JSON API. The two are
-  separate cache layers and the JSON one goes green first — the very first
-  automated deploy (v0.7.17) sailed past the readiness gate and then died in
-  `pip install`, which still saw 0.7.16 as the newest release. The gate now
-  looks for the wheel filename pip will actually fetch, and the install itself
-  retries, since it is the only authoritative test of "installable". The run
-  failed safe: restart and health check were skipped, the rollback restored the
-  running version, and the pause state survived.
+- Deploy: install the wheels attached to the GitHub Release instead of pulling
+  from PyPI at all. The simple index is Fastly-cached with `max-age=600`, so for
+  up to ten minutes after a release pip can still be served an index page that
+  predates it. Two consecutive deploys died on this — v0.7.17 on `sbxloop`, then
+  v0.7.18 on `sbxloop-worker`, a separate project whose index page is cached
+  independently, which is why the first attempt at a fix (waiting on the host
+  package's index entry) did not hold. `Release` attaches the same `dist/` it
+  publishes, so the wheels exist the moment it finishes; installing both
+  together also satisfies the host wheel's exact `sbxloop-worker==X` pin without
+  the index being consulted for it. Rollback still uses PyPI, where the older
+  version is never racing. Both failed runs failed safe — restart and health
+  check skipped, rollback restored the running version, pause state survived.
 
 - Discord: a reply to the bot is still recognised when discord.py leaves
   `reference.resolved` unset (the referenced message came only from the

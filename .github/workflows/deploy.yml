@@ -141,26 +141,34 @@ jobs:
             -d "$(jq -nc --arg c "${MSG}" '{content:$c}')" \
             "https://discord.com/api/v10/channels/${ch}/messages" >/dev/null
 
-      - name: Wait for the version to be installable from PyPI
+      - name: Fetch the release wheels
+        id: wheels
         if: steps.installed.outputs.changed == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           VERSION: ${{ steps.target.outputs.version }}
         run: |
           set -euo pipefail
-          # Poll the *simple index* — the thing pip actually resolves against.
-          # The JSON API is a separate cache layer and goes green first: on
-          # v0.7.17 it answered 200 while pip still saw 0.7.16 as the newest,
-          # so the deploy sailed past this gate and died in `pip install`.
-          for _ in $(seq 1 20); do
-            if curl -sS -H 'Cache-Control: no-cache' https://pypi.org/simple/sbxloop/ \
-                 | grep -q "sbxloop-${VERSION}-py3-none-any\.whl"; then
-              echo "sbxloop ${VERSION} is on the PyPI simple index"
+          # Install from the GitHub Release, not PyPI. Release attaches the
+          # same dist/ it uploads to PyPI, and it exists the moment Release
+          # finishes — whereas the PyPI simple index is Fastly-cached with
+          # `max-age=600`, so for up to ten minutes pip can still be served an
+          # index that predates the upload. Two deploys died that way: v0.7.17
+          # on `sbxloop`, then v0.7.18 on `sbxloop-worker`, which is a separate
+          # project with its own independently-cached index page.
+          dist="$(mktemp -d)"
+          echo "dist=${dist}" >> "$GITHUB_OUTPUT"
+          for attempt in 1 2 3 4 5; do
+            if gh release download "v${VERSION}" --repo "${REPO}" --dir "${dist}" \
+                 --pattern '*.whl' --clobber; then
+              ls -1 "${dist}"
               exit 0
             fi
-            echo "waiting for sbxloop ${VERSION} on the PyPI simple index…"
+            echo "release v${VERSION} not downloadable yet (attempt ${attempt}); retrying in 15s"
             sleep 15
           done
-          echo "::error::sbxloop ${VERSION} never reached the PyPI simple index after 5 minutes"
+          echo "::error::could not download the wheels for v${VERSION}"
           exit 1
 
       - name: Record the daemon's pause state
@@ -205,26 +213,18 @@ jobs:
         if: steps.installed.outputs.changed == 'true'
         env:
           VERSION: ${{ steps.target.outputs.version }}
+          DIST: ${{ steps.wheels.outputs.dist }}
         run: |
           set -euo pipefail
-          # [discord] is required — the daemon's bridge needs it. The worker is
-          # already pinned exactly by the host wheel's injected
-          # sbxloop-worker==VERSION; naming it is belt-and-braces.
-          #
-          # Retry even though the gate above checked the index: pip and that
-          # check can hit different CDN nodes, and the install is the only
-          # authoritative test of "installable". Nothing here is destructive
-          # until it succeeds, so retrying is free.
-          for attempt in 1 2 3 4 5 6; do
-            if "${VENV_PIP}" install --upgrade \
-                 "sbxloop[discord]==${VERSION}" "sbxloop-worker==${VERSION}"; then
-              ok=yes
-              break
-            fi
-            echo "attempt ${attempt} failed — index may still be propagating; retrying in 15s"
-            sleep 15
-          done
-          [ "${ok:-no}" = yes ] || { echo "::error::pip install of ${VERSION} failed 6 times"; exit 1; }
+          # Both wheels together, from the release: the host wheel pins
+          # sbxloop-worker==VERSION exactly, and naming the local worker wheel
+          # satisfies that pin without the index being consulted for it at all.
+          # [discord] is required — the daemon's bridge needs it. Everything
+          # else (pydantic, discord.py) still resolves from PyPI, which is fine:
+          # those are not racing a just-published version.
+          "${VENV_PIP}" install --upgrade \
+            "${DIST}/sbxloop_worker-${VERSION}-py3-none-any.whl" \
+            "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord]"
           "${VENV_SBXLOOP}" --version
 
       - name: Restart the daemon
@@ -276,6 +276,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "::error::deploy failed — rolling back to ${PREV}"
+          # PyPI is safe here: PREV has been published for a while, so its index
+          # page is long since warm. No just-published version to race.
           "${VENV_PIP}" install --upgrade "sbxloop[discord]==${PREV}" "sbxloop-worker==${PREV}"
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
@@ -302,6 +304,10 @@ jobs:
             "${SBXLOOP}" daemon ctl resume --timeout 60 || echo "::warning::could not resume"
           fi
           "${SBXLOOP}" daemon ctl status --timeout 60 || true
+
+      - name: Clean up the downloaded wheels
+        if: always() && steps.wheels.outputs.dist != ''
+        run: rm -rf -- "${{ steps.wheels.outputs.dist }}"
 
       - name: Report to Discord
         if: always() && steps.installed.outputs.changed == 'true'

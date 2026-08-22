@@ -24,23 +24,30 @@ daemon host and takes **no** checkout — it installs from PyPI and needs nothin
     release when `Release`'s ancestor guard skipped tagging. `workflow_dispatch` can name one.
 02. **Short-circuits** if the host already runs that version, so re-runs and skipped releases
     cost nothing.
-03. **Waits for PyPI** (5 min cap). Publishing lands ~3m45s after merge, so this is normally
-    instant when chained off `Release`.
+03. **Fetches the release wheels** with `gh release download`, rather than installing from
+    PyPI. `Release` attaches the same `dist/` it uploads to PyPI, and they exist the moment
+    that workflow finishes — whereas the PyPI simple index is Fastly-cached with
+    `max-age=600`, so for up to ten minutes pip can be served an index page that predates
+    the upload. Two deploys died exactly there: v0.7.17 on `sbxloop`, then v0.7.18 on
+    `sbxloop-worker`, which is a separate project with its own independently cached page.
 04. **Pauses and drains.** `daemon ctl pause` stops new claims; it then polls `ctl status`
     every 15 s for up to 20 minutes until `current: idle`. The 15 s floor is deliberate —
     `status()` mutates the circuit breaker (#309). On timeout it restarts anyway: cancellation
     is honored at the next task boundary and an interrupted run resumes, it just spends one of
     the item's resume-budget slots.
-05. **Upgrades** with `pip install --upgrade 'sbxloop[discord]==X' 'sbxloop-worker==X'`. The
-    `[discord]` extra is required for the daemon's bridge; the worker is already pinned exactly
-    by the host wheel's injected `sbxloop-worker==X`.
+05. **Upgrades** by installing both local wheels together. The host wheel pins
+    `sbxloop-worker==X` exactly, and naming the local worker wheel satisfies that pin without
+    the index being consulted for it at all. `[discord]` is required for the daemon's bridge.
+    Everything else (pydantic, discord.py) still resolves from PyPI, which is fine — those are
+    not racing a just-published version.
 06. **Restarts**, after `systemctl --user reset-failed` — without that, a previously
     crash-looping unit sits `failed` and is not restartable (`StartLimitBurst=5` per 600 s).
 07. **Health-checks**: unit active, `--version` matches, `sbxloop doctor` exits 0 (never
     `--deep`, which boots a microVM), `daemon ctl status` answers (exit 2 means no daemon came
     up), then a 45 s settle to prove it is not crash-looping.
 08. **Rolls back** to the previously installed version on any failed check, restarts, and fails
-    the job loudly.
+    the job loudly. Rollback installs from PyPI: the previous version has been published for a
+    while, so its index page is long since warm and there is no race to lose.
 09. **Restores the pause state** it recorded at the start. This is required, not cosmetic:
     pause is in-memory only (#308), so *every* restart otherwise comes back claiming work
     autonomously. It runs after a rollback too — whatever version is live, operator intent
