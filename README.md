@@ -462,6 +462,18 @@ every merge to `main` publishes a patch while upgrading this host is
 manual, so the daemon also says so once at startup when it is behind.
 (It only reports: upgrading is `pip install --upgrade sbxloop` plus a
 restart, by a human on the host.)
+Ask "what is the daemon doing?" or "why is nothing running?" and it quotes
+the daemon's own recent log lines — `daemon.idle`, `breaker`,
+`github.poll_failed` — through `daemon_log(tail, level, grep)`, the journal
+without ssh. It reads a **bounded in-process ring buffer** the running
+daemon fills (the last 2000 rendered lines, already redacted), not the full
+systemd journal: anything older than the buffer, or from a previous daemon
+process, still needs `journalctl --user -u sbxloop-daemon`. `tail` is how
+many records (default 50, at most 500), `level` keeps only records at or
+above `DEBUG`/`INFO`/`WARNING`/`ERROR`, and `grep` is a plain
+case-insensitive substring — never a regular expression, so no pattern from
+chat can wedge the daemon. The result is clipped to
+`[concierge] max_tool_result_chars` like every other tool result.
 It finishes triage too: "reply on #12 that we're waiting on upstream"
 posts a comment signed with your name, and "close #12 as a duplicate of
 #7" comments and closes it as *not planned* (or *completed*) — but only

@@ -131,6 +131,10 @@ Guidance:
   or guess a rate. "No usage recorded" means the run predates usage
   reporting or its backend does not report it — say that, do not call it
   zero spend.
+- "What is the daemon doing?" / "why is nothing running?" → `daemon_log`,
+  the daemon's own recent log lines. Quote the `daemon.idle`, `breaker` and
+  `github.poll_failed` lines you actually see rather than guessing; `grep`
+  is a plain substring, not a regular expression.
 - Steering a live run happens **in that run's Discord thread**, not here:
   when someone tries to steer from the control channel, name the thread
   (`run_detail` shows it) and tell them to @mention you there.
