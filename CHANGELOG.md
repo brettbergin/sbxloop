@@ -8,14 +8,34 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Automated deploys to the daemon host** (`.github/workflows/deploy.yml`).
+  Every merge to `main` already auto-released to PyPI, but getting that release
+  onto the running daemon was manual, so a host silently drifted behind its own
+  releases (#331). The new workflow chains off `Release` on a self-hosted runner
+  and does the last mile: pause the daemon and wait for the in-flight run to
+  finish (20 min cap, 15s poll floor — `status()` mutates the breaker, #309),
+  `pip install` the exact released version, `systemctl --user restart`, then
+  health-check it (unit active, `--version` matches, `sbxloop doctor`, `ctl status`, and a 45s settle against crash loops). A failed check rolls back to
+  the version that was running. The operator's pause state is recorded up front
+  and re-applied afterwards — required, because pause is in-memory only (#308)
+  and a restart otherwise resumes autonomous dispatch silently. Deploy start and
+  outcome are posted to the Discord control channel. See `docs/deploy.md`.
+
+- `contrib/systemd/github-runner.service` and `contrib/systemd/sbx-sandboxd.service`.
+  The runner is a **user** unit, not GitHub's `svc.sh` system unit: a system
+  service has no `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, so
+  `systemctl --user restart sbxloop-daemon` fails from one. `sbx-sandboxd`
+  supervises the sandbox backend, which was previously a bare process nothing
+  would restart; `sbxloop-daemon.service` now `Requires=` and is ordered after it.
+
 - Concierge: **`version_status`** answers "are we up to date?" — the
   installed `sbxloop`, `sbxloop-worker` and `sbx` versions against the
   latest releases on PyPI, with a `pip install --upgrade` hint when the host
   is behind. Every merge to `main` auto-releases a patch while deploying to
-  a daemon host is manual, so the daemon now also posts one drift line to
+  a daemon host was manual, so the daemon now also posts one drift line to
   the control channel at startup when it is behind — a tool only helps
   whoever thinks to ask. Read-only and always available (no GitHub, no new
-  config knob); upgrading stays a human step on the host. The PyPI lookup is
+  config knob); it reports drift rather than acting on it. The PyPI lookup is
   the host's only outbound HTTP besides Discord: unauthenticated, bounded by
   a 4s timeout and a response cap, memoised for five minutes, and degrading
   to "could not reach PyPI" rather than failing a turn. A `.devN` build or a

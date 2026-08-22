@@ -843,6 +843,7 @@ The real-sbx end-to-end suite runs in CI via a manually dispatched workflow.
 
 - [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume
 - [Worker protocol](docs/worker-protocol.md) — the host↔worker contract: job kinds, events, transports
+- [Deploying the daemon](docs/deploy.md) — merge to `main` releases, then deploys itself to the daemon host: drain, upgrade, restart, health check, roll back
 - [Spike: agent-session backend](docs/spikes/46-agent-session-backend.md) — feasibility study for proxy-held secrets via sbx native sessions (issue #46)
 - [Changelog](CHANGELOG.md)
 
