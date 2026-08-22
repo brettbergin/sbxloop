@@ -8,7 +8,8 @@ the only environment holding ``GH_TOKEN``.
 from __future__ import annotations
 
 import time
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel
 
@@ -29,6 +30,156 @@ class IssueRef(BaseModel):
 class PrRef(BaseModel):
     number: int
     url: str
+
+
+# What a review says about a PR. REQUEST_CHANGES/APPROVE are the ones that
+# carry weight: under branch protection they gate the merge, so "the review
+# was accepted" becomes a state GitHub enforces rather than one sbxloop only
+# tracks. COMMENT is the degraded mode for an identity the repo will not
+# accept as a reviewer.
+ReviewEvent = Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"]
+
+# Folded verdict of a head commit's check runs.
+CheckState = Literal["pending", "red", "green"]
+
+
+class ReviewComment(BaseModel):
+    """One inline comment, anchored to a line of the PR's diff."""
+
+    path: str
+    line: int
+    body: str
+    # RIGHT is the post-change side; a comment on a deleted line needs LEFT.
+    side: Literal["LEFT", "RIGHT"] = "RIGHT"
+
+
+class SubmittedReview(NamedTuple):
+    """A posted review: its url, and the event GitHub actually accepted.
+
+    ``event`` is not necessarily the one requested — see
+    :meth:`GithubOps.pr_review_create`.
+    """
+
+    url: str
+    event: ReviewEvent
+
+    @property
+    def gates_merge(self) -> bool:
+        """Whether this review can hold the merge. A COMMENT cannot."""
+        return self.event in ("APPROVE", "REQUEST_CHANGES")
+
+
+class ChecksVerdict(NamedTuple):
+    """Every check run on a head commit, folded to one answer.
+
+    ``pending`` is deliberately distinct from ``green``: a PR whose checks
+    have not reported yet has not passed, and reading "no failures so far"
+    as success is exactly how a red PR gets settled as done.
+    """
+
+    state: CheckState
+    total: int
+    pending: tuple[str, ...]
+    failed: tuple[str, ...]
+
+    def summary(self) -> str:
+        if self.state == "green":
+            return f"all {self.total} check(s) passed"
+        if self.state == "pending":
+            return f"{len(self.pending)} of {self.total} check(s) still running"
+        return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
+
+
+# Check-run conclusions that are not failures. ``neutral`` and ``skipped``
+# are deliberately included: a skipped job is not a red build, and treating
+# it as one would wedge the fix loop against something no commit can change.
+# Everything else — failure, timed_out, cancelled, action_required, stale, or
+# a conclusion GitHub adds later — counts as failed. Unknown conclusions fail
+# closed: a check nobody understands must not read as permission to merge.
+PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+
+
+def fold_check_runs(payload: Any) -> ChecksVerdict:
+    """``GET /repos/{repo}/commits/{sha}/check-runs`` folded to a verdict.
+
+    A run with no ``conclusion`` yet is pending, whatever its status says. A
+    head commit with no checks at all reads as ``green``: a repository
+    without CI must not deadlock the loop waiting for a report that will
+    never come.
+    """
+    runs = payload.get("check_runs") if isinstance(payload, dict) else None
+    if not isinstance(runs, list):
+        return ChecksVerdict("green", 0, (), ())
+    pending: list[str] = []
+    failed: list[str] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        name = str(run.get("name") or "check")
+        conclusion = run.get("conclusion")
+        if conclusion is None:
+            pending.append(name)
+        elif str(conclusion).lower() not in PASSING_CONCLUSIONS:
+            failed.append(name)
+    total = len(runs)
+    if failed:
+        # Red beats pending: the build is already known broken, and waiting
+        # on the stragglers only delays the fix.
+        return ChecksVerdict("red", total, tuple(pending), tuple(failed))
+    if pending:
+        return ChecksVerdict("pending", total, tuple(pending), ())
+    return ChecksVerdict("green", total, (), ())
+
+
+def fold_reviews(payload: Any, *, login: str | None = None) -> str:
+    """``GET /repos/{repo}/pulls/{n}/reviews`` folded to one state.
+
+    GitHub keeps every review ever submitted, so only each reviewer's
+    *latest* verdict counts — an APPROVE after a REQUEST_CHANGES clears it.
+    ``COMMENT`` reviews never change a reviewer's standing verdict (GitHub's
+    own rule) and are skipped. ``login`` narrows the fold to one reviewer,
+    which is how the loop asks "did *my* review get satisfied?" without a
+    human's approval answering on its behalf.
+
+    Returns ``APPROVED``, ``CHANGES_REQUESTED`` or ``NONE``.
+    """
+    if not isinstance(payload, list):
+        return "NONE"
+    latest: dict[str, str] = {}
+    for review in payload:
+        if not isinstance(review, dict):
+            continue
+        state = str(review.get("state") or "").upper()
+        if state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            continue
+        who = str((review.get("user") or {}).get("login") or "")
+        if login is not None and who != login:
+            continue
+        # A dismissed review no longer stands; recording it stops a later
+        # entry-free fold from resurrecting the verdict it replaced.
+        latest[who] = "NONE" if state == "DISMISSED" else state
+    if any(state == "CHANGES_REQUESTED" for state in latest.values()):
+        return "CHANGES_REQUESTED"
+    if any(state == "APPROVED" for state in latest.values()):
+        return "APPROVED"
+    return "NONE"
+
+
+def review_payload(
+    event: ReviewEvent, body: str, comments: Sequence[ReviewComment] = ()
+) -> dict[str, Any]:
+    """The POST body for the reviews API.
+
+    ``comments`` is omitted rather than sent empty: a review with no inline
+    anchors is an ordinary summary review, and GitHub rejects an empty array
+    on some paths.
+    """
+    payload: dict[str, Any] = {"event": event, "body": body}
+    if comments:
+        payload["comments"] = [
+            {"path": c.path, "line": c.line, "side": c.side, "body": c.body} for c in comments
+        ]
+    return payload
 
 
 class GithubOps:
@@ -116,6 +267,77 @@ class GithubOps:
     def pr_comment(self, repo: str, number: int, body: str) -> str:
         data = self._op("pr.comment", {"repo": repo, "number": number, "body": body})
         return str(data.get("url", ""))
+
+    # -- pull request review ------------------------------------------------
+    #
+    # These go through `raw.api` rather than dedicated worker ops: the
+    # reviews and check-runs endpoints need no parameter shaping the generic
+    # transport does not already do, and a typed method here keeps the
+    # untyped escape hatch confined to one layer instead of spreading
+    # `raw()` calls through the daemon.
+
+    def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+        """The PR itself — head sha (what the checks hang off), head ref
+        (the branch a fix run must land on) and merge state."""
+        data = self.raw("GET", f"/repos/{repo}/pulls/{number}")
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"pr_get returned a malformed result: {data!r}")
+        return data
+
+    def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
+        """Every check run on ``sha``, folded to one verdict."""
+        return fold_check_runs(self.raw("GET", f"/repos/{repo}/commits/{sha}/check-runs"))
+
+    def pr_review_state(self, repo: str, number: int, *, login: str | None = None) -> str:
+        """``APPROVED`` / ``CHANGES_REQUESTED`` / ``NONE`` — each reviewer's
+        latest verdict only. ``login`` narrows it to one reviewer."""
+        return fold_reviews(self.raw("GET", f"/repos/{repo}/pulls/{number}/reviews"), login=login)
+
+    def pr_review_create(
+        self,
+        repo: str,
+        number: int,
+        event: ReviewEvent,
+        body: str,
+        comments: Sequence[ReviewComment] = (),
+    ) -> SubmittedReview:
+        """Submit a review, with optional inline comments on the diff.
+
+        A ``REQUEST_CHANGES`` or ``APPROVE`` from an identity the repository
+        will not accept as a reviewer is refused by the API — a PR author
+        cannot approve their own, among other rules. Losing the feedback
+        over that would be the worst outcome, so it is resubmitted as a
+        plain ``COMMENT``, which any identity may leave.
+
+        The returned ``event`` is what was *actually* accepted, not what was
+        asked for. Callers must read it: a COMMENT gates nothing, so an
+        acceptance loop that assumed REQUEST_CHANGES had landed would wait
+        forever for an approval no one was ever asked to give.
+        """
+        path = f"/repos/{repo}/pulls/{number}/reviews"
+
+        def submit(kind: ReviewEvent) -> SubmittedReview:
+            data = self.raw("POST", path, review_payload(kind, body, comments))
+            url = str(data.get("html_url", "")) if isinstance(data, dict) else ""
+            return SubmittedReview(url, kind)
+
+        try:
+            return submit(event)
+        except GithubOpsError:
+            if event == "COMMENT":
+                raise
+            log.warning(
+                "gh.review_event_refused",
+                repo=repo,
+                pr=number,
+                requested=event,
+                hint=(
+                    "this identity is not an accepted reviewer on the repo; "
+                    "posting the feedback as a COMMENT review, which does not "
+                    "gate the merge"
+                ),
+            )
+            return submit("COMMENT")
 
     def contents_read(self, repo: str, path: str, ref: str | None = None) -> str:
         params: dict[str, Any] = {"repo": repo, "path": path}

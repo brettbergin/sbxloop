@@ -6,6 +6,53 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **A run must prove the project's own gate before it delivers.** PR #389 was
+  delivered green-looking and sat red: `mdformat` and `security` failing, both
+  plain `make check` targets. The plan's verify commands were a *subset* of
+  what the repository enforces, so nothing in the run ran what CI runs, and
+  `_settle` marked the item done anyway. The review that followed cut five
+  style issues and never mentioned the build was broken.
+
+  When a project declares a gate — a `check` target in the makefile GNU make
+  would actually read — the task graph must run it. Enforced in
+  `verifylint.lint_verify_commands` at JSON acceptance, so a decomposition
+  that skips it costs one retry with the rule quoted rather than a PR, a
+  review round and a human noticing.
+
+  Required **of the graph, not of each task**: demanding it per task would run
+  a multi-minute check once per task for no extra signal, and decompositions
+  already tend to end with an "everything green" task, which is where it
+  belongs. A project that declares no gate has none invented for it — a
+  requirement the executor cannot satisfy is worse than no requirement, since
+  it cannot edit verify commands.
+
+- **A pull-request review capability** (`GithubOps.pr_review_create`,
+  `pr_review_state`, `pr_checks`, `pr_get`). These go through the existing
+  `raw.api` escape hatch rather than new worker ops — the reviews and
+  check-runs endpoints need no parameter shaping the generic transport does
+  not already do — with typed methods keeping the untyped hatch confined to
+  one layer.
+
+  The folds carry the judgement and are pure over payloads: a check run with
+  no conclusion yet is **pending, not green** (reading "no failures so far" as
+  success is how a red PR gets settled as done); a conclusion nobody
+  recognises **fails closed**; `neutral` and `skipped` are not failures; a
+  repository with no CI reads green rather than deadlocking the loop. For
+  reviews, only each reviewer's *latest* verdict counts, `COMMENT` reviews
+  never change it, and a dismissed one stops standing.
+
+  `pr_review_create` returns the event GitHub **actually accepted**, not the
+  one requested: an identity the repository will not accept as a reviewer has
+  `REQUEST_CHANGES` refused, and the feedback is re-posted as a `COMMENT`
+  rather than lost. A `COMMENT` gates nothing, so callers must read the
+  returned event — an acceptance loop that assumed otherwise would wait
+  forever for an approval nobody was asked to give.
+
+  Nothing calls the review methods yet; the loop change that uses them lands
+  separately.
+
 ### Fixed
 
 - **A revision no longer re-derives what its own previous attempt already
