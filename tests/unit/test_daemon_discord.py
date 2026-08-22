@@ -204,6 +204,7 @@ class FakeLoop:
             "queued": 2,
             "runs_today": 1,
             "max_runs_per_day": 12,
+            "run_cap_timezone": "UTC",
             "breaker_open": False,
             "paused": self.paused,
             "stopping": False,
@@ -538,7 +539,9 @@ class TestBridge:
                 bridge._handle_message(FakeMessage(cmd, control))
             assert wait_for(lambda: len(control.sent) >= 6)
             joined = "\n".join(control.sent)
-            assert "**queued:** 2" in joined and "runs today:** 1/12" in joined
+            assert "**queued:** 2" in joined
+            assert "**runs today (UTC):** 1/12, resets at 00:00 UTC" in joined
+            assert "olling" not in joined and "24h" not in joined
             assert "paused" in joined and "resumed." in joined
             assert floop.cancelled == 1 and "cancel requested" in joined
             assert "queue is empty." in joined

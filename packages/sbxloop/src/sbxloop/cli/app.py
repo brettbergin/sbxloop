@@ -1406,7 +1406,12 @@ def daemon(
         typer.Option("--backlog", help="Where agent-filed follow-up work goes: github|inbox|off."),
     ] = None,
     max_runs_per_day: Annotated[
-        int | None, typer.Option("--max-runs-per-day", help="Rolling 24h run cap.")
+        int | None,
+        int | None,
+        typer.Option(
+            "--max-runs-per-day",
+            help="Calendar-day run cap; resets at midnight in run_cap_timezone (default UTC).",
+        ),
     ] = None,
     poll_interval: Annotated[
         float | None, typer.Option("--poll-interval", help="Seconds between polls.")
@@ -2160,7 +2165,8 @@ mem_abort = 0.0
 # until a human merges the PR, and no extra tracking issue is opened.
 # close_on_success = true         # false leaves the issue open for a human to close on merge
 # tracking_issue = true           # false skips the per-run tracking issue
-# max_runs_per_day = 12           # rolling 24h window, persisted across restarts
+# max_runs_per_day = 12           # calendar-day cap, persisted across restarts
+# run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
 # retry_backoff_s = 900.0          # times the attempt number

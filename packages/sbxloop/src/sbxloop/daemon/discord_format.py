@@ -1198,13 +1198,14 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
     current = f"{code(cur['run_id'])} — {_one_line(cur.get('title') or '', 120)}" if cur else "idle"
     breaker = "open" if status.get("breaker_open") else "closed"
     resumes = status.get("resumes_today", 0)
+    tz = status.get("run_cap_timezone", "UTC")
     fields = (
         ("Current", current, False),
         ("Queued", str(status.get("queued", 0)), True),
         (
-            "Runs today",
+            f"Runs today ({tz})",
             f"{status.get('runs_today', 0)}/{status.get('max_runs_per_day', '?')}"
-            + (f" ({resumes} resumed)" if resumes else ""),
+            f" · resets 00:00 {tz}" + (f" ({resumes} resumed)" if resumes else ""),
             True,
         ),
         ("Breaker", breaker, True),

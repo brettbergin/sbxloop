@@ -3,8 +3,11 @@
 One item at a time, one fresh :class:`LoopEngine` per item (engines are
 single-use: their cancel flag never clears), one shared daemon-owned
 :class:`StateStore`, a fresh :class:`EventBus` per run (each engine adds
-permanent subscribers to its bus). Spend guardrails — a rolling daily run
-cap, a per-item attempt cap, a consecutive-failure circuit breaker — are
+permanent subscribers to its bus). Spend guardrails — a calendar-day run
+cap that counts runs started since 00:00 in ``daemon.run_cap_timezone``
+(default ``UTC``) and resets at the next midnight there; a per-item
+attempt cap; a
+consecutive-failure circuit breaker — are
 the daemon's only defense against a mislabeled issue in a fully autonomous
 setup, so they are enforced in the tick, not left to configuration hope.
 
@@ -20,8 +23,11 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
+from zoneinfo import ZoneInfo
 
 from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
@@ -74,6 +80,21 @@ log = get_logger(__name__)
 
 # How often the audit scheduler fast-forwards the checkout to see new charters.
 AUDIT_REFRESH_S = 600.0
+
+
+def day_window(now: float, tz: str) -> tuple[float, float]:
+    """The calendar day containing epoch ``now`` in IANA zone ``tz``, as
+    ``(start_epoch, next_start_epoch)``.
+
+    Every instant in the same local calendar date maps to the same
+    ``start_epoch``, and the count only resets when local midnight passes. ``next_start_epoch`` is
+    the next local midnight (which is not always 86400s later — DST days
+    are 23 or 25 hours long)."""
+    zone = ZoneInfo(tz)
+    local = datetime.fromtimestamp(now, tz=zone)
+    start = datetime.combine(local.date(), dtime(0, 0), tzinfo=zone)
+    next_start = datetime.combine(local.date() + timedelta(days=1), dtime(0, 0), tzinfo=zone)
+    return start.timestamp(), next_start.timestamp()
 
 
 class Frontend(Protocol):
@@ -408,6 +429,7 @@ class DaemonLoop:
 
     def status(self) -> dict[str, Any]:
         now = self.clock()
+        day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         with self._current_lock:
             handle = self._current
         return {
@@ -419,8 +441,10 @@ class DaemonLoop:
             if handle
             else None,
             "queued": len(self.dstore.queued()),
-            "runs_today": self.dstore.runs_started_since(now - DAY_S),
-            "resumes_today": self.dstore.resumes_since(now - DAY_S),
+            "runs_today": self.dstore.runs_started_since(day_start),
+            "runs_today_resets_at": day_end,
+            "run_cap_timezone": self.config.daemon.run_cap_timezone,
+            "resumes_today": self.dstore.resumes_since(day_start),
             "max_runs_per_day": self.config.daemon.max_runs_per_day,
             "breaker_open": self._breaker_open(now),
             "consecutive_failures": self._consecutive_failures,
@@ -489,16 +513,21 @@ class DaemonLoop:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
             return TickResult(idle_kind="breaker")
-        started_today = self.dstore.runs_started_since(now - DAY_S)
+        day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
+        started_today = self.dstore.runs_started_since(day_start)
         if started_today >= self.config.daemon.max_runs_per_day:
             if now - self._last_cap_log > 3600:
                 self._last_cap_log = now
                 cap = self.config.daemon.max_runs_per_day
+                tz = self.config.daemon.run_cap_timezone
                 self._notify(
-                    f"daily run cap reached ({started_today}/{cap}); idling until the window rolls",
+                    f"run cap reached for today ({tz}): {started_today}/{cap}; "
+                    f"resets at 00:00 {tz}",
                     "daemon.daily_cap",
                     started_today=started_today,
                     cap=cap,
+                    timezone=tz,
+                    resets_at=day_end,
                 )
             return TickResult(idle_kind="daily_cap")
         self._schedule_audits(now)
@@ -1366,7 +1395,7 @@ class DaemonLoop:
     def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> None:
         """The loop evaluating the code it just wrote: after a patch item
         delivers a PR, open a review audit of that PR. Once per run, patch
-        items only (an audit has no PR), capped per rolling day, best-effort."""
+        items only (an audit has no PR), capped per calendar day, best-effort."""
         daemon = self.config.daemon
         if not daemon.review_deliveries or item.kind != "patch" or report.delivery is None:
             return
@@ -1377,12 +1406,13 @@ class DaemonLoop:
         try:
             if self.dstore.review_filed(run_id):
                 return
-            if self.dstore.reviews_since(now - DAY_S) >= daemon.reviews_per_day:
+            day_start, _ = day_window(now, daemon.run_cap_timezone)
+            if self.dstore.reviews_since(day_start) >= daemon.reviews_per_day:
                 log.info(
                     "review.skipped",
                     item=item.item_id,
                     run=run_id,
-                    reason="daily cap reached",
+                    reason="calendar-day cap reached",
                     cap=daemon.reviews_per_day,
                 )
                 return
@@ -1410,7 +1440,7 @@ class DaemonLoop:
 
         Only for patch items — a failed audit filing a post-mortem that is
         itself an audit would recurse — only once per run, and capped per
-        rolling day so a bad night cannot flood the tracker. Best-effort:
+        calendar day so a bad night cannot flood the tracker. Best-effort:
         the item is already settled; this must never change that."""
         daemon = self.config.daemon
         if not daemon.postmortems or item.kind != "patch":
@@ -1422,12 +1452,13 @@ class DaemonLoop:
         try:
             if self.dstore.postmortem_filed(run_id):
                 return
-            if self.dstore.postmortems_since(now - DAY_S) >= daemon.postmortems_per_day:
+            day_start, _ = day_window(now, daemon.run_cap_timezone)
+            if self.dstore.postmortems_since(day_start) >= daemon.postmortems_per_day:
                 log.info(
                     "postmortem.skipped",
                     item=item.item_id,
                     run=run_id,
-                    reason="daily cap reached",
+                    reason="calendar-day cap reached",
                     cap=daemon.postmortems_per_day,
                 )
                 return

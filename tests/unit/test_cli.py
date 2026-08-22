@@ -514,6 +514,20 @@ class TestDaemonCommand:
         # and the run tick + orderly shutdown follow it
         assert "daemon.tick" in result.output and "daemon.stopped" in result.output
 
+    def test_max_runs_per_day_help_names_the_calendar_day(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The flag gates a calendar day, so its help must not read as a
+        trailing window (operators read ``10/10`` and expected no more runs)."""
+        # Wide terminal + ANSI stripping, as elsewhere: rich wraps the 80-col
+        # panel mid-token and styles "--" apart from the flag name, so
+        # "--max-runs-per-day" is never contiguous in the raw output.
+        monkeypatch.setenv("COLUMNS", "300")
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", runner.invoke(app, ["daemon", "--help"]).output)
+        (help_text,) = [line for line in plain.splitlines() if "--max-runs-per-day" in line]
+        assert "Calendar-day" in help_text and "run_cap_timezone" in help_text
+        assert "24h" not in help_text and "olling" not in help_text
+
     def test_log_level_flag_beats_env(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
