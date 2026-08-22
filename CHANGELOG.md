@@ -252,6 +252,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Orphaned runs no longer sit in `running` forever** (#374). The run row was
+  only ever written by the in-process run loop, so a cancelled work item — or a
+  daemon that died mid-run — left the run stuck in `running`/`decomposing`
+  while `!sbx status` reported `current: null`; anything counting active runs
+  (guardrails, resume logic, cost reporting) was misled by phantoms. Two sweeps
+  now close them, both *appending* a `run.reconciled` chronology event rather
+  than rewriting history: daemon startup reconciles every non-terminal run that
+  is neither executing in this process nor pinned for resume, and every tick —
+  including while paused — reconciles runs idle longer than
+  `[daemon] run_stale_after_s` (default 6h; `0` disables) while nothing is in
+  flight. A run whose item was cancelled becomes `cancelled` with reason
+  `work item cancelled` and the operator attribution preserved; anything else
+  becomes `failed` with `orphaned: daemon restarted while run was in flight`.
+  Cancellation itself now transitions the run record in the same path as the
+  work item, so the two cannot diverge, and the recorded reason is rendered
+  next to the state in `sbxloop status` / `list_runs` output, in the run detail
+  view and in the TUI header.
+
 - Sandbox secrets: a proxy **sentinel** is no longer mistaken for a delivered
   credential. sbx's secret proxy exports `sbx-cs-…` in place of the value and
   swaps the real one in on the way out — which works for anything that just

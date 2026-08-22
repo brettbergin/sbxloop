@@ -1052,13 +1052,21 @@ class TestConformanceRecording:
     """Provisioning's own field checks double as conformance probes: every
     run refreshes the version-keyed verdict cache for free."""
 
-    def test_ensure_pair_records_field_verdicts(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+    def test_ensure_pair_records_field_verdicts(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from sbxloop.sbx.conformance import (
             PROBE_SECRET_ENV_VISIBILITY,
             PROBE_WORKSPACE_MOUNT,
             load_verdicts,
         )
 
+        # The fake runs exec for real, so the host env IS the sandbox env, and
+        # the pair provisions in parallel with both roles writing the same
+        # verdict key. Unless both probes get the same answer the cached
+        # verdict is whichever role finished last — a coin toss.
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
         provisioner = make_provisioner(fake_sbx, tmp_path)
         pair = provisioner.ensure_pair("r1")
         try:

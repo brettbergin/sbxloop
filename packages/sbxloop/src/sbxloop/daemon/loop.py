@@ -47,7 +47,13 @@ from sbxloop.daemon.postmortem import build_dossier
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import RESUMABLE_RUN_STATES, TERMINAL_RUN_STATES, RunResult
+from sbxloop.engine.model import (
+    RESUMABLE_RUN_STATES,
+    TERMINAL_RUN_STATES,
+    RunRecord,
+    RunResult,
+    RunState,
+)
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     ProvisionError,
@@ -56,7 +62,7 @@ from sbxloop.errors import (
     SbxloopError,
     StateError,
 )
-from sbxloop.events import EventBus, HostEventTypes
+from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
@@ -267,7 +273,47 @@ class DaemonLoop:
         secrets first (so an interruption here leaves the ledger open for
         recovery to finish the job), then close its ledger row."""
         self._remove_stale_run_sandboxes(run_id)
+        self._end_run_cancelled(run_id, f"cancelled: run {result} (never resumed)", source=result)
         self.dstore.finish_ledger(run_id, result, now)
+
+    def _end_run_cancelled(
+        self,
+        run_id: str,
+        reason: str,
+        *,
+        requester: str | None = None,
+        retry: bool = False,
+        source: str,
+    ) -> None:
+        """Transition the *engine* run record to the terminal state
+        ``cancelled`` and append (never mutate) a chronology event saying so.
+
+        Without this the run row is only ever written by the in-process run
+        loop, so a cancelled item left a phantom ``running`` run behind
+        (#374). A run already in a terminal state, or with no record at all
+        (died before ``create_run``), is a no-op.
+        """
+        try:
+            record = self.store.get_run(run_id)
+        except (SbxloopError, StateError):
+            log.debug("run.cancel_no_record", run=run_id, hint="died before create_run")
+            return
+        if record.state in TERMINAL_RUN_STATES:
+            return
+        try:
+            self.store.reconcile_run(run_id, "cancelled", reason)
+            self.store.append_event(
+                Event.now(
+                    "run.cancelled",
+                    run_id,
+                    reason=reason,
+                    by=requester,
+                    requeued=retry,
+                    via=source,
+                )
+            )
+        except (SbxloopError, StateError) as exc:
+            log.warning("run.cancel_write_failed", run=run_id, error=str(exc))
 
     def _deliver_pending_reports(self) -> None:
         """Tell the sources about operator decisions they have not heard:
@@ -436,6 +482,9 @@ class DaemonLoop:
         # reaches its source even while paused or with the breaker open.
         self._deliver_pending_reports()
         self._maybe_gc(now)
+        # Liveness safety net for phantom active runs (#374); sweeps even while
+        # paused, the very state the field report was filed from.
+        self._reconcile_stale_runs(now)
         if self._paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -832,10 +881,16 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         if fresh.state == "abandoned":
+            self._end_run_cancelled(
+                run_id, f"cancelled: {item.item_id} abandoned by operator", source="abandon"
+            )
             self.dstore.finish_ledger(run_id, "abandoned", now)
             self._deliver_report(fresh)
             self._frontend_finished(item, report)
             return "abandoned"
+        self._end_run_cancelled(
+            run_id, f"cancelled: {item.item_id} requeued by operator", source="requeue"
+        )
         self.dstore.finish_ledger(run_id, "requeued", now)
         self._frontend_finished(item, report)
         self._notify(
@@ -987,12 +1042,23 @@ class DaemonLoop:
         self, item: WorkItem, source: WorkSource, run_id: str, cancel: CancelRequest
     ) -> TickOutcome:
         now = self.clock()
-        # The daemon's verdict is "cancelled" even though the persisted run
-        # is still mid-flight (and therefore resumable) — that is the point.
         report = self._report(run_id, None)._replace(
             state="cancelled", cancelled_by=cancel.requester, requeued=cancel.retry
         )
-        reason = f"cancelled by {cancel.requester}"
+        reason = f"cancelled by {cancel.requester}" + (" (retry)" if cancel.retry else "")
+        # The engine state store (state.db) and the daemon store are separate
+        # databases, so the run row and the item row cannot share one
+        # transaction. The run record is written FIRST and the item writes
+        # follow adjacently: an interruption between them leaves a terminal
+        # run and a still-running item (which recovery re-queues) rather than
+        # the phantom `running` run of #374.
+        self._end_run_cancelled(
+            run_id,
+            reason,
+            requester=cancel.requester,
+            retry=cancel.retry,
+            source="operator_cancel",
+        )
         self.dstore.finish_ledger(run_id, "cancelled", now)
         self.dstore.mark_cancelled(item.item_id, reason, now)
         if cancel.retry:
@@ -1423,7 +1489,10 @@ class DaemonLoop:
         breaker / daily cap / pause gate and the per-item resume budget.
         Recovery used to dispatch resumes directly, so a daemon restarting
         into a bad state (breaker open, cap spent, operator-paused) resumed
-        anyway (#254)."""
+        anyway (#254).
+
+        Finishes with :meth:`_reconcile_orphan_runs`, which closes any run
+        row a dead process left non-terminal (#374)."""
         for item in self.dstore.running_items():
             source = self._source_for(item)
             now = self.clock()
@@ -1501,6 +1570,102 @@ class DaemonLoop:
                     reason="run state neither terminal nor resumable; starting over",
                 )
         self._settle_offline_overrides()
+        self._reconcile_orphan_runs()
+
+    def _reconcile_orphan_runs(self) -> None:
+        """Force every *orphaned* non-terminal run to a terminal state (#374).
+
+        The run row is only ever written by the in-process run loop, so a
+        cancelled item or a dead process left phantom ``running`` /
+        ``decomposing`` runs behind: ``list_runs`` disagreed with
+        ``!sbx status`` and anything counting active runs was misled.
+
+        Two kinds of run are deliberately left alone: the run genuinely
+        executing in this process, and one queued for resume (item
+        ``queued`` with the run still pinned — the ``mark_resume_pending``
+        path above), which tick will pick up. Everything else is closed as
+        ``cancelled`` (its item was cancelled) or ``failed`` (orphaned).
+        Chronology is only ever appended to.
+        """
+        with self._current_lock:
+            handle = self._current
+        live_run_id = handle.run_id if handle is not None else None
+        for record in self.store.non_terminal_runs():
+            if record.run_id == live_run_id:
+                continue
+            item_id = self.dstore.item_for_run(record.run_id)
+            item = self.dstore.get(item_id) if item_id else None
+            if item is not None and item.state == "queued" and item.run_id == record.run_id:
+                continue  # pending resume: tick owns it
+            self._reconcile_run_record(record)
+
+    def _reconcile_run_record(
+        self, record: RunRecord, *, reason_override: str | None = None
+    ) -> bool:
+        """Close one non-terminal run, appending (never mutating) chronology.
+
+        Shared by startup reconciliation and the tick-time staleness sweep.
+        A cancelled work item wins over ``reason_override`` so operator
+        attribution is preserved in the run's reason.
+        """
+        item_id = self.dstore.item_for_run(record.run_id)
+        item = self.dstore.get(item_id) if item_id else None
+        if item is not None and item.state == "cancelled":
+            state: RunState = "cancelled"
+            reason = "work item cancelled"
+            if item.last_error:
+                reason = f"work item cancelled: {item.last_error}"
+        else:
+            state = "failed"
+            reason = reason_override or "orphaned: daemon restarted while run was in flight"
+        try:
+            self.store.reconcile_run(record.run_id, state, reason)
+            self.store.append_event(
+                Event.now(
+                    "run.reconciled",
+                    record.run_id,
+                    state=state,
+                    reason=reason,
+                    previous_state=record.state,
+                    item=item_id,
+                )
+            )
+        except (SbxloopError, StateError) as exc:
+            log.warning("recovery.run_reconcile_failed", run=record.run_id, error=str(exc))
+            return False
+        self._notify(
+            f"recovery: orphaned run {record.run_id} {record.state} -> {state} ({reason})",
+            "recovery.run_reconciled",
+            run=record.run_id,
+            item=item_id,
+            state=state,
+            previous=record.state,
+            level="warning",
+        )
+        return True
+
+    def _reconcile_stale_runs(self, now: float) -> None:
+        """Liveness safety net (#374): with no run executing in this process,
+        close non-terminal runs that have shown no activity for
+        ``[daemon] run_stale_after_s``. Disabled when the threshold is 0."""
+        threshold = self.config.daemon.run_stale_after_s
+        if threshold <= 0:
+            return
+        with self._current_lock:
+            if self._current is not None:
+                return  # a run is genuinely in flight; nothing here is stale
+        for record in self.store.non_terminal_runs():
+            last_activity = max(record.updated_at, self.store.last_event_ts(record.run_id) or 0.0)
+            idle = now - last_activity
+            if idle <= threshold:
+                continue
+            item_id = self.dstore.item_for_run(record.run_id)
+            item = self.dstore.get(item_id) if item_id else None
+            if item is not None and item.state == "queued" and item.run_id == record.run_id:
+                continue  # pending resume: tick owns it
+            self._reconcile_run_record(
+                record, reason_override=f"orphaned: stale, no activity for {int(idle)}s"
+            )
 
     def _settle_offline_overrides(self) -> None:
         """`sbxloop daemon abandon|requeue` while no daemon is running can
