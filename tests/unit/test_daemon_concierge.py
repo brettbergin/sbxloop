@@ -198,6 +198,7 @@ def make(
     inbox: bool = True,
     config: dict[str, Any] | None = None,
     versions: Any = None,
+    on_watch: Callable[[str, str], str | None] | None = None,
 ) -> tuple[Concierge, FakeClient, FakeHost, LoopWithRuns, DaemonStore]:
     raw: dict[str, Any] = {
         "state_dir": str(tmp_path / "state"),
@@ -226,6 +227,7 @@ def make(
         bus=EventBus(),
         clock=lambda: 1_000_000.0,
         versions=versions if versions is not None else FakeVersions(),
+        on_watch=on_watch,
     )
     return concierge, client, host, loop, dstore
 
@@ -252,6 +254,7 @@ class TestJobShape:
             "sbx_control",
             "list_runs",
             "run_detail",
+            "watch_run",
             "run_events",
             "item_detail",
             "enqueue_work",
@@ -1364,3 +1367,108 @@ class TestDaemonLogTool:
         assert "daemon_log" in specs
         properties = specs["daemon_log"].parameters["properties"]
         assert {"tail", "level", "grep"} <= set(properties)
+
+
+class TestWatchRun:
+    """``watch_run``: register interest, or answer at once if already done."""
+
+    def _watcher(self) -> tuple[list[tuple[str, str]], Callable[[str, str], str | None]]:
+        seen: list[tuple[str, str]] = []
+
+        def on_watch(run_id: str, requester: str) -> str | None:
+            seen.append((run_id, requester))
+            return None
+
+        return seen, on_watch
+
+    def test_tool_is_registered(self, tmp_path: Path) -> None:
+        concierge, _, _, _, _ = make(tmp_path, [])
+        assert "watch_run" in concierge.tool_names
+
+    def test_registers_unfinished_run(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "r7abcdefg"})]}],
+            on_watch=on_watch,
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r7abcdefg", "Ship it")
+        store.set_run_state("r7abcdefg", "running")
+        turn(concierge, author="alice")
+        text = client.responses[0].text
+        assert seen == [("r7abcdefg", "alice (via concierge)")]
+        assert "r7abcdefg" in text
+        assert "restart" in text
+
+    def test_finished_run_answers_immediately(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "r8abcdefg"})]}],
+            on_watch=on_watch,
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r8abcdefg", "widget shipped")
+        store.set_run_state("r8abcdefg", "completed")
+        loop.reports["r8abcdefg"] = RunReport(
+            "r8abcdefg",
+            "completed",
+            "2/2 tasks done",
+            delivery=(9, "https://github.com/owner/repo/pull/9"),
+        )
+        turn(concierge, author="alice")
+        text = client.responses[0].text
+        assert seen == []
+        assert "completed" in text
+        assert "widget shipped" in text
+        assert "https://github.com/owner/repo/pull/9" in text
+
+    def test_resolves_work_item_to_newest_run(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "inbox:w.md"})]}],
+            on_watch=on_watch,
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        for run_id in ("r1abcdefg", "r2abcdefg"):
+            store.create_run(run_id, "Ship it")
+        store.set_run_state("r1abcdefg", "failed")
+        store.set_run_state("r2abcdefg", "running")
+        item = WorkItem(item_id="inbox:w.md", source="inbox", source_key="w.md", title="Widget")
+        dstore.upsert_new(item, 1.0)
+        dstore.mark_running("inbox:w.md", "r1abcdefg", 2.0)
+        dstore.mark_running("inbox:w.md", "r2abcdefg", 3.0)
+        turn(concierge, author="alice")
+        assert seen == [("r2abcdefg", "alice (via concierge)")]
+        assert "r2abcdefg" in client.responses[0].text
+
+    def test_unknown_id(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "nope"})]}],
+            on_watch=on_watch,
+        )
+        turn(concierge)
+        assert "no run or work item" in client.responses[0].text
+        assert seen == []
+
+    def test_without_callback_says_unavailable(self, tmp_path: Path) -> None:
+        concierge, client, _, _, _ = make(
+            tmp_path, [{"calls": [("watch_run", {"run_id_or_item_id": "r9abcdefg"})]}]
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r9abcdefg", "Ship it")
+        store.set_run_state("r9abcdefg", "running")
+        turn(concierge)
+        assert "not available on this transport" in client.responses[0].text
+
+    def test_concierge_module_has_no_discord_import(self) -> None:
+        import re
+
+        from sbxloop.daemon import concierge as module
+
+        source = Path(str(module.__file__)).read_text(encoding="utf-8")
+        assert re.search(r"^\s*(import|from)\s+discord", source, re.M) is None

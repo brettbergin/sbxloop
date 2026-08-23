@@ -1160,3 +1160,152 @@ class TestBridge:
 def test_threading_sanity() -> None:
     # guard: the module must not require an event loop at import/construct time
     assert threading.current_thread() is threading.main_thread()
+
+
+class TestRunWatches:
+    """#335: `watch_run` registers a Discord id on the bridge and the run's
+    finish posts an @mention notice in the control channel."""
+
+    def test_author_id_is_the_mentionable_form(self) -> None:
+        from sbxloop.daemon.discord import _author_id, _author_name
+
+        control = FakeChannel(FakeClient(), 42)
+        msg = FakeMessage("hi", control)
+        assert _author_id(msg) == "1"
+        assert _author_name(msg) == "Discord user `brett`"
+        msg.author = type("A", (), {"name": "webhook"})()
+        assert _author_id(msg) is None
+
+    def test_concierge_turn_records_the_id_and_on_watch_registers(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            bridge._handle_message(
+                FakeMessage("<@777> watch r1", control, mentions=[BOT_USER], mid=901)
+            )
+            assert wait_for(lambda: concierge.turns != [])
+            assert bridge.on_watch("r1", "Discord user `brett`") is None
+            assert bridge._watchers == {"r1": ["1"]}
+            # a second registration by the same person is not duplicated
+            assert bridge.on_watch("r1", "Discord user `brett`") is None
+            assert bridge._watchers == {"r1": ["1"]}
+        finally:
+            bridge.close()
+
+    def test_unknown_requester_registers_nothing_and_says_so(self, tmp_path: Path) -> None:
+        bridge, _, _ = make_bridge(tmp_path)
+        note = bridge.on_watch("r1", "Discord user `nobody`")
+        assert note is not None and "mentionable id" in note
+        assert bridge._watchers == {}
+
+    def test_finish_pings_watchers_once_with_the_outcome(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            control = client.channels[42]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            bridge._remember_requester("Discord user `brett`", "1")
+            assert bridge.on_watch("r1", "Discord user `brett`") is None
+            bridge.run_finished(
+                item,
+                RunReport(
+                    "r1",
+                    "completed",
+                    "1/1 tasks done",
+                    delivery=(3, "https://x/pull/3"),
+                ),
+            )
+            assert wait_for(lambda: any(s.startswith("<@1> run `r1`") for s in control.sent))
+            notice = next(s for s in control.sent if s.startswith("<@1> run `r1`"))
+            assert "**completed**" in notice
+            assert "1/1 tasks done" in notice
+            assert "🔀 PR #3 <https://x/pull/3>" in notice
+            tid = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
+            assert f"<#{tid}>" in notice
+            assert bridge._watchers == {}
+            # a second finish for the same run pings nobody (the pop is final)
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert not wait_for(
+                lambda: sum(1 for s in control.sent if s.startswith("<@1>")) > 1, timeout=1.0
+            )
+        finally:
+            bridge.close()
+
+    def test_no_watchers_posts_no_mention(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            control = client.channels[42]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert wait_for(lambda: any("finished: completed" in s for s in thread.sent))
+            assert not any("<@" in s for s in control.sent)
+        finally:
+            bridge.close()
+
+    def test_two_watchers_share_one_message(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            control = client.channels[42]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            bridge._remember_requester("brett", "1")
+            bridge._remember_requester("dana", "2")
+            assert bridge.on_watch("r1", "brett") is None
+            assert bridge.on_watch("r1", "dana") is None
+            bridge.run_finished(item, RunReport("r1", "failed", "0/1 tasks done"))
+            assert wait_for(lambda: any(s.startswith("<@1> <@2>") for s in control.sent))
+            notices = [s for s in control.sent if "<@1>" in s]
+            assert len(notices) == 1
+            assert "**failed**" in notices[0]
+        finally:
+            bridge.close()
+
+    def test_a_restart_forgets_every_watch(self, tmp_path: Path) -> None:
+        # watches (and the requester-id map) live in bridge memory only: a
+        # freshly constructed bridge over the same state dir knows nothing,
+        # which is what the concierge's confirmation warns about.
+        bridge, _, _ = make_bridge(tmp_path)
+        bridge._remember_requester("Discord user `brett`", "1")
+        assert bridge.on_watch("r1", "Discord user `brett`") is None
+        assert bridge._watchers == {"r1": ["1"]}
+
+        restarted, _, _ = make_bridge(tmp_path)
+        assert restarted._watchers == {}
+        note = restarted.on_watch("r1", "Discord user `brett`")
+        assert note is not None and "mentionable id" in note
+        assert restarted._watchers == {}
+
+    def test_post_failure_is_not_fatal(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            control = client.channels[42]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            bridge._remember_requester("brett", "1")
+            assert bridge.on_watch("r1", "brett") is None
+
+            async def boom(*a: Any, **k: Any) -> None:
+                raise RuntimeError("discord is on fire")
+
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bridge._send_channel = boom  # type: ignore[method-assign]
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            # the finish path still completes: the card lands and state is cleared
+            assert wait_for(lambda: any("finished: completed" in s for s in thread.sent))
+            assert wait_for(lambda: "r1" not in bridge._items)
+            assert bridge._watchers == {}
+            assert not any("<@1>" in s for s in control.sent)
+        finally:
+            bridge.close()

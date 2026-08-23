@@ -9,7 +9,10 @@ engine changes are needed. Daemon-level events (queueing, breaker, cap,
 recovery) go to the control channel itself. In the control channel,
 ``!sbx <verb>`` runs an operator command and @mentioning the bot (or
 replying to it) talks to the **concierge** — the channel's agent
-(``sbxloop.daemon.concierge``); routing rules live in
+(``sbxloop.daemon.concierge``). Its ``watch_run`` tool calls back into
+``DiscordBridge.on_watch``, which remembers the asker's Discord id and
+@mentions them here when the run finishes; that registry is in-memory
+only, so a daemon restart forgets every watch. Routing rules live in
 ``sbxloop.daemon.discord_routing``.
 
 Two rules make this safe to bolt onto the engine:
@@ -94,6 +97,9 @@ DIGEST_EDIT_MIN_S = 3.0
 # --once daemon can finish its run before the gateway is even up, and its
 # chronology must not end wherever the process happened to exit.
 DRAIN_WAIT_S = 20.0
+# Requester display-string -> Discord id map (run watches); bounded so a
+# long-lived daemon does not accumulate every author it has ever seen.
+REQUESTER_ID_CAP = 200
 # The concierge's "🛠 …" tool-note line is edited at most this often.
 CONCIERGE_NOTE_EDIT_MIN_S = 1.5
 
@@ -205,6 +211,13 @@ class DiscordBridge:
         self._items: dict[str, WorkItem] = {}
         self._pending: dict[str, _Pending] = {}  # message_id -> pending steer
         self._lock = threading.Lock()
+        # Run watches (#335). The concierge is transport-agnostic: it hands a
+        # requester *display string* to `on_watch`, and the bridge turns it
+        # back into a mentionable id through `_requester_ids`. Both live in
+        # memory only — a daemon restart forgets every registration.
+        self._watch_lock = threading.Lock()
+        self._watchers: dict[str, list[str]] = {}  # run_id -> discord user ids
+        self._requester_ids: dict[str, str] = {}  # author display string -> user id
         # Per-run rendering state, owned by the pump (discord thread only).
         self._batchers: dict[str, ToolBatcher] = {}
         self._digests: dict[str, ToolDigest] = {}
@@ -502,6 +515,80 @@ class DiscordBridge:
 
     # -- concierge (the control channel's agent) --------------------------------------
 
+    # -- run watches (#335) -----------------------------------------------------------
+
+    def _remember_requester(self, author: str, author_id: str | None) -> None:
+        """Map a concierge requester's display string to their Discord id, so
+        `on_watch` can register a mentionable id later in the same turn."""
+        if not author_id:
+            return
+        with self._watch_lock:
+            self._requester_ids[author] = author_id
+            while len(self._requester_ids) > REQUESTER_ID_CAP:
+                self._requester_ids.pop(next(iter(self._requester_ids)))
+
+    def on_watch(self, run_id: str, requester: str) -> str | None:
+        """Register interest in a run's outcome; the callback handed to the
+        Concierge (the transport seam — the concierge never imports discord).
+        Returns None on success, or a short note to append to the concierge's
+        confirmation when the requester has no mentionable id. Never raises:
+        a bridge problem must not fail the concierge turn."""
+        try:
+            with self._watch_lock:
+                user_id = self._requester_ids.get(requester)
+                if user_id is None:
+                    return (
+                        "(I don't have a mentionable id for you, so nothing was "
+                        "registered — ask again from the control channel)"
+                    )
+                watchers = self._watchers.setdefault(run_id, [])
+                if user_id not in watchers:
+                    watchers.append(user_id)
+            log.info("discord.watch_registered", run=run_id, by=requester)
+            return None
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("discord.watch_register_failed", run=run_id, error=str(exc), exc_info=True)
+            return None
+
+    def _watch_notice(
+        self, run_id: str, watchers: list[str], state: str, report: RunReport, thread: Any
+    ) -> str:
+        mentions = " ".join(f"<@{uid}>" for uid in watchers)
+        lines = [f"{mentions} run `{run_id}` finished: **{state}**"]
+        if report.task_summary:
+            lines.append(f"tasks: {_one_line(report.task_summary, 200)}")
+        if report.tracking_issue:
+            lines.append(
+                f"📋 tracking issue #{report.tracking_issue[0]} <{report.tracking_issue[1]}>"
+            )
+        if report.delivery:
+            lines.append(f"🔀 PR #{report.delivery[0]} <{report.delivery[1]}>")
+        if report.delivery_error:
+            lines.append(f"⚠ delivery failed: {_one_line(report.delivery_error, 200)}")
+        lines.extend(filed_lines(report, repo=self.config.github.repo))
+        if thread is not None:
+            lines.append(f"chronology: <#{thread.thread_id}>")
+        return _clip("\n".join(lines), self.discord.max_message_chars)
+
+    async def _post_watch_notice(self, run_id: str, state: str, report: RunReport) -> None:
+        """Ping everyone watching this run, once. `_watchers` is keyed by run
+        id only: a watch asked for by work item is resolved to that item's
+        newest run concierge-side, before `on_watch` is called, so there is no
+        item-id key to pop here. The pop is final — a second finish for the
+        same run pings nobody."""
+        with self._watch_lock:
+            watchers = self._watchers.pop(run_id, [])
+        if not watchers:
+            return
+        try:
+            thread = self.dstore.discord_thread(run_id)
+            await self._send_channel(
+                self._watch_notice(run_id, watchers, state, report, thread),
+                mentions=True,
+            )
+        except Exception as exc:
+            log.warning("discord.watch_notice_failed", run=run_id, error=str(exc), exc_info=True)
+
     async def _concierge_turn(self, message: Any, text: str) -> None:
         channel = message.channel
         prefix = self.discord.command_prefix
@@ -523,6 +610,7 @@ class DiscordBridge:
             self._schedule(self._concierge_tool_note(turn, name, args, response))
 
         author = _author_name(message)
+        self._remember_requester(author, _author_id(message))
         log.info("discord.concierge_turn", by=author, chars=len(text))
         try:
             async with _typing(channel):
@@ -944,6 +1032,7 @@ class DiscordBridge:
             facts["pr"] = report.delivery
         facts["summary"] = report.task_summary
         await self._refresh_headline(run_id, item=item, state=state)
+        await self._post_watch_notice(run_id, state, report)
         # Per-run render state is no longer needed.
         self._batchers.pop(run_id, None)
         self._digests.pop(run_id, None)
@@ -1153,6 +1242,7 @@ class DiscordBridge:
         embed: EmbedSpec | None = None,
         suppress_embeds: bool = False,
         reply_to: Any = None,
+        mention_users: bool = False,
     ) -> Any:
         """The single send seam: content is clipped, mentions are always
         disabled (agent prose can contain @everyone), embeds are converted
@@ -1165,7 +1255,7 @@ class DiscordBridge:
         if reply_to is not None:
             kwargs["reference"] = reply_to
             kwargs["mention_author"] = False
-        mentions = _allowed_mentions_none()
+        mentions = _allowed_mentions_users() if mention_users else _allowed_mentions_none()
         if mentions is not None:
             kwargs["allowed_mentions"] = mentions
         if suppress_embeds:
@@ -1220,10 +1310,12 @@ class DiscordBridge:
             )
             return None
 
-    async def _send_channel(self, text: str, *, embed: EmbedSpec | None = None) -> None:
+    async def _send_channel(
+        self, text: str, *, embed: EmbedSpec | None = None, mentions: bool = False
+    ) -> None:
         channel = await self._channel()
         if channel is not None:
-            await self._send(channel, text, embed=embed)
+            await self._send(channel, text, embed=embed, mention_users=mentions)
 
     async def _react(self, message: Any, emoji: str) -> None:
         try:
@@ -1390,6 +1482,16 @@ def _tool_call_summary(name: str, args: dict[str, Any]) -> str:
     return f"{name}({_one_line(inner, 60)})"
 
 
+def _author_id(message: Any) -> str | None:
+    """The author's numeric Discord id, which is what an ``<@id>`` mention
+    needs; `_author_name` stays the display/attribution form (backticked, so
+    it never becomes a GitHub mention). None when the message has no author
+    id (a webhook, or a fake message in tests)."""
+    author = getattr(message, "author", None)
+    ident = getattr(author, "id", None)
+    return str(ident) if ident is not None else None
+
+
 def _author_name(message: Any) -> str:
     """Who sent a control-channel command, for attribution on the source
     (GitHub comment) and in the finish card. Username over display name (it
@@ -1419,6 +1521,16 @@ def _to_embed(spec: EmbedSpec) -> Any:
     if spec.footer:
         embed.set_footer(text=spec.footer)
     return embed
+
+
+def _allowed_mentions_users() -> Any:
+    """Mentions of explicitly named users only (never @everyone/@here or
+    roles) — what a run-watch ping needs to actually reach the requester."""
+    try:
+        import discord as discordpy
+    except ImportError:
+        return None
+    return discordpy.AllowedMentions(everyone=False, roles=False, users=True)
 
 
 def _allowed_mentions_none() -> Any:

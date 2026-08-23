@@ -116,6 +116,10 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   polls for. It is **kept across daemon restarts** when the installed worker
   still matches the host, because the SDK session store — the conversation's
   memory, resumed via `resume_session_id` — lives inside the VM.
+  Its `watch_run` tool registers interest in a run so the asker is
+  @mentioned in the control channel when that run finishes; the registry
+  (and the requester's mentionable Discord id) lives in the Discord
+  bridge's memory only, so **a daemon restart forgets every watch**.
   `daemon_log` is served from a ring-buffer handler `configure_logging`
   installs in `sbxloop/log.py` — a `deque` with a `maxlen`, so a long-lived
   daemon's memory is bounded; the append is one atomic deque operation with
