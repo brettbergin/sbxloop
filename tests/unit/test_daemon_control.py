@@ -279,10 +279,15 @@ class TestControlQueue:
         # Nothing left behind to be replayed by a later daemon.
         assert list((tmp_path / CTL_SUBDIR).iterdir()) == []
 
-    def test_resending_is_bounded_by_the_callers_budget(self, tmp_path: Path) -> None:
-        """A daemon that never finishes starting must still fail at the
-        deadline rather than spin — the refusal is the honest answer once
-        the caller is out of budget."""
+    def test_resending_is_bounded_and_answers_with_the_refusal(self, tmp_path: Path) -> None:
+        """A daemon that never finishes starting must fail at the deadline
+        rather than spin, and must fail *as the refusal it got*.
+
+        The final attempt is the one the deadline interrupts, so it reports
+        `pending` whenever the server had claimed it — which would tell the
+        operator the daemon is executing a command it refused every time.
+        This test used to pass only when that race went the other way; it
+        was flaky on CI and blocked a release."""
         floop = FakeLoop(_dstore(tmp_path))
         server = ControlServer(floop, tmp_path, poll_s=0.02)
         server.start()
