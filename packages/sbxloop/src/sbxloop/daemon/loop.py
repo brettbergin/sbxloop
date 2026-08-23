@@ -138,6 +138,11 @@ class RunHandle:
 Runner = Callable[[WorkItem, Config, str, EventBus, bool], RunResult]
 
 
+# Item states a review run can no longer leave: if the reviewer is in one of
+# these and the PR's review never settled, nothing is coming.
+_TERMINAL_ITEM_STATES = frozenset({"done", "failed", "abandoned", "cancelled"})
+
+
 class DaemonLoop:
     def __init__(
         self,
@@ -1627,9 +1632,33 @@ class DaemonLoop:
             self._fix_round(item, state, now, why=checks.summary(), failed=checks.failed)
             return
         if state.review_in_flight:
+            reviewer = self.dstore.get(state.review_ref or "")
+            if reviewer is not None and reviewer.state in _TERMINAL_ITEM_STATES:
+                # The review run is over and never settled — it failed, or
+                # wrote no verdict. Clear the marker rather than wait on it:
+                # an in-flight flag nothing will ever clear parks the item
+                # silently, and silence is the one outcome this loop must
+                # not produce.
+                log.warning(
+                    "review.abandoned_in_flight",
+                    item=item.item_id,
+                    pr=pr,
+                    reviewer=state.review_ref,
+                    reviewer_state=reviewer.state,
+                )
+                self.dstore.review_in_flight(item.item_id, None)
+                return
             log.debug("review.waiting", item=item.item_id, pr=pr, on="review")
             return
-        if review_state == "CHANGES_REQUESTED":
+        # A review the repo would only accept as a COMMENT leaves no verdict
+        # on GitHub at all, so our own record of what it asked for is the
+        # only answer there is. Ignoring it would accept a PR the reviewer
+        # had just explained was broken — which is precisely what it did on
+        # PR #406.
+        asked_for_changes = review_state == "CHANGES_REQUESTED" or (
+            not state.gates and state.verdict == "REQUEST_CHANGES"
+        )
+        if asked_for_changes:
             self._fix_round(item, state, now, why="the review requested changes", failed=())
             return
         if not state.reviewed:
@@ -1641,8 +1670,10 @@ class DaemonLoop:
                 self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, no reviewer")
             return
         # An approval nobody can give is not worth waiting for: a review the
-        # repo would only accept as a COMMENT never produces one.
-        satisfied = review_state == "APPROVED" if state.gates else True
+        # repo would only accept as a COMMENT never produces one on GitHub.
+        # Fall back to what our review actually asked for rather than
+        # assuming satisfaction.
+        satisfied = review_state == "APPROVED" if state.gates else state.verdict == "APPROVE"
         if satisfied:
             self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, review satisfied")
             return
@@ -1755,7 +1786,20 @@ class DaemonLoop:
             return None
         if posted is None:
             return None
-        self.dstore.review_settled(item.item_id, gates=posted.gates_merge)
+        # `item` is the review's own work item; the item *waiting* on this PR
+        # is a different one. Settling against the charter updated no row and
+        # left the waiter marked "review in flight" for ever (field: gh:335
+        # parked on PR #406 while its review had already been posted).
+        waiting = self.dstore.awaiting_review(item.item_id)
+        if waiting is None:
+            log.warning(
+                "review.no_waiter",
+                item=item.item_id,
+                pr=pr_number,
+                hint="posted, but no item is recorded as awaiting this PR",
+            )
+        else:
+            self.dstore.review_settled(waiting, gates=posted.gates_merge, verdict=posted.event)
         verdict = "approved" if posted.event == "APPROVE" else "requested changes"
         gate = "" if posted.gates_merge else " (as a comment — it does not gate the merge)"
         self._notify(
