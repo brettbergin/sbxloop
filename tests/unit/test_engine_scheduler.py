@@ -230,8 +230,8 @@ class TestFailurePropagation:
         assert sched.started == ["t2"]
 
 
-class TestExecutorContinuityWiring:
-    """The engine side of executor continuity: which session may be resumed,
+class TestBuilderContinuityWiring:
+    """The engine side of builder continuity: which session may be resumed,
     and where the previous attempt's report comes from.
 
     Field failure rrhb28j7n/t5 — five executor sessions on one task, each
@@ -240,14 +240,14 @@ class TestExecutorContinuityWiring:
     """
 
     def test_a_replan_drops_the_session(self, tmp_path: Path) -> None:
-        """A revision continues the same plan, so resuming is the point. A
-        replan threw the approach away — a resumed session would carry the
+        """A revision continues the same approach, so resuming is the point.
+        A replan threw the approach away — a resumed session would carry the
         discarded approach forward as though it were still the intent."""
         engine = Scheduler(tmp_path, [spec("t1")], lanes=1).engine
         task = TaskRecord(spec=spec("t1"), session_id="sess-1", revisions=2)
-        engine._discard_plan(task)
+        engine._discard_session(task)
         assert task.session_id is None
-        assert task.plan is None and task.revisions == 0
+        assert task.revisions == 0
 
     def test_only_a_session_from_this_process_is_resumable(self, tmp_path: Path) -> None:
         """`task.session_id` is persisted, but sandboxes are cattle: a resumed
@@ -260,7 +260,10 @@ class TestExecutorContinuityWiring:
 
     def test_the_prior_report_comes_off_the_committed_attempt(self, tmp_path: Path) -> None:
         """Read from the store rather than held in memory, so a resumed run's
-        revision gets the same context a fresh one would."""
+        revision gets the same context a fresh one would. A legacy
+        ``execute`` row (six-phase checkpoint) is read as a fallback so a
+        remapped mid-flight task keeps its old report across the upgrade;
+        a ``build`` row from this pipeline wins over it."""
         sched = Scheduler(tmp_path, [spec("t1")], lanes=1)
         engine, run_id = sched.engine, sched.run_id
         task = engine.store.get_tasks(run_id)[0]
@@ -277,12 +280,23 @@ class TestExecutorContinuityWiring:
         )
         assert engine._prior_attempt_report(run_id, task) == "ran uv sync; gate green"
 
+        engine.store.record_phase(
+            run_id,
+            "build",
+            task_id="t1",
+            attempt=2,
+            status="ok",
+            output_json=json.dumps({"report": "routed work to src/", "session_id": "s2"}),
+            started_at=1.0,
+        )
+        assert engine._prior_attempt_report(run_id, task) == "routed work to src/"
+
     def test_a_row_without_a_report_yields_nothing(self, tmp_path: Path) -> None:
         sched = Scheduler(tmp_path, [spec("t1")], lanes=1)
         engine, run_id = sched.engine, sched.run_id
         engine.store.record_phase(
             run_id,
-            "execute",
+            "build",
             task_id="t1",
             attempt=1,
             status="ok",

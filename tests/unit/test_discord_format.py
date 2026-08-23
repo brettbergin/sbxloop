@@ -33,7 +33,6 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     issue_url,
     mask_urls,
-    plan_text,
     queue_lines,
     ref_link,
     refs_text,
@@ -44,7 +43,6 @@ from sbxloop.daemon.discord_format import (
     strip_json_payload,
     summary_embed,
     summary_text,
-    verdict_text,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.events import Event
@@ -173,71 +171,10 @@ class TestDecisionCards:
             "3. ⏭ `t3` Docs — after `t1`, `t2`",
         ]
 
-    def test_plan_numbers_its_steps_and_names_its_promises(self) -> None:
-        text = plan_text(
-            {
-                "task_id": "t2",
-                "attempt": 1,
-                "steps": ["write it", "test it"],
-                "expected_artifacts": ["out.txt"],
-                "verify_commands": ["uv run pytest -q"],
-                "egress": [{"domain": "pypi.org", "reason": "install deps"}],
-            }
-        )
-        assert text.splitlines() == [
-            "🗺 **plan** · task `t2`",
-            "1. write it",
-            "2. test it",
-            "**expects:** `out.txt`",
-            "**verify:** `uv run pytest -q`",
-            "**egress:** `pypi.org` — install deps",
-        ]
-
-    def test_replan_says_which_attempt_it_is(self) -> None:
-        text = plan_text({"task_id": "t2", "attempt": 3, "steps": ["try again"]})
-        assert text.splitlines() == ["🗺 **plan** · task `t2` *(replan 3)*", "1. try again"]
-
-    def test_verdict_carries_issues_and_the_feedback_verbatim(self) -> None:
-        text = verdict_text(
-            {
-                "task_id": "t1",
-                "phase": "scrutinize",
-                "verdict": "revise",
-                "issues": [
-                    {"severity": "high", "detail": "quoted fields are ignored"},
-                    {"severity": "low", "detail": "no empty-file test"},
-                ],
-                "feedback": "Handle quotes.\nThen add the test.",
-            }
-        )
-        assert text.splitlines() == [
-            "♻ **scrutinize: revise** · task `t1`",
-            "🔴 **high** — quoted fields are ignored",
-            "⚪ **low** — no empty-file test",
-            "> Handle quotes.",
-            "> Then add the test.",
-        ]
-
-    def test_a_clean_verdict_is_one_line(self) -> None:
-        assert verdict_text(
-            {
-                "task_id": "t1",
-                "phase": "validate",
-                "verdict": "accept",
-                "issues": [],
-                "feedback": "",
-            }
-        ) == ("✅ **validate: accept** · task `t1`")
-
     def test_missing_and_misshapen_fields_do_not_break_a_card(self) -> None:
         # Event data is agent-shaped: a renderer must not assume a list.
         assert roster_text({}).splitlines() == ["🧩 **0 task(s)**"]
         assert roster_text({"tasks": "nope"}).splitlines() == ["🧩 **0 task(s)**"]
-        assert plan_text({"task_id": "t1", "steps": []}).splitlines() == [
-            "🗺 **plan** · task `t1`",
-            "· (no steps)",
-        ]
-        assert verdict_text({}).splitlines() == ["🔎 **critic: ** · task ``"]
 
     def test_events_render_at_every_level(self) -> None:
         for level in ("quiet", "normal", "verbose"):
@@ -247,22 +184,6 @@ class TestDecisionCards:
             )
             assert texts(roster) == ["🧩 **1 task(s)**\n1. `t1` T"]
             assert roster[0].kind == "block"
-            plan = format_for_discord(ev("phase.plan", task_id="t1", steps=["go"]), level=level)
-            assert texts(plan) == ["🗺 **plan** · task `t1`\n1. go"]
-            verdict = format_for_discord(
-                ev("phase.verdict", task_id="t1", phase="validate", verdict="reject"), level=level
-            )
-            assert texts(verdict) == ["❌ **validate: reject** · task `t1`"]
-
-    def test_a_long_plan_is_split_not_clipped(self) -> None:
-        chunks = format_for_discord(
-            ev("phase.plan", task_id="t1", steps=[f"step {i} " + "x" * 120 for i in range(40)]),
-            max_chars=400,
-        )
-        assert len(chunks) > 1
-        assert all(len(c.text) <= 400 for c in chunks)
-        assert chunks[1].text.startswith(f"🗺 *(cont. 2/{len(chunks)})*")
-        assert "step 39" in chunks[-1].text
 
 
 class TestFormat:
@@ -355,23 +276,20 @@ class TestFormat:
                 )
             )
         ) == ["✗ **verify** · task `t2` — pytest: 1 failed"]
-        assert texts(
-            format_for_discord(
-                ev("phase.end", task_id="t2", phase="critic", status="degraded", message="skipped")
-            )
-        ) == ["⚠ **critic degraded** · task `t2` — skipped"]
+        # The builder's report excerpt is the plan card's replacement in the
+        # chronology; other ok phase-ends stay verbose-only.
         assert texts(
             format_for_discord(
                 ev(
                     "phase.end",
                     task_id="t2",
-                    phase="scrutinize",
-                    status="verify_suspect",
-                    message="wrong od layout",
+                    phase="build",
+                    status="ok",
+                    message="added the parser and its tests",
                 )
             )
-        ) == ["🔎 **scrutinize suspects the check** · task `t2` — wrong od layout"]
-        assert format_for_discord(ev("phase.end", task_id="t2", phase="plan", status="ok")) == []
+        ) == ["🔨 **build** · task `t2` — added the parser and its tests"]
+        assert format_for_discord(ev("phase.end", task_id="t2", phase="verify", status="ok")) == []
 
     def test_newly_surfaced_events_and_levels(self) -> None:
         err = format_for_discord(ev("worker.error", message="job died"))
@@ -528,7 +446,7 @@ class TestToolBatcher:
 class TestStatusLine:
     def test_progression(self) -> None:
         s = StatusLine()
-        assert s.render() == "⏳ planning"
+        assert s.render() == "⏳ decomposing"
         s.observe(ev("task.state", task_id="t1", title="Add tests", state="pending", revisions=0))
         s.observe(ev("task.state", task_id="t2", title="Wire CLI", state="pending", revisions=0))
         assert s.render() == "⏳ 2 task(s) planned"
@@ -567,7 +485,7 @@ class TestSteerProgress:
         for _ in range(12):
             p.observe(ev("agent.tool_start", tool="bash", args="ls"))
         assert p.render() == (
-            "⏳ steer queued — agent is mid-**execute** on `t2` · Wire CLI "
+            "⏳ steer queued — agent is mid-**build** on `t2` · Wire CLI "
             "(12/40 tool calls so far); answered at the next checkpoint"
         )
         # a phase boundary is a checkpoint: the count restarts with the new job
@@ -580,15 +498,15 @@ class TestSteerProgress:
         p.observe(ev("task.end", task_id="t2", title="Wire CLI", state="done"))
         assert p.render() == "⏳ steer queued; answered at the next checkpoint"
 
-    def test_production_event_order_keeps_the_planning_phase(self) -> None:
-        # LoopEngine._run_task emits task.state=planning BEFORE task.start
+    def test_production_event_order_keeps_the_build_phase(self) -> None:
+        # LoopEngine._run_task emits task.state=executing BEFORE task.start
         # (and the persisted phase first on resume); the start must not
         # wipe the phase already observed for the same task.
         p = SteerProgress(cap=40)
-        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
-        p.observe(ev("task.start", task_id="t1", title="Plan it"))
+        p.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
+        p.observe(ev("task.start", task_id="t1", title="Build it"))
         assert p.render() == (
-            "⏳ steer queued — agent is mid-**plan** on `t1` · Plan it; "
+            "⏳ steer queued — agent is mid-**build** on `t1` · Build it; "
             "answered at the next checkpoint"
         )
         p.observe(ev("task.state", task_id="t3", state="verifying", revisions=0))
@@ -603,7 +521,7 @@ class TestSteerProgress:
 
     def test_unbounded_cap_and_terminal_states(self) -> None:
         p = SteerProgress(cap=0)  # 0 = unbounded in [budgets]
-        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
+        p.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
         p.observe(ev("agent.tool_start", tool="bash", args="ls"))
         assert "(1 tool call so far)" in p.render()
         p.observe(ev("agent.tool_start", tool="bash", args="ls"))
@@ -805,15 +723,13 @@ class TestRunSummary:
             tev(110.0, "agent.usage", input_tokens=1000, output_tokens=200, cost=0.10),
             tev(111.0, "agent.tool_start", tool="bash"),
             tev(112.0, "agent.tool_start", tool="bash"),
-            tev(120.0, "phase.verdict", task_id="t1", phase="verify", verdict="pass"),
             tev(
                 130.0,
-                "phase.verdict",
+                "phase.end",
                 task_id="t2",
-                phase="scrutinize",
-                verdict="revise",
-                issues=[{"severity": "major", "detail": "tests missing"}],
-                feedback="add tests",
+                phase="verify",
+                status="failed",
+                message="verify command failed: `pytest -q` (exit 1)",
             ),
             tev(140.0, "agent.usage", input_tokens=2000, output_tokens=300, cost=0.15),
             tev(150.0, "chat.message", message_id="m1", text="go faster"),
@@ -832,8 +748,9 @@ class TestRunSummary:
         assert stats.turns == 2 and stats.tool_calls == 2
         assert stats.input_tokens == 3000 and stats.output_tokens == 500
         assert stats.cost == pytest.approx(0.25)
-        assert stats.verdict_passes == 1
-        assert stats.rework == [("t2", "scrutinize", "revise", "tests missing")]
+        assert stats.rework == [
+            ("t2", "verify", "failed", "verify command failed: `pytest -q` (exit 1)")
+        ]
         assert stats.steers == 1 and stats.steers_answered == 1 and stats.steers_failed == 0
         assert stats.denies == 1
         assert stats.task_counts() == (2, 2)
@@ -863,7 +780,7 @@ class TestRunSummary:
         assert "all 2 task(s) completed" in well
         assert "answered all 1 steering message(s)" in well
         work = fields["Needed work"]
-        assert "• `t2` scrutinize: **revise** — tests missing" in work
+        assert "• `t2` verify: **failed** — verify command failed: `pytest -q` (exit 1)" in work
         assert "• 1 policy denial(s)" in work
 
     def test_summary_card_degrades_without_stats(self) -> None:

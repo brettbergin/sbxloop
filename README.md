@@ -10,7 +10,7 @@
 sbxloop turns a large outcome ("migrate this service to async", "add coverage
 to every untested module") into a supervised agentic loop: it **decomposes**
 the outcome into a task graph, then for each task
-**plans → executes → scrutinizes → verifies → validates**, with
+**builds → verifies**, with
 revision/replan budgets, checkpointing, resume, artifact harvesting, and
 optional delivery of the results as a GitHub pull request.
 
@@ -92,25 +92,26 @@ print(result.state, result.run_id)
 
 ```
 outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
-              PLAN ─▶ EXECUTE ─▶ SCRUTINIZE ─▶ VERIFY ─▶ VALIDATE ─▶ done
-                        ▲             │revise            │fail        │reject
-                        └─────────────┴──────────────────┘            │
-                        └── replan ◀──────────────────────────────────┘
+              BUILD ─▶ VERIFY ─▶ done
+                ▲        │fail (≤ revisions: same session resumes;
+                └────────┘        exhausted: fresh session, one replan)
 ```
 
-- **Plan** — produces the task's approach, its `verify_commands`, and
-  (optionally) declared network egress needs (see
+- **Decompose** — produces the task DAG, and with it every task's
+  `verify_commands` (the whole mechanical exam — the builder cannot edit
+  them) and any declared network egress needs (see
   [Network egress](#network-egress-least-privilege-by-plan)).
-- **Execute** — the Copilot agent session does the work in the sandbox
-  workspace.
-- **Scrutinize** — a fresh, read-only critic session reviews the diff and
-  artifacts. The read-only barrier is allowlist + default-deny: critic
-  sessions may only use known-read capabilities, so an SDK change can never
-  silently hand a critic write access to the workspace it reviews.
+- **Build** — one Copilot agent session plans and does the work in the
+  sandbox workspace, narrating its approach first. A revision resumes the
+  same session; a replan (or a chat steer) starts a fresh one.
 - **Verify** — mechanical: the task's `verify_commands` must exit 0, run from
   the workspace root. No LLM. The full command transcript is persisted with
   the attempt, so a resumed run judges with the real evidence.
-- **Validate** — a fresh read-only session judges the acceptance criteria.
+
+There is no in-run critic: the per-task review stages audited task
+completion and rubber-stamped it while diff-level defects leaked to the PR.
+Adversarial review lives in the daemon's post-delivery review lane, which
+sees the whole diff and drives bounded fix rounds on the delivered PR.
 
 **Budgets, not vibes.** Revisions, replans, task count, and wall clock are all
 bounded (`[budgets]` in config; defaults: 2 revisions and 1 replan per task,
@@ -118,8 +119,8 @@ bounded (`[budgets]` in config; defaults: 2 revisions and 1 replan per task,
 its dependents are skipped and the run continues, finishing `failed` if any
 task failed. One deliberate exception: when revisions are exhausted by
 *verify-command* failures, the task spends a replan first when budget
-remains — the executor cannot edit verify commands, so only a fresh plan can
-unstick a broken check.
+remains — the builder cannot edit verify commands, so only a fresh session's
+fresh approach can unstick work that disagrees with where a check looks.
 
 **Checkpointing and resume.** State is committed to SQLite after every
 transition. `sbxloop resume <run>` re-provisions a fresh sandbox pair and
@@ -165,20 +166,21 @@ the apt mirrors, and the supported languages' package registries (issue
 [#141](https://github.com/brettbergin/sbxloop/issues/141) — no language's
 build should fail for a reason another language's build never encounters).
 Well-known registries outside that set are one notch narrower: not reachable
-by default, but a plan may declare them in `egress` with no configuration,
-and every grant lands in the audit log. Anything else the PLAN phase
+by default, but the decomposer may declare them per task in `egress` with no
+configuration,
+and every grant lands in the audit log. Anything else the decomposer
 declares — each domain with a justification — is validated against
 operator-set bounds:
 
 ```toml
 # sbxloop.toml
 [policy]
-allow = ["nexus.corp.example.com"]  # what plans MAY request
+allow = ["nexus.corp.example.com"]  # what tasks MAY request
 deny  = []                          # never grantable, even if allowed
 ```
 
 Patterns are exact domains, `*.example.com` wildcards, or `*`. Empty `allow`
-(the default) means plans may only use the baseline and the well-known
+(the default) means tasks may only use the baseline and the well-known
 registries. `deny` wins over everything, including the always-reachable
 baseline: a denied registry is never seeded into the sandbox in the first
 place. In-bounds grants are
@@ -192,7 +194,7 @@ sbxloop logs <run> --type policy.   # who asked for what, and what was granted
 sbxloop config policy               # the effective per-phase policy
 ```
 
-Out-of-bounds requests fail plan validation with a remediation hint. Static
+Out-of-bounds requests fail graph validation with a remediation hint. Static
 extras that every run should have go in `[sandbox] extra_allow_domains`.
 
 ### Chatting with a running loop
@@ -204,10 +206,11 @@ inspect the workspace. The reply lands in the transcript, and the agent decides
 what your message means for the work:
 
 - **continue** — a question or status check; it answers and carries on.
-- **steer task** — the current task is re-planned immediately with your guidance
-  as feedback (user direction spends no revision/replan budget).
+- **steer task** — the current task's build session is discarded and restarted
+  immediately with your guidance as feedback (user direction spends no
+  revision/replan budget).
 - **steer run** — your guidance becomes a standing instruction injected into
-  every later planning/execution prompt, persisted so `sbxloop resume` keeps it.
+  every later build prompt, persisted so `sbxloop resume` keeps it.
 
 Messages queue while a phase is in flight (the status panel shows them), every
 chat turn is a persisted event (`sbxloop logs <run> --type chat.`), and
@@ -303,7 +306,7 @@ Two more things close the loop. Every PR the daemon delivers gets a
 **review audit** (`[daemon] review_deliveries`): a fresh run reads the source
 issue and the diff as a skeptical maintainer and files defects, missing
 tests and scope drift as backlog issues — sbxloop evaluating the code
-sbxloop wrote. And findings *about the tool itself* — the planner wrote a
+sbxloop wrote. And findings *about the tool itself* — the decomposer wrote a
 bad verify command, a prompt misled the agent, delivery mishandled a case —
 are never dumped on the project's tracker: the audit contract routes them
 to `.sbxloop/backlog/tool/`, and `[daemon] tool_repo = "brettbergin/sbxloop"`
@@ -322,7 +325,8 @@ error); `sbxloop daemon abandon <item> [--reason …]` gives one up (a live
 daemon cancels its in-flight run and tells the issue/inbox file — the report
 is owed on the row and paid by the next tick or the next daemon start, once);
 `sbxloop daemon retry <item>` re-queues an abandoned or cancelled item with attempts
-reset and a **fresh plan** — not a resume of the plan that failed; and
+reset and a **fresh build session** — not a resume of the approach that
+failed; and
 `sbxloop daemon requeue <item>` drops a running item's pinned run so its
 next dispatch starts over (attempts and backoff kept). The same controls are
 `!sbx items|abandon|retry|requeue` on Discord.
@@ -396,10 +400,8 @@ messages as Markdown with persona attribution, split at paragraph and
 code-fence boundaries instead of clipped — their **narration only**, never the
 JSON payload a structured phase returns; what that payload *decided* is posted
 in its own words instead: the task roster (`🧩 3 task(s)`, re-announced with
-persisted state on resume), each task's plan (numbered steps, expected
-artifacts, verify commands, egress grants) and every critic verdict
-(`♻ scrutinize: revise`, its issues by severity, the feedback quoted as the
-executor will receive it); each burst of tool calls
+persisted state on resume) — while the builder narrates its approach in
+prose, and each attempt closes with a `🔨 build` report-excerpt line; each burst of tool calls
 digested into **one line edited in place** (`⚙ 23 tool calls (bash x21, view x2) — last: pytest -q`, with a "may be stuck" nudge when the last
 calls are near-identical) — failed calls still get their own detail
 block, and `chronology_level = "verbose"` streams every call batched into
@@ -699,7 +701,7 @@ release and the uv-managed Python 3.13 are both GitHub release assets
 (`github.com`, redirecting to `release-assets.githubusercontent.com`), and
 both hosts are in the agent sandbox's provisioning-time allowlist. The rest
 fetch from a vendor or registry, and
-**provisioning runs before the PLAN phase**, so a plan's `egress` declaration
+**provisioning runs before any task**, so a task's `egress` declaration
 is too late to help it. Until those domains are part of the provisioning
 baseline, allow them explicitly:
 
@@ -839,7 +841,7 @@ came from. The notable knobs:
 | `[sandbox] workspace_isolation`        | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                 |
 | `[sandbox] extra_allow_domains`        | `[]`               | Static egress allows applied to every run.                                                              |
 | `[sandbox] languages`                  | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                              |
-| `[policy] allow` / `deny`              | `[]`               | Bounds for plan-declared egress.                                                                        |
+| `[policy] allow` / `deny`              | `[]`               | Bounds for task-declared egress.                                                                        |
 | `[github] repo` / `report` / `deliver` | unset / `false`    | The GitHub integration gate and toggles.                                                                |
 | `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |

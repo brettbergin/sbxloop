@@ -102,8 +102,18 @@ def fix_brief(pr_number: int, why: str, failed: Sequence[str] = ()) -> str:
     return "\n\n".join(parts)
 
 
-def fix_tasks(pr_number: int, why: str, failed: Sequence[str] = ()) -> list[TaskSpec]:
-    """The seeded task graph for a fix round — deliberately one task."""
+def fix_tasks(
+    pr_number: int, why: str, failed: Sequence[str] = (), *, gate: str | None = None
+) -> list[TaskSpec]:
+    """The seeded task graph for a fix round — deliberately one task.
+
+    ``gate`` is the operator's ``sandbox.gate_command`` when one is set; it
+    becomes the task's mechanical verify command now that no plan phase
+    authors any. Host-authored, so the builder still never writes its own
+    exam. With no gate known the task carries no verify commands and the
+    PR's own CI checks — which the acceptance gate already polls — remain
+    the mechanical arbiter.
+    """
     criteria = [f"PR #{pr_number}'s checks pass", "the review's objections are addressed"]
     criteria += [f"the `{name}` check passes" for name in failed]
     return [
@@ -112,6 +122,7 @@ def fix_tasks(pr_number: int, why: str, failed: Sequence[str] = ()) -> list[Task
             title=FIX_TASK_TITLE,
             description=fix_brief(pr_number, why, failed),
             acceptance_criteria=criteria,
+            verify_commands=[gate] if gate else [],
         )
     ]
 

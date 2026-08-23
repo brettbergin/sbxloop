@@ -286,8 +286,8 @@ class TestConfigAndInit:
     def test_config_policy_defaults(self, workdir: Path) -> None:
         result = runner.invoke(app, ["config", "policy"])
         assert result.exit_code == 0
-        assert "execute" in result.output
-        assert "plan-declared grants" in result.output
+        assert "build" in result.output
+        assert "task-declared grants" in result.output
         assert "empty" in result.output  # no [policy] allow configured
         assert "api.githubcopilot.com" in result.output
 
@@ -1093,10 +1093,7 @@ class TestRunCommand:
                         ]
                     }
                 },
-                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
                 {"text": "did it"},
-                {"json": {"verdict": "pass"}},
-                {"json": {"verdict": "accept"}},
             ],
         )
         result = runner.invoke(app, ["run", "make it so", "--no-tui"])
@@ -1120,10 +1117,7 @@ class TestRunCommand:
                 ]
             }
         },
-        {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
         {"text": "did it"},
-        {"json": {"verdict": "pass"}},
-        {"json": {"verdict": "accept"}},
     ]
 
     def test_run_no_keep_sandboxes_overrides_config(
@@ -1171,13 +1165,10 @@ class TestRunCommand:
                         ]
                     }
                 },
-                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
                 {
                     "text": "did it",
                     "events": [{"type": "agent.message", "data": {"content": m}} for m in messages],
                 },
-                {"json": {"verdict": "pass"}},
-                {"json": {"verdict": "accept"}},
             ],
         )
         result = runner.invoke(app, ["run", "make it so"])  # tui mode (default)
@@ -1234,10 +1225,7 @@ class TestRunCommand:
                         ]
                     }
                 },
-                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
                 {"text": "did it"},
-                {"json": {"verdict": "pass"}},
-                {"json": {"verdict": "accept"}},
             ],
         )
 
@@ -1298,10 +1286,7 @@ class TestRunCommand:
                         ]
                     }
                 },
-                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
                 {"text": "did it"},
-                {"json": {"verdict": "pass"}},
-                {"json": {"verdict": "accept"}},
             ],
         )
         monkeypatch.setenv("SBXLOOP_GITHUB__REPORT", "true")
@@ -1329,10 +1314,7 @@ class TestRunCommand:
                         ]
                     }
                 },
-                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
                 {"text": "did it", "files": {"hello.txt": "hi", "docs/readme.md": "# hi"}},
-                {"json": {"verdict": "pass"}},
-                {"json": {"verdict": "accept"}},
             ],
         )
         result = runner.invoke(app, ["run", "write hello", "--no-tui"])
@@ -1572,8 +1554,6 @@ class TestRunCommand:
     ) -> None:
         # Task fails on budgets (not infra), so the run finishes "failed"
         # and the summary must point at the kept pair.
-        revise = {"json": {"verdict": "revise", "feedback": "nope"}}
-        plan = {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}}
         execute = {"text": "tried"}
         self.make_run_env(
             workdir,
@@ -1588,13 +1568,14 @@ class TestRunCommand:
                                 "description": "",
                                 "depends_on": [],
                                 "acceptance_criteria": ["works"],
-                                "verify_commands": ["true"],
+                                "verify_commands": ["false"],
                             }
                         ]
                     }
                 },
-                plan,
-                *[execute, revise] * 3,
+                # 3 builds burn the revisions, then the replan's fresh
+                # session burns 3 more — verify ("false") fails them all.
+                *[execute] * 6,
             ],
         )
         monkeypatch.setenv("SBXLOOP_KEEP_ON_FAILURE", "true")

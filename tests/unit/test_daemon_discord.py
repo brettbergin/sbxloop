@@ -387,13 +387,12 @@ class TestBridge:
             thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
             bus.emit("agent.usage", "r1", input_tokens=1200, output_tokens=80, cost=0.05)
             bus.emit(
-                "phase.verdict",
+                "phase.end",
                 "r1",
                 task_id="t1",
                 phase="verify",
-                verdict="revise",
-                message="verify: revise",
-                issues=[{"severity": "major", "detail": "lint fails"}],
+                status="failed",
+                message="verify command failed: `lint` (exit 1)",
             )
             bus.emit("task.state", "r1", task_id="t1", state="done", revisions=1)
             bridge.run_finished(
@@ -410,7 +409,10 @@ class TestBridge:
             assert names == ["Stats", "Went well", "Needed work"]
             values = {f.name: f.value for f in card.fields}
             assert "delivered PR [#3](https://x/pull/3)" in values["Went well"]
-            assert "`t1` verify: **revise** — lint fails" in values["Needed work"]
+            assert (
+                "`t1` verify: **failed** — verify command failed: `lint` (exit 1)"
+                in values["Needed work"]
+            )
         finally:
             bridge.close()
 
@@ -1124,12 +1126,12 @@ class TestBridge:
                 m.id for m in thread.messages.values() if m.content.startswith("⏳ steer queued")
             )
             note = thread.messages[note_id]
-            assert "mid-**execute** on `t2` · Wire CLI (3/40 tool calls so far)" in note.content
+            assert "mid-**build** on `t2` · Wire CLI (3/60 tool calls so far)" in note.content
             assert note.content.endswith("answered at the next checkpoint")
             # more tool calls -> the SAME note is edited, not a new one
             for _ in range(2):
                 bus.emit("agent.tool_start", "r1", tool="bash", args="ls")
-            assert wait_for(lambda: "5/40 tool calls" in note.content, timeout=8)
+            assert wait_for(lambda: "5/60 tool calls" in note.content, timeout=8)
             bus.emit("agent.tool_cap", "r1", cap=40, calls=40, tool="bash")
             assert wait_for(lambda: "ceiling reached" in note.content, timeout=8)
             # the engine picks it up at the checkpoint, then answers

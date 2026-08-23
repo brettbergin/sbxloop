@@ -8,11 +8,11 @@ from pydantic import ValidationError
 from sbxloop.engine.model import (
     DEFAULT_ARTIFACT_EXCLUDES,
     GITIGNORED,
+    EgressSpec,
     RunRecord,
     SteerVerdict,
     TaskGraph,
     TaskSpec,
-    Verdict,
     artifact_files,
     artifacts_dir,
     scan_artifacts,
@@ -55,16 +55,28 @@ class TestTaskGraph:
             TaskGraph.model_validate({"tasks": [spec("t1", ["t2"]), spec("t2", ["t1"])]})
 
 
-class TestVerdict:
-    def test_verdict_literals(self) -> None:
-        assert Verdict(verdict="pass").issues == []
-        with pytest.raises(ValidationError):
-            Verdict(verdict="maybe")  # type: ignore[arg-type]
-
+class TestTaskSpec:
     def test_task_spec_defaults(self) -> None:
         t = TaskSpec(id="t1", title="X")
         assert t.acceptance_criteria == []
         assert t.verify_commands == []
+        assert t.egress == []
+
+    def test_task_egress_domains_validated(self) -> None:
+        """Egress moved from the plan to the task spec; the same domain
+        validation guards it — a scheme, path, or bare `*` is rejected at
+        graph acceptance, not at grant time."""
+        t = TaskSpec.model_validate(
+            {
+                "id": "t1",
+                "title": "X",
+                "egress": [{"domain": "Registry.NPMJS.org", "reason": "npm"}],
+            }
+        )
+        assert t.egress[0].domain == "registry.npmjs.org"  # normalised
+        for bad in ("https://x.com", "x.com/path", "*"):
+            with pytest.raises(ValidationError, match="domain"):
+                EgressSpec(domain=bad)
 
 
 class TestArtifactFiles:

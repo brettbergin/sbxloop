@@ -144,40 +144,40 @@ every failure degrades to "could not reach PyPI" rather than raising.
 
 ```
 outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
-             PLAN ─▶ EXECUTE ─▶ SCRUTINIZE ─▶ VERIFY ─▶ VALIDATE ─▶ done
-                       ▲            │revise            │fail        │reject
-                       └────────────┴──────────────────┘            ▼
-                       PLAN ◀── (plan cleared, revisions reset) ─ replan
+             BUILD ─▶ VERIFY ─▶ done
+               ▲        │fail (≤ max_revisions: same session resumes)
+               └────────┘
+               ▲ (revisions exhausted by verify: fresh session, one replan)
 ```
 
 - **DECOMPOSE** — one agent session turns the outcome into a validated task
-  DAG (unique ids, resolvable deps, acyclic; `max_tasks` budget).
-- **PLAN** — fresh session produces steps, expected artifacts, and
-  verify commands for one task.
-- **EXECUTE** — full tool access, does the work in the run workspace. The
-  one phase that *continues* rather than starting fresh: a revision resumes
-  the previous attempt's session where the SDK still has it, and is handed
-  that attempt's report either way, so it builds on what was already
-  established instead of re-deriving it. A replan clears the session — the
-  approach it holds was the one thrown away.
-- **SCRUTINIZE** — a fresh session in the *same sandbox* with **read-only
-  permissions** reviews the work against plan + acceptance criteria, with
-  evidence gathered mechanically (`git status`, `git diff HEAD`). Fresh
-  session: no anchoring to the executor's claims. Read-only: the critic
-  cannot "fix" things. Same sandbox: the workspace under review is
-  preserved. The diff is handed over in full (clipped head+tail at
-  `DIFF_CLIP`) rather than as a `--stat` summary: a critic that has to
-  rediscover the change by opening files spends turns, and turns are what a
-  run is billed and timed by.
-- **VERIFY** — mechanical: the union of task and plan `verify_commands` must
-  all exit 0. No LLM.
-- **VALIDATE** — fresh read-only session judges each acceptance criterion.
+  DAG (unique ids, resolvable deps, acyclic; `max_tasks` budget). It
+  authors every task's `verify_commands` — the whole mechanical exam, which
+  the builder cannot edit (#94: the agent that does the work must not
+  author its own exam) — and any per-task `egress` declarations, both
+  checked at JSON acceptance.
+- **BUILD** — full tool access, plans and does the work in one session,
+  narrating its approach first. The one phase that *continues* rather than
+  starting fresh: a revision resumes the previous attempt's session where
+  the SDK still has it, and is handed that attempt's report either way, so
+  it builds on what was already established instead of re-deriving it. A
+  replan (or a chat steer) clears the session — the approach it holds was
+  the one thrown away.
+- **VERIFY** — mechanical: the task's decomposer-authored `verify_commands`
+  must all exit 0. No LLM.
 
-Failures loop with budgets: scrutiny revisions and verify failures re-EXECUTE
-with feedback (`max_revisions_per_task`); validation rejections re-PLAN with
-the plan cleared (`max_replans_per_task`). Exhaustion fails the task, skips
-its dependents, and finishes the run `failed`. A wall-clock budget bounds the
-whole run.
+There is no in-run critic. The former SCRUTINIZE/VALIDATE stages audited
+task completion and rubber-stamped it (6/6 pass, 5/5 accept in the measured
+baseline) while diff-level defects — races, failure ordering, unguarded
+parses — leaked to the PR. Adversarial review lives in the daemon's
+post-delivery review lane, which sees the whole diff and drives bounded fix
+rounds on the delivered PR.
+
+Failures loop with budgets: verify failures re-BUILD with the failure
+transcript as feedback (`max_revisions_per_task`); exhausting revisions on
+verify failures spends a replan (`max_replans_per_task`) and restarts with a
+fresh session. Exhaustion fails the task, skips its dependents, and finishes
+the run `failed`. A wall-clock budget bounds the whole run.
 
 Structured JSON phases are validated against pydantic models with one retry
 that feeds the validation error back to the agent.
@@ -226,9 +226,9 @@ and the registry tiers (`$baseline_registries`, `$declarable_registries`) are
 injected from `policy.py` rather than written into the files. The flip side is
 that a bare `$` anywhere else — a shell `$PID` in an example — breaks rendering
 (a literal dollar is `$$`), and `tests/unit/test_prompts.py` pins further
-section-level rules: plan.md's environment opener must stay language-neutral,
-every ecosystem's notes must keep their markers, and the response-format section
-must come last. Each template opens with an HTML comment stating its own
+section-level rules: build.md's environment notes and decompose.md's
+verify-authoring rules must keep their field-regression markers, and every
+ecosystem's notes must keep theirs. Each template opens with an HTML comment stating its own
 contract (variables, escaping, which test guards which section); `render` strips
 that header before the prompt reaches the model, so it costs no tokens and
 cannot be mistaken for instructions.

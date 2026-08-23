@@ -21,8 +21,6 @@ class TestLevelFor:
             ("run.anything_new", logging.INFO),  # the whole run.* family
             (HostEventTypes.TASK_STATE, logging.INFO),
             (HostEventTypes.PHASE_END, logging.INFO),
-            (HostEventTypes.PHASE_PLAN, logging.INFO),
-            (HostEventTypes.PHASE_VERDICT, logging.INFO),
             (HostEventTypes.SANDBOX_READY, logging.INFO),
             (HostEventTypes.CHAT_MESSAGE, logging.INFO),
             (HostEventTypes.POLICY_DENY, logging.INFO),

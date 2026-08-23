@@ -1336,14 +1336,14 @@ def config_policy() -> None:
     table = Table(title="agent sandbox: effective egress per phase")
     table.add_column("phase", no_wrap=True)
     table.add_column("policy", overflow="fold")
-    table.add_row("decompose / plan", "baseline")
+    table.add_row("decompose", "baseline")
     table.add_row(
-        "execute",
-        "baseline + plan-declared grants (auto-granted just before execute, "
+        "build",
+        "baseline + task-declared grants (auto-granted just before build, "
         "within the [policy] bounds below; every grant/refusal is event-logged)",
     )
     table.add_row(
-        "scrutinize / verify / validate",
+        "verify",
         "baseline + grants already made — sbx has no policy revocation, so "
         "grants persist for the sandbox's lifetime (sandboxes are removed at "
         "run end; grants never outlive a run)",
@@ -1360,20 +1360,20 @@ def config_policy() -> None:
         )
     )
 
-    bounds = Table(title="[policy] bounds for plan-declared grants")
+    bounds = Table(title="[policy] bounds for task-declared grants")
     bounds.add_column("bound", no_wrap=True)
     bounds.add_column("patterns", overflow="fold")
     bounds.add_row(
         "allow",
         ", ".join(config.policy.allow)
-        or "(empty — plans may only use the baseline and well-known registries)",
+        or "(empty — tasks may only use the baseline and well-known registries)",
     )
     bounds.add_row("deny", ", ".join(config.policy.deny) or "(none)")
     console.print(bounds)
 
     if config.github.enabled:
         gh_domains = ", ".join([*GITHUB_ALLOW_DOMAINS, *extra])
-        console.print(f"github sandbox (all phases, no plan grants): {gh_domains}")
+        console.print(f"github sandbox (all phases, no task grants): {gh_domains}")
     console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
 
 

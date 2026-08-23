@@ -16,7 +16,6 @@ from pathlib import Path
 
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
-    PlanModel,
     RunRecord,
     RunState,
     TaskRecord,
@@ -25,6 +24,14 @@ from sbxloop.engine.model import (
 )
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
+
+# Task states written by the six-phase pipeline (pre-BUILD), remapped at
+# read time so mid-flight runs resume across the upgrade. See get_tasks.
+_LEGACY_TASK_STATES: dict[str, TaskState] = {
+    "planning": "executing",
+    "scrutinizing": "verifying",
+    "validating": "verifying",
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -291,11 +298,10 @@ class StateStore:
     def update_task(self, run_id: str, task: TaskRecord) -> None:
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE tasks SET state = ?, plan_json = ?, revisions = ?, replans = ?,"
+                "UPDATE tasks SET state = ?, revisions = ?, replans = ?,"
                 " last_feedback = ?, session_id = ? WHERE run_id = ? AND task_id = ?",
                 (
                     task.state,
-                    task.plan.model_dump_json() if task.plan else None,
                     task.revisions,
                     task.replans,
                     task.last_feedback,
@@ -314,7 +320,15 @@ class StateStore:
         ).fetchall()
         records: list[TaskRecord] = []
         for row in rows:
-            state: TaskState = row["state"]
+            # Rows persisted by the six-phase pipeline are remapped onto the
+            # live vocabulary before pydantic sees them, extending the old
+            # resume-rewind precedent: `planning` never committed work, so
+            # BUILD starts fresh; `scrutinizing` is only set after the
+            # execute report committed, so idempotent mechanical VERIFY is
+            # the cheaper re-entry (a failure re-enters BUILD normally);
+            # `validating` re-derives its verify evidence the same way.
+            # plan_json is ignored — the column stays, unread and unwritten.
+            state: TaskState = _LEGACY_TASK_STATES.get(row["state"], row["state"])
             records.append(
                 TaskRecord(
                     spec=TaskSpec.model_validate_json(row["spec_json"]),
@@ -323,11 +337,6 @@ class StateStore:
                     replans=row["replans"],
                     last_feedback=row["last_feedback"],
                     session_id=row["session_id"],
-                    plan=(
-                        PlanModel.model_validate_json(row["plan_json"])
-                        if row["plan_json"]
-                        else None
-                    ),
                 )
             )
         return records

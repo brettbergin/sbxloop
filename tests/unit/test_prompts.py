@@ -9,6 +9,22 @@ from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
 
 
+def build_context(**over: str) -> dict[str, str]:
+    context = {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "d",
+        "acceptance_criteria": "- c",
+        "verify_commands": "- true",
+        "prior_attempt": "(none)",
+        "feedback": "(none)",
+        "user_guidance": "(none)",
+    }
+    context.update(over)
+    return context
+
+
 def test_render_decompose() -> None:
     text = render("decompose", outcome="Build the thing", max_tasks="5", project_gate="- gate")
     assert "Build the thing" in text
@@ -17,167 +33,86 @@ def test_render_decompose() -> None:
 
 
 def test_decompose_states_the_uv_project_convention() -> None:
-    # #250: the decomposer writes verify commands too, and the lint holds
-    # them to the uv convention when a lockfile is present — so the rule
-    # has to be stated where the decomposer reads it, not only in plan.md.
+    # #250: the decomposer writes ALL the verify commands, and the lint
+    # holds them to the uv convention when a lockfile is present — so the
+    # rule has to be stated where the decomposer reads it.
     text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
     assert "uv.lock" in text
     assert "uv run pytest" in text
 
 
-def test_execute_and_plan_carry_environment_notes() -> None:
+def test_decompose_carries_verify_authoring_rules() -> None:
+    """The builder cannot fix a wrong exam, so authoring time is the only
+    mitigation for the wrong-check failure class (formerly verify_suspect):
+    the workspace-root/sh-c/portability facts that lived in plan.md must
+    now reach the decomposer."""
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
+    assert "workspace root" in text
+    assert "cannot edit" in text
+    assert "`sh -c`" in text
+    assert "test runner over shell pipelines" in text
+
+
+def test_build_carries_environment_notes() -> None:
     """Field regression: the agent burned its whole revision budget on
     `python3 -m venv` failing (missing ensurepip) and bare pip hitting
-    PEP 668 — the prompts must state the environment facts."""
-    execute = render(
-        "execute",
-        outcome="o",
-        task_id="t1",
-        task_title="tt",
-        task_description="td",
-        plan_steps="- s",
-        expected_artifacts="- a",
-        prior_attempt="(none)",
-        feedback="(none)",
-        user_guidance="(none)",
-    )
-    plan = render(
-        "plan",
-        outcome="o",
-        task_id="t1",
-        task_title="tt",
-        task_description="td",
-        acceptance_criteria="- c",
-        feedback="(none)",
-        user_guidance="(none)",
-    )
-    for text in (execute, plan):
-        assert "externally managed" in text
-        assert "python3 -m venv" in text
-        assert "sudo" in text
-        assert "allowlist" in text
-    # Plan-declared egress: the planner must know the field and its bounds,
-    # and the executor must report blocked domains instead of retrying.
-    assert "egress" in plan
-    assert "egress" in execute
-    assert "blocked domain" in execute
+    PEP 668 — the prompt must state the environment facts."""
+    build = render("build", **build_context())
+    assert "externally managed" in build
+    assert "python3 -m venv" in build
+    assert "sudo" in build
+    assert "allowlist" in build
+    # Task-declared egress: the builder must report blocked domains instead
+    # of retrying forever.
+    assert "egress" in build
+    assert "blocked domain" in build
     # Field regression (rv4zfdb1m): the executor nested the project in a
     # subdirectory while root-relative verify commands failed every revision.
-    # Both sides must be told verify runs from the workspace root.
-    assert "workspace root" in plan
-    assert "workspace root" in execute
-    assert "cannot edit" in plan
-    assert "cannot edit" in execute
-    # 0.5.0 regression: environment notes buried the response-format section
-    # and JSON compliance dropped. The format instructions must come LAST.
-    assert plan.index("Environment facts") < plan.index("Response format")
-    assert "ONLY the fenced JSON block" in plan
+    assert "workspace root" in build
+    assert "cannot edit" in build
 
 
-# Layer 3 (issue #142): the prompts must carry per-ecosystem environment
-# notes at parity, so no single toolchain is the one a planner pattern-matches
-# against. Each entry is (ecosystem, plan.md markers, execute.md markers);
-# one row per language sub-issue.
-ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
-    ("Python", ("PEP 668", "python3 -m venv", ".venv/bin/pytest"), ("PEP 668", ".venv/bin/")),
-    # #250: the uv-projects note rides inside the Python block of every prompt.
-    (
-        "uv projects",
-        ("uv.lock", "uv sync", "uv run pytest -q"),
-        ("uv.lock", "uv sync", "uv run"),
-    ),
-    ("JavaScript/Node", ("package.json", "npm ci && npm test"), ("package.json", "npm ci")),
-    (
-        "TypeScript",
-        ("tsconfig.json", "npx tsc --noEmit && npm test"),
-        ("tsconfig.json", "tsc --noEmit"),
-    ),
-    ("Go", ("go.mod", "go build ./... && go test ./..."), ("go.mod", "./...")),
-    ("Rust", ("Cargo.toml", "cargo test", "target/"), ("Cargo.toml", "cargo test")),
-    ("Ruby", ("Gemfile", "bundle exec rspec"), ("Gemfile", "bundle exec")),
-    (
-        "Java/JVM",
-        ("pom.xml", "mvn -q -B test", "./gradlew test"),
-        ("pom.xml", "JAVA_HOME", "./gradlew"),
-    ),
-    ("C#/.NET", (".csproj", "dotnet test", "global.json"), (".csproj", "dotnet test")),
-    (
-        "PHP",
-        ("composer.json", "composer install --no-interaction && ./vendor/bin/phpunit"),
-        ("composer.json", "./vendor/bin/"),
-    ),
-    (
-        "C/C++",
-        ("cmake -S . -B build", "ctest --test-dir build --output-on-failure"),
-        ("cmake -S . -B build", "ctest --test-dir build"),
-    ),
+def test_build_shows_the_exam_and_asks_for_a_plan_first_report() -> None:
+    """The builder sees the decomposer-authored verify commands verbatim
+    (it no longer writes them), and its report opens with the approach —
+    the chronology's plan-card replacement."""
+    build = render("build", **build_context(verify_commands="- uv run pytest -q"))
+    assert "Verify commands that will run when you finish" in build
+    assert "- uv run pytest -q" in build
+    assert "state your approach first" in build
+    assert build.index("## Task") < build.index("Verify commands that will run")
+
+
+# Layer 3 (issue #142): the prompt must carry per-ecosystem environment
+# notes at parity, so no single toolchain is the one the builder
+# pattern-matches against. One row per language sub-issue.
+ECOSYSTEM_NOTES: list[tuple[str, tuple[str, ...]]] = [
+    ("Python", ("PEP 668", ".venv/bin/")),
+    # #250: the uv-projects note rides inside the Python block.
+    ("uv projects", ("uv.lock", "uv sync", "uv run")),
+    ("JavaScript/Node", ("package.json", "npm ci")),
+    ("TypeScript", ("tsconfig.json", "tsc --noEmit")),
+    ("Go", ("go.mod", "./...")),
+    ("Rust", ("Cargo.toml", "cargo test")),
+    ("Ruby", ("Gemfile", "bundle exec")),
+    ("Java/JVM", ("pom.xml", "JAVA_HOME", "./gradlew")),
+    ("C#/.NET", (".csproj", "dotnet test")),
+    ("PHP", ("composer.json", "./vendor/bin/")),
+    ("C/C++", ("cmake -S . -B build", "ctest --test-dir build")),
 ]
 
 
 @pytest.mark.parametrize(
-    ("ecosystem", "plan_markers", "execute_markers"),
+    ("ecosystem", "markers"),
     ECOSYSTEM_NOTES,
     ids=[row[0] for row in ECOSYSTEM_NOTES],
 )
-def test_prompts_carry_ecosystem_notes(
-    ecosystem: str,
-    plan_markers: tuple[str, ...],
-    execute_markers: tuple[str, ...],
-) -> None:
-    plan = render(
-        "plan",
-        outcome="o",
-        task_id="t1",
-        task_title="T",
-        task_description="d",
-        acceptance_criteria="- c",
-        feedback="(none)",
-        user_guidance="(none)",
-    )
-    execute = render(
-        "execute",
-        outcome="o",
-        task_id="t1",
-        task_title="T",
-        task_description="d",
-        plan_steps="- s",
-        expected_artifacts="- a",
-        prior_attempt="(none)",
-        feedback="(none)",
-        user_guidance="(none)",
-    )
-    for text in (plan, execute):
-        assert "Ecosystem notes" in text
-        assert f"**{ecosystem}**" in text
-    for marker in plan_markers:
-        assert marker in plan, f"{ecosystem}: missing {marker!r} in plan.md"
-    for marker in execute_markers:
-        assert marker in execute, f"{ecosystem}: missing {marker!r} in execute.md"
-
-
-def test_environment_facts_lead_language_neutral() -> None:
-    """Layer 3 (#142): the environment opener must be toolchain-neutral —
-    per-ecosystem specifics belong in the Ecosystem notes block below it, not
-    in the framing every task reads."""
-    plan = render(
-        "plan",
-        outcome="o",
-        task_id="t1",
-        task_title="T",
-        task_description="d",
-        acceptance_criteria="- c",
-        feedback="(none)",
-        user_guidance="(none)",
-    )
-    opener = plan[plan.index("## Environment facts") : plan.index("Ecosystem notes")]
-    # The universal contract stays in the opener...
-    assert "workspace root" in opener
-    assert "cannot edit" in opener
-    # ...while no ecosystem gets to frame it.
-    for ecosystem_specific in ("PEP 668", ".venv", "pytest"):
-        assert ecosystem_specific not in opener, (
-            f"{ecosystem_specific!r} leaked into the language-neutral opener"
-        )
+def test_prompts_carry_ecosystem_notes(ecosystem: str, markers: tuple[str, ...]) -> None:
+    build = render("build", **build_context())
+    assert "Ecosystem notes" in build
+    assert f"**{ecosystem}**" in build
+    for marker in markers:
+        assert marker in build, f"{ecosystem}: missing {marker!r} in build.md"
 
 
 # One full context per template. Kept in sync with the header comment at the
@@ -185,45 +120,7 @@ def test_environment_facts_lead_language_neutral() -> None:
 # variables a template takes (#225).
 RENDER_CONTEXTS: dict[str, dict[str, str]] = {
     "decompose": {"outcome": "o", "max_tasks": "3", "project_gate": "- gate rule"},
-    "plan": {
-        "outcome": "o",
-        "task_id": "t1",
-        "task_title": "T",
-        "task_description": "d",
-        "acceptance_criteria": "- c",
-        "feedback": "f",
-        "user_guidance": "g",
-    },
-    "execute": {
-        "outcome": "o",
-        "task_id": "t1",
-        "task_title": "T",
-        "task_description": "d",
-        "plan_steps": "- s",
-        "expected_artifacts": "- a",
-        "prior_attempt": "p",
-        "feedback": "f",
-        "user_guidance": "g",
-    },
-    "scrutinize": {
-        "task_id": "t1",
-        "task_title": "T",
-        "task_description": "d",
-        "acceptance_criteria": "- c",
-        "plan_steps": "- s",
-        "prior_feedback": "f",
-        "executor_report": "r",
-        "evidence": "e",
-        "verify_commands": "- true",
-    },
-    "validate": {
-        "outcome": "o",
-        "task_id": "t1",
-        "task_title": "T",
-        "task_description": "d",
-        "acceptance_criteria": "- c",
-        "verify_results": "v",
-    },
+    "build": build_context(),
     "steer": {
         "outcome": "o",
         "tasks_summary": "- t1 [executing] T",
@@ -314,39 +211,19 @@ def test_contract_header_never_reaches_the_model() -> None:
 def test_registry_tiers_are_injected_not_hardcoded() -> None:
     """#141 moves registries between the tiers one language at a time; a
     hardcoded prompt list would drift, and a drifted list is a failed run —
-    the planner either declares what needs no declaration or omits what
+    the decomposer either declares what needs no declaration or omits what
     does. Both tiers must reach both prompts from policy.py."""
-    plan = render(
-        "plan",
-        outcome="o",
-        task_id="t1",
-        task_title="tt",
-        task_description="td",
-        acceptance_criteria="- c",
-        feedback="(none)",
-        user_guidance="(none)",
-    )
-    execute = render(
-        "execute",
-        outcome="o",
-        task_id="t1",
-        task_title="tt",
-        task_description="td",
-        plan_steps="- s",
-        expected_artifacts="- a",
-        prior_attempt="(none)",
-        feedback="(none)",
-        user_guidance="(none)",
-    )
-    for text in (plan, execute):
+    decompose = render("decompose", outcome="o", max_tasks="3", project_gate="- gate rule")
+    build = render("build", **build_context())
+    for text in (decompose, build):
         for domain in BASELINE_REGISTRY_DOMAINS:
             assert f"`{domain}`" in text
         for domain in WELL_KNOWN_REGISTRY_DOMAINS:
             assert f"`{domain}`" in text
-    # The planner must be able to tell the tiers apart: the baseline is
+    # The decomposer must be able to tell the tiers apart: the baseline is
     # named as never-declare, the well-known set as declare-if-touched.
-    assert "never declare them" in plan
-    assert "npm" in plan.lower()
+    assert "never declare them" in decompose
+    assert "npm" in decompose.lower()
 
 
 def test_render_missing_variable_fails_loudly() -> None:
@@ -386,32 +263,10 @@ def test_steer_prompt_carries_chat_contract() -> None:
     assert "ONLY the fenced JSON block" in text
 
 
-def test_plan_and_execute_render_standing_guidance() -> None:
-    plan = render(
-        "plan",
-        outcome="o",
-        task_id="t1",
-        task_title="T",
-        task_description="d",
-        acceptance_criteria="- c",
-        feedback="f",
-        user_guidance="- always use postgres",
-    )
-    execute = render(
-        "execute",
-        outcome="o",
-        task_id="t1",
-        task_title="T",
-        task_description="d",
-        plan_steps="- s",
-        expected_artifacts="- a",
-        prior_attempt="(none)",
-        feedback="f",
-        user_guidance="- always use postgres",
-    )
-    for text in (plan, execute):
-        assert "Standing user guidance" in text
-        assert "always use postgres" in text
+def test_build_renders_standing_guidance() -> None:
+    build = render("build", **build_context(user_guidance="- always use postgres"))
+    assert "Standing user guidance" in build
+    assert "always use postgres" in build
 
 
 def test_bullet_list() -> None:

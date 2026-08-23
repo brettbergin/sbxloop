@@ -17,7 +17,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.sbx.cli import SbxCLI
 from tests.conftest import FakeSbx
-from tests.unit.test_engine import ACCEPT, EXECUTE, PASS, PLAN, Harness, task, taskgraph
+from tests.unit.test_engine import BUILD, Harness, task, taskgraph
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_inbox_item_runs_through_the_real_engine(harness: Harness, tmp_path: Path) -> None:
-    harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS, ACCEPT])
+    harness.script([taskgraph(task("t1")), BUILD])
     config = Config.model_validate(
         {
             "state_dir": str(harness.state_dir),
