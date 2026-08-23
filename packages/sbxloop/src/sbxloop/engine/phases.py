@@ -96,30 +96,6 @@ AGENT_NAMES = {
     "steer": "steering",
 }
 
-# System-message sections dropped per phase (see Budgets.trim_system_message).
-# The whole system message is re-sent on every turn of a session, so a section
-# a phase cannot act on is charged once per turn for the life of the session —
-# and turns are what a run is billed and timed by.
-#
-# Only ``code_change_rules`` (coding rules, linting/testing, ecosystem tools,
-# style) is dropped, and only from the phases that write no code: EXECUTE is
-# the sole phase with write permission, and the critics are read-only by
-# construction. Everything else stays, deliberately:
-#
-# - ``tool_instructions`` and ``tool_efficiency`` make sessions cheaper, not
-#   dearer — a critic that cannot drive its tools is the #123 failure mode.
-# - ``tone`` governs output format; a chattier reply is an ExpectedJsonMissing
-#   retry, which costs a whole extra session.
-# - ``safety`` is not worth trimming for the bytes it saves.
-PHASE_DROP_SECTIONS: dict[str, tuple[str, ...]] = {
-    "decompose": ("code_change_rules",),
-    "plan": ("code_change_rules",),
-    "execute": (),
-    "scrutinize": ("code_change_rules",),
-    "validate": ("code_change_rules",),
-    "steer": ("code_change_rules",),
-}
-
 log = get_logger(__name__)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -220,13 +196,6 @@ class PhaseRunner:
 
     # -- job plumbing ------------------------------------------------------
 
-    def _drop_sections(self, phase: str) -> list[str]:
-        """System-message sections this phase does not need, or nothing when
-        the operator has turned trimming off."""
-        if not self.config.budgets.trim_system_message:
-            return []
-        return list(PHASE_DROP_SECTIONS.get(phase, ()))
-
     def _agent_job(
         self,
         prompt: str,
@@ -248,7 +217,6 @@ class PhaseRunner:
             cwd=self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
             max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
-            drop_system_sections=self._drop_sections(phase),
             # Only EXECUTE ever passes one. The critics are fresh by design
             # (module docstring): a reviewer that inherited the executor's
             # session would inherit its conclusions with it, and that
@@ -265,7 +233,6 @@ class PhaseRunner:
             permission_mode=permission_mode,
             expect=expect,
             prompt_chars=len(prompt),
-            dropped_sections=len(job.drop_system_sections) or None,
             resumed=bool(resume_session_id),
         )
         result = self.agent.submit(job, agent=agent_name)

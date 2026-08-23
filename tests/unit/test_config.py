@@ -156,6 +156,8 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
         load_config(cwd=tmp_path, env={})
     assert config.daemon.close_on_success is True and config.daemon.tracking_issue is True
     assert config.daemon.delivered_label == "sbxloop:delivered"
+    assert config.daemon.completed_label == "sbxloop:completed"
+    assert config.github.deliver_closes is None
     (tmp_path / "sbxloop.toml").write_text(
         '[daemon]\ntrigger_label = "x"\nin_progress_label = "x"\n'
     )
@@ -164,6 +166,14 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     # delivered_label takes part in the lifecycle-label distinctness check
     (tmp_path / "sbxloop.toml").write_text('[daemon]\ndelivered_label = "sbxloop:failed"\n')
     with pytest.raises(ConfigError, match="distinct"):
+        load_config(cwd=tmp_path, env={})
+    # completed_label does too, case-insensitively
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\ncompleted_label = "SBXLOOP:DELIVERED"\n')
+    with pytest.raises(ConfigError, match="case-insensitively"):
+        load_config(cwd=tmp_path, env={})
+    # deliver_closes must be a positive issue number
+    (tmp_path / "sbxloop.toml").write_text('[github]\nrepo = "o/r"\ndeliver_closes = 0\n')
+    with pytest.raises(ConfigError):
         load_config(cwd=tmp_path, env={})
     # tool_repo must be owner/name
     (tmp_path / "sbxloop.toml").write_text('[daemon]\ntool_repo = "not a repo"\n')

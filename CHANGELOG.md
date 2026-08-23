@@ -6,6 +6,43 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Removed
+
+- **The per-phase system-message trimming flag under `[budgets]`, and the
+  whole trimming code path behind it.** #386. The flag was added earlier in
+  this same unreleased cycle on the premise that the ~22k tokens of fixed
+  context riding every turn were ~62% of a run's input spend. The usage fields
+  shipped alongside it now answer that: run `rrhb28j7n` shows
+  `cache_read_tokens` is a *subset* of `input_tokens` — turn 0 writes ~20k and
+  turn 1 reads exactly that back — and 86.5% of the run's input tokens
+  (3,615,785 / 4,180,827) are cache reads (executor 91.7%, planner 83.3%,
+  validator 82.4%, scrutinizer 79.1%, decomposer 68.5%). The static
+  system-prompt prefix the flag trimmed is precisely the most-cached region,
+  and the "62% of spend" premise was 62% of *tokens*, billed at cache-read
+  rates. Left in place the flag was a trap for a future operator expecting a
+  62% reduction, so the code path is gone with it: the per-phase drop-section
+  table and the `PhaseRunner` method that consulted it, the job-request field
+  that carried the section list to the worker, the SDK `customize` branch of
+  `system_message_config` (now append-only) along with the SDK section
+  vocabulary snapshot and its lookup helper, and the `sbxloop doctor`
+  prompt-sections drift check. Prompt assembly is byte-identical to the flag's
+  default-off behaviour, so no run changes. **Breaking config change:** the
+  loader forbids unknown keys, so a config still setting that key under
+  `[budgets]` is now rejected — delete the key.
+
+### Added
+
+- **`pr_status(number)`, a concierge host tool for how a delivered PR is
+  doing.** #333. "How is PR #41 doing?" now gets an answer without a
+  browser: the CI check runs summarised as counts with each failing check
+  named and linked, the review decision and who reviewed, whether GitHub
+  calls the PR mergeable, and whether the branch is behind its base. It is
+  served through the github-ops box with `GithubOps.raw`
+  (`GET /repos/{repo}/pulls/{n}`, `/commits/{sha}/check-runs`,
+  `/pulls/{n}/reviews`), the output is clipped like every other tool
+  result, and a PR that does not exist is answered plainly. **Read-only:
+  there is no merge or write path — the concierge cannot merge from chat.**
+
 ### Changed
 
 - **Run threads now show what a tool call ran and what it produced.** A bash
@@ -52,6 +89,19 @@ All notable changes to sbxloop are documented here. The project adheres to
     need no migration**. Truncation and excerpting are display-only: the stored
     event keeps the full command and output. See `docs/worker-protocol.md` and
     `docs/architecture.md`.
+
+- **Cost is no longer summed across turns.** #386. The Copilot SDK's
+  `AssistantUsageData.cost` is a per-turn *constant* (15.0 on every turn of
+  every session), not a delta, so folding it through `Usage.merged` turned a
+  147-turn run into `cost: 2205.0000` — a fabricated figure the concierge
+  would repeat in Discord as fact. The host no longer lifts `cost` out of
+  `agent.usage` events, `Usage.merged` carries it last-wins rather than
+  additively, and `_cost_line` renders a figure only when it is strictly
+  positive; `run_usage` and `usage_today` say "cost: not reported by the agent
+  backend" instead. The field's *unit is unknown*: a value identical on every
+  turn of every session is far more likely a premium-request multiplier or a
+  quota unit than a currency amount, so it must never be rendered as a
+  currency figure until the unit is established.
 
 - **The acceptance loop now runs its gates cheapest-first, and a fix round is
   one task.** #399 shipped the gate; this makes it efficient enough to run.
@@ -309,21 +359,6 @@ All notable changes to sbxloop are documented here. The project adheres to
     now a pure `usage_from_sdk_sample` (unit-tested despite the module being
     coverage-omitted, like `read_only_denial` before it), and `run_usage` breaks
     spend down by turns and jobs per persona.
-  - **`[budgets] trim_system_message`** (default **off**) drops the agent SDK
-    system-message sections a phase cannot act on, so they stop being re-sent
-    every turn. Deliberately narrow: only `code_change_rules`, and only from the
-    five phases that write no code — EXECUTE, the one phase with write
-    permission, keeps everything. Off by default until a field run answers two
-    questions the usage fields above now make answerable: whether that 22k is
-    billed or served from cache (an unmeasured optimisation should not be on),
-    and whether the SDK accepts the `customize` config shape — if it does not,
-    every agent job fails, and the deploy's health check would not catch it
-    because it never starts a run. `tool_instructions`/`tool_efficiency` make
-    sessions cheaper rather than dearer, `tone` governs output format (a
-    chattier reply costs a whole retry session), and `safety` is not worth
-    trimming for the bytes. `sbxloop doctor` gains a section-vocabulary drift
-    check mirroring the permission-kinds one, because a renamed section fails
-    silently — spend just returns to baseline.
   - **`[budgets] max_parallel_tasks`** (default 1) runs independent tasks
     concurrently. The task DAG already knew which tasks were independent; the
     loop walked them one at a time regardless. Readiness is now evaluated

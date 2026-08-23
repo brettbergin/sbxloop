@@ -23,7 +23,6 @@ import os
 import shutil
 import time
 from collections import Counter
-from collections.abc import Sequence
 from typing import Any, get_args
 
 from sbxloop_worker._json import extract_json
@@ -452,82 +451,15 @@ def _tool_error(data: Any) -> str | None:
     return redact_secrets(message)[-TOOL_OUTPUT_CLIP:]
 
 
-# The SDK's system-message section vocabulary, field-verified against
-# github-copilot-sdk 1.0.9 (``copilot.session.SYSTEM_MESSAGE_SECTIONS``, whose
-# keys are the ``SystemMessageSection`` literal). Every turn of a session
-# re-sends the whole system message, so a section a phase cannot use is not
-# paid for once — it is paid for on every turn. ``sbxloop doctor`` compares
-# the installed SDK against this snapshot so vocabulary drift on an SDK bump
-# is surfaced there rather than as a silently un-trimmed (or, worse,
-# over-trimmed) phase in the field.
-SDK_SYSTEM_MESSAGE_SECTIONS = frozenset(
-    {
-        "preamble",
-        "identity",
-        "tone",
-        "tool_efficiency",
-        "environment_context",
-        "code_change_rules",
-        "guidelines",
-        "safety",
-        "tool_instructions",
-        "custom_instructions",
-        "runtime_instructions",
-        "last_instructions",
-    }
-)
-
-
-def installed_sdk_system_message_sections() -> frozenset[str] | None:
-    """The installed SDK's system-message section vocabulary, or None.
-
-    Returns None when github-copilot-sdk is not installed, or when it is too
-    old to expose ``SYSTEM_MESSAGE_SECTIONS`` — an SDK without the mapping
-    cannot be trimmed, and the caller treats that as "leave the system
-    message alone" rather than an error.
-    """
-    try:
-        from copilot.session import SYSTEM_MESSAGE_SECTIONS
-    except ImportError:
-        return None
-    if not isinstance(SYSTEM_MESSAGE_SECTIONS, dict):
-        return None
-    return frozenset(str(name) for name in SYSTEM_MESSAGE_SECTIONS)
-
-
-def system_message_config(
-    content: str | None,
-    drop_sections: Sequence[str] = (),
-    known_sections: frozenset[str] | None = None,
-) -> dict[str, Any] | None:
+def system_message_config(content: str | None) -> dict[str, Any] | None:
     """The SDK ``system_message`` kwarg for one job, or None to leave the
     SDK's default prompt untouched.
 
-    ``customize`` mode keeps the SDK-managed prompt structure and removes
-    only the named sections, so the guardrails a ``replace`` would discard
-    stay in place. Sections the installed SDK does not know are dropped from
-    the request rather than sent: a host running ahead of the sandbox's SDK
-    degrades to today's behaviour instead of failing the job on a name the
-    SDK would reject.
-
-    ``known_sections=None`` means the installed SDK reported no vocabulary at
-    all — it predates ``SYSTEM_MESSAGE_SECTIONS``, and an SDK that cannot
-    name the sections cannot be assumed to accept a ``customize`` config
-    either. That trims **nothing**: sending the request anyway would fail
-    every trimmed job, which is the opposite of the fallback this is for.
+    ``append`` mode keeps the SDK-managed prompt structure intact and adds
+    the job's extra content after it; with no extra content there is nothing
+    to send.
     """
-    if known_sections is None:
-        return {"mode": "append", "content": content} if content else None
-    wanted = [name for name in dict.fromkeys(drop_sections) if name in known_sections]
-    if not wanted:
-        return {"mode": "append", "content": content} if content else None
-    config: dict[str, Any] = {
-        "mode": "customize",
-        "sections": {name: {"action": "remove"} for name in wanted},
-    }
-    if content:
-        config["content"] = content
-    return config
+    return {"mode": "append", "content": content} if content else None
 
 
 def _sdk_field(data: Any, name: str) -> Any:
@@ -549,18 +481,23 @@ def _sdk_field(data: Any, name: str) -> Any:
 def usage_from_sdk_sample(data: Any) -> Usage:
     """One ``AssistantUsageData`` turn sample as a protocol :class:`Usage`.
 
-    The SDK reports far more than tokens (field-verified against
-    github-copilot-sdk 1.0.9, ``copilot.generated.session_events``): cost
-    and the prompt-cache counters ride on every sample. Dropping them made
-    a run's real spend unknowable — the whole chain downstream already
-    carries the fields (``Usage`` in the worker protocol, the concierge's
-    ``_USAGE_FIELDS`` and ``_cost_line``), so ``run_usage`` was telling
-    operators cost was "not reported by the agent backend" while the
-    backend reported it on every turn.
+    The prompt-cache counters ride on every sample (field-verified against
+    github-copilot-sdk 1.0.9, ``copilot.generated.session_events``) and are
+    read here because they are genuine per-turn deltas that the whole chain
+    downstream already carries (``Usage`` in the worker protocol, the
+    concierge's ``_USAGE_FIELDS``).
 
-    ``cost`` is flagged experimental by the SDK, so it is read defensively
-    like everything else here: a field that disappears on an SDK bump
-    degrades to None rather than failing the session.
+    ``AssistantUsageData.cost`` is deliberately NOT read. It is not a
+    per-turn delta: it was observed as the same constant 15.0 on every turn
+    of every session in run rrhb28j7n (sbxloop 0.7.26). ``Usage.merged``
+    sums every numeric field — correct for token counters — so a 147-turn
+    run folds to 147 x 15.0 = 2205.0 and ``_cost_line`` renders a fabricated
+    figure that the concierge then repeats as fact. A value identical on
+    every turn is far more likely a premium-request multiplier or quota unit
+    than a currency amount, so the field stays unread until its unit is
+    established; "cost: not reported by the agent backend" is the honest
+    fallback. If it is ever surfaced it must be carried non-additively
+    (last/max wins, as ``Usage.merged`` already does for ``model``).
     """
     return Usage(
         model=_sdk_field(data, "model"),
@@ -568,7 +505,6 @@ def usage_from_sdk_sample(data: Any) -> Usage:
         output_tokens=_sdk_field(data, "output_tokens"),
         cache_read_tokens=_sdk_field(data, "cache_read_tokens"),
         cache_write_tokens=_sdk_field(data, "cache_write_tokens"),
-        cost=_sdk_field(data, "cost"),
     )
 
 
@@ -743,11 +679,7 @@ class CopilotBackend:
         }
         if job.model and job.model != "auto":
             kwargs["model"] = job.model
-        system_message = system_message_config(
-            job.system_message,
-            job.drop_system_sections,
-            installed_sdk_system_message_sections(),
-        )
+        system_message = system_message_config(job.system_message)
         if system_message is not None:
             kwargs["system_message"] = system_message
         if job.cwd:

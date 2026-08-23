@@ -183,17 +183,29 @@ that feeds the validation error back to the agent.
 A run's spend and its wall clock are both governed by **turns**, not jobs.
 Every turn re-sends the whole session context, and field measurement (run
 `rews3ssdn`: 272 turns across 25 jobs) put ~22k tokens of fixed context on
-every one of them — roughly 62% of the run's input spend, against a phase
-prompt under 2k. Wall clock tracked the same count at ~10s/turn. Two knobs
-follow from that:
+every one of them, against a phase prompt under 2k. Wall clock tracked the
+same turn count at ~10s/turn.
 
-- `[budgets] trim_system_message` (default **off**) drops the agent SDK's
-  system-message sections a phase cannot act on (`PHASE_DROP_SECTIONS` in
-  `sbxloop.engine.phases`), so they are not re-sent every turn. Only
-  `code_change_rules`, and only from the phases that write no code. Off until
-  a real run says whether that 22k is billed or cached, and whether the SDK
-  accepts the `customize` config shape — a rejection fails every agent job,
-  and the deploy health check would not catch it because it starts no run.
+That fixed context is, however, overwhelmingly **cached**, not re-billed:
+run `rrhb28j7n` shows `cache_read_tokens` is a subset of `input_tokens` —
+turn 0 writes ~20k and turn 1 reads exactly that back — and 86.5% of the
+run's input tokens (3,615,785 / 4,180,827) are cache reads: executor 91.7%,
+planner 83.3%, validator 82.4%, scrutinizer 79.1%, decomposer 68.5%. The
+earlier "62% of spend" figure was 62% of *tokens*, and those tokens bill at
+cache-read rates. Trimming the static prefix therefore has little to win and
+would invalidate the cache; the knob that did it is gone.
+
+The same run also settles what `AssistantUsageData.cost` is *not*: it reports
+the same constant (15.0) on every turn of every session, so it is not a
+per-turn delta and summing it fabricates a figure. `Usage.merged` therefore
+carries it last-wins rather than additively. Its unit is unknown — a constant
+per turn reads far more like a premium-request multiplier or a quota unit than
+a currency amount — so it must not be rendered as currency; `run_usage` and
+`usage_today` report "cost: not reported by the agent backend" until the unit
+is established.
+
+One knob remains:
+
 - `[budgets] max_parallel_tasks` runs independent tasks concurrently. The
   task DAG already knows which tasks are independent; above 1 they share one
   agent sandbox and one workspace, so raising it is safe only for outcomes

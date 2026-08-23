@@ -1552,13 +1552,17 @@ class _RunUsage(NamedTuple):
 # `agent.usage` payloads carry an `agent` key the host adds on the way through
 # (worker/client.py), and Usage forbids extras — so pick the fields out rather
 # than validating the whole dict.
+#
+# `cost` is deliberately absent (#386): the Copilot SDK reports it as a
+# per-turn constant (15.0 on every turn), so lifting it out of the event and
+# folding it through `Usage.merged` made `run_usage` print 147 x 15.0 = 2205.0
+# — a fabricated figure the concierge would repeat in Discord as fact.
 _USAGE_FIELDS = (
     "model",
     "input_tokens",
     "output_tokens",
     "cache_read_tokens",
     "cache_write_tokens",
-    "cost",
 )
 
 
@@ -1612,10 +1616,11 @@ def _cost_line(usage: Usage) -> str:
     """Cost when the backend reports it, and otherwise a plain statement that
     it did not — never a zero the model would go on to repeat as fact.
 
-    The Copilot SDK does report cost per turn, but the field is flagged
-    experimental and older runs predate sbxloop reading it, so "not
-    reported" stays a live answer rather than a dead branch."""
-    if usage.cost is None:
+    Only a strictly positive figure is rendered. A summed, zero or otherwise
+    fabricated cost must never be printed: the concierge repeats this line in
+    Discord as fact, so "not reported" is the honest answer whenever the
+    number is not a real per-record cost (#386)."""
+    if usage.cost is None or usage.cost <= 0:
         return "cost: not reported by the agent backend (tokens above are the whole record)"
     return f"cost: {usage.cost:.4f}"
 

@@ -42,19 +42,26 @@ class Usage(ProtocolModel):
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    # NOT additive. The Copilot SDK's ``AssistantUsageData.cost`` is a per-turn
+    # constant of unknown unit (15.0 on every turn of every session — far more
+    # likely a premium-request/quota multiplier than a currency amount), so
+    # summing it fabricates a number (#386).
     cost: float | None = None
 
     def merged(self, other: Usage) -> Usage:
-        """Accumulate another usage sample into this one (None-safe sums)."""
+        """Accumulate another usage sample into this one (None-safe sums).
+
+        Token counters are summed. ``model`` and ``cost`` are *not*: they are
+        last-wins, because neither is a per-turn delta. See the ``cost`` field
+        comment above.
+        """
 
         def add(a: int | None, b: int | None) -> int | None:
             if a is None and b is None:
                 return None
             return (a or 0) + (b or 0)
 
-        cost: float | None = None
-        if self.cost is not None or other.cost is not None:
-            cost = (self.cost or 0.0) + (other.cost or 0.0)
+        cost = other.cost if other.cost is not None else self.cost
         return Usage(
             model=other.model or self.model,
             input_tokens=add(self.input_tokens, other.input_tokens),
@@ -182,14 +189,6 @@ class JobRequest(ProtocolModel):
     # kind == "agent.session"
     prompt: str | None = None
     system_message: str | None = None
-    # System-message sections the backend should drop for this job. Every
-    # turn of a session re-sends the whole system message, so a section a
-    # phase cannot use is not paid for once — it is paid for on every turn,
-    # and turns are what a run is billed and timed by. Names are the SDK's
-    # section vocabulary; unknown names are ignored by the backend rather
-    # than failing the job, so a host ahead of the sandbox's SDK degrades to
-    # today's behaviour instead of killing the run.
-    drop_system_sections: list[str] = Field(default_factory=list)
     model: str | None = None
     resume_session_id: str | None = None
     permission_mode: PermissionMode = "auto"

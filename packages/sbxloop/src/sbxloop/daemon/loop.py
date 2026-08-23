@@ -142,6 +142,11 @@ Runner = Callable[[WorkItem, Config, str, EventBus, bool], RunResult]
 # these and the PR's review never settled, nothing is coming.
 _TERMINAL_ITEM_STATES = frozenset({"done", "failed", "abandoned", "cancelled"})
 
+# How often one accepted-but-unmerged PR is asked whether it merged yet.
+# Merges are human-paced (hours to days), so a five-minute floor keeps the
+# watch responsive without spending a GitHub read per PR per tick.
+_MERGE_POLL_MIN_S = 300.0
+
 
 class DaemonLoop:
     def __init__(
@@ -521,6 +526,9 @@ class DaemonLoop:
         # clock, and a PR that went green while the daemon was paused should
         # be settled when it resumes, not left waiting.
         self._poll_reviews(now)
+        # Then accepted-but-unmerged ones: the source issue closes when the
+        # PR actually lands, and that can happen while paused too.
+        self._poll_merges(now)
         if self._paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -989,6 +997,12 @@ class DaemonLoop:
                 # the item stays in flight: settling on "a PR exists" is how
                 # #389 was marked done with mdformat and security failing.
                 return "reviewing"
+            if item.kind == "patch" and item.source == "github" and report.delivery is not None:
+                # Not held for review (await_review off, or no github
+                # source at hold time) — still arm the merge watch, or the
+                # issue would never close when this PR lands.
+                number, url = report.delivery
+                self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now, url=url)
             self.dstore.mark_done(item.item_id, now)
             source.report_success(item, report)
             self._frontend_finished(item, report)
@@ -1194,6 +1208,14 @@ class DaemonLoop:
                     "deliver": item.kind != "audit",
                     "deliver_draft": self.config.daemon.deliver_draft,
                     "create_repo": False,
+                    # "Closes #N" in the PR body: GitHub links issue and PR
+                    # and closes the issue on merge even when the daemon is
+                    # not running to do it.
+                    "deliver_closes": (
+                        int(item.source_key)
+                        if item.kind != "audit" and item.source_key.isdigit()
+                        else None
+                    ),
                 }
             )
         update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
@@ -1556,7 +1578,7 @@ class DaemonLoop:
         if github is None or not hasattr(github, "pr_state"):
             return False
         number, url = report.delivery
-        self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now)
+        self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now, url=url)
         self.dstore.mark_reviewing(item.item_id, now)
         self._notify(
             f"⏳ {item.item_id} delivered PR {link(f'#{number}', url)} — "
@@ -1605,6 +1627,8 @@ class DaemonLoop:
         ===============================  ===========================
         state                            action
         ===============================  ===========================
+        merged                           accept and settle the issue
+        closed without merge             mark failed
         checks pending                   wait (free)
         checks red                       fix round
         green, review in flight          wait
@@ -1613,9 +1637,12 @@ class DaemonLoop:
         green, review satisfied          accept
         ===============================  ===========================
 
-        CI first is the point: it is GitHub's compute and costs nothing, so
-        a red PR never spends a review run on work that has to change
-        anyway.
+        The PR's own fate outranks every gate: a human merging it IS the
+        acceptance (waiting for an approval on a merged PR strands the item
+        forever), and a human closing it unmerged is a rejection no review
+        can override. Below that, CI first is the point: it is GitHub's
+        compute and costs nothing, so a red PR never spends a review run on
+        work that has to change anyway.
         """
         state = self.dstore.pr_state(item.item_id)
         if state is None:
@@ -1624,7 +1651,14 @@ class DaemonLoop:
             self._accept(item, now, detail="no delivered PR was recorded")
             return
         pr = state.pr_number
-        checks, review_state = github.pr_state(pr)
+        snap = github.pr_state(pr)
+        if snap.merged:
+            self._accept_merged(item, now, pr, state.pr_url)
+            return
+        if snap.state == "closed":
+            self._reject_closed(item, now, pr, state.pr_url)
+            return
+        checks, review_state = snap.checks, snap.review
         if checks.state == "pending":
             log.debug("review.waiting", item=item.item_id, pr=pr, on="checks")
             return
@@ -1759,6 +1793,116 @@ class DaemonLoop:
             item=item.item_id,
             run=item.run_id,
         )
+
+    def _accept_merged(self, item: WorkItem, now: float, pr: int, url: str) -> None:
+        """A human merged the PR while the item was still in review.
+
+        The merge is the acceptance, and the issue settles right now —
+        through :meth:`report_merged`, not ``report_success``, whose
+        "delivered, awaiting merge" comment would be nonsense on a merged
+        PR. A failed settle leaves the row unsettled; the item is done, so
+        the merge watch retries it.
+        """
+        source: Any = self._source_for(item)
+        self.dstore.mark_done(item.item_id, now)
+        settled = (
+            source is not None
+            and hasattr(source, "report_merged")
+            and bool(source.report_merged(item, pr, url))
+        )
+        if settled:
+            self.dstore.settle_merge(item.item_id, now, merged_at=now)
+        self._notify(
+            f"✅ {item.item_id} accepted — PR #{pr} was merged; issue closed as completed",
+            "item.merged",
+            item=item.item_id,
+            run=item.run_id,
+            pr=pr,
+        )
+
+    def _reject_closed(self, item: WorkItem, now: float, pr: int, url: str) -> None:
+        """The PR was closed without merging while the item was in review:
+        a human rejected it, and no gate below can override that."""
+        source: Any = self._source_for(item)
+        if source is not None and hasattr(source, "report_pr_closed"):
+            source.report_pr_closed(item, pr, url)
+        self.dstore.mark_failed(
+            item.item_id, f"PR #{pr} was closed without being merged", now, requeue=False
+        )
+        # Settle even if the report did not land: the item is failed, so
+        # the merge watch (which only sweeps done items) would never retry
+        # this row anyway, and the log already carries the failure.
+        self.dstore.settle_merge(item.item_id, now, merged_at=None)
+        self._notify(
+            f"⚠ {item.item_id}: PR #{pr} was closed without being merged — marked failed; "
+            "the issue stays open for a human.",
+            "item.pr_rejected",
+            level="warning",
+            item=item.item_id,
+            pr=pr,
+        )
+
+    def _poll_merges(self, now: float) -> None:
+        """Settle accepted items whose PRs have since merged or been closed.
+
+        Acceptance (green CI, satisfied review) is not the end of the
+        story: the source issue closes, wearing the completed label, when
+        the PR actually lands. Same placement rationale as
+        :meth:`_poll_reviews` — GitHub reads, not engine wall clock — and
+        each PR is asked at most once per ``_MERGE_POLL_MIN_S`` because
+        merges are human-paced.
+        """
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "pr_merge_state"):
+            return
+        for item_id, pr, url in self.dstore.merge_watch(now, _MERGE_POLL_MIN_S):
+            item = self.dstore.get(item_id)
+            if item is None or item.source != "github" or item.kind != "patch":
+                # Nothing to settle on GitHub (inbox work, audits): retire
+                # the row without spending a read.
+                self.dstore.settle_merge(item_id, now, merged_at=None)
+                continue
+            try:
+                merged, state = github.pr_merge_state(pr)
+            except Exception:
+                # Best-effort with no round budget: the PR is open and a
+                # human can always act, so a failed read only waits for the
+                # next interval.
+                log.warning("merge.poll_failed", item=item_id, pr=pr, exc_info=True)
+                self.dstore.touch_merge_check(item_id, now)
+                continue
+            if merged:
+                if github.report_merged(item, pr, url):
+                    self.dstore.settle_merge(item_id, now, merged_at=now)
+                    self._notify(
+                        f"🔀 {item_id}: PR #{pr} merged — closed issue "
+                        f"#{item.source_key} and labelled it "
+                        f"`{github.labels.completed}`",
+                        "item.merged",
+                        item=item_id,
+                        pr=pr,
+                    )
+                else:
+                    self.dstore.touch_merge_check(item_id, now)
+                continue
+            if state == "closed":
+                if github.report_pr_closed(item, pr, url):
+                    self.dstore.mark_failed(
+                        item_id, f"PR #{pr} was closed without being merged", now, requeue=False
+                    )
+                    self.dstore.settle_merge(item_id, now, merged_at=None)
+                    self._notify(
+                        f"⚠ {item_id}: PR #{pr} was closed without being merged — "
+                        "marked failed; the issue stays open for a human.",
+                        "item.pr_rejected",
+                        level="warning",
+                        item=item_id,
+                        pr=pr,
+                    )
+                else:
+                    self.dstore.touch_merge_check(item_id, now)
+                continue
+            self.dstore.touch_merge_check(item_id, now)
 
     def _post_review(self, item: WorkItem, run_id: str) -> SubmittedReview | None:
         """Post this run's review to the PR it reviewed, when it is one.
