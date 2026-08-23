@@ -118,7 +118,12 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     -- AND reported to the source, so a restart resumes the watch.
     merged_at  REAL,
     settled    INTEGER NOT NULL DEFAULT 0,
-    last_merge_check REAL NOT NULL DEFAULT 0
+    last_merge_check REAL NOT NULL DEFAULT 0,
+    -- The PR branch's head as of our own last delivery, observed on the
+    -- first poll after it. A later head that differs was pushed by someone
+    -- else: the PR has been taken over, and a fix round force-updating it
+    -- would silently replace their work (#412).
+    delivered_head TEXT
 );
 
 CREATE TABLE IF NOT EXISTS daemon_audits (
@@ -199,6 +204,13 @@ _MIGRATIONS = (
         "last_merge_check",
         "ALTER TABLE daemon_pr_state ADD COLUMN last_merge_check REAL NOT NULL DEFAULT 0",
     ),
+    # The takeover guard (#412): rows from before the column re-baseline on
+    # their next poll, exactly like a fresh delivery.
+    (
+        "daemon_pr_state",
+        "delivered_head",
+        "ALTER TABLE daemon_pr_state ADD COLUMN delivered_head TEXT",
+    ),
 )
 
 
@@ -219,6 +231,9 @@ class PrState(NamedTuple):
     # and reported to the source.
     settled: bool = False
     merged_at: float | None = None
+    # The branch head as of our own last delivery (#412); None until the
+    # first poll after a delivery observes it.
+    delivered_head: str | None = None
 
     @property
     def review_in_flight(self) -> bool:
@@ -860,7 +875,7 @@ class DaemonStore:
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
                 "pr_number = excluded.pr_number, branch = excluded.branch, "
                 "updated_at = excluded.updated_at, pr_url = excluded.pr_url, "
-                "settled = 0, merged_at = NULL",
+                "settled = 0, merged_at = NULL, delivered_head = NULL",
                 (item_id, pr_number, branch, now, url),
             )
             self._conn.commit()
@@ -884,6 +899,7 @@ class DaemonStore:
             pr_url=str(row["pr_url"] or ""),
             settled=bool(row["settled"]),
             merged_at=row["merged_at"],
+            delivered_head=row["delivered_head"],
         )
 
     def merge_watch(self, now: float, min_interval_s: float) -> list[tuple[str, int, str]]:
@@ -921,6 +937,17 @@ class DaemonStore:
             self._conn.execute(
                 "UPDATE daemon_pr_state SET last_merge_check = ? WHERE item_id = ?",
                 (now, item_id),
+            )
+            self._conn.commit()
+
+    def set_delivered_head(self, item_id: str, sha: str) -> None:
+        """Record the PR branch head our own delivery produced, as observed
+        on the first poll after it. A later, different head means someone
+        else pushed — the takeover guard's baseline (#412)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET delivered_head = ? WHERE item_id = ?",
+                (sha, item_id),
             )
             self._conn.commit()
 

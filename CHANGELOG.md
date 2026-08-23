@@ -49,6 +49,36 @@ All notable changes to sbxloop are documented here. The project adheres to
   also stops nesting one brief's boilerplate inside another's: the persisted
   brief rides on the seeded task verbatim.
 
+### Fixed
+
+- **A fix round can no longer force-update a PR branch a human has taken
+  over.** #412. The daemon now baselines the branch head its own delivery
+  produced (observed on the first poll after delivering; a re-delivery
+  re-baselines) and, when a later poll sees a head it did not deliver,
+  hands the item over instead of queueing a fix round: the item is
+  abandoned out loud with the PR left open and theirs, and re-triggering
+  the source issue opts the loop back in. Previously whoever pushed last
+  won.
+
+- **Verify commands may no longer reach for the network.** #440. A
+  decomposer-authored `gh pr view … | grep -q .` failed a review task whose
+  deliverable — a local file — was present and valid, because the sandbox's
+  anonymous GitHub quota was exhausted. The verify-command lint now rejects
+  `gh` outright and `curl`/`wget` against anything but an unambiguously
+  local address (probing a server the command itself started stays legal),
+  with the rule quoted in the retry feedback and stated in the decompose
+  prompt: a verify command judges the workspace, not the network.
+
+- **Review charters are filed once, stay abandoned, and never run against a
+  PR that already merged.** #442. Filing now consults the existing
+  `daemon_reviews` record: a charter that already exists — or existed, in
+  any terminal state — for a delivery is not re-derived under a new issue
+  number, so an operator's abandon is durable and green checks become the
+  whole bar (the "no reviewer" precedent). And a charter whose PR merged or
+  closed while it waited in the queue is settled at dispatch without
+  spending an engine run — the field case burned three items and four runs
+  auditing a PR that had already landed.
+
 ### Added
 
 - **Per-phase usage columns on `phase_attempts`.** Every phase attempt row

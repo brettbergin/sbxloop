@@ -296,6 +296,10 @@ class PrSnapshot(NamedTuple):
     review: str  # APPROVED | CHANGES_REQUESTED | NONE
     merged: bool
     state: str  # open | closed
+    # The branch head this poll saw; "" when it could not be read (and for
+    # merged/closed PRs, whose snapshot skips the read). Feeds the takeover
+    # guard (#412).
+    head_sha: str = ""
 
 
 class GitHubIssueSource:
@@ -870,7 +874,9 @@ class GitHubIssueSource:
             # and the gate must not read that as permission to merge.
             else ChecksVerdict("pending", 0, ("unknown head commit",), ())
         )
-        return PrSnapshot(checks, self._ops().pr_review_state(self.repo, pr_number), merged, state)
+        return PrSnapshot(
+            checks, self._ops().pr_review_state(self.repo, pr_number), merged, state, head_sha=sha
+        )
 
     def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
         """(merged, open/closed state) for a delivered PR.

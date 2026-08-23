@@ -173,6 +173,31 @@ class TestMutationRules:
             )
             assert problems and "must not modify the environment" in problems[0]
 
+
+class TestNetworkRules:
+    """#440: a verify command judges the workspace, not the network — a
+    rate limit or a flake failed a review task whose local deliverable was
+    present and valid."""
+
+    def test_gh_is_always_flagged(self) -> None:
+        problems = lint_verify_commands(["gh pr view 429 --json body | grep -q ."], [])
+        assert problems and "not the network" in problems[0]
+
+    def test_remote_curl_and_wget_are_flagged(self) -> None:
+        for command in ("curl -fsS https://api.github.com/user", "wget https://example.com/x"):
+            problems = lint_verify_commands([command], [])
+            assert problems and "not the network" in problems[0], command
+
+    def test_local_curl_is_clean(self) -> None:
+        """Probing a server the command itself started is a documented
+        pattern; only remote addresses are out of bounds."""
+        clean = [
+            "curl -fsS http://localhost:8000/status",
+            "curl -fsS http://127.0.0.1:9090/healthz",
+        ]
+        for command in clean:
+            assert lint_verify_commands([command], []) == [], command
+
     def test_project_local_installs_stay_legal(self) -> None:
         # npm ci / composer install are the ecosystem-prescribed verify
         # preambles; only system-level mutation is out of bounds.
