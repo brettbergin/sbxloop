@@ -1717,7 +1717,23 @@ class DaemonLoop:
             not state.gates and state.verdict == "REQUEST_CHANGES"
         )
         if asked_for_changes:
-            self._fix_round(item, state, now, why="the review requested changes", failed=())
+            # Quote the standing objections into the brief: the fix agent's
+            # sandbox has no GitHub credential (#437), so what the daemon
+            # fetches here is all the reviewer feedback that round will see.
+            objections = ""
+            if hasattr(github, "pr_review_feedback"):
+                try:
+                    objections = github.pr_review_feedback(pr)
+                except Exception:
+                    log.warning("review.feedback_fetch_failed", item=item.item_id, pr=pr)
+            self._fix_round(
+                item,
+                state,
+                now,
+                why="the review requested changes",
+                failed=(),
+                objections=objections,
+            )
             return
         if not state.reviewed:
             # Green and unreviewed: only now is a review run worth spending.
@@ -1842,6 +1858,7 @@ class DaemonLoop:
         *,
         why: str,
         failed: Sequence[str],
+        objections: str = "",
     ) -> None:
         """Send the item back for one more round against its own PR branch.
 
@@ -1865,7 +1882,9 @@ class DaemonLoop:
                 rounds=budget,
             )
             return
-        self.dstore.queue_fix(item.item_id, fix_brief(state.pr_number, why, failed), now)
+        self.dstore.queue_fix(
+            item.item_id, fix_brief(state.pr_number, why, failed, objections=objections), now
+        )
         self._notify(
             f"🔁 {item.item_id}: PR #{state.pr_number} — {why}; fix round {spent}/{budget}",
             "review.fix_round",

@@ -115,6 +115,33 @@ Envelope: `{v, ts, run_id, job_id?, type, data}` — one JSON object per line.
 - Host: `run.start|state|end`, `task.start|state|end`, `phase.start|end`,
   `sandbox.provision_start|ready|cleanup`, `worker.stdout`
 
+### Tool calls
+
+`agent.tool_start` carries `{tool, tool_call_id, args}`. `agent.tool_end`
+carries `{tool_call_id, tool, args, success, exit_code, output, error, output_lines, duration_ms}` and is correlated to its start by
+`tool_call_id` — parallel calls complete out of order, so consumers must
+pair on the id rather than on command text.
+
+- `output` is a bounded head+tail *excerpt* of the tool's combined output:
+  the first `TOOL_OUTPUT_HEAD_LINES` (20) and last `TOOL_OUTPUT_TAIL_LINES`
+  (20) lines, separated by an explicit `… N lines elided …` marker naming
+  the omitted line count. The `TOOL_OUTPUT_CLIP` (1000) char cap is enforced
+  structurally — each line is middle-elided at `TOOL_OUTPUT_LINE_CLIP` (200)
+  and whole lines are then dropped from around the marker — so the first
+  line, the marker and the last line survive however wide the output is,
+  and an excerpt can never approach Discord's 2000-char message limit. The excerpt (and `error`) are secret-redacted inside the worker
+  (`sbxloop_worker.secrets.redact_secrets`) *before* emission, so no
+  credential-shaped text leaves the sandbox in an event.
+- `output_lines` (int, optional) — total line count of the *untruncated*
+  output, so a reader can see how much was elided.
+- `duration_ms` (int, optional) — wall time from the matching
+  `agent.tool_start`, measured in the worker.
+
+**Compatibility.** `output_lines` and `duration_ms` are purely additive; no
+existing field was removed or renamed. Older workers simply omit them and
+host consumers (`run_events`, chronology, checkpoint/resume) treat them as
+absent, so mixed worker/host versions interoperate in both directions.
+
 ### Resource telemetry
 
 `sandbox.resources` is emitted once at job start and then on every heartbeat:

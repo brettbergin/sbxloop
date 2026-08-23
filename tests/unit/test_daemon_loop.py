@@ -1884,6 +1884,7 @@ class ReviewingSource(FakeSource):
         self.pr_open = True
         self.merged_ok = True  # what report_merged answers
         self.head_sha = ""  # the branch head each poll observes
+        self.feedback = ""  # what pr_review_feedback answers
         self.polls = 0
         self.merge_polls = 0
         self.reviews: list[int] = []
@@ -1906,6 +1907,10 @@ class ReviewingSource(FakeSource):
     def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
         self.merge_polls += 1
         return self.merged, "open" if self.pr_open else "closed"
+
+    def pr_review_feedback(self, pr_number: int) -> str:
+        self.calls.append(("review_feedback", pr_number))
+        return self.feedback
 
     def report_merged(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
         self.calls.append(("merged", pr_number))
@@ -2060,6 +2065,19 @@ class TestAcceptanceGate:
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
         assert "requested changes" in h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+
+    def test_a_review_fix_round_quotes_the_objections(self, tmp_path: Path) -> None:
+        """The fix agent's sandbox has no GitHub credential (#437): whatever
+        the daemon quotes into the brief is all the reviewer feedback the
+        round will ever see."""
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()  # files the review
+        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
+        source.review_state = "CHANGES_REQUESTED"
+        source.feedback = "- `a.py:9`: off by one"
+        h.loop.tick()
+        brief = h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+        assert "- `a.py:9`: off by one" in brief
 
     def test_a_non_gating_approval_still_accepts(self, tmp_path: Path) -> None:
         """A review the repo would only accept as a COMMENT never produces an

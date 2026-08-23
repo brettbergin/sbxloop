@@ -19,6 +19,7 @@ from pathlib import Path
 
 from sbxloop.daemon.review import (
     MAX_INLINE_COMMENTS,
+    REVIEW_INSTRUCTIONS,
     collect_review,
     parse_review,
     review_body,
@@ -35,6 +36,39 @@ def review_json(**over: object) -> str:
     }
     payload.update(over)
     return json.dumps(payload)
+
+
+class TestReviewInstructions:
+    """The review contract's load-bearing phrases.
+
+    The lenses exist because the pipeline's task-completion critics were
+    removed in favour of this one adversarial pass: the defect classes that
+    field-verified as leaking to outside reviewers (races, failure ordering,
+    unguarded parses, broken callers) must be named, not implied.
+    """
+
+    def test_the_adversarial_lenses_are_named(self) -> None:
+        for marker in (
+            "Concurrency and locking",
+            "TOCTOU",
+            "Failure ordering and partial writes",
+            "Input validation at trust boundaries",
+            "Cross-module interaction",
+            "every caller",
+        ):
+            assert marker in REVIEW_INSTRUCTIONS, marker
+
+    def test_a_green_gate_is_not_sufficient(self) -> None:
+        assert "necessary, not sufficient" in REVIEW_INSTRUCTIONS
+
+    def test_the_json_contract_is_intact(self) -> None:
+        for marker in (
+            "`.sbxloop/review.json`",
+            '`"approve"` or `"request_changes"`',
+            "{path, line, body}",
+            "a clean review is a valid result",
+        ):
+            assert marker in REVIEW_INSTRUCTIONS, marker
 
 
 class TestParseReview:

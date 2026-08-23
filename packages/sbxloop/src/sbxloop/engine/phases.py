@@ -37,7 +37,13 @@ from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.verifylint import UV_LOCKFILE, gate_rule, lint_verify_commands, project_gate
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
+from sbxloop_worker.protocol import (
+    BatchCommandResult,
+    JobRequest,
+    JobResult,
+    SessionHealth,
+    Usage,
+)
 
 
 class EvidenceCommand(NamedTuple):
@@ -111,6 +117,14 @@ class VerifyOutcome(NamedTuple):
     results: str
 
 
+class PhaseSpend(NamedTuple):
+    """Model usage accumulated since the last drain — the token bill for the
+    phase attempt the engine is about to record."""
+
+    usage: Usage | None
+    turns: int | None
+
+
 class CriticOutcome(NamedTuple):
     """A critic phase's verdict plus the tooling health of the session that
     produced it, so the engine can persist how blind the critic actually was
@@ -174,9 +188,27 @@ class PhaseRunner:
         # later plan/execute prompt. The engine appends live entries and
         # replays persisted ones on resume.
         self.user_guidance: list[str] = []
+        # Running usage tally across agent jobs, drained by the engine when
+        # it records a phase attempt (drain_spend) so retries and critic
+        # re-runs bill to the phase row they served.
+        self._spend_usage = Usage()
+        self._spend_turns = 0
 
     def add_guidance(self, text: str) -> None:
         self.user_guidance.append(text)
+
+    def drain_spend(self) -> PhaseSpend:
+        """Usage accumulated since the last drain (every agent job, retries
+        included), then reset. A phase that fails before being recorded leaks
+        its spend into the next drained row — accepted: the columns serve
+        aggregate per-phase accounting, not billing."""
+        spend = PhaseSpend(
+            usage=self._spend_usage if self._spend_usage != Usage() else None,
+            turns=self._spend_turns or None,
+        )
+        self._spend_usage = Usage()
+        self._spend_turns = 0
+        return spend
 
     def _guidance(self) -> str:
         return bullet_list(self.user_guidance)
@@ -237,6 +269,10 @@ class PhaseRunner:
         )
         result = self.agent.submit(job, agent=agent_name)
         usage = result.usage
+        if usage is not None:
+            self._spend_usage = self._spend_usage.merged(usage)
+        if result.turns:
+            self._spend_turns += result.turns
         log.info(
             "phase.agent_done",
             run=self.run_id,

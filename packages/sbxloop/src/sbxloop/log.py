@@ -23,7 +23,11 @@ House style
   the per-run engine thread :func:`bind_run` stamps them on every record.
 - Never log a secret: subprocess argv goes through
   :func:`sbxloop.sbx.cli.redacted_argv`; :func:`redact_secrets` masks any
-  keyword whose name says it is a credential.
+  keyword whose name says it is a credential; :func:`redact_text` masks
+  credential *shapes* inside free-form text (a command line, captured
+  stdout/stderr) where there is no key name to go on. The Discord bridge
+  runs every command and output excerpt it renders through
+  :func:`redact_text` before publishing it to a thread.
 
 The daemon configures the pipeline once via :func:`configure_logging`
 (``[daemon] log_level`` / ``--log-level``, ``log_format`` console|json).
@@ -61,9 +65,13 @@ THIRD_PARTY_LOGGERS: tuple[str, ...] = (
     "git",
 )
 
-_SECRET_KEY = re.compile(
-    r"(^|_)(token|secret|password|passwd|authorization|api_key|apikey|pat)($|_)", re.I
-)
+#: Credential-ish key vocabulary, shared by the key-name and text scrubbers.
+#: NOTE: a worker-side twin lives in ``sbxloop_worker.secrets`` (the worker
+#: cannot import sbxloop); when adding a word here, consider whether the twin
+#: needs it too — see "Redaction at the render seam" in docs/architecture.md.
+_SECRET_WORDS = r"token|secret|password|passwd|api[_-]?key|apikey|pat"  # nosec B105 - regex vocabulary of credential key names, not a credential
+
+_SECRET_KEY = re.compile(rf"(^|_)(authorization|{_SECRET_WORDS})($|_)", re.I)
 _HANDLER_MARK = "_sbxloop_log_handler"
 
 #: How many rendered log lines the in-process ring buffer keeps.
@@ -183,6 +191,76 @@ def redact_secrets(
         if value not in (None, "") and _SECRET_KEY.search(key):
             event_dict[key] = REDACTED
     return event_dict
+
+
+# Provider token shapes that are secrets wherever they appear, with no key
+# name to go on: GitHub's ``ghp_``/``gho_``/``ghu_``/``ghs_``/``ghr_`` and
+# the fine-grained ``github_pat_`` prefix.
+_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+)
+
+_AUTH_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)((?:bearer|token|basic)\s+)?([^\s'\"]+)")
+# The credential word must be a whole delimiter-separated segment of the
+# name (`GITHUB_TOKEN`, `--api-key`, `my.secret`), not a substring of an
+# ordinary word — otherwise `PATH=`, `--patch`, `compat=1` and `patch: 3`
+# all get masked and the rendered command becomes unreadable.
+_FLAG_RE = re.compile(
+    rf"(?i)(--?(?:[A-Za-z0-9]+-)*(?:{_SECRET_WORDS})(?:-[A-Za-z0-9]+)*)([=\s]+)"
+    r"(['\"]?)([^\s'\"]+)"
+)
+_ASSIGN_RE = re.compile(
+    rf"(?i)(?<![\w.-])((?:[A-Za-z0-9]+[_.-])*(?:{_SECRET_WORDS})(?:[_.-][A-Za-z0-9]+)*)"
+    r"(\s*[:=]\s*)(['\"]?)([^\s'\"]+)"
+)
+
+
+def _mask_value(match: re.Match[str]) -> str:
+    """Keep everything but the credential itself; leave already-masked
+    values (anything starting with ``*``) alone so redaction is idempotent."""
+    prefix, sep, quote, value = match.group(1), match.group(2), match.group(3), match.group(4)
+    if value.startswith("*"):
+        return match.group(0)
+    return f"{prefix}{sep}{quote}{REDACTED}{quote}"
+
+
+def _mask_auth(match: re.Match[str]) -> str:
+    head, scheme, value = match.group(1), match.group(2) or "", match.group(3)
+    if value.startswith("*"):
+        return match.group(0)
+    return f"{head}{scheme}{REDACTED}"
+
+
+def redact_text(text: str) -> str:
+    """Mask credential *shapes* inside free-form text.
+
+    Where :func:`redact_secrets` masks by key *name* in an event dict, this
+    works on text that has no keys: a command line, captured stdout/stderr,
+    an excerpt about to be published to a Discord thread. It covers GitHub
+    token prefixes (``ghp_``…, ``github_pat_``), ``Authorization: Bearer
+    <token>`` headers, ``NAME=value`` / ``NAME: value`` assignments whose
+    name reads as a credential, and ``--token=…`` style CLI flags,
+    replacing the credential with :data:`REDACTED`.
+
+    Guarantees: ordinary text comes back unchanged, the function is
+    idempotent (already-masked text is left alone) and it never raises —
+    on unexpected input it returns the input coerced to ``str``."""
+    try:
+        out = str(text)
+    except Exception:  # pragma: no cover - str() on a hostile __str__
+        return ""
+    if not out:
+        return out
+    try:
+        for pattern in _TOKEN_PATTERNS:
+            out = pattern.sub(REDACTED, out)
+        out = _AUTH_RE.sub(_mask_auth, out)
+        out = _FLAG_RE.sub(_mask_value, out)
+        out = _ASSIGN_RE.sub(_mask_value, out)
+    except Exception:  # pragma: no cover - defensive: never break a render
+        return str(text)
+    return out
 
 
 def drop_none_fields(
@@ -328,4 +406,5 @@ __all__ = [
     "get_logger",
     "log_buffer",
     "redact_secrets",
+    "redact_text",
 ]

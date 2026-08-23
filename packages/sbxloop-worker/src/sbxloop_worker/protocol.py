@@ -301,6 +301,9 @@ class JobResult(ProtocolModel):
     output_json: dict[str, Any] | list[Any] | None = None
     session_id: str | None = None
     usage: Usage | None = None
+    # Model turns taken by an agent session (the count of per-turn usage
+    # samples; None for non-agent jobs / backends that do not report it).
+    turns: int | None = None
     # Tooling health of an agent session (None when nothing degraded, or for
     # non-agent jobs / backends that do not report it).
     health: SessionHealth | None = None
