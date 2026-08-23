@@ -198,6 +198,7 @@ def make(
     inbox: bool = True,
     config: dict[str, Any] | None = None,
     versions: Any = None,
+    on_watch: Callable[[str, str], str | None] | None = None,
 ) -> tuple[Concierge, FakeClient, FakeHost, LoopWithRuns, DaemonStore]:
     raw: dict[str, Any] = {
         "state_dir": str(tmp_path / "state"),
@@ -226,6 +227,7 @@ def make(
         bus=EventBus(),
         clock=lambda: 1_000_000.0,
         versions=versions if versions is not None else FakeVersions(),
+        on_watch=on_watch,
     )
     return concierge, client, host, loop, dstore
 
@@ -252,6 +254,7 @@ class TestJobShape:
             "sbx_control",
             "list_runs",
             "run_detail",
+            "watch_run",
             "run_events",
             "item_detail",
             "enqueue_work",
@@ -290,7 +293,7 @@ class TestJobShape:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
         turn(concierge)
         names = [t.name for t in client.jobs[0].host_tools]
-        assert "github_get" in names
+        assert "github_get" in names and "pr_status" in names
         assert "create_issue" in names and "label_issue_for_run" in names
         assert "list_issues" in names
         assert "comment_on_issue" in names and "close_issue" in names
@@ -308,7 +311,13 @@ class TestJobShape:
             tmp_path / "b", [{}], github=FakeGithub(), config={"concierge": {"github_tools": False}}
         )
         turn(concierge2)
-        assert "github_get" not in [t.name for t in client2.jobs[0].host_tools]
+        names2 = [t.name for t in client2.jobs[0].host_tools]
+        assert "github_get" not in names2 and "pr_status" not in names2
+        # no ops facade at all (and so no repo) → neither read tool is offered
+        concierge4, client4, *_ = make(tmp_path / "d", [{}], github=None)
+        turn(concierge4)
+        names4 = [t.name for t in client4.jobs[0].host_tools]
+        assert "github_get" not in names4 and "pr_status" not in names4
 
     def test_reply_is_clipped(self, tmp_path: Path) -> None:
         concierge, *_ = make(
@@ -636,6 +645,103 @@ class TestTools:
         assert file.text.startswith("src/a.py@main:")
         assert bad.text == "pr needs number"
         assert github.paths[0] == "/repos/owner/repo/pulls/7"
+
+    def test_pr_status_reports_checks_reviews_and_mergeability(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            {
+                "/pulls/41/reviews": [
+                    {"user": {"login": "ana"}, "state": "APPROVED"},
+                    {"user": {"login": "bo"}, "state": "CHANGES_REQUESTED"},
+                ],
+                "/check-runs": {
+                    "check_runs": [
+                        {"name": "lint", "status": "completed", "conclusion": "success"},
+                        {"name": "types", "status": "completed", "conclusion": "success"},
+                        {"name": "docs", "status": "completed", "conclusion": "success"},
+                        {
+                            "name": "test (3.13)",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "html_url": "https://gh/run/9",
+                        },
+                    ]
+                },
+                "/pulls/41": {
+                    "number": 41,
+                    "title": "Add pr_status",
+                    "state": "open",
+                    "html_url": "https://gh/pr/41",
+                    "mergeable": True,
+                    "mergeable_state": "behind",
+                    "head": {"ref": "feat", "sha": "deadbeef"},
+                    "base": {"ref": "main"},
+                },
+            }
+        )
+        concierge, client, *_ = make(
+            tmp_path, [{"calls": [("pr_status", {"number": 41})]}], github=github
+        )
+        turn(concierge)
+        (status,) = client.responses
+        assert "#41 Add pr_status [open]" in status.text
+        assert "3 passed, 1 failed" in status.text
+        assert "test (3.13): failure" in status.text and "https://gh/run/9" in status.text
+        assert "APPROVED by ana" in status.text and "CHANGES_REQUESTED by bo" in status.text
+        assert "mergeable" in status.text and "behind main" in status.text
+        assert len(status.text) <= 2000
+        # exactly the three documented GETs, and nothing else
+        assert github.paths == [
+            "/repos/owner/repo/pulls/41",
+            "/repos/owner/repo/commits/deadbeef/check-runs",
+            "/repos/owner/repo/pulls/41/reviews?per_page=100",
+        ]
+        # read-only: every call is a GET and none of them merges
+        assert all(method == "GET" for method, _, _ in github.calls)
+        assert not any("merge" in path for _, path, _ in github.calls)
+
+    def test_pr_status_handles_no_reviews_and_a_missing_pr(self, tmp_path: Path) -> None:
+        green = FakeGithub(
+            {
+                "/pulls/8": {
+                    "number": 8,
+                    "title": "Green",
+                    "state": "open",
+                    "mergeable": True,
+                    "mergeable_state": "clean",
+                    "head": {"ref": "f", "sha": "abc"},
+                    "base": {"ref": "main"},
+                },
+                "/check-runs": {
+                    "check_runs": [{"name": "lint", "status": "completed", "conclusion": "success"}]
+                },
+                "/pulls/8/reviews": [],
+            }
+        )
+        concierge, client, *_ = make(
+            tmp_path, [{"calls": [("pr_status", {"number": 8})]}], github=green
+        )
+        turn(concierge)
+        (ok,) = client.responses
+        assert "1 check: 1 passed" in ok.text
+        assert "reviews: no reviews" in ok.text
+        assert "up to date with main" in ok.text
+        assert green.paths == [
+            "/repos/owner/repo/pulls/8",
+            "/repos/owner/repo/commits/abc/check-runs",
+            "/repos/owner/repo/pulls/8/reviews?per_page=100",
+        ]
+
+        gone = FakeGithub(fail={"GET /repos/owner/repo/pulls/999": github_error("ref_missing_404")})
+        concierge2, client2, *_ = make(
+            tmp_path / "b", [{"calls": [("pr_status", {"number": 999})]}], github=gone
+        )
+        turn(concierge2)
+        (miss,) = client2.responses
+        assert miss.text == "PR #999 does not exist in owner/repo"
+        assert "Traceback" not in miss.text
+        # the failed PR read stops there: no checks/reviews follow-up, no writes
+        assert gone.paths == ["/repos/owner/repo/pulls/999"]
+        assert all(method == "GET" for method, _, _ in gone.calls)
 
     def test_list_issues_defaults_to_the_backlog_and_flags_queued_ones(
         self, tmp_path: Path
@@ -1364,3 +1470,200 @@ class TestDaemonLogTool:
         assert "daemon_log" in specs
         properties = specs["daemon_log"].parameters["properties"]
         assert {"tail", "level", "grep"} <= set(properties)
+
+
+class TestWatchRun:
+    """``watch_run``: register interest, or answer at once if already done."""
+
+    def _watcher(self) -> tuple[list[tuple[str, str]], Callable[[str, str], str | None]]:
+        seen: list[tuple[str, str]] = []
+
+        def on_watch(run_id: str, requester: str) -> str | None:
+            seen.append((run_id, requester))
+            return None
+
+        return seen, on_watch
+
+    def test_tool_is_registered(self, tmp_path: Path) -> None:
+        concierge, _, _, _, _ = make(tmp_path, [])
+        assert "watch_run" in concierge.tool_names
+
+    def test_registers_unfinished_run(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "r7abcdefg"})]}],
+            on_watch=on_watch,
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r7abcdefg", "Ship it")
+        store.set_run_state("r7abcdefg", "running")
+        turn(concierge, author="alice")
+        text = client.responses[0].text
+        assert seen == [("r7abcdefg", "alice (via concierge)")]
+        assert "r7abcdefg" in text
+        assert "restart" in text
+
+    def test_finished_run_answers_immediately(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "r8abcdefg"})]}],
+            on_watch=on_watch,
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r8abcdefg", "widget shipped")
+        store.set_run_state("r8abcdefg", "completed")
+        loop.reports["r8abcdefg"] = RunReport(
+            "r8abcdefg",
+            "completed",
+            "2/2 tasks done",
+            delivery=(9, "https://github.com/owner/repo/pull/9"),
+        )
+        turn(concierge, author="alice")
+        text = client.responses[0].text
+        assert seen == []
+        assert "completed" in text
+        assert "widget shipped" in text
+        assert "https://github.com/owner/repo/pull/9" in text
+
+    def test_resolves_work_item_to_newest_run(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "inbox:w.md"})]}],
+            on_watch=on_watch,
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        for run_id in ("r1abcdefg", "r2abcdefg"):
+            store.create_run(run_id, "Ship it")
+        store.set_run_state("r1abcdefg", "failed")
+        store.set_run_state("r2abcdefg", "running")
+        item = WorkItem(item_id="inbox:w.md", source="inbox", source_key="w.md", title="Widget")
+        dstore.upsert_new(item, 1.0)
+        dstore.mark_running("inbox:w.md", "r1abcdefg", 2.0)
+        dstore.mark_running("inbox:w.md", "r2abcdefg", 3.0)
+        turn(concierge, author="alice")
+        assert seen == [("r2abcdefg", "alice (via concierge)")]
+        assert "r2abcdefg" in client.responses[0].text
+
+    def test_unknown_id(self, tmp_path: Path) -> None:
+        seen, on_watch = self._watcher()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "nope"})]}],
+            on_watch=on_watch,
+        )
+        turn(concierge)
+        assert "no run or work item" in client.responses[0].text
+        assert seen == []
+
+    def test_without_callback_says_unavailable(self, tmp_path: Path) -> None:
+        concierge, client, _, _, _ = make(
+            tmp_path, [{"calls": [("watch_run", {"run_id_or_item_id": "r9abcdefg"})]}]
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r9abcdefg", "Ship it")
+        store.set_run_state("r9abcdefg", "running")
+        turn(concierge)
+        assert "not available on this transport" in client.responses[0].text
+
+    def test_concierge_module_has_no_discord_import(self) -> None:
+        import re
+
+        from sbxloop.daemon import concierge as module
+
+        source = Path(str(module.__file__)).read_text(encoding="utf-8")
+        assert re.search(r"^\s*(import|from)\s+discord", source, re.M) is None
+
+
+class TestPrStatusFormatters:
+    """The pure renderers behind ``pr_status``: counts, reviewers, mergeability."""
+
+    def test_check_runs_counts_and_names_failures(self) -> None:
+        from sbxloop.daemon.concierge import _check_runs_summary
+
+        text = _check_runs_summary(
+            {
+                "total_count": 4,
+                "check_runs": [
+                    {"name": "lint", "conclusion": "success"},
+                    {"name": "build", "conclusion": "success"},
+                    {
+                        "name": "test (3.13)",
+                        "conclusion": "failure",
+                        "html_url": "https://gh/run/1",
+                    },
+                    {"name": "docs", "conclusion": None, "status": "in_progress"},
+                ],
+            }
+        )
+        assert "2 passed" in text
+        assert "1 failed" in text
+        assert "1 in_progress" in text
+        assert "test (3.13)" in text
+        assert "https://gh/run/1" in text
+        assert "lint" not in text
+
+    def test_check_runs_accepts_bare_list_and_truncates(self) -> None:
+        from sbxloop.daemon.concierge import _check_runs_summary
+
+        runs = [{"name": f"job{i}", "conclusion": "failure"} for i in range(12)]
+        text = _check_runs_summary(runs, limit=3)
+        assert "12 checks" in text
+        assert "… (9 more)" in text
+        assert text.count("\n") == 4
+
+    @pytest.mark.parametrize("payload", [None, "nope", [], {}, ["a", "b"], {"check_runs": 5}])
+    def test_check_runs_tolerates_junk(self, payload: Any) -> None:
+        from sbxloop.daemon.concierge import _check_runs_summary
+
+        assert _check_runs_summary(payload) == "(no checks)"
+
+    def test_reviews_keeps_latest_state_per_reviewer(self) -> None:
+        from sbxloop.daemon.concierge import _reviews_summary
+
+        text = _reviews_summary(
+            [
+                {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED"},
+                {"user": {"login": "bob"}, "state": "CHANGES_REQUESTED"},
+                {"user": {"login": "alice"}, "state": "APPROVED"},
+                {"user": {"login": "alice"}, "state": "COMMENTED"},
+                "junk",
+                {"state": None},
+            ]
+        )
+        assert text == "APPROVED by alice, CHANGES_REQUESTED by bob"
+
+    @pytest.mark.parametrize("payload", [None, [], "x", {"a": 1}, [{"user": None}]])
+    def test_reviews_without_reviews(self, payload: Any) -> None:
+        from sbxloop.daemon.concierge import _reviews_summary
+
+        assert _reviews_summary(payload) == "no reviews"
+
+    def test_reviews_truncate(self) -> None:
+        from sbxloop.daemon.concierge import _reviews_summary
+
+        data = [{"user": {"login": f"u{i}"}, "state": "APPROVED"} for i in range(5)]
+        assert "… (3 more)" in _reviews_summary(data, limit=2)
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"mergeable": True, "mergeable_state": "clean"}, "mergeable (clean)"),
+            ({"mergeable": False, "mergeable_state": "dirty"}, "not mergeable (dirty)"),
+            ({"mergeable": None}, "mergeable state unknown (GitHub still computing)"),
+            (None, "mergeable state unavailable"),
+            ("pr", "mergeable state unavailable"),
+        ],
+    )
+    def test_mergeable_summary(self, payload: Any, expected: str) -> None:
+        from sbxloop.daemon.concierge import _mergeable_summary
+
+        assert _mergeable_summary(payload) == expected
+
+    def test_mergeable_summary_flags_behind(self) -> None:
+        from sbxloop.daemon.concierge import _mergeable_summary
+
+        text = _mergeable_summary({"mergeable": True, "mergeable_state": "behind"})
+        assert "behind base" in text

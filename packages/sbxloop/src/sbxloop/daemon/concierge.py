@@ -88,12 +88,21 @@ STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
 
 _RUN_STATES = ["pending", "running", "completed", "failed", "cancelled"]
+#: Run states that mean the run is over — nothing more will happen to it, so a
+#: watch on one of these is answered immediately instead of registered.
+_FINISHED_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 #: Levels ``daemon_log`` accepts, coarsest last — the filter is at-or-above.
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 # GitHub's ``state_reason`` for a close. ``completed`` means the thing was
 # actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
 # stale. Nothing else is accepted, so the model cannot invent a reason.
 CLOSE_REASONS = ("completed", "not_planned")
+#: Appended to a tool call's ``by`` for GitHub-facing attribution (see
+#: ``_tool_handler``). A transport's ``on_watch`` callback receives this same
+#: tagged string as its ``requester`` and must strip it back off before
+#: looking a requester up by the untagged form it was remembered under —
+#: see ``DiscordBridge.on_watch``.
+VIA_CONCIERGE_SUFFIX = " (via concierge)"
 
 
 class ConciergeReply(NamedTuple):
@@ -135,6 +144,7 @@ class Concierge:
         bus: EventBus,
         clock: Callable[[], float] = time.time,
         versions: VersionProbe | None = None,
+        on_watch: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self.config = config
         self.loop = loop
@@ -150,6 +160,9 @@ class Concierge:
         # check warms the PyPI memo for the first "are we up to date?".
         # Injected whole in tests, so no unit test reaches PyPI or runs `sbx`.
         self.versions = versions if versions is not None else VersionProbe()
+        # Transport seam: the bridge hands in a callback that records who wants
+        # a ping when a run finishes. None means this transport cannot notify.
+        self._on_watch = on_watch
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sbxloop-concierge")
         self._pending = 0
         self._state_lock = threading.Lock()
@@ -391,7 +404,7 @@ class Concierge:
             return HostToolResponse(
                 call_id=call.call_id, ok=False, error=f"unknown tool {call.name!r}"
             )
-        by = f"{author} (via concierge)"
+        by = f"{author}{VIA_CONCIERGE_SUFFIX}"
         started = time.monotonic()
         try:
             with self._tool_lock:
@@ -464,6 +477,22 @@ class Concierge:
                     parameters=_schema({"run_id": {"type": "string"}}, ["run_id"]),
                 ),
                 self._tool_run_detail,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="watch_run",
+                    description=(
+                        "Register interest in a run (or a work item, by its id) so the person "
+                        "who asked is @mentioned in the control channel with the outcome when "
+                        "it finishes. If the run has already finished, answers with the "
+                        "outcome immediately instead of registering. Watches are kept in "
+                        "memory only — a daemon restart forgets them."
+                    ),
+                    parameters=_schema(
+                        {"run_id_or_item_id": {"type": "string"}}, ["run_id_or_item_id"]
+                    ),
+                ),
+                self._tool_watch_run,
             ),
             HostTool(
                 HostToolSpec(
@@ -611,6 +640,25 @@ class Concierge:
                         ),
                     ),
                     self._tool_github_get,
+                )
+            )
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="pr_status",
+                        description=(
+                            "Report how a pull request in "
+                            f"{self.config.github.repo} is doing: CI check runs "
+                            "(with the failing ones' URLs), review state and reviewers, "
+                            "mergeability, and whether the branch is behind its base. "
+                            "Read-only: it never merges, closes or writes anything."
+                        ),
+                        parameters=_schema(
+                            {"number": {"type": "integer", "minimum": 1}},
+                            ["number"],
+                        ),
+                    ),
+                    self._tool_pr_status,
                 )
             )
         if (
@@ -821,6 +869,61 @@ class Concierge:
                 "not in the control channel"
             )
         return "\n".join(lines)
+
+    def _tool_watch_run(self, args: dict[str, Any], by: str) -> str:
+        ident = str(args.get("run_id_or_item_id", "")).strip()
+        if not ident:
+            return "run_id_or_item_id is required"
+        run = None
+        try:
+            run = self.store.get_run(ident)
+        except SbxloopError:
+            run = None
+        if run is None:
+            item = self.dstore.get(ident)
+            if item is None:
+                return f"no run or work item {ident!r} in this daemon's state store"
+            runs = self.dstore.runs_for_item(ident)
+            if not runs:
+                return (
+                    f"work item {ident} has no runs yet — it has not started, "
+                    "so there is nothing to watch"
+                )
+            try:
+                run = self.store.get_run(runs[-1])
+            except SbxloopError:
+                return f"no run {runs[-1]!r} in this daemon's state store"
+        run_id = run.run_id
+        if run.state in _FINISHED_RUN_STATES:
+            report = self.loop.report_for(run_id)
+            lines = [
+                f"run {run_id} already finished: state={run.state}",
+                f"outcome: {_one_line(run.outcome, 400)}",
+                f"tasks: {report.task_summary}",
+            ]
+            if report.tracking_issue:
+                lines.append(
+                    f"tracking issue: #{report.tracking_issue[0]} {report.tracking_issue[1]}"
+                )
+            if report.delivery:
+                lines.append(f"delivered PR: #{report.delivery[0]} {report.delivery[1]}")
+            if report.delivery_error:
+                lines.append(f"delivery error: {_one_line(report.delivery_error, 300)}")
+            if report.filed:
+                lines.append(f"filed backlog: {', '.join(report.filed)}")
+            return "\n".join(lines)
+        if self._on_watch is None:
+            return (
+                "watching is not available on this transport — no notifier is wired, "
+                f"so I cannot ping you when {run_id} finishes"
+            )
+        note = self._on_watch(run_id, by)
+        confirm = (
+            f"watching {run_id} (state {run.state}) — I'll ping {by} in the control "
+            "channel with the outcome when it finishes. Note: watches live in memory, "
+            "so a daemon restart forgets them."
+        )
+        return f"{confirm}\n{note}" if note else confirm
 
     def _tool_run_events(self, args: dict[str, Any], by: str) -> str:
         run_id = str(args.get("run_id", "")).strip()
@@ -1056,6 +1159,66 @@ class Concierge:
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"GitHub read failed: {_one_line(str(exc), 300)}"
         return f"unknown what {what!r}"
+
+    def _tool_pr_status(self, args: dict[str, Any], by: str) -> str:
+        assert self.github is not None
+        repo = self.config.github.repo
+        number = args.get("number")
+        if not number:
+            return "pr_status needs number"
+        try:
+            n = int(number)
+        except (TypeError, ValueError):
+            return f"number must be an integer, got {number!r}"
+
+        missing = f"PR #{n} does not exist in {repo}"
+        try:
+            pr = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}"))
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            text = str(exc).lower()
+            if "404" in text or "not found" in text:
+                return missing
+            return f"reading PR #{n} failed: {_one_line(str(exc), 300)}"
+        if not isinstance(pr, dict) or not pr.get("number"):
+            return missing
+
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        sha = str(head.get("sha") or "")
+        try:
+            checks: Any = {}
+            if sha:
+                checks = self.github.call(
+                    lambda ops: ops.raw("GET", f"/repos/{repo}/commits/{sha}/check-runs")
+                )
+            reviews = self.github.call(
+                lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}/reviews?per_page=100")
+            )
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"reading PR #{n} failed: {_one_line(str(exc), 300)}"
+
+        title = _one_line(str(pr.get("title") or ""), 120)
+        flags = str(pr.get("state") or "?")
+        if pr.get("draft"):
+            flags = f"{flags}, draft"
+        base_ref = _one_line(str(base.get("ref") or "?"), 60)
+        head_ref = _one_line(str(head.get("ref") or "?"), 60)
+        state = pr.get("mergeable_state")
+        if not state:
+            behind = f"behind-ness unknown (vs {base_ref})"
+        elif str(state).lower() == "behind":
+            behind = f"behind {base_ref}"
+        else:
+            behind = f"up to date with {base_ref}"
+
+        lines = [
+            _one_line(f"#{n} {title} [{flags}] {pr.get('html_url') or ''}".strip(), 300),
+            _one_line(f"{head_ref} → {base_ref}", 200),
+            _check_runs_summary(checks, limit=5),
+            f"reviews: {_reviews_summary(reviews)}",
+            _one_line(f"{_mergeable_summary(pr)} · {behind}", 300),
+        ]
+        return "\n".join(lines)[:2000]
 
     def _tool_create_issue(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
@@ -1548,6 +1711,106 @@ def _pr_files(files: Any, *, with_patch: bool) -> str:
                 patch = patch[:1500] + "\n… (patch truncated)"
             lines.append(patch)
     return "\n".join(lines) or "(no files)"
+
+
+def _check_runs_summary(data: Any, *, limit: int = 10) -> str:
+    """The ``check-runs`` payload as counts plus the runs worth clicking.
+
+    Accepts either the raw ``{"check_runs": [...]}`` dict or a bare list,
+    and ignores anything in it that is not a dict.
+    """
+    runs = data.get("check_runs") if isinstance(data, dict) else data
+    if not isinstance(runs, list):
+        return "(no checks)"
+    entries = [r for r in runs if isinstance(r, dict)]
+    if not entries:
+        return "(no checks)"
+
+    counts: dict[str, int] = {}
+    interesting: list[str] = []
+    for run in entries:
+        conclusion = run.get("conclusion")
+        if conclusion:
+            state = str(conclusion).lower()
+        else:
+            state = str(run.get("status") or "pending").lower()
+        counts[state] = counts.get(state, 0) + 1
+        if state == "success":
+            continue
+        name = _one_line(str(run.get("name") or "(unnamed)"), 120)
+        url = run.get("html_url")
+        line = f"- {name}: {state}"
+        if url:
+            line = f"{line} — {_one_line(str(url), 200)}"
+        interesting.append(_one_line(line, 200))
+
+    order = [
+        "success",
+        "failure",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "neutral",
+        "skipped",
+    ]
+    ranked = sorted(counts, key=lambda s: (order.index(s) if s in order else len(order), s))
+    words = {"success": "passed", "failure": "failed"}
+    head = ", ".join(f"{counts[state]} {words.get(state, state)}" for state in ranked)
+    total = len(entries)
+    lines = [f"{total} check{'s' if total != 1 else ''}: {head}"]
+    lines.extend(interesting[:limit])
+    if len(interesting) > limit:
+        lines.append(f"… ({len(interesting) - limit} more)")
+    return "\n".join(lines)
+
+
+def _reviews_summary(data: Any, *, limit: int = 10) -> str:
+    """Latest review state per reviewer, e.g. ``APPROVED by alice``."""
+    if not isinstance(data, list):
+        return "no reviews"
+    latest: dict[str, str] = {}
+    for review in data:
+        if not isinstance(review, dict):
+            continue
+        user = review.get("user")
+        login = str((user or {}).get("login") or "?") if isinstance(user, dict) else "?"
+        state = str(review.get("state") or "").upper()
+        if not state:
+            continue
+        if state in ("COMMENTED", "PENDING") and latest.get(login) in (
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "DISMISSED",
+        ):
+            continue
+        latest[login] = state
+    if not latest:
+        return "no reviews"
+    shown = list(latest.items())[:limit]
+    text = ", ".join(f"{state} by {login}" for login, state in shown)
+    if len(latest) > limit:
+        text = f"{text}, … ({len(latest) - limit} more)"
+    return _one_line(text, 300)
+
+
+def _mergeable_summary(data: Any) -> str:
+    """``mergeable``/``mergeable_state`` as a short phrase."""
+    if not isinstance(data, dict):
+        return "mergeable state unavailable"
+    mergeable = data.get("mergeable")
+    if mergeable is True:
+        text = "mergeable"
+    elif mergeable is False:
+        text = "not mergeable"
+    else:
+        text = "mergeable state unknown (GitHub still computing)"
+    state = data.get("mergeable_state")
+    if state:
+        state = _one_line(str(state), 60)
+        text = f"{text} ({state})"
+        if state.lower() == "behind":
+            text = f"{text} — branch is behind base"
+    return text
 
 
 def _issue_summary(data: Any) -> str:
