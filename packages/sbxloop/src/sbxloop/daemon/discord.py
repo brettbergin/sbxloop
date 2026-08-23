@@ -49,6 +49,7 @@ from sbxloop.daemon.discord_format import (
     DISCORD_MAX_MESSAGE,
     Chunk,
     EmbedSpec,
+    RunStats,
     StatusLine,
     SteerProgress,
     ToolBatcher,
@@ -65,6 +66,8 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     split_markdown,
     status_embed,
+    summary_embed,
+    summary_text,
 )
 from sbxloop.daemon.discord_routing import route_message
 from sbxloop.daemon.model import RunReport, WorkItem
@@ -239,6 +242,8 @@ class DiscordBridge:
         self._steer_last_edit: dict[str, float] = {}
         # Facts that enrich the headline card as the run reveals them.
         self._facts: dict[str, dict[str, Any]] = {}
+        # Counters behind the end-of-run summary card, the thread's last post.
+        self._runstats: dict[str, RunStats] = {}
         # item_id -> run_id for the last run of an item (notice -> thread pointer).
         self._item_runs: dict[str, str] = {}
 
@@ -790,6 +795,7 @@ class DiscordBridge:
                 buffer_run = run_id
                 chunks = self._render(run_id, event)
                 self._observe_facts(run_id, event)
+                self._runstats.setdefault(run_id, RunStats()).observe(event)
                 if event.type == "agent.tool_start":
                     buffer = await self._digest_tick(run_id, buffer)
                 elif event.type == "agent.tool_end":
@@ -1043,6 +1049,15 @@ class DiscordBridge:
                 text,
                 embed=finish_embed(item, report, state, len(unanswered), repo=repo),
             )
+            # The thread's LAST post: the summary card — the run's numbers,
+            # what went well, what needed work — so a human opening the
+            # thread later reads the outcome bottom-up without scrolling.
+            stats = self._runstats.get(run_id)
+            await self._send(
+                thread,
+                summary_text(stats, state),
+                embed=summary_embed(stats, report, state, len(unanswered)),
+            )
         facts = self._facts.setdefault(run_id, {})
         if report.tracking_issue:
             facts["tracking"] = report.tracking_issue
@@ -1060,6 +1075,7 @@ class DiscordBridge:
         self._status_msg.pop(run_id, None)
         self._status_last_edit.pop(run_id, None)
         self._facts.pop(run_id, None)
+        self._runstats.pop(run_id, None)
         self._items.pop(run_id, None)
         self._progress.pop(run_id, None)
         self._steer_last_edit.pop(run_id, None)

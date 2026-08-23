@@ -374,6 +374,46 @@ class TestBridge:
         finally:
             bridge.close()
 
+    def test_run_summary_is_the_threads_last_post(self, tmp_path: Path) -> None:
+        """The very last post in a run thread is the end-of-run summary card:
+        the run's numbers, what went well, what needed work."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit("agent.usage", "r1", input_tokens=1200, output_tokens=80, cost=0.05)
+            bus.emit(
+                "phase.verdict",
+                "r1",
+                task_id="t1",
+                phase="verify",
+                verdict="revise",
+                message="verify: revise",
+                issues=[{"severity": "major", "detail": "lint fails"}],
+            )
+            bus.emit("task.state", "r1", task_id="t1", state="done", revisions=1)
+            bridge.run_finished(
+                item,
+                RunReport("r1", "completed", "1/1 tasks done", delivery=(3, "https://x/pull/3")),
+            )
+            assert wait_for(lambda: any(s.startswith("📊 **run summary**") for s in thread.sent))
+            # After the finish card, nothing else lands in the thread.
+            assert thread.sent[-1].startswith("📊 **run summary**")
+            assert "1 turn(s)" in thread.sent[-1] and "$0.05" in thread.sent[-1]
+            summary_kwargs = thread.sent_kwargs[-1]
+            card = summary_kwargs["embed"]
+            names = [f.name for f in card.fields]
+            assert names == ["Stats", "Went well", "Needed work"]
+            values = {f.name: f.value for f in card.fields}
+            assert "delivered PR [#3](https://x/pull/3)" in values["Went well"]
+            assert "`t1` verify: **revise** — lint fails" in values["Needed work"]
+        finally:
+            bridge.close()
+
     def test_bus_subscriber_never_blocks(self, tmp_path: Path) -> None:
         bridge, _client, _ = make_bridge(tmp_path)
         # do NOT start the bridge: nothing drains the queue; emits must still return instantly
