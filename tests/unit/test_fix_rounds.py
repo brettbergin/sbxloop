@@ -37,6 +37,17 @@ class TestFixBrief:
     def test_no_failing_checks_means_no_checks_section(self) -> None:
         assert "Failing checks" not in fix_brief(7, "the review requested changes")
 
+    def test_it_never_claims_gh_works(self) -> None:
+        """The fix agent's sandbox has no GitHub credential (#437); a brief
+        telling it to run `gh pr view` hands it a tool that cannot work."""
+        assert "gh pr view" not in fix_brief(7, "the review requested changes")
+        assert "gh pr view" not in fix_brief(7, "checks failed", ("lint",), objections="fix line 9")
+
+    def test_objections_are_quoted_verbatim(self) -> None:
+        brief = fix_brief(7, "the review requested changes", objections="- `a.py:9`: off by one")
+        assert "- `a.py:9`: off by one" in brief
+        assert "Address each one" in brief
+
 
 class TestFixTasks:
     def test_a_round_is_exactly_one_task(self) -> None:
@@ -49,9 +60,12 @@ class TestFixTasks:
         criteria = " ".join(tasks[0].acceptance_criteria)
         assert "lint" in criteria and "mdformat" in criteria
 
-    def test_the_brief_rides_on_the_task(self) -> None:
-        tasks = fix_tasks(7, "the review requested changes")
-        assert "#7" in tasks[0].description
+    def test_the_brief_rides_on_the_task_verbatim(self) -> None:
+        """The dispatch site passes the persisted brief; re-wrapping it in
+        fix_brief again nested one brief's boilerplate inside another's."""
+        brief = fix_brief(7, "the review requested changes")
+        tasks = fix_tasks(7, brief)
+        assert tasks[0].description == brief
 
 
 class TestSeededRunSkipsDecompose:

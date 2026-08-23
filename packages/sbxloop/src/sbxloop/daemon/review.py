@@ -57,6 +57,31 @@ REVIEW_INSTRUCTIONS = (
     "target, an npm script, tox, nox), otherwise its tests and linters. A PR "
     "that does not pass what CI enforces is not approvable, whatever the code "
     "looks like.\n\n"
+    "A green gate is necessary, not sufficient: the defects that reach a PR "
+    "are precisely the ones its tests do not encode. Hunt for them through "
+    "these lenses, reading the diff adversarially rather than sympathetically:\n"
+    "- **Concurrency and locking.** Shared state the diff touches without the "
+    "lock the rest of the module holds; check-then-act gaps (TOCTOU) where "
+    "another thread, process, or poll can move the state between the check "
+    "and the action; blocking calls on threads that must not block (event "
+    "loops, heartbeat threads).\n"
+    "- **Failure ordering and partial writes.** For every multi-step "
+    "operation: what state survives if it dies between steps? Is cleanup "
+    "ordered so a failure cannot strand the very state the code claims to "
+    "prevent? Does an error path raise before or after the side effect it "
+    "should undo?\n"
+    "- **Input validation at trust boundaries.** Data parsed from files, "
+    "events, other processes, or model output: what happens on malformed, "
+    "empty, oversized, NaN, or stale input? A parse that can raise inside a "
+    "loop that must not die is a finding.\n"
+    "- **Cross-module interaction.** Walk every caller of each changed "
+    "function — including callers the diff did not edit — and check the "
+    "invariants documented where the diff did not reach. A change that is "
+    "locally correct and breaks a caller's assumption is the classic leaked "
+    "defect.\n\n"
+    "A concrete, line-anchored `request_changes` is worth more than a polite "
+    "approve. Approve only when you looked for these failure modes and did "
+    "not find them — say so in the summary.\n\n"
     'The file is JSON: `verdict` is `"approve"` or `"request_changes"`; '
     "`summary` is markdown prose for the review body; `comments` is a list of "
     "`{path, line, body}` anchored to lines the PR actually changed. Anchor "
@@ -76,12 +101,17 @@ REVIEW_INSTRUCTIONS = (
 FIX_TASK_TITLE = "Make the pull request acceptable"
 
 
-def fix_brief(pr_number: int, why: str, failed: Sequence[str] = ()) -> str:
+def fix_brief(pr_number: int, why: str, failed: Sequence[str] = (), objections: str = "") -> str:
     """What one fix round is for, concretely.
 
     Named failures rather than "make the PR acceptable": the round is one
     task whose acceptance criteria are exactly these, and a vague brief is
     what turns a small fix back into a full investigation.
+
+    ``objections`` is the review feedback standing on the PR, fetched by the
+    daemon through the github-ops sandbox and baked in verbatim — the fix
+    agent's own sandbox has no GitHub credential (#437), so telling it to
+    read the PR itself hands it a tool that cannot work.
     """
     parts = [
         f"Pull request #{pr_number} is not yet acceptable: {why}.",
@@ -95,22 +125,38 @@ def fix_brief(pr_number: int, why: str, failed: Sequence[str] = ()) -> str:
             + ", ".join(failed)
             + ". Run the project's own gate here and make it pass before you finish."
         )
-    parts.append(
-        "Any unresolved review comments on the PR say what a reviewer "
-        "objected to; read them (`gh pr view --comments`) and address each one."
-    )
+    if objections:
+        parts.append(
+            "The review comments standing on the PR, quoted here because "
+            "`gh` is not authenticated in this sandbox:\n\n"
+            + objections
+            + "\n\nAddress each one — with a change, or with a reasoned "
+            "explanation in your final summary."
+        )
+    else:
+        parts.append(
+            "Unresolved review comments on the PR say what a reviewer "
+            "objected to. They could not be quoted here and `gh` is not "
+            "authenticated in this sandbox, so work from the problems named "
+            "above and the project's own gate."
+        )
     return "\n\n".join(parts)
 
 
-def fix_tasks(pr_number: int, why: str, failed: Sequence[str] = ()) -> list[TaskSpec]:
-    """The seeded task graph for a fix round — deliberately one task."""
+def fix_tasks(pr_number: int, brief: str, failed: Sequence[str] = ()) -> list[TaskSpec]:
+    """The seeded task graph for a fix round — deliberately one task.
+
+    ``brief`` is an already-built :func:`fix_brief` and rides on the task
+    verbatim; re-wrapping it here nested one brief's boilerplate inside
+    another's.
+    """
     criteria = [f"PR #{pr_number}'s checks pass", "the review's objections are addressed"]
     criteria += [f"the `{name}` check passes" for name in failed]
     return [
         TaskSpec(
             id="fix",
             title=FIX_TASK_TITLE,
-            description=fix_brief(pr_number, why, failed),
+            description=brief,
             acceptance_criteria=criteria,
         )
     ]
