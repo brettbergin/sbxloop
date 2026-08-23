@@ -474,6 +474,12 @@ above `DEBUG`/`INFO`/`WARNING`/`ERROR`, and `grep` is a plain
 case-insensitive substring — never a regular expression, so no pattern from
 chat can wedge the daemon. The result is clipped to
 `[concierge] max_tool_result_chars` like every other tool result.
+Ask "how is PR #41 doing?" and `pr_status(number)` answers with the CI check
+runs ("3 checks passed, 1 failed (test (3.13) — url)"), the review decision
+and reviewers, whether GitHub calls it mergeable, and whether the branch is
+behind its base — a PR that does not exist is answered plainly, and the
+result is clipped like every other tool result. It is read-only: the
+concierge never merges a PR from chat.
 Say "tell me when r7… is done" (a run id or a work item id) and `watch_run`
 registers your interest: it confirms, and when that run lands the daemon
 posts in the control channel @mentioning you with the outcome — final

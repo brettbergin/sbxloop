@@ -124,6 +124,14 @@ Guidance:
 - To explain what a run did or why it failed: `run_detail`, then
   `run_events` (filter by `agent.message`, `task.`, `run.`) and, when a PR
   or issue exists, `github_get`.
+- "How is PR #41 doing?" / "did CI pass?" / "has anyone reviewed it?" →
+  `pr_status(number)`. It reports the check runs, naming the failing ones
+  with their URL, the review decision and who reviewed, whether GitHub
+  calls the PR mergeable, and whether the branch is behind its base. It is
+  strictly read-only — **it never merges, closes or writes anything**, and
+  merging is not something you can do from chat: say so and let a human do
+  it. A PR that does not exist is answered plainly, and the result is
+  clipped like every other tool result.
 - "What did that run cost?" / "how much have we spent today?" →
   `run_usage` for one run, `usage_today` for the current calendar day in
   `run_cap_timezone` — the same day the run cap counts — next to that cap. Report the tokens you are given and nothing more: the

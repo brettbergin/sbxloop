@@ -6,6 +6,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`pr_status(number)`, a concierge host tool for how a delivered PR is
+  doing.** #333. "How is PR #41 doing?" now gets an answer without a
+  browser: the CI check runs summarised as counts with each failing check
+  named and linked, the review decision and who reviewed, whether GitHub
+  calls the PR mergeable, and whether the branch is behind its base. It is
+  served through the github-ops box with `GithubOps.raw`
+  (`GET /repos/{repo}/pulls/{n}`, `/commits/{sha}/check-runs`,
+  `/pulls/{n}/reviews`), the output is clipped like every other tool
+  result, and a PR that does not exist is answered plainly. **Read-only:
+  there is no merge or write path — the concierge cannot merge from chat.**
+
 ### Changed
 
 - **The acceptance loop now runs its gates cheapest-first, and a fix round is
