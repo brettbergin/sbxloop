@@ -495,9 +495,12 @@ class TestTools:
         assert resp.ok
         assert "3 turns/2 jobs" in resp.text
         assert "300 cached" in resp.text
-        # Cost is reported by the backend now, so it must be shown, not denied.
-        assert "cost: 0.7500" in resp.text
-        assert "cost: not reported" not in resp.text
+        # Cost stays unread (#386): the backend's per-turn `cost` is a
+        # constant, so accumulating it across turns fabricates a total
+        # (3 x 0.25 = 0.75 here, 147 x 15.0 = 2205.0 in the field). The
+        # honest answer is that it was not reported.
+        assert "cost: not reported" in resp.text
+        assert "0.7500" not in resp.text
 
     def test_a_run_without_usage_events_says_not_recorded(self, tmp_path: Path) -> None:
         """Acceptance: runs predating usage reporting answer "not recorded",
