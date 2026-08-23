@@ -1944,7 +1944,7 @@ class TestAcceptanceGate:
     def test_green_and_reviewed_and_approved_is_accepted(self, tmp_path: Path) -> None:
         h, source = self._delivered(tmp_path)
         h.loop.tick()  # files the review
-        h.dstore.review_settled("gh:1", gates=True)
+        h.dstore.review_settled("gh:1", gates=True, verdict="APPROVE")
         source.review_state = "APPROVED"
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
@@ -1966,18 +1966,19 @@ class TestAcceptanceGate:
     def test_changes_requested_queues_a_fix_round(self, tmp_path: Path) -> None:
         h, source = self._delivered(tmp_path)
         h.loop.tick()  # files the review
-        h.dstore.review_settled("gh:1", gates=True)
+        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
         source.review_state = "CHANGES_REQUESTED"
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
         assert "requested changes" in h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
 
-    def test_a_review_that_cannot_gate_does_not_wait_for_an_approval(self, tmp_path: Path) -> None:
+    def test_a_non_gating_approval_still_accepts(self, tmp_path: Path) -> None:
         """A review the repo would only accept as a COMMENT never produces an
-        approval; waiting for one would strand every item."""
+        approval on GitHub; waiting for one would strand every item. Our own
+        record of what it asked for is the answer."""
         h, source = self._delivered(tmp_path)
         h.loop.tick()
-        h.dstore.review_settled("gh:1", gates=False)
+        h.dstore.review_settled("gh:1", gates=False, verdict="APPROVE")
         source.review_state = "NONE"
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
@@ -1985,7 +1986,7 @@ class TestAcceptanceGate:
     def test_a_gating_review_does_wait_for_its_approval(self, tmp_path: Path) -> None:
         h, source = self._delivered(tmp_path)
         h.loop.tick()
-        h.dstore.review_settled("gh:1", gates=True)
+        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
         source.review_state = "NONE"
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
@@ -2013,6 +2014,47 @@ class TestAcceptanceGate:
         h.dstore._conn.commit()
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+
+    def test_a_non_gating_request_for_changes_is_still_honoured(self, tmp_path: Path) -> None:
+        """PR #406: the review explained at length that the feature did not
+        work outside its own tests, but it could only be posted as a COMMENT
+        — so GitHub recorded no verdict, and the gate read "cannot block" as
+        "satisfied" and would have accepted the PR anyway. What the review
+        *asked for* is the only answer there is when GitHub holds none."""
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()
+        h.dstore.review_settled("gh:1", gates=False, verdict="REQUEST_CHANGES")
+        source.review_state = "NONE"  # a COMMENT leaves no verdict on GitHub
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert "requested changes" in h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+
+    def test_the_waiting_item_is_settled_not_the_review_charter(self, tmp_path: Path) -> None:
+        """The review runs as its own work item, so the charter's id is not
+        the id of the item waiting on the PR. Settling against the wrong one
+        updated no row and left the waiter marked "review in flight" for
+        ever — gh:335 sat parked on PR #406 with its review already posted."""
+        h, _ = self._delivered(tmp_path)
+        h.loop.tick()
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and state.review_in_flight
+        assert h.dstore.awaiting_review(state.review_ref or "") == "gh:1"
+        assert h.dstore.awaiting_review("gh:not-a-review") is None
+
+    def test_a_review_run_that_never_settles_does_not_park_the_item(self, tmp_path: Path) -> None:
+        """An in-flight flag nothing will ever clear is a silent park, which
+        is the one outcome this loop must not produce."""
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()
+        ref = h.dstore.pr_state("gh:1").review_ref or "gh:x"  # type: ignore[union-attr]
+        h.dstore.upsert_new(
+            WorkItem(item_id=ref, source="github", source_key="x", title="review"), h.clock.t
+        )
+        h.dstore.mark_failed(ref, "review run died", h.clock.t, requeue=False)
+        h.loop.tick()  # notices and clears the stale marker
+        assert not h.dstore.pr_state("gh:1").review_in_flight  # type: ignore[union-attr]
+        h.loop.tick()  # the gate resumes: a fresh review is filed
+        assert len(source.reviews) == 2
 
     def test_the_gate_can_be_turned_off(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
