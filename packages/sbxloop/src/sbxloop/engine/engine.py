@@ -338,6 +338,7 @@ class LoopEngine:
                     base=github_cfg.deliver_base,
                     draft=github_cfg.deliver_draft,
                     exclude=self.config.artifacts.exclude,
+                    closes=github_cfg.deliver_closes,
                 )
             except SbxloopError as exc:
                 self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
@@ -863,6 +864,7 @@ class LoopEngine:
                 # new one: same branch in, same branch out.
                 branch=self.config.sandbox.continue_branch,
                 exclude=self.config.artifacts.exclude,
+                closes=gh.deliver_closes,
             )
         except SbxloopError as exc:
             # Catches the whole family the delivery path can raise — not just
