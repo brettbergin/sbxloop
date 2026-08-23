@@ -51,6 +51,11 @@ _CLAIM_RE = re.compile(re.escape(CLAIM_MARKER) + r"([0-9a-f]{32}) -->")
 # many pages is not one the daemon should be arbitrating by comment anyway.
 _MAX_PAGES = 10
 
+# How much fetched review feedback one fix brief may carry. Enough for a
+# review body plus a couple dozen inline comments; a brief is a prompt, not
+# an archive.
+_REVIEW_FEEDBACK_CLIP = 6_000
+
 
 class WorkSource(Protocol):
     name: str
@@ -291,6 +296,10 @@ class PrSnapshot(NamedTuple):
     review: str  # APPROVED | CHANGES_REQUESTED | NONE
     merged: bool
     state: str  # open | closed
+    # The branch head this poll saw; "" when it could not be read (and for
+    # merged/closed PRs, whose snapshot skips the read). Feeds the takeover
+    # guard (#412).
+    head_sha: str = ""
 
 
 class GitHubIssueSource:
@@ -865,7 +874,9 @@ class GitHubIssueSource:
             # and the gate must not read that as permission to merge.
             else ChecksVerdict("pending", 0, ("unknown head commit",), ())
         )
-        return PrSnapshot(checks, self._ops().pr_review_state(self.repo, pr_number), merged, state)
+        return PrSnapshot(
+            checks, self._ops().pr_review_state(self.repo, pr_number), merged, state, head_sha=sha
+        )
 
     def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
         """(merged, open/closed state) for a delivered PR.
@@ -876,6 +887,39 @@ class GitHubIssueSource:
         """
         pr = self._ops().pr_get(self.repo, pr_number)
         return bool(pr.get("merged")), str(pr.get("state") or "")
+
+    def pr_review_feedback(self, pr_number: int) -> str:
+        """The objections standing on a PR, as text a fix round can act on.
+
+        The fix agent's sandbox holds no GitHub credential (#437), so the
+        daemon reads the change-requesting review bodies and the inline
+        review comments through the github-ops sandbox and bakes them into
+        the fix brief. Latest verdict per reviewer only, matching how
+        ``fold_reviews`` judges the PR; inline comments are quoted with
+        their anchors so the fix agent can find the lines.
+        """
+        ops = self._ops()
+        latest: dict[str, dict[str, object]] = {}
+        for review in ops.raw("GET", f"/repos/{self.repo}/pulls/{pr_number}/reviews") or []:
+            login = str(((review.get("user") or {}).get("login")) or "")
+            if str(review.get("state") or "") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                latest[login] = review
+        parts: list[str] = []
+        for review in latest.values():
+            if str(review.get("state")) != "CHANGES_REQUESTED":
+                continue
+            body = str(review.get("body") or "").strip()
+            if body:
+                parts.append(body)
+        for comment in ops.raw("GET", f"/repos/{self.repo}/pulls/{pr_number}/comments") or []:
+            body = str(comment.get("body") or "").strip()
+            if not body:
+                continue
+            path = str(comment.get("path") or "")
+            line = comment.get("line") or comment.get("original_line")
+            anchor = f"`{path}:{line}`: " if path and line else f"`{path}`: " if path else ""
+            parts.append(f"- {anchor}{body}")
+        return "\n\n".join(parts)[:_REVIEW_FEEDBACK_CLIP]
 
     def post_review(
         self, run: RunRecord, pr_number: int, origin_run_id: str
@@ -900,12 +944,13 @@ class GitHubIssueSource:
         body = (
             f"# Review: PR #{pr_number} (delivered by run `{run_id}` for {item.item_id})\n\n"
             f"PR: {pr_url}\nSource issue: {item.url or item.source_key}\n\n"
-            "Charter: review this PR as a skeptical maintainer. Read the source issue and the "
-            "full diff (`gh pr diff` / `gh pr view` are available; the workspace is a fresh "
-            "clone — check out the PR's branch to run its tests). Look for: defects and "
-            "wrong behaviour, missing edge cases and tests, scope drift from the issue, "
-            "unjustified claims in the PR body, style that contradicts the repository's "
-            "conventions, and anything a reviewer would block on.\n\n"
+            "Charter: review this PR as a skeptical maintainer. The source issue's text is "
+            "quoted in this charter, and the workspace is a fresh clone — check out the PR's "
+            "branch, and read the full diff with git, not `gh` (`gh` is not authenticated in "
+            "this sandbox): `git fetch origin <base>` then `git diff origin/<base>...HEAD`. "
+            "Look for: defects and wrong behaviour, missing edge cases and tests, scope "
+            "drift from the issue, unjustified claims in the PR body, style that contradicts "
+            "the repository's conventions, and anything a reviewer would block on.\n\n"
             f"{REVIEW_INSTRUCTIONS}\n\n"
             f"<!-- sbxloop-review {run_id} -->"
         )

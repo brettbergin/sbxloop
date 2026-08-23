@@ -22,6 +22,26 @@ from tests.conftest import FakeSbx
 
 runner = CliRunner()
 
+# A verbatim-shaped bash tool call from a real run thread: the informative
+# verb sits behind a long, per-run `cd` prefix (#403).
+RUN_PATH = "/home/bergs/.local/state/sbxloop/sbxloop-work/runs/rfxm7ad23/workspace"
+RUN_CMD = (
+    f"cd {RUN_PATH} && git diff --stat -- README.md docs/architecture.md CHANGELOG.md | head -120"
+)
+
+
+def assert_no_silent_truncation(rendered: str) -> None:
+    """Every token of the original command survives whole unless it carries
+    an explicit `…` marker — truncation must never split mid-token."""
+    whole = set(RUN_CMD.split()) | {"$RUN"}
+    command = rendered.split(" $ ", 1)[-1].splitlines()[0]
+    for token in command.split():
+        if "…" in token:
+            continue
+        assert token in whole or not any(
+            token != cand and cand.startswith(token) for cand in whole
+        ), f"token {token!r} looks like a silently truncated fragment"
+
 
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -1940,6 +1960,15 @@ class TestDashboard:
         assert "bash" in line
         assert "pip install -e ." in line
 
+    def test_format_event_tool_command_is_readable(self) -> None:
+        from sbxloop.cli.tui import format_event
+
+        line = format_event(Event.now("agent.tool_start", "r1", tool="bash", args=RUN_CMD))
+        assert "cd $RUN &&" in line
+        assert "git diff" in line
+        assert RUN_PATH not in line
+        assert_no_silent_truncation(line)
+
     def test_format_event_tool_end_failure_includes_error(self) -> None:
         from sbxloop.cli.tui import format_event
 
@@ -1990,6 +2019,63 @@ class TestToolTranscript:
         text = self.render_text(Event.now("agent.tool_start", "r1", tool="bash", args=long_cmd))
         assert text is not None
         assert "…" in text
+
+    def wide_text(self, event: Event) -> str:
+        """Render without terminal wrapping, so tokens split by line folding
+        are not mistaken for truncation."""
+        from rich.console import Console
+
+        from sbxloop.cli.tui import render_event
+
+        rendered = render_event(event)
+        assert rendered is not None
+        console = Console(record=True, width=300)
+        console.print(rendered)
+        return console.export_text()
+
+    def test_tool_start_collapses_run_prefix_and_keeps_verb(self) -> None:
+        text = self.wide_text(Event.now("agent.tool_start", "r1", tool="bash", args=RUN_CMD))
+        assert text is not None
+        assert "cd $RUN &&" in text
+        assert "git diff" in text
+        assert RUN_PATH not in text
+        assert_no_silent_truncation(text)
+
+    def test_tool_end_failure_collapses_run_prefix_and_keeps_verb(self) -> None:
+        text = self.wide_text(
+            Event.now(
+                "agent.tool_end",
+                "r1",
+                tool="bash",
+                args=RUN_CMD,
+                success=False,
+                exit_code=2,
+                error="fatal: bad revision",
+            )
+        )
+        assert text is not None
+        assert "cd $RUN &&" in text
+        assert "git diff" in text
+        assert RUN_PATH not in text
+        assert_no_silent_truncation(text)
+
+    def test_rendering_leaves_stored_args_untouched(self) -> None:
+        from sbxloop.cli.tui import format_event, render_event
+        from sbxloop.events import summarize_event
+
+        event = Event.now("agent.tool_start", "r1", tool="bash", args=RUN_CMD)
+        summarize_event(event)
+        format_event(event)
+        render_event(event)
+        assert event.data["args"] == RUN_CMD
+
+    def test_summarize_event_still_clips_non_tool_args(self) -> None:
+        from sbxloop.events import summarize_event
+
+        event = Event.now("worker.exec", "r1", args="cd " + RUN_PATH + " && " + "y" * 300)
+        summary = summarize_event(event)
+        assert summary["args"].startswith("cd " + RUN_PATH[:20])
+        assert len(summary["args"]) <= 120
 
     def test_tool_end_success_is_quiet_check(self) -> None:
         text = self.render_text(

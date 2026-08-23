@@ -96,3 +96,48 @@ class TestSubscriber:
         summary = summarize_event(event)["summary"]
         assert len(summary) == 160
         assert "\n" not in summary
+
+
+OLD_TOOL_END = {
+    "tool": "bash",
+    "args": "cd /home/x/.local/state/sbxloop/sbxloop-work/runs/rfxm7ad23/workspace && uv run mypy",
+    "success": False,
+    "exit_code": 1,
+    "error": "error: bad type",
+}
+NEW_TOOL_END = {**OLD_TOOL_END, "tool_call_id": "c1", "output_lines": 120, "duration_ms": 1500}
+
+
+class TestToolEventSchemaCompatibility:
+    """`output_lines`/`duration_ms`/`tool_call_id` are additive: a stored
+    stream from an older worker still summarises, renders and replays, and a
+    stream with them renders the richer form (#403 t7)."""
+
+    @pytest.mark.parametrize("data", [OLD_TOOL_END, NEW_TOOL_END], ids=["old", "new"])
+    def test_summary_and_render_tolerate_both_shapes(self, data: dict[str, object]) -> None:
+        event = Event.now(EventTypes.AGENT_TOOL_END, "r1", job_id="j1", **data)
+        fields = summarize_event(event)
+        # The run path collapses; the verb survives; the log line renders.
+        assert fields["args"] == "cd $RUN && uv run mypy"
+        assert fields["summary"] == "bash"
+        line = format_event(event)
+        assert "agent.tool_end" in line and "cd $RUN && uv run mypy" in line
+
+    def test_stored_payload_keeps_the_full_command(self) -> None:
+        event = Event.now(EventTypes.AGENT_TOOL_END, "r1", **NEW_TOOL_END)
+        # Rendering is display-only: the event's own data is untouched.
+        assert event.data["args"] == NEW_TOOL_END["args"]
+        assert event.data["output_lines"] == 120
+        assert event.data["duration_ms"] == 1500
+
+    def test_bus_mirrors_both_shapes_without_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        bus = EventBus()
+        bus.subscribe(event_log_subscriber)
+        with caplog.at_level(logging.DEBUG, logger=RUN_LOGGER_NAME):
+            bus.emit(EventTypes.AGENT_TOOL_START, "r1", tool="bash", args="ls")
+            bus.emit(EventTypes.AGENT_TOOL_END, "r1", **OLD_TOOL_END)
+            bus.emit(EventTypes.AGENT_TOOL_START, "r1", tool="bash", args="ls", tool_call_id="c1")
+            bus.emit(EventTypes.AGENT_TOOL_END, "r1", **NEW_TOOL_END)
+        records = [r for r in caplog.records if r.name == RUN_LOGGER_NAME]
+        assert len(records) == 4
+        assert all(r.levelno == logging.DEBUG for r in records)

@@ -75,7 +75,11 @@ $outcome
   `./vendor/bin/phpunit`, never bare `phpunit`. Go/Rust/.NET/Node commands
   are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
   Never `sudo` or `apt` in a verify command: verification checks the work,
-  it does not build the environment.
+  it does not build the environment. Never `gh`, and never `curl`/`wget`
+  against anything but a local address: a verify command judges the
+  workspace, not the network — an API rate limit or a flake must not be
+  able to fail work that is done. Check the local files or run the local
+  tests instead.
   $project_gate
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.

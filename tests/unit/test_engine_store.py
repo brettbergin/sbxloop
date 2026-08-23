@@ -224,6 +224,30 @@ class TestPhasesAndEvents:
         last_seq = all_events[-1][0]
         assert list(store.events("r1", after_seq=last_seq)) == []
 
+    def test_mixed_shape_tool_events_round_trip_verbatim(self, tmp_path: Path) -> None:
+        """The chronology stores tool events verbatim, whether or not they
+        carry the additive `tool_call_id`/`output_lines`/`duration_ms` fields,
+        so a run checkpointed by one worker version replays under another
+        without migration (#403 t7)."""
+        long_cmd = (
+            "cd /home/x/.local/state/sbxloop/sbxloop-work/runs/r1/workspace"
+            " && uv run pytest -q " + "x" * 500
+        )
+        old = {"tool": "bash", "args": long_cmd, "success": True, "exit_code": 0}
+        new = {**old, "tool_call_id": "c1", "output_lines": 120, "duration_ms": 1500}
+        db = tmp_path / "state.db"
+        store = StateStore(db)
+        store.append_event(Event(ts=1.0, run_id="r1", type="agent.tool_end", data=dict(old)))
+        store.append_event(Event(ts=2.0, run_id="r1", type="agent.tool_end", data=dict(new)))
+        replayed = [e.data for _, e in store.events("r1", type_prefix="agent.")]
+        assert replayed == [old, new]
+        # The stored command is the full one; truncation is display-only.
+        assert replayed[0]["args"] == long_cmd
+        # A resume reopens the database: the same events come back unchanged.
+        store.close()
+        reopened = StateStore(db)
+        assert [e.data for _, e in reopened.events("r1")] == [old, new]
+
     def test_last_event_ts(self, store: StateStore) -> None:
         assert store.last_event_ts("r1") is None
         store.append_event(Event(ts=5.0, run_id="r1", type="run.start"))

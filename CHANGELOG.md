@@ -82,6 +82,55 @@ All notable changes to sbxloop are documented here. The project adheres to
   loader forbids unknown keys, so a config still setting that key under
   `[budgets]` is now rejected — delete the key.
 
+### Changed
+
+- **The PR review lane hunts defects adversarially, and its briefs stop
+  pointing at tools that cannot work.** #437. `REVIEW_INSTRUCTIONS` now
+  names the defect lenses that field-verified as leaking past the pipeline
+  to outside reviewers — concurrency/locking (TOCTOU), failure ordering and
+  partial writes, input validation at trust boundaries, and cross-module
+  interaction ("walk every caller") — with an explicit "a green gate is
+  necessary, not sufficient". The review charter sends the reviewer to
+  `git diff origin/<base>...HEAD` instead of claiming `gh pr diff` works
+  (the agent sandbox holds no GitHub credential), and a review-driven fix
+  round now *quotes the standing objections into its brief*: the daemon
+  fetches the change-requesting review bodies and inline comments through
+  the github-ops sandbox (`pr_review_feedback`, latest verdict per reviewer,
+  anchors preserved) rather than telling the fix agent to run
+  `gh pr view --comments` in a sandbox where it cannot. Fix-round dispatch
+  also stops nesting one brief's boilerplate inside another's: the persisted
+  brief rides on the seeded task verbatim.
+
+### Fixed
+
+- **A fix round can no longer force-update a PR branch a human has taken
+  over.** #412. The daemon now baselines the branch head its own delivery
+  produced (observed on the first poll after delivering; a re-delivery
+  re-baselines) and, when a later poll sees a head it did not deliver,
+  hands the item over instead of queueing a fix round: the item is
+  abandoned out loud with the PR left open and theirs, and re-triggering
+  the source issue opts the loop back in. Previously whoever pushed last
+  won.
+
+- **Verify commands may no longer reach for the network.** #440. A
+  decomposer-authored `gh pr view … | grep -q .` failed a review task whose
+  deliverable — a local file — was present and valid, because the sandbox's
+  anonymous GitHub quota was exhausted. The verify-command lint now rejects
+  `gh` outright and `curl`/`wget` against anything but an unambiguously
+  local address (probing a server the command itself started stays legal),
+  with the rule quoted in the retry feedback and stated in the decompose
+  prompt: a verify command judges the workspace, not the network.
+
+- **Review charters are filed once, stay abandoned, and never run against a
+  PR that already merged.** #442. Filing now consults the existing
+  `daemon_reviews` record: a charter that already exists — or existed, in
+  any terminal state — for a delivery is not re-derived under a new issue
+  number, so an operator's abandon is durable and green checks become the
+  whole bar (the "no reviewer" precedent). And a charter whose PR merged or
+  closed while it waited in the queue is settled at dispatch without
+  spending an engine run — the field case burned three items and four runs
+  auditing a PR that had already landed.
+
 ### Added
 
 - **Per-phase usage columns on `phase_attempts`.** Every phase attempt row
@@ -109,6 +158,53 @@ All notable changes to sbxloop are documented here. The project adheres to
   there is no merge or write path — the concierge cannot merge from chat.**
 
 ### Changed
+
+- **Run threads now show what a tool call ran and what it produced.** A bash
+  call used to render as two near-identical lines — `agent.tool_start` and
+  `agent.tool_end` — each showing an ellipsised command whose only surviving
+  text was the long, identical run path, and neither carrying the outcome, so
+  a watcher could see that `ruff` and `mypy` ran for 95 seconds without
+  learning whether they passed. Now:
+
+  - **Commands truncate informatively.** The new `sbxloop.cli.cmdfmt` collapses
+    the boilerplate `cd <absolute run path> &&` prefix to `cd $RUN &&` and, if
+    the line still exceeds `COMMAND_DISPLAY_CLIP` (160 chars, a named default),
+    elides the *longest argument tokens* rather than the middle of the whole
+    string — the leading verb always survives and every shortened token carries
+    a literal `…`, so nothing is ever cut mid-token without a marker. Applied
+    to the Discord chronology, the TUI and `sbxloop logs` alike.
+  - **One thread entry per call.** `ToolBatcher` records a start as pending
+    (emitting nothing) and writes a single line on completion — `$ bash  cd $RUN && uv run mypy  ✓ 1.5s` / `✗ exit 1 · 1.5s`. Pairing is strictly by
+    `tool_call_id`, never by comparing command text, so concurrent calls
+    finishing out of order still carry their own command; an unmatched end
+    renders from its own args. A call still in flight survives routine
+    flushes untouched (its one line lands on completion) and only the
+    run-end flush renders leftovers as `… running`, so no call is ever
+    printed twice.
+  - **Results reach the thread, bounded.** A completed call gets a ✓/✗ header
+    with its exit status and a fenced head+tail excerpt of its output, with
+    elision marked `… N lines elided …` counted from the new `output_lines`.
+    Failures get the larger budget and prefer stderr; successes are quiet by
+    default. Caps are named constants (`TOOL_OUTPUT_LINES_DEFAULT` 0,
+    `TOOL_FAIL_OUTPUT_LINES_DEFAULT` 20, `TOOL_EXCERPT_LINE_CLIP` 300,
+    `TOOL_EXCERPT_MAX_CHARS` 1200), the two line budgets are configurable as
+    `[discord] tool_output_lines` / `tool_fail_output_lines`, and the rendered
+    message is clamped to `DISCORD_MAX_MESSAGE` so nothing can overflow
+    Discord. The worker-side excerpt likewise keeps the first and last 20 lines
+    instead of a blind 1000-char tail, so the *start* of a failure survives.
+  - **Redaction is guaranteed at both ends.** Because this publishes more of
+    what a command printed, the worker redacts output and error text before
+    emission (`sbxloop_worker.secrets.redact_secrets`) and the renderer scrubs
+    every command and excerpt again with the new, idempotent
+    `sbxloop.log.redact_text` before it can reach a thread.
+  - **The protocol change is additive only.** `agent.tool_end` gained optional
+    `output_lines` and `duration_ms` (measured from the matching start);
+    nothing was removed or renamed, older workers simply omit them, and
+    consumers tolerate their absence — so `run_events`, `sbxloop logs`, the log
+    sink and checkpoint/resume all keep working and **existing chronologies
+    need no migration**. Truncation and excerpting are display-only: the stored
+    event keeps the full command and output. See `docs/worker-protocol.md` and
+    `docs/architecture.md`.
 
 - **Cost is no longer summed across turns.** #386. The Copilot SDK's
   `AssistantUsageData.cost` is a per-turn *constant* (15.0 on every turn of

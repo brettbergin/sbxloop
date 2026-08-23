@@ -766,6 +766,8 @@ class DaemonLoop:
     ) -> TickOutcome:
         """Run one item (fresh, or resuming its interrupted run) and settle it."""
         now = self.clock()
+        if resume_run_id is None and self._settle_moot_review(item, source, now):
+            return "done"
         run_id = resume_run_id or new_run_id()
         started = time.monotonic()
         if resume_run_id is None:
@@ -1501,6 +1503,16 @@ class DaemonLoop:
                 # Without a second review the loop could only run one way.
                 return False
             number, url = report.delivery
+            if self.dstore.review_filed(run_id):
+                # A charter for this delivery already exists — or existed:
+                # the operator abandoning it, or the charter run failing,
+                # must not re-derive "this PR needs a review" and file the
+                # same work under a new number, silently undoing the abandon
+                # (#442, field: PR #414 audited three times). Green checks
+                # become the whole bar, the same as a deployment with no
+                # reviewer; re-triggering the charter issue opts back in.
+                log.info("review.already_filed", item=item.item_id, run=run_id, pr=number)
+                return False
             ref = github.file_review(item, number, url, run_id)
             self.dstore.record_review(run_id, number, ref, now)
             self.dstore.review_in_flight(item.item_id, ref)
@@ -1664,6 +1676,18 @@ class DaemonLoop:
         if snap.state == "closed":
             self._reject_closed(item, now, pr, state.pr_url)
             return
+        # The takeover guard (#412). The first poll after a delivery records
+        # the head that delivery produced; a later head that differs was
+        # pushed by someone else, and a fix round would force-update the
+        # branch over their work — whoever pushes last wins. Hand the PR to
+        # its human instead, out loud.
+        if snap.head_sha:
+            if not state.delivered_head:
+                self.dstore.set_delivered_head(item.item_id, snap.head_sha)
+                state = state._replace(delivered_head=snap.head_sha)
+            elif snap.head_sha != state.delivered_head:
+                self._hand_off_taken_over(item, state, now, snap.head_sha)
+                return
         checks, review_state = snap.checks, snap.review
         if checks.state == "pending":
             log.debug("review.waiting", item=item.item_id, pr=pr, on="checks")
@@ -1699,7 +1723,23 @@ class DaemonLoop:
             not state.gates and state.verdict == "REQUEST_CHANGES"
         )
         if asked_for_changes:
-            self._fix_round(item, state, now, why="the review requested changes", failed=())
+            # Quote the standing objections into the brief: the fix agent's
+            # sandbox has no GitHub credential (#437), so what the daemon
+            # fetches here is all the reviewer feedback that round will see.
+            objections = ""
+            if hasattr(github, "pr_review_feedback"):
+                try:
+                    objections = github.pr_review_feedback(pr)
+                except Exception:
+                    log.warning("review.feedback_fetch_failed", item=item.item_id, pr=pr)
+            self._fix_round(
+                item,
+                state,
+                now,
+                why="the review requested changes",
+                failed=(),
+                objections=objections,
+            )
             return
         if not state.reviewed:
             # Green and unreviewed: only now is a review run worth spending.
@@ -1718,6 +1758,82 @@ class DaemonLoop:
             self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, review satisfied")
             return
         log.debug("review.waiting", item=item.item_id, pr=pr, on="approval")
+
+    def _settle_moot_review(self, item: WorkItem, source: WorkSource, now: float) -> bool:
+        """Settle a review charter whose PR has already merged or closed.
+
+        Running it would spend a full engine run reviewing a decision GitHub
+        already made — the field case (#442) burned three items and four
+        runs auditing PR #414 after its merge. Checked at dispatch rather
+        than filing time because the merge can land while the charter waits
+        in the queue. Best-effort: an unreadable PR state dispatches
+        normally rather than stranding the charter.
+        """
+        target = self.dstore.review_target(item.item_id)
+        if target is None:
+            return False
+        pr_number, _ = target
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "pr_merge_state"):
+            return False
+        try:
+            merged, pr_state = github.pr_merge_state(pr_number)
+        except Exception:
+            log.warning("review.moot_check_failed", item=item.item_id, pr=pr_number)
+            return False
+        if not merged and pr_state != "closed":
+            return False
+        fate = "merged" if merged else "closed"
+        self.dstore.mark_done(item.item_id, now)
+        try:
+            source.report_success(
+                item,
+                RunReport(
+                    run_id="-",
+                    state="completed",
+                    task_summary=f"review not run: PR #{pr_number} already {fate}",
+                ),
+            )
+        except Exception:
+            log.warning("review.moot_settle_failed", item=item.item_id, exc_info=True)
+        self._notify(
+            f"⏭ {item.item_id}: PR #{pr_number} already {fate} — its review charter is "
+            "moot and was settled without a run.",
+            "review.moot",
+            item=item.item_id,
+            pr=pr_number,
+            fate=fate,
+        )
+        return True
+
+    def _hand_off_taken_over(
+        self, item: WorkItem, state: PrState, now: float, head_sha: str
+    ) -> None:
+        """Someone else pushed to the PR's branch: stop competing for it.
+
+        A fix round delivers by force-updating the branch (the 422 handling
+        that keeps one PR per item), so continuing would silently replace
+        the human's commits (#412, field: PR #406). The item is handed over
+        with the PR left open; re-triggering the source issue opts back in.
+        """
+        self.dstore.mark_failed(
+            item.item_id,
+            f"PR #{state.pr_number} taken over: branch {state.branch} moved to "
+            f"{head_sha[:12]} (not our delivery)",
+            now,
+            requeue=False,
+        )
+        self._notify(
+            f"✋ {item.item_id}: PR #{state.pr_number} has commits the daemon did not "
+            f"deliver on `{state.branch}` — someone has taken it over. Automatic fix "
+            "rounds stopped; the PR is open and theirs. Re-trigger the source issue "
+            "to opt the loop back in.",
+            "review.taken_over",
+            level="error",
+            item=item.item_id,
+            pr=state.pr_number,
+            head=head_sha,
+        )
 
     def _poll_failed(self, item: WorkItem, now: float) -> None:
         """Charge a failed poll a round, and hand the item over at the cap."""
@@ -1748,6 +1864,7 @@ class DaemonLoop:
         *,
         why: str,
         failed: Sequence[str],
+        objections: str = "",
     ) -> None:
         """Send the item back for one more round against its own PR branch.
 
@@ -1771,7 +1888,9 @@ class DaemonLoop:
                 rounds=budget,
             )
             return
-        self.dstore.queue_fix(item.item_id, fix_brief(state.pr_number, why, failed), now)
+        self.dstore.queue_fix(
+            item.item_id, fix_brief(state.pr_number, why, failed, objections=objections), now
+        )
         self._notify(
             f"🔁 {item.item_id}: PR #{state.pr_number} — {why}; fix round {spent}/{budget}",
             "review.fix_round",

@@ -166,6 +166,7 @@ class RecordingOps:
         self.comments: list[tuple[int, str]] = []
         self.created: list[tuple[str, list[str] | None]] = []
         self.created_in: list[str] = []  # repo each issue_create targeted
+        self.created_bodies: list[str] = []
         self.fail_on: set[str] = set()
         # Comments as GitHub lists them (ascending), events per issue; a
         # claim test scripts a rival's claim comment here.
@@ -180,6 +181,9 @@ class RecordingOps:
         # merged/closed short-circuit must NOT spend.
         self.prs: dict[int, dict[str, Any]] = {}
         self.pr_reads: list[str] = []
+        # Scripted review rows and inline PR comments for pr_review_feedback.
+        self.review_rows: list[dict[str, Any]] = []
+        self.pr_comment_rows: list[dict[str, Any]] = []
 
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:
         self.pr_reads.append("get")
@@ -215,6 +219,10 @@ class RecordingOps:
             raise GithubOpsError(f"{method} {path} -> HTTP 500: boom")
         self.raw_calls.append((method, path, body))
         base, _, query = path.partition("?")
+        if method == "GET" and "/pulls/" in base and base.endswith("/reviews"):
+            return list(self.review_rows)
+        if method == "GET" and "/pulls/" in base and base.endswith("/comments"):
+            return list(self.pr_comment_rows)
         if method == "GET" and base.endswith("/comments"):
             return [] if "page=2" in query else list(self.comment_rows)
         if method == "GET" and base.endswith("/events"):
@@ -246,6 +254,7 @@ class RecordingOps:
     def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> IssueRef:
         self.created.append((title, labels))
         self.created_in.append(repo)
+        self.created_bodies.append(body)
         return IssueRef(number=77, url="https://x/issues/77")
 
 
@@ -328,6 +337,45 @@ class TestGitHubSource:
         src2 = GitHubIssueSource(lambda: ops2, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
         src2.report_success(src2.poll()[0], report())
         assert not any(m == "PATCH" for m, _, _ in ops2.raw_calls)
+
+    def test_the_review_charter_never_claims_gh_works(self) -> None:
+        """The review sandbox holds no GitHub credential (#437): the charter
+        must send the reviewer to git, not to `gh` subcommands that fail."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        src.file_review(src.poll()[0], 9, "https://x/pull/9", "r1")
+        body = ops.created_bodies[-1]
+        assert "Charter" in body
+        assert "gh pr diff" not in body and "gh pr view" not in body
+        assert "git diff origin/" in body
+
+    def test_pr_review_feedback_quotes_bodies_and_anchors(self) -> None:
+        ops = RecordingOps()
+        ops.review_rows = [
+            {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "body": "lock is missing"},
+            {"user": {"login": "bob"}, "state": "APPROVED", "body": "lgtm"},
+        ]
+        ops.pr_comment_rows = [
+            {"path": "a.py", "line": 9, "body": "off by one"},
+            {"path": "", "line": None, "body": ""},  # empty body dropped
+        ]
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        feedback = src.pr_review_feedback(9)
+        assert "lock is missing" in feedback
+        assert "`a.py:9`: off by one" in feedback
+        assert "lgtm" not in feedback  # an approval is not an objection
+
+    def test_pr_review_feedback_honours_latest_verdict_per_reviewer(self) -> None:
+        """A reviewer whose change request was superseded by their own later
+        approval no longer objects — quoting the stale body would send the
+        fix round after feedback that was already withdrawn."""
+        ops = RecordingOps()
+        ops.review_rows = [
+            {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "body": "fix the race"},
+            {"user": {"login": "alice"}, "state": "APPROVED", "body": "fixed, thanks"},
+        ]
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        assert "fix the race" not in src.pr_review_feedback(9)
 
     def test_review_and_tool_filing_shapes(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})

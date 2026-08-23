@@ -374,48 +374,6 @@ class TestBridge:
         finally:
             bridge.close()
 
-    def test_run_summary_is_the_threads_last_post(self, tmp_path: Path) -> None:
-        """The very last post in a run thread is the end-of-run summary card:
-        the run's numbers, what went well, what needed work."""
-        bridge, client, _ = make_bridge(tmp_path)
-        bridge.start()
-        try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
-            bus = EventBus()
-            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
-            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
-            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
-            bus.emit("agent.usage", "r1", input_tokens=1200, output_tokens=80, cost=0.05)
-            bus.emit(
-                "phase.end",
-                "r1",
-                task_id="t1",
-                phase="verify",
-                status="failed",
-                message="verify command failed: `lint` (exit 1)",
-            )
-            bus.emit("task.state", "r1", task_id="t1", state="done", revisions=1)
-            bridge.run_finished(
-                item,
-                RunReport("r1", "completed", "1/1 tasks done", delivery=(3, "https://x/pull/3")),
-            )
-            assert wait_for(lambda: any(s.startswith("📊 **run summary**") for s in thread.sent))
-            # After the finish card, nothing else lands in the thread.
-            assert thread.sent[-1].startswith("📊 **run summary**")
-            assert "1 turn(s)" in thread.sent[-1] and "$0.05" in thread.sent[-1]
-            summary_kwargs = thread.sent_kwargs[-1]
-            card = summary_kwargs["embed"]
-            names = [f.name for f in card.fields]
-            assert names == ["Stats", "Went well", "Needed work"]
-            values = {f.name: f.value for f in card.fields}
-            assert "delivered PR [#3](https://x/pull/3)" in values["Went well"]
-            assert (
-                "`t1` verify: **failed** — verify command failed: `lint` (exit 1)"
-                in values["Needed work"]
-            )
-        finally:
-            bridge.close()
-
     def test_bus_subscriber_never_blocks(self, tmp_path: Path) -> None:
         bridge, _client, _ = make_bridge(tmp_path)
         # do NOT start the bridge: nothing drains the queue; emits must still return instantly
@@ -867,7 +825,7 @@ class TestBridge:
             )
             assert wait_for(lambda: any("✗ `bash` failed (exit 1)" in s for s in thread.sent))
             batch = next(s for s in thread.sent if s.startswith("```text\n$ bash  ls 0"))
-            assert batch.count("$ bash") == 4 and "pytest -q   ✗ exit 1" in batch
+            assert batch.count("$ bash") == 4 and "pytest -q  ✗ exit 1" in batch
             assert batch.endswith("```")
             detail = next(s for s in thread.sent if s.startswith("✗ `bash` failed"))
             assert "```text\nFAILED test_x\n1 failed\n```" in detail
@@ -1377,3 +1335,139 @@ class TestRunWatches:
             assert not any("<@1>" in s for s in control.sent)
         finally:
             bridge.close()
+
+
+class TestToolOutputExcerptWiring:
+    """The configured excerpt caps reach both render paths (t5/#403)."""
+
+    def test_verbose_batcher_path_uses_configured_caps(self, tmp_path: Path) -> None:
+        bridge, _, _ = make_bridge(
+            tmp_path,
+            chronology_level="verbose",
+            tool_output_lines=2,
+            tool_fail_output_lines=6,
+        )
+        detail = "\n".join(f"L{i}" for i in range(50))
+        bridge._render("r1", ev("agent.tool_start", tool="bash", args="ls", tool_call_id="c1"))
+        ok = bridge._render(
+            "r1",
+            ev(
+                "agent.tool_end",
+                tool="bash",
+                tool_call_id="c1",
+                success=True,
+                exit_code=0,
+                output=detail,
+                output_lines=50,
+            ),
+        )
+        excerpt = next(c for c in ok if c.text.startswith("✓"))
+        assert "… 48 lines elided …" in excerpt.text
+        assert len(excerpt.text) <= 2000
+
+        bad = bridge._render(
+            "r1",
+            ev(
+                "agent.tool_end",
+                tool="bash",
+                tool_call_id="c2",
+                success=False,
+                exit_code=2,
+                error="boom: it broke",
+                output=detail,
+                output_lines=50,
+            ),
+        )
+        fail = next(c for c in bad if c.text.startswith("✗"))
+        assert "(exit 2)" in fail.text and "boom: it broke" in fail.text
+
+    def test_normal_digest_path_surfaces_failure_only(self, tmp_path: Path) -> None:
+        bridge, _, _ = make_bridge(tmp_path, tool_fail_output_lines=6)
+        detail = "\n".join(f"E{i}" for i in range(100))
+        bridge._render("r1", ev("agent.tool_start", tool="bash", args="ls", tool_call_id="c1"))
+        assert (
+            bridge._render(
+                "r1",
+                ev(
+                    "agent.tool_end",
+                    tool="bash",
+                    tool_call_id="c1",
+                    success=True,
+                    exit_code=0,
+                    output=detail,
+                    output_lines=100,
+                ),
+            )
+            == []
+        )
+        chunks = bridge._render(
+            "r1",
+            ev(
+                "agent.tool_end",
+                tool="bash",
+                tool_call_id="c2",
+                success=False,
+                exit_code=1,
+                error=detail,
+                output_lines=100,
+            ),
+        )
+        assert len(chunks) == 1
+        assert "… 94 lines elided …" in chunks[0].text
+        assert len(chunks[0].text) <= 2000
+
+
+class TestToolOutputRedactionWiring:
+    """event -> _render -> chunk: nothing published carries a credential (#403 t6)."""
+
+    PAT = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    JWT = "eyJhbGciOiJIUzI1NiJ9.payload.signature"
+    KEY = "sk-live-abcdef0123456789"
+
+    @property
+    def command(self) -> str:
+        return (
+            f"gh auth login --with-token {self.PAT} && "
+            f"curl -H 'Authorization: Bearer {self.JWT}' -X GET https://api && "
+            f"API_KEY={self.KEY} deploy"
+        )
+
+    @property
+    def output(self) -> str:
+        return (
+            f"error: bad credentials\ntoken was {self.PAT}\n"
+            f"Authorization: Bearer {self.JWT}\nAPI_KEY={self.KEY}\n"
+        )
+
+    @pytest.mark.parametrize("level", ["verbose", "normal"])
+    def test_no_secret_reaches_any_chunk(self, tmp_path: Path, level: str) -> None:
+        bridge, _, _ = make_bridge(
+            tmp_path, chronology_level=level, tool_output_lines=5, tool_fail_output_lines=20
+        )
+        chunks = list(
+            bridge._render(
+                "r1",
+                ev("agent.tool_start", tool="bash", args=self.command, tool_call_id="c1"),
+            )
+        )
+        chunks += bridge._render(
+            "r1",
+            ev(
+                "agent.tool_end",
+                tool="bash",
+                tool_call_id="c1",
+                success=False,
+                exit_code=1,
+                error=self.output,
+                output=self.output,
+                output_lines=4,
+            ),
+        )
+        chunks += bridge._render("r1", ev("agent.message", text="done"))
+        texts = [c.text for c in chunks]
+        assert texts
+        blob = "\n".join(texts)
+        for literal in (self.PAT, self.JWT, self.KEY):
+            assert literal not in blob, literal
+        assert "***" in blob
+        assert all(len(t) <= 2000 for t in texts)

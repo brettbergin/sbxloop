@@ -49,7 +49,6 @@ from sbxloop.daemon.discord_format import (
     DISCORD_MAX_MESSAGE,
     Chunk,
     EmbedSpec,
-    RunStats,
     StatusLine,
     SteerProgress,
     ToolBatcher,
@@ -66,8 +65,6 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     split_markdown,
     status_embed,
-    summary_embed,
-    summary_text,
 )
 from sbxloop.daemon.discord_routing import route_message
 from sbxloop.daemon.model import RunReport, WorkItem
@@ -242,8 +239,6 @@ class DiscordBridge:
         self._steer_last_edit: dict[str, float] = {}
         # Facts that enrich the headline card as the run reveals them.
         self._facts: dict[str, dict[str, Any]] = {}
-        # Counters behind the end-of-run summary card, the thread's last post.
-        self._runstats: dict[str, RunStats] = {}
         # item_id -> run_id for the last run of an item (notice -> thread pointer).
         self._item_runs: dict[str, str] = {}
 
@@ -795,7 +790,6 @@ class DiscordBridge:
                 buffer_run = run_id
                 chunks = self._render(run_id, event)
                 self._observe_facts(run_id, event)
-                self._runstats.setdefault(run_id, RunStats()).observe(event)
                 if event.type == "agent.tool_start":
                     buffer = await self._digest_tick(run_id, buffer)
                 elif event.type == "agent.tool_end":
@@ -841,29 +835,36 @@ class DiscordBridge:
             # only failures keep their own detail block.
             digest = self._digest(run_id)
             if event.type == "agent.tool_start":
-                digest.add_start(str(d.get("tool") or "?"), str(d.get("args") or ""))
+                digest.add_start(
+                    str(d.get("tool") or "?"),
+                    str(d.get("args") or ""),
+                    d.get("tool_call_id"),
+                )
                 return []
             if event.type == "agent.tool_end":
                 detail = digest.add_end(
                     str(d.get("tool") or "?"),
+                    d.get("tool_call_id"),
                     success=d.get("success"),
                     exit_code=d.get("exit_code"),
                     detail=str(d.get("error") or d.get("output") or ""),
+                    output_lines=d.get("output_lines"),
                 )
                 return [detail] if detail else []
             return format_for_discord(event, level=level, max_chars=self.discord.max_message_chars)
         batcher = self._batchers.get(run_id)
         if batcher is None:
             batcher = self._batchers[run_id] = ToolBatcher(
-                max_lines=self.discord.tool_batch_lines, quiet=(level == "quiet")
+                max_lines=self.discord.tool_batch_lines,
+                quiet=(level == "quiet"),
+                output_lines=self.discord.tool_output_lines,
+                fail_output_lines=self.discord.tool_fail_output_lines,
             )
         if event.type == "agent.tool_start":
+            # No line yet: the call renders once, on completion.
             batcher.add_start(
                 str(d.get("tool") or "?"), str(d.get("args") or ""), d.get("tool_call_id")
             )
-            if batcher.full:
-                batch = batcher.flush()
-                return [batch] if batch else []
             return []
         if event.type == "agent.tool_end":
             detail = batcher.add_end(
@@ -872,11 +873,18 @@ class DiscordBridge:
                 success=d.get("success"),
                 exit_code=d.get("exit_code"),
                 detail=str(d.get("error") or d.get("output") or ""),
+                args=str(d.get("args") or ""),
+                duration_ms=d.get("duration_ms"),
+                output_lines=d.get("output_lines"),
             )
-            if detail is None:
+            if detail is None and not batcher.full:
                 return []
             batch = batcher.flush()
-            return [batch, detail] if batch else [detail]
+            if batch and detail:
+                return [batch, detail]
+            if batch:
+                return [batch]
+            return [detail] if detail else []
         chunks = format_for_discord(event, level=level, max_chars=self.discord.max_message_chars)
         if not chunks:
             return []
@@ -936,7 +944,13 @@ class DiscordBridge:
         digest = self._digests.get(run_id)
         if digest is None:
             digest = self._digests[run_id] = ToolDigest(
-                cancel_hint=f"{self.discord.command_prefix} cancel"
+                cancel_hint=f"{self.discord.command_prefix} cancel",
+                # The normal level exists to *not* stream successes: the
+                # digest line already reports them, so successes get no
+                # excerpt here regardless of tool_output_lines (which is a
+                # verbose-level knob). Failures keep the configured budget.
+                output_lines=0,
+                fail_output_lines=self.discord.tool_fail_output_lines,
             )
         return digest
 
@@ -1021,6 +1035,12 @@ class DiscordBridge:
             unanswered = [p for p in self._pending.values() if p.run_id == run_id]
             self._pending = {m: p for m, p in self._pending.items() if p.run_id != run_id}
         thread = await self._ensure_thread(run_id)
+        # Close the tool batch: anything still in flight can no longer get an
+        # end event, so this is the one flush that renders `… running` lines.
+        batcher = self._batchers.get(run_id)
+        leftovers = batcher.flush(final=True) if batcher else None
+        if leftovers is not None:
+            await self._flush(run_id, [leftovers])
         await self._digest_tick(run_id, [], close=True)
         # Final status-line edit, then the report card.
         status = self._status.get(run_id)
@@ -1049,15 +1069,6 @@ class DiscordBridge:
                 text,
                 embed=finish_embed(item, report, state, len(unanswered), repo=repo),
             )
-            # The thread's LAST post: the summary card — the run's numbers,
-            # what went well, what needed work — so a human opening the
-            # thread later reads the outcome bottom-up without scrolling.
-            stats = self._runstats.get(run_id)
-            await self._send(
-                thread,
-                summary_text(stats, state),
-                embed=summary_embed(stats, report, state, len(unanswered)),
-            )
         facts = self._facts.setdefault(run_id, {})
         if report.tracking_issue:
             facts["tracking"] = report.tracking_issue
@@ -1075,7 +1086,6 @@ class DiscordBridge:
         self._status_msg.pop(run_id, None)
         self._status_last_edit.pop(run_id, None)
         self._facts.pop(run_id, None)
-        self._runstats.pop(run_id, None)
         self._items.pop(run_id, None)
         self._progress.pop(run_id, None)
         self._steer_last_edit.pop(run_id, None)

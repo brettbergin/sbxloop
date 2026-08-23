@@ -1883,6 +1883,8 @@ class ReviewingSource(FakeSource):
         self.merged = False
         self.pr_open = True
         self.merged_ok = True  # what report_merged answers
+        self.head_sha = ""  # the branch head each poll observes
+        self.feedback = ""  # what pr_review_feedback answers
         self.polls = 0
         self.merge_polls = 0
         self.reviews: list[int] = []
@@ -1900,11 +1902,15 @@ class ReviewingSource(FakeSource):
         state = "open" if self.pr_open else "closed"
         if self.merged or not self.pr_open:
             return PrSnapshot(ChecksVerdict("pending", 0, (), ()), "NONE", self.merged, state)
-        return PrSnapshot(self.checks, self.review_state, False, state)
+        return PrSnapshot(self.checks, self.review_state, False, state, head_sha=self.head_sha)
 
     def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
         self.merge_polls += 1
         return self.merged, "open" if self.pr_open else "closed"
+
+    def pr_review_feedback(self, pr_number: int) -> str:
+        self.calls.append(("review_feedback", pr_number))
+        return self.feedback
 
     def report_merged(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
         self.calls.append(("merged", pr_number))
@@ -1940,6 +1946,71 @@ class TestAcceptanceGate:
         source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
         assert h.loop.tick().outcome == "reviewing"
         return h, source
+
+    def test_first_poll_baselines_the_delivered_head(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        source.head_sha = "ours0001"
+        h.loop.tick()
+        assert h.dstore.pr_state("gh:1").delivered_head == "ours0001"  # type: ignore[union-attr]
+
+    def test_a_foreign_push_hands_the_pr_over(self, tmp_path: Path) -> None:
+        """#412: a fix round delivers by force-updating the branch, so a head
+        the daemon did not deliver means continuing would replace a human's
+        commits — whoever pushes last wins. Hand it over instead."""
+        h, source = self._delivered(tmp_path)
+        source.head_sha = "ours0001"
+        h.loop.tick()  # baselines
+        source.head_sha = "theirs002"
+        source.checks = ChecksVerdict("red", 2, (), ("lint",))  # would queue a fix round
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned", "handed to a human, not retried"  # type: ignore[union-attr]
+        assert "taken over" in (item.last_error or "")  # type: ignore[union-attr]
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and state.fix_brief is None, "no fix round was queued"
+
+    def test_a_review_is_not_refiled_after_its_charter_dies(self, tmp_path: Path) -> None:
+        """#442: abandoning (or losing) the review charter must not silently
+        re-derive 'this PR needs a review' and file the same charter under a
+        new number. Green checks become the whole bar instead."""
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()  # green + unreviewed: files the review charter (gh:109)
+        assert source.reviews == [9]
+        # The charter runs as its own item and dies without posting a verdict.
+        h.dstore.upsert_new(
+            WorkItem(item_id="gh:109", source="github", source_key="109", title="review"),
+            now=5.0,
+        )
+        h.dstore.mark_failed("gh:109", "abandoned by operator", 6.0, requeue=False)
+        h.loop.tick()  # clears the dead in-flight marker
+        h.loop.tick()  # green + still unreviewed — but the charter was already filed
+        assert source.reviews == [9], "the charter was re-filed"
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+
+    def test_a_moot_review_charter_settles_without_a_run(self, tmp_path: Path) -> None:
+        """#442: a review charter whose PR already merged reviews nothing —
+        the field case burned four runs auditing a merged PR."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": {"await_review": True},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        h.dstore.record_review("rorig0001", 9, "gh:200", 1.0)
+        source.merged = True
+        source.items = [
+            WorkItem(item_id="gh:200", source="github", source_key="200", title="review: PR #9")
+        ]
+        result = h.loop.tick()
+        assert result.outcome == "done"
+        assert h.runs == [], "the charter must not spend an engine run"
+        assert h.dstore.get("gh:200").state == "done"  # type: ignore[union-attr]
+        assert any(kind == "success" for kind, _ in source.calls)
 
     def test_a_delivered_item_waits_and_spends_no_review_yet(self, tmp_path: Path) -> None:
         """CI first: nothing is reviewed until the build has reported."""
@@ -1994,6 +2065,19 @@ class TestAcceptanceGate:
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
         assert "requested changes" in h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+
+    def test_a_review_fix_round_quotes_the_objections(self, tmp_path: Path) -> None:
+        """The fix agent's sandbox has no GitHub credential (#437): whatever
+        the daemon quotes into the brief is all the reviewer feedback the
+        round will ever see."""
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()  # files the review
+        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
+        source.review_state = "CHANGES_REQUESTED"
+        source.feedback = "- `a.py:9`: off by one"
+        h.loop.tick()
+        brief = h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+        assert "- `a.py:9`: off by one" in brief
 
     def test_a_non_gating_approval_still_accepts(self, tmp_path: Path) -> None:
         """A review the repo would only accept as a COMMENT never produces an
@@ -2066,7 +2150,10 @@ class TestAcceptanceGate:
 
     def test_a_review_run_that_never_settles_does_not_park_the_item(self, tmp_path: Path) -> None:
         """An in-flight flag nothing will ever clear is a silent park, which
-        is the one outcome this loop must not produce."""
+        is the one outcome this loop must not produce. The dead charter is
+        NOT re-filed (#442 — re-deriving it undid operator abandons and
+        burned runs re-reviewing the same PR): green checks become the whole
+        bar, the same as a deployment with no reviewer."""
         h, source = self._delivered(tmp_path)
         h.loop.tick()
         ref = h.dstore.pr_state("gh:1").review_ref or "gh:x"  # type: ignore[union-attr]
@@ -2076,8 +2163,9 @@ class TestAcceptanceGate:
         h.dstore.mark_failed(ref, "review run died", h.clock.t, requeue=False)
         h.loop.tick()  # notices and clears the stale marker
         assert not h.dstore.pr_state("gh:1").review_in_flight  # type: ignore[union-attr]
-        h.loop.tick()  # the gate resumes: a fresh review is filed
-        assert len(source.reviews) == 2
+        h.loop.tick()  # the gate resumes — and accepts on green, no re-file
+        assert len(source.reviews) == 1
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
 
     def test_the_gate_can_be_turned_off(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(

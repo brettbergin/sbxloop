@@ -376,6 +376,17 @@ class TestMergeWatchRows:
         state = store.pr_state("gh:7")
         assert state is not None and not state.settled and state.merged_at is None
 
+    def test_delivered_head_baselines_and_redelivery_clears_it(self, tmp_path: Path) -> None:
+        """#412: the takeover guard's baseline. A fresh delivery (a fix
+        round) moves the branch itself, so it must clear the old head or the
+        guard would read the daemon's own push as a takeover."""
+        store = self._armed(tmp_path)
+        assert store.pr_state("gh:7").delivered_head is None  # type: ignore[union-attr]
+        store.set_delivered_head("gh:7", "abc123")
+        assert store.pr_state("gh:7").delivered_head == "abc123"  # type: ignore[union-attr]
+        store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
+        assert store.pr_state("gh:7").delivered_head is None  # type: ignore[union-attr]
+
     def test_merge_watch_returns_only_done_unsettled_due_rows(self, tmp_path: Path) -> None:
         store = self._armed(tmp_path)
         assert store.merge_watch(1000.0, 300.0) == [("gh:7", 9, "https://x/pull/9")]
