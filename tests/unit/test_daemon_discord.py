@@ -1194,6 +1194,32 @@ class TestRunWatches:
         finally:
             bridge.close()
 
+    def test_watch_registers_through_the_real_concierge_seam(self, tmp_path: Path) -> None:
+        """Regression for the author/`by` mismatch: `_remember_requester`
+        stores a watcher's id under the bare author string, but a real
+        concierge turn's tool calls arrive tagged with
+        `concierge.VIA_CONCIERGE_SUFFIX` (`Concierge._tool_handler` builds
+        `by = f"{author}{VIA_CONCIERGE_SUFFIX}"`) before reaching `on_watch`.
+        Drive an actual `Concierge` — not `FakeConcierge`, which never adds
+        the tag — wired to `bridge.on_watch`, so the seam the two test files
+        used to test in contradictory isolation is now actually crossed."""
+        from sbxloop.engine.store import StateStore
+        from tests.unit.test_daemon_concierge import make, turn
+
+        bridge, _client, _floop = make_bridge(tmp_path)
+        author = "Discord user `brett`"
+        bridge._remember_requester(author, "555")
+        concierge, _, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "r1"})]}],
+            on_watch=bridge.on_watch,
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r1", "Ship it")
+        store.set_run_state("r1", "running")
+        turn(concierge, author=author)
+        assert bridge._watchers == {"r1": ["555"]}
+
     def test_unknown_requester_registers_nothing_and_says_so(self, tmp_path: Path) -> None:
         bridge, _, _ = make_bridge(tmp_path)
         note = bridge.on_watch("r1", "Discord user `nobody`")

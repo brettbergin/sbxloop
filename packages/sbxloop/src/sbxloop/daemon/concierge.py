@@ -97,6 +97,12 @@ _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 # actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
 # stale. Nothing else is accepted, so the model cannot invent a reason.
 CLOSE_REASONS = ("completed", "not_planned")
+#: Appended to a tool call's ``by`` for GitHub-facing attribution (see
+#: ``_tool_handler``). A transport's ``on_watch`` callback receives this same
+#: tagged string as its ``requester`` and must strip it back off before
+#: looking a requester up by the untagged form it was remembered under —
+#: see ``DiscordBridge.on_watch``.
+VIA_CONCIERGE_SUFFIX = " (via concierge)"
 
 
 class ConciergeReply(NamedTuple):
@@ -398,7 +404,7 @@ class Concierge:
             return HostToolResponse(
                 call_id=call.call_id, ok=False, error=f"unknown tool {call.name!r}"
             )
-        by = f"{author} (via concierge)"
+        by = f"{author}{VIA_CONCIERGE_SUFFIX}"
         started = time.monotonic()
         try:
             with self._tool_lock:

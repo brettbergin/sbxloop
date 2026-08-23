@@ -43,6 +43,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from sbxloop.config import Config
+from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
 from sbxloop.daemon.discord_format import (
     DISCORD_MAX_MESSAGE,
@@ -100,6 +101,11 @@ DRAIN_WAIT_S = 20.0
 # Requester display-string -> Discord id map (run watches); bounded so a
 # long-lived daemon does not accumulate every author it has ever seen.
 REQUESTER_ID_CAP = 200
+# Run watches (run_id -> watcher ids); bounded for the same reason, and also
+# because `_watchers` is only ever cleared on the `run_finished` path — a run
+# that never gets there (daemon shutdown mid-run, a crash, a breaker
+# teardown) would otherwise leak its entry forever.
+WATCHERS_CAP = 200
 # The concierge's "🛠 …" tool-note line is edited at most this often.
 CONCIERGE_NOTE_EDIT_MIN_S = 1.5
 
@@ -532,10 +538,17 @@ class DiscordBridge:
         Concierge (the transport seam — the concierge never imports discord).
         Returns None on success, or a short note to append to the concierge's
         confirmation when the requester has no mentionable id. Never raises:
-        a bridge problem must not fail the concierge turn."""
+        a bridge problem must not fail the concierge turn.
+
+        A concierge-driven call arrives tagged with ``VIA_CONCIERGE_SUFFIX``
+        (``_tool_handler`` builds ``by = f"{author} (via concierge)"``), but
+        `_remember_requester` stores the id under the bare, untagged author
+        string. Strip the tag back off before the lookup, or every real
+        watch fails to find an id and silently registers nothing."""
+        key = requester.removesuffix(VIA_CONCIERGE_SUFFIX)
         try:
             with self._watch_lock:
-                user_id = self._requester_ids.get(requester)
+                user_id = self._requester_ids.get(key)
                 if user_id is None:
                     return (
                         "(I don't have a mentionable id for you, so nothing was "
@@ -544,6 +557,8 @@ class DiscordBridge:
                 watchers = self._watchers.setdefault(run_id, [])
                 if user_id not in watchers:
                     watchers.append(user_id)
+                while len(self._watchers) > WATCHERS_CAP:
+                    self._watchers.pop(next(iter(self._watchers)))
             log.info("discord.watch_registered", run=run_id, by=requester)
             return None
         except Exception as exc:  # pragma: no cover - defensive
@@ -575,7 +590,10 @@ class DiscordBridge:
         id only: a watch asked for by work item is resolved to that item's
         newest run concierge-side, before `on_watch` is called, so there is no
         item-id key to pop here. The pop is final — a second finish for the
-        same run pings nobody."""
+        same run pings nobody. A run that never reaches this path at all
+        (shutdown mid-run, a crash, a breaker teardown) leaves its entry
+        in `_watchers` — `WATCHERS_CAP` bounds that instead of leaking it
+        forever, evicting the oldest registrations first."""
         with self._watch_lock:
             watchers = self._watchers.pop(run_id, [])
         if not watchers:
