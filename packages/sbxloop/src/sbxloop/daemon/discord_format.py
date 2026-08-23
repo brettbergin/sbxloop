@@ -1399,6 +1399,248 @@ def finish_embed(
     ).clamped()
 
 
+# -- end-of-run summary --------------------------------------------------------------
+
+
+class RunStats:
+    """Counters behind the end-of-run summary card, fed the same live event
+    stream the chronology renders.
+
+    Observed rather than mined from the state store: the pump already sees
+    every event, and the summary must stay postable when the engine store is
+    not reachable from the bridge. The price is scope: a daemon restarted
+    mid-run starts counting again, so ``resumed`` is remembered and the card
+    says the stats cover the watched leg instead of passing partial numbers
+    off as the whole run.
+    """
+
+    def __init__(self) -> None:
+        self.first_ts: float | None = None
+        self.last_ts: float | None = None
+        self.resumed = False
+        # One ``agent.usage`` event is one assistant turn — the unit runs
+        # are billed and timed by. Token/cost fields stay None until a
+        # backend actually reports them: "not reported" is not zero.
+        self.turns = 0
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+        self.cost: float | None = None
+        self.tool_calls = 0
+        self.capped = False
+        self.denies = 0
+        self.resource_warnings = 0
+        self.steers = 0
+        self.steers_answered = 0
+        self.steers_failed = 0
+        # (task_id, phase, status, reason) for every verify failure — the
+        # rework signal now that no critic issues verdicts in-run.
+        self.rework: list[tuple[str, str, str, str]] = []
+        self.total_tasks = 0
+        self.states: dict[str, str] = {}
+        self.revisions: dict[str, int] = {}
+
+    def observe(self, event: Event) -> None:
+        if self.first_ts is None:
+            self.first_ts = event.ts
+        self.last_ts = event.ts
+        d = event.data
+        t = event.type
+        if t == HostEventTypes.RUN_START and d.get("resumed"):
+            self.resumed = True
+        elif t == "agent.usage":
+            self.turns += 1
+            if d.get("input_tokens") is not None:
+                self.input_tokens = (self.input_tokens or 0) + int(d["input_tokens"])
+            if d.get("output_tokens") is not None:
+                self.output_tokens = (self.output_tokens or 0) + int(d["output_tokens"])
+            if d.get("cost") is not None:
+                self.cost = (self.cost or 0.0) + float(d["cost"])
+        elif t == "agent.tool_start":
+            self.tool_calls += 1
+        elif t == "agent.tool_cap":
+            self.capped = True
+        elif t == HostEventTypes.POLICY_DENY:
+            self.denies += 1
+        elif t == "sandbox.resources_warning":
+            self.resource_warnings += 1
+        elif t == HostEventTypes.CHAT_MESSAGE:
+            self.steers += 1
+        elif t == HostEventTypes.CHAT_REPLY:
+            if d.get("error"):
+                self.steers_failed += 1
+            else:
+                self.steers_answered += 1
+        elif t == HostEventTypes.RUN_TASKS and isinstance(d.get("tasks"), list):
+            self.total_tasks = max(self.total_tasks, len(d["tasks"]))
+        elif t in (HostEventTypes.TASK_STATE, HostEventTypes.TASK_END):
+            tid = str(d.get("task_id") or "")
+            if tid and d.get("state"):
+                self.states[tid] = str(d["state"])
+            if tid and d.get("revisions") is not None:
+                self.revisions[tid] = int(d["revisions"] or 0)
+        elif t == HostEventTypes.PHASE_END:
+            phase = str(d.get("phase") or "?")
+            if phase == "verify" and str(d.get("status") or "") == "failed":
+                self.rework.append(
+                    (str(d.get("task_id") or "?"), phase, "failed", str(d.get("message") or ""))
+                )
+
+    @property
+    def duration_s(self) -> float | None:
+        if self.first_ts is None or self.last_ts is None:
+            return None
+        return max(0.0, self.last_ts - self.first_ts)
+
+    def task_counts(self) -> tuple[int, int]:
+        """(done, total) as observed; the roster event pins the total."""
+        done = sum(1 for s in self.states.values() if s == "done")
+        return done, max(self.total_tasks, len(self.states))
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h {s % 3600 // 60:02d}m"
+    if s >= 60:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s}s"
+
+
+def _fmt_count(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "—"
+
+
+def summary_text(stats: RunStats | None, state: str) -> str:
+    """The plain-text lead over the summary embed: the headline numbers, so
+    the card still reads where embeds are suppressed."""
+    head = "📊 **run summary**"
+    if stats is None:
+        return head
+    bits: list[str] = []
+    if (dur := stats.duration_s) is not None:
+        bits.append(_fmt_duration(dur))
+    if stats.turns:
+        bits.append(f"{stats.turns} turn(s)")
+    if stats.tool_calls:
+        bits.append(f"{stats.tool_calls} tool call(s)")
+    if stats.input_tokens is not None or stats.output_tokens is not None:
+        bits.append(
+            f"{_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out tokens"
+        )
+    if stats.cost is not None:
+        bits.append(f"${stats.cost:,.2f}")
+    return head + (f" — {' · '.join(bits)}" if bits else "")
+
+
+def _stat_rows(stats: RunStats) -> list[str]:
+    rows: list[str] = []
+    counters = []
+    if stats.turns:
+        counters.append(f"turns {stats.turns}")
+    if stats.tool_calls:
+        counters.append(f"tool calls {stats.tool_calls}")
+    if counters:
+        rows.append(" · ".join(counters))
+    if stats.input_tokens is not None or stats.output_tokens is not None:
+        spend = (
+            f"tokens {_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out"
+        )
+        if stats.cost is not None:
+            spend += f" · cost ${stats.cost:,.2f}"
+        rows.append(spend)
+    elif stats.cost is not None:
+        rows.append(f"cost ${stats.cost:,.2f}")
+    if stats.steers:
+        rows.append(f"steering {stats.steers} asked / {stats.steers_answered} answered")
+    return rows
+
+
+def _went_well(stats: RunStats, report: RunReport) -> list[str]:
+    out: list[str] = []
+    if report.delivery:
+        out.append(f"delivered PR {link(f'#{report.delivery[0]}', report.delivery[1])}")
+    if report.filed:
+        out.append(f"filed {len(report.filed)} finding(s)")
+    done, total = stats.task_counts()
+    if total and done == total:
+        out.append(f"all {total} task(s) completed")
+    elif done:
+        out.append(f"{done}/{total} task(s) completed")
+    clean = sum(
+        1 for tid, s in stats.states.items() if s == "done" and not stats.revisions.get(tid)
+    )
+    if clean:
+        out.append(f"{clean} task(s) verified without revision")
+    if stats.steers and stats.steers_answered == stats.steers:
+        out.append(f"answered all {stats.steers} steering message(s)")
+    return out
+
+
+def _needed_work(stats: RunStats, report: RunReport, unanswered: int) -> list[str]:
+    out: list[str] = []
+    for tid, phase, verdict, reason in stats.rework[:4]:
+        line = f"{code(tid)} {phase}: **{verdict}**"
+        if reason:
+            line += f" — {_one_line(reason, 160)}"
+        out.append(line)
+    if len(stats.rework) > 4:
+        out.append(f"… and {len(stats.rework) - 4} more verify failure(s)")
+    failed = sum(1 for s in stats.states.values() if s == "failed")
+    if failed:
+        out.append(f"{failed} task(s) failed")
+    if report.delivery_error:
+        out.append(f"delivery failed — {_one_line(report.delivery_error, 160)}")
+    if unanswered:
+        out.append(f"{unanswered} steering message(s) went unanswered")
+    if stats.steers_failed:
+        out.append(f"{stats.steers_failed} steer(s) errored")
+    if stats.capped:
+        out.append("hit the per-phase tool-call ceiling")
+    if stats.denies:
+        out.append(f"{stats.denies} policy denial(s)")
+    if stats.resource_warnings:
+        out.append(f"{stats.resource_warnings} sandbox resource warning(s)")
+    return out
+
+
+def _bullets(lines: list[str], empty: str) -> str:
+    return "\n".join(f"• {line}" for line in lines) if lines else empty
+
+
+def summary_embed(
+    stats: RunStats | None,
+    report: RunReport,
+    state: str,
+    unanswered: int = 0,
+) -> EmbedSpec:
+    """The end-of-run summary card — the last thing posted in a run thread:
+    the run's numbers, what went well, and what needed work."""
+    stats = stats or RunStats()
+    description = f"**{state}** — {report.task_summary}"
+    if (dur := stats.duration_s) is not None:
+        description += f" in {_fmt_duration(dur)}"
+    if stats.resumed:
+        description += "\n_stats cover the run since the daemon last picked it up_"
+    fields: list[tuple[str, str, bool]] = []
+    if rows := _stat_rows(stats):
+        fields.append(("Stats", "\n".join(rows), False))
+    fields.append(("Went well", _bullets(_went_well(stats, report), "nothing stood out"), False))
+    fields.append(
+        (
+            "Needed work",
+            _bullets(_needed_work(stats, report, unanswered), "no setbacks observed"),
+            False,
+        )
+    )
+    return EmbedSpec(
+        title="📊 run summary",
+        description=description,
+        color=STATE_COLOR.get(state, COLOR_DIM),
+        fields=tuple(fields),
+        footer=f"run {report.run_id}",
+    ).clamped()
+
+
 def status_embed(status: dict[str, Any]) -> EmbedSpec:
     cur = status.get("current")
     current = f"{code(cur['run_id'])} — {_one_line(cur.get('title') or '', 120)}" if cur else "idle"
@@ -1597,6 +1839,7 @@ __all__ = [
     "TOOL_OUTPUT_LINES_DEFAULT",
     "Chunk",
     "EmbedSpec",
+    "RunStats",
     "StatusLine",
     "ToolBatcher",
     "block",
@@ -1625,4 +1868,6 @@ __all__ = [
     "split_markdown",
     "status_embed",
     "strip_json_payload",
+    "summary_embed",
+    "summary_text",
 ]

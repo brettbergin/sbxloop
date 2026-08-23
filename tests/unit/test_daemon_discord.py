@@ -1054,6 +1054,48 @@ class TestBridge:
         assert time.time() - t0 < 5
         assert bridge._thread is not None and not bridge._thread.is_alive()
 
+    def test_run_summary_is_the_threads_last_post(self, tmp_path: Path) -> None:
+        """The very last post in a run thread is the end-of-run summary card:
+        the run's numbers, what went well, what needed work."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit("agent.usage", "r1", input_tokens=1200, output_tokens=80, cost=0.05)
+            bus.emit(
+                "phase.end",
+                "r1",
+                task_id="t1",
+                phase="verify",
+                status="failed",
+                message="verify command failed: `lint` (exit 1)",
+            )
+            bus.emit("task.state", "r1", task_id="t1", state="done", revisions=1)
+            bridge.run_finished(
+                item,
+                RunReport("r1", "completed", "1/1 tasks done", delivery=(3, "https://x/pull/3")),
+            )
+            assert wait_for(lambda: any(s.startswith("📊 **run summary**") for s in thread.sent))
+            # After the finish card, nothing else lands in the thread.
+            assert thread.sent[-1].startswith("📊 **run summary**")
+            assert "1 turn(s)" in thread.sent[-1] and "$0.05" in thread.sent[-1]
+            summary_kwargs = thread.sent_kwargs[-1]
+            card = summary_kwargs["embed"]
+            names = [f.name for f in card.fields]
+            assert names == ["Stats", "Went well", "Needed work"]
+            values = {f.name: f.value for f in card.fields}
+            assert "delivered PR [#3](https://x/pull/3)" in values["Went well"]
+            assert (
+                "`t1` verify: **failed** — verify command failed: `lint` (exit 1)"
+                in values["Needed work"]
+            )
+        finally:
+            bridge.close()
+
     def test_steer_gets_a_live_wait_note_edited_in_place(self, tmp_path: Path) -> None:
         """#236: the ⏳ reaction says "received"; the note under the steer
         says where the agent is (phase, task, tool calls vs the #228
