@@ -103,6 +103,15 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **The end-of-run summary card is back as the thread's last post.** The
+  fix delivered for #420 (tool-call rendering) also deleted the summary
+  card machinery shipped hours earlier — `RunStats`, `summary_text`,
+  `summary_embed`, their bridge wiring and tests — without its outcome
+  calling for it; the removal was unintentional and is restored here,
+  adapted to the three-phase pipeline: the "needed work" ledger now counts
+  verify failures (there are no critic verdicts to count), and "went well"
+  reports tasks verified without revision.
+
 - **A fix round can no longer force-update a PR branch a human has taken
   over.** #412. The daemon now baselines the branch head its own delivery
   produced (observed on the first poll after delivering; a re-delivery
