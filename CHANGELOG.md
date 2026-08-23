@@ -103,6 +103,23 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **`daemon_log` lines are scrubbed by credential *shape*, not just by key
+  name.** The ring buffer behind `daemon_log` was documented as holding
+  "already-redacted" lines, but the only redaction was the structlog
+  processor that masks a value whose *key* names a credential — useless for
+  a token embedded in a message string or in a record from a third-party
+  logger (`httpx`, `git`), which has no structlog keys at all. Those lines
+  used to reach only stderr/journald; relaying them into a Discord channel
+  turned the gap into a leak. `_RingBufferHandler.emit` now runs every
+  rendered line through `redact_text`, which also learned URL userinfo
+  (`https://TOKEN@host`, `https://user:pass@host`), AWS access key ids and
+  Discord bot token shapes. `redact_secrets` accepts the text form
+  (`redact_secrets(line)`) alongside the structlog-processor form; the
+  processor is also exported under the clearer name `redact_secret_keys`.
+  Both passes are best-effort — an unusual credential format may still slip
+  through — and the docs now say so rather than promising "already
+  redacted" lines.
+
 - **The end-of-run summary card is back as the thread's last post.** The
   fix delivered for #420 (tool-call rendering) also deleted the summary
   card machinery shipped hours earlier — `RunStats`, `summary_text`,

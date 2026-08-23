@@ -124,7 +124,12 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   installs in `sbxloop/log.py` — a `deque` with a `maxlen`, so a long-lived
   daemon's memory is bounded; the append is one atomic deque operation with
   no locks or I/O, keeping it off the hot path, and it stores the line the
-  stderr handler already rendered and redacted.
+  stderr handler already rendered, run through `redact_text` so a
+  credential embedded in free text (a third-party logger's message, a
+  captured stderr excerpt) is masked before it can reach a chat channel.
+  Both passes — key names and credential shapes — are best-effort: an
+  unusual credential format can still slip through, so `daemon_log` output
+  is "scrubbed", not "guaranteed secret-free".
 
 The credential split holds for both: the host never holds a PAT in a
 process that also talks to a model, and neither box holds both tokens.
@@ -420,6 +425,11 @@ House style for host code:
   thread).
 - Never log a secret: subprocess argv goes through `redacted_argv()`, and the
   `redact_secrets` processor masks any field whose name says it is a
-  credential (`token`, `secret`, `password`, `api_key`, …).
+  credential (`token`, `secret`, `password`, `api_key`, …). Key names are not
+  enough on their own, so the ring-buffer handler behind `daemon_log`
+  additionally runs each rendered line through `redact_text`, which matches
+  credential *shapes* (GitHub/Discord token prefixes, AWS key ids, URL
+  userinfo, `Authorization:` headers). Shape matching is best-effort; do not
+  treat either pass as a guarantee.
 - `DaemonLoop._notify(text, event, **fields)` is the seam that both narrates
   to Discord (`text`) and logs a structured record (`event`, `fields`).

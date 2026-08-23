@@ -476,14 +476,20 @@ Ask "what is the daemon doing?" or "why is nothing running?" and it quotes
 the daemon's own recent log lines — `daemon.idle`, `breaker`,
 `github.poll_failed` — through `daemon_log(tail, level, grep)`, the journal
 without ssh. It reads a **bounded in-process ring buffer** the running
-daemon fills (the last 2000 rendered lines, already redacted), not the full
+daemon fills (the last 2000 rendered lines, scrubbed both by
+key name — the structlog processor masks values under keys like `token` or
+`password` — and by credential shape, a pattern pass over the rendered line
+that catches secrets embedded in free text), not the full
 systemd journal: anything older than the buffer, or from a previous daemon
 process, still needs `journalctl --user -u sbxloop-daemon`. `tail` is how
 many records (default 50, at most 500), `level` keeps only records at or
 above `DEBUG`/`INFO`/`WARNING`/`ERROR`, and `grep` is a plain
 case-insensitive substring — never a regular expression, so no pattern from
 chat can wedge the daemon. The result is clipped to
-`[concierge] max_tool_result_chars` like every other tool result.
+`[concierge] max_tool_result_chars` like every other tool result. Both
+passes are best-effort: an unusual credential format that neither the key
+names nor the shape patterns recognise can still surface in `daemon_log`
+output, so treat what it prints as potentially sensitive.
 Say "tell me when r7… is done" (a run id or a work item id) and `watch_run`
 registers your interest: it confirms, and when that run lands the daemon
 posts in the control channel @mentioning you with the outcome — final

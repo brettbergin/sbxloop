@@ -375,3 +375,58 @@ class TestRedactText:
         once = redact_text(f"API_KEY=abc {self.PAT} Authorization: Bearer {self.JWT}")
         assert redact_text(once) == once
         assert redact_text(None) == "None"  # type: ignore[arg-type]
+
+
+class TestRingBufferRedaction:
+    """The ring buffer feeds `daemon_log` into chat, so rendered lines get
+    value-shape scrubbing on top of the key-name processor (#392)."""
+
+    SECRET = "ghp_" + "SECRET123abcdef"
+
+    def test_third_party_free_text_secret_masked(self, restore_logging: None) -> None:
+        configure_logging("DEBUG", stream=io.StringIO())
+        log_buffer().clear()
+        logging.getLogger("httpx").warning(
+            f"HTTP Request failed url=https://x/?token={self.SECRET}"
+        )
+        line = log_buffer().tail(1)[0].line
+        assert self.SECRET not in line
+        assert "HTTP Request failed" in line
+        assert REDACTED in line
+
+    def test_innocent_key_with_embedded_secret_masked(self, restore_logging: None) -> None:
+        configure_logging("DEBUG", stream=io.StringIO())
+        log_buffer().clear()
+        get_logger("sbxloop.test").info(
+            "cmd.failed",
+            stderr=f"could not read Password for 'https://{self.SECRET}@github.com'",
+        )
+        line = log_buffer().tail(1)[0].line
+        assert self.SECRET not in line
+        assert "could not read Password" in line
+        assert "github.com" in line
+
+    def test_ordinary_lines_survive_intact(self, restore_logging: None) -> None:
+        configure_logging("DEBUG", stream=io.StringIO())
+        log_buffer().clear()
+        get_logger("sbxloop.test").info("run.dispatch", item="gh:1", attempt=2)
+        line = log_buffer().tail(1)[0].line
+        assert "run.dispatch" in line
+        assert "item=gh:1" in line
+        assert "attempt=2" in line
+        assert REDACTED not in line
+
+    def test_text_form_of_redact_secrets(self) -> None:
+        out = redact_secrets(f"url=https://x/?token={self.SECRET}")
+        assert self.SECRET not in out
+        assert redact_secrets(out) == out
+
+    def test_processor_form_still_works(self) -> None:
+        out = redact_secrets(None, "info", {"event": "x", "github_token": "t"})
+        assert out["github_token"] == REDACTED
+
+    def test_aws_and_url_userinfo_shapes(self) -> None:
+        out = redact_secrets("id AKIAIOSFODNN7EXAMPLE via https://bob:hunter2@example.com/x")
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "hunter2" not in out
+        assert "example.com" in out

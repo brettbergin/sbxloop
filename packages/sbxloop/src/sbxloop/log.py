@@ -150,7 +150,7 @@ class _RingBufferHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         with contextlib.suppress(Exception):  # defensive; never break logging
-            line = self.format(record).rstrip("\n")
+            line = redact_text(self.format(record).rstrip("\n"))
             self._buffer.append(
                 LogRecordLine(
                     timestamp=datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
@@ -182,7 +182,7 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     return structlog.stdlib.get_logger(name)
 
 
-def redact_secrets(
+def redact_secret_keys(
     _logger: Any, _method: str, event_dict: structlog.typing.EventDict
 ) -> structlog.typing.EventDict:
     """Mask the value of any key that names a credential (``token``,
@@ -193,13 +193,41 @@ def redact_secrets(
     return event_dict
 
 
+def redact_secrets(*args: Any) -> Any:
+    """Scrub credentials. Two shapes, one name.
+
+    ``redact_secrets(text)`` masks credential *shapes* inside a rendered
+    line (see :func:`redact_text`) — this is what the ring buffer runs on
+    every record, third-party loggers included.
+
+    ``redact_secrets(logger, method, event_dict)`` is the structlog
+    processor form, kept for the configured pipeline: it masks by key name
+    (see :func:`redact_secret_keys`).
+    """
+    if len(args) == 3:
+        return redact_secret_keys(*args)
+    if len(args) == 1:
+        return redact_text(args[0])
+    raise TypeError(f"redact_secrets() takes 1 or 3 arguments, got {len(args)}")
+
+
 # Provider token shapes that are secrets wherever they appear, with no key
 # name to go on: GitHub's ``ghp_``/``gho_``/``ghu_``/``ghs_``/``ghr_`` and
 # the fine-grained ``github_pat_`` prefix.
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    # Short-but-unmistakable GitHub prefixes too: anything wearing the
+    # prefix is a credential shape, whatever its length.
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{6,}"),
+    # AWS access key ids.
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # Discord bot tokens: base64 id . timestamp . hmac
+    re.compile(r"\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}"),
 )
+
+#: ``scheme://user:pass@host`` / ``scheme://SECRET@host`` userinfo.
+_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@'\"]+)(:[^/\s@'\"]*)?@")
 
 _AUTH_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)((?:bearer|token|basic)\s+)?([^\s'\"]+)")
 # The credential word must be a whole delimiter-separated segment of the
@@ -232,6 +260,15 @@ def _mask_auth(match: re.Match[str]) -> str:
     return f"{head}{scheme}{REDACTED}"
 
 
+def _mask_url_cred(match: re.Match[str]) -> str:
+    scheme, user, password = match.group(1), match.group(2), match.group(3)
+    if password is not None:
+        return f"{scheme}{user}:{REDACTED}@"
+    if user.startswith("*"):
+        return match.group(0)
+    return f"{scheme}{REDACTED}@"
+
+
 def redact_text(text: str) -> str:
     """Mask credential *shapes* inside free-form text.
 
@@ -255,6 +292,7 @@ def redact_text(text: str) -> str:
     try:
         for pattern in _TOKEN_PATTERNS:
             out = pattern.sub(REDACTED, out)
+        out = _URL_CRED_RE.sub(_mask_url_cred, out)
         out = _AUTH_RE.sub(_mask_auth, out)
         out = _FLAG_RE.sub(_mask_value, out)
         out = _ASSIGN_RE.sub(_mask_value, out)
@@ -321,7 +359,7 @@ def configure_logging(
         structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
-        redact_secrets,
+        redact_secret_keys,
         drop_none_fields,
     ]
     structlog.configure(
@@ -405,6 +443,7 @@ __all__ = [
     "configure_logging",
     "get_logger",
     "log_buffer",
+    "redact_secret_keys",
     "redact_secrets",
     "redact_text",
 ]
