@@ -108,7 +108,17 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     review_ref TEXT,
     -- What the next fix round is for; NULL when no round is queued.
     fix_brief  TEXT,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    -- Where the PR lives, so post-acceptance notices need not re-mine the
+    -- run's event stream for it.
+    pr_url     TEXT NOT NULL DEFAULT '',
+    -- The merge watch: acceptance is not the end of the story — the source
+    -- issue settles (close + completed label) only when the PR merges.
+    -- `settled` is 0 until the merge (or an unmerged close) has been seen
+    -- AND reported to the source, so a restart resumes the watch.
+    merged_at  REAL,
+    settled    INTEGER NOT NULL DEFAULT 0,
+    last_merge_check REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS daemon_audits (
@@ -166,6 +176,29 @@ _MIGRATIONS = (
         "ALTER TABLE daemon_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0",
     ),
     ("daemon_pr_state", "verdict", "ALTER TABLE daemon_pr_state ADD COLUMN verdict TEXT"),
+    # The merge watch. `settled` defaults to 0 so rows from before the
+    # column — accepted items whose PRs merged with no one watching — are
+    # swept retroactively at the next tick.
+    (
+        "daemon_pr_state",
+        "pr_url",
+        "ALTER TABLE daemon_pr_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "daemon_pr_state",
+        "merged_at",
+        "ALTER TABLE daemon_pr_state ADD COLUMN merged_at REAL",
+    ),
+    (
+        "daemon_pr_state",
+        "settled",
+        "ALTER TABLE daemon_pr_state ADD COLUMN settled INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "daemon_pr_state",
+        "last_merge_check",
+        "ALTER TABLE daemon_pr_state ADD COLUMN last_merge_check REAL NOT NULL DEFAULT 0",
+    ),
 )
 
 
@@ -181,6 +214,11 @@ class PrState(NamedTuple):
     fix_brief: str | None
     # What our own review asked for, when one has been posted.
     verdict: str | None = None
+    pr_url: str = ""
+    # The merge watch: set once the merge (or unmerged close) has been seen
+    # and reported to the source.
+    settled: bool = False
+    merged_at: float | None = None
 
     @property
     def review_in_flight(self) -> bool:
@@ -806,20 +844,24 @@ class DaemonStore:
 
     # -- PR acceptance state ---------------------------------------------------
 
-    def record_delivery(self, item_id: str, pr_number: int, branch: str, now: float) -> None:
+    def record_delivery(
+        self, item_id: str, pr_number: int, branch: str, now: float, *, url: str = ""
+    ) -> None:
         """This item delivered ``pr_number``; start tracking its acceptance.
 
         Idempotent on the item: a re-delivery of the same PR (a fix round
         pushing to the same branch) must not reset the round count, which is
-        the only thing bounding the loop.
+        the only thing bounding the loop. It does re-arm the merge watch —
+        a fresh delivery means there is a PR to watch again.
         """
         with self._lock:
             self._conn.execute(
-                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
+                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, updated_at, pr_url) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
                 "pr_number = excluded.pr_number, branch = excluded.branch, "
-                "updated_at = excluded.updated_at",
-                (item_id, pr_number, branch, now),
+                "updated_at = excluded.updated_at, pr_url = excluded.pr_url, "
+                "settled = 0, merged_at = NULL",
+                (item_id, pr_number, branch, now, url),
             )
             self._conn.commit()
 
@@ -839,7 +881,48 @@ class DaemonStore:
             review_ref=row["review_ref"],
             fix_brief=row["fix_brief"],
             verdict=row["verdict"],
+            pr_url=str(row["pr_url"] or ""),
+            settled=bool(row["settled"]),
+            merged_at=row["merged_at"],
         )
+
+    def merge_watch(self, now: float, min_interval_s: float) -> list[tuple[str, int, str]]:
+        """(item_id, pr_number, pr_url) for every accepted-but-unsettled PR
+        due another merge check.
+
+        Joined on ``state = 'done'``: an item still reviewing is the
+        acceptance gate's to advance, and a failed/abandoned one has been
+        handed to a human — neither should cost a GitHub read here.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT p.item_id, p.pr_number, p.pr_url FROM daemon_pr_state p "
+                "JOIN daemon_work_items w ON w.item_id = p.item_id "
+                "WHERE p.settled = 0 AND w.state = 'done' AND p.last_merge_check <= ? "
+                "ORDER BY p.updated_at ASC",
+                (now - min_interval_s,),
+            ).fetchall()
+        return [(str(r["item_id"]), int(r["pr_number"]), str(r["pr_url"] or "")) for r in rows]
+
+    def settle_merge(self, item_id: str, now: float, *, merged_at: float | None) -> None:
+        """The PR's fate has been seen and reported: merged (``merged_at``
+        set) or closed without merging. Either way the watch is over."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET settled = 1, merged_at = ?, "
+                "last_merge_check = ?, updated_at = ? WHERE item_id = ?",
+                (merged_at, now, now, item_id),
+            )
+            self._conn.commit()
+
+    def touch_merge_check(self, item_id: str, now: float) -> None:
+        """One merge check spent; the next is not due for another interval."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET last_merge_check = ? WHERE item_id = ?",
+                (now, item_id),
+            )
+            self._conn.commit()
 
     def review_in_flight(self, item_id: str, review_ref: str | None) -> None:
         """Record the review charter now running for this PR, or None when

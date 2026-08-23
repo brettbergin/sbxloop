@@ -188,6 +188,11 @@ class GithubConfig(_ConfigModel):
     # needs a token that may create repositories for the owner.
     create_repo: bool = False
     create_public: bool = False  # created repositories are private by default
+    # Issue in `repo` this delivery resolves; rendered as "Closes #N" in the
+    # PR body so GitHub links issue and PR and closes the issue on merge
+    # even when the daemon is not running. Set per-run by the daemon for
+    # issue-sourced patch items; inbox work has no issue and leaves it unset.
+    deliver_closes: int | None = Field(default=None, ge=1)
 
     @field_validator("repo")
     @classmethod
@@ -385,15 +390,13 @@ class DaemonConfig(_ConfigModel):
     ``backlog_auto_trigger`` is set — a self-feeding queue is the failure
     mode that flag guards.
 
-    ``close_on_success`` / ``tracking_issue`` shape how loudly a delivered
-    run touches the issue tracker. The defaults suit a task queue where the
-    PR is the reviewable object: close the source issue, open a per-run
-    tracking issue. Pointed at a repo whose issues are design/discussion
-    items (sbxloop's own tracker, #251) that auto-closes a design issue the
-    moment a *draft* PR appears and doubles issue volume with self-closing
-    tracking issues — set both to false there: the source issue gets the
-    summary comment plus ``delivered_label`` and stays open for the human
-    who merges the PR.
+    A delivered patch item settles its source issue on *merge*, not on
+    acceptance: at acceptance the issue gets the summary comment plus
+    ``delivered_label`` and stays open; when the PR merges the daemon
+    closes it and swaps in ``completed_label``, and a PR closed without
+    merging marks the item failed instead. ``close_on_success`` used to
+    close at acceptance and is now a deprecated no-op; ``tracking_issue``
+    still governs the per-run tracking issue.
 
     Unattended runs need a different workspace posture from a one-shot
     ``sbxloop run`` (#255). ``workspace_isolation`` replaces the
@@ -422,6 +425,9 @@ class DaemonConfig(_ConfigModel):
     failed_label: str = "sbxloop:failed"
     backlog_label: str = "sbxloop:backlog"
     delivered_label: str = "sbxloop:delivered"
+    # Applied when the work actually lands: at merge for patch items, at
+    # close for audits. The durable "sbxloop did this" mark on the issue.
+    completed_label: str = "sbxloop:completed"
     # Discovery lane: an issue carrying this label is a charter — the run
     # investigates and files findings as backlog issues, never a PR.
     audit_label: str = "sbxloop:audit"
@@ -464,6 +470,9 @@ class DaemonConfig(_ConfigModel):
     # delivery) go — the tool's own tracker, never the project's. Unset:
     # such findings are only noted in the closing comment.
     tool_repo: str | None = None
+    # Deprecated: patch items now settle their source issue when the PR
+    # merges (close + `completed_label`), never at acceptance, so this flag
+    # no longer closes anything. Kept so existing configs still load.
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
@@ -524,6 +533,7 @@ class DaemonConfig(_ConfigModel):
             self.failed_label,
             self.backlog_label,
             self.delivered_label,
+            self.completed_label,
             self.audit_label,
         ]
         if any(not label.strip() for label in labels):

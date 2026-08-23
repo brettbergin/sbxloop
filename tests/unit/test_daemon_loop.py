@@ -19,6 +19,7 @@ from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
 from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.sources import GitHubLabels, PrSnapshot
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
@@ -1879,17 +1880,39 @@ class ReviewingSource(FakeSource):
         super().__init__()
         self.checks = ChecksVerdict("green", 2, (), ())
         self.review_state = "NONE"
+        self.merged = False
+        self.pr_open = True
+        self.merged_ok = True  # what report_merged answers
         self.polls = 0
+        self.merge_polls = 0
         self.reviews: list[int] = []
+        self.labels = GitHubLabels(
+            "sbxloop:run", "sbxloop:in-progress", "sbxloop:failed", "sbxloop:backlog"
+        )
 
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
         self.reviews.append(pr_number)
         self.calls.append(("file_review", pr_number))
         return f"gh:{pr_number + 100}"
 
-    def pr_state(self, pr_number: int) -> tuple[ChecksVerdict, str]:
+    def pr_state(self, pr_number: int) -> PrSnapshot:
         self.polls += 1
-        return self.checks, self.review_state
+        state = "open" if self.pr_open else "closed"
+        if self.merged or not self.pr_open:
+            return PrSnapshot(ChecksVerdict("pending", 0, (), ()), "NONE", self.merged, state)
+        return PrSnapshot(self.checks, self.review_state, False, state)
+
+    def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
+        self.merge_polls += 1
+        return self.merged, "open" if self.pr_open else "closed"
+
+    def report_merged(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
+        self.calls.append(("merged", pr_number))
+        return self.merged_ok
+
+    def report_pr_closed(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
+        self.calls.append(("pr_closed", pr_number))
+        return True
 
 
 class TestAcceptanceGate:
@@ -2079,7 +2102,7 @@ class TestAcceptanceGate:
         handed to a human, out loud."""
         h, source = self._delivered(tmp_path, review_rounds=1)
 
-        def boom(pr_number: int) -> tuple[ChecksVerdict, str]:
+        def boom(pr_number: int) -> PrSnapshot:
             raise RuntimeError("github is down")
 
         source.pr_state = boom  # type: ignore[assignment]
@@ -2098,7 +2121,7 @@ class TestAcceptanceGate:
         calls = {"n": 0}
         real = source.pr_state
 
-        def flaky(pr_number: int) -> tuple[ChecksVerdict, str]:
+        def flaky(pr_number: int) -> PrSnapshot:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("transient")
@@ -2109,3 +2132,143 @@ class TestAcceptanceGate:
         assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
         h.loop.tick()  # recovers: files the review
         assert source.reviews == [9]
+
+    def test_a_merged_pr_is_accepted_over_every_other_gate(self, tmp_path: Path) -> None:
+        """A human merging the PR IS the acceptance: no review is filed on a
+        merged PR, and the issue settles through report_merged right away —
+        waiting for an approval on a merged PR is how items wedge forever."""
+        h, source = self._delivered(tmp_path)
+        source.merged = True
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert source.reviews == []
+        assert ("merged", 9) in source.calls
+        assert not any(kind == "success" for kind, _ in source.calls)
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+
+    def test_a_pr_closed_unmerged_during_review_abandons_the_item(self, tmp_path: Path) -> None:
+        """A human closing the PR without merging is a rejection no gate
+        below can override: handed over, issue marked failed but open."""
+        h, source = self._delivered(tmp_path)
+        source.pr_open = False
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "without being merged" in (item.last_error or "")  # type: ignore[union-attr]
+        assert ("pr_closed", 9) in source.calls
+        assert source.reviews == []
+
+
+class TestMergeWatch:
+    """Acceptance is not the end of the story: the source issue settles —
+    close plus completed label — when the PR actually lands. The watch
+    sweeps accepted-but-unsettled rows in daemon_pr_state, throttled to one
+    read per PR per interval, and survives restarts because the rows do.
+    """
+
+    def _accepted(self, tmp_path: Path, **daemon: object) -> tuple[Harness, ReviewingSource]:
+        """One github patch item run to done (no review gate), watch armed."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": dict({"await_review": False}, **daemon),
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
+        assert h.loop.tick().outcome == "done"
+        return h, source
+
+    def test_an_open_pr_waits_and_the_watch_is_throttled(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        h.loop.tick()  # first watch poll
+        assert source.merge_polls == 1
+        assert not any(kind in {"merged", "pr_closed"} for kind, _ in source.calls)
+        assert not h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        h.loop.tick()  # inside the interval: no read spent
+        assert source.merge_polls == 1
+        h.clock.t += 301
+        h.loop.tick()
+        assert source.merge_polls == 2
+
+    def test_a_merged_pr_settles_the_issue_once(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        source.merged = True
+        h.loop.tick()
+        assert [c for c in source.calls if c[0] == "merged"] == [("merged", 9)]
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        h.clock.t += 3600
+        h.loop.tick()  # settled rows are not polled again
+        assert source.merge_polls == 1
+
+    def test_a_pr_closed_unmerged_abandons_the_item(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        source.pr_open = False
+        h.loop.tick()
+        assert ("pr_closed", 9) in source.calls
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "without being merged" in (item.last_error or "")  # type: ignore[union-attr]
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+
+    def test_a_failed_settle_is_retried_next_interval(self, tmp_path: Path) -> None:
+        """report_merged returning False (a GitHub hiccup mid-settle) leaves
+        the row unsettled so the close is retried, not recorded as done."""
+        h, source = self._accepted(tmp_path)
+        source.merged = True
+        source.merged_ok = False
+        h.loop.tick()
+        assert not h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        source.merged_ok = True
+        h.clock.t += 301
+        h.loop.tick()
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        assert [c for c in source.calls if c[0] == "merged"] == [("merged", 9), ("merged", 9)]
+
+    def test_a_restart_resumes_the_watch(self, tmp_path: Path) -> None:
+        """The watch lives in daemon_pr_state, not in memory: a fresh loop
+        over the same store picks up where the old one stopped."""
+        h, source = self._accepted(tmp_path)
+        h.loop.tick()
+        assert source.merge_polls == 1
+        loop2 = DaemonLoop(
+            h.config,
+            store=h.store,
+            dstore=h.dstore,
+            sources=[source],
+            runner=h.runner,
+            clock=h.clock,
+        )
+        source.merged = True
+        h.clock.t += 301
+        loop2.tick()
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        assert ("merged", 9) in source.calls
+
+    def test_a_non_github_row_retires_without_a_read(self, tmp_path: Path) -> None:
+        """Inbox work has no issue to settle: its row is retired silently,
+        costing zero GitHub reads."""
+        h, source = self._accepted(tmp_path)
+        h.dstore.upsert_new(inbox_item(), h.clock.t)
+        h.dstore.mark_done("inbox:a.md", h.clock.t)
+        h.dstore.record_delivery("inbox:a.md", 7, "b", h.clock.t, url="u")
+        h.loop.tick()
+        assert h.dstore.pr_state("inbox:a.md").settled  # type: ignore[union-attr]
+        assert source.merge_polls == 1  # only gh:1 was asked
+
+    def test_deliver_closes_is_threaded_for_github_patch_items(self, tmp_path: Path) -> None:
+        """The PR body carries `Closes #N` so GitHub links issue and PR and
+        closes the issue on merge even when the daemon is down."""
+        h, _ = self._accepted(tmp_path)
+        assert h.run_configs[0].github.deliver_closes == 1
+
+    def test_deliver_closes_is_not_set_for_inbox_items(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        assert h.loop.tick().outcome == "done"
+        assert h.run_configs[0].github.deliver_closes is None
