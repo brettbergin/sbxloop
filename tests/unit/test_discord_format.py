@@ -15,6 +15,7 @@ from sbxloop.daemon.discord_format import (
     EMBED_TOTAL_MAX,
     TOOL_FAIL_OUTPUT_LINES_DEFAULT,
     TOOL_OUTPUT_LINES_DEFAULT,
+    Chunk,
     EmbedSpec,
     RunStats,
     StatusLine,
@@ -37,6 +38,8 @@ from sbxloop.daemon.discord_format import (
     mask_urls,
     output_excerpt,
     queue_lines,
+    redact_chunk,
+    redact_embed,
     ref_link,
     refs_text,
     repetitive_streak,
@@ -1229,3 +1232,67 @@ class TestOldWorkerEventCompatibility:
             "bash", 1, "x" * 200000 + "\n" + "y\n" * 5000, success=False, max_lines=200
         )
         assert chunk is not None and len(chunk.text) <= DISCORD_MAX_MESSAGE
+
+
+class TestRedactChunk:
+    """Every outgoing chunk is scrubbed at the publishing seam (#422)."""
+
+    PAT = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def test_agent_message_prose_quoting_a_token_is_masked(self) -> None:
+        text = f"I found GITHUB_TOKEN={self.PAT} in .env and used it"
+        out = redact_chunk(Chunk(text=text, kind="block", flush=True, suppress_embeds=True))
+        assert self.PAT not in out.text
+        assert "***" in out.text
+        assert (out.kind, out.flush, out.suppress_embeds) == ("block", True, True)
+
+    def test_embed_strings_are_all_masked(self) -> None:
+        embed = EmbedSpec(
+            title=f"verdict GITHUB_TOKEN={self.PAT}",
+            description=f"the report said API_KEY={self.PAT}",
+            url="https://example.invalid/pull/1",
+            color=COLOR_OK,
+            fields=(
+                (f"TOKEN={self.PAT}", f"value GITHUB_TOKEN={self.PAT}", True),
+                ("plain", "nothing to see", False),
+            ),
+            footer=f"footer GITHUB_TOKEN={self.PAT}",
+        )
+        out = redact_chunk(Chunk(text="see embed", embed=embed, kind="embed"))
+        assert out.embed is not None
+        blob = out.embed.as_text()
+        assert self.PAT not in blob
+        assert "***" in blob
+        assert out.embed.url == embed.url and out.embed.color == embed.color
+        assert out.embed.fields[1] == ("plain", "nothing to see", False)
+        assert out.kind == "embed"
+
+    def test_redact_embed_directly(self) -> None:
+        out = redact_embed(EmbedSpec(description=f"GITHUB_TOKEN={self.PAT}"))
+        assert self.PAT not in (out.description or "")
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "Planning now: I will read the config and run the tests",
+            "note: the password field is required but missing",
+            "**verdict** pass — 3 checks, 0 findings",
+            "```\nmake test\n```",
+            "",
+        ],
+    )
+    def test_ordinary_prose_is_byte_identical(self, prose: str) -> None:
+        chunk = Chunk(text=prose, kind="line")
+        out = redact_chunk(chunk)
+        assert out.text == prose
+        assert out is chunk
+
+    def test_never_raises_on_a_hostile_chunk(self) -> None:
+        class Weird:
+            def __str__(self) -> str:  # pragma: no cover - not called
+                raise RuntimeError("boom")
+
+        chunk = Chunk(text=Weird())  # type: ignore[arg-type]
+        out = redact_chunk(chunk)  # must not raise
+        assert isinstance(out, Chunk)
+        assert (out.kind, out.flush, out.suppress_embeds) == ("line", False, False)

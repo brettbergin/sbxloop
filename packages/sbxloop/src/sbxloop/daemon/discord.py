@@ -64,6 +64,7 @@ from sbxloop.daemon.discord_format import (
     format_for_discord,
     headline_embed,
     headline_text,
+    redact_chunk,
     split_markdown,
     status_embed,
     summary_embed,
@@ -75,7 +76,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.errors import DaemonError
 from sbxloop.events import Event, EventBus, HostEventTypes
-from sbxloop.log import get_logger
+from sbxloop.log import get_logger, redact_text
 
 if TYPE_CHECKING:
     from sbxloop.daemon.concierge import Concierge, ConciergeReply
@@ -696,7 +697,9 @@ class DiscordBridge:
         if turn.note is None:
             return
         try:
-            await turn.note.edit(content=_clip(turn.render(), self.discord.max_message_chars))
+            await turn.note.edit(
+                content=_clip(redact_text(turn.render()), self.discord.max_message_chars)
+            )
             turn.last_edit = time.monotonic()
         except Exception:
             log.warning("discord.concierge_note_edit_failed", exc_info=True)
@@ -793,7 +796,7 @@ class DiscordBridge:
                     buffer = await self._flush_all(buffer_run, buffer)
                     buffer = await self._digest_tick(buffer_run, buffer, close=True)
                 buffer_run = run_id
-                chunks = self._render(run_id, event)
+                chunks = [redact_chunk(c) for c in self._render(run_id, event)]
                 self._observe_facts(run_id, event)
                 self._runstats.setdefault(run_id, RunStats()).observe(event)
                 if event.type == "agent.tool_start":
@@ -976,7 +979,7 @@ class DiscordBridge:
         now = asyncio.get_event_loop().time()
         due = force or close or now - self._digest_last_edit.get(run_id, 0) >= DIGEST_EDIT_MIN_S
         if digest.dirty and (msg is None or due):
-            text = _clip(digest.render(), self.discord.max_message_chars)
+            text = _clip(redact_text(digest.render()), self.discord.max_message_chars)
             try:
                 if msg is None:
                     buffer = await self._flush_all(run_id, buffer)
@@ -1010,7 +1013,7 @@ class DiscordBridge:
                 await self._send(thread, "\n".join(group))
                 group, size = [], 0
 
-        for chunk in chunks:
+        for chunk in (redact_chunk(c) for c in chunks):
             if chunk.kind == "line":
                 if size + len(chunk.text) + 1 > limit and group:
                     await send_group()
@@ -1130,7 +1133,7 @@ class DiscordBridge:
         status = self._status.get(run_id)
         if status is None or (not status.dirty and not force):
             return
-        text = _clip(status.render(), self.discord.max_message_chars)
+        text = _clip(redact_text(status.render()), self.discord.max_message_chars)
         try:
             msg = self._status_msg.get(run_id)
             if msg is None:
@@ -1205,7 +1208,9 @@ class DiscordBridge:
         progress = self._progress.get(pending.run_id) or SteerProgress()
         try:
             await pending.status.edit(
-                content=_clip(progress.render(state=state), self.discord.max_message_chars)
+                content=_clip(
+                    redact_text(progress.render(state=state)), self.discord.max_message_chars
+                )
             )
         except Exception:
             log.warning(
@@ -1310,6 +1315,11 @@ class DiscordBridge:
         ``reply_to`` threads the message under a human's message
         (``send(reference=…)``); if Discord rejects the reference the text
         is sent plainly instead."""
+        # Last line of defence (#422): everything published — agent prose,
+        # verdict embeds, the daemon log tail — is scrubbed of credential
+        # shapes here, not just the renderers that remember to do it.
+        chunk = redact_chunk(Chunk(text=text or "", embed=embed))
+        text, embed = chunk.text, chunk.embed
         content = _clip(text, self.discord.max_message_chars) if text else None
         kwargs: dict[str, Any] = {}
         if reply_to is not None:
@@ -1463,6 +1473,8 @@ class DiscordBridge:
             if channel is None:
                 return
             msg = await channel.fetch_message(known.headline_id)
+            chunk = redact_chunk(Chunk(text=text or "", embed=embed))
+            text, embed = chunk.text, chunk.embed
             kwargs: dict[str, Any] = {"content": _clip(text, self.discord.max_message_chars)}
             if embed is not None and self.discord.embeds:
                 converted = _to_embed(embed)

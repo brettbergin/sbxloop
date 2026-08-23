@@ -26,8 +26,14 @@ House style
   keyword whose name says it is a credential; :func:`redact_text` masks
   credential *shapes* inside free-form text (a command line, captured
   stdout/stderr) where there is no key name to go on. The Discord bridge
-  runs every command and output excerpt it renders through
-  :func:`redact_text` before publishing it to a thread.
+  runs *everything* it publishes to a run thread through
+  :func:`redact_text` at the publish seam — agent prose, plan/roster text,
+  verdicts and findings summaries, embed strings, tool commands and output
+  excerpts, and the daemon log tail behind ``!sbx logs`` — via
+  :func:`sbxloop.daemon.discord_format.redact_chunk`. Redaction upstream
+  (in the worker, and in the individual renderers) is kept as defence in
+  depth: :func:`redact_text` is idempotent and leaves ordinary prose,
+  including plain ``key: value`` pairs, unchanged.
 
 The daemon configures the pipeline once via :func:`configure_logging`
 (``[daemon] log_level`` / ``--log-level``, ``log_format`` console|json).
@@ -202,6 +208,45 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _AUTH_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)((?:bearer|token|basic)\s+)?([^\s'\"]+)")
+
+#: An all-letter value at least this long stops reading as an English word and
+#: starts reading as a credential. Ordinary prose words are far shorter.
+_ALPHA_SECRET_MIN = 20
+_ALPHA_ONLY = re.compile(r"[A-Za-z]+")
+
+
+def _is_machine_name(name: str) -> bool:
+    """Whether ``name`` is written as machine syntax rather than prose.
+
+    An ALL-CAPS name (``GITHUB_TOKEN``, ``MY_PAT``) is an environment
+    variable, never an English sentence opener, so ``NAME: value`` with such
+    a name is masked without inspecting the value.
+    """
+    return any(c.isalpha() for c in name) and name == name.upper()
+
+
+def _looks_like_secret_value(value: str, *, quoted: bool) -> bool:
+    """Whether ``value`` reads as a credential rather than as English prose.
+
+    Only consulted for the ``NAME: value`` shape, which collides with
+    ordinary narration and Markdown (``password: required field is
+    missing``, ``- token: the word token appears here``). The ``NAME=value``
+    shape is machine syntax and is masked unconditionally.
+
+    A quoted value is a literal, so it is always treated as a credential. An
+    unquoted run of plain letters is treated as prose unless it is longer
+    than any ordinary word; anything else (digits, ``_-./+``, base64 padding)
+    has the shape of a secret.
+    """
+    if not value:
+        return False
+    if quoted:
+        return True
+    if _ALPHA_ONLY.fullmatch(value):
+        return len(value) >= _ALPHA_SECRET_MIN
+    return True
+
+
 # The credential word must be a whole delimiter-separated segment of the
 # name (`GITHUB_TOKEN`, `--api-key`, `my.secret`), not a substring of an
 # ordinary word — otherwise `PATH=`, `--patch`, `compat=1` and `patch: 3`
@@ -222,12 +267,20 @@ def _mask_value(match: re.Match[str]) -> str:
     prefix, sep, quote, value = match.group(1), match.group(2), match.group(3), match.group(4)
     if value.startswith("*"):
         return match.group(0)
+    if (
+        ":" in sep
+        and not _is_machine_name(prefix)
+        and not _looks_like_secret_value(value, quoted=bool(quote))
+    ):
+        return match.group(0)
     return f"{prefix}{sep}{quote}{REDACTED}{quote}"
 
 
 def _mask_auth(match: re.Match[str]) -> str:
     head, scheme, value = match.group(1), match.group(2) or "", match.group(3)
     if value.startswith("*"):
+        return match.group(0)
+    if not scheme and not _looks_like_secret_value(value, quoted=False):
         return match.group(0)
     return f"{head}{scheme}{REDACTED}"
 
@@ -242,6 +295,14 @@ def redact_text(text: str) -> str:
     <token>`` headers, ``NAME=value`` / ``NAME: value`` assignments whose
     name reads as a credential, and ``--token=…`` style CLI flags,
     replacing the credential with :data:`REDACTED`.
+
+    ``NAME=value`` and ``--flag=value`` are machine syntax and are masked on
+    the name alone. ``NAME: value`` is not: it is also how English narration
+    and Markdown are written (``password: required field is missing``,
+    ``- token: the word token appears here``), so unless the name is an
+    ALL-CAPS environment variable the value must itself look like a
+    credential -- quoted, or containing something other than plain letters,
+    or a letter run too long to be an ordinary word.
 
     Guarantees: ordinary text comes back unchanged, the function is
     idempotent (already-masked text is left alone) and it never raises —

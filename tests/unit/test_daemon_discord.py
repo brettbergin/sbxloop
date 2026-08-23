@@ -13,6 +13,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.discord import DiscordBridge, _Pending, format_for_discord, headline_text
+from sbxloop.daemon.discord_format import EmbedSpec
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.errors import DaemonError
@@ -1513,3 +1514,57 @@ class TestToolOutputRedactionWiring:
             assert literal not in blob, literal
         assert "***" in blob
         assert all(len(t) <= 2000 for t in texts)
+
+
+class TestPumpRedactionWiring:
+    """Every outgoing chunk — not just tool output — is scrubbed (#422)."""
+
+    PAT = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def test_agent_message_prose_is_masked_in_the_thread(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread_id = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
+            thread = client.channels[thread_id]
+            bus.emit(
+                "agent.message",
+                "r1",
+                content=f"I read GITHUB_TOKEN={self.PAT} from the env file",
+                agent="executor",
+                model="m",
+            )
+            assert wait_for(lambda: any("env file" in s for s in thread.sent))
+            blob = "\n".join(thread.sent)
+            assert self.PAT not in blob
+            assert "***" in blob
+        finally:
+            bridge.close()
+
+    def test_embed_strings_are_masked_at_the_send_seam(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        embed = EmbedSpec(
+            title=f"report GITHUB_TOKEN={self.PAT}",
+            description=f"found API_KEY={self.PAT}",
+            fields=((f"TOKEN={self.PAT}", f"GITHUB_TOKEN={self.PAT}", False),),
+            footer=f"GITHUB_TOKEN={self.PAT}",
+        )
+        asyncio.run(bridge._send(channel, f"GITHUB_TOKEN={self.PAT}", embed=embed))
+        sent_embed = channel.messages[next(iter(channel.messages))].embed
+        spec = sent_embed.spec if sent_embed is not None else None
+        blob = "\n".join(channel.sent) + "\n" + (spec.as_text() if spec is not None else "")
+        assert spec is not None
+        assert self.PAT not in blob
+        assert "***" in blob
+
+    def test_ordinary_prose_is_sent_unchanged(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        prose = "note: the password field is required but missing — see docs/config.md"
+        asyncio.run(bridge._send(channel, prose))
+        assert channel.sent == [prose]

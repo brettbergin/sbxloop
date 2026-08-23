@@ -350,11 +350,17 @@ calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
   configurable as `[discord] tool_output_lines` / `tool_fail_output_lines`.
   The finished message is additionally clamped to `DISCORD_MAX_MESSAGE`, so no
   input can overflow Discord's limit.
-- **Redaction at the render seam.** The worker already redacts an event's
-  output before it leaves the sandbox; because this feature *publishes* more
-  of what a command printed, every rendered command and every excerpt passes
-  through `sbxloop.log.redact_text` again on the way to a thread. It is
-  idempotent, so text already masked upstream is unchanged. The credential
+- **Redaction at the publish seam.** The worker already redacts an event's
+  output before it leaves the sandbox; the bridge redacts again on the way
+  out, and not only for tool detail. `redact_chunk()` scrubs a chunk's text
+  and every human-visible embed string, and it is applied to *every*
+  outgoing chunk and message, so everything a run thread publishes — agent
+  prose, plan/roster text, verdicts and findings summaries, tool commands
+  and excerpts, and the daemon log tail behind `!sbx logs` — is masked
+  before it reaches Discord. Upstream redaction stays as defence in depth,
+  and the masking is idempotent, so text already masked upstream is
+  unchanged, and ordinary prose containing a `key: value` pair whose value
+  reads as English comes back byte-identical. The credential
   vocabulary is deliberately spelled twice — `sbxloop_worker.secrets` (worker
   side; the worker cannot import sbxloop) and `sbxloop.log` (host side) — and
   the two word lists differ slightly, so a word added to one should be

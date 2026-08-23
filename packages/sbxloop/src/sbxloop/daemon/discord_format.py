@@ -15,13 +15,21 @@ bridge sends every message with mentions disabled instead, so a stray
 
 Redaction guarantee
 -------------------
-Every command line and every tool-output excerpt rendered here passes
-through :func:`sbxloop.log.redact_text` before it can reach a Discord
-thread — :func:`_tool_line`, :func:`output_excerpt` and
-:meth:`ToolDigest.render` all apply it. Upstream redaction (the event
-payload) still applies; this is a second, render-time belt so that
-surfacing tool stdout/stderr in a thread cannot publish a credential that
-upstream missed. It is idempotent, so already-masked text is unchanged.
+*Everything* a run thread publishes is redacted at the publish seam, not
+just tool detail: agent prose, plan/roster text, verdicts and findings
+summaries, tool commands and output excerpts, and the daemon log tail
+surfaced by ``!sbx logs``. :func:`redact_chunk` scrubs a chunk's text and
+every human-visible embed string (title, description, field names and
+values, footer) with :func:`sbxloop.log.redact_text`, and the bridge
+applies it to every outgoing chunk and message — the pump's render step,
+the flush loop and the send/edit seams — plus the status line, tool
+digest, steer status and concierge note edits. The dedicated renderers
+here (:func:`_tool_line`, :func:`output_excerpt`,
+:meth:`ToolDigest.render`) still redact, and upstream redaction of the
+event payload in the worker still applies: both are defence in depth. The
+masking is idempotent, so already-masked text is unchanged, and it leaves
+ordinary prose — including `key: value` pairs whose value reads as
+English — byte-identical.
 """
 
 from __future__ import annotations
@@ -223,6 +231,54 @@ class Chunk:
     kind: str = "line"
     flush: bool = False
     suppress_embeds: bool = False
+
+
+def _redact(text: str | None) -> str | None:
+    if not text:
+        return text
+    try:
+        return redact_text(text)
+    except Exception:  # pragma: no cover - redact_text is documented not to raise
+        return text
+
+
+def redact_embed(embed: EmbedSpec) -> EmbedSpec:
+    """A copy of ``embed`` with every human-visible string scrubbed by
+    :func:`sbxloop.log.redact_text`. Non-text attributes (url, color,
+    field ``inline`` flags) are untouched."""
+    return EmbedSpec(
+        title=_redact(embed.title),
+        description=_redact(embed.description),
+        url=embed.url,
+        color=embed.color,
+        fields=tuple((_redact(n) or "", _redact(v) or "", i) for n, v, i in embed.fields),
+        footer=_redact(embed.footer),
+    )
+
+
+def redact_chunk(chunk: Chunk) -> Chunk:
+    """A copy of ``chunk`` with its text and embed strings scrubbed.
+
+    The last line of defence before publishing: agent prose, plan/roster
+    text, verdict embeds and log tails all pass through here, so a
+    credential an upstream renderer failed to mask never reaches Discord.
+    ``kind``, ``flush`` and ``suppress_embeds`` are preserved and the
+    helper never raises — an unredactable chunk is returned as-is.
+    """
+    try:
+        text = _redact(chunk.text) or ""
+        embed = redact_embed(chunk.embed) if chunk.embed is not None else None
+        if text == chunk.text and embed is chunk.embed:
+            return chunk
+        return Chunk(
+            text=text,
+            embed=embed,
+            kind=chunk.kind,
+            flush=chunk.flush,
+            suppress_embeds=chunk.suppress_embeds,
+        )
+    except Exception:  # pragma: no cover - defensive: publishing must not break
+        return chunk
 
 
 def line(text: str, *, flush: bool = False) -> Chunk:

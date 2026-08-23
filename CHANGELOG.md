@@ -103,6 +103,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Every outgoing Discord chunk is redacted, not just tool output.**
+  `redact_chunk()` in `discord_format.py` scrubs a chunk's text and every
+  human-visible embed string (title, description, field names/values,
+  footer) with `sbxloop.log.redact_text`, and the bridge applies it at the
+  publishing seam — the pump's render step, the `_flush` loop and `_send`
+  itself — plus the status line, tool digest, steer-status and concierge
+  note edits. Agent prose quoting a token it read from an env file, a
+  verdict/report embed and the `!sbx logs` tail are all masked now; #403
+  only covered tool commands and output excerpts. `kind`, `flush` and
+  `suppress_embeds` are preserved, ordinary prose comes back byte-identical
+  and the helper never raises (#422).
+
 - **The end-of-run summary card is back as the thread's last post.** The
   fix delivered for #420 (tool-call rendering) also deleted the summary
   card machinery shipped hours earlier — `RunStats`, `summary_text`,

@@ -1523,3 +1523,115 @@ class TestWatchRun:
 
         source = Path(str(module.__file__)).read_text(encoding="utf-8")
         assert re.search(r"^\s*(import|from)\s+discord", source, re.M) is None
+
+
+class TestToolReplyRedaction:
+    """#422 t3: the concierge does not go through the run-thread pump, so
+    tool replies that echo captured run/log/event text are the last place a
+    credential shape can reach Discord. Every reply is redacted at the
+    single point where the host tool response is built."""
+
+    TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    @pytest.fixture(autouse=True)
+    def _buffer(self) -> Any:
+        from sbxloop.log import log_buffer
+
+        log_buffer().clear()
+        yield
+        log_buffer().clear()
+
+    def _seed_run(self, tmp_path: Path, dstore: DaemonStore, loop: LoopWithRuns) -> StateStore:
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r1abcdefg", "Ship the widget")
+        store.save_tasks("r1abcdefg", [TaskSpec(id="t1", title="Build widget")])
+        store.set_run_state("r1abcdefg", "completed")
+        loop.reports["r1abcdefg"] = RunReport("r1abcdefg", "completed", "1/1 tasks done")
+        return store
+
+    def test_daemon_log_tail_is_redacted(self, tmp_path: Path) -> None:
+        from sbxloop.log import LogRecordLine, log_buffer
+
+        log_buffer().append(
+            LogRecordLine(
+                "2026-01-01T00:00:00+00:00",
+                "ERROR",
+                "sbxloop.gh.poll",
+                f"github.poll_failed using {self.TOKEN} sbxq",
+            )
+        )
+        concierge, client, _, _, _ = make(tmp_path, [{"calls": [("daemon_log", {"grep": "sbxq"})]}])
+        turn(concierge)
+        text = client.responses[0].text
+        assert self.TOKEN not in text
+        assert "***" in text
+        assert "github.poll_failed using" in text and "sbxq" in text
+
+    def test_run_events_output_is_redacted(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, dstore = make(
+            tmp_path, [{"calls": [("run_events", {"run_id": "r1abcdefg", "tail": 50})]}]
+        )
+        store = self._seed_run(tmp_path, dstore, loop)
+        from sbxloop.events import Event
+
+        store.append_event(
+            Event.now(
+                "agent.message",
+                "r1abcdefg",
+                content=f"I found GITHUB_TOKEN={self.TOKEN} in the env file",
+                agent="executor",
+            )
+        )
+        turn(concierge)
+        text = client.responses[0].text
+        assert self.TOKEN not in text
+        assert "I found" in text and "in the env file" in text
+
+    def test_run_detail_outcome_is_redacted(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("run_detail", {"run_id": "r1abcdefg"})]}]
+        )
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r1abcdefg", f"done; used token {self.TOKEN} once")
+        store.save_tasks("r1abcdefg", [TaskSpec(id="t1", title="Build widget")])
+        store.set_run_state("r1abcdefg", "completed")
+        loop.reports["r1abcdefg"] = RunReport("r1abcdefg", "completed", "1/1 tasks done")
+        turn(concierge)
+        text = client.responses[0].text
+        assert self.TOKEN not in text
+        assert "done; used token" in text and "once" in text
+
+    def test_item_detail_body_is_redacted(self, tmp_path: Path) -> None:
+        concierge, client, _, _, dstore = make(
+            tmp_path, [{"calls": [("item_detail", {"item_id": "inbox:w.md"})]}]
+        )
+        item = WorkItem(
+            item_id="inbox:w.md",
+            source="inbox",
+            source_key="w.md",
+            title="Widget",
+            body=f"deploy with GITHUB_TOKEN={self.TOKEN} please",
+        )
+        dstore.upsert_new(item, 1.0)
+        turn(concierge)
+        text = client.responses[0].text
+        assert self.TOKEN not in text
+        assert "deploy with" in text and "please" in text
+
+    def test_ordinary_prose_reply_is_untouched(self, tmp_path: Path) -> None:
+        concierge, client, _, _, dstore = make(
+            tmp_path, [{"calls": [("item_detail", {"item_id": "inbox:w.md"})]}]
+        )
+        dstore.upsert_new(
+            WorkItem(
+                item_id="inbox:w.md",
+                source="inbox",
+                source_key="w.md",
+                title="Widget",
+                body="note: the key thing here is that prose survives",
+            ),
+            1.0,
+        )
+        turn(concierge)
+        text = client.responses[0].text
+        assert "note: the key thing here is that prose survives" in text

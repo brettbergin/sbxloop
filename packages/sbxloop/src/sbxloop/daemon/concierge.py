@@ -59,7 +59,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
-from sbxloop.log import get_logger, log_buffer
+from sbxloop.log import get_logger, log_buffer, redact_text
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
     EventTypes,
@@ -417,11 +417,12 @@ class Concierge:
                 error=f"{type(exc).__name__}: {exc}"[:300],
                 exc_info=True,
             )
+            detail = redact_text(f"{type(exc).__name__}: {exc}")
             return HostToolResponse(
                 call_id=call.call_id,
                 ok=False,
-                text=f"tool {call.name} failed: {type(exc).__name__}: {exc}",
-                error=f"{type(exc).__name__}: {exc}",
+                text=f"tool {call.name} failed: {detail}",
+                error=detail,
             )
         log.info(
             "concierge.tool",
@@ -433,7 +434,10 @@ class Concierge:
         return HostToolResponse(
             call_id=call.call_id,
             ok=True,
-            text=_clip(text, self.config.concierge.max_tool_result_chars),
+            # Single redaction point for every tool reply: handlers echo
+            # run-produced text (log tails, event payloads, item detail) that
+            # upstream redaction does not cover.
+            text=_clip(redact_text(text), self.config.concierge.max_tool_result_chars),
         )
 
     def _build_tools(self) -> list[HostTool]:

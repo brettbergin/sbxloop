@@ -375,3 +375,96 @@ class TestRedactText:
         once = redact_text(f"API_KEY=abc {self.PAT} Authorization: Bearer {self.JWT}")
         assert redact_text(once) == once
         assert redact_text(None) == "None"  # type: ignore[arg-type]
+
+
+#: Agent narration, plan/verdict text and Markdown that a blanket redaction
+#: pass over every outgoing Discord chunk will now hit (#422 t1). None of it
+#: contains a credential, so none of it may be altered.
+PROSE_CORPUS: tuple[str, ...] = (
+    "Note: the secret sauce is caching",
+    "password: required field is missing",
+    "- token: the word token appears here",
+    "* secret: kept in the operator's password manager",
+    "Warning: apikey must be a string",
+    "authorization: required for admin routes",
+    "TODO: password reset flow needs tests.",
+    "Fix: token handling was broken in the tokenizer.",
+    "The token is stored in the keyring, not in the repo.",
+    "I read the config and the api_key was absent.",
+    "Verdict: pass. The redaction seam masks the token before publishing.",
+    "1. token: leading digits are a list marker, not an assignment\n2. secret: still prose",
+    "```python\napi_key: str | None = None\n```",
+    "```\npassword: required\n```",
+    "> Note: secret handling is documented in docs/architecture.md",
+    "| field | notes |\n| token | opaque |\n| secret | never logged |",
+    "See `redact_text`: token shapes are masked wherever they appear.",
+    "uv run pytest -q tests/unit",
+    "grep -rn 'daemon_log' README.md | head -40",
+    "",
+)
+
+#: Real credential shapes that must never survive the pass.
+SECRET_CORPUS: tuple[tuple[str, str], ...] = (
+    ("gh auth login --with-token ghp_" + "A" * 36, "ghp_" + "A" * 36),
+    ("token=github_pat_11ABCDEFG0" + "b" * 30, "github_pat_11ABCDEFG0" + "b" * 30),
+    ("curl -H 'Authorization: Bearer eyJhbGciOi.abc.def'", "eyJhbGciOi.abc.def"),
+    ("Authorization: dGhpcy1pcy1hLXNlY3JldA==", "dGhpcy1pcy1hLXNlY3JldA=="),
+    ("env API_KEY=sk-live-abc123 ./run.sh", "sk-live-abc123"),
+    ("GITHUB_TOKEN: ghx-9f8e7d6c5b4a", "ghx-9f8e7d6c5b4a"),
+    ("DISCORD_BOT_TOKEN: hunter2", "hunter2"),
+    ("sbx --api-key=k3y-v4lu3-here run", "k3y-v4lu3-here"),
+    ("app.token=t0k3n-material", "t0k3n-material"),
+    ('password: "correct horse battery"', "correct horse battery"),
+    ("secret: aG93LWxvbmctY2FuLWEtd29yZC1iZQ", "aG93LWxvbmctY2FuLWEtd29yZC1iZQ"),
+)
+
+
+class TestRedactTextProseCorpus:
+    """A blanket pass over prose must be a no-op (#422 t1)."""
+
+    @pytest.mark.parametrize("text", PROSE_CORPUS)
+    def test_prose_unchanged(self, text: str) -> None:
+        from sbxloop.log import redact_text
+
+        assert redact_text(text) == text
+
+    @pytest.mark.parametrize(("text", "literal"), SECRET_CORPUS)
+    def test_secrets_masked(self, text: str, literal: str) -> None:
+        from sbxloop.log import redact_text
+
+        out = redact_text(text)
+        assert literal not in out
+        assert "***" in out
+
+    @pytest.mark.parametrize("text", [*PROSE_CORPUS, *[t for t, _ in SECRET_CORPUS]])
+    def test_idempotent(self, text: str) -> None:
+        from sbxloop.log import redact_text
+
+        once = redact_text(text)
+        assert redact_text(once) == once
+
+    def test_whole_document_of_prose_unchanged(self) -> None:
+        """The corpus joined into one multi-line message, as the pump sees it."""
+        from sbxloop.log import redact_text
+
+        document = "\n\n".join(PROSE_CORPUS)
+        assert redact_text(document) == document
+
+    def test_secrets_masked_when_embedded_in_prose(self) -> None:
+        from sbxloop.log import redact_text
+
+        message = "I exported API_KEY=sk-live-abc123 first; note: the secret sauce is caching."
+        out = redact_text(message)
+        assert "sk-live-abc123" not in out
+        assert "note: the secret sauce is caching." in out
+
+    def test_never_raises_on_odd_input(self) -> None:
+        from sbxloop.log import redact_text
+
+        class Boom:
+            def __str__(self) -> str:
+                return "token=abc123"
+
+        assert redact_text(Boom()) == "token=***"  # type: ignore[arg-type]
+        assert redact_text(None) == "None"  # type: ignore[arg-type]
+        assert redact_text(12345) == "12345"  # type: ignore[arg-type]
