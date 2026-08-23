@@ -590,6 +590,7 @@ class CopilotBackend:
         from copilot import CopilotClient
 
         usage = Usage()
+        turns = 0
         tracker = SessionHealthTracker()
         governor = ToolCallGovernor(job.max_tool_calls)
         final_text: list[str] = []
@@ -605,7 +606,7 @@ class CopilotBackend:
         tool_calls = ToolCallRegistry()
 
         def on_event(event: Any) -> None:
-            nonlocal usage, model_slug
+            nonlocal usage, turns, model_slug
             data = getattr(event, "data", None)
             type_name = type(data).__name__ if data is not None else type(event).__name__
             if type_name == "AssistantMessageDeltaData":
@@ -660,6 +661,7 @@ class CopilotBackend:
             elif type_name == "AssistantUsageData":
                 sample = usage_from_sdk_sample(data)
                 usage = usage.merged(sample)
+                turns += 1
                 if sample.model:
                     model_slug = sample.model
                 payload = sample.model_dump(exclude_none=True)
@@ -684,6 +686,7 @@ class CopilotBackend:
                     output_json=output_json,
                     session_id=session_id,
                     usage=usage if usage != Usage() else None,
+                    turns=turns or None,
                     health=tracker.health(governor),
                 )
             finally:
