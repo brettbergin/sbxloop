@@ -30,6 +30,25 @@ All notable changes to sbxloop are documented here. The project adheres to
   loader forbids unknown keys, so a config still setting that key under
   `[budgets]` is now rejected — delete the key.
 
+### Changed
+
+- **The PR review lane hunts defects adversarially, and its briefs stop
+  pointing at tools that cannot work.** #437. `REVIEW_INSTRUCTIONS` now
+  names the defect lenses that field-verified as leaking past the pipeline
+  to outside reviewers — concurrency/locking (TOCTOU), failure ordering and
+  partial writes, input validation at trust boundaries, and cross-module
+  interaction ("walk every caller") — with an explicit "a green gate is
+  necessary, not sufficient". The review charter sends the reviewer to
+  `git diff origin/<base>...HEAD` instead of claiming `gh pr diff` works
+  (the agent sandbox holds no GitHub credential), and a review-driven fix
+  round now *quotes the standing objections into its brief*: the daemon
+  fetches the change-requesting review bodies and inline comments through
+  the github-ops sandbox (`pr_review_feedback`, latest verdict per reviewer,
+  anchors preserved) rather than telling the fix agent to run
+  `gh pr view --comments` in a sandbox where it cannot. Fix-round dispatch
+  also stops nesting one brief's boilerplate inside another's: the persisted
+  brief rides on the seeded task verbatim.
+
 ### Added
 
 - **`pr_status(number)`, a concierge host tool for how a delivered PR is
