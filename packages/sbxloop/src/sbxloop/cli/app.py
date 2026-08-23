@@ -2212,6 +2212,8 @@ mem_abort = 0.0
 # embeds = true                    # headline / finished / status as embed cards
 # status_line = true               # one per-run message edited as tasks progress
 # tool_batch_lines = 8             # verbose: consecutive tool calls per code block
+# tool_output_lines = 0            # tail output lines echoed for a successful call (0 = none)
+# tool_fail_output_lines = 20      # head+tail output lines echoed for a failed call
 
 [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask

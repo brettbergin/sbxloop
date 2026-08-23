@@ -410,8 +410,13 @@ refused egress called out; and a finished report card (the headline turns
 shape — `🔎 audit #701 filed for charter flakes · audit: flakes`,
 `🔎 review #801 filed for PR #9 · gh:4`, `🔎 post-mortem #901 filed for gh:4 · abandoned: …`, `✅ gh:9 done (2/2 tasks done) · filed #50` — with every
 issue number a link. Mentions are always disabled, so model output can never ping the
-channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
-`chronology_level` tune it. **@mention the bot in a run's thread to steer that run**
+channel. `[discord] embeds`, `status_line`, `tool_batch_lines`,
+`tool_output_lines` (tail output lines echoed for a *successful* call,
+default `0` = none) and `tool_fail_output_lines` (head+tail lines echoed for a
+*failed* call, default `20` — a watcher needs the stderr) tune it, along with
+`chronology_level`. Excerpts are line-clipped, body-capped and clamped to
+Discord's 2000-character message limit, with any elision marked
+`… N lines elided …`. **@mention the bot in a run's thread to steer that run**
 (or reply to one of its messages there) — the same rule the control channel
 uses, so people can talk about a run in its own thread without derailing it.
 Your message is
@@ -474,12 +479,6 @@ above `DEBUG`/`INFO`/`WARNING`/`ERROR`, and `grep` is a plain
 case-insensitive substring — never a regular expression, so no pattern from
 chat can wedge the daemon. The result is clipped to
 `[concierge] max_tool_result_chars` like every other tool result.
-Ask "how is PR #41 doing?" and `pr_status(number)` answers with the CI check
-runs ("3 checks passed, 1 failed (test (3.13) — url)"), the review decision
-and reviewers, whether GitHub calls it mergeable, and whether the branch is
-behind its base — a PR that does not exist is answered plainly, and the
-result is clipped like every other tool result. It is read-only: the
-concierge never merges a PR from chat.
 Say "tell me when r7… is done" (a run id or a work item id) and `watch_run`
 registers your interest: it confirms, and when that run lands the daemon
 posts in the control channel @mentioning you with the outcome — final

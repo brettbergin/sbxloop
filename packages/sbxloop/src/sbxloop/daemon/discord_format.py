@@ -12,6 +12,16 @@ fenced blocks with a language, ``> quotes``, masked links ``[text](url)``,
 and ``<url>`` to suppress unfurling. Agent prose is never escaped — the
 bridge sends every message with mentions disabled instead, so a stray
 ``@everyone`` in model output cannot ping anyone.
+
+Redaction guarantee
+-------------------
+Every command line and every tool-output excerpt rendered here passes
+through :func:`sbxloop.log.redact_text` before it can reach a Discord
+thread — :func:`_tool_line`, :func:`output_excerpt` and
+:meth:`ToolDigest.render` all apply it. Upstream redaction (the event
+payload) still applies; this is a second, render-time belt so that
+surfacing tool stdout/stderr in a thread cannot publish a credential that
+upstream missed. It is idempotent, so already-masked text is unchanged.
 """
 
 from __future__ import annotations
@@ -24,15 +34,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from sbxloop.cli.cmdfmt import format_command
 from sbxloop.cli.tui import (
     _LIFECYCLE_PREFIXES,
     _TRANSCRIPT_SKIP,
     TOOL_ARGS_LINE_CLIP,
-    TOOL_FAIL_TAIL_LINES,
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.events import Event, HostEventTypes
+from sbxloop.log import redact_text
 
 # Discord's hard cap per message; _clip never returns more than this even
 # if a caller passes a nonsense limit.
@@ -47,6 +58,26 @@ EMBED_FIELD_VALUE_MAX = 1024
 EMBED_FIELDS_MAX = 25
 EMBED_TOTAL_MAX = 6000
 EMBED_FOOTER_MAX = 2048
+
+# -- tool output excerpt budget -------------------------------------------------------------
+# What a completed tool call is allowed to publish back into the thread.
+# Deliberately asymmetric: a success is noise once you know it succeeded, a
+# failure is the thing the watcher opened the thread for. Every one of these
+# is an upper bound only -- the renderer additionally clamps the finished
+# message to DISCORD_MAX_MESSAGE, so no combination can overflow Discord.
+
+# Tail lines shown for a *successful* call. 0 (the default) means a success
+# renders no block of its own: its outcome and exit status already appear on
+# the batched ``$ bash …  ✓ 1.2s`` line, and giving every success a block
+# would break batching and flood the thread. Raise it to echo output.
+TOOL_OUTPUT_LINES_DEFAULT = 0
+# Total head+tail lines shown for a *failed* call: enough stderr to act on.
+TOOL_FAIL_OUTPUT_LINES_DEFAULT = 20
+# Per-line character clip inside an excerpt, so one 1MB line cannot eat the
+# whole budget before the total-chars cap is applied.
+TOOL_EXCERPT_LINE_CLIP = 300
+# Total characters of fenced body across all excerpt lines.
+TOOL_EXCERPT_MAX_CHARS = 1200
 
 COLOR_RUNNING = 0x3498DB
 COLOR_OK = 0x2ECC71
@@ -386,33 +417,186 @@ def _strip_bare_json(text: str) -> str:
 # -- tool batching --------------------------------------------------------------------------
 
 
+def _excerpt_lines(
+    lines: list[str], max_lines: int, total: int, line_clip: int, *, tail_only: bool = False
+) -> list[str]:
+    """Head+tail selection of at most ``max_lines`` lines with a middle
+    ``… N lines elided …`` marker; ``total`` is the true line count of the
+    original output (which may exceed what survived upstream clipping)."""
+    if max_lines <= 0:
+        return []
+    if len(lines) <= max_lines:
+        picked = list(lines)
+        cut = len(picked)
+    elif tail_only or max_lines == 1:
+        picked = lines[-max_lines:]
+        cut = 0
+    else:
+        head_n = max_lines // 2
+        tail_n = max_lines - head_n
+        picked = lines[:head_n] + lines[-tail_n:]
+        cut = head_n
+    omitted = max(0, total - len(picked))
+    out = [_clip(ln.rstrip(), line_clip).replace("```", "'''") for ln in picked]
+    if omitted > 0:
+        out = [*out[:cut], f"… {omitted} lines elided …", *out[cut:]]
+    return out
+
+
+def output_excerpt(
+    tool: str,
+    exit_code: int | None,
+    detail: str,
+    *,
+    success: bool | None = False,
+    output_lines: int | None = None,
+    max_lines: int | None = None,
+    line_clip: int = TOOL_EXCERPT_LINE_CLIP,
+    max_chars: int = TOOL_EXCERPT_MAX_CHARS,
+) -> Chunk | None:
+    """The block a completed tool call gets to itself: an outcome header
+    plus a bounded excerpt of its output.
+
+    A failure shows ``TOOL_FAIL_OUTPUT_LINES_DEFAULT`` head+tail lines (the
+    caller should pass the event's ``error``, falling back to ``output``, so
+    stderr is what appears); a success shows at most
+    ``TOOL_OUTPUT_LINES_DEFAULT`` tail lines and renders nothing at all when
+    that budget is 0 and there is nothing to say. Elision is marked with
+    ``… N lines elided …``, counted from ``output_lines`` (the event's true
+    line count) when the stored text was itself truncated.
+
+    Bounds: each line is clipped to ``line_clip``, the fenced body to
+    ``max_chars``, and the finished message to ``DISCORD_MAX_MESSAGE`` --
+    so no input, however pathological, can exceed Discord's limit.
+
+    Redaction: upstream masks the event payload, and this renderer
+    additionally runs the detail through :func:`sbxloop.log.redact_text`
+    before splitting it into lines, so a credential shape that survived
+    upstream (or that spans a clipped line) still cannot reach the thread.
+    """
+    failed = success is False
+    if max_lines is None:
+        max_lines = TOOL_FAIL_OUTPUT_LINES_DEFAULT if failed else TOOL_OUTPUT_LINES_DEFAULT
+    exit_part = f" (exit {exit_code})" if exit_code is not None else ""
+    head = f"✗ {code(tool)} failed{exit_part}" if failed else f"✓ {code(tool)}{exit_part}"
+    lines = [ln for ln in redact_text(str(detail or "")).strip().splitlines() if ln.strip()]
+    total = max(len(lines), int(output_lines or 0))
+    picked = _excerpt_lines(lines, int(max_lines), total, line_clip, tail_only=not failed)
+    if not picked:
+        return block(head) if failed else None
+    body = "\n".join(picked)
+    # Body cap, then a whole-message clamp that also re-closes the fence if
+    # the clamp landed inside it.
+    body = _cut(body, max(1, int(max_chars)))
+    text = f"{head}\n```text\n{body}\n```"
+    if len(text) > DISCORD_MAX_MESSAGE:
+        text = _clip(text, DISCORD_MAX_MESSAGE - 4).rstrip("\n") + "\n```"
+    return block(text)
+
+
 def failure_detail(tool: str, exit_code: int | None, detail: str) -> Chunk:
-    """The block a failed tool call gets to itself: marker line plus the
-    last few output lines, so the ✗ and its explanation sit together."""
-    tail = [ln for ln in str(detail or "").strip().splitlines() if ln.strip()][
-        -TOOL_FAIL_TAIL_LINES:
-    ]
-    head = f"✗ {code(tool)} failed" + (f" (exit {exit_code})" if exit_code is not None else "")
-    if not tail:
-        return block(head)
-    body = "\n".join(_clip(ln.rstrip(), 300).replace("```", "'''") for ln in tail)
-    return block(f"{head}\n```text\n{body}\n```")
+    """Backwards-compatible failure renderer: :func:`output_excerpt` with
+    the failure budget. Always returns a chunk."""
+    chunk = output_excerpt(tool, exit_code, detail, success=False)
+    assert chunk is not None
+    return chunk
+
+
+def _duration(ms: float | int | None) -> str:
+    """``1.2s`` / ``840ms`` for a call's duration; empty when unknown."""
+    if ms is None:
+        return ""
+    try:
+        value = float(ms)
+    except (TypeError, ValueError):
+        return ""
+    if value < 1000:
+        return f"{round(value)}ms"
+    return f"{value / 1000:.1f}s"
+
+
+def _tool_line(
+    tool: str,
+    args: str,
+    *,
+    success: bool | None = None,
+    exit_code: int | None = None,
+    duration_ms: float | int | None = None,
+    running: bool = False,
+) -> str:
+    """One rendered line for a tool call: ``$ bash  <command>  ✓ 1.2s``.
+
+    The command goes through :func:`format_command`, so the boilerplate
+    ``cd <run path> &&`` prefix collapses to ``cd $RUN &&``, the leading
+    verb always survives and no token is cut without a ``…`` marker.
+
+    The raw command is scrubbed with :func:`sbxloop.log.redact_text` first
+    (before formatting, so token boundaries are still intact), so no
+    credential can be published even if one reached the event payload.
+    """
+    text = f"$ {tool}"
+    args_line = format_command(redact_text(str(args or "")), TOOL_ARGS_LINE_CLIP - 40)
+    if args_line:
+        text += f"  {args_line}"
+    dur = _duration(duration_ms)
+    if running:
+        text += "  … running"
+    elif success is False:
+        marker = f"✗ exit {exit_code}" if exit_code is not None else "✗ failed"
+        text += f"  {marker}" + (f" · {dur}" if dur else "")
+    elif success is True:
+        text += "  ✓" + (f" {dur}" if dur else "")
+    elif dur:
+        text += f"  {dur}"
+    return text.replace("```", "'''")
 
 
 class ToolBatcher:
-    """Collects consecutive tool calls into one fenced block.
+    """Collects tool calls into one fenced block, one line per call.
 
-    ``add_start``/``add_end`` feed it; ``flush()`` renders the block. A
-    failed call marks its own line with ``✗ exit N`` and yields a detail
-    chunk (last few output lines) that the pump sends right after the
-    batch, so the marker and its explanation sit together.
+    A call is rendered exactly once, when it completes: ``add_start``
+    records it as pending (emitting nothing) and ``add_end`` resolves it
+    by ``tool_call_id`` and appends the single line carrying the command,
+    the outcome (``✓`` / ``✗ exit N``) and the duration. Correlation is
+    strictly by call id, so concurrent calls that finish out of order
+    still pair up and each line carries its own command.
+
+    An end with no matching start renders from the end event's own tool
+    and args; if the end carries neither an id nor args (an older worker
+    that predates ``tool_call_id``), it falls back to the oldest in-flight
+    start for the same tool. A start that never ends is rendered as
+    ``… running`` when the batch is flushed, so nothing in flight is lost.
+
+    Volume is bounded: the command is clipped to ``TOOL_ARGS_LINE_CLIP -
+    40`` characters, a failed call's detail chunk keeps at most
+    ``fail_output_lines`` output lines (``TOOL_EXCERPT_LINE_CLIP``
+    characters each, ``TOOL_EXCERPT_MAX_CHARS`` in total), and a
+    batch holds at most ``max_lines`` lines (the daemon's
+    ``discord.tool_batch_lines``) before the pump flushes it.
+
+    Redaction: upstream masks the event payload, and every line and
+    excerpt this class renders additionally passes through
+    :func:`sbxloop.log.redact_text` (in :func:`_tool_line` and
+    :func:`output_excerpt`), so a credential in a command or in captured
+    output cannot reach the thread.
     """
 
-    def __init__(self, *, max_lines: int = 8, quiet: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        max_lines: int = 8,
+        quiet: bool = False,
+        output_lines: int = TOOL_OUTPUT_LINES_DEFAULT,
+        fail_output_lines: int = TOOL_FAIL_OUTPUT_LINES_DEFAULT,
+    ) -> None:
         self.max_lines = max_lines
         self.quiet = quiet
+        # Excerpt budgets (discord.tool_output_lines / tool_fail_output_lines).
+        self.output_lines = output_lines
+        self.fail_output_lines = fail_output_lines
         self._lines: list[str] = []
-        self._by_call: dict[str, int] = {}
+        self._pending: dict[str, tuple[str, str]] = {}
+        self._synthetic = 0
 
     def __len__(self) -> int:
         return len(self._lines)
@@ -422,15 +606,25 @@ class ToolBatcher:
         return len(self._lines) >= self.max_lines
 
     def add_start(self, tool: str, args: str, call_id: str | None) -> None:
+        """Record a call as in flight. Emits no line -- the line is written
+        when the call ends (or when a flush finds it still running)."""
         if self.quiet:
             return
-        text = f"$ {tool}"
-        args_line = _one_line_mid(str(args or ""), TOOL_ARGS_LINE_CLIP - 40)
-        if args_line:
-            text += f"  {args_line}"
-        if call_id:
-            self._by_call[str(call_id)] = len(self._lines)
-        self._lines.append(text.replace("```", "'''"))
+        key = str(call_id) if call_id else self._next_key()
+        self._pending[key] = (tool, str(args or ""))
+
+    def _next_key(self) -> str:
+        self._synthetic += 1
+        return f"\x00anon{self._synthetic}"
+
+    def _pop_oldest(self, tool: str) -> tuple[str, str] | None:
+        """The oldest in-flight start for ``tool`` (dicts keep insertion
+        order), used only when correlation by id is impossible."""
+        for key, value in self._pending.items():
+            if value[0] == tool:
+                del self._pending[key]
+                return value
+        return None
 
     def add_end(
         self,
@@ -440,23 +634,54 @@ class ToolBatcher:
         success: bool | None,
         exit_code: int | None,
         detail: str,
+        args: str = "",
+        duration_ms: float | int | None = None,
+        output_lines: int | None = None,
     ) -> Chunk | None:
-        if success is not False:
+        """Resolve the pending start for ``call_id`` and append its one line.
+
+        ``output_lines`` is the event's true output line count, used for the
+        elided-line count when the stored text was truncated upstream."""
+        pending = self._pending.pop(str(call_id), None) if call_id else None
+        if pending is None and not args:
+            # An old worker emits no ``tool_call_id`` and no ``args`` on the
+            # end event, so there is nothing to correlate on: fall back to the
+            # oldest in-flight start for the same tool. Ordering is only
+            # approximate, but it beats dropping the command entirely and
+            # leaving a phantom "… running" line behind at flush.
+            pending = self._pop_oldest(tool)
+        line_tool, line_args = pending if pending is not None else (tool, str(args or ""))
+        if not self.quiet:
+            self._lines.append(
+                _tool_line(
+                    line_tool or tool,
+                    line_args,
+                    success=success,
+                    exit_code=exit_code,
+                    duration_ms=duration_ms,
+                )
+            )
+        if success is not False and (self.quiet or self.output_lines <= 0):
             return None
-        marker = f"   ✗ exit {exit_code}" if exit_code is not None else "   ✗ failed"
-        idx = self._by_call.get(str(call_id)) if call_id else None
-        if idx is not None and idx < len(self._lines):
-            self._lines[idx] += marker
-        elif not self.quiet:
-            self._lines.append(f"$ {tool}{marker}")
-        return failure_detail(tool, exit_code, detail)
+        return output_excerpt(
+            tool,
+            exit_code,
+            detail,
+            success=success,
+            output_lines=output_lines,
+            max_lines=self.fail_output_lines if success is False else self.output_lines,
+        )
 
     def flush(self) -> Chunk | None:
-        if not self._lines:
-            return None
-        body = "\n".join(self._lines)
+        lines = list(self._lines)
+        if not self.quiet:
+            lines += [_tool_line(tool, args, running=True) for tool, args in self._pending.values()]
         self._lines = []
-        self._by_call = {}
+        self._pending = {}
+        self._synthetic = 0
+        if not lines:
+            return None
+        body = "\n".join(lines)
         return block(f"```text\n{body}\n```", flush=False)
 
 
@@ -550,14 +775,25 @@ class ToolDigest:
     the "may be stuck; cancel to stop" nudge for the human.
     """
 
-    def __init__(self, *, cancel_hint: str = "!sbx cancel") -> None:
+    def __init__(
+        self,
+        *,
+        cancel_hint: str = "!sbx cancel",
+        output_lines: int = 0,
+        fail_output_lines: int = TOOL_FAIL_OUTPUT_LINES_DEFAULT,
+    ) -> None:
         self.cancel_hint = cancel_hint
+        # At the normal level a success adds nothing by default: the digest
+        # line already says the burst ran. Failures keep the full budget.
+        self.output_lines = output_lines
+        self.fail_output_lines = fail_output_lines
         self.count = 0
         self.failed = 0
         self.by_tool: dict[str, int] = {}
         self.last: tuple[str, str] | None = None
         self._repetition = RepetitionDetector()
         self._dirty = False
+        self._seen: set[str] = set()
 
     def __len__(self) -> int:
         return self.count
@@ -570,10 +806,12 @@ class ToolDigest:
     def repetitive(self) -> int:
         return self._repetition.streak
 
-    def add_start(self, tool: str, args: str) -> None:
+    def add_start(self, tool: str, args: str, call_id: str | None = None) -> None:
+        if call_id:
+            self._seen.add(str(call_id))
         self.count += 1
         self.by_tool[tool] = self.by_tool.get(tool, 0) + 1
-        self.last = (tool, " ".join(str(args or "").split()))
+        self.last = (tool, " ".join(redact_text(str(args or "")).split()))
         # Fed incrementally so a 200-call spiral still reports a 200-long
         # streak (a bounded tail would cap it and never collapse the line).
         self._repetition.add(*self.last)
@@ -582,18 +820,48 @@ class ToolDigest:
     def add_end(
         self,
         tool: str,
+        call_id: str | None = None,
         *,
         success: bool | None,
         exit_code: int | None,
         detail: str,
+        output_lines: int | None = None,
     ) -> Chunk | None:
         """A failed call is the one thing that stays individual: returns
-        its detail chunk (as the batcher would) and counts it in the line."""
+        its detail chunk (as the batcher would) and counts it in the line.
+
+        Pairing is by ``call_id``: an end whose id was never started still
+        counts as a call, and a duplicate end for an id already resolved
+        is ignored so ``failed`` never double-counts."""
+        key = str(call_id) if call_id else ""
+        if key:
+            if key in self._seen:
+                self._seen.discard(key)
+            else:
+                # An end with no start: count the call so the digest total
+                # matches what actually ran.
+                self.count += 1
+                self.by_tool[tool] = self.by_tool.get(tool, 0) + 1
+                self._dirty = True
         if success is not False:
-            return None
+            return output_excerpt(
+                tool,
+                exit_code,
+                detail,
+                success=success,
+                output_lines=output_lines,
+                max_lines=self.output_lines,
+            )
         self.failed += 1
         self._dirty = True
-        return failure_detail(tool, exit_code, detail)
+        return output_excerpt(
+            tool,
+            exit_code,
+            detail,
+            success=False,
+            output_lines=output_lines,
+            max_lines=self.fail_output_lines,
+        )
 
     def render(self) -> str:
         self._dirty = False
@@ -601,6 +869,9 @@ class ToolDigest:
             return ""
         streak = self.repetitive
         last_tool, last_args = self.last or ("?", "")
+        # Belt to add_start's braces: the rendered command is scrubbed again
+        # so no path into ``last`` can publish a credential.
+        last_args = redact_text(last_args)
         last = f" — last: {code(_one_line_mid(last_args, DIGEST_LAST_CLIP))}" if last_args else ""
         if streak and streak == self.count:
             head = f"⚙ {last_tool} x{streak} similar commands{last}"
@@ -1193,262 +1464,6 @@ def finish_embed(
     ).clamped()
 
 
-# -- end-of-run summary --------------------------------------------------------------
-
-
-class RunStats:
-    """Counters behind the end-of-run summary card, fed the same live event
-    stream the chronology renders.
-
-    Observed rather than mined from the state store: the pump already sees
-    every event, and the summary must stay postable when the engine store is
-    not reachable from the bridge. The price is scope: a daemon restarted
-    mid-run starts counting again, so ``resumed`` is remembered and the card
-    says the stats cover the watched leg instead of passing partial numbers
-    off as the whole run.
-    """
-
-    def __init__(self) -> None:
-        self.first_ts: float | None = None
-        self.last_ts: float | None = None
-        self.resumed = False
-        # One ``agent.usage`` event is one assistant turn — the unit runs
-        # are billed and timed by. Token/cost fields stay None until a
-        # backend actually reports them: "not reported" is not zero.
-        self.turns = 0
-        self.input_tokens: int | None = None
-        self.output_tokens: int | None = None
-        self.cost: float | None = None
-        self.tool_calls = 0
-        self.capped = False
-        self.denies = 0
-        self.resource_warnings = 0
-        self.steers = 0
-        self.steers_answered = 0
-        self.steers_failed = 0
-        self.verdict_passes = 0
-        # (task_id, phase, verdict, reason) for every revise/reject ruling.
-        self.rework: list[tuple[str, str, str, str]] = []
-        self.total_tasks = 0
-        self.states: dict[str, str] = {}
-        self.revisions: dict[str, int] = {}
-
-    def observe(self, event: Event) -> None:
-        if self.first_ts is None:
-            self.first_ts = event.ts
-        self.last_ts = event.ts
-        d = event.data
-        t = event.type
-        if t == HostEventTypes.RUN_START and d.get("resumed"):
-            self.resumed = True
-        elif t == "agent.usage":
-            self.turns += 1
-            if d.get("input_tokens") is not None:
-                self.input_tokens = (self.input_tokens or 0) + int(d["input_tokens"])
-            if d.get("output_tokens") is not None:
-                self.output_tokens = (self.output_tokens or 0) + int(d["output_tokens"])
-            if d.get("cost") is not None:
-                self.cost = (self.cost or 0.0) + float(d["cost"])
-        elif t == "agent.tool_start":
-            self.tool_calls += 1
-        elif t == "agent.tool_cap":
-            self.capped = True
-        elif t == HostEventTypes.POLICY_DENY:
-            self.denies += 1
-        elif t == "sandbox.resources_warning":
-            self.resource_warnings += 1
-        elif t == HostEventTypes.CHAT_MESSAGE:
-            self.steers += 1
-        elif t == HostEventTypes.CHAT_REPLY:
-            if d.get("error"):
-                self.steers_failed += 1
-            else:
-                self.steers_answered += 1
-        elif t == HostEventTypes.RUN_TASKS and isinstance(d.get("tasks"), list):
-            self.total_tasks = max(self.total_tasks, len(d["tasks"]))
-        elif t in (HostEventTypes.TASK_STATE, HostEventTypes.TASK_END):
-            tid = str(d.get("task_id") or "")
-            if tid and d.get("state"):
-                self.states[tid] = str(d["state"])
-            if tid and d.get("revisions") is not None:
-                self.revisions[tid] = int(d["revisions"] or 0)
-        elif t == HostEventTypes.PHASE_VERDICT:
-            verdict = str(d.get("verdict") or "")
-            if verdict in ("pass", "accept"):
-                self.verdict_passes += 1
-            elif verdict in ("revise", "reject"):
-                issues = d.get("issues")
-                reason = ""
-                if isinstance(issues, list) and issues:
-                    reason = str((issues[0] or {}).get("detail") or "")
-                reason = reason or str(d.get("feedback") or "")
-                self.rework.append(
-                    (str(d.get("task_id") or "?"), str(d.get("phase") or "?"), verdict, reason)
-                )
-
-    @property
-    def duration_s(self) -> float | None:
-        if self.first_ts is None or self.last_ts is None:
-            return None
-        return max(0.0, self.last_ts - self.first_ts)
-
-    def task_counts(self) -> tuple[int, int]:
-        """(done, total) as observed; the roster event pins the total."""
-        done = sum(1 for s in self.states.values() if s == "done")
-        return done, max(self.total_tasks, len(self.states))
-
-
-def _fmt_duration(seconds: float) -> str:
-    s = int(seconds)
-    if s >= 3600:
-        return f"{s // 3600}h {s % 3600 // 60:02d}m"
-    if s >= 60:
-        return f"{s // 60}m {s % 60:02d}s"
-    return f"{s}s"
-
-
-def _fmt_count(value: int | None) -> str:
-    return f"{value:,}" if value is not None else "—"
-
-
-def summary_text(stats: RunStats | None, state: str) -> str:
-    """The plain-text lead over the summary embed: the headline numbers, so
-    the card still reads where embeds are suppressed."""
-    head = "📊 **run summary**"
-    if stats is None:
-        return head
-    bits: list[str] = []
-    if (dur := stats.duration_s) is not None:
-        bits.append(_fmt_duration(dur))
-    if stats.turns:
-        bits.append(f"{stats.turns} turn(s)")
-    if stats.tool_calls:
-        bits.append(f"{stats.tool_calls} tool call(s)")
-    if stats.input_tokens is not None or stats.output_tokens is not None:
-        bits.append(
-            f"{_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out tokens"
-        )
-    if stats.cost is not None:
-        bits.append(f"${stats.cost:,.2f}")
-    return head + (f" — {' · '.join(bits)}" if bits else "")
-
-
-def _stat_rows(stats: RunStats) -> list[str]:
-    rows: list[str] = []
-    counters = []
-    if stats.turns:
-        counters.append(f"turns {stats.turns}")
-    if stats.tool_calls:
-        counters.append(f"tool calls {stats.tool_calls}")
-    if counters:
-        rows.append(" · ".join(counters))
-    if stats.input_tokens is not None or stats.output_tokens is not None:
-        spend = (
-            f"tokens {_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out"
-        )
-        if stats.cost is not None:
-            spend += f" · cost ${stats.cost:,.2f}"
-        rows.append(spend)
-    elif stats.cost is not None:
-        rows.append(f"cost ${stats.cost:,.2f}")
-    if stats.steers:
-        rows.append(f"steering {stats.steers} asked / {stats.steers_answered} answered")
-    return rows
-
-
-def _went_well(stats: RunStats, report: RunReport) -> list[str]:
-    out: list[str] = []
-    if report.delivery:
-        out.append(f"delivered PR {link(f'#{report.delivery[0]}', report.delivery[1])}")
-    if report.filed:
-        out.append(f"filed {len(report.filed)} finding(s)")
-    done, total = stats.task_counts()
-    if total and done == total:
-        out.append(f"all {total} task(s) completed")
-    elif done:
-        out.append(f"{done}/{total} task(s) completed")
-    clean = sum(
-        1 for tid, s in stats.states.items() if s == "done" and not stats.revisions.get(tid)
-    )
-    if clean and stats.rework:
-        # Only worth saying when some tasks did need rework; otherwise the
-        # verdict line below already covers it.
-        out.append(f"{clean} task(s) accepted without revision")
-    if stats.verdict_passes:
-        line = f"{stats.verdict_passes} critic verdict(s) passed"
-        if not stats.rework:
-            line += " with no rework asked"
-        out.append(line)
-    if stats.steers and stats.steers_answered == stats.steers:
-        out.append(f"answered all {stats.steers} steering message(s)")
-    return out
-
-
-def _needed_work(stats: RunStats, report: RunReport, unanswered: int) -> list[str]:
-    out: list[str] = []
-    for tid, phase, verdict, reason in stats.rework[:4]:
-        line = f"{code(tid)} {phase}: **{verdict}**"
-        if reason:
-            line += f" — {_one_line(reason, 160)}"
-        out.append(line)
-    if len(stats.rework) > 4:
-        out.append(f"… and {len(stats.rework) - 4} more critic ruling(s) asking for rework")
-    failed = sum(1 for s in stats.states.values() if s == "failed")
-    if failed:
-        out.append(f"{failed} task(s) failed")
-    if report.delivery_error:
-        out.append(f"delivery failed — {_one_line(report.delivery_error, 160)}")
-    if unanswered:
-        out.append(f"{unanswered} steering message(s) went unanswered")
-    if stats.steers_failed:
-        out.append(f"{stats.steers_failed} steer(s) errored")
-    if stats.capped:
-        out.append("hit the per-phase tool-call ceiling")
-    if stats.denies:
-        out.append(f"{stats.denies} policy denial(s)")
-    if stats.resource_warnings:
-        out.append(f"{stats.resource_warnings} sandbox resource warning(s)")
-    return out
-
-
-def _bullets(lines: list[str], empty: str) -> str:
-    return "\n".join(f"• {line}" for line in lines) if lines else empty
-
-
-def summary_embed(
-    stats: RunStats | None,
-    report: RunReport,
-    state: str,
-    unanswered: int = 0,
-) -> EmbedSpec:
-    """The end-of-run summary card — the last thing posted in a run thread:
-    the run's numbers, what went well, and what needed work."""
-    stats = stats or RunStats()
-    description = f"**{state}** — {report.task_summary}"
-    if (dur := stats.duration_s) is not None:
-        description += f" in {_fmt_duration(dur)}"
-    if stats.resumed:
-        description += "\n_stats cover the run since the daemon last picked it up_"
-    fields: list[tuple[str, str, bool]] = []
-    if rows := _stat_rows(stats):
-        fields.append(("Stats", "\n".join(rows), False))
-    fields.append(("Went well", _bullets(_went_well(stats, report), "nothing stood out"), False))
-    fields.append(
-        (
-            "Needed work",
-            _bullets(_needed_work(stats, report, unanswered), "no setbacks observed"),
-            False,
-        )
-    )
-    return EmbedSpec(
-        title="📊 run summary",
-        description=description,
-        color=STATE_COLOR.get(state, COLOR_DIM),
-        fields=tuple(fields),
-        footer=f"run {report.run_id}",
-    ).clamped()
-
-
 def status_embed(status: dict[str, Any]) -> EmbedSpec:
     cur = status.get("current")
     current = f"{code(cur['run_id'])} — {_one_line(cur.get('title') or '', 120)}" if cur else "idle"
@@ -1641,6 +1656,10 @@ __all__ = [
     "COLOR_RUNNING",
     "COLOR_WARN",
     "DISCORD_MAX_MESSAGE",
+    "TOOL_EXCERPT_LINE_CLIP",
+    "TOOL_EXCERPT_MAX_CHARS",
+    "TOOL_FAIL_OUTPUT_LINES_DEFAULT",
+    "TOOL_OUTPUT_LINES_DEFAULT",
     "Chunk",
     "EmbedSpec",
     "StatusLine",
@@ -1663,6 +1682,7 @@ __all__ = [
     "link",
     "mask_urls",
     "nolink",
+    "output_excerpt",
     "plan_text",
     "queue_lines",
     "ref_link",

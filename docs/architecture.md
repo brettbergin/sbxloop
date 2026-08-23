@@ -110,11 +110,7 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
   run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads and
   issue triage (file, list, comment, label for a run, close) through the ops
-  box, `pr_status` — a read-only PR health read served through the same
-  github-ops box via `GithubOps.raw` (`GET /repos/{repo}/pulls/{n}`,
-  `/commits/{sha}/check-runs`, `/pulls/{n}/reviews`) for check runs, review
-  decision, mergeability and behind-ness, with **no merge or write path** —
-  and `daemon_log` over the process's own recent log lines — relayed as
+  box, and `daemon_log` over the process's own recent log lines — relayed as
   `agent.tool_request` events and answered
   by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
   polls for. It is **kept across daemon restarts** when the installed worker
@@ -302,6 +298,53 @@ agent's reply did not — they exist so a surface can show the decision without
 showing the agent's JSON, which is what the Discord bridge does.
 
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
+
+### Tool calls in a run thread
+
+A watcher reads a run thread to see what the agents are *executing*, so tool
+calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
+`sbxloop.daemon.discord_format`):
+
+- **Informative truncation.** A command is rendered by
+  `cmdfmt.format_command`: whitespace collapses, the boilerplate
+  `cd <absolute run path> &&` prefix — identical on every call in a run, and
+  the thing naive middle-elision spends the whole budget on — collapses to
+  `cd $RUN &&`, and if the line is still over `COMMAND_DISPLAY_CLIP` (160
+  characters, a named default a caller may override) the *longest argument
+  tokens* are elided one at a time. The leading verb therefore always
+  survives, and any token that lost characters carries a literal `…`, so a
+  token in the output is never a silently truncated one. This is display-only:
+  the stored event keeps the full command, so `run_events`, `sbxloop logs` and
+  resume are unaffected.
+- **One entry per call.** `ToolBatcher` records `agent.tool_start` as pending
+  and emits nothing; the single line is written when `agent.tool_end` arrives:
+  `$ bash  cd $RUN && uv run mypy  ✓ 1.5s` or `✗ exit 1 · 1.5s`. Correlation is
+  by `tool_call_id`, never by comparing command text, so parallel calls
+  completing out of order still carry their own command. An end with no
+  matching start renders from its own `args` (falling back to the oldest
+  in-flight start for that tool, for workers predating `tool_call_id`), and a
+  start still in flight at flush is shown as `… running`.
+- **Bounded output excerpts.** `output_excerpt` gives a completed call a
+  header (✓/✗ plus exit status) and a fenced head+tail excerpt of its output,
+  with any elision marked `… N lines elided …` counted from the event's
+  `output_lines`. A failure gets the larger budget and prefers `error`
+  (stderr); a success is quiet by default, because the batched line already
+  reports it. The caps are named constants — `TOOL_OUTPUT_LINES_DEFAULT` (0),
+  `TOOL_FAIL_OUTPUT_LINES_DEFAULT` (20), `TOOL_EXCERPT_LINE_CLIP` (300
+  chars/line), `TOOL_EXCERPT_MAX_CHARS` (1200) — with the two line budgets
+  configurable as `[discord] tool_output_lines` / `tool_fail_output_lines`.
+  The finished message is additionally clamped to `DISCORD_MAX_MESSAGE`, so no
+  input can overflow Discord's limit.
+- **Redaction at the render seam.** The worker already redacts an event's
+  output before it leaves the sandbox; because this feature *publishes* more
+  of what a command printed, every rendered command and every excerpt passes
+  through `sbxloop.log.redact_text` again on the way to a thread. It is
+  idempotent, so text already masked upstream is unchanged.
+- **Additive schema.** `tool_call_id`, `output_lines` and `duration_ms` on
+  `agent.tool_end` are optional; nothing was removed or renamed. Consumers
+  tolerate their absence, so an older worker's chronology renders (without
+  duration or elision counts) and no migration of existing chronologies is
+  required.
 
 ## Logging
 

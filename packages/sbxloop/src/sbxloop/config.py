@@ -582,6 +582,13 @@ class DiscordConfig(_ConfigModel):
     embeds: bool = True
     status_line: bool = True
     tool_batch_lines: int = Field(default=8, ge=1, le=40)
+    # How much of a completed tool call's output is echoed into the thread:
+    # tail lines for a success (0 = none) and head+tail lines for a failure,
+    # which gets the larger budget because that is what a watcher needs to
+    # act. Both are upper bounds — the renderer additionally caps the body
+    # and clamps the message to Discord's 2000-character limit.
+    tool_output_lines: int = Field(default=0, ge=0, le=20)
+    tool_fail_output_lines: int = Field(default=20, ge=0, le=60)
 
     @property
     def enabled(self) -> bool:

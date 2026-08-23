@@ -14,6 +14,8 @@ answer, so the predicate lives here rather than being spelled twice.
 
 from __future__ import annotations
 
+import re
+
 # gho_/ghu_ user-to-server, ghp_ classic PAT, ghs_ server-to-server,
 # github_pat_ fine-grained.
 GITHUB_TOKEN_PREFIXES = ("gho_", "ghu_", "ghp_", "ghs_", "github_pat_")
@@ -37,3 +39,63 @@ def shell_token_case() -> str:
     """The `case` pattern a probe uses to classify a value inside the VM,
     kept in step with :data:`GITHUB_TOKEN_PREFIXES`."""
     return "|".join(f"{prefix}*" for prefix in GITHUB_TOKEN_PREFIXES)
+
+
+# --- Redaction of free text -------------------------------------------------
+#
+# Mirrors :func:`sbxloop.log.redact_secrets` in intent, but operates on *text*
+# rather than a structlog event dict: tool output is published to run threads,
+# so anything credential-shaped must be masked inside the worker, before it
+# leaves as an event. The worker cannot import sbxloop (it depends only on
+# pydantic), so the patterns are spelled here.
+
+REDACTED = "***"
+
+_TOKEN_CHARS = r"[A-Za-z0-9_\-]"  # nosec B105 - regex character class, not a credential
+
+_REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # GitHub tokens, keyed off the same prefixes used above.
+    re.compile(r"(?:gho_|ghu_|ghp_|ghs_|github_pat_)[A-Za-z0-9_]{8,}"),
+    # sbx secret-proxy sentinels.
+    re.compile(rf"{SBX_SENTINEL_PREFIX}{_TOKEN_CHARS}{{4,}}"),
+    # AWS access key ids.
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+)
+
+# `Bearer <token>` headers: keep the scheme, mask the credential.
+_BEARER = re.compile(r"\b(Bearer|Basic|token)\s+([A-Za-z0-9._\-+/=]{8,})")
+
+_SECRET_WORDS = r"token|secret|password|passwd|api[-_]?key|credential|authorization"  # nosec B105 - regex vocabulary of credential key names, not a credential
+_SECRET_NAME = rf"[A-Za-z0-9_.\-]*(?:{_SECRET_WORDS})[A-Za-z0-9_.\-]*"
+
+# KEY=VALUE (env/CLI style) where the key names a credential.
+_ASSIGNMENT = re.compile(rf"\b({_SECRET_NAME})(\s*=\s*)(\"[^\"]*\"|'[^']*'|\S+)", re.IGNORECASE)
+
+# "key": "value" / key: value (JSON/YAML style).
+# The value is left alone when it is already a masked ``Bearer ***`` header,
+# so an Authorization line keeps its scheme visible.
+_MAPPING = re.compile(
+    rf"(\"?{_SECRET_NAME}\"?\s*:\s*)"
+    rf"(?!(?:Bearer|Basic|token)\b)"
+    rf"(\"[^\"]*\"|'[^']*'|[^,;\s}}]+)",
+    re.IGNORECASE,
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Mask credential-looking substrings in free text.
+
+    Total by construction: never raises, and returns its input unchanged
+    when nothing matches.
+    """
+    if not text:
+        return text
+    try:
+        for pattern in _REDACTION_PATTERNS:
+            text = pattern.sub(REDACTED, text)
+        text = _BEARER.sub(rf"\1 {REDACTED}", text)
+        text = _ASSIGNMENT.sub(rf"\1\2{REDACTED}", text)
+        text = _MAPPING.sub(rf"\1{REDACTED}", text)
+    except (re.error, RuntimeError):  # pragma: no cover - defensive
+        return REDACTED
+    return text
