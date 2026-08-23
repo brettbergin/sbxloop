@@ -72,13 +72,14 @@ Respond with exactly one fenced JSON block:
 - `"continue"` — the message does not change the work: a question, a status
   check, an acknowledgement. Answer it in `reply`; leave `guidance` empty.
 - `"steer_task"` — the message changes how the CURRENT task should be done.
-  The task will be re-planned immediately with your `guidance` as feedback.
+  The task's build session is discarded and restarted immediately with your
+  `guidance` as feedback.
 - `"steer_run"` — the message changes direction for the whole remaining run.
   Your `guidance` becomes a standing instruction added to every later
-  planning and execution prompt.
+  build prompt.
 
 `guidance` is required for `steer_task`/`steer_run`: write imperative
-instructions addressed to the planner/executor (not to the user), capturing
+instructions addressed to the builder (not to the user), capturing
 exactly what must change. Choose the narrowest action that honors the user's
 message — do not restructure work the user only asked a question about.
 

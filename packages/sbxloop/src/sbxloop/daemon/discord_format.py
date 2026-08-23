@@ -360,7 +360,7 @@ def _is_json_doc(text: str) -> bool:
 def strip_json_payload(text: str) -> str:
     """``text`` without the machine-readable JSON the engine already read.
 
-    Every structured phase — decompose, plan, scrutinize, validate, steer —
+    Every structured phase — decompose, steer —
     asks its agent for one fenced JSON block, and agents narrate around it.
     The engine parses that block and the bridge already renders what it
     *means*: the status line, the phase lines, the steering reply, the
@@ -999,7 +999,7 @@ class StatusLine:
         elif total:
             head = f"⏳ {total} task(s) planned"
         else:
-            head = "⏳ planning"
+            head = "⏳ decomposing"
         return head + (f"\n{totals}" if totals else "")
 
 
@@ -1007,11 +1007,8 @@ class StatusLine:
 # when the current one ends, so this is what "how long until my steer lands"
 # is measured against.
 _STATE_PHASE = {
-    "planning": "plan",
-    "executing": "execute",
-    "scrutinizing": "scrutinize",
+    "executing": "build",
     "verifying": "verify",
-    "validating": "validate",
 }
 _PHASE_STATES = frozenset(_STATE_PHASE)
 
@@ -1045,7 +1042,7 @@ class SteerProgress:
         t = event.type
         tid = str(d.get("task_id") or "")
         if t == "task.start" and tid:
-            # The engine emits ``task.state=planning`` (and, on resume, the
+            # The engine emits ``task.state=executing`` (and, on resume, the
             # persisted phase) *before* ``task.start``, so a start for the
             # task already being tracked only supplies the title — the
             # phase and counters observed for it stay put.
@@ -1138,16 +1135,6 @@ def format_for_discord(
         ]
     if t == HostEventTypes.RUN_TASKS:
         return [block(part) for part in split_markdown(roster_text(data), max_chars)]
-    if t == HostEventTypes.PHASE_PLAN:
-        return [
-            block(part)
-            for part in split_markdown(plan_text(data), max_chars, cont="🗺 *(cont. {i}/{n})*")
-        ]
-    if t == HostEventTypes.PHASE_VERDICT:
-        return [
-            block(part)
-            for part in split_markdown(verdict_text(data), max_chars, cont="🔎 *(cont. {i}/{n})*")
-        ]
     if t == HostEventTypes.RUN_REPORT:
         return [line(f"📋 tracking issue {link(f'#{data.get("issue")}', data.get('url'))}")]
     if t == HostEventTypes.RUN_DELIVER:
@@ -1197,15 +1184,11 @@ def format_for_discord(
         msg = _one_line(data.get("message") or "", 300)
         if status == "failed":
             return [line(f"✗ **{phase}**{where}" + (f" — {msg}" if msg else ""))]
-        if status == "degraded":
-            return [line(f"⚠ **{phase} degraded**{where}" + (f" — {msg}" if msg else ""))]
-        if status == "verify_suspect":
-            # A critic ruling the *check* wrong (#231) is a course change a
-            # human steering the run should see: it either spends a replan
-            # or explains why it did not.
-            return [
-                line(f"🔎 **{phase} suspects the check**{where}" + (f" — {msg}" if msg else ""))
-            ]
+        if status == "ok" and phase == "build" and msg:
+            # The builder's report excerpt is the chronology's record of what
+            # the attempt did — the plan card's replacement now that the
+            # approach is narrated in prose instead of structured JSON.
+            return [line(f"🔨 **build**{where} — {msg}")]
         if verbose and msg:
             return [line(f"· {phase}{where} — {msg}")]
         return []
@@ -1264,23 +1247,13 @@ def format_for_discord(
 
 # -- what the structured phases decided ------------------------------------------------
 
-# The three phases that answer in JSON also decide the three things a human
-# watching a thread most wants to read: what the run will do, how a task will
-# be done, and why a critic sent it back. Their replies are not posted (see
-# strip_json_payload), so the engine emits the parsed decision as its own
-# event and these render it.
+# DECOMPOSE answers in JSON and decides the thing a human watching a thread
+# most wants to read first: what the run will do. Its reply is not posted
+# (see strip_json_payload), so the engine emits the parsed roster as its own
+# event and this renders it. The build phase narrates in prose — its
+# streamed messages and its phase.end report excerpt are the chronology.
 
 TASK_STATE_MARKER = {"done": "✅", "failed": "❌", "skipped": "⏭"}
-VERDICT_MARKER = {  # nosec B105 - "pass" is the scrutinizer's verdict, not a credential
-    "pass": "✅",
-    "accept": "✅",
-    "revise": "♻",
-    "reject": "❌",
-}
-SEVERITY_MARKER = {"high": "🔴", "medium": "🟠", "low": "⚪"}
-# What a plan/verdict field is worth in the chronology before it is a wall of
-# text; the whole card is still split across messages if it needs to be.
-DECISION_ITEM_CLIP = 300
 
 
 def _list(data: dict[str, Any], key: str) -> list[Any]:
@@ -1308,58 +1281,6 @@ def roster_text(data: dict[str, Any]) -> str:
         lines.append(
             f"{head}{code(task.get('id'))} {_one_line(task.get('title') or '', 120)}{tail}"
         )
-    return "\n".join(lines)
-
-
-def plan_text(data: dict[str, Any]) -> str:
-    """One task's plan: the steps, then what the plan promised about them."""
-    attempt = int(data.get("attempt") or 1)
-    head = f"🗺 **plan** · task {code(data.get('task_id'))}"
-    if attempt > 1:
-        head += f" *(replan {attempt})*"
-    lines = [head]
-    steps = _list(data, "steps")
-    for index, step in enumerate(steps, start=1):
-        text = _one_line(str(step or ""), DECISION_ITEM_CLIP)
-        if text:
-            lines.append(f"{index}. {text}")
-    if not steps:
-        lines.append("· (no steps)")
-    for label, key in (("expects", "expected_artifacts"), ("verify", "verify_commands")):
-        joined = " · ".join(
-            code(_one_line(str(v), 120)) for v in _list(data, key) if str(v).strip()
-        )
-        if joined:
-            lines.append(f"**{label}:** {joined}")
-    egress = _list(data, "egress")
-    for grant in egress:
-        if isinstance(grant, dict) and grant.get("domain"):
-            reason = _one_line(str(grant.get("reason") or ""), 160)
-            lines.append(
-                f"**egress:** {code(grant['domain'])}" + (f" — {reason}" if reason else "")
-            )
-    return "\n".join(lines)
-
-
-def verdict_text(data: dict[str, Any]) -> str:
-    """A critic's ruling: the call, what it found, and what it asked for."""
-    verdict = str(data.get("verdict") or "")
-    phase = str(data.get("phase") or "critic")
-    marker = VERDICT_MARKER.get(verdict, "🔎")
-    lines = [f"{marker} **{phase}: {verdict}** · task {code(data.get('task_id'))}"]
-    issues = _list(data, "issues")
-    for issue in issues:
-        if not isinstance(issue, dict):
-            continue
-        detail = _one_line(str(issue.get("detail") or ""), DECISION_ITEM_CLIP)
-        if not detail:
-            continue
-        severity = str(issue.get("severity") or "medium")
-        lines.append(f"{SEVERITY_MARKER.get(severity, '·')} **{severity}** — {detail}")
-    feedback = str(data.get("feedback") or "").strip()
-    if feedback:
-        # Quoted: it is what the executor is about to be told, verbatim.
-        lines.append("\n".join(f"> {ln}" for ln in _clip(feedback, 900).splitlines()))
     return "\n".join(lines)
 
 
@@ -1697,7 +1618,6 @@ __all__ = [
     "mask_urls",
     "nolink",
     "output_excerpt",
-    "plan_text",
     "queue_lines",
     "ref_link",
     "refs_text",
@@ -1705,5 +1625,4 @@ __all__ = [
     "split_markdown",
     "status_embed",
     "strip_json_payload",
-    "verdict_text",
 ]

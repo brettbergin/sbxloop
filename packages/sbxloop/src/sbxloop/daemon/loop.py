@@ -1327,7 +1327,13 @@ class DaemonLoop:
             # failures already are the acceptance criteria, and decomposing
             # them costs a whole session to rediscover a structure we have.
             self.dstore.clear_fix(item.item_id)
-            return engine.start(brief, run_id=run_id, tasks=fix_tasks(pr_number, brief, failed))
+            return engine.start(
+                brief,
+                run_id=run_id,
+                tasks=fix_tasks(
+                    pr_number, brief, failed, gate=self.config.sandbox.gate_command or None
+                ),
+            )
         return engine.start(self.outcome_text(item), run_id=run_id)
 
     def _pending_fix(self, item: WorkItem) -> tuple[int, str, tuple[str, ...]] | None:

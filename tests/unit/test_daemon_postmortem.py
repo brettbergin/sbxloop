@@ -10,7 +10,7 @@ from sbxloop.config import Config
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.postmortem import DOSSIER_MAX_CHARS, build_dossier, postmortem_marker
 from sbxloop.daemon.sources import PrSnapshot
-from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
+from sbxloop.engine.model import TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
 from sbxloop.gh.ops import ChecksVerdict
@@ -31,7 +31,11 @@ def gh_item(kind: str = "patch") -> WorkItem:
 
 def seed_failed_run(store: StateStore, run_id: str) -> None:
     store.create_run(run_id, "outcome")
-    spec = TaskSpec(id="t1", title="Do it", verify_commands=["uv run pytest -q"])
+    spec = TaskSpec(
+        id="t1",
+        title="Do it",
+        verify_commands=["uv run pytest -q", "sh -c \"git status | awk '{print $2}'\""],
+    )
     store.save_tasks(run_id, [spec])
     store.update_task(
         run_id,
@@ -41,10 +45,6 @@ def seed_failed_run(store: StateStore, run_id: str) -> None:
             revisions=2,
             replans=1,
             last_feedback="verify keeps failing",
-            plan=PlanModel(
-                steps=["write code"],
-                verify_commands=["sh -c \"git status | awk '{print $2}'\""],
-            ),
         ),
     )
     store.record_phase(
@@ -82,7 +82,7 @@ class TestDossier:
         assert text.startswith("# Post-mortem: Fix the thing")
         assert "ended **abandoned: run ended failed** after 2 attempt(s)" in text
         assert "## Run `r1`" in text and "State: **failed**" in text
-        assert "Verify commands (as run, under `sh -c`):" in text
+        assert "Verify commands (decomposer-authored, run under `sh -c`):" in text
         assert "sh -c \"git status | awk '{print $2}'\"" in text
         assert "Last verify attempt (failed, attempt 1):" in text and "M README.md" in text
         assert "verify command failed" in text  # failure events section

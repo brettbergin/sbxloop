@@ -39,13 +39,13 @@ from sbxloop.cli.cmdfmt import COMMAND_DISPLAY_CLIP, format_command
 from sbxloop.events import Event, HostEventTypes, summarize_event
 from sbxloop_worker.protocol import EventTypes
 
+# Live task states only; historical events replayed from a pre-BUILD run
+# may carry retired states (planning/scrutinizing/validating), which fall
+# through to the "dim" default in every lookup.
 TASK_STATE_STYLES = {
     "pending": "dim",
-    "planning": "yellow",
     "executing": "cyan",
-    "scrutinizing": "magenta",
     "verifying": "blue",
-    "validating": "magenta",
     "done": "green",
     "failed": "red",
     "skipped": "dim red",
@@ -219,8 +219,7 @@ def render_event(event: Event) -> RenderableType | None:
         elif event.type == HostEventTypes.PHASE_END and data.get("status") == "failed":
             style = "red"
         elif (
-            (event.type == HostEventTypes.PHASE_END and data.get("status") == "verify_suspect")
-            or "fallback" in event.type
+            "fallback" in event.type
             or "missing" in event.type
             or "warning" in event.type
             or event.type == HostEventTypes.POLICY_DENY

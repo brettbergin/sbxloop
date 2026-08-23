@@ -174,14 +174,7 @@ class HostEventTypes:
     TASK_START = "task.start"
     TASK_STATE = "task.state"
     TASK_END = "task.end"
-    PHASE_START = "phase.start"
     PHASE_END = "phase.end"
-    # What a structured phase decided, as data the host has already parsed:
-    # the plan a task will be executed against, and a critic's ruling on the
-    # result. Emitted so a UI can say what the agent decided without reading
-    # the agent's JSON reply.
-    PHASE_PLAN = "phase.plan"
-    PHASE_VERDICT = "phase.verdict"
     POLICY_ALLOW = "policy.allow"
     POLICY_DENY = "policy.deny"
     SANDBOX_PROVISION_START = "sandbox.provision_start"

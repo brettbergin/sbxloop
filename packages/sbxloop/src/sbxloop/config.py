@@ -330,8 +330,10 @@ class Budgets(_ConfigModel):
     per_job_timeout_s: float = 1800.0
     # Per-phase tool-call ceiling (#228): an agent session past this many
     # tool calls has further calls turned away with a nudge to stop
-    # investigating and report. 0 disables.
-    max_tool_calls_per_phase: int = Field(default=40, ge=0)
+    # investigating and report. 0 disables. 60 (was 40) since BUILD merged
+    # planning and execution into one session; retune from measured
+    # phase_attempts usage once the merged pipeline has field data.
+    max_tool_calls_per_phase: int = Field(default=60, ge=0)
     # How many tasks may be in flight at once. A run's wall clock is
     # essentially its turn count times the per-turn latency, and the task
     # loop is otherwise strictly serial even where the task DAG says two

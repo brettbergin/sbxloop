@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
+from sbxloop.engine.model import TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
@@ -60,7 +60,6 @@ class TestTasks:
         task.revisions = 2
         task.last_feedback = "try harder"
         task.session_id = "s-1"
-        task.plan = PlanModel(steps=["one"], verify_commands=["true"])
         store.update_task("r1", task)
 
         loaded = store.get_tasks("r1")[0]
@@ -68,8 +67,42 @@ class TestTasks:
         assert loaded.revisions == 2
         assert loaded.last_feedback == "try harder"
         assert loaded.session_id == "s-1"
-        assert loaded.plan is not None
-        assert loaded.plan.steps == ["one"]
+
+    def test_legacy_states_remap_on_read(self, store: StateStore) -> None:
+        """Rows persisted by the six-phase pipeline remap onto the live
+        vocabulary before pydantic sees them, so mid-flight runs resume
+        across the upgrade: planning never committed work (fresh BUILD);
+        scrutinizing has a committed report (idempotent VERIFY re-entry);
+        validating re-derives its verify evidence the same way."""
+        store.create_run("r1", "x")
+        store.save_tasks("r1", [TaskSpec(id=t, title=t.upper()) for t in ("t1", "t2", "t3", "t4")])
+        for task_id, legacy in (
+            ("t1", "planning"),
+            ("t2", "scrutinizing"),
+            ("t3", "validating"),
+            ("t4", "done"),
+        ):
+            store._conn.execute(
+                "UPDATE tasks SET state = ? WHERE run_id = 'r1' AND task_id = ?",
+                (legacy, task_id),
+            )
+        store._conn.commit()
+        states = {t.spec.id: t.state for t in store.get_tasks("r1")}
+        assert states == {
+            "t1": "executing",
+            "t2": "verifying",
+            "t3": "verifying",
+            "t4": "done",
+        }
+
+    def test_legacy_plan_json_is_ignored_not_fatal(self, store: StateStore) -> None:
+        """A pre-upgrade row's plan_json column may hold anything; reading
+        the task must not parse it (the column stays, unread)."""
+        store.create_run("r1", "x")
+        store.save_tasks("r1", [TaskSpec(id="t1", title="A")])
+        store._conn.execute("UPDATE tasks SET plan_json = '{not even json' WHERE run_id = 'r1'")
+        store._conn.commit()
+        assert store.get_tasks("r1")[0].spec.id == "t1"
 
     def test_update_unknown_task(self, store: StateStore) -> None:
         store.create_run("r1", "x")

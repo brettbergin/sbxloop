@@ -1084,12 +1084,12 @@ class TestBridge:
                 m.id for m in thread.messages.values() if m.content.startswith("⏳ steer queued")
             )
             note = thread.messages[note_id]
-            assert "mid-**execute** on `t2` · Wire CLI (3/40 tool calls so far)" in note.content
+            assert "mid-**build** on `t2` · Wire CLI (3/60 tool calls so far)" in note.content
             assert note.content.endswith("answered at the next checkpoint")
             # more tool calls -> the SAME note is edited, not a new one
             for _ in range(2):
                 bus.emit("agent.tool_start", "r1", tool="bash", args="ls")
-            assert wait_for(lambda: "5/40 tool calls" in note.content, timeout=8)
+            assert wait_for(lambda: "5/60 tool calls" in note.content, timeout=8)
             bus.emit("agent.tool_cap", "r1", cap=40, calls=40, tool="bash")
             assert wait_for(lambda: "ceiling reached" in note.content, timeout=8)
             # the engine picks it up at the checkpoint, then answers

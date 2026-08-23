@@ -6,6 +6,58 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The per-task pipeline is three phases, not six: DECOMPOSE → BUILD →
+  VERIFY.** PLAN and EXECUTE merged into one BUILD session that plans and
+  does the work (narrating its approach first — the chronology's plan-card
+  replacement, carried as a report excerpt on the build `phase.end`), and
+  the SCRUTINIZE and VALIDATE critics are gone along with the
+  `verify_suspect` protocol and the degraded-critic guard (#123's guard
+  protected clean critic verdicts; with no JSON critics left there is
+  nothing to guard — mechanical VERIFY fails loudly on its own, and the
+  review lane's missing-verdict handling already leaves a broken review
+  visibly un-reviewed). Rationale, measured on the `rews3ssdn` baseline:
+  the critics rubber-stamped task completion (scrutinize 6/6 pass, validate
+  5/5 accept) while the defect classes that actually leak to delivered PRs
+  are diff-level and cross-cutting — invisible to a per-task completion
+  audit by construction; meanwhile the non-executor stages cost ~35% of
+  tokens and ~43% of wall clock, much of it fresh sessions re-deriving what
+  the previous stage had already read. Adversarial review now lives solely
+  in the daemon's post-delivery review lane, which sees the whole diff and
+  drives bounded fix rounds. Consequences through the system:
+  - `verify_commands` are **decomposer-authored only** (the plan-level set
+    is gone): the agent that does the work never writes its own exam (#94),
+    and the builder is shown the commands verbatim. The wrong-exam failure
+    class formerly caught by `verify_suspect` is mitigated at authoring
+    time — plan.md's workspace-root/`sh -c`/portability rules moved into
+    decompose.md — and by the verify-exhaustion escape hatch, which now
+    restarts BUILD in a fresh session (spending a replan) instead of
+    re-planning.
+  - **Egress is task-declared**: the decompose JSON gains per-task
+    `egress`, bounds-checked at graph acceptance (one retry with the
+    operator-bounds message) and granted at BUILD entry, same grant-late
+    rationale as before.
+  - Task states are `pending/executing/verifying/done/failed/skipped`;
+    rows persisted by the six-phase pipeline are remapped at read time
+    (`planning`→`executing`, `scrutinizing`/`validating`→`verifying`), so
+    mid-flight runs resume across the upgrade with no data migration — and
+    the new vocabulary is a strict subset of the old, so a rollback can
+    still resume runs the new code wrote.
+  - `steer_task` restarts the build session with the guidance (budget-free)
+    rather than re-planning; `phase.plan`/`phase.verdict` events are gone
+    (`phase.start` was dead code and went too), the Discord plan and
+    verdict cards with them — the roster card, status line, builder prose,
+    build report excerpts, and end-of-run summary (rework now counted from
+    verify failures) remain the chronology.
+  - A fix round's seeded task now carries the operator's
+    `sandbox.gate_command` as its verify command when one is set
+    (host-authored; with none set the PR's own CI stays the mechanical
+    arbiter, which the acceptance gate already polls).
+  - `budgets.max_tool_calls_per_phase` default 40 → 60 for the merged
+    session; retune from per-phase usage data once the merged pipeline has
+    field numbers.
+
 ### Removed
 
 - **The per-phase system-message trimming flag under `[budgets]`, and the
