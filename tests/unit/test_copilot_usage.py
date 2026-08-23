@@ -5,12 +5,11 @@ Copilot subscription), so the mapping lives as a pure function over
 sample-shaped objects and is tested here with stand-ins — the same pattern
 ``read_only_denial`` and ``ripgrep_page_size_plan`` follow.
 
-What this guards: sbxloop read only ``model``/``input_tokens``/
-``output_tokens`` off ``AssistantUsageData`` and dropped ``cost`` and the
-prompt-cache counters, even though the whole reporting chain downstream
-already carried them. A run's real spend was unknowable and ``run_usage``
-told operators cost was "not reported by the agent backend" while the
-backend reported it on every turn.
+What this guards: sbxloop reads the prompt-cache counters off
+``AssistantUsageData`` because they are genuine per-turn deltas, but does
+not read ``cost``. ``cost`` is a per-turn constant (observed 15.0 on every
+turn of every session in run rrhb28j7n), so summing it in ``Usage.merged``
+fabricates a total; it stays unread until its unit is established.
 """
 
 from __future__ import annotations
@@ -21,7 +20,12 @@ from sbxloop_worker.backends.copilot import available_tool_count, usage_from_sdk
 
 
 class TestUsageFromSdkSample:
-    def test_maps_every_reported_field(self) -> None:
+    def test_maps_token_counters_but_never_cost(self) -> None:
+        """The sample still carries ``cost``; the mapping must ignore it.
+
+        It is the same constant on every turn, so ``Usage.merged`` — which
+        sums numeric fields — would fold a run into a fabricated total.
+        """
         usage = usage_from_sdk_sample(
             SimpleNamespace(
                 model="claude-opus-5",
@@ -37,7 +41,7 @@ class TestUsageFromSdkSample:
         assert usage.output_tokens == 310
         assert usage.cache_read_tokens == 18_500
         assert usage.cache_write_tokens == 1_200
-        assert usage.cost == 0.0421
+        assert usage.cost is None
 
     def test_falls_back_to_camel_case_spellings(self) -> None:
         usage = usage_from_sdk_sample(
