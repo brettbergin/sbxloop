@@ -69,6 +69,23 @@ All notable changes to sbxloop are documented here. The project adheres to
   the daemon's checkout, which fetched it but never checked it out. The clone
   therefore asks the source for that exact ref rather than mutating it.
 
+### Fixed
+
+- **Run reconciliation no longer kills live runs owned by another
+  process.** #379. Both reconciliation sweeps — the one at daemon startup
+  and the staleness safety net — decided "orphan" from this process's
+  in-flight run alone, so any other non-terminal run in the shared
+  `state.db` was rewritten to `failed` with `orphaned: daemon restarted while run was in flight`. That state DB is shared: a foreground
+  `sbxloop run` / `sbxloop resume` in the same checkout uses the same
+  file (the daemon's `state_dir` resolves to a legacy `./.sbxloop` when
+  one exists), as does a second daemon pointed at the same state
+  directory. A daemon restart mid-run therefore marked an operator's live
+  run failed, and its engine thread kept writing to the same row
+  afterwards, so the persisted state flip-flopped. Reconciliation is now
+  gated on the daemon's own work-item ledger: a run with no matching
+  ledger item belongs to someone else and is never touched, whatever its
+  state or age.
+
 ### Added
 
 - **A delivered item is not done until its PR is accepted.** `_settle` used to

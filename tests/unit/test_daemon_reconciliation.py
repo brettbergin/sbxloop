@@ -33,7 +33,7 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult
 from sbxloop.errors import RunCancelledError
 from sbxloop.events import Event, EventBus
-from tests.unit.test_daemon_loop import Harness, inbox_item
+from tests.unit.test_daemon_loop import Harness, inbox_item, own_run
 
 
 def _fresh_daemon(h: Harness) -> Harness:
@@ -227,6 +227,7 @@ class TestStatusAndListAgree:
     def test_idle_daemon_reports_no_active_runs_after_recover(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         for run_id, state in (("r_orph", "running"), ("r_dec", "decomposing")):
+            own_run(h, run_id)
             h.store.create_run(run_id, "x")
             h.store.set_run_state(run_id, state)
         h.store.create_run("r_done", "x")
@@ -243,6 +244,7 @@ class TestStatusAndListAgree:
     def test_live_run_is_the_only_active_run_after_recover(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         for run_id, state in (("r_orph", "running"), ("r_dec", "decomposing")):
+            own_run(h, run_id)
             h.store.create_run(run_id, "x")
             h.store.set_run_state(run_id, state)
         h.store.create_run("r_live", "x")
@@ -254,3 +256,47 @@ class TestStatusAndListAgree:
         non_terminal = {r.run_id for r in h.store.non_terminal_runs()}
         assert non_terminal == {"r_live"}
         assert _active_runs(h.loop) == non_terminal
+
+
+class TestForeignRunNotReconciled:
+    """#379: the engine ``state.db`` is shared with foreground ``sbxloop run`` /
+    ``sbxloop resume`` invocations (and possibly a second daemon), so a
+    non-terminal run row that *this* daemon's own ledger knows nothing about
+    belongs to another live process and must never be reconciled away."""
+
+    @staticmethod
+    def _age(h: Harness, run_id: str, updated_at: float) -> None:
+        h.store._conn.execute(
+            "UPDATE runs SET updated_at = ? WHERE run_id = ?", (updated_at, run_id)
+        )
+        h.store._conn.commit()
+
+    def test_foreign_cli_run_survives_recover(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.store.create_run("rcli12345", "outcome")
+        h.store.set_run_state("rcli12345", "running")
+        assert h.dstore.item_for_run("rcli12345") is None
+
+        h.loop.recover()
+
+        record = h.store.get_run("rcli12345")
+        assert record.state not in TERMINAL_RUN_STATES
+        assert record.state == "running"
+        assert [e.type for _, e in h.store.events("rcli12345")] == []
+
+    def test_foreign_cli_run_survives_stale_sweep(self, tmp_path: Path) -> None:
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "daemon": {"run_stale_after_s": 3600.0}}
+        )
+        h = Harness(tmp_path, config)
+        h.store.create_run("rcli67890", "outcome")
+        h.store.set_run_state("rcli67890", "running")
+        assert h.dstore.item_for_run("rcli67890") is None
+        self._age(h, "rcli67890", h.clock.t - 99999.0)
+
+        h.loop._reconcile_stale_runs(h.clock.t)
+
+        record = h.store.get_run("rcli67890")
+        assert record.state not in TERMINAL_RUN_STATES
+        assert record.state == "running"
+        assert [e.type for _, e in h.store.events("rcli67890")] == []

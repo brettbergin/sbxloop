@@ -1943,12 +1943,25 @@ class DaemonLoop:
         ``decomposing`` runs behind: ``list_runs`` disagreed with
         ``!sbx status`` and anything counting active runs was misled.
 
-        Two kinds of run are deliberately left alone: the run genuinely
-        executing in this process, and one queued for resume (item
-        ``queued`` with the run still pinned — the ``mark_resume_pending``
-        path above), which tick will pick up. Everything else is closed as
-        ``cancelled`` (its item was cancelled) or ``failed`` (orphaned).
-        Chronology is only ever appended to.
+        **Ownership rule (#379).** Only runs the daemon's own ledger knows
+        about — ``dstore.item_for_run(run_id) is not None`` — are ever
+        reconciled. The engine ``state.db`` is shared with foreground
+        ``sbxloop run`` / ``sbxloop resume`` (``cli/app.py`` opens
+        ``StateStore(config.state_dir / "state.db")``) and
+        :mod:`daemon.paths` may resolve the daemon's ``state_dir`` to the
+        legacy ``./.sbxloop`` of the same checkout. There is no pid/lock
+        file to tell a live foreign run from a dead one, so rewriting a
+        foreign row to ``failed`` would corrupt a run that is still
+        executing in another process. Unowned rows are skipped and logged
+        as ``recovery.run_not_owned``.
+
+        Among owned runs, two are deliberately left alone: the run
+        genuinely executing in this process, and one queued for resume
+        (item ``queued`` with the run still pinned — the
+        ``mark_resume_pending`` path above), which tick will pick up.
+        Every other owned run is closed as ``cancelled`` (its item was
+        cancelled) or ``failed`` (orphaned). Chronology is only ever
+        appended to.
         """
         with self._current_lock:
             handle = self._current
@@ -1957,7 +1970,15 @@ class DaemonLoop:
             if record.run_id == live_run_id:
                 continue
             item_id = self.dstore.item_for_run(record.run_id)
-            item = self.dstore.get(item_id) if item_id else None
+            if item_id is None:
+                log.debug(
+                    "recovery.run_not_owned",
+                    run=record.run_id,
+                    state=record.state,
+                    sweep="orphan",
+                )
+                continue
+            item = self.dstore.get(item_id)
             if item is not None and item.state == "queued" and item.run_id == record.run_id:
                 continue  # pending resume: tick owns it
             self._reconcile_run_record(record)
@@ -2022,8 +2043,17 @@ class DaemonLoop:
             idle = now - last_activity
             if idle <= threshold:
                 continue
+            # Ownership gate: see _reconcile_orphan_runs' docstring (#379).
             item_id = self.dstore.item_for_run(record.run_id)
-            item = self.dstore.get(item_id) if item_id else None
+            if item_id is None:
+                log.debug(
+                    "recovery.run_not_owned",
+                    run=record.run_id,
+                    state=record.state,
+                    sweep="stale",
+                )
+                continue
+            item = self.dstore.get(item_id)
             if item is not None and item.state == "queued" and item.run_id == record.run_id:
                 continue  # pending resume: tick owns it
             self._reconcile_run_record(

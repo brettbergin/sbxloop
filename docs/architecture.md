@@ -249,13 +249,16 @@ process (or a cancelled work item) used to leave runs stuck in `running` or
 was active (#374). Two sweeps keep them honest, and both only ever *append*
 chronology (a `run.reconciled` event) — historical events are never mutated:
 
-- **Startup reconciliation** closes every non-terminal run (`created`,
-  `provisioning`, `decomposing`, `running`, `finalizing`) that is neither the
-  run executing in this process nor one pinned for resume.
+- **Startup reconciliation** considers only non-terminal runs (`created`,
+  `provisioning`, `decomposing`, `running`, `finalizing`) that are **recorded
+  in the daemon's own work-item ledger** — a run with no matching ledger item
+  is left untouched. Among the runs it does own, it still skips the run
+  executing in this process and any run pinned for resume.
 - **The staleness safety net** runs every tick — including while paused — and
-  closes any non-terminal run whose last activity (chronology, falling back to
-  the run row's `updated_at`) is older than `[daemon] run_stale_after_s` while
-  no run is executing. The default is 6h (`21600`); `0` disables this sweep.
+  closes any non-terminal run *the daemon's own ledger owns* whose last
+  activity (chronology, falling back to the run row's `updated_at`) is older
+  than `[daemon] run_stale_after_s` while no run is executing. The default is
+  6h (`21600`); `0` disables this sweep.
 
 The reason recorded depends on the associated work item: a `cancelled` item
 gives run state `cancelled` with reason `work item cancelled` (plus the
@@ -266,7 +269,19 @@ transitions the run record alongside the work item, so the two cannot diverge.
 
 The run that is legitimately in flight is **never** reconciled: both sweeps
 skip the daemon's `current` run and any item queued for resume, and the
-staleness sweep does not run at all while a run is executing. The persisted
+staleness sweep does not run at all while a run is executing.
+
+**Ownership rule: the daemon only reconciles runs it started.** The state DB
+at `<state_dir>/state.db` is shared with the CLI (`sbxloop run`,
+`sbxloop resume`) and potentially a second daemon — the daemon's `state_dir`
+resolves to a legacy `./.sbxloop` when one exists, which is exactly the
+directory a foreground CLI run in the same checkout uses. A run that is not
+in this daemon's work-item ledger belongs to another process, and neither
+sweep touches it, no matter its state or age (#379). Without that gate, a
+daemon restart during an operator's `sbxloop run` would rewrite that live
+run's row to `failed` while its engine kept writing to it.
+
+The persisted
 reason is surfaced next to the state in `sbxloop status` / `list_runs` output,
 on the `reason:` line of `sbxloop status <run>`, and in the TUI run header.
 

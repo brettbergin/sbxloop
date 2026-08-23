@@ -131,6 +131,24 @@ class Harness:
         return RunResult(run_id=run_id, state=state)
 
 
+def own_run(h: Harness, run_id: str, key: str | None = None, *, settled: bool = True) -> str:
+    """Register `run_id` in the daemon's *own* ledger, as a real dispatch would.
+
+    Reconciliation only touches runs the daemon owns (#379), so tests that
+    model an orphaned daemon run must give it a ledger item.
+    """
+    key = key or f"{run_id}.md"
+    item = inbox_item(key)
+    h.dstore.upsert_new(item, now=1.0)
+    h.dstore.mark_claimed(item.item_id, now=1.0)
+    h.dstore.mark_running(item.item_id, run_id, now=2.0)
+    if settled:
+        # The item finished but the process died before the run row was
+        # closed: the orphan shape, with nothing left to resume.
+        h.dstore.mark_done(item.item_id, 3.0)
+    return item.item_id
+
+
 class TestTick:
     def test_one_item_success_end_to_end(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
@@ -1704,6 +1722,7 @@ class TestOrphanRunReconciliation:
     def test_recover_reconciles_orphan_run_failed(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         for run_id, state in (("r_orph", "running"), ("r_dec", "decomposing")):
+            own_run(h, run_id)
             h.store.create_run(run_id, "x")
             h.store.set_run_state(run_id, state)
         h.loop.recover()
@@ -1755,6 +1774,7 @@ class TestStaleRunReconciliation:
         h = self._stale_harness(tmp_path)
         now = h.clock.t
         for run_id in ("r_stale", "r_fresh"):
+            own_run(h, run_id)
             h.store.create_run(run_id, "x")
             h.store.set_run_state(run_id, "running")
         self._age(h, "r_stale", now - 7200.0)
@@ -1770,6 +1790,7 @@ class TestStaleRunReconciliation:
     def test_sweep_runs_while_paused(self, tmp_path: Path) -> None:
         h = self._stale_harness(tmp_path)
         h.loop._paused = True
+        own_run(h, "r_stale")
         h.store.create_run("r_stale", "x")
         h.store.set_run_state("r_stale", "decomposing")
         self._age(h, "r_stale", h.clock.t - 99999.0)
