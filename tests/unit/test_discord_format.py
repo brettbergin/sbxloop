@@ -14,6 +14,7 @@ from sbxloop.daemon.discord_format import (
     DISCORD_MAX_MESSAGE,
     EMBED_TOTAL_MAX,
     EmbedSpec,
+    RunStats,
     StatusLine,
     SteerProgress,
     ToolBatcher,
@@ -41,6 +42,8 @@ from sbxloop.daemon.discord_format import (
     split_markdown,
     status_embed,
     strip_json_payload,
+    summary_embed,
+    summary_text,
     verdict_text,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
@@ -787,6 +790,120 @@ class TestEmbeds:
         assert daemon_notice("✅ gh:8 done · PR https://x/pull/9", thread_id=77) == (
             "✅ gh:8 done · PR <https://x/pull/9> · <#77>"
         )
+
+
+def tev(ts: float, type: str, **data: Any) -> Event:
+    return Event(ts=ts, run_id="r1", type=type, data=data)
+
+
+class TestRunSummary:
+    def _folded(self) -> RunStats:
+        stats = RunStats()
+        for event in (
+            tev(100.0, "run.start", outcome="fix the bug"),
+            tev(101.0, "run.tasks", tasks=[{"id": "t1"}, {"id": "t2"}]),
+            tev(110.0, "agent.usage", input_tokens=1000, output_tokens=200, cost=0.10),
+            tev(111.0, "agent.tool_start", tool="bash"),
+            tev(112.0, "agent.tool_start", tool="bash"),
+            tev(120.0, "phase.verdict", task_id="t1", phase="verify", verdict="pass"),
+            tev(
+                130.0,
+                "phase.verdict",
+                task_id="t2",
+                phase="scrutinize",
+                verdict="revise",
+                issues=[{"severity": "major", "detail": "tests missing"}],
+                feedback="add tests",
+            ),
+            tev(140.0, "agent.usage", input_tokens=2000, output_tokens=300, cost=0.15),
+            tev(150.0, "chat.message", message_id="m1", text="go faster"),
+            tev(151.0, "chat.reply", message_id="m1", reply="ok", action="continue"),
+            tev(160.0, "policy.deny", op="push"),
+            tev(161.0, "task.state", task_id="t1", state="done", revisions=0),
+            tev(162.0, "task.end", task_id="t2", state="done", revisions=1),
+            tev(220.0, "run.end", state="completed"),
+        ):
+            stats.observe(event)
+        return stats
+
+    def test_stats_fold_the_event_stream(self) -> None:
+        stats = self._folded()
+        assert stats.duration_s == 120.0
+        assert stats.turns == 2 and stats.tool_calls == 2
+        assert stats.input_tokens == 3000 and stats.output_tokens == 500
+        assert stats.cost == pytest.approx(0.25)
+        assert stats.verdict_passes == 1
+        assert stats.rework == [("t2", "scrutinize", "revise", "tests missing")]
+        assert stats.steers == 1 and stats.steers_answered == 1 and stats.steers_failed == 0
+        assert stats.denies == 1
+        assert stats.task_counts() == (2, 2)
+
+    def test_summary_text_leads_with_the_headline_numbers(self) -> None:
+        stats = self._folded()
+        assert summary_text(stats, "completed") == (
+            "📊 **run summary** — 2m 00s · 2 turn(s) · 2 tool call(s) · "
+            "3,000 in / 500 out tokens · $0.25"
+        )
+        assert summary_text(None, "completed") == "📊 **run summary**"
+
+    def test_summary_card_stats_and_both_ledgers(self) -> None:
+        stats = self._folded()
+        report = RunReport("r1", "completed", "2/2 tasks done", delivery=(34, "https://x/pull/34"))
+        card = summary_embed(stats, report, "completed")
+        assert card.title == "📊 run summary" and card.color == COLOR_OK
+        assert card.description == "**completed** — 2/2 tasks done in 2m 00s"
+        assert card.footer == "run r1"
+        fields = {n: v for n, v, _ in card.fields}
+        assert list(fields) == ["Stats", "Went well", "Needed work"]
+        assert "turns 2 · tool calls 2" in fields["Stats"]
+        assert "tokens 3,000 in / 500 out · cost $0.25" in fields["Stats"]
+        assert "steering 1 asked / 1 answered" in fields["Stats"]
+        well = fields["Went well"]
+        assert "delivered PR [#34](https://x/pull/34)" in well
+        assert "all 2 task(s) completed" in well
+        assert "answered all 1 steering message(s)" in well
+        work = fields["Needed work"]
+        assert "• `t2` scrutinize: **revise** — tests missing" in work
+        assert "• 1 policy denial(s)" in work
+
+    def test_summary_card_degrades_without_stats(self) -> None:
+        """A run the pump never saw events for still gets a summary; unknown
+        numbers are omitted rather than shown as zero."""
+        report = RunReport("r1", "failed", "no tasks ran")
+        card = summary_embed(None, report, "failed")
+        assert card.color == COLOR_FAIL and card.description == "**failed** — no tasks ran"
+        fields = {n: v for n, v, _ in card.fields}
+        assert "Stats" not in fields
+        assert fields["Went well"] == "nothing stood out"
+        assert fields["Needed work"] == "no setbacks observed"
+
+    def test_summary_card_flags_setbacks_and_resume(self) -> None:
+        stats = RunStats()
+        stats.observe(tev(100.0, "run.start", resumed=True))
+        stats.observe(tev(101.0, "agent.tool_cap", cap=40))
+        stats.observe(tev(102.0, "chat.message", message_id="m1", text="x"))
+        stats.observe(tev(103.0, "chat.reply", message_id="m1", error="worker died"))
+        stats.observe(tev(104.0, "task.state", task_id="t1", state="failed"))
+        report = RunReport("r1", "failed", "0/1 tasks done", delivery_error="409 conflict")
+        card = summary_embed(stats, report, "failed", unanswered=1)
+        assert "_stats cover the run since the daemon last picked it up_" in (
+            card.description or ""
+        )
+        work = {n: v for n, v, _ in card.fields}["Needed work"]
+        assert "1 task(s) failed" in work
+        assert "delivery failed — 409 conflict" in work
+        assert "1 steering message(s) went unanswered" in work
+        assert "1 steer(s) errored" in work
+        assert "hit the per-phase tool-call ceiling" in work
+
+    def test_usage_never_reported_is_not_zero(self) -> None:
+        stats = RunStats()
+        stats.observe(tev(100.0, "agent.usage"))
+        assert stats.turns == 1
+        assert stats.input_tokens is None and stats.cost is None
+        assert summary_text(stats, "completed") == "📊 **run summary** — 0s · 1 turn(s)"
+        card = summary_embed(stats, RunReport("r1", "completed", "x"), "completed")
+        assert {n: v for n, v, _ in card.fields}["Stats"] == "turns 1"
 
 
 class TestFiledRefs:
