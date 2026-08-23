@@ -110,7 +110,11 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
   run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads and
   issue triage (file, list, comment, label for a run, close) through the ops
-  box, and `daemon_log` over the process's own recent log lines — relayed as
+  box, `pr_status` — a read-only PR health read served through the same
+  github-ops box via `GithubOps.raw` (`GET /repos/{repo}/pulls/{n}`,
+  `/commits/{sha}/check-runs`, `/pulls/{n}/reviews`) for check runs, review
+  decision, mergeability and behind-ness, with **no merge or write path** —
+  and `daemon_log` over the process's own recent log lines — relayed as
   `agent.tool_request` events and answered
   by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
   polls for. It is **kept across daemon restarts** when the installed worker
