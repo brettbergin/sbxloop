@@ -483,7 +483,8 @@ immediately instead of registering. Watches live in the bot's **memory
 only**: a daemon restart forgets every one of them, so re-ask after a
 restart.
 
-It finishes triage too: "reply on #12 that we're waiting on upstream"posts a comment signed with your name, and "close #12 as a duplicate of
+It finishes triage too: "reply on #12 that we're waiting on upstream"
+posts a comment signed with your name, and "close #12 as a duplicate of
 #7" comments and closes it as *not planned* (or *completed*) — but only
 after it has asked and you have said yes naming the issue, and never while
 a run is working that issue. `[concierge] create_issues` gates all of it.
