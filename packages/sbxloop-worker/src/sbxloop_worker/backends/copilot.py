@@ -21,6 +21,7 @@ import contextlib
 import json
 import os
 import shutil
+import time
 from collections import Counter
 from typing import Any, get_args
 
@@ -35,7 +36,7 @@ from sbxloop_worker.protocol import (
     SessionHealth,
     Usage,
 )
-from sbxloop_worker.secrets import looks_like_github_token
+from sbxloop_worker.secrets import looks_like_github_token, redact_secrets
 
 # The SDK's permission-request ``kind`` vocabulary, field-verified against
 # github-copilot-sdk 1.0.9 (2026-08-13): ``copilot.session.PermissionRequest``
@@ -193,7 +194,19 @@ def _auth_diagnostic() -> str:
 # Transcript-facing clips: the event stream is telemetry, not the artifact
 # channel, so payloads are bounded aggressively.
 TOOL_ARGS_CLIP = 400
+# Hard char cap on a rendered excerpt. The outer bound: whatever the line
+# budget below admits, the excerpt can never approach Discord's 2000-char
+# message limit.
 TOOL_OUTPUT_CLIP = 1_000
+# How much of the output is shown when it is longer than the budget: the
+# first N and last M lines, with an explicit elision marker between them.
+TOOL_OUTPUT_HEAD_LINES = 20
+TOOL_OUTPUT_TAIL_LINES = 20
+# Per-line cap inside an excerpt. Without it a single wide line (a pytest
+# progress bar, a minified blob) would eat the whole char budget and force
+# the head or the elision marker out. Must stay well under half of
+# TOOL_OUTPUT_CLIP so one head line, the marker and one tail line always fit.
+TOOL_OUTPUT_LINE_CLIP = 200
 
 
 def _tool_args(arguments: Any) -> str | None:
@@ -232,15 +245,99 @@ def _tool_exit_code(data: Any) -> int | None:
     return None
 
 
-def _tool_output(data: Any) -> str | None:
-    """A bounded tail of the tool's output, for transcript display."""
+class ToolCallRegistry:
+    """Correlates tool completions with their starts by ``tool_call_id``.
+
+    Parallel calls interleave and complete out of order, so a completion
+    recovers the tool name, displayed args and elapsed time from the id it
+    carries rather than by comparing command text. Entries are dropped on
+    completion, bounding memory over a long session.
+    """
+
+    def __init__(self) -> None:
+        self._starts: dict[str, tuple[str | None, str | None, float]] = {}
+
+    def start(self, call_id: Any, tool: Any, args: str | None) -> None:
+        if call_id:
+            self._starts[str(call_id)] = (
+                str(tool) if tool else None,
+                args,
+                time.monotonic(),
+            )
+
+    def end(self, call_id: Any) -> tuple[str | None, str | None, int | None]:
+        """(tool, args, duration_ms) for a completion; blanks when unmatched."""
+        started = self._starts.pop(str(call_id), None)
+        if started is None:
+            return (None, None, None)
+        tool, args, began = started
+        return (tool, args, max(0, int((time.monotonic() - began) * 1000)))
+
+
+def excerpt_output(text: str) -> str:
+    """A bounded, secret-redacted head+tail excerpt of tool output.
+
+    Long output keeps the first :data:`TOOL_OUTPUT_HEAD_LINES` and last
+    :data:`TOOL_OUTPUT_TAIL_LINES` lines, separated by an explicit
+    ``… N lines elided …`` marker naming the omitted line count. Redaction
+    runs on the full text before any cutting, so no credential shape is
+    split across a cut boundary.
+
+    The char cap (:data:`TOOL_OUTPUT_CLIP`) is enforced structurally, never
+    by slicing the finished string: each line is first clipped to
+    :data:`TOOL_OUTPUT_LINE_CLIP`, then whole lines are dropped from the
+    middle — the end of the head and the start of the tail — with the
+    marker recounted, so however wide the input lines are, the first line,
+    the elision marker and the last line always survive.
+    """
+    half = TOOL_OUTPUT_LINE_CLIP // 2
+    lines = [
+        ln if len(ln) <= TOOL_OUTPUT_LINE_CLIP else ln[:half] + "…" + ln[-(half - 1) :]
+        for ln in redact_secrets(text).splitlines()
+    ]
+    head = lines[:TOOL_OUTPUT_HEAD_LINES]
+    tail = lines[TOOL_OUTPUT_HEAD_LINES:][-TOOL_OUTPUT_TAIL_LINES:]
+    if not tail and len(head) > 1:
+        # Short-but-wide output lands entirely in `head`; keep the last line
+        # on the tail side so char-budget trimming can never drop it.
+        head, tail = head[:-1], head[-1:]
+
+    def render(h: list[str], t: list[str]) -> str:
+        omitted = len(lines) - len(h) - len(t)
+        marker = [f"… {omitted} lines elided …"] if omitted > 0 else []
+        return "\n".join([*h, *marker, *t])
+
+    out = render(head, tail)
+    while len(out) > TOOL_OUTPUT_CLIP and (len(head) > 1 or len(tail) > 1):
+        if len(head) >= len(tail):
+            head = head[:-1]
+        else:
+            tail = tail[1:]
+        out = render(head, tail)
+    return out
+
+
+def _tool_output_text(data: Any) -> str | None:
+    """The tool's raw output text, unbounded (None when absent/blank)."""
     result = getattr(data, "result", None)
     content = getattr(result, "content", None)
     if not content and result is not None:
         content = getattr(result, "detailed_content", None)
     if not isinstance(content, str) or not content.strip():
         return None
-    return content[-TOOL_OUTPUT_CLIP:]
+    return content
+
+
+def _tool_output(data: Any) -> str | None:
+    """A bounded excerpt of the tool's output, for transcript display."""
+    content = _tool_output_text(data)
+    return None if content is None else excerpt_output(content)
+
+
+def _tool_output_lines(data: Any) -> int | None:
+    """Total line count of the tool's untruncated output."""
+    content = _tool_output_text(data)
+    return None if content is None else len(content.splitlines())
 
 
 # The Copilot CLI's built-in command validator declines to run some commands
@@ -378,7 +475,7 @@ def _tool_error(data: Any) -> str | None:
     message = getattr(error, "message", None)
     if not isinstance(message, str) or not message.strip():
         return None
-    return message[-TOOL_OUTPUT_CLIP:]
+    return excerpt_output(message)
 
 
 def system_message_config(content: str | None) -> dict[str, Any] | None:
@@ -493,6 +590,7 @@ class CopilotBackend:
         from copilot import CopilotClient
 
         usage = Usage()
+        turns = 0
         tracker = SessionHealthTracker()
         governor = ToolCallGovernor(job.max_tool_calls)
         final_text: list[str] = []
@@ -503,10 +601,12 @@ class CopilotBackend:
         model_slug = job.model if job.model and job.model != "auto" else None
         # tool_call_id -> (tool name, displayed args), so completion events
         # can say what ran (the SDK's Complete event carries only the call id).
-        tool_calls: dict[str, tuple[str | None, str | None]] = {}
+        # Completions correlate to their start by id (not by comparing
+        # command text), which also yields a per-call duration.
+        tool_calls = ToolCallRegistry()
 
         def on_event(event: Any) -> None:
-            nonlocal usage, model_slug
+            nonlocal usage, turns, model_slug
             data = getattr(event, "data", None)
             type_name = type(data).__name__ if data is not None else type(event).__name__
             if type_name == "AssistantMessageDeltaData":
@@ -527,8 +627,7 @@ class CopilotBackend:
                 tool = getattr(data, "tool_name", None) or getattr(data, "toolName", None)
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
                 args = _tool_args(getattr(data, "arguments", None))
-                if call_id:
-                    tool_calls[str(call_id)] = (str(tool) if tool else None, args)
+                tool_calls.start(call_id, tool, args)
                 emit(
                     EventTypes.AGENT_TOOL_START,
                     tool=tool,
@@ -537,7 +636,7 @@ class CopilotBackend:
                 )
             elif type_name.startswith("ToolExecutionComplete"):
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
-                tool, args = tool_calls.get(str(call_id), (None, None))
+                tool, args, duration_ms = tool_calls.end(call_id)
                 success = getattr(data, "success", None)
                 output = _tool_output(data)
                 error = _tool_error(data)
@@ -556,10 +655,13 @@ class CopilotBackend:
                     exit_code=_tool_exit_code(data),
                     output=output,
                     error=error,
+                    output_lines=_tool_output_lines(data),
+                    duration_ms=duration_ms,
                 )
             elif type_name == "AssistantUsageData":
                 sample = usage_from_sdk_sample(data)
                 usage = usage.merged(sample)
+                turns += 1
                 if sample.model:
                     model_slug = sample.model
                 payload = sample.model_dump(exclude_none=True)
@@ -584,6 +686,7 @@ class CopilotBackend:
                     output_json=output_json,
                     session_id=session_id,
                     usage=usage if usage != Usage() else None,
+                    turns=turns or None,
                     health=tracker.health(governor),
                 )
             finally:
