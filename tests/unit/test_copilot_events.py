@@ -80,13 +80,14 @@ class TestToolOutput:
         data = SimpleNamespace(result=SimpleNamespace(content="", detailed_content="details"))
         assert _tool_output(data) == "details"
 
-    def test_long_output_keeps_tail(self) -> None:
+    def test_long_output_keeps_both_ends(self) -> None:
         data = SimpleNamespace(
-            result=SimpleNamespace(content="a" * 5_000 + "END", detailed_content=None)
+            result=SimpleNamespace(content="BEGIN" + "a" * 5_000 + "END", detailed_content=None)
         )
         output = _tool_output(data)
         assert output is not None
-        assert len(output) == TOOL_OUTPUT_CLIP
+        assert len(output) <= TOOL_OUTPUT_CLIP
+        assert output.startswith("BEGIN")
         assert output.endswith("END")
 
     def test_missing_result_is_none(self) -> None:
@@ -256,10 +257,31 @@ class TestExcerptOutput:
         assert len(lines) == TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 1
 
     def test_char_cap_bounds_a_single_huge_line(self) -> None:
-        out = excerpt_output("x" * 50_000 + "END")
-        assert len(out) == TOOL_OUTPUT_CLIP
+        out = excerpt_output("BEGIN" + "x" * 50_000 + "END")
+        assert len(out) <= TOOL_OUTPUT_CLIP
+        assert out.startswith("BEGIN")  # both ends of a wide line survive
         assert out.endswith("END")
+        assert "…" in out
         assert len(out) < 2_000  # Discord message limit
+
+    def test_wide_lines_keep_head_marker_and_tail(self) -> None:
+        # Many lines wide enough that a naive tail slice of the finished
+        # string would discard the head and the elision marker entirely.
+        text = "\n".join(f"line{i} " + "x" * 60 for i in range(100))
+        out = excerpt_output(text)
+        assert len(out) <= TOOL_OUTPUT_CLIP
+        assert "elided" in out
+        assert out.splitlines()[0].startswith("line0 ")
+        assert out.splitlines()[-1].startswith("line99 ")
+
+    def test_pathologically_wide_lines_still_bounded_with_marker(self) -> None:
+        text = "\n".join(f"L{i} " + "y" * 5_000 for i in range(50))
+        out = excerpt_output(text)
+        assert len(out) <= TOOL_OUTPUT_CLIP
+        assert "elided" in out
+        lines = out.splitlines()
+        assert lines[0].startswith("L0 ")
+        assert lines[-1].startswith("L49 ")
 
     def test_token_in_output_is_redacted(self) -> None:
         token = "ghp_" + "a1b2c3d4" * 4 + "wxyz"

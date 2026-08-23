@@ -65,8 +65,16 @@ _REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
 # `Bearer <token>` headers: keep the scheme, mask the credential.
 _BEARER = re.compile(r"\b(Bearer|Basic|token)\s+([A-Za-z0-9._\-+/=]{8,})")
 
-_SECRET_WORDS = r"token|secret|password|passwd|api[-_]?key|credential|authorization"  # nosec B105 - regex vocabulary of credential key names, not a credential
-_SECRET_NAME = rf"[A-Za-z0-9_.\-]*(?:{_SECRET_WORDS})[A-Za-z0-9_.\-]*"
+# NOTE: this vocabulary has a host-side twin in ``sbxloop.log`` (used by
+# ``redact_text``); the two are spelled separately because the worker cannot
+# import sbxloop. When adding a word here, consider whether the twin needs it
+# too — see "Redaction at the render seam" in docs/architecture.md.
+_SECRET_WORDS = r"token|secret|password|passwd|api[-_]?key|credentials?|authorization"  # nosec B105 - regex vocabulary of credential key names, not a credential
+# The credential word must be a whole delimiter-separated segment of the name
+# (`GITHUB_TOKEN`, `aws.credentials`), not a substring of an ordinary word —
+# otherwise a pytest `tokens: 5` summary or `compat=1` gets masked and the
+# published excerpt lies about what the tool printed.
+_SECRET_NAME = rf"(?:[A-Za-z0-9]+[_.\-])*(?:{_SECRET_WORDS})(?:[_.\-][A-Za-z0-9]+)*"
 
 # KEY=VALUE (env/CLI style) where the key names a credential.
 _ASSIGNMENT = re.compile(rf"\b({_SECRET_NAME})(\s*=\s*)(\"[^\"]*\"|'[^']*'|\S+)", re.IGNORECASE)

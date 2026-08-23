@@ -46,3 +46,27 @@ class TestRedactSecrets:
 
     def test_non_secret_assignment_kept(self) -> None:
         assert redact_secrets("PATH=/usr/bin") == "PATH=/usr/bin"
+
+    def test_credential_word_must_be_a_whole_name_segment(self) -> None:
+        # A pytest summary or usage counter must not be masked just because
+        # a credential word appears inside an ordinary word (PR #420 review).
+        for text in (
+            "tokens: 5",
+            "input_tokens: 1234",
+            "2131 passed, 1 skipped",
+            "compat=1",
+            "patch: 3",
+            "secrets_found=0",
+        ):
+            assert redact_secrets(text) == text
+
+    def test_delimited_credential_segments_still_masked(self) -> None:
+        for text, literal in (
+            ("GITHUB_TOKEN=ghx-abc123", "ghx-abc123"),
+            ("aws.credentials: /root/.aws", "/root/.aws"),
+            ('{"api_key": "k3y"}', "k3y"),
+            ("MY_PASSWORD=hunter2", "hunter2"),
+        ):
+            out = redact_secrets(text)
+            assert literal not in out
+            assert REDACTED in out

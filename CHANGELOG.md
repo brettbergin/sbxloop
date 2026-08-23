@@ -63,8 +63,10 @@ All notable changes to sbxloop are documented here. The project adheres to
     (emitting nothing) and writes a single line on completion — `$ bash  cd $RUN && uv run mypy  ✓ 1.5s` / `✗ exit 1 · 1.5s`. Pairing is strictly by
     `tool_call_id`, never by comparing command text, so concurrent calls
     finishing out of order still carry their own command; an unmatched end
-    renders from its own args and a call still in flight at flush shows
-    `… running`.
+    renders from its own args. A call still in flight survives routine
+    flushes untouched (its one line lands on completion) and only the
+    run-end flush renders leftovers as `… running`, so no call is ever
+    printed twice.
   - **Results reach the thread, bounded.** A completed call gets a ✓/✗ header
     with its exit status and a fenced head+tail excerpt of its output, with
     elision marked `… N lines elided …` counted from the new `output_lines`.

@@ -334,8 +334,11 @@ calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
   by `tool_call_id`, never by comparing command text, so parallel calls
   completing out of order still carry their own command. An end with no
   matching start renders from its own `args` (falling back to the oldest
-  in-flight start for that tool, for workers predating `tool_call_id`), and a
-  start still in flight at flush is shown as `… running`.
+  in-flight start for that tool, for workers predating `tool_call_id`). A
+  start still in flight survives routine flushes — its one line lands on
+  completion — and only the run-end `flush(final=True)` renders leftovers as
+  `… running`, so a mid-run flush (a failed sibling, the coalesce timer)
+  cannot print the same call twice.
 - **Bounded output excerpts.** `output_excerpt` gives a completed call a
   header (✓/✗ plus exit status) and a fenced head+tail excerpt of its output,
   with any elision marked `… N lines elided …` counted from the event's
@@ -351,7 +354,13 @@ calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
   output before it leaves the sandbox; because this feature *publishes* more
   of what a command printed, every rendered command and every excerpt passes
   through `sbxloop.log.redact_text` again on the way to a thread. It is
-  idempotent, so text already masked upstream is unchanged.
+  idempotent, so text already masked upstream is unchanged. The credential
+  vocabulary is deliberately spelled twice — `sbxloop_worker.secrets` (worker
+  side; the worker cannot import sbxloop) and `sbxloop.log` (host side) — and
+  the two word lists differ slightly, so a word added to one should be
+  weighed for the other. Both anchor the word to whole `_`/`.`/`-`-delimited
+  name segments, so `PATH=`, `--patch`, `compat=1` or a pytest `tokens: 5`
+  line are never masked.
 - **Additive schema.** `tool_call_id`, `output_lines` and `duration_ms` on
   `agent.tool_end` are optional; nothing was removed or renamed. Consumers
   tolerate their absence, so an older worker's chronology renders (without

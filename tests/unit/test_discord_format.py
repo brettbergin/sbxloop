@@ -529,12 +529,30 @@ class TestToolBatcher:
         assert b.add_end("bash", "zz", success=True, exit_code=0, detail="", args="echo hi") is None
         assert "$ bash  echo hi  ✓" in b.flush().text  # type: ignore[union-attr]
 
-    def test_unfinished_start_is_flushed_as_running(self) -> None:
+    def test_unfinished_start_is_flushed_as_running_only_when_final(self) -> None:
         b = ToolBatcher()
         b.add_start("bash", "sleep 100", "c1")
-        text = b.flush().text  # type: ignore[union-attr]
+        assert b.flush() is None  # routine flush: in-flight calls stay pending
+        text = b.flush(final=True).text  # type: ignore[union-attr]
         assert text == "```text\n$ bash  sleep 100  … running\n```"
-        assert b.flush() is None
+        assert b.flush(final=True) is None
+
+    def test_call_in_flight_at_flush_renders_exactly_once(self) -> None:
+        # The PR #420 review repro: a failed sibling forces a mid-batch
+        # flush; the call still in flight must not appear as `… running`
+        # then again on completion.
+        b = ToolBatcher()
+        b.add_start("bash", "uv run mypy", "c1")
+        b.add_start("bash", "uv run pytest -q", "c2")
+        b.add_end("bash", "c2", success=False, exit_code=1, detail="1 failed")
+        first = b.flush()  # the failure triggers an immediate flush
+        assert first is not None
+        assert "pytest" in first.text and "mypy" not in first.text
+        b.add_end("bash", "c1", success=True, exit_code=0, detail="", duration_ms=500)
+        second = b.flush(final=True)
+        assert second is not None
+        assert second.text == "```text\n$ bash  uv run mypy  ✓ 500ms\n```"
+        assert "running" not in second.text
 
     def test_full_and_quiet(self) -> None:
         b = ToolBatcher(max_lines=2)
@@ -1082,7 +1100,7 @@ class TestRenderRedaction:
     def test_batcher_running_line_is_redacted(self) -> None:
         b = ToolBatcher(max_lines=8)
         b.add_start("bash", f"gh auth login --with-token {PAT} && {APIKEY} run", "c1")
-        chunk = b.flush()
+        chunk = b.flush(final=True)
         assert chunk is not None
         _assert_clean(chunk.text)
         assert "running" in chunk.text

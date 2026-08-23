@@ -564,8 +564,10 @@ class ToolBatcher:
     An end with no matching start renders from the end event's own tool
     and args; if the end carries neither an id nor args (an older worker
     that predates ``tool_call_id``), it falls back to the oldest in-flight
-    start for the same tool. A start that never ends is rendered as
-    ``… running`` when the batch is flushed, so nothing in flight is lost.
+    start for the same tool. In-flight starts survive routine flushes —
+    their line is still written on completion — and a start that never ends
+    is rendered as ``… running`` by the run-end ``flush(final=True)``, so
+    nothing in flight is lost and no call is rendered twice.
 
     Volume is bounded: the command is clipped to ``TOOL_ARGS_LINE_CLIP -
     40`` characters, a failed call's detail chunk keeps at most
@@ -672,13 +674,25 @@ class ToolBatcher:
             max_lines=self.fail_output_lines if success is False else self.output_lines,
         )
 
-    def flush(self) -> Chunk | None:
+    def flush(self, *, final: bool = False) -> Chunk | None:
+        """The batched lines as one fenced chunk (None when there are none).
+
+        A routine flush renders only *completed* calls; anything still in
+        flight stays pending so its one line is written by ``add_end`` when
+        it completes — otherwise a mid-run flush (a failed sibling call, the
+        coalesce timer) would print an in-flight call twice, first as
+        ``… running`` and again on completion. Only a ``final`` flush (the
+        run is over, no end event can arrive) renders the leftovers as
+        ``… running`` and clears them."""
         lines = list(self._lines)
-        if not self.quiet:
-            lines += [_tool_line(tool, args, running=True) for tool, args in self._pending.values()]
         self._lines = []
-        self._pending = {}
-        self._synthetic = 0
+        if final:
+            if not self.quiet:
+                lines += [
+                    _tool_line(tool, args, running=True) for tool, args in self._pending.values()
+                ]
+            self._pending = {}
+            self._synthetic = 0
         if not lines:
             return None
         body = "\n".join(lines)

@@ -66,6 +66,9 @@ THIRD_PARTY_LOGGERS: tuple[str, ...] = (
 )
 
 #: Credential-ish key vocabulary, shared by the key-name and text scrubbers.
+#: NOTE: a worker-side twin lives in ``sbxloop_worker.secrets`` (the worker
+#: cannot import sbxloop); when adding a word here, consider whether the twin
+#: needs it too — see "Redaction at the render seam" in docs/architecture.md.
 _SECRET_WORDS = r"token|secret|password|passwd|api[_-]?key|apikey|pat"  # nosec B105 - regex vocabulary of credential key names, not a credential
 
 _SECRET_KEY = re.compile(rf"(^|_)(authorization|{_SECRET_WORDS})($|_)", re.I)
@@ -199,12 +202,17 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _AUTH_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)((?:bearer|token|basic)\s+)?([^\s'\"]+)")
+# The credential word must be a whole delimiter-separated segment of the
+# name (`GITHUB_TOKEN`, `--api-key`, `my.secret`), not a substring of an
+# ordinary word — otherwise `PATH=`, `--patch`, `compat=1` and `patch: 3`
+# all get masked and the rendered command becomes unreadable.
 _FLAG_RE = re.compile(
-    rf"(?i)(--?[A-Za-z0-9-]*(?:{_SECRET_WORDS})[A-Za-z0-9-]*)([=\s]+)(['\"]?)([^\s'\"]+)"
+    rf"(?i)(--?(?:[A-Za-z0-9]+-)*(?:{_SECRET_WORDS})(?:-[A-Za-z0-9]+)*)([=\s]+)"
+    r"(['\"]?)([^\s'\"]+)"
 )
 _ASSIGN_RE = re.compile(
-    rf"(?i)(?<![\w.-])([A-Za-z0-9_.-]*(?:{_SECRET_WORDS})[A-Za-z0-9_.-]*)(\s*[:=]\s*)"
-    r"(['\"]?)([^\s'\"]+)"
+    rf"(?i)(?<![\w.-])((?:[A-Za-z0-9]+[_.-])*(?:{_SECRET_WORDS})(?:[_.-][A-Za-z0-9]+)*)"
+    r"(\s*[:=]\s*)(['\"]?)([^\s'\"]+)"
 )
 
 

@@ -125,9 +125,11 @@ pair on the id rather than on command text.
 - `output` is a bounded head+tail *excerpt* of the tool's combined output:
   the first `TOOL_OUTPUT_HEAD_LINES` (20) and last `TOOL_OUTPUT_TAIL_LINES`
   (20) lines, separated by an explicit `… N lines elided …` marker naming
-  the omitted line count, then hard-capped at `TOOL_OUTPUT_CLIP` (1000)
-  characters so an excerpt can never approach Discord's 2000-char message
-  limit. The excerpt (and `error`) are secret-redacted inside the worker
+  the omitted line count. The `TOOL_OUTPUT_CLIP` (1000) char cap is enforced
+  structurally — each line is middle-elided at `TOOL_OUTPUT_LINE_CLIP` (200)
+  and whole lines are then dropped from around the marker — so the first
+  line, the marker and the last line survive however wide the output is,
+  and an excerpt can never approach Discord's 2000-char message limit. The excerpt (and `error`) are secret-redacted inside the worker
   (`sbxloop_worker.secrets.redact_secrets`) *before* emission, so no
   credential-shaped text leaves the sandbox in an event.
 - `output_lines` (int, optional) — total line count of the *untruncated*

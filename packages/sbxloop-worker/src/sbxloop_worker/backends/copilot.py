@@ -202,6 +202,11 @@ TOOL_OUTPUT_CLIP = 1_000
 # first N and last M lines, with an explicit elision marker between them.
 TOOL_OUTPUT_HEAD_LINES = 20
 TOOL_OUTPUT_TAIL_LINES = 20
+# Per-line cap inside an excerpt. Without it a single wide line (a pytest
+# progress bar, a minified blob) would eat the whole char budget and force
+# the head or the elision marker out. Must stay well under half of
+# TOOL_OUTPUT_CLIP so one head line, the marker and one tail line always fit.
+TOOL_OUTPUT_LINE_CLIP = 200
 
 
 def _tool_args(arguments: Any) -> str | None:
@@ -275,19 +280,41 @@ def excerpt_output(text: str) -> str:
     Long output keeps the first :data:`TOOL_OUTPUT_HEAD_LINES` and last
     :data:`TOOL_OUTPUT_TAIL_LINES` lines, separated by an explicit
     ``… N lines elided …`` marker naming the omitted line count. Redaction
-    runs before the char cap, so the cap bounds what is actually emitted.
+    runs on the full text before any cutting, so no credential shape is
+    split across a cut boundary.
+
+    The char cap (:data:`TOOL_OUTPUT_CLIP`) is enforced structurally, never
+    by slicing the finished string: each line is first clipped to
+    :data:`TOOL_OUTPUT_LINE_CLIP`, then whole lines are dropped from the
+    middle — the end of the head and the start of the tail — with the
+    marker recounted, so however wide the input lines are, the first line,
+    the elision marker and the last line always survive.
     """
-    lines = text.splitlines()
-    budget = TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES
-    if len(lines) > budget:
-        omitted = len(lines) - budget
-        kept = [
-            *lines[:TOOL_OUTPUT_HEAD_LINES],
-            f"… {omitted} lines elided …",
-            *lines[-TOOL_OUTPUT_TAIL_LINES:],
-        ]
-        text = "\n".join(kept)
-    return redact_secrets(text)[-TOOL_OUTPUT_CLIP:]
+    half = TOOL_OUTPUT_LINE_CLIP // 2
+    lines = [
+        ln if len(ln) <= TOOL_OUTPUT_LINE_CLIP else ln[:half] + "…" + ln[-(half - 1) :]
+        for ln in redact_secrets(text).splitlines()
+    ]
+    head = lines[:TOOL_OUTPUT_HEAD_LINES]
+    tail = lines[TOOL_OUTPUT_HEAD_LINES:][-TOOL_OUTPUT_TAIL_LINES:]
+    if not tail and len(head) > 1:
+        # Short-but-wide output lands entirely in `head`; keep the last line
+        # on the tail side so char-budget trimming can never drop it.
+        head, tail = head[:-1], head[-1:]
+
+    def render(h: list[str], t: list[str]) -> str:
+        omitted = len(lines) - len(h) - len(t)
+        marker = [f"… {omitted} lines elided …"] if omitted > 0 else []
+        return "\n".join([*h, *marker, *t])
+
+    out = render(head, tail)
+    while len(out) > TOOL_OUTPUT_CLIP and (len(head) > 1 or len(tail) > 1):
+        if len(head) >= len(tail):
+            head = head[:-1]
+        else:
+            tail = tail[1:]
+        out = render(head, tail)
+    return out
 
 
 def _tool_output_text(data: Any) -> str | None:
@@ -448,7 +475,7 @@ def _tool_error(data: Any) -> str | None:
     message = getattr(error, "message", None)
     if not isinstance(message, str) or not message.strip():
         return None
-    return redact_secrets(message)[-TOOL_OUTPUT_CLIP:]
+    return excerpt_output(message)
 
 
 def system_message_config(content: str | None) -> dict[str, Any] | None:

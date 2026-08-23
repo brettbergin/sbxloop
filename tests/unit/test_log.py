@@ -339,6 +339,36 @@ class TestRedactText:
         ):
             assert redact_text(text) == text
 
+    def test_credential_word_must_be_a_whole_name_segment(self) -> None:
+        # `pat` inside PATH/patch/compat is not a credential; masking these
+        # made rendered commands unreadable (PR #420 review).
+        from sbxloop.log import redact_text
+
+        for text in (
+            "PATH=/usr/local/bin:/usr/bin",
+            "export PATH=$HOME/bin",
+            "git apply --patch=foo",
+            "ls --path /tmp",
+            "patch: 3",
+            "compat=1",
+            "dispatch=async",
+        ):
+            assert redact_text(text) == text
+
+    def test_delimited_credential_segments_still_masked(self) -> None:
+        from sbxloop.log import redact_text
+
+        for text, literal in (
+            ("GITHUB_PAT=ghx-abc123", "ghx-abc123"),
+            ("MY_PAT: sekrit", "sekrit"),
+            ("gh --api-key k3y", "k3y"),
+            ("app.token=t0k", "t0k"),
+            ("--access-token=abc123", "abc123"),
+        ):
+            out = redact_text(text)
+            assert literal not in out
+            assert "***" in out
+
     def test_idempotent_and_never_raises(self) -> None:
         from sbxloop.log import redact_text
 

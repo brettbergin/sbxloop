@@ -1035,6 +1035,12 @@ class DiscordBridge:
             unanswered = [p for p in self._pending.values() if p.run_id == run_id]
             self._pending = {m: p for m, p in self._pending.items() if p.run_id != run_id}
         thread = await self._ensure_thread(run_id)
+        # Close the tool batch: anything still in flight can no longer get an
+        # end event, so this is the one flush that renders `… running` lines.
+        batcher = self._batchers.get(run_id)
+        leftovers = batcher.flush(final=True) if batcher else None
+        if leftovers is not None:
+            await self._flush(run_id, [leftovers])
         await self._digest_tick(run_id, [], close=True)
         # Final status-line edit, then the report card.
         status = self._status.get(run_id)
