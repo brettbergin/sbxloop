@@ -642,6 +642,25 @@ class Concierge:
                     self._tool_github_get,
                 )
             )
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="pr_status",
+                        description=(
+                            "Report how a pull request in "
+                            f"{self.config.github.repo} is doing: CI check runs "
+                            "(with the failing ones' URLs), review state and reviewers, "
+                            "mergeability, and whether the branch is behind its base. "
+                            "Read-only: it never merges, closes or writes anything."
+                        ),
+                        parameters=_schema(
+                            {"number": {"type": "integer", "minimum": 1}},
+                            ["number"],
+                        ),
+                    ),
+                    self._tool_pr_status,
+                )
+            )
         if (
             self.github is not None
             and self.config.github.repo
@@ -1141,6 +1160,66 @@ class Concierge:
             return f"GitHub read failed: {_one_line(str(exc), 300)}"
         return f"unknown what {what!r}"
 
+    def _tool_pr_status(self, args: dict[str, Any], by: str) -> str:
+        assert self.github is not None
+        repo = self.config.github.repo
+        number = args.get("number")
+        if not number:
+            return "pr_status needs number"
+        try:
+            n = int(number)
+        except (TypeError, ValueError):
+            return f"number must be an integer, got {number!r}"
+
+        missing = f"PR #{n} does not exist in {repo}"
+        try:
+            pr = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}"))
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            text = str(exc).lower()
+            if "404" in text or "not found" in text:
+                return missing
+            return f"reading PR #{n} failed: {_one_line(str(exc), 300)}"
+        if not isinstance(pr, dict) or not pr.get("number"):
+            return missing
+
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        sha = str(head.get("sha") or "")
+        try:
+            checks: Any = {}
+            if sha:
+                checks = self.github.call(
+                    lambda ops: ops.raw("GET", f"/repos/{repo}/commits/{sha}/check-runs")
+                )
+            reviews = self.github.call(
+                lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}/reviews?per_page=100")
+            )
+        except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
+            return f"reading PR #{n} failed: {_one_line(str(exc), 300)}"
+
+        title = _one_line(str(pr.get("title") or ""), 120)
+        flags = str(pr.get("state") or "?")
+        if pr.get("draft"):
+            flags = f"{flags}, draft"
+        base_ref = _one_line(str(base.get("ref") or "?"), 60)
+        head_ref = _one_line(str(head.get("ref") or "?"), 60)
+        state = pr.get("mergeable_state")
+        if not state:
+            behind = f"behind-ness unknown (vs {base_ref})"
+        elif str(state).lower() == "behind":
+            behind = f"behind {base_ref}"
+        else:
+            behind = f"up to date with {base_ref}"
+
+        lines = [
+            _one_line(f"#{n} {title} [{flags}] {pr.get('html_url') or ''}".strip(), 300),
+            _one_line(f"{head_ref} → {base_ref}", 200),
+            _check_runs_summary(checks, limit=5),
+            f"reviews: {_reviews_summary(reviews)}",
+            _one_line(f"{_mergeable_summary(pr)} · {behind}", 300),
+        ]
+        return "\n".join(lines)[:2000]
+
     def _tool_create_issue(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
         repo = self.config.github.repo
@@ -1632,6 +1711,106 @@ def _pr_files(files: Any, *, with_patch: bool) -> str:
                 patch = patch[:1500] + "\n… (patch truncated)"
             lines.append(patch)
     return "\n".join(lines) or "(no files)"
+
+
+def _check_runs_summary(data: Any, *, limit: int = 10) -> str:
+    """The ``check-runs`` payload as counts plus the runs worth clicking.
+
+    Accepts either the raw ``{"check_runs": [...]}`` dict or a bare list,
+    and ignores anything in it that is not a dict.
+    """
+    runs = data.get("check_runs") if isinstance(data, dict) else data
+    if not isinstance(runs, list):
+        return "(no checks)"
+    entries = [r for r in runs if isinstance(r, dict)]
+    if not entries:
+        return "(no checks)"
+
+    counts: dict[str, int] = {}
+    interesting: list[str] = []
+    for run in entries:
+        conclusion = run.get("conclusion")
+        if conclusion:
+            state = str(conclusion).lower()
+        else:
+            state = str(run.get("status") or "pending").lower()
+        counts[state] = counts.get(state, 0) + 1
+        if state == "success":
+            continue
+        name = _one_line(str(run.get("name") or "(unnamed)"), 120)
+        url = run.get("html_url")
+        line = f"- {name}: {state}"
+        if url:
+            line = f"{line} — {_one_line(str(url), 200)}"
+        interesting.append(_one_line(line, 200))
+
+    order = [
+        "success",
+        "failure",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "neutral",
+        "skipped",
+    ]
+    ranked = sorted(counts, key=lambda s: (order.index(s) if s in order else len(order), s))
+    words = {"success": "passed", "failure": "failed"}
+    head = ", ".join(f"{counts[state]} {words.get(state, state)}" for state in ranked)
+    total = len(entries)
+    lines = [f"{total} check{'s' if total != 1 else ''}: {head}"]
+    lines.extend(interesting[:limit])
+    if len(interesting) > limit:
+        lines.append(f"… ({len(interesting) - limit} more)")
+    return "\n".join(lines)
+
+
+def _reviews_summary(data: Any, *, limit: int = 10) -> str:
+    """Latest review state per reviewer, e.g. ``APPROVED by alice``."""
+    if not isinstance(data, list):
+        return "no reviews"
+    latest: dict[str, str] = {}
+    for review in data:
+        if not isinstance(review, dict):
+            continue
+        user = review.get("user")
+        login = str((user or {}).get("login") or "?") if isinstance(user, dict) else "?"
+        state = str(review.get("state") or "").upper()
+        if not state:
+            continue
+        if state in ("COMMENTED", "PENDING") and latest.get(login) in (
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "DISMISSED",
+        ):
+            continue
+        latest[login] = state
+    if not latest:
+        return "no reviews"
+    shown = list(latest.items())[:limit]
+    text = ", ".join(f"{state} by {login}" for login, state in shown)
+    if len(latest) > limit:
+        text = f"{text}, … ({len(latest) - limit} more)"
+    return _one_line(text, 300)
+
+
+def _mergeable_summary(data: Any) -> str:
+    """``mergeable``/``mergeable_state`` as a short phrase."""
+    if not isinstance(data, dict):
+        return "mergeable state unavailable"
+    mergeable = data.get("mergeable")
+    if mergeable is True:
+        text = "mergeable"
+    elif mergeable is False:
+        text = "not mergeable"
+    else:
+        text = "mergeable state unknown (GitHub still computing)"
+    state = data.get("mergeable_state")
+    if state:
+        state = _one_line(str(state), 60)
+        text = f"{text} ({state})"
+        if state.lower() == "behind":
+            text = f"{text} — branch is behind base"
+    return text
 
 
 def _issue_summary(data: Any) -> str:
