@@ -110,6 +110,17 @@ _UV_VENV_REMEDY = (
 # command that has to install something is doing the executor's job.
 MUTATING_COMMANDS = frozenset({"sudo", "apt", "apt-get", "dnf", "yum", "apk"})
 
+# So is the network. A verify command must judge the workspace, not remote
+# state: `gh pr view | grep -q .` failed a review task whose deliverable — a
+# local file — was present and valid, because the sandbox's anonymous GitHub
+# quota was exhausted (#440). A rate limit or a network flake must never be
+# able to fail work that is actually done. `curl`/`wget` stay legal against
+# an address that is unambiguously local (probing a server the command
+# itself started is a documented pattern); `gh` never is — it talks to
+# GitHub by definition.
+NETWORK_COMMANDS = frozenset({"gh", "curl", "wget"})
+_LOCAL_ADDRESS = re.compile(r"localhost|127\.0\.0\.1|\[?::1\]?|0\.0\.0\.0|unix:")
+
 # Shell operators that start a new command position. Backtick / $( catch
 # command substitutions so `echo $(pytest)` is still inspected.
 _SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\||\$\(|`|\n")
@@ -457,6 +468,14 @@ def lint_verify_commands(
                     f"verify command `{command}` runs `{head}` — verify commands "
                     "must not modify the environment; anything that needs "
                     "installing is a plan step, not a verification"
+                )
+                continue
+            if head in NETWORK_COMMANDS and (head == "gh" or not _LOCAL_ADDRESS.search(command)):
+                problems.append(
+                    f"verify command `{command}` runs `{head}` — verify commands "
+                    "must judge the workspace, not the network: an API rate "
+                    "limit or a flake would fail work that is done. Check the "
+                    "local files or run the local tests instead"
                 )
                 continue
             if uv_python and _VENV_PATH.search(head):
