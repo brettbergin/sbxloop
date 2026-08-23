@@ -911,6 +911,7 @@ class LoopEngine:
                 )
             ordered = graph.topo_order()
             self.store.save_tasks(run_id, ordered)
+            spend = phases.drain_spend()
             self.store.record_phase(
                 run_id,
                 "decompose",
@@ -919,6 +920,8 @@ class LoopEngine:
                 status="ok",
                 output_json=graph.model_dump_json(),
                 started_at=started,
+                usage=spend.usage,
+                turns=spend.turns,
             )
             tasks = self.store.get_tasks(run_id)
 
@@ -1126,6 +1129,7 @@ class LoopEngine:
             verify_commands=list(plan.verify_commands),
             egress=[{"domain": e.domain, "reason": e.reason} for e in plan.egress],
         )
+        spend = phases.drain_spend()
         self.store.record_phase(
             run_id,
             "plan",
@@ -1134,6 +1138,8 @@ class LoopEngine:
             status="ok",
             output_json=plan.model_dump_json(),
             started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
         )
         self._set_task_state(run_id, task, "executing")
 
@@ -1188,6 +1194,7 @@ class LoopEngine:
         if result.session_id:
             self._live_sessions.add(result.session_id)
         executor_report = clip(result.output_text)
+        spend = phases.drain_spend()
         self.store.record_phase(
             run_id,
             "execute",
@@ -1196,12 +1203,15 @@ class LoopEngine:
             status="ok",
             output_json=json.dumps({"report": executor_report, "session_id": result.session_id}),
             started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
         )
         self._set_task_state(run_id, task, "scrutinizing")
 
         started = time.time()
         outcome = phases.scrutinize(task, task.plan, executor_report)
         verdict = outcome.verdict
+        spend = phases.drain_spend()
         self.store.record_phase(
             run_id,
             "scrutinize",
@@ -1210,6 +1220,8 @@ class LoopEngine:
             status=verdict.verdict,
             output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
         )
         self._emit_verdict(run_id, task, "scrutinize", verdict)
         self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
@@ -1374,6 +1386,7 @@ class LoopEngine:
         started = time.time()
         outcome = phases.validate(task, verify_results)
         verdict = outcome.verdict
+        spend = phases.drain_spend()
         self.store.record_phase(
             run_id,
             "validate",
@@ -1382,6 +1395,8 @@ class LoopEngine:
             status=verdict.verdict,
             output_json=json.dumps(self._critic_payload(outcome)),
             started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
         )
         self._emit_verdict(run_id, task, "validate", verdict)
         self._emit_critic_degraded(run_id, task, "validate", outcome)
@@ -1573,6 +1588,7 @@ class LoopEngine:
                     attempt=self._steer_attempts,
                     exc_info=True,
                 )
+                spend = phases.drain_spend()
                 self.store.record_phase(
                     run_id,
                     "steer",
@@ -1581,6 +1597,8 @@ class LoopEngine:
                     status="error",
                     output_json=json.dumps({"message": message.text, "error": str(exc)}),
                     started_at=started,
+                    usage=spend.usage,
+                    turns=spend.turns,
                 )
                 self.bus.emit(
                     HostEventTypes.CHAT_REPLY,
@@ -1590,6 +1608,7 @@ class LoopEngine:
                 )
                 continue
             action = self._apply_steer(run_id, task, verdict, phases)
+            spend = phases.drain_spend()
             self.store.record_phase(
                 run_id,
                 "steer",
@@ -1600,6 +1619,8 @@ class LoopEngine:
                     {"message": message.text} | verdict.model_dump() | {"applied": action}
                 ),
                 started_at=started,
+                usage=spend.usage,
+                turns=spend.turns,
             )
             self.bus.emit(
                 HostEventTypes.CHAT_REPLY,

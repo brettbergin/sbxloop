@@ -32,6 +32,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Per-phase usage columns on `phase_attempts`.** Every phase attempt row
+  now bills the tokens and model turns its agent sessions actually spent:
+  `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+  `cost`, and `turns`, populated from the worker's per-turn usage samples
+  (`JobResult` gains a `turns` count) and accumulated across JSON retries and
+  critic re-runs so a failed first attempt still bills to the phase it served.
+  Mechanical phases (verify) record NULLs. Existing state databases gain the
+  columns in place on open — the additive-migration mechanism previously
+  covering only `runs` now covers any table. This is the instrument for
+  before/after cost comparison of upcoming pipeline changes; until now
+  per-phase spend attribution required folding `agent.usage` events by
+  persona.
+
 - **`pr_status(number)`, a concierge host tool for how a delivered PR is
   doing.** #333. "How is PR #41 doing?" now gets an answer without a
   browser: the CI check runs summarised as counts with each failing check

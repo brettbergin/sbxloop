@@ -297,6 +297,19 @@ class TestHappyPath:
         phases = [row["phase"] for row in engine.store.phase_attempts(result.run_id)]
         assert phases == ["decompose", "plan", "execute", "scrutinize", "verify", "validate"]
 
+    def test_phase_attempts_carry_usage(self, harness: Harness) -> None:
+        """Every agent phase row bills its session's tokens and turns; the
+        mechanical verify row stays NULL."""
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine()
+        result = engine.start("bill phases")
+        rows = {row["phase"]: row for row in engine.store.phase_attempts(result.run_id)}
+        for phase in ("decompose", "plan", "execute", "scrutinize", "validate"):
+            assert rows[phase]["input_tokens"] is not None, phase
+            assert rows[phase]["turns"] == 1, phase
+        assert rows["verify"]["input_tokens"] is None
+        assert rows["verify"]["turns"] is None
+
 
 class TestReviseAndVerify:
     def test_scrutinize_revise_then_pass(self, harness: Harness) -> None:
