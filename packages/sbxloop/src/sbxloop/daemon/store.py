@@ -100,6 +100,10 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     -- the item forever.
     gates      INTEGER NOT NULL DEFAULT 0,
     reviewed   INTEGER NOT NULL DEFAULT 0,
+    -- The event our own review asked for (APPROVE / REQUEST_CHANGES). When
+    -- the review could only be posted as a COMMENT, GitHub records no
+    -- verdict at all, so this is the only place the answer survives.
+    verdict    TEXT,
     -- The review charter in flight, or NULL when none is.
     review_ref TEXT,
     -- What the next fix round is for; NULL when no round is queued.
@@ -161,6 +165,7 @@ _MIGRATIONS = (
         "rounds",
         "ALTER TABLE daemon_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0",
     ),
+    ("daemon_pr_state", "verdict", "ALTER TABLE daemon_pr_state ADD COLUMN verdict TEXT"),
 )
 
 
@@ -174,6 +179,8 @@ class PrState(NamedTuple):
     reviewed: int
     review_ref: str | None
     fix_brief: str | None
+    # What our own review asked for, when one has been posted.
+    verdict: str | None = None
 
     @property
     def review_in_flight(self) -> bool:
@@ -831,6 +838,7 @@ class DaemonStore:
             reviewed=int(row["reviewed"]),
             review_ref=row["review_ref"],
             fix_brief=row["fix_brief"],
+            verdict=row["verdict"],
         )
 
     def review_in_flight(self, item_id: str, review_ref: str | None) -> None:
@@ -844,14 +852,29 @@ class DaemonStore:
             )
             self._conn.commit()
 
-    def review_settled(self, item_id: str, *, gates: bool) -> None:
-        """A review has been posted: it is no longer in flight, and we now
-        know whether it can actually hold the merge."""
+    def awaiting_review(self, review_ref: str) -> str | None:
+        """The item whose PR ``review_ref`` is the review of.
+
+        The review runs as its *own* work item, so the charter's id is not
+        the id of the item waiting on the PR — settling against the wrong
+        one updates no row and leaves the waiter marked "review in flight"
+        for ever (field: gh:335 parked on PR #406).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT item_id FROM daemon_pr_state WHERE review_ref = ?", (review_ref,)
+            ).fetchone()
+        return str(row["item_id"]) if row is not None else None
+
+    def review_settled(self, item_id: str, *, gates: bool, verdict: str) -> None:
+        """A review has been posted against this item's PR: it is no longer
+        in flight, and we now know both what it asked for and whether GitHub
+        will let that hold the merge."""
         with self._lock:
             self._conn.execute(
-                "UPDATE daemon_pr_state SET review_ref = NULL, gates = ?, "
+                "UPDATE daemon_pr_state SET review_ref = NULL, gates = ?, verdict = ?, "
                 "reviewed = reviewed + 1 WHERE item_id = ?",
-                (int(gates), item_id),
+                (int(gates), verdict, item_id),
             )
             self._conn.commit()
 
