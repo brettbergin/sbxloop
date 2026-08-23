@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sbxloop.config import Config
+from sbxloop.daemon.model import RunReport
 from sbxloop.daemon.review import FIX_TASK_TITLE, fix_brief, fix_tasks
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RunResult
@@ -84,3 +85,30 @@ class TestSeededRunSkipsDecompose:
         engine = self._engine(tmp_path)
         engine.start("do the thing", run_id="rord00001")
         assert engine.store.get_tasks("rord00001") == []
+
+
+class TestFixRoundHeadTracking:
+    """The loop's own fix-round push must not look like a human's.
+
+    Every fix round finishes back through `_hold_for_review`, which re-reads
+    the PR's head — so the sha it force-pushed becomes the new baseline and
+    the next poll does not trip the hand-off guard (#412).
+    """
+
+    def test_a_fix_round_delivery_updates_the_recorded_head(self, tmp_path: Path) -> None:
+        from tests.unit.test_daemon_loop import TestHandOffGuard
+
+        h, source = TestHandOffGuard()._delivered(tmp_path)
+        assert h.dstore.pr_state("gh:1").head_sha == "sha0"  # type: ignore[union-attr]
+        # The fix round pushes: GitHub now reports the sha the loop wrote.
+        source.head_sha = "B-sha"
+        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
+        source.review_state = "CHANGES_REQUESTED"
+        report = RunReport(run_id="r2", state="completed", task_summary="", delivery=(9, "u9"))
+        item = h.dstore.get("gh:1")
+        assert item is not None
+        assert h.loop._hold_for_review(item, "r2", report, 100.0)
+        assert h.dstore.pr_state("gh:1").head_sha == "B-sha"  # type: ignore[union-attr]
+        # The following poll sees B-sha and works the item as normal.
+        h.loop._poll_reviews(101.0)
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]

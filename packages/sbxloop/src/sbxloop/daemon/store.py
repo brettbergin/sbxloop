@@ -94,6 +94,10 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     item_id    TEXT PRIMARY KEY,
     pr_number  INTEGER NOT NULL,
     branch     TEXT NOT NULL DEFAULT '',
+    -- The head sha the loop itself last delivered to that branch. A head
+    -- that has moved since means someone else has been working in there,
+    -- and a fix round would force-update over their commits.
+    head_sha   TEXT NOT NULL DEFAULT '',
     rounds     INTEGER NOT NULL DEFAULT 0,
     -- Whether the review that was actually posted can hold the merge; a
     -- COMMENT cannot, and waiting for an approval nobody can give strands
@@ -166,6 +170,11 @@ _MIGRATIONS = (
         "ALTER TABLE daemon_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0",
     ),
     ("daemon_pr_state", "verdict", "ALTER TABLE daemon_pr_state ADD COLUMN verdict TEXT"),
+    (
+        "daemon_pr_state",
+        "head_sha",
+        "ALTER TABLE daemon_pr_state ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''",
+    ),
 )
 
 
@@ -181,6 +190,8 @@ class PrState(NamedTuple):
     fix_brief: str | None
     # What our own review asked for, when one has been posted.
     verdict: str | None = None
+    # The head sha this loop last delivered to ``branch``.
+    head_sha: str = ""
 
     @property
     def review_in_flight(self) -> bool:
@@ -806,20 +817,43 @@ class DaemonStore:
 
     # -- PR acceptance state ---------------------------------------------------
 
-    def record_delivery(self, item_id: str, pr_number: int, branch: str, now: float) -> None:
+    def record_delivery(
+        self,
+        item_id: str,
+        pr_number: int,
+        branch: str,
+        now: float,
+        *,
+        head_sha: str = "",
+    ) -> None:
         """This item delivered ``pr_number``; start tracking its acceptance.
 
         Idempotent on the item: a re-delivery of the same PR (a fix round
         pushing to the same branch) must not reset the round count, which is
-        the only thing bounding the loop.
+        the only thing bounding the loop. The delivered head sha *is*
+        overwritten on redelivery — it is the new baseline for noticing a
+        head someone else has moved.
         """
         with self._lock:
             self._conn.execute(
-                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
+                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, head_sha, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
                 "pr_number = excluded.pr_number, branch = excluded.branch, "
-                "updated_at = excluded.updated_at",
-                (item_id, pr_number, branch, now),
+                "head_sha = excluded.head_sha, updated_at = excluded.updated_at",
+                (item_id, pr_number, branch, head_sha, now),
+            )
+            self._conn.commit()
+
+    def record_head(self, item_id: str, head_sha: str) -> None:
+        """Adopt ``head_sha`` as the baseline for this item's PR.
+
+        Touches nothing else: used for a PR delivered before the sha was
+        recorded, so the moved-head check has something to compare against.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET head_sha = ? WHERE item_id = ?",
+                (head_sha, item_id),
             )
             self._conn.commit()
 
@@ -839,6 +873,7 @@ class DaemonStore:
             review_ref=row["review_ref"],
             fix_brief=row["fix_brief"],
             verdict=row["verdict"],
+            head_sha=str(row["head_sha"] or ""),
         )
 
     def review_in_flight(self, item_id: str, review_ref: str | None) -> None:

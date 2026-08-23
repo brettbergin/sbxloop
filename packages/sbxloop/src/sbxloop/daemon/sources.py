@@ -25,7 +25,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from urllib.parse import quote
 
 from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
@@ -37,6 +37,23 @@ from sbxloop.gh.ops import ChecksVerdict, GithubOps, SubmittedReview
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
+
+
+class PrObservation(NamedTuple):
+    """Everything one PR read can tell the acceptance gate.
+
+    The checks verdict and the review state are what the gate has always
+    used; the head sha and the PR's label names (lowercased) come free with
+    the payload already fetched. Surfacing them lets a later gate notice
+    that the head moved under it — someone else pushed to the branch — or
+    that a hands-off label is present, without a single extra API call.
+    """
+
+    checks: ChecksVerdict
+    review: str
+    head_sha: str
+    labels: tuple[str, ...]
+
 
 # A file still being written must not be claimed half-way; operators are
 # told to write elsewhere and rename, but a small mtime guard costs nothing.
@@ -777,16 +794,27 @@ class GitHubIssueSource:
             title=title,
         )
 
-    def pr_state(self, pr_number: int) -> tuple[ChecksVerdict, str]:
-        """(checks, review state) for a PR — what the acceptance gate needs.
+    def pr_state(self, pr_number: int) -> PrObservation:
+        """What the acceptance gate can learn about a PR in one poll.
 
         Two reads rather than one: the check runs hang off the *head commit*,
         so the sha has to be fetched first, and fetching it fresh each poll
         is what makes a PR that was pushed to since the last look report on
         its new commit rather than the old one's checks.
+
+        That same payload already carries the head sha and the PR's labels,
+        so both are returned alongside the verdicts rather than discarded —
+        no extra round-trip buys them.
         """
         pr = self._ops().pr_get(self.repo, pr_number)
         sha = str(((pr.get("head") or {}).get("sha")) or "")
+        labels = tuple(
+            name
+            for raw in (pr.get("labels") or [])
+            if isinstance(raw, dict)
+            for name in (str(raw.get("name") or "").strip().lower(),)
+            if name
+        )
         checks = (
             self._ops().pr_checks(self.repo, sha)
             if sha
@@ -794,7 +822,7 @@ class GitHubIssueSource:
             # and the gate must not read that as permission to merge.
             else ChecksVerdict("pending", 0, ("unknown head commit",), ())
         )
-        return checks, self._ops().pr_review_state(self.repo, pr_number)
+        return PrObservation(checks, self._ops().pr_review_state(self.repo, pr_number), sha, labels)
 
     def post_review(
         self, run: RunRecord, pr_number: int, origin_run_id: str

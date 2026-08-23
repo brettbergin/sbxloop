@@ -1546,6 +1546,11 @@ class DaemonLoop:
 
         Only a patch item that actually opened a PR: an audit has no PR, and
         a run that delivered nothing has nothing to be accepted.
+
+        The delivered head sha is recorded alongside the PR. Every fix-round
+        delivery re-enters this same path, so this is what keeps the loop's
+        own pushes from tripping the moved-head hand-off guard in
+        :meth:`_handed_off`.
         """
         daemon = self.config.daemon
         if not daemon.await_review or item.kind != "patch" or report.delivery is None:
@@ -1556,7 +1561,12 @@ class DaemonLoop:
         if github is None or not hasattr(github, "pr_state"):
             return False
         number, url = report.delivery
-        self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now)
+        head = ""
+        try:
+            head = str(getattr(github.pr_state(number), "head_sha", "") or "")
+        except Exception:
+            log.warning("review.head_read_failed", item=item.item_id, pr=number, exc_info=True)
+        self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now, head_sha=head)
         self.dstore.mark_reviewing(item.item_id, now)
         self._notify(
             f"⏳ {item.item_id} delivered PR {link(f'#{number}', url)} — "
@@ -1605,6 +1615,7 @@ class DaemonLoop:
         ===============================  ===========================
         state                            action
         ===============================  ===========================
+        head moved / hands-off label     hand over (free)
         checks pending                   wait (free)
         checks red                       fix round
         green, review in flight          wait
@@ -1624,7 +1635,10 @@ class DaemonLoop:
             self._accept(item, now, detail="no delivered PR was recorded")
             return
         pr = state.pr_number
-        checks, review_state = github.pr_state(pr)
+        obs = github.pr_state(pr)
+        if self._handed_off(item, state, obs, now):
+            return
+        checks, review_state = obs.checks, obs.review
         if checks.state == "pending":
             log.debug("review.waiting", item=item.item_id, pr=pr, on="checks")
             return
@@ -1678,6 +1692,49 @@ class DaemonLoop:
             self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, review satisfied")
             return
         log.debug("review.waiting", item=item.item_id, pr=pr, on="approval")
+
+    def _handed_off(self, item: WorkItem, state: PrState, obs: Any, now: float) -> bool:
+        """Whether someone else has taken this PR over.
+
+        The loop knows the head sha it last delivered. If the PR's head has
+        moved since, a human has been working on that branch — a fix round
+        would clone it and force-update the ref, silently replacing their
+        work. A ``hands_off_label`` on the PR says the same thing
+        deliberately. Either way the item is handed over: no fix round, no
+        delivery, no acceptance.
+        """
+        observed = str(getattr(obs, "head_sha", "") or "")
+        labels = tuple(getattr(obs, "labels", ()) or ())
+        stored = state.head_sha
+        label = self.config.daemon.hands_off_label.strip()
+        if label and label.lower() in {str(name).lower() for name in labels}:
+            reason = f"PR #{state.pr_number} carries {label} — leaving it to a human"
+            why = "label"
+        elif not stored:
+            # First poll after a delivery that could not read the sha: adopt
+            # what is there as the baseline rather than guess at a hand-off.
+            if observed:
+                self.dstore.record_head(item.item_id, observed)
+            return False
+        elif observed and observed != stored:
+            reason = (
+                f"PR #{state.pr_number}: its head moved from {stored[:7]} to "
+                f"{observed[:7]} — someone else has been working on it"
+            )
+            why = "head_moved"
+        else:
+            return False
+        self.dstore.mark_failed(item.item_id, reason, now, requeue=False)
+        self._notify(
+            f"✋ {item.item_id}: {reason}. Handing it over; PR #{state.pr_number} is left "
+            "open and the daemon will not touch its branch again.",
+            "review.handed_off",
+            level="error",
+            item=item.item_id,
+            pr=state.pr_number,
+            reason=why,
+        )
+        return True
 
     def _poll_failed(self, item: WorkItem, now: float) -> None:
         """Charge a failed poll a round, and hand the item over at the cap."""

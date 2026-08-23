@@ -460,6 +460,11 @@ class DaemonConfig(_ConfigModel):
     # next delivery deserves one.
     await_review: bool = True
     review_rounds: int = 3
+    # A PR (or its source issue) carrying this label is never touched again by
+    # the loop: no fix round, no delivery to its branch — it is handed to a
+    # human. The deliberate counterpart to the moved-head hand-off, which
+    # catches the case where nobody had a chance to declare anything.
+    hands_off_label: str = "sbxloop:hands-off"
     # Where findings ABOUT THE TOOL (sbxloop's planner, prompts, lint,
     # delivery) go — the tool's own tracker, never the project's. Unset:
     # such findings are only noted in the closing comment.

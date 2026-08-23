@@ -283,6 +283,38 @@ persisted consecutive-failure circuit breaker, which are unaffected by the
 day boundary. Operator strings name both the day and the zone
 (`runs today (UTC): 7/10, resets at 00:00 UTC`).
 
+### The acceptance gate
+
+A delivered PR sits in `reviewing` and is advanced by exactly one step per
+poll. The gates are ordered by what they cost:
+
+| state                        | action           |
+| ---------------------------- | ---------------- |
+| head moved / hands-off label | hand over (free) |
+| checks pending               | wait (free)      |
+| checks red                   | fix round        |
+| green, review in flight      | wait             |
+| green, changes requested     | fix round        |
+| green, not yet reviewed      | file a review    |
+| green, review satisfied      | accept           |
+
+CI comes before a review because it is GitHub's compute and costs nothing:
+a red PR never spends a review run on work that has to change anyway.
+
+The **hand-off gate is first** for a different reason. It is free — the head
+sha and the labels both come out of the single `pr_state` read the poll
+already makes — and it is the only gate that protects work the loop did not
+do. Every fix round clones the PR's branch and force-updates the ref (that
+is what makes a round update the PR instead of opening a second one), so a
+commit someone else pushed would be silently replaced. The loop records the
+head sha of every delivery in `daemon_pr_state`; a head it did not produce,
+or `[daemon] hands_off_label` on the PR, means someone else has taken the PR
+over. The item is failed without requeue, a `✋` notification is sent, and
+the PR is left open for a human — no fix round, no further delivery to that
+branch. A stored sha of `''` (an old row, or a delivery that could not read
+the sha) adopts what the first poll observes as its baseline rather than
+guessing at a hand-off.
+
 ## Events
 
 Everything observable is an `Event` (versioned JSONL envelope, shared model

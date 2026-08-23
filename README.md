@@ -306,6 +306,16 @@ are never dumped on the project's tracker: the audit contract routes them
 to `.sbxloop/backlog/tool/`, and `[daemon] tool_repo = "brettbergin/sbxloop"`
 files them upstream (unset: they are noted in the closing comment only).
 
+**A PR the loop no longer owns is handed over.** A fix round clones the PR's
+branch and force-updates it, so a commit someone else pushed there would be
+replaced. The daemon therefore records the head sha of every PR it delivers,
+and checks it first on every review poll: a head it did not produce means a
+human has been working the branch, and `[daemon] hands_off_label`
+(`sbxloop:hands-off`, empty disables) on the PR says the same thing
+deliberately. Either way the loop is done with that PR — no fix round, no
+further delivery to its branch — the item is failed without requeue, a `✋`
+notification goes out, and the PR is left open for a human to finish.
+
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
 an interrupted run (SIGTERM, crash) is resumed on the next start — through
@@ -866,6 +876,7 @@ The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
 | `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
 | `[daemon] max_runs_per_day` | `12` | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there. |
 | `[daemon] run_cap_timezone` | `UTC` | IANA timezone defining the run cap's day boundary (also used by the per-day review and post-mortem caps). |
+| `[daemon] hands_off_label` | `sbxloop:hands-off` | Label on a delivered PR that hands it to a human: no fix round, no further delivery to its branch (empty disables). |
 | `[daemon] run_stale_after_s` | `21600` | With no run executing, non-terminal runs idle this long are reconciled to a terminal state (`0` disables). |
 
 ## Repository layout

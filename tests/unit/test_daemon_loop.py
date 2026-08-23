@@ -19,6 +19,7 @@ from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
 from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.sources import PrObservation
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
@@ -1879,6 +1880,8 @@ class ReviewingSource(FakeSource):
         super().__init__()
         self.checks = ChecksVerdict("green", 2, (), ())
         self.review_state = "NONE"
+        self.head_sha = "sha0"
+        self.labels: tuple[str, ...] = ()
         self.polls = 0
         self.reviews: list[int] = []
 
@@ -1887,9 +1890,9 @@ class ReviewingSource(FakeSource):
         self.calls.append(("file_review", pr_number))
         return f"gh:{pr_number + 100}"
 
-    def pr_state(self, pr_number: int) -> tuple[ChecksVerdict, str]:
+    def pr_state(self, pr_number: int) -> PrObservation:
         self.polls += 1
-        return self.checks, self.review_state
+        return PrObservation(self.checks, self.review_state, self.head_sha, self.labels)
 
 
 class TestAcceptanceGate:
@@ -2109,3 +2112,95 @@ class TestAcceptanceGate:
         assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
         h.loop.tick()  # recovers: files the review
         assert source.reviews == [9]
+
+
+class TestHandOffGuard:
+    """A PR a human has taken over is never force-updated by the loop.
+
+    `clone_existing_branch` only refuses a *missing* branch; a branch that
+    exists and is being actively worked on was indistinguishable from one
+    waiting for a fix round (#412). The head sha the loop last delivered is
+    the answer: if it moved, someone else has been in there.
+    """
+
+    def _delivered(self, tmp_path: Path, **daemon: object) -> tuple[Harness, ReviewingSource]:
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": dict({"await_review": True}, **daemon),
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
+        assert h.loop.tick().outcome == "reviewing"
+        return h, source
+
+    def _asked_for_changes(self, h: Harness, source: ReviewingSource) -> None:
+        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
+        source.review_state = "CHANGES_REQUESTED"
+
+    def test_the_delivery_records_the_head_sha(self, tmp_path: Path) -> None:
+        h, _ = self._delivered(tmp_path)
+        assert h.dstore.pr_state("gh:1").head_sha == "sha0"  # type: ignore[union-attr]
+
+    def test_a_moved_head_queues_no_fix_round(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        self._asked_for_changes(h, source)
+        source.head_sha = "sha-human"
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
+        rounds_before = h.dstore.pr_state("gh:1").rounds  # type: ignore[union-attr]
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state != "queued"  # type: ignore[union-attr]
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert h.dstore.pr_state("gh:1").rounds == rounds_before  # type: ignore[union-attr]
+        assert any("someone else has been working on it" in t for t in front.seen)
+
+    def test_an_unchanged_head_still_queues_the_fix_round(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        self._asked_for_changes(h, source)
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+
+    def test_the_hands_off_label_hands_over_with_an_unchanged_head(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        self._asked_for_changes(h, source)
+        source.labels = ("sbxloop:hands-off",)
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "abandoned"  # type: ignore[union-attr]
+        assert any("hands-off" in t for t in front.seen)
+
+    def test_a_configured_label_is_honoured_and_the_default_ignored(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path, hands_off_label="mine:keep-out")
+        self._asked_for_changes(h, source)
+        source.labels = ("sbxloop:hands-off",)
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+
+    def test_no_stored_sha_adopts_a_baseline_and_proceeds(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        h.dstore.record_head("gh:1", "")
+        self._asked_for_changes(h, source)
+        source.head_sha = "sha-observed"
+        h.loop.tick()
+        assert h.dstore.pr_state("gh:1").head_sha == "sha-observed"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+
+    def test_a_source_without_the_new_fields_behaves_as_before(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        self._asked_for_changes(h, source)
+
+        class Old:
+            checks = ChecksVerdict("green", 2, (), ())
+            review = "CHANGES_REQUESTED"
+
+        source.pr_state = lambda pr_number: Old()  # type: ignore[assignment,return-value]
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]

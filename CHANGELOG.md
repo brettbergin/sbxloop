@@ -8,6 +8,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **A PR someone else has taken over is handed back, not force-updated.**
+  #412. The daemon now records the head sha of every PR it delivers in
+  `daemon_pr_state` (new `head_sha` column, migrated in place on an existing
+  database; a row with no sha adopts what the first poll observes as its
+  baseline). On every review poll, before any other gate, a head the loop did
+  not produce — or the `sbxloop:hands-off` label on the PR — takes the PR out
+  of its hands. Until now nothing distinguished "this PR is waiting for me to
+  fix it" from "a human is fixing it right now": the fix round would clone
+  that branch and force-update the ref, silently replacing their work, and
+  only someone noticing and running `!sbx abandon` stopped it. The item is now
+  failed without requeue, a `✋` notification is sent, no fix round is queued,
+  the branch is never force-updated again, and the PR is left open for a
+  human. The label name is `[daemon] hands_off_label`, defaulting to
+  `sbxloop:hands-off`; setting it empty disables that half of the check.
+
 - **`pr_status(number)`, a concierge host tool for how a delivered PR is
   doing.** #333. "How is PR #41 doing?" now gets an answer without a
   browser: the CI check runs summarised as counts with each failing check

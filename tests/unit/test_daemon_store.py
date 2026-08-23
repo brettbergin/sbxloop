@@ -352,3 +352,61 @@ class TestOperatorControls:
         # requeue (unpin) tells the source nothing
         store.mark_running("gh:7", "r1", now=4.0)
         assert store.requeue("gh:7", now=5.0).pending_report is None
+
+
+class TestDeliveredHeadSha:
+    """The head sha the loop last delivered is what lets a later poll notice
+    that someone else has pushed to the PR branch."""
+
+    def test_migration_adds_column_to_existing_database(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE daemon_pr_state ("
+            " item_id TEXT PRIMARY KEY, pr_number INTEGER NOT NULL,"
+            " branch TEXT NOT NULL DEFAULT '', rounds INTEGER NOT NULL DEFAULT 0,"
+            " gates INTEGER NOT NULL DEFAULT 0, reviewed INTEGER NOT NULL DEFAULT 0,"
+            " review_ref TEXT, fix_brief TEXT, updated_at REAL NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO daemon_pr_state (item_id, pr_number, branch) VALUES (?, ?, ?)",
+            ("gh:7", 406, "sbxloop/old"),
+        )
+        conn.commit()
+        conn.close()
+
+        store = DaemonStore(path)
+        cols = {r[1] for r in store._conn.execute("PRAGMA table_info(daemon_pr_state)").fetchall()}
+        assert "head_sha" in cols
+        state = store.pr_state("gh:7")
+        assert state is not None and state.head_sha == ""
+        assert state.pr_number == 406 and state.branch == "sbxloop/old"
+
+    def test_round_trips_through_record_delivery(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.record_delivery("gh:7", 406, "sbxloop/b", 2.0, head_sha="abc123")
+        state = store.pr_state("gh:7")
+        assert state is not None and state.head_sha == "abc123"
+
+    def test_record_head_overwrites_only_the_sha(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.record_delivery("gh:7", 406, "sbxloop/b", 2.0)
+        assert store.pr_state("gh:7").head_sha == ""  # type: ignore[union-attr]
+        store.record_head("gh:7", "deadbeef")
+        state = store.pr_state("gh:7")
+        assert state is not None
+        assert state.head_sha == "deadbeef"
+        assert state.pr_number == 406 and state.branch == "sbxloop/b" and state.rounds == 0
+
+    def test_redelivery_updates_sha_but_preserves_rounds(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.record_delivery("gh:7", 406, "sbxloop/b", 2.0, head_sha="aaa")
+        assert store.bump_pr_round("gh:7") == 1
+        store.record_delivery("gh:7", 406, "sbxloop/b", 3.0, head_sha="bbb")
+        state = store.pr_state("gh:7")
+        assert state is not None and state.head_sha == "bbb" and state.rounds == 1

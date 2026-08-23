@@ -9,6 +9,7 @@ from typing import Any
 from sbxloop.config import Config
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.postmortem import DOSSIER_MAX_CHARS, build_dossier, postmortem_marker
+from sbxloop.daemon.sources import PrObservation
 from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
@@ -195,13 +196,15 @@ class ReviewingSource(GithubLikeSource):
         super().__init__()
         self.reviews: list[tuple[str, int, str]] = []
         self.checks = ChecksVerdict("green", 1, (), ())
+        self.head_sha = "sha0"
+        self.labels: tuple[str, ...] = ()
 
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
         self.reviews.append((item.item_id, pr_number, run_id))
         return f"gh:{800 + len(self.reviews)}"
 
-    def pr_state(self, pr_number: int) -> tuple[ChecksVerdict, str]:
-        return self.checks, "NONE"
+    def pr_state(self, pr_number: int) -> PrObservation:
+        return PrObservation(self.checks, "NONE", self.head_sha, self.labels)
 
 
 def reviewing_harness(tmp_path: Path, **daemon: Any) -> Harness:

@@ -14,10 +14,11 @@ from sbxloop.daemon.sources import (
     GitHubIssueSource,
     GitHubLabels,
     InboxSource,
+    PrObservation,
     parse_markdown_item,
 )
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import IssueRef
+from sbxloop.gh.ops import ChecksVerdict, IssueRef
 
 LABELS = GitHubLabels("sbxloop:run", "sbxloop:in-progress", "sbxloop:failed", "sbxloop:backlog")
 
@@ -176,6 +177,11 @@ class RecordingOps:
         # rival between our post and our re-read.
         self.after_comment: Any = None
         self._next_comment_id = 100
+        # PR reads, for the acceptance gate's pr_state poll.
+        self.pr_payload: dict[str, Any] = {}
+        self.pr_gets: list[tuple[str, int]] = []
+        self.checks_for: list[str] = []
+        self.review_state = "APPROVED"
 
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         self.searches.append(query)
@@ -232,6 +238,18 @@ class RecordingOps:
         self.created_in.append(repo)
         return IssueRef(number=77, url="https://x/issues/77")
 
+    # --- PR reads (the acceptance gate's single poll) ---
+    def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+        self.pr_gets.append((repo, number))
+        return dict(self.pr_payload)
+
+    def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
+        self.checks_for.append(sha)
+        return ChecksVerdict("green", 3, (), ())
+
+    def pr_review_state(self, repo: str, number: int) -> str:
+        return self.review_state
+
 
 def issue(number: int, *labels: str, state: str = "open") -> dict[str, Any]:
     return {
@@ -271,6 +289,32 @@ class TestGitHubSource:
         items = {i.item_id: i for i in self.make(ops).poll()}
         assert items["gh:5"].kind == "audit"
         assert items["gh:6"].kind == "patch"
+
+    def test_pr_state_surfaces_head_sha_and_labels_from_one_read(self) -> None:
+        """The payload the checks read already needs carries the head sha and
+        the PR's labels; a later gate must get both without paying for
+        another API call."""
+        ops = RecordingOps()
+        ops.pr_payload = {
+            "head": {"sha": "abc123"},
+            "labels": [{"name": "Bug"}, {"name": "sbxloop:hands-off"}],
+        }
+        obs = self.make(ops).pr_state(406)
+        assert isinstance(obs, PrObservation)
+        assert obs.head_sha == "abc123"
+        assert obs.labels == ("bug", "sbxloop:hands-off")
+        assert obs.checks.state == "green" and obs.review == "APPROVED"
+        assert ops.pr_gets == [("o/r", 406)] and ops.checks_for == ["abc123"]
+
+    def test_pr_state_without_labels_or_head_is_pending_with_no_labels(self) -> None:
+        ops = RecordingOps()
+        ops.pr_payload = {}
+        obs = self.make(ops).pr_state(406)
+        assert obs.labels == ()
+        assert obs.head_sha == ""
+        assert obs.checks.state == "pending"
+        assert obs.checks.pending == ("unknown head commit",)
+        assert ops.pr_gets == [("o/r", 406)] and ops.checks_for == []
 
     def test_claim_clears_delivered_only_when_present(self) -> None:
         """A blind DELETE of the delivered label 404s on every fresh issue and
