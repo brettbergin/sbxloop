@@ -1651,6 +1651,7 @@ def daemon(
                 host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
                 bus=concierge_bus,
                 versions=versions,
+                on_watch=bridge.on_watch,
             )
             bridge.concierge = concierge
             concierge.warm_up()

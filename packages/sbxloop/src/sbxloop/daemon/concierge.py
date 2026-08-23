@@ -88,12 +88,21 @@ STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
 
 _RUN_STATES = ["pending", "running", "completed", "failed", "cancelled"]
+#: Run states that mean the run is over — nothing more will happen to it, so a
+#: watch on one of these is answered immediately instead of registered.
+_FINISHED_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 #: Levels ``daemon_log`` accepts, coarsest last — the filter is at-or-above.
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 # GitHub's ``state_reason`` for a close. ``completed`` means the thing was
 # actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
 # stale. Nothing else is accepted, so the model cannot invent a reason.
 CLOSE_REASONS = ("completed", "not_planned")
+#: Appended to a tool call's ``by`` for GitHub-facing attribution (see
+#: ``_tool_handler``). A transport's ``on_watch`` callback receives this same
+#: tagged string as its ``requester`` and must strip it back off before
+#: looking a requester up by the untagged form it was remembered under —
+#: see ``DiscordBridge.on_watch``.
+VIA_CONCIERGE_SUFFIX = " (via concierge)"
 
 
 class ConciergeReply(NamedTuple):
@@ -135,6 +144,7 @@ class Concierge:
         bus: EventBus,
         clock: Callable[[], float] = time.time,
         versions: VersionProbe | None = None,
+        on_watch: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self.config = config
         self.loop = loop
@@ -150,6 +160,9 @@ class Concierge:
         # check warms the PyPI memo for the first "are we up to date?".
         # Injected whole in tests, so no unit test reaches PyPI or runs `sbx`.
         self.versions = versions if versions is not None else VersionProbe()
+        # Transport seam: the bridge hands in a callback that records who wants
+        # a ping when a run finishes. None means this transport cannot notify.
+        self._on_watch = on_watch
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sbxloop-concierge")
         self._pending = 0
         self._state_lock = threading.Lock()
@@ -391,7 +404,7 @@ class Concierge:
             return HostToolResponse(
                 call_id=call.call_id, ok=False, error=f"unknown tool {call.name!r}"
             )
-        by = f"{author} (via concierge)"
+        by = f"{author}{VIA_CONCIERGE_SUFFIX}"
         started = time.monotonic()
         try:
             with self._tool_lock:
@@ -464,6 +477,22 @@ class Concierge:
                     parameters=_schema({"run_id": {"type": "string"}}, ["run_id"]),
                 ),
                 self._tool_run_detail,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="watch_run",
+                    description=(
+                        "Register interest in a run (or a work item, by its id) so the person "
+                        "who asked is @mentioned in the control channel with the outcome when "
+                        "it finishes. If the run has already finished, answers with the "
+                        "outcome immediately instead of registering. Watches are kept in "
+                        "memory only — a daemon restart forgets them."
+                    ),
+                    parameters=_schema(
+                        {"run_id_or_item_id": {"type": "string"}}, ["run_id_or_item_id"]
+                    ),
+                ),
+                self._tool_watch_run,
             ),
             HostTool(
                 HostToolSpec(
@@ -821,6 +850,61 @@ class Concierge:
                 "not in the control channel"
             )
         return "\n".join(lines)
+
+    def _tool_watch_run(self, args: dict[str, Any], by: str) -> str:
+        ident = str(args.get("run_id_or_item_id", "")).strip()
+        if not ident:
+            return "run_id_or_item_id is required"
+        run = None
+        try:
+            run = self.store.get_run(ident)
+        except SbxloopError:
+            run = None
+        if run is None:
+            item = self.dstore.get(ident)
+            if item is None:
+                return f"no run or work item {ident!r} in this daemon's state store"
+            runs = self.dstore.runs_for_item(ident)
+            if not runs:
+                return (
+                    f"work item {ident} has no runs yet — it has not started, "
+                    "so there is nothing to watch"
+                )
+            try:
+                run = self.store.get_run(runs[-1])
+            except SbxloopError:
+                return f"no run {runs[-1]!r} in this daemon's state store"
+        run_id = run.run_id
+        if run.state in _FINISHED_RUN_STATES:
+            report = self.loop.report_for(run_id)
+            lines = [
+                f"run {run_id} already finished: state={run.state}",
+                f"outcome: {_one_line(run.outcome, 400)}",
+                f"tasks: {report.task_summary}",
+            ]
+            if report.tracking_issue:
+                lines.append(
+                    f"tracking issue: #{report.tracking_issue[0]} {report.tracking_issue[1]}"
+                )
+            if report.delivery:
+                lines.append(f"delivered PR: #{report.delivery[0]} {report.delivery[1]}")
+            if report.delivery_error:
+                lines.append(f"delivery error: {_one_line(report.delivery_error, 300)}")
+            if report.filed:
+                lines.append(f"filed backlog: {', '.join(report.filed)}")
+            return "\n".join(lines)
+        if self._on_watch is None:
+            return (
+                "watching is not available on this transport — no notifier is wired, "
+                f"so I cannot ping you when {run_id} finishes"
+            )
+        note = self._on_watch(run_id, by)
+        confirm = (
+            f"watching {run_id} (state {run.state}) — I'll ping {by} in the control "
+            "channel with the outcome when it finishes. Note: watches live in memory, "
+            "so a daemon restart forgets them."
+        )
+        return f"{confirm}\n{note}" if note else confirm
 
     def _tool_run_events(self, args: dict[str, Any], by: str) -> str:
         run_id = str(args.get("run_id", "")).strip()

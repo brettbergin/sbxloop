@@ -474,6 +474,15 @@ above `DEBUG`/`INFO`/`WARNING`/`ERROR`, and `grep` is a plain
 case-insensitive substring — never a regular expression, so no pattern from
 chat can wedge the daemon. The result is clipped to
 `[concierge] max_tool_result_chars` like every other tool result.
+Say "tell me when r7… is done" (a run id or a work item id) and `watch_run`
+registers your interest: it confirms, and when that run lands the daemon
+posts in the control channel @mentioning you with the outcome — final
+state, task summary, tracking issue, PR, delivery error, anything filed.
+Watching a run that has already finished answers with the outcome
+immediately instead of registering. Watches live in the bot's **memory
+only**: a daemon restart forgets every one of them, so re-ask after a
+restart.
+
 It finishes triage too: "reply on #12 that we're waiting on upstream"
 posts a comment signed with your name, and "close #12 as a duplicate of
 #7" comments and closes it as *not planned* (or *completed*) — but only
