@@ -118,8 +118,23 @@ class TestDeliverWorkspace:
         assert ops.pr_kwargs["draft"] is False
         assert "hello.txt" in ops.pr_kwargs["body"]
         assert "sub/logo.bin" in ops.pr_kwargs["body"]
+        assert "Closes #" not in ops.pr_kwargs["body"]  # no issue was named
         # ...and the exclusion is surfaced, not silent (#67)
         assert "1 file(s) excluded (.git)" in ops.pr_kwargs["body"]
+
+    def test_closes_puts_the_closing_keyword_in_the_body(self, tmp_path: Path) -> None:
+        """`Closes #N` is how GitHub links issue and PR and closes the issue
+        on merge even when the daemon is not running to do it."""
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="write hello",
+            source_dir=make_workspace(tmp_path),
+            closes=42,
+        )
+        assert "Closes #42" in ops.pr_kwargs["body"]
 
     def test_dot_path_artifacts_are_delivered(self, tmp_path: Path) -> None:
         """.github/ and .gitignore are the point of many outcomes — they must

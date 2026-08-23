@@ -1540,8 +1540,9 @@ def daemon(
             config.daemon.in_progress_label,
             config.daemon.failed_label,
             config.daemon.backlog_label,
-            config.daemon.delivered_label,
-            config.daemon.audit_label,
+            delivered=config.daemon.delivered_label,
+            audit=config.daemon.audit_label,
+            completed=config.daemon.completed_label,
         )
         sources.append(
             GitHubIssueSource(
@@ -2150,6 +2151,7 @@ mem_abort = 0.0
 # failed_label = "sbxloop:failed"
 # backlog_label = "sbxloop:backlog"
 # delivered_label = "sbxloop:delivered"
+# completed_label = "sbxloop:completed"  # applied when the work lands (PR merged / audit closed)
 # audit_label = "sbxloop:audit"    # discovery lane: investigate, file findings, no PR
 # postmortems = true             # file a post-mortem audit when a patch item fails
 # postmortems_per_day = 3
@@ -2157,12 +2159,11 @@ mem_abort = 0.0
 # review_deliveries = true       # audit each PR the loop delivers (defects → backlog)
 # tool_repo = "brettbergin/sbxloop"  # findings ABOUT sbxloop go here, never to the project
 # audit_dir = ".github/sbxloop/audits"
-# What a delivered run does to the tracker. Defaults are task-queue
-# semantics: close the source issue (the PR is the reviewable object) and
-# open a per-run tracking issue. For a design/discussion tracker set both
-# false: the source issue gets the summary + delivered_label and stays open
-# until a human merges the PR, and no extra tracking issue is opened.
-# close_on_success = true         # false leaves the issue open for a human to close on merge
+# A delivered patch item settles its source issue when the PR MERGES: at
+# acceptance the issue gets the summary + delivered_label and stays open;
+# on merge the daemon closes it and swaps in completed_label. A PR closed
+# without merging marks the item failed instead.
+# close_on_success = true         # deprecated no-op: issues now close on merge, not acceptance
 # tracking_issue = true           # false skips the per-run tracking issue
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)

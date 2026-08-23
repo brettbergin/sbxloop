@@ -246,13 +246,16 @@ work came from, and keeps going. Two work sources, usable together:
   repo being worked on) carrying the trigger label (`sbxloop:run` by
   default). The daemon claims the issue (label swap + comment), runs it with
   reporting and delivery forced on (PRs arrive as **drafts** by default),
-  and on success comments the summary + PR link and **closes** the issue —
-  the PR is now the reviewable object. Failures retry with backoff, then
-  land in `sbxloop:failed` with re-trigger instructions. For a tracker whose
-  issues are design items rather than tasks, `close_on_success = false` in
-  `[daemon]` leaves the issue open with `sbxloop:delivered` for the human
-  who merges the PR, and `tracking_issue = false` skips the per-run tracking
-  issue (the summary comment on the source issue carries the same info).
+  and on success comments the summary + PR link and adds
+  `sbxloop:delivered`. The issue settles when the PR **merges**: the daemon
+  watches the delivered PR, and on merge closes the issue and swaps in
+  `sbxloop:completed` (the PR body also carries `Closes #N`, so GitHub
+  links the pair and closes the issue even when the daemon is down). A PR
+  closed without merging marks the item failed and leaves the issue open.
+  Run failures retry with backoff, then land in `sbxloop:failed` with
+  re-trigger instructions. `tracking_issue = false` in `[daemon]` skips the
+  per-run tracking issue (the summary comment on the source issue carries
+  the same info).
 - **Inbox files**: drop a `.md` (first `# heading` = title) into
   `<inbox>/pending/`; it moves through `running/` to `done/` or `failed/`
   with a `<name>.result.md` beside it.
@@ -360,15 +363,16 @@ tool call, `sbx` invocation and poll. See
 
 #### Working a design tracker
 
-The daemon's defaults are task-queue semantics: a delivered run closes the
-source issue (the PR is the reviewable object) and opens a per-run tracking
-issue. When the repository's issues are design discussions rather than a
-queue of chores, flip both knobs:
+A source issue always settles on **merge**, not on delivery: at acceptance
+the daemon comments the run summary and PR link, removes
+`sbxloop:in-progress`, and adds `sbxloop:delivered`; when the PR merges it
+closes the issue (`state_reason: completed`) and swaps `sbxloop:delivered`
+for `sbxloop:completed`. A PR closed without merging marks the item failed
+(`sbxloop:failed`) and leaves the issue open for the human to re-trigger or
+close. (`close_on_success`, which used to close the issue at acceptance, is
+now a deprecated no-op.) For a tracker whose issues are design discussions
+rather than a queue of chores:
 
-- `[daemon] close_on_success` (default `true`) — with `false` the daemon
-  comments on the source issue with the run summary and the PR link, removes
-  `sbxloop:in-progress`, adds `sbxloop:delivered`, and leaves the issue open
-  so the human who merges the PR decides when the discussion is settled.
 - `[daemon] tracking_issue` (default `true`) — with `false` no per-run
   tracking issue is opened; the summary comment on the source issue is the
   record, so the design thread stays in one place.
@@ -376,7 +380,6 @@ queue of chores, flip both knobs:
 ```toml
 [daemon]
 deliver_draft = true          # PRs arrive as drafts for review
-close_on_success = false      # leave the design issue open for the human
 tracking_issue = false        # the summary comment is the record
 workspace_isolation = "clone" # never touch the runner's checkout
 refresh_workspace = true      # fast-forward it before each fresh run
