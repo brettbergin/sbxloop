@@ -7,8 +7,9 @@ import threading
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
+from sbxloop.cli.cmdfmt import format_command
 from sbxloop.log import get_logger
-from sbxloop_worker.protocol import Event
+from sbxloop_worker.protocol import Event, EventTypes
 
 log = get_logger(__name__)
 
@@ -116,7 +117,13 @@ def summarize_event(event: Event) -> dict[str, Any]:
     ``sbxloop logs`` prints and what the daemon's log sink emits: task/agent
     ids, the first present :data:`SUMMARY_KEYS` value (as ``summary``, with
     the key it came from as ``summary_key``), the resource snapshot, tool
-    args and any error — each clipped to a display line."""
+    args and any error — each clipped to a display line.
+
+    Tool ``args`` for ``agent.tool_start``/``agent.tool_end`` are rendered
+    with :func:`sbxloop.cli.cmdfmt.format_command`, so the boilerplate ``cd
+    <run path> &&`` prefix collapses to ``cd $RUN &&`` and the command verb
+    always survives. Only the returned summary changes: the stored event
+    payload keeps the full, untouched command."""
     data = event.data
     out: dict[str, Any] = {}
     if data.get("task_id"):
@@ -139,7 +146,10 @@ def summarize_event(event: Event) -> dict[str, Any]:
         if data.get("level"):
             out["resource_level"] = data["level"]
     if data.get("args"):
-        out["args"] = _clip(data["args"], 120)
+        if event.type in (EventTypes.AGENT_TOOL_START, EventTypes.AGENT_TOOL_END):
+            out["args"] = format_command(str(data["args"]))
+        else:
+            out["args"] = _clip(data["args"], 120)
     if picked != "error" and data.get("error"):
         out["error"] = _clip(data["error"], SUMMARY_CLIP)
     return out
