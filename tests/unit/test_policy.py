@@ -356,7 +356,7 @@ class TestEgressGranter:
 
     def test_baseline_registry_needs_no_grant(self, fake_sbx: FakeSbx) -> None:
         # The parity promise: a plan may name the language registry, and it
-        # costs nothing — no grant, no event, no failure when it forgets.
+        # is free — no grant, no event, no failure when it forgets.
         events: list[Event] = []
         granter = self.make_granter(fake_sbx, events)
         granter.apply("t1", [("pypi.org", "pip install the deps")])

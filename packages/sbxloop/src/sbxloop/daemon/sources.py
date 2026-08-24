@@ -39,7 +39,7 @@ from sbxloop.log import get_logger
 log = get_logger(__name__)
 
 # A file still being written must not be claimed half-way; operators are
-# told to write elsewhere and rename, but a small mtime guard costs nothing.
+# told to write elsewhere and rename, but a small mtime guard is free.
 INBOX_SETTLE_S = 2.0
 _HEADING_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")

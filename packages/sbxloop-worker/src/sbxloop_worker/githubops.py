@@ -321,7 +321,7 @@ def _blobs_create_many(t: Transport, p: dict[str, Any], progress: ProgressFn | N
     The delivery path used to submit one worker job per blob POST; the fixed
     per-job overhead (sbx cp + fresh worker process) dominated delivery time
     for large workspaces (#66). Here the loop over files runs inside the
-    sandbox, so N files cost N REST calls but only one job cycle.
+    sandbox, so N files spend N REST calls but only one job cycle.
     """
     _require(p, "repo", "files")
     files = p["files"]

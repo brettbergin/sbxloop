@@ -402,7 +402,7 @@ class TestMergeWatchRows:
 
     def test_merge_watch_skips_items_not_done(self, tmp_path: Path) -> None:
         """A reviewing item is the acceptance gate's to advance, and a
-        failed one has been handed to a human — neither costs a read."""
+        failed one has been handed to a human — neither spends a read."""
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
         store.record_delivery("gh:7", 9, "b", 1.0, url="u")

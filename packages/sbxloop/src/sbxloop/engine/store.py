@@ -74,7 +74,6 @@ CREATE TABLE IF NOT EXISTS phase_attempts (
     output_tokens INTEGER,
     cache_read_tokens INTEGER,
     cache_write_tokens INTEGER,
-    cost       REAL,
     turns      INTEGER
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -112,7 +111,6 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "cache_write_tokens",
             "ALTER TABLE phase_attempts ADD COLUMN cache_write_tokens INTEGER",
         ),
-        ("cost", "ALTER TABLE phase_attempts ADD COLUMN cost REAL"),
         ("turns", "ALTER TABLE phase_attempts ADD COLUMN turns INTEGER"),
     ),
 }
@@ -361,8 +359,8 @@ class StateStore:
             self._conn.execute(
                 "INSERT INTO phase_attempts"
                 " (run_id, task_id, phase, attempt, status, output_json, started_at, ended_at,"
-                "  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, turns)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, turns)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     task_id,
@@ -376,7 +374,6 @@ class StateStore:
                     u.output_tokens,
                     u.cache_read_tokens,
                     u.cache_write_tokens,
-                    u.cost,
                     turns,
                 ),
             )

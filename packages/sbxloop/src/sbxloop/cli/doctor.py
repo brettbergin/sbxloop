@@ -192,7 +192,7 @@ def collect_checks(
                 )
             )
             # git is baseline agent tooling (#252): a template without it
-            # costs an apt top-up on every provision, and loses git outright
+            # spends an apt top-up on every provision, and loses git outright
             # wherever apt is unreachable — worth a row, never a hard fail.
             if record.git is None:
                 git_detail = (
@@ -277,7 +277,7 @@ def collect_checks(
     # copilot SDK permission-kind vocabulary: the worker's read-only critic
     # barrier is an allowlist over these kinds and fails closed on drift, so
     # a vocabulary change never grants write access — but it can silently
-    # cost the critic a read capability. Surface drift here on SDK bumps
+    # spend the critic a read capability. Surface drift here on SDK bumps
     # instead of as degraded reviews in the field.
     sdk_kinds = installed_sdk_permission_kinds()
     if sdk_kinds is None:

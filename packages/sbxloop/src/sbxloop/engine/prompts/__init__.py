@@ -25,7 +25,7 @@ def _strip_contract_header(text: str) -> str:
     """Drop the leading ``<!-- ... -->`` block that documents a template's
     contract (#225). It is written for the humans editing the file — the
     variables it lists, the ``$``-escaping rule, which test guards which
-    section — and must never cost the model tokens or, worse, be read by
+    section — and must never spend the model tokens or, worse, be read by
     it as instructions. Stripping happens before ``Template`` sees the text
     so the header can name ``$variables`` freely."""
     return _CONTRACT_HEADER.sub("", text, count=1)

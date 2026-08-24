@@ -70,7 +70,7 @@ class SandboxConfig(_ConfigModel):
     head start Python has had since 0.4.0; setting it REPLACES that default
     rather than adding to it, so nothing is provisioned for a language the
     operator did not ask for. Provisioning is probe-first (a template that
-    already ships the toolchain costs nothing) and never fatal.
+    already ships the toolchain is free) and never fatal.
 
     ``workspace_isolation`` governs what happens when ``workspace`` points
     at an existing git checkout. ``auto`` (default): each run works in a
@@ -439,7 +439,7 @@ class DaemonConfig(_ConfigModel):
     # settling is how PR #389 was marked done with `mdformat` and
     # `security` failing.
     #
-    # The gates run cheapest-first: CI is GitHub's compute and costs nothing,
+    # The gates run cheapest-first: CI is GitHub's compute and is free,
     # so it decides before a review run is spent — reviewing a red PR wastes
     # a whole run on work that has to change anyway.
     #

@@ -251,7 +251,7 @@ class Concierge:
             elif isinstance(exc, WorkerError | SbxError) and not isinstance(
                 exc, WorkerTimeoutError
             ):
-                # A dead sandbox costs one hiccup: DaemonAgent drops it
+                # A dead sandbox spends one hiccup: DaemonAgent drops it
                 # (rate-limited) and the retry re-provisions — with a fresh
                 # session store, so the resume id is gone too.
                 if self.host.note_failure(exc):
@@ -1050,7 +1050,7 @@ class Concierge:
         lines = [f"run {run_id} · {usage.model_line} · {usage.samples} sample(s)"]
         lines.extend(_usage_rows(usage.by_agent, usage.turns_by_agent, usage.jobs_by_agent))
         lines.append(_usage_row("total", usage.total, turns=usage.samples))
-        lines.append(_cost_line(usage.total))
+        lines.append(_SPEND_NOT_REPORTED)
         return "\n".join(lines)
 
     def _tool_usage_today(self, args: dict[str, Any], by: str) -> str:
@@ -1093,7 +1093,7 @@ class Concierge:
         lines = [head]
         lines.extend(_usage_rows(rows, row_turns))
         lines.append(_usage_row("total", total, turns=samples))
-        lines.append(_cost_line(total))
+        lines.append(_SPEND_NOT_REPORTED)
         return "\n".join(lines)
 
     def _tool_daemon_log(self, args: dict[str, Any], by: str) -> str:
@@ -1553,10 +1553,11 @@ class _RunUsage(NamedTuple):
 # (worker/client.py), and Usage forbids extras — so pick the fields out rather
 # than validating the whole dict.
 #
-# `cost` is deliberately absent (#386): the Copilot SDK reports it as a
-# per-turn constant (15.0 on every turn), so lifting it out of the event and
-# folding it through `Usage.merged` made `run_usage` print 147 x 15.0 = 2205.0
-# — a fabricated figure the concierge would repeat in Discord as fact.
+# Spend is deliberately absent (#386, #439): the Copilot SDK reports it as a
+# per-turn constant (15.0 on every turn) of unknown unit, so lifting it out of
+# the event and folding it through `Usage.merged` made `run_usage` print
+# 147 x 15.0 = 2205.0 — a fabricated figure the concierge would repeat in
+# Discord as fact. `Usage` carries no such field at all now.
 _USAGE_FIELDS = (
     "model",
     "input_tokens",
@@ -1612,17 +1613,11 @@ def _usage_rows(
     ]
 
 
-def _cost_line(usage: Usage) -> str:
-    """Cost when the backend reports it, and otherwise a plain statement that
-    it did not — never a zero the model would go on to repeat as fact.
-
-    Only a strictly positive figure is rendered. A summed, zero or otherwise
-    fabricated cost must never be printed: the concierge repeats this line in
-    Discord as fact, so "not reported" is the honest answer whenever the
-    number is not a real per-record cost (#386)."""
-    if usage.cost is None or usage.cost <= 0:
-        return "cost: not reported by the agent backend (tokens above are the whole record)"
-    return f"cost: {usage.cost:.4f}"
+# No backend reports a spend figure in a known unit, so every usage block ends
+# with the same plain statement rather than a number. The concierge repeats
+# this line in Discord as fact, and a zero or a fabricated figure would be
+# repeated just as confidently (#386, #439).
+_SPEND_NOT_REPORTED = "spend: not reported by the agent backend (tokens above are the whole record)"
 
 
 def _clip(text: str, limit: int) -> str:

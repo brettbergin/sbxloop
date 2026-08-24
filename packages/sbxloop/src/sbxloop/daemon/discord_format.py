@@ -723,7 +723,7 @@ def _head(args: str) -> str:
 
 class RepetitionDetector:
     """Trailing-run detector for near-identical commands, fed one call at a
-    time so a burst of any length costs O(window) memory.
+    time so a burst of any length spends O(window) memory.
 
     A call extends the current run when it has the same tool and head word
     as the previous one. The run is *repetitive* once it holds ``window``
@@ -743,7 +743,7 @@ class RepetitionDetector:
         self._ratios: deque[float] = deque(maxlen=max(window - 1, 1))
 
     def add(self, tool: str, args: str) -> int:
-        from difflib import SequenceMatcher  # local: keep import cost off the hot path
+        from difflib import SequenceMatcher  # local: keep import price off the hot path
 
         head = (tool, _head(args))
         if head != self._head:
@@ -1419,12 +1419,12 @@ class RunStats:
         self.last_ts: float | None = None
         self.resumed = False
         # One ``agent.usage`` event is one assistant turn — the unit runs
-        # are billed and timed by. Token/cost fields stay None until a
-        # backend actually reports them: "not reported" is not zero.
+        # are billed and timed by. Token fields stay None until a backend
+        # actually reports them: "not reported" is not zero. No backend
+        # reports a spend figure in a known unit, so none is tracked (#439).
         self.turns = 0
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
-        self.cost: float | None = None
         self.tool_calls = 0
         self.capped = False
         self.denies = 0
@@ -1453,8 +1453,6 @@ class RunStats:
                 self.input_tokens = (self.input_tokens or 0) + int(d["input_tokens"])
             if d.get("output_tokens") is not None:
                 self.output_tokens = (self.output_tokens or 0) + int(d["output_tokens"])
-            if d.get("cost") is not None:
-                self.cost = (self.cost or 0.0) + float(d["cost"])
         elif t == "agent.tool_start":
             self.tool_calls += 1
         elif t == "agent.tool_cap":
@@ -1527,8 +1525,6 @@ def summary_text(stats: RunStats | None, state: str) -> str:
         bits.append(
             f"{_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out tokens"
         )
-    if stats.cost is not None:
-        bits.append(f"${stats.cost:,.2f}")
     return head + (f" — {' · '.join(bits)}" if bits else "")
 
 
@@ -1545,11 +1541,7 @@ def _stat_rows(stats: RunStats) -> list[str]:
         spend = (
             f"tokens {_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out"
         )
-        if stats.cost is not None:
-            spend += f" · cost ${stats.cost:,.2f}"
         rows.append(spend)
-    elif stats.cost is not None:
-        rows.append(f"cost ${stats.cost:,.2f}")
     if stats.steers:
         rows.append(f"steering {stats.steers} asked / {stats.steers_answered} answered")
     return rows

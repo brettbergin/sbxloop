@@ -205,7 +205,7 @@ def prune_run_dirs(
        (``rmtree`` can fail half-way; a rename cannot), then deleted.
 
     A marker with no removal behind it (crash between the two steps, or a
-    removal that failed) only costs a refused resume of a run that was
+    removal that failed) only spends a refused resume of a run that was
     already past retention; the next sweep finishes the job.
     """
     now = time.time() if now is None else now

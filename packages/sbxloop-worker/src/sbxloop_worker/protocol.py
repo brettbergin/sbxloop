@@ -42,18 +42,12 @@ class Usage(ProtocolModel):
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
-    # NOT additive. The Copilot SDK's ``AssistantUsageData.cost`` is a per-turn
-    # constant of unknown unit (15.0 on every turn of every session — far more
-    # likely a premium-request/quota multiplier than a currency amount), so
-    # summing it fabricates a number (#386).
-    cost: float | None = None
 
     def merged(self, other: Usage) -> Usage:
         """Accumulate another usage sample into this one (None-safe sums).
 
-        Token counters are summed. ``model`` and ``cost`` are *not*: they are
-        last-wins, because neither is a per-turn delta. See the ``cost`` field
-        comment above.
+        Token counters are summed. ``model`` is not: it is last-wins, because
+        it is not a per-turn delta.
         """
 
         def add(a: int | None, b: int | None) -> int | None:
@@ -61,14 +55,12 @@ class Usage(ProtocolModel):
                 return None
             return (a or 0) + (b or 0)
 
-        cost = other.cost if other.cost is not None else self.cost
         return Usage(
             model=other.model or self.model,
             input_tokens=add(self.input_tokens, other.input_tokens),
             output_tokens=add(self.output_tokens, other.output_tokens),
             cache_read_tokens=add(self.cache_read_tokens, other.cache_read_tokens),
             cache_write_tokens=add(self.cache_write_tokens, other.cache_write_tokens),
-            cost=cost,
         )
 
 
@@ -214,7 +206,7 @@ class JobRequest(ProtocolModel):
 
     # kind == "shell.batch": shell command strings, each run via ``sh -c``
     # sequentially inside ONE worker process. Every job pays a fixed
-    # round-trip cost (stage job JSON, exec a cold interpreter, fetch the
+    # round-trip price (stage job JSON, exec a cold interpreter, fetch the
     # result) that dwarfs a mechanical command's real work, so verify and
     # evidence commands ride together instead of one job each.
     commands: list[str] | None = None

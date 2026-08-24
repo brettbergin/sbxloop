@@ -674,7 +674,7 @@ class Provisioner:
         security tradeoff. If sbx later injects secrets into exec sessions,
         this check passes and the token stays out of the VM.
 
-        There is a third answer, and missing it cost a live outage
+        There is a third answer, and missing it spend a live outage
         (2026-08-21): sbx can export its proxy *sentinel* (``sbx-cs-...``)
         into the exec environment. That is non-empty, so a `test -n` probe
         called it visible and skipped the fallback - but no GitHub client

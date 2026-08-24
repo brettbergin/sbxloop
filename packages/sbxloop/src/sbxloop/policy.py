@@ -45,7 +45,7 @@ DOMAIN_PATTERN_RE = re.compile(r"(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+
 # exception whatever the tiers said — while every plan that never declared
 # `pypi.org` started failing mid-EXECUTE.
 #
-# The cost is audit granularity: a baseline registry emits no `policy.allow`
+# The price is audit granularity: a baseline registry emits no `policy.allow`
 # event, because there is no grant to log. So the tier stays narrow — the
 # read-only public registry hosts of supported languages, nothing else — and
 # `[policy] deny` still overrides it, including the provision-time seeding

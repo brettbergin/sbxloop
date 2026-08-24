@@ -212,7 +212,7 @@ class LoopEngine:
         for work that is *already* decomposed — a fix round whose brief is a
         list of concrete CI failures and review comments is one task whose
         acceptance criteria are those failures, and asking an agent to
-        decompose it costs a whole session to rediscover a structure the
+        decompose it spends a whole session to rediscover a structure the
         caller already knows. A normal run passes nothing and decomposes.
         """
         run_id = run_id or new_run_id()
@@ -1087,7 +1087,7 @@ class LoopEngine:
         # Task-boundary harvest narrows the loss window on long runs; the
         # finalize harvest in _drive remains the authoritative sweep.
         # When harvest_mode is "final", skip the mid-run copy for cheaper
-        # per-task cost on runs with large workspaces.
+        # per-task price on runs with large workspaces.
         if self.config.artifacts.harvest_mode == "per-task":
             # Copies the whole workspace out of the shared sandbox; two lanes
             # harvesting at once would interleave into the same directory.

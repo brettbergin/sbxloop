@@ -637,7 +637,7 @@ class TestInstallFallbacks:
     def test_ensure_dev_tools_git_probe_success_installs_nothing(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        # A template that ships git costs no apt for it, even when nothing
+        # A template that ships git needs no apt for it, even when nothing
         # else is selected — probe first, like every other entry.
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
@@ -685,7 +685,7 @@ class TestInstallFallbacks:
     def test_ensure_dev_tools_batches_apt_across_languages(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        # Two apt languages must cost ONE `update && install`, not two.
+        # Two apt languages must spend ONE `update && install`, not two.
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())

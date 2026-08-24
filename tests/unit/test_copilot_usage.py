@@ -7,9 +7,10 @@ sample-shaped objects and is tested here with stand-ins — the same pattern
 
 What this guards: sbxloop reads the prompt-cache counters off
 ``AssistantUsageData`` because they are genuine per-turn deltas, but does
-not read ``cost``. ``cost`` is a per-turn constant (observed 15.0 on every
-turn of every session in run rrhb28j7n), so summing it in ``Usage.merged``
-fabricates a total; it stays unread until its unit is established.
+does not read the sample's per-turn spend attribute. That figure is a
+constant (observed 15.0 on every turn of every session in run rrhb28j7n),
+so summing it fabricated a total; ``Usage`` has no field for it at all
+(#439) and it stays unread until its unit is established.
 """
 
 from __future__ import annotations
@@ -20,12 +21,9 @@ from sbxloop_worker.backends.copilot import available_tool_count, usage_from_sdk
 
 
 class TestUsageFromSdkSample:
-    def test_maps_token_counters_but_never_cost(self) -> None:
-        """The sample still carries ``cost``; the mapping must ignore it.
-
-        It is the same constant on every turn, so ``Usage.merged`` — which
-        sums numeric fields — would fold a run into a fabricated total.
-        """
+    def test_maps_token_counters_only(self) -> None:
+        """Only the genuine per-turn deltas are mapped; anything else the
+        sample carries has nowhere to land on ``Usage``."""
         usage = usage_from_sdk_sample(
             SimpleNamespace(
                 model="claude-opus-5",
@@ -33,7 +31,6 @@ class TestUsageFromSdkSample:
                 output_tokens=310,
                 cache_read_tokens=18_500,
                 cache_write_tokens=1_200,
-                cost=0.0421,
             )
         )
         assert usage.model == "claude-opus-5"
@@ -41,7 +38,6 @@ class TestUsageFromSdkSample:
         assert usage.output_tokens == 310
         assert usage.cache_read_tokens == 18_500
         assert usage.cache_write_tokens == 1_200
-        assert usage.cost is None
 
     def test_falls_back_to_camel_case_spellings(self) -> None:
         usage = usage_from_sdk_sample(
@@ -67,7 +63,6 @@ class TestUsageFromSdkSample:
         assert usage.output_tokens is None
         assert usage.cache_read_tokens is None
         assert usage.cache_write_tokens is None
-        assert usage.cost is None
 
     def test_a_sample_carrying_nothing_is_not_an_error(self) -> None:
         """An SDK bump that renames or drops fields must degrade to an empty

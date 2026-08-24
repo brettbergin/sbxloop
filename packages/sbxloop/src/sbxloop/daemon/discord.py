@@ -428,7 +428,7 @@ class DiscordBridge:
         channel_id = int(raw) if raw is not None else None
         author_is_bot = bool(getattr(getattr(message, "author", None), "bot", False))
         # Our own chronology posts arrive here too, so settle the free facts
-        # before the one that costs a store lookup.
+        # before the one that spends a store lookup.
         route = route_message(
             content=str(getattr(message, "content", "") or ""),
             channel_id=channel_id,

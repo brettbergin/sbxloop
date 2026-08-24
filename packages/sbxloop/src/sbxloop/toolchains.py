@@ -5,13 +5,13 @@ honest answer being "whichever ones the operator selected", rather than
 Python by accident of implementation. ``[sandbox] languages`` picks entries
 from here; ``worker.client._ensure_dev_tools`` runs them before the agent's
 first turn so a Node task does not spend revision budget discovering that
-``node`` is absent while a Python task never pays that cost.
+``node`` is absent while a Python task never pays that price.
 
 Each entry carries the three things the ensure needs and nothing else:
 
 - ``probe`` — a ``sh -c`` expression that exits 0 when the toolchain is
   already usable. Probing first means a template that already ships the
-  toolchain costs no apt call and no network at all, matching the existing
+  toolchain needs no apt call and no network at all, matching the existing
   ``_ensure_dev_tools``/``_ensure_search_fallback`` pattern.
 - ``apt_packages`` — packages for the distro path. These are pooled across
   all selected toolchains into ONE ``apt-get update && apt-get install``,

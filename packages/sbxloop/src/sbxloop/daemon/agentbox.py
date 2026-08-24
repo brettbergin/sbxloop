@@ -10,7 +10,7 @@ pattern).
 
 Unlike the github box it is **reused across daemon restarts**: the SDK's
 session store — the concierge's conversation memory — lives inside the VM,
-and a fresh microVM plus Copilot install costs minutes at every restart.
+and a fresh microVM plus Copilot install spends minutes at every restart.
 So :meth:`DaemonAgent.client` first looks for the deterministic name in
 ``sbx ls`` and keeps the sandbox when the installed worker still matches
 this host (:meth:`WorkerClient.verify_installed`); a host upgrade or a
@@ -43,8 +43,8 @@ T = TypeVar("T")
 SANDBOX_NAME_PREFIX = "sbxloop-concierge"
 # Events from the concierge's own sandbox carry this run id.
 CONCIERGE_RUN_ID = "concierge"
-# Same reasoning as the github box: a dead sandbox costs one re-provision,
-# an outage must not cost one per failing message.
+# Same reasoning as the github box: a dead sandbox spends one re-provision,
+# an outage must not spend one per failing message.
 REPROVISION_MIN_INTERVAL_S = 300.0
 
 

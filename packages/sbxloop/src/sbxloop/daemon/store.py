@@ -908,7 +908,7 @@ class DaemonStore:
 
         Joined on ``state = 'done'``: an item still reviewing is the
         acceptance gate's to advance, and a failed/abandoned one has been
-        handed to a human — neither should cost a GitHub read here.
+        handed to a human — neither should spend a GitHub read here.
         """
         with self._lock:
             rows = self._conn.execute(

@@ -3,7 +3,7 @@
 A normal run decomposes an outcome and spends ~270 turns across ~5 phases per
 task. A fix round addressing "mdformat failed" or "line 12 is off by one" is
 already decomposed — the failures *are* the acceptance criteria — so asking an
-agent to rediscover that structure costs a whole session for nothing.
+agent to rediscover that structure spends a whole session for nothing.
 """
 
 from __future__ import annotations

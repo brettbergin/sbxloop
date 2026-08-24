@@ -898,7 +898,7 @@ class TestDaemonGithubInstance:
         assert gh_a.name == sandbox_name_for(a.state_dir)  # stable across restarts
 
     def test_reprovision_is_rate_limited(self, tmp_path: Path) -> None:
-        """A GitHub outage used to cost one microVM rebuild per failing
+        """A GitHub outage used to spend one microVM rebuild per failing
         call; now at most one per REPROVISION_MIN_INTERVAL_S (#254)."""
         from sbxloop.config import Config
         from sbxloop.daemon.github import REPROVISION_MIN_INTERVAL_S, DaemonGithub

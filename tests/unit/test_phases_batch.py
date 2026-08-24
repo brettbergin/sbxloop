@@ -1,4 +1,4 @@
-"""PhaseRunner shell batching (#125): verify must cost ONE worker job, not
+"""PhaseRunner shell batching (#125): verify must spend ONE worker job, not
 one per command — the per-job round-trip (stage JSON, cold interpreter,
 fetch result) dwarfs the commands' real work."""
 

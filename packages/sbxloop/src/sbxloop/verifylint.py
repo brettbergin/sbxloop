@@ -7,7 +7,7 @@ the executor burned a revision apt-installing packages system-wide to
 satisfy a command it is forbidden to edit. Prompt guidance alone is
 probabilistic — the model complied at plan time and not at decompose time
 in the very same run — so the convention is enforced here, at JSON
-acceptance, where a violation costs one retry with the rule quoted instead
+acceptance, where a violation spends one retry with the rule quoted instead
 of a revision cycle.
 
 The hazard is not the same across languages, so the rules are a table
@@ -265,8 +265,8 @@ def command_heads(command: str) -> list[str]:
 # review that followed cut five style issues without noticing the build was
 # broken.
 #
-# Checked at JSON acceptance rather than after delivery: here it costs one
-# retry with the rule quoted, there it costs a PR, a review round and a human
+# Checked at JSON acceptance rather than after delivery: here it spends one
+# retry with the rule quoted, there it spends a PR, a review round and a human
 # noticing. Polling the PR's checks still catches what this cannot (anything
 # that only fails in CI's environment); this is the cheap half.
 #

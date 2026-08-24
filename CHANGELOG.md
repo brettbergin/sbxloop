@@ -6,6 +6,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Removed
+
+- **`Usage` no longer carries a spend field, and no usage block renders a
+  money-shaped number.** #439. After #386 stopped both producers writing it
+  (`usage_from_sdk_sample` and the concierge's `_USAGE_FIELDS`), the field on
+  `Usage`, its last-wins branch in `Usage.merged`, the `phase_attempts.cost`
+  column and the concierge's `f"...{...:.4f}"` spend render were reachable only from
+  a hand-built object in a test — dead wire plumbing whose surviving render
+  was precisely the currency shape #386 forbade. `run_usage` and `usage_today`
+  now end with a fixed "spend: not reported by the agent backend (tokens above
+  are the whole record)" line, and the Discord run summary drops its `$x.xx`
+  bit. Existing state databases are unaffected: the dropped column is simply
+  no longer written or read.
+
 ### Changed
 
 - **The per-task pipeline is three phases, not six: DECOMPOSE → BUILD →
@@ -221,7 +235,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   147-turn run into `cost: 2205.0000` — a fabricated figure the concierge
   would repeat in Discord as fact. The host no longer lifts `cost` out of
   `agent.usage` events, `Usage.merged` carries it last-wins rather than
-  additively, and `_cost_line` renders a figure only when it is strictly
+  additively, and the concierge's spend line renders a figure only when it is strictly
   positive; `run_usage` and `usage_today` say "cost: not reported by the agent
   backend" instead. The field's *unit is unknown*: a value identical on every
   turn of every session is far more likely a premium-request multiplier or a

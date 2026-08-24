@@ -96,7 +96,7 @@ REVIEW_INSTRUCTIONS = (
 
 # A fix round is ONE task, seeded rather than decomposed. The failures are
 # already the acceptance criteria: asking an agent to decompose "mdformat
-# failed" costs a whole session to rediscover a structure the caller already
+# failed" spends a whole session to rediscover a structure the caller already
 # knows, and a normal run is ~270 turns and the better part of an hour.
 FIX_TASK_TITLE = "Make the pull request acceptable"
 
@@ -185,7 +185,7 @@ def _comment(entry: Any) -> ReviewComment | None:
     """One inline comment, or None when the agent's entry is unusable.
 
     Defensive because this is agent-authored JSON: a comment missing its
-    anchor cannot be posted, and one bad entry must not cost the review.
+    anchor cannot be posted, and one bad entry must not spend the review.
     """
     if not isinstance(entry, dict):
         return None

@@ -514,17 +514,17 @@ def usage_from_sdk_sample(data: Any) -> Usage:
     downstream already carries (``Usage`` in the worker protocol, the
     concierge's ``_USAGE_FIELDS``).
 
-    ``AssistantUsageData.cost`` is deliberately NOT read. It is not a
-    per-turn delta: it was observed as the same constant 15.0 on every turn
-    of every session in run rrhb28j7n (sbxloop 0.7.26). ``Usage.merged``
-    sums every numeric field — correct for token counters — so a 147-turn
-    run folds to 147 x 15.0 = 2205.0 and ``_cost_line`` renders a fabricated
-    figure that the concierge then repeats as fact. A value identical on
-    every turn is far more likely a premium-request multiplier or quota unit
-    than a currency amount, so the field stays unread until its unit is
-    established; "cost: not reported by the agent backend" is the honest
-    fallback. If it is ever surfaced it must be carried non-additively
-    (last/max wins, as ``Usage.merged`` already does for ``model``).
+    The sample's per-turn spend attribute is deliberately NOT read, and
+    ``Usage`` carries no field for it (#386, #439). It is not a per-turn
+    delta: it was observed as the same constant 15.0 on every turn of every
+    session in run rrhb28j7n (sbxloop 0.7.26), so folding it through
+    ``Usage.merged`` fabricated a run total the concierge then repeated as
+    fact. A value identical on every turn is far more likely a
+    premium-request multiplier or quota unit than a currency amount, so it
+    stays unread until its unit is established; "spend: not reported by the
+    agent backend" is the honest answer. If it is ever surfaced it must be
+    carried non-additively (last/max wins, as ``Usage.merged`` already does
+    for ``model``) and never rendered in a currency shape.
     """
     return Usage(
         model=_sdk_field(data, "model"),
@@ -796,7 +796,7 @@ class CopilotBackend:
             # Resume is an optimisation, never a requirement: it saves a
             # revision from re-deriving what its own previous attempt
             # established. A session the SDK has expired, evicted, or never
-            # heard of must cost that saving and nothing more — falling
+            # heard of must spend that saving and nothing more — falling
             # through to a fresh session is exactly the behaviour before
             # resume existed, and the prompt still carries the previous
             # attempt's report either way.

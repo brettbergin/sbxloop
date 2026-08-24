@@ -54,7 +54,7 @@ class TestChatInput:
         chat.feed(b"\x1b[A\x1b[3~hello\r")
         assert submitted == ["hello"]
 
-    def test_bare_escape_costs_at_most_the_next_char(self) -> None:
+    def test_bare_escape_consumes_at_most_the_next_char(self) -> None:
         chat, submitted = self.collect()
         # Esc alone, later typing: only the char right after Esc is treated
         # as an Alt-combo and dropped; the rest goes through.
