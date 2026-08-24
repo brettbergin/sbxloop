@@ -15,10 +15,16 @@ from types import SimpleNamespace
 from sbxloop_worker.backends.copilot import (
     TOOL_ARGS_CLIP,
     TOOL_OUTPUT_CLIP,
+    TOOL_OUTPUT_HEAD_LINES,
+    TOOL_OUTPUT_TAIL_LINES,
     SessionHealthTracker,
+    ToolCallRegistry,
     _tool_args,
+    _tool_error,
     _tool_exit_code,
     _tool_output,
+    _tool_output_lines,
+    excerpt_output,
     tool_refusal,
 )
 
@@ -74,13 +80,14 @@ class TestToolOutput:
         data = SimpleNamespace(result=SimpleNamespace(content="", detailed_content="details"))
         assert _tool_output(data) == "details"
 
-    def test_long_output_keeps_tail(self) -> None:
+    def test_long_output_keeps_both_ends(self) -> None:
         data = SimpleNamespace(
-            result=SimpleNamespace(content="a" * 5_000 + "END", detailed_content=None)
+            result=SimpleNamespace(content="BEGIN" + "a" * 5_000 + "END", detailed_content=None)
         )
         output = _tool_output(data)
         assert output is not None
-        assert len(output) == TOOL_OUTPUT_CLIP
+        assert len(output) <= TOOL_OUTPUT_CLIP
+        assert output.startswith("BEGIN")
         assert output.endswith("END")
 
     def test_missing_result_is_none(self) -> None:
@@ -218,3 +225,149 @@ class TestToolRefusal:
         # Command output that merely *mentions* the phrase (e.g. a grep over
         # logs) must not be classified as a refusal.
         assert not tool_refusal(None, "found: Command not executed. in daemon.log")
+
+
+def _complete(content: str, *, error: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        result=SimpleNamespace(content=content, detailed_content=None),
+        error=SimpleNamespace(message=error) if error else None,
+    )
+
+
+class TestExcerptOutput:
+    def test_short_output_is_not_elided(self) -> None:
+        text = "\n".join(f"line {i}" for i in range(5))
+        assert excerpt_output(text) == text
+        assert "elided" not in excerpt_output(text)
+
+    def test_output_at_budget_is_not_elided(self) -> None:
+        total = TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES
+        text = "\n".join(f"L{i}" for i in range(total))
+        assert "elided" not in excerpt_output(text)
+
+    def test_long_output_keeps_head_and_tail_with_marker(self) -> None:
+        total = TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 412
+        text = "\n".join(f"L{i}" for i in range(total))
+        out = excerpt_output(text)
+        lines = out.splitlines()
+        assert lines[0] == "L0"
+        assert lines[TOOL_OUTPUT_HEAD_LINES - 1] == f"L{TOOL_OUTPUT_HEAD_LINES - 1}"
+        assert lines[TOOL_OUTPUT_HEAD_LINES] == "… 412 lines elided …"
+        assert lines[-1] == f"L{total - 1}"
+        assert len(lines) == TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 1
+
+    def test_char_cap_bounds_a_single_huge_line(self) -> None:
+        out = excerpt_output("BEGIN" + "x" * 50_000 + "END")
+        assert len(out) <= TOOL_OUTPUT_CLIP
+        assert out.startswith("BEGIN")  # both ends of a wide line survive
+        assert out.endswith("END")
+        assert "…" in out
+        assert len(out) < 2_000  # Discord message limit
+
+    def test_wide_lines_keep_head_marker_and_tail(self) -> None:
+        # Many lines wide enough that a naive tail slice of the finished
+        # string would discard the head and the elision marker entirely.
+        text = "\n".join(f"line{i} " + "x" * 60 for i in range(100))
+        out = excerpt_output(text)
+        assert len(out) <= TOOL_OUTPUT_CLIP
+        assert "elided" in out
+        assert out.splitlines()[0].startswith("line0 ")
+        assert out.splitlines()[-1].startswith("line99 ")
+
+    def test_pathologically_wide_lines_still_bounded_with_marker(self) -> None:
+        text = "\n".join(f"L{i} " + "y" * 5_000 for i in range(50))
+        out = excerpt_output(text)
+        assert len(out) <= TOOL_OUTPUT_CLIP
+        assert "elided" in out
+        lines = out.splitlines()
+        assert lines[0].startswith("L0 ")
+        assert lines[-1].startswith("L49 ")
+
+    def test_token_in_output_is_redacted(self) -> None:
+        token = "ghp_" + "a1b2c3d4" * 4 + "wxyz"
+        out = excerpt_output(f"cloning with {token}\nAPI_KEY=supersecretvalue")
+        assert token not in out
+        assert "supersecretvalue" not in out
+
+    def test_output_lines_counts_untruncated_total(self) -> None:
+        data = _complete("\n".join(str(i) for i in range(500)))
+        assert _tool_output_lines(data) == 500
+        assert _tool_output_lines(SimpleNamespace(result=None)) is None
+
+    def test_error_message_is_redacted(self) -> None:
+        token = "ghp_" + "z9y8x7w6" * 4 + "abcd"
+        message = _tool_error(SimpleNamespace(error=SimpleNamespace(message=f"denied {token}")))
+        assert message is not None
+        assert token not in message
+
+
+class TestToolCallRegistry:
+    def test_end_recovers_tool_and_args_and_duration(self) -> None:
+        registry = ToolCallRegistry()
+        registry.start("c1", "bash", "uv run pytest -q")
+        tool, args, duration_ms = registry.end("c1")
+        assert (tool, args) == ("bash", "uv run pytest -q")
+        assert isinstance(duration_ms, int) and duration_ms >= 0
+
+    def test_concurrent_calls_pair_by_id_when_ends_arrive_out_of_order(self) -> None:
+        registry = ToolCallRegistry()
+        registry.start("c1", "bash", "ruff check .")
+        registry.start("c2", "bash", "mypy")
+        assert registry.end("c2")[:2] == ("bash", "mypy")
+        assert registry.end("c1")[:2] == ("bash", "ruff check .")
+
+    def test_unmatched_end_is_blank_not_an_error(self) -> None:
+        assert ToolCallRegistry().end("nope") == (None, None, None)
+
+    def test_entries_are_dropped_after_completion(self) -> None:
+        registry = ToolCallRegistry()
+        registry.start("c1", "bash", "ls")
+        registry.end("c1")
+        assert registry.end("c1") == (None, None, None)
+
+    def test_start_without_call_id_is_ignored(self) -> None:
+        registry = ToolCallRegistry()
+        registry.start(None, "bash", "ls")
+        assert registry.end(None) == (None, None, None)
+
+
+class TestToolEndPayload:
+    """The fields a completed call publishes, as the backend assembles them."""
+
+    def test_payload_carries_new_additive_fields_alongside_the_old(self) -> None:
+        registry = ToolCallRegistry()
+        token = "ghp_" + "q1w2e3r4" * 4 + "tyui"
+        registry.start("c1", "bash", "gh auth status")
+        data = SimpleNamespace(
+            tool_call_id="c1",
+            success=False,
+            result=SimpleNamespace(
+                content="\n".join([f"L{i}" for i in range(100)] + [f"token={token}"]),
+                detailed_content=None,
+                contents=[SimpleNamespace(exit_code=1)],
+            ),
+            error=SimpleNamespace(message="boom"),
+        )
+        tool, args, duration_ms = registry.end("c1")
+        payload = {
+            "tool_call_id": "c1",
+            "tool": tool,
+            "args": args,
+            "success": data.success,
+            "exit_code": _tool_exit_code(data),
+            "output": _tool_output(data),
+            "error": _tool_error(data),
+            "output_lines": _tool_output_lines(data),
+            "duration_ms": duration_ms,
+        }
+        assert payload["tool"] == "bash"
+        assert payload["args"] == "gh auth status"
+        assert payload["exit_code"] == 1
+        assert payload["error"] == "boom"
+        assert payload["output_lines"] == 101
+        assert isinstance(payload["duration_ms"], int)
+        output = payload["output"]
+        assert isinstance(output, str)
+        assert token not in output
+        assert "lines elided" in output
+        assert len(output) <= TOOL_OUTPUT_CLIP

@@ -19,7 +19,7 @@ from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
 from sbxloop.daemon.model import RunReport, WorkItem
-from sbxloop.daemon.sources import PrObservation
+from sbxloop.daemon.sources import GitHubLabels, PrSnapshot
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
@@ -1880,19 +1880,53 @@ class ReviewingSource(FakeSource):
         super().__init__()
         self.checks = ChecksVerdict("green", 2, (), ())
         self.review_state = "NONE"
-        self.head_sha = "sha0"
-        self.labels: tuple[str, ...] = ()
+        self.merged = False
+        self.pr_open = True
+        self.merged_ok = True  # what report_merged answers
+        self.head_sha = ""  # the branch head each poll observes
+        self.pr_labels: tuple[str, ...] = ()  # labels on the delivered PR
+        self.feedback = ""  # what pr_review_feedback answers
         self.polls = 0
+        self.merge_polls = 0
         self.reviews: list[int] = []
+        self.labels = GitHubLabels(
+            "sbxloop:run", "sbxloop:in-progress", "sbxloop:failed", "sbxloop:backlog"
+        )
 
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
         self.reviews.append(pr_number)
         self.calls.append(("file_review", pr_number))
         return f"gh:{pr_number + 100}"
 
-    def pr_state(self, pr_number: int) -> PrObservation:
+    def pr_state(self, pr_number: int) -> PrSnapshot:
         self.polls += 1
-        return PrObservation(self.checks, self.review_state, self.head_sha, self.labels)
+        state = "open" if self.pr_open else "closed"
+        if self.merged or not self.pr_open:
+            return PrSnapshot(ChecksVerdict("pending", 0, (), ()), "NONE", self.merged, state)
+        return PrSnapshot(
+            self.checks,
+            self.review_state,
+            False,
+            state,
+            head_sha=self.head_sha,
+            labels=self.pr_labels,
+        )
+
+    def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
+        self.merge_polls += 1
+        return self.merged, "open" if self.pr_open else "closed"
+
+    def pr_review_feedback(self, pr_number: int) -> str:
+        self.calls.append(("review_feedback", pr_number))
+        return self.feedback
+
+    def report_merged(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
+        self.calls.append(("merged", pr_number))
+        return self.merged_ok
+
+    def report_pr_closed(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
+        self.calls.append(("pr_closed", pr_number))
+        return True
 
 
 class TestAcceptanceGate:
@@ -1920,6 +1954,96 @@ class TestAcceptanceGate:
         source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
         assert h.loop.tick().outcome == "reviewing"
         return h, source
+
+    def test_first_poll_baselines_the_delivered_head(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        source.head_sha = "ours0001"
+        h.loop.tick()
+        assert h.dstore.pr_state("gh:1").delivered_head == "ours0001"  # type: ignore[union-attr]
+
+    def test_a_foreign_push_hands_the_pr_over(self, tmp_path: Path) -> None:
+        """#412: a fix round delivers by force-updating the branch, so a head
+        the daemon did not deliver means continuing would replace a human's
+        commits — whoever pushes last wins. Hand it over instead."""
+        h, source = self._delivered(tmp_path)
+        source.head_sha = "ours0001"
+        h.loop.tick()  # baselines
+        source.head_sha = "theirs002"
+        source.checks = ChecksVerdict("red", 2, (), ("lint",))  # would queue a fix round
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned", "handed to a human, not retried"  # type: ignore[union-attr]
+        assert "taken over" in (item.last_error or "")  # type: ignore[union-attr]
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and state.fix_brief is None, "no fix round was queued"
+
+    def test_the_hands_off_label_hands_the_pr_over(self, tmp_path: Path) -> None:
+        """#412: the deliberate half of the guard. A human who labels the PR
+        before touching its branch is not raced by a fix round."""
+        h, source = self._delivered(tmp_path)
+        source.pr_labels = ("sbxloop:hands-off",)
+        source.checks = ChecksVerdict("red", 2, (), ("lint",))  # would queue a fix round
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item is not None and item.state == "abandoned"
+        assert "sbxloop:hands-off" in (item.last_error or "")
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and state.fix_brief is None, "no fix round was queued"
+
+    def test_an_unrelated_label_changes_nothing(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path)
+        source.pr_labels = ("bug",)
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_an_empty_hands_off_label_disables_the_check(self, tmp_path: Path) -> None:
+        h, source = self._delivered(tmp_path, hands_off_label="")
+        source.pr_labels = ("",)
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_a_review_is_not_refiled_after_its_charter_dies(self, tmp_path: Path) -> None:
+        """#442: abandoning (or losing) the review charter must not silently
+        re-derive 'this PR needs a review' and file the same charter under a
+        new number. Green checks become the whole bar instead."""
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()  # green + unreviewed: files the review charter (gh:109)
+        assert source.reviews == [9]
+        # The charter runs as its own item and dies without posting a verdict.
+        h.dstore.upsert_new(
+            WorkItem(item_id="gh:109", source="github", source_key="109", title="review"),
+            now=5.0,
+        )
+        h.dstore.mark_failed("gh:109", "abandoned by operator", 6.0, requeue=False)
+        h.loop.tick()  # clears the dead in-flight marker
+        h.loop.tick()  # green + still unreviewed — but the charter was already filed
+        assert source.reviews == [9], "the charter was re-filed"
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+
+    def test_a_moot_review_charter_settles_without_a_run(self, tmp_path: Path) -> None:
+        """#442: a review charter whose PR already merged reviews nothing —
+        the field case burned four runs auditing a merged PR."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": {"await_review": True},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        h.dstore.record_review("rorig0001", 9, "gh:200", 1.0)
+        source.merged = True
+        source.items = [
+            WorkItem(item_id="gh:200", source="github", source_key="200", title="review: PR #9")
+        ]
+        result = h.loop.tick()
+        assert result.outcome == "done"
+        assert h.runs == [], "the charter must not spend an engine run"
+        assert h.dstore.get("gh:200").state == "done"  # type: ignore[union-attr]
+        assert any(kind == "success" for kind, _ in source.calls)
 
     def test_a_delivered_item_waits_and_spends_no_review_yet(self, tmp_path: Path) -> None:
         """CI first: nothing is reviewed until the build has reported."""
@@ -1974,6 +2098,19 @@ class TestAcceptanceGate:
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
         assert "requested changes" in h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+
+    def test_a_review_fix_round_quotes_the_objections(self, tmp_path: Path) -> None:
+        """The fix agent's sandbox has no GitHub credential (#437): whatever
+        the daemon quotes into the brief is all the reviewer feedback the
+        round will ever see."""
+        h, source = self._delivered(tmp_path)
+        h.loop.tick()  # files the review
+        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
+        source.review_state = "CHANGES_REQUESTED"
+        source.feedback = "- `a.py:9`: off by one"
+        h.loop.tick()
+        brief = h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+        assert "- `a.py:9`: off by one" in brief
 
     def test_a_non_gating_approval_still_accepts(self, tmp_path: Path) -> None:
         """A review the repo would only accept as a COMMENT never produces an
@@ -2046,7 +2183,10 @@ class TestAcceptanceGate:
 
     def test_a_review_run_that_never_settles_does_not_park_the_item(self, tmp_path: Path) -> None:
         """An in-flight flag nothing will ever clear is a silent park, which
-        is the one outcome this loop must not produce."""
+        is the one outcome this loop must not produce. The dead charter is
+        NOT re-filed (#442 — re-deriving it undid operator abandons and
+        burned runs re-reviewing the same PR): green checks become the whole
+        bar, the same as a deployment with no reviewer."""
         h, source = self._delivered(tmp_path)
         h.loop.tick()
         ref = h.dstore.pr_state("gh:1").review_ref or "gh:x"  # type: ignore[union-attr]
@@ -2056,8 +2196,9 @@ class TestAcceptanceGate:
         h.dstore.mark_failed(ref, "review run died", h.clock.t, requeue=False)
         h.loop.tick()  # notices and clears the stale marker
         assert not h.dstore.pr_state("gh:1").review_in_flight  # type: ignore[union-attr]
-        h.loop.tick()  # the gate resumes: a fresh review is filed
-        assert len(source.reviews) == 2
+        h.loop.tick()  # the gate resumes — and accepts on green, no re-file
+        assert len(source.reviews) == 1
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
 
     def test_the_gate_can_be_turned_off(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
@@ -2082,7 +2223,7 @@ class TestAcceptanceGate:
         handed to a human, out loud."""
         h, source = self._delivered(tmp_path, review_rounds=1)
 
-        def boom(pr_number: int) -> tuple[ChecksVerdict, str]:
+        def boom(pr_number: int) -> PrSnapshot:
             raise RuntimeError("github is down")
 
         source.pr_state = boom  # type: ignore[assignment]
@@ -2101,7 +2242,7 @@ class TestAcceptanceGate:
         calls = {"n": 0}
         real = source.pr_state
 
-        def flaky(pr_number: int) -> tuple[ChecksVerdict, str]:
+        def flaky(pr_number: int) -> PrSnapshot:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("transient")
@@ -2113,22 +2254,46 @@ class TestAcceptanceGate:
         h.loop.tick()  # recovers: files the review
         assert source.reviews == [9]
 
+    def test_a_merged_pr_is_accepted_over_every_other_gate(self, tmp_path: Path) -> None:
+        """A human merging the PR IS the acceptance: no review is filed on a
+        merged PR, and the issue settles through report_merged right away —
+        waiting for an approval on a merged PR is how items wedge forever."""
+        h, source = self._delivered(tmp_path)
+        source.merged = True
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert source.reviews == []
+        assert ("merged", 9) in source.calls
+        assert not any(kind == "success" for kind, _ in source.calls)
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
 
-class TestHandOffGuard:
-    """A PR a human has taken over is never force-updated by the loop.
+    def test_a_pr_closed_unmerged_during_review_abandons_the_item(self, tmp_path: Path) -> None:
+        """A human closing the PR without merging is a rejection no gate
+        below can override: handed over, issue marked failed but open."""
+        h, source = self._delivered(tmp_path)
+        source.pr_open = False
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "without being merged" in (item.last_error or "")  # type: ignore[union-attr]
+        assert ("pr_closed", 9) in source.calls
+        assert source.reviews == []
 
-    `clone_existing_branch` only refuses a *missing* branch; a branch that
-    exists and is being actively worked on was indistinguishable from one
-    waiting for a fix round (#412). The head sha the loop last delivered is
-    the answer: if it moved, someone else has been in there.
+
+class TestMergeWatch:
+    """Acceptance is not the end of the story: the source issue settles —
+    close plus completed label — when the PR actually lands. The watch
+    sweeps accepted-but-unsettled rows in daemon_pr_state, throttled to one
+    read per PR per interval, and survives restarts because the rows do.
     """
 
-    def _delivered(self, tmp_path: Path, **daemon: object) -> tuple[Harness, ReviewingSource]:
+    def _accepted(self, tmp_path: Path, **daemon: object) -> tuple[Harness, ReviewingSource]:
+        """One github patch item run to done (no review gate), watch armed."""
         cfg = Config.model_validate(
             {
                 "state_dir": str(tmp_path / "state"),
                 "github": {"repo": "o/r"},
-                "daemon": dict({"await_review": True}, **daemon),
+                "daemon": dict({"await_review": False}, **daemon),
             }
         )
         h = Harness(tmp_path, cfg)
@@ -2136,71 +2301,95 @@ class TestHandOffGuard:
         h.source = source
         h.loop.sources = [source]
         source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
-        assert h.loop.tick().outcome == "reviewing"
+        assert h.loop.tick().outcome == "done"
         return h, source
 
-    def _asked_for_changes(self, h: Harness, source: ReviewingSource) -> None:
-        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
-        source.review_state = "CHANGES_REQUESTED"
-
-    def test_the_delivery_records_the_head_sha(self, tmp_path: Path) -> None:
-        h, _ = self._delivered(tmp_path)
-        assert h.dstore.pr_state("gh:1").head_sha == "sha0"  # type: ignore[union-attr]
-
-    def test_a_moved_head_queues_no_fix_round(self, tmp_path: Path) -> None:
-        h, source = self._delivered(tmp_path)
-        self._asked_for_changes(h, source)
-        source.head_sha = "sha-human"
-        front = RecordingFrontend()
-        h.loop.frontend = front  # type: ignore[assignment]
-        rounds_before = h.dstore.pr_state("gh:1").rounds  # type: ignore[union-attr]
+    def test_an_open_pr_waits_and_the_watch_is_throttled(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        h.loop.tick()  # first watch poll
+        assert source.merge_polls == 1
+        assert not any(kind in {"merged", "pr_closed"} for kind, _ in source.calls)
+        assert not h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        h.loop.tick()  # inside the interval: no read spent
+        assert source.merge_polls == 1
+        h.clock.t += 301
         h.loop.tick()
+        assert source.merge_polls == 2
+
+    def test_a_merged_pr_settles_the_issue_once(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        source.merged = True
+        h.loop.tick()
+        assert [c for c in source.calls if c[0] == "merged"] == [("merged", 9)]
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        h.clock.t += 3600
+        h.loop.tick()  # settled rows are not polled again
+        assert source.merge_polls == 1
+
+    def test_a_pr_closed_unmerged_abandons_the_item(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        source.pr_open = False
+        h.loop.tick()
+        assert ("pr_closed", 9) in source.calls
         item = h.dstore.get("gh:1")
-        assert item.state != "queued"  # type: ignore[union-attr]
         assert item.state == "abandoned"  # type: ignore[union-attr]
-        assert h.dstore.pr_state("gh:1").rounds == rounds_before  # type: ignore[union-attr]
-        assert any("someone else has been working on it" in t for t in front.seen)
+        assert "without being merged" in (item.last_error or "")  # type: ignore[union-attr]
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
 
-    def test_an_unchanged_head_still_queues_the_fix_round(self, tmp_path: Path) -> None:
-        h, source = self._delivered(tmp_path)
-        self._asked_for_changes(h, source)
+    def test_a_failed_settle_is_retried_next_interval(self, tmp_path: Path) -> None:
+        """report_merged returning False (a GitHub hiccup mid-settle) leaves
+        the row unsettled so the close is retried, not recorded as done."""
+        h, source = self._accepted(tmp_path)
+        source.merged = True
+        source.merged_ok = False
         h.loop.tick()
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
-
-    def test_the_hands_off_label_hands_over_with_an_unchanged_head(self, tmp_path: Path) -> None:
-        h, source = self._delivered(tmp_path)
-        self._asked_for_changes(h, source)
-        source.labels = ("sbxloop:hands-off",)
-        front = RecordingFrontend()
-        h.loop.frontend = front  # type: ignore[assignment]
+        assert not h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        source.merged_ok = True
+        h.clock.t += 301
         h.loop.tick()
-        assert h.dstore.get("gh:1").state == "abandoned"  # type: ignore[union-attr]
-        assert any("hands-off" in t for t in front.seen)
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        assert [c for c in source.calls if c[0] == "merged"] == [("merged", 9), ("merged", 9)]
 
-    def test_a_configured_label_is_honoured_and_the_default_ignored(self, tmp_path: Path) -> None:
-        h, source = self._delivered(tmp_path, hands_off_label="mine:keep-out")
-        self._asked_for_changes(h, source)
-        source.labels = ("sbxloop:hands-off",)
+    def test_a_restart_resumes_the_watch(self, tmp_path: Path) -> None:
+        """The watch lives in daemon_pr_state, not in memory: a fresh loop
+        over the same store picks up where the old one stopped."""
+        h, source = self._accepted(tmp_path)
         h.loop.tick()
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert source.merge_polls == 1
+        loop2 = DaemonLoop(
+            h.config,
+            store=h.store,
+            dstore=h.dstore,
+            sources=[source],
+            runner=h.runner,
+            clock=h.clock,
+        )
+        source.merged = True
+        h.clock.t += 301
+        loop2.tick()
+        assert h.dstore.pr_state("gh:1").settled  # type: ignore[union-attr]
+        assert ("merged", 9) in source.calls
 
-    def test_no_stored_sha_adopts_a_baseline_and_proceeds(self, tmp_path: Path) -> None:
-        h, source = self._delivered(tmp_path)
-        h.dstore.record_head("gh:1", "")
-        self._asked_for_changes(h, source)
-        source.head_sha = "sha-observed"
+    def test_a_non_github_row_retires_without_a_read(self, tmp_path: Path) -> None:
+        """Inbox work has no issue to settle: its row is retired silently,
+        costing zero GitHub reads."""
+        h, source = self._accepted(tmp_path)
+        h.dstore.upsert_new(inbox_item(), h.clock.t)
+        h.dstore.mark_done("inbox:a.md", h.clock.t)
+        h.dstore.record_delivery("inbox:a.md", 7, "b", h.clock.t, url="u")
         h.loop.tick()
-        assert h.dstore.pr_state("gh:1").head_sha == "sha-observed"  # type: ignore[union-attr]
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert h.dstore.pr_state("inbox:a.md").settled  # type: ignore[union-attr]
+        assert source.merge_polls == 1  # only gh:1 was asked
 
-    def test_a_source_without_the_new_fields_behaves_as_before(self, tmp_path: Path) -> None:
-        h, source = self._delivered(tmp_path)
-        self._asked_for_changes(h, source)
+    def test_deliver_closes_is_threaded_for_github_patch_items(self, tmp_path: Path) -> None:
+        """The PR body carries `Closes #N` so GitHub links issue and PR and
+        closes the issue on merge even when the daemon is down."""
+        h, _ = self._accepted(tmp_path)
+        assert h.run_configs[0].github.deliver_closes == 1
 
-        class Old:
-            checks = ChecksVerdict("green", 2, (), ())
-            review = "CHANGES_REQUESTED"
-
-        source.pr_state = lambda pr_number: Old()  # type: ignore[assignment,return-value]
-        h.loop.tick()
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+    def test_deliver_closes_is_not_set_for_inbox_items(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        assert h.loop.tick().outcome == "done"
+        assert h.run_configs[0].github.deliver_closes is None

@@ -21,7 +21,6 @@ from rich.table import Table
 
 import sbxloop
 from sbxloop.config import load_config, load_config_with_sources
-from sbxloop.engine.phases import PHASE_DROP_SECTIONS
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.bake import load_bake_record
@@ -34,7 +33,6 @@ from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import (
     SDK_PERMISSION_KINDS,
     installed_sdk_permission_kinds,
-    installed_sdk_system_message_sections,
 )
 
 TESTED_SBX_SERIES = "0.38"
@@ -314,50 +312,6 @@ def collect_checks(
                 "New kinds are denied in read-only critic sessions (fails "
                 "closed); update READ_ONLY_ALLOWED_KINDS/SDK_PERMISSION_KINDS "
                 "in sbxloop_worker.backends.copilot after re-verifying",
-                hard=False,
-            )
-        )
-
-    # copilot SDK system-message sections: phases drop the sections they
-    # cannot act on, and the whole system message rides on every turn, so a
-    # renamed section silently stops being trimmed (spend quietly returns to
-    # baseline) while a section that gains new meaning could be trimmed when
-    # it should not be. Neither shows up as a failure in the field.
-    sdk_sections = installed_sdk_system_message_sections()
-    dropped = sorted({name for names in PHASE_DROP_SECTIONS.values() for name in names})
-    if sdk_sections is None:
-        checks.append(
-            Check(
-                "copilot sdk prompt sections",
-                True,
-                "github-copilot-sdk not installed on this host — section "
-                "vocabulary unverifiable here (checked where the SDK runs); "
-                "unknown section names are dropped from the request, so a "
-                "mismatch costs trimming, never the job",
-                hard=False,
-            )
-        )
-    elif not set(dropped) - sdk_sections:
-        checks.append(
-            Check(
-                "copilot sdk prompt sections",
-                True,
-                f"installed SDK ({_sdk_version()}) knows every trimmed section "
-                f"({', '.join(dropped) or 'none'}; {len(sdk_sections)} available)",
-            )
-        )
-    else:
-        missing = ", ".join(sorted(set(dropped) - sdk_sections))
-        checks.append(
-            Check(
-                "copilot sdk prompt sections",
-                False,
-                f"installed SDK ({_sdk_version()}) does not know these trimmed "
-                f"sections: {missing}. They are dropped from the request, so "
-                "those phases silently keep paying for the section on every "
-                "turn; re-verify the vocabulary and update PHASE_DROP_SECTIONS "
-                "in sbxloop.engine.phases and SDK_SYSTEM_MESSAGE_SECTIONS in "
-                "sbxloop_worker.backends.copilot",
                 hard=False,
             )
         )

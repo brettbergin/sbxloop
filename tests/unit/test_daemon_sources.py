@@ -14,7 +14,6 @@ from sbxloop.daemon.sources import (
     GitHubIssueSource,
     GitHubLabels,
     InboxSource,
-    PrObservation,
     parse_markdown_item,
 )
 from sbxloop.errors import GithubOpsError
@@ -167,6 +166,7 @@ class RecordingOps:
         self.comments: list[tuple[int, str]] = []
         self.created: list[tuple[str, list[str] | None]] = []
         self.created_in: list[str] = []  # repo each issue_create targeted
+        self.created_bodies: list[str] = []
         self.fail_on: set[str] = set()
         # Comments as GitHub lists them (ascending), events per issue; a
         # claim test scripts a rival's claim comment here.
@@ -177,11 +177,25 @@ class RecordingOps:
         # rival between our post and our re-read.
         self.after_comment: Any = None
         self._next_comment_id = 100
-        # PR reads, for the acceptance gate's pr_state poll.
-        self.pr_payload: dict[str, Any] = {}
-        self.pr_gets: list[tuple[str, int]] = []
-        self.checks_for: list[str] = []
-        self.review_state = "APPROVED"
+        # Scripted PR payloads for pr_get, and a call log for the reads the
+        # merged/closed short-circuit must NOT spend.
+        self.prs: dict[int, dict[str, Any]] = {}
+        self.pr_reads: list[str] = []
+        # Scripted review rows and inline PR comments for pr_review_feedback.
+        self.review_rows: list[dict[str, Any]] = []
+        self.pr_comment_rows: list[dict[str, Any]] = []
+
+    def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+        self.pr_reads.append("get")
+        return self.prs.get(number, {"state": "open", "merged": False, "head": {"sha": "abc"}})
+
+    def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
+        self.pr_reads.append("checks")
+        return ChecksVerdict("green", 1, (), ())
+
+    def pr_review_state(self, repo: str, number: int) -> str:
+        self.pr_reads.append("reviews")
+        return "NONE"
 
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         self.searches.append(query)
@@ -205,6 +219,10 @@ class RecordingOps:
             raise GithubOpsError(f"{method} {path} -> HTTP 500: boom")
         self.raw_calls.append((method, path, body))
         base, _, query = path.partition("?")
+        if method == "GET" and "/pulls/" in base and base.endswith("/reviews"):
+            return list(self.review_rows)
+        if method == "GET" and "/pulls/" in base and base.endswith("/comments"):
+            return list(self.pr_comment_rows)
         if method == "GET" and base.endswith("/comments"):
             return [] if "page=2" in query else list(self.comment_rows)
         if method == "GET" and base.endswith("/events"):
@@ -236,19 +254,8 @@ class RecordingOps:
     def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> IssueRef:
         self.created.append((title, labels))
         self.created_in.append(repo)
+        self.created_bodies.append(body)
         return IssueRef(number=77, url="https://x/issues/77")
-
-    # --- PR reads (the acceptance gate's single poll) ---
-    def pr_get(self, repo: str, number: int) -> dict[str, Any]:
-        self.pr_gets.append((repo, number))
-        return dict(self.pr_payload)
-
-    def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
-        self.checks_for.append(sha)
-        return ChecksVerdict("green", 3, (), ())
-
-    def pr_review_state(self, repo: str, number: int) -> str:
-        return self.review_state
 
 
 def issue(number: int, *labels: str, state: str = "open") -> dict[str, Any]:
@@ -290,32 +297,6 @@ class TestGitHubSource:
         assert items["gh:5"].kind == "audit"
         assert items["gh:6"].kind == "patch"
 
-    def test_pr_state_surfaces_head_sha_and_labels_from_one_read(self) -> None:
-        """The payload the checks read already needs carries the head sha and
-        the PR's labels; a later gate must get both without paying for
-        another API call."""
-        ops = RecordingOps()
-        ops.pr_payload = {
-            "head": {"sha": "abc123"},
-            "labels": [{"name": "Bug"}, {"name": "sbxloop:hands-off"}],
-        }
-        obs = self.make(ops).pr_state(406)
-        assert isinstance(obs, PrObservation)
-        assert obs.head_sha == "abc123"
-        assert obs.labels == ("bug", "sbxloop:hands-off")
-        assert obs.checks.state == "green" and obs.review == "APPROVED"
-        assert ops.pr_gets == [("o/r", 406)] and ops.checks_for == ["abc123"]
-
-    def test_pr_state_without_labels_or_head_is_pending_with_no_labels(self) -> None:
-        ops = RecordingOps()
-        ops.pr_payload = {}
-        obs = self.make(ops).pr_state(406)
-        assert obs.labels == ()
-        assert obs.head_sha == ""
-        assert obs.checks.state == "pending"
-        assert obs.checks.pending == ("unknown head commit",)
-        assert ops.pr_gets == [("o/r", 406)] and ops.checks_for == []
-
     def test_claim_clears_delivered_only_when_present(self) -> None:
         """A blind DELETE of the delivered label 404s on every fresh issue and
         the event stream renders each as an error panel (field noise on
@@ -356,6 +337,45 @@ class TestGitHubSource:
         src2 = GitHubIssueSource(lambda: ops2, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
         src2.report_success(src2.poll()[0], report())
         assert not any(m == "PATCH" for m, _, _ in ops2.raw_calls)
+
+    def test_the_review_charter_never_claims_gh_works(self) -> None:
+        """The review sandbox holds no GitHub credential (#437): the charter
+        must send the reviewer to git, not to `gh` subcommands that fail."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        src.file_review(src.poll()[0], 9, "https://x/pull/9", "r1")
+        body = ops.created_bodies[-1]
+        assert "Charter" in body
+        assert "gh pr diff" not in body and "gh pr view" not in body
+        assert "git diff origin/" in body
+
+    def test_pr_review_feedback_quotes_bodies_and_anchors(self) -> None:
+        ops = RecordingOps()
+        ops.review_rows = [
+            {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "body": "lock is missing"},
+            {"user": {"login": "bob"}, "state": "APPROVED", "body": "lgtm"},
+        ]
+        ops.pr_comment_rows = [
+            {"path": "a.py", "line": 9, "body": "off by one"},
+            {"path": "", "line": None, "body": ""},  # empty body dropped
+        ]
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        feedback = src.pr_review_feedback(9)
+        assert "lock is missing" in feedback
+        assert "`a.py:9`: off by one" in feedback
+        assert "lgtm" not in feedback  # an approval is not an objection
+
+    def test_pr_review_feedback_honours_latest_verdict_per_reviewer(self) -> None:
+        """A reviewer whose change request was superseded by their own later
+        approval no longer objects — quoting the stale body would send the
+        fix round after feedback that was already withdrawn."""
+        ops = RecordingOps()
+        ops.review_rows = [
+            {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "body": "fix the race"},
+            {"user": {"login": "alice"}, "state": "APPROVED", "body": "fixed, thanks"},
+        ]
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        assert "fix the race" not in src.pr_review_feedback(9)
 
     def test_review_and_tool_filing_shapes(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})
@@ -565,34 +585,143 @@ class TestGitHubSource:
         closed = RecordingOps({"4": issue(4, "sbxloop:run", state="closed")})
         assert self.make(closed).claim(item) is False
 
-    def test_success_closes_with_state_reason(self) -> None:
+    def test_success_leaves_a_patch_issue_open_with_delivered_label(self) -> None:
+        """A delivered PR is not a resolution: the issue settles on merge
+        (report_merged), so success only marks it delivered — whatever the
+        deprecated close_on_success says."""
+        for closing in (True, False):
+            ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+            item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+            src = GitHubIssueSource(
+                lambda ops=ops: ops,  # type: ignore[misc]
+                "o/r",
+                LABELS,
+                host="db",
+                close_on_success=closing,
+            )
+            src.report_success(item, report())
+            assert not any(m == "PATCH" for m, _, _ in ops.raw_calls), closing
+            assert (
+                "DELETE",
+                "/repos/o/r/issues/4/labels/sbxloop%3Ain-progress",
+                None,
+            ) in ops.raw_calls
+            assert (
+                "POST",
+                "/repos/o/r/issues/4/labels",
+                {"labels": ["sbxloop:delivered"]},
+            ) in ops.raw_calls
+            body = ops.comments[-1][1]
+            assert "pull/9" in body and "closed when the PR merges" in body
+
+    def test_success_closes_an_audit_with_completed_label(self) -> None:
+        """An audit has no PR whose merge could settle it: it closes on
+        completion, wearing the completed label as the sbxloop mark."""
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
-        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x", kind="audit")
         self.make(ops).report_success(item, report())
-        assert any("pull/9" in body for _, body in ops.comments)
-        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Ain-progress", None) in ops.raw_calls
+        assert (
+            "POST",
+            "/repos/o/r/issues/4/labels",
+            {"labels": ["sbxloop:completed"]},
+        ) in ops.raw_calls
         assert (
             "PATCH",
             "/repos/o/r/issues/4",
             {"state": "closed", "state_reason": "completed"},
         ) in ops.raw_calls
 
-    def test_success_without_close_leaves_open_with_delivered_label(self) -> None:
-        """Design-tracker semantics (#251): a draft PR is not a resolution,
-        so the source issue stays open for the human who merges it."""
-        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+    def test_report_merged_labels_then_closes(self) -> None:
+        """The merge settles the issue: completed label on, lifecycle labels
+        off, closed as completed — labels before the close, so a mid-way
+        failure leaves an open, correctly labelled issue."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:delivered")})
         item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
-        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", close_on_success=False)  # type: ignore[arg-type]
-        src.report_success(item, report())
-        assert not any(m == "PATCH" for m, _, _ in ops.raw_calls)
-        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Ain-progress", None) in ops.raw_calls
+        assert self.make(ops).report_merged(item, 9, "https://x/pull/9") is True
+        assert any("pull/9" in body and "merged" in body for _, body in ops.comments)
+        writes = [(m, p) for m, p, _ in ops.raw_calls if m in {"POST", "PATCH", "DELETE"}]
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Adelivered") in writes
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Ain-progress") in writes
+        completed = writes.index(("POST", "/repos/o/r/issues/4/labels"))
+        closed = writes.index(("PATCH", "/repos/o/r/issues/4"))
+        assert completed < closed
         assert (
             "POST",
             "/repos/o/r/issues/4/labels",
-            {"labels": ["sbxloop:delivered"]},
+            {"labels": ["sbxloop:completed"]},
         ) in ops.raw_calls
-        body = ops.comments[-1][1]
-        assert "pull/9" in body and "Leaving this issue open" in body
+        assert (
+            "PATCH",
+            "/repos/o/r/issues/4",
+            {"state": "closed", "state_reason": "completed"},
+        ) in ops.raw_calls
+
+    def test_report_merged_failure_returns_false_for_a_retry(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:delivered")})
+        ops.fail_on = {"PATCH"}
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        assert self.make(ops).report_merged(item, 9, "u") is False
+
+    def test_report_pr_closed_marks_failed_and_leaves_the_issue_open(self) -> None:
+        """A human closing the PR unmerged is a rejection: failed label on,
+        issue left open for the human to re-trigger or close."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:delivered")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        assert self.make(ops).report_pr_closed(item, 9, "https://x/pull/9") is True
+        assert not any(m == "PATCH" for m, _, _ in ops.raw_calls)
+        assert (
+            "POST",
+            "/repos/o/r/issues/4/labels",
+            {"labels": ["sbxloop:failed"]},
+        ) in ops.raw_calls
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Adelivered", None) in ops.raw_calls
+        assert any("closed without being merged" in body for _, body in ops.comments)
+
+    def test_pr_merge_state_folds_the_pr_payload(self) -> None:
+        ops = RecordingOps()
+        ops.prs[9] = {"state": "closed", "merged": True}
+        assert self.make(ops).pr_merge_state(9) == (True, "closed")
+        ops.prs[9] = {"state": "open", "merged": False}
+        assert self.make(ops).pr_merge_state(9) == (False, "open")
+
+    def test_pr_state_short_circuits_a_merged_or_closed_pr(self) -> None:
+        """A merged or closed PR is past checks and review: one read, not
+        three, and the snapshot carries the fate the ladder acts on."""
+        ops = RecordingOps()
+        ops.prs[9] = {"state": "closed", "merged": True, "head": {"sha": "abc"}}
+        snap = self.make(ops).pr_state(9)
+        assert snap.merged and snap.state == "closed"
+        assert ops.pr_reads == ["get"]
+        ops.pr_reads.clear()
+        ops.prs[9] = {"state": "open", "merged": False, "head": {"sha": "abc"}}
+        snap = self.make(ops).pr_state(9)
+        assert not snap.merged and snap.state == "open"
+        assert ops.pr_reads == ["get", "checks", "reviews"]
+
+    def test_pr_state_surfaces_the_pr_labels_from_the_same_read(self) -> None:
+        """The payload the head sha comes from already carries the labels, so
+        the hands-off check costs no extra API call."""
+        ops = RecordingOps()
+        ops.prs[9] = {
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "abc"},
+            "labels": [{"name": "Bug"}, {"name": "sbxloop:hands-off"}, {"name": ""}, "junk"],
+        }
+        snap = self.make(ops).pr_state(9)
+        assert snap.labels == ("bug", "sbxloop:hands-off")
+        assert ops.pr_reads == ["get", "checks", "reviews"]
+
+    def test_pr_state_without_labels_reports_none(self) -> None:
+        ops = RecordingOps()
+        ops.prs[9] = {"state": "open", "merged": False, "head": {"sha": "abc"}}
+        assert self.make(ops).pr_state(9).labels == ()
+
+    def test_requeued_strips_the_completed_label_too(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:completed")})
+        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="x")
+        self.make(ops).report_requeued(item, "b")
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Acompleted", None) in ops.raw_calls
 
     def test_claim_clears_stale_delivered_label_in_either_mode(self) -> None:
         """A rejected PR's issue gets re-triggered; the delivered label from

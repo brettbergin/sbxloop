@@ -142,6 +142,11 @@ Runner = Callable[[WorkItem, Config, str, EventBus, bool], RunResult]
 # these and the PR's review never settled, nothing is coming.
 _TERMINAL_ITEM_STATES = frozenset({"done", "failed", "abandoned", "cancelled"})
 
+# How often one accepted-but-unmerged PR is asked whether it merged yet.
+# Merges are human-paced (hours to days), so a five-minute floor keeps the
+# watch responsive without spending a GitHub read per PR per tick.
+_MERGE_POLL_MIN_S = 300.0
+
 
 class DaemonLoop:
     def __init__(
@@ -521,6 +526,9 @@ class DaemonLoop:
         # clock, and a PR that went green while the daemon was paused should
         # be settled when it resumes, not left waiting.
         self._poll_reviews(now)
+        # Then accepted-but-unmerged ones: the source issue closes when the
+        # PR actually lands, and that can happen while paused too.
+        self._poll_merges(now)
         if self._paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -758,6 +766,8 @@ class DaemonLoop:
     ) -> TickOutcome:
         """Run one item (fresh, or resuming its interrupted run) and settle it."""
         now = self.clock()
+        if resume_run_id is None and self._settle_moot_review(item, source, now):
+            return "done"
         run_id = resume_run_id or new_run_id()
         started = time.monotonic()
         if resume_run_id is None:
@@ -989,6 +999,12 @@ class DaemonLoop:
                 # the item stays in flight: settling on "a PR exists" is how
                 # #389 was marked done with mdformat and security failing.
                 return "reviewing"
+            if item.kind == "patch" and item.source == "github" and report.delivery is not None:
+                # Not held for review (await_review off, or no github
+                # source at hold time) — still arm the merge watch, or the
+                # issue would never close when this PR lands.
+                number, url = report.delivery
+                self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now, url=url)
             self.dstore.mark_done(item.item_id, now)
             source.report_success(item, report)
             self._frontend_finished(item, report)
@@ -1194,6 +1210,14 @@ class DaemonLoop:
                     "deliver": item.kind != "audit",
                     "deliver_draft": self.config.daemon.deliver_draft,
                     "create_repo": False,
+                    # "Closes #N" in the PR body: GitHub links issue and PR
+                    # and closes the issue on merge even when the daemon is
+                    # not running to do it.
+                    "deliver_closes": (
+                        int(item.source_key)
+                        if item.kind != "audit" and item.source_key.isdigit()
+                        else None
+                    ),
                 }
             )
         update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
@@ -1303,7 +1327,13 @@ class DaemonLoop:
             # failures already are the acceptance criteria, and decomposing
             # them costs a whole session to rediscover a structure we have.
             self.dstore.clear_fix(item.item_id)
-            return engine.start(brief, run_id=run_id, tasks=fix_tasks(pr_number, brief, failed))
+            return engine.start(
+                brief,
+                run_id=run_id,
+                tasks=fix_tasks(
+                    pr_number, brief, failed, gate=self.config.sandbox.gate_command or None
+                ),
+            )
         return engine.start(self.outcome_text(item), run_id=run_id)
 
     def _pending_fix(self, item: WorkItem) -> tuple[int, str, tuple[str, ...]] | None:
@@ -1473,6 +1503,16 @@ class DaemonLoop:
                 # Without a second review the loop could only run one way.
                 return False
             number, url = report.delivery
+            if self.dstore.review_filed(run_id):
+                # A charter for this delivery already exists — or existed:
+                # the operator abandoning it, or the charter run failing,
+                # must not re-derive "this PR needs a review" and file the
+                # same work under a new number, silently undoing the abandon
+                # (#442, field: PR #414 audited three times). Green checks
+                # become the whole bar, the same as a deployment with no
+                # reviewer; re-triggering the charter issue opts back in.
+                log.info("review.already_filed", item=item.item_id, run=run_id, pr=number)
+                return False
             ref = github.file_review(item, number, url, run_id)
             self.dstore.record_review(run_id, number, ref, now)
             self.dstore.review_in_flight(item.item_id, ref)
@@ -1546,11 +1586,6 @@ class DaemonLoop:
 
         Only a patch item that actually opened a PR: an audit has no PR, and
         a run that delivered nothing has nothing to be accepted.
-
-        The delivered head sha is recorded alongside the PR. Every fix-round
-        delivery re-enters this same path, so this is what keeps the loop's
-        own pushes from tripping the moved-head hand-off guard in
-        :meth:`_handed_off`.
         """
         daemon = self.config.daemon
         if not daemon.await_review or item.kind != "patch" or report.delivery is None:
@@ -1561,12 +1596,7 @@ class DaemonLoop:
         if github is None or not hasattr(github, "pr_state"):
             return False
         number, url = report.delivery
-        head = ""
-        try:
-            head = str(getattr(github.pr_state(number), "head_sha", "") or "")
-        except Exception:
-            log.warning("review.head_read_failed", item=item.item_id, pr=number, exc_info=True)
-        self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now, head_sha=head)
+        self.dstore.record_delivery(item.item_id, number, branch_name(run_id), now, url=url)
         self.dstore.mark_reviewing(item.item_id, now)
         self._notify(
             f"⏳ {item.item_id} delivered PR {link(f'#{number}', url)} — "
@@ -1615,7 +1645,9 @@ class DaemonLoop:
         ===============================  ===========================
         state                            action
         ===============================  ===========================
-        head moved / hands-off label     hand over (free)
+        merged                           accept and settle the issue
+        closed without merge             mark failed
+        hands-off label / head moved     hand over (free)
         checks pending                   wait (free)
         checks red                       fix round
         green, review in flight          wait
@@ -1624,9 +1656,12 @@ class DaemonLoop:
         green, review satisfied          accept
         ===============================  ===========================
 
-        CI first is the point: it is GitHub's compute and costs nothing, so
-        a red PR never spends a review run on work that has to change
-        anyway.
+        The PR's own fate outranks every gate: a human merging it IS the
+        acceptance (waiting for an approval on a merged PR strands the item
+        forever), and a human closing it unmerged is a rejection no review
+        can override. Below that, CI first is the point: it is GitHub's
+        compute and costs nothing, so a red PR never spends a review run on
+        work that has to change anyway.
         """
         state = self.dstore.pr_state(item.item_id)
         if state is None:
@@ -1635,10 +1670,30 @@ class DaemonLoop:
             self._accept(item, now, detail="no delivered PR was recorded")
             return
         pr = state.pr_number
-        obs = github.pr_state(pr)
-        if self._handed_off(item, state, obs, now):
+        snap = github.pr_state(pr)
+        if snap.merged:
+            self._accept_merged(item, now, pr, state.pr_url)
             return
-        checks, review_state = obs.checks, obs.review
+        if snap.state == "closed":
+            self._reject_closed(item, now, pr, state.pr_url)
+            return
+        # The takeover guard (#412). The first poll after a delivery records
+        # the head that delivery produced; a later head that differs was
+        # pushed by someone else, and a fix round would force-update the
+        # branch over their work — whoever pushes last wins. Hand the PR to
+        # its human instead, out loud. The hands-off label says the same
+        # thing deliberately, before anyone has pushed anything.
+        if self._hands_off_labelled(snap):
+            self._hand_off_labelled(item, state, now)
+            return
+        if snap.head_sha:
+            if not state.delivered_head:
+                self.dstore.set_delivered_head(item.item_id, snap.head_sha)
+                state = state._replace(delivered_head=snap.head_sha)
+            elif snap.head_sha != state.delivered_head:
+                self._hand_off_taken_over(item, state, now, snap.head_sha)
+                return
+        checks, review_state = snap.checks, snap.review
         if checks.state == "pending":
             log.debug("review.waiting", item=item.item_id, pr=pr, on="checks")
             return
@@ -1673,7 +1728,23 @@ class DaemonLoop:
             not state.gates and state.verdict == "REQUEST_CHANGES"
         )
         if asked_for_changes:
-            self._fix_round(item, state, now, why="the review requested changes", failed=())
+            # Quote the standing objections into the brief: the fix agent's
+            # sandbox has no GitHub credential (#437), so what the daemon
+            # fetches here is all the reviewer feedback that round will see.
+            objections = ""
+            if hasattr(github, "pr_review_feedback"):
+                try:
+                    objections = github.pr_review_feedback(pr)
+                except Exception:
+                    log.warning("review.feedback_fetch_failed", item=item.item_id, pr=pr)
+            self._fix_round(
+                item,
+                state,
+                now,
+                why="the review requested changes",
+                failed=(),
+                objections=objections,
+            )
             return
         if not state.reviewed:
             # Green and unreviewed: only now is a review run worth spending.
@@ -1693,48 +1764,113 @@ class DaemonLoop:
             return
         log.debug("review.waiting", item=item.item_id, pr=pr, on="approval")
 
-    def _handed_off(self, item: WorkItem, state: PrState, obs: Any, now: float) -> bool:
-        """Whether someone else has taken this PR over.
+    def _settle_moot_review(self, item: WorkItem, source: WorkSource, now: float) -> bool:
+        """Settle a review charter whose PR has already merged or closed.
 
-        The loop knows the head sha it last delivered. If the PR's head has
-        moved since, a human has been working on that branch — a fix round
-        would clone it and force-update the ref, silently replacing their
-        work. A ``hands_off_label`` on the PR says the same thing
-        deliberately. Either way the item is handed over: no fix round, no
-        delivery, no acceptance.
+        Running it would spend a full engine run reviewing a decision GitHub
+        already made — the field case (#442) burned three items and four
+        runs auditing PR #414 after its merge. Checked at dispatch rather
+        than filing time because the merge can land while the charter waits
+        in the queue. Best-effort: an unreadable PR state dispatches
+        normally rather than stranding the charter.
         """
-        observed = str(getattr(obs, "head_sha", "") or "")
-        labels = tuple(getattr(obs, "labels", ()) or ())
-        stored = state.head_sha
-        label = self.config.daemon.hands_off_label.strip()
-        if label and label.lower() in {str(name).lower() for name in labels}:
-            reason = f"PR #{state.pr_number} carries {label} — leaving it to a human"
-            why = "label"
-        elif not stored:
-            # First poll after a delivery that could not read the sha: adopt
-            # what is there as the baseline rather than guess at a hand-off.
-            if observed:
-                self.dstore.record_head(item.item_id, observed)
+        target = self.dstore.review_target(item.item_id)
+        if target is None:
             return False
-        elif observed and observed != stored:
-            reason = (
-                f"PR #{state.pr_number}: its head moved from {stored[:7]} to "
-                f"{observed[:7]} — someone else has been working on it"
+        pr_number, _ = target
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "pr_merge_state"):
+            return False
+        try:
+            merged, pr_state = github.pr_merge_state(pr_number)
+        except Exception:
+            log.warning("review.moot_check_failed", item=item.item_id, pr=pr_number)
+            return False
+        if not merged and pr_state != "closed":
+            return False
+        fate = "merged" if merged else "closed"
+        self.dstore.mark_done(item.item_id, now)
+        try:
+            source.report_success(
+                item,
+                RunReport(
+                    run_id="-",
+                    state="completed",
+                    task_summary=f"review not run: PR #{pr_number} already {fate}",
+                ),
             )
-            why = "head_moved"
-        else:
-            return False
-        self.dstore.mark_failed(item.item_id, reason, now, requeue=False)
+        except Exception:
+            log.warning("review.moot_settle_failed", item=item.item_id, exc_info=True)
         self._notify(
-            f"✋ {item.item_id}: {reason}. Handing it over; PR #{state.pr_number} is left "
-            "open and the daemon will not touch its branch again.",
-            "review.handed_off",
+            f"⏭ {item.item_id}: PR #{pr_number} already {fate} — its review charter is "
+            "moot and was settled without a run.",
+            "review.moot",
+            item=item.item_id,
+            pr=pr_number,
+            fate=fate,
+        )
+        return True
+
+    def _hand_off_taken_over(
+        self, item: WorkItem, state: PrState, now: float, head_sha: str
+    ) -> None:
+        """Someone else pushed to the PR's branch: stop competing for it.
+
+        A fix round delivers by force-updating the branch (the 422 handling
+        that keeps one PR per item), so continuing would silently replace
+        the human's commits (#412, field: PR #406). The item is handed over
+        with the PR left open; re-triggering the source issue opts back in.
+        """
+        self.dstore.mark_failed(
+            item.item_id,
+            f"PR #{state.pr_number} taken over: branch {state.branch} moved to "
+            f"{head_sha[:12]} (not our delivery)",
+            now,
+            requeue=False,
+        )
+        self._notify(
+            f"✋ {item.item_id}: PR #{state.pr_number} has commits the daemon did not "
+            f"deliver on `{state.branch}` — someone has taken it over. Automatic fix "
+            "rounds stopped; the PR is open and theirs. Re-trigger the source issue "
+            "to opt the loop back in.",
+            "review.taken_over",
             level="error",
             item=item.item_id,
             pr=state.pr_number,
-            reason=why,
+            head=head_sha,
         )
-        return True
+
+    def _hands_off_labelled(self, snap: Any) -> bool:
+        """Whether the PR carries the configured hands-off label.
+
+        The deliberate counterpart to the moved-head guard: it is the way to
+        claim a PR *before* pushing anything to it. An empty
+        ``hands_off_label`` disables this half of the check.
+        """
+        label = self.config.daemon.hands_off_label.strip().lower()
+        if not label:
+            return False
+        return label in {str(name).strip().lower() for name in getattr(snap, "labels", ()) or ()}
+
+    def _hand_off_labelled(self, item: WorkItem, state: PrState, now: float) -> None:
+        """A human has claimed the PR with the hands-off label."""
+        label = self.config.daemon.hands_off_label.strip()
+        self.dstore.mark_failed(
+            item.item_id,
+            f"PR #{state.pr_number} carries {label} — left to a human",
+            now,
+            requeue=False,
+        )
+        self._notify(
+            f"✋ {item.item_id}: PR #{state.pr_number} carries `{label}` — automatic fix "
+            "rounds stopped; the PR is open and theirs. Remove the label and re-trigger "
+            "the source issue to opt the loop back in.",
+            "review.hands_off",
+            level="error",
+            item=item.item_id,
+            pr=state.pr_number,
+            label=label,
+        )
 
     def _poll_failed(self, item: WorkItem, now: float) -> None:
         """Charge a failed poll a round, and hand the item over at the cap."""
@@ -1765,6 +1901,7 @@ class DaemonLoop:
         *,
         why: str,
         failed: Sequence[str],
+        objections: str = "",
     ) -> None:
         """Send the item back for one more round against its own PR branch.
 
@@ -1788,7 +1925,9 @@ class DaemonLoop:
                 rounds=budget,
             )
             return
-        self.dstore.queue_fix(item.item_id, fix_brief(state.pr_number, why, failed), now)
+        self.dstore.queue_fix(
+            item.item_id, fix_brief(state.pr_number, why, failed, objections=objections), now
+        )
         self._notify(
             f"🔁 {item.item_id}: PR #{state.pr_number} — {why}; fix round {spent}/{budget}",
             "review.fix_round",
@@ -1816,6 +1955,116 @@ class DaemonLoop:
             item=item.item_id,
             run=item.run_id,
         )
+
+    def _accept_merged(self, item: WorkItem, now: float, pr: int, url: str) -> None:
+        """A human merged the PR while the item was still in review.
+
+        The merge is the acceptance, and the issue settles right now —
+        through :meth:`report_merged`, not ``report_success``, whose
+        "delivered, awaiting merge" comment would be nonsense on a merged
+        PR. A failed settle leaves the row unsettled; the item is done, so
+        the merge watch retries it.
+        """
+        source: Any = self._source_for(item)
+        self.dstore.mark_done(item.item_id, now)
+        settled = (
+            source is not None
+            and hasattr(source, "report_merged")
+            and bool(source.report_merged(item, pr, url))
+        )
+        if settled:
+            self.dstore.settle_merge(item.item_id, now, merged_at=now)
+        self._notify(
+            f"✅ {item.item_id} accepted — PR #{pr} was merged; issue closed as completed",
+            "item.merged",
+            item=item.item_id,
+            run=item.run_id,
+            pr=pr,
+        )
+
+    def _reject_closed(self, item: WorkItem, now: float, pr: int, url: str) -> None:
+        """The PR was closed without merging while the item was in review:
+        a human rejected it, and no gate below can override that."""
+        source: Any = self._source_for(item)
+        if source is not None and hasattr(source, "report_pr_closed"):
+            source.report_pr_closed(item, pr, url)
+        self.dstore.mark_failed(
+            item.item_id, f"PR #{pr} was closed without being merged", now, requeue=False
+        )
+        # Settle even if the report did not land: the item is failed, so
+        # the merge watch (which only sweeps done items) would never retry
+        # this row anyway, and the log already carries the failure.
+        self.dstore.settle_merge(item.item_id, now, merged_at=None)
+        self._notify(
+            f"⚠ {item.item_id}: PR #{pr} was closed without being merged — marked failed; "
+            "the issue stays open for a human.",
+            "item.pr_rejected",
+            level="warning",
+            item=item.item_id,
+            pr=pr,
+        )
+
+    def _poll_merges(self, now: float) -> None:
+        """Settle accepted items whose PRs have since merged or been closed.
+
+        Acceptance (green CI, satisfied review) is not the end of the
+        story: the source issue closes, wearing the completed label, when
+        the PR actually lands. Same placement rationale as
+        :meth:`_poll_reviews` — GitHub reads, not engine wall clock — and
+        each PR is asked at most once per ``_MERGE_POLL_MIN_S`` because
+        merges are human-paced.
+        """
+        github: Any = next((s for s in self.sources if s.name == "github"), None)
+        if github is None or not hasattr(github, "pr_merge_state"):
+            return
+        for item_id, pr, url in self.dstore.merge_watch(now, _MERGE_POLL_MIN_S):
+            item = self.dstore.get(item_id)
+            if item is None or item.source != "github" or item.kind != "patch":
+                # Nothing to settle on GitHub (inbox work, audits): retire
+                # the row without spending a read.
+                self.dstore.settle_merge(item_id, now, merged_at=None)
+                continue
+            try:
+                merged, state = github.pr_merge_state(pr)
+            except Exception:
+                # Best-effort with no round budget: the PR is open and a
+                # human can always act, so a failed read only waits for the
+                # next interval.
+                log.warning("merge.poll_failed", item=item_id, pr=pr, exc_info=True)
+                self.dstore.touch_merge_check(item_id, now)
+                continue
+            if merged:
+                if github.report_merged(item, pr, url):
+                    self.dstore.settle_merge(item_id, now, merged_at=now)
+                    self._notify(
+                        f"🔀 {item_id}: PR #{pr} merged — closed issue "
+                        f"#{item.source_key} and labelled it "
+                        f"`{github.labels.completed}`",
+                        "item.merged",
+                        item=item_id,
+                        pr=pr,
+                    )
+                else:
+                    self.dstore.touch_merge_check(item_id, now)
+                continue
+            if state == "closed":
+                if github.report_pr_closed(item, pr, url):
+                    self.dstore.mark_failed(
+                        item_id, f"PR #{pr} was closed without being merged", now, requeue=False
+                    )
+                    self.dstore.settle_merge(item_id, now, merged_at=None)
+                    self._notify(
+                        f"⚠ {item_id}: PR #{pr} was closed without being merged — "
+                        "marked failed; the issue stays open for a human.",
+                        "item.pr_rejected",
+                        level="warning",
+                        item=item_id,
+                        pr=pr,
+                    )
+                else:
+                    self.dstore.touch_merge_check(item_id, now)
+                continue
+            self.dstore.touch_merge_check(item_id, now)
 
     def _post_review(self, item: WorkItem, run_id: str) -> SubmittedReview | None:
         """Post this run's review to the PR it reviewed, when it is one.

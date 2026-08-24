@@ -132,23 +132,6 @@ class TestChatRendering:
         )
         assert "standing guidance added" in render_to_text(rendered)
 
-    def test_verify_suspect_ruling_renders_as_warning(self) -> None:
-        # A critic ruling the check wrong (#231) is a course change, not
-        # dim lifecycle noise.
-        rendered = render_event(
-            make_event(
-                HostEventTypes.PHASE_END,
-                task_id="t1",
-                phase="scrutinize",
-                status="verify_suspect",
-                honored=True,
-                message="scrutinizer passed the work but ruled the verify command wrong: od",
-            )
-        )
-        assert rendered is not None
-        assert rendered.style == "yellow"
-        assert "ruled the verify command wrong" in render_to_text(rendered)
-
     def test_format_event_carries_chat_text(self) -> None:
         line = format_event(make_event(HostEventTypes.CHAT_MESSAGE, text="hello agent"))
         assert "chat.message" in line

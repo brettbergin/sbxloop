@@ -1,16 +1,14 @@
-"""LoopEngine: drives DECOMPOSE → (PLAN → EXECUTE → SCRUTINIZE → VERIFY →
-VALIDATE)* under budgets, with SQLite checkpointing after every transition.
+"""LoopEngine: drives DECOMPOSE → (BUILD → VERIFY)* under budgets, with
+SQLite checkpointing after every transition.
 
 Failure semantics:
 
 - Budget exhaustion (revisions/replans) fails the *task*; dependents are
   skipped and the run continues, finishing ``failed`` if any task failed.
   One exception: revisions exhausted by *verify-command* failures spend a
-  replan first when budget remains — the executor cannot edit verify
-  commands, so only a fresh plan can unstick a broken check. The faster
-  route out (#231): when the scrutinizer passes the work after a verify
-  failure and flags the *check itself* as wrong (``verify_suspect``), the
-  replan is spent immediately instead of after the revisions burn.
+  replan first when budget remains — the builder cannot edit the
+  decomposer-authored verify commands, so only a fresh session's fresh
+  approach can unstick work that disagrees with where a check looks.
 - Infrastructure errors (worker/sbx crashes) propagate after state is
   persisted — equivalent to a kill. ``resume()`` re-provisions a fresh
   sandbox pair (sandboxes are cattle; the workspace and SQLite state
@@ -49,11 +47,10 @@ from sbxloop.engine.model import (
     TaskRecord,
     TaskSpec,
     TaskState,
-    Verdict,
     artifacts_dir,
     scan_artifacts,
 )
-from sbxloop.engine.phases import VERIFY_FAILURE_PREFIX, CriticOutcome, PhaseRunner, clip
+from sbxloop.engine.phases import VERIFY_FAILURE_PREFIX, PhaseRunner, clip
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -338,6 +335,7 @@ class LoopEngine:
                     base=github_cfg.deliver_base,
                     draft=github_cfg.deliver_draft,
                     exclude=self.config.artifacts.exclude,
+                    closes=github_cfg.deliver_closes,
                 )
             except SbxloopError as exc:
                 self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=repo, error=str(exc))
@@ -863,6 +861,7 @@ class LoopEngine:
                 # new one: same branch in, same branch out.
                 branch=self.config.sandbox.continue_branch,
                 exclude=self.config.artifacts.exclude,
+                closes=gh.deliver_closes,
             )
         except SbxloopError as exc:
             # Catches the whole family the delivery path can raise — not just
@@ -909,6 +908,7 @@ class LoopEngine:
                 )
             ordered = graph.topo_order()
             self.store.save_tasks(run_id, ordered)
+            spend = phases.drain_spend()
             self.store.record_phase(
                 run_id,
                 "decompose",
@@ -917,6 +917,8 @@ class LoopEngine:
                 status="ok",
                 output_json=graph.model_dump_json(),
                 started_at=started,
+                usage=spend.usage,
+                turns=spend.turns,
             )
             tasks = self.store.get_tasks(run_id)
 
@@ -1054,20 +1056,11 @@ class LoopEngine:
         pair: SandboxPair,
         granter: EgressGranter,
     ) -> None:
-        budgets = self.config.budgets
         if task.state == "pending":
-            self._set_task_state(run_id, task, "planning")
+            self._set_task_state(run_id, task, "executing")
         self.bus.emit(
             HostEventTypes.TASK_START, run_id, task_id=task.spec.id, title=task.spec.title
         )
-        # Resume mapping: executing/scrutinizing restart at executing (the
-        # plan is persisted); a missing plan always restarts at planning.
-        if task.state in ("executing", "scrutinizing") and task.plan is None:
-            self._set_task_state(run_id, task, "planning")
-        if task.state in ("verifying", "validating") and task.plan is None:
-            self._set_task_state(run_id, task, "planning")
-        if task.state == "scrutinizing":
-            self._set_task_state(run_id, task, "executing")
 
         while not task.terminal:
             self._check_cancelled_and_clock(run_id, deadline)
@@ -1084,14 +1077,10 @@ class LoopEngine:
                 task.last_feedback = abort_reason
                 self._set_task_state(run_id, task, "failed")
                 break
-            if task.state == "planning":
-                self._phase_plan(run_id, phases, task)
-            elif task.state == "executing":
-                self._phase_execute_and_scrutinize(run_id, phases, task, granter)
+            if task.state == "executing":
+                self._phase_build(run_id, phases, task, granter)
             elif task.state == "verifying":
-                self._phase_verify(run_id, phases, task, budgets)
-            elif task.state == "validating":
-                self._phase_validate(run_id, phases, task, budgets)
+                self._phase_verify(run_id, phases, task)
             else:  # pragma: no cover - defensive
                 raise StateError(f"task {task.spec.id} in unexpected state {task.state}")
 
@@ -1106,52 +1095,21 @@ class LoopEngine:
                 self._harvest(run_id, pair)
         self._emit_task_end(run_id, task)
 
-    def _phase_plan(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
-        started = time.time()
-        plan = phases.plan(task)
-        task.plan = plan
-        # What the task will actually be executed against, as parsed data:
-        # the planner answers in JSON, so this is the only form of the plan a
-        # human ever sees.
-        self.bus.emit(
-            HostEventTypes.PHASE_PLAN,
-            run_id,
-            task_id=task.spec.id,
-            attempt=task.replans + 1,
-            message=f"{len(plan.steps)} step(s)",
-            steps=list(plan.steps),
-            expected_artifacts=list(plan.expected_artifacts),
-            verify_commands=list(plan.verify_commands),
-            egress=[{"domain": e.domain, "reason": e.reason} for e in plan.egress],
-        )
-        self.store.record_phase(
-            run_id,
-            "plan",
-            task_id=task.spec.id,
-            attempt=task.replans + 1,
-            status="ok",
-            output_json=plan.model_dump_json(),
-            started_at=started,
-        )
-        self._set_task_state(run_id, task, "executing")
-
-    def _phase_execute_and_scrutinize(
+    def _phase_build(
         self,
         run_id: str,
         phases: PhaseRunner,
         task: TaskRecord,
         granter: EgressGranter,
     ) -> None:
-        assert task.plan is not None
-        # Grant-late: plan-declared egress is applied at EXECUTE entry, not
-        # at plan time. Runs here (not in _phase_plan) so resumed tasks whose
-        # persisted state skips planning still get their grants on the
-        # freshly provisioned sandbox.
-        # The grant rewrites the shared sandbox's network policy, so lanes
-        # take it in turn rather than interleaving inside it.
+        # Grant-late: task-declared egress is applied at BUILD entry, not at
+        # decompose time, so resumed tasks get their grants on the freshly
+        # provisioned sandbox. The grant rewrites the shared sandbox's
+        # network policy, so lanes take it in turn rather than interleaving
+        # inside it.
         with self._sandbox_lock:
             granter.apply(
-                task.spec.id, [(egress.domain, egress.reason) for egress in task.plan.egress]
+                task.spec.id, [(egress.domain, egress.reason) for egress in task.spec.egress]
             )
         started = time.time()
         # A revision continues the same agent's own work on the same task, so
@@ -1162,9 +1120,8 @@ class LoopEngine:
         # fragile — it needs the session to still exist — so the report is
         # passed unconditionally rather than only as a fallback.
         resume = task.session_id if task.session_id in self._live_sessions else None
-        result = phases.execute(
+        result = phases.build(
             task,
-            task.plan,
             prior_report=self._prior_attempt_report(run_id, task),
             resume_session_id=resume,
         )
@@ -1185,144 +1142,47 @@ class LoopEngine:
         task.session_id = result.session_id
         if result.session_id:
             self._live_sessions.add(result.session_id)
-        executor_report = clip(result.output_text)
+        builder_report = clip(result.output_text)
+        spend = phases.drain_spend()
         self.store.record_phase(
             run_id,
-            "execute",
+            "build",
             task_id=task.spec.id,
             attempt=task.revisions + 1,
             status="ok",
-            output_json=json.dumps({"report": executor_report, "session_id": result.session_id}),
+            output_json=json.dumps({"report": builder_report, "session_id": result.session_id}),
             started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
         )
-        self._set_task_state(run_id, task, "scrutinizing")
-
-        started = time.time()
-        outcome = phases.scrutinize(task, task.plan, executor_report)
-        verdict = outcome.verdict
-        self.store.record_phase(
-            run_id,
-            "scrutinize",
-            task_id=task.spec.id,
-            attempt=task.revisions + 1,
-            status=verdict.verdict,
-            output_json=json.dumps(self._critic_payload(outcome)),
-            started_at=started,
-        )
-        self._emit_verdict(run_id, task, "scrutinize", verdict)
-        self._emit_critic_degraded(run_id, task, "scrutinize", outcome)
-        if self._replan_suspect_verify(run_id, task, verdict):
-            return
-        if verdict.verdict == "revise":
-            self._register_revision(run_id, task, verdict.feedback or "scrutiny found issues")
-            return
-        task.last_feedback = ""
-        self._set_task_state(run_id, task, "verifying")
-
-    def _last_verify_failure(self, run_id: str, task: TaskRecord) -> str | None:
-        """The verify feedback that triggered the revision now under review,
-        or None if that revision was not verify-triggered.
-
-        Read from the persisted verify attempt rather than
-        ``task.last_feedback``: feedback text is agent-authored (a critic's
-        ``revise`` may open with anything, including the verify-failure
-        wording), so only the phase ledger can say what actually ran. The
-        attempt numbers line up because verify runs at attempt ``revisions
-        + 1`` and a failure bumps ``revisions`` before the next execute — so
-        the last verify is the trigger iff its attempt equals the current
-        revision count. A replan resets revisions to 0, which no verify
-        attempt can match, so the old plan's failures do not carry over.
-        """
-        row = self.store.latest_phase_attempt(run_id, task.spec.id, "verify")
-        if row is None or row["status"] != "failed" or row["attempt"] != task.revisions:
-            return None
-        try:
-            feedback = json.loads(row["output_json"] or "{}").get("feedback")
-        except ValueError:
-            return None
-        return feedback if isinstance(feedback, str) else None
-
-    def _replan_suspect_verify(self, run_id: str, task: TaskRecord, verdict: Verdict) -> bool:
-        """Spend a replan now when the scrutinizer passed the work but ruled
-        the verify command itself wrong (#231). Returns True if the task was
-        sent back to planning.
-
-        Field failure r567rsm4e: a portable, runnable check asserting an
-        ``od`` column layout that never matches — correct code, wrong check,
-        130+ executor tool calls across revisions before verify exhaustion
-        finally replanned (#94). The scrutinizer is the one stage that sees
-        the failing command next to the passing code, so its ruling is the
-        earliest point the loop can act.
-
-        The ruling is only honored on a ``pass`` — a ``revise`` means the
-        work is not done either, and the executor's fix comes first — and
-        only when backed by evidence: the revision being reviewed was itself
-        triggered by a verify failure (read from the persisted verify
-        attempt, not from feedback text), so a speculative flag on a check
-        that has never run cannot cost a replan on a fine plan; and only
-        within the replan budget, since a task that has no replans left can
-        only fail bounded, not loop. Either way the ruling is put in the
-        live stream: silently ignoring a critic's finding is the
-        transcript-only failure #94 already fixed once.
-        """
-        if not verdict.verify_suspect:
-            return False
-        reason = verdict.verify_suspect_reason
-        failure = self._last_verify_failure(run_id, task)
-        budget = task.replans < self.config.budgets.max_replans_per_task
-        honored = verdict.verdict == "pass" and failure is not None and budget
-        if honored:
-            message = f"scrutinizer passed the work but ruled the verify command wrong: {reason}"
-        elif verdict.verdict != "pass":
-            message = (
-                "scrutinizer flagged the verify command as wrong but asked for "
-                f"revisions first; the work is revised before the check is judged: {reason}"
-            )
-        elif failure is None:
-            message = (
-                "scrutinizer flagged the verify command as wrong before it has "
-                f"failed; ignored until verify runs: {reason}"
-            )
-        else:
-            message = (
-                "scrutinizer flagged the verify command as wrong but no replan "
-                f"budget remains; verifying anyway: {reason}"
-            )
+        # The report excerpt is the chronology's record of what this attempt
+        # did (the builder narrates its approach in prose now that no
+        # structured plan exists); the streamed agent messages carry the
+        # detail.
+        headline = " ".join((result.output_text or "").split())
         self.bus.emit(
             HostEventTypes.PHASE_END,
             run_id,
             task_id=task.spec.id,
-            phase="scrutinize",
-            status="verify_suspect",
-            honored=honored,
-            message=message,
+            phase="build",
+            status="ok",
+            attempt=task.revisions + 1,
+            message=headline[:300] or "(builder produced no report)",
         )
-        if not honored:
-            return False
-        task.replans += 1
-        self._discard_plan(task)
-        task.last_feedback = (
-            "the reviewer judged the work correct and the verify command itself "
-            f"wrong: {reason}\n\nWrite a plan whose verify_commands check what "
-            "the task actually requires — prefer the project's test runner over "
-            "shell pipelines. The failing check was:\n\n" + (failure or "")
-        )
-        self._set_task_state(run_id, task, "planning")
-        return True
+        task.last_feedback = ""
+        self._set_task_state(run_id, task, "verifying")
 
     def _phase_verify(
         self,
         run_id: str,
         phases: PhaseRunner,
         task: TaskRecord,
-        budgets: object,
     ) -> None:
-        assert task.plan is not None
         started = time.time()
-        passed, feedback, results = phases.verify(task, task.plan)
-        # `results` (the full command transcript) is persisted so VALIDATE —
-        # including one entered on resume in a fresh process — reads its
-        # evidence from phase_attempts rather than in-memory state (#61).
+        passed, feedback, results = phases.verify(task)
+        # `results` (the full command transcript) is persisted so a resumed
+        # run — and the daemon's postmortems — read the evidence from
+        # phase_attempts rather than in-memory state (#61).
         self.store.record_phase(
             run_id,
             "verify",
@@ -1335,7 +1195,7 @@ class LoopEngine:
             started_at=started,
         )
         if passed:
-            self._set_task_state(run_id, task, "validating")
+            self._set_task_state(run_id, task, "done")
             return
         # Put the failing command in the live stream: without this the
         # transcript jumps verifying -> failed and the reason only exists
@@ -1354,132 +1214,22 @@ class LoopEngine:
         )
         self._register_revision(run_id, task, feedback, verify_failure=True)
 
-    def _phase_validate(
-        self,
-        run_id: str,
-        phases: PhaseRunner,
-        task: TaskRecord,
-        budgets: object,
-    ) -> None:
-        verify_results = self._verify_evidence(run_id, task)
-        if verify_results is None:
-            # No committed verify transcript for this task (a pre-upgrade
-            # checkpoint resumed into `validating`): VERIFY is mechanical and
-            # idempotent, so rewind and repopulate the evidence rather than
-            # asking the judge to rule without it.
-            self._set_task_state(run_id, task, "verifying")
-            return
-        started = time.time()
-        outcome = phases.validate(task, verify_results)
-        verdict = outcome.verdict
-        self.store.record_phase(
-            run_id,
-            "validate",
-            task_id=task.spec.id,
-            attempt=task.replans + 1,
-            status=verdict.verdict,
-            output_json=json.dumps(self._critic_payload(outcome)),
-            started_at=started,
-        )
-        self._emit_verdict(run_id, task, "validate", verdict)
-        self._emit_critic_degraded(run_id, task, "validate", outcome)
-        if verdict.verdict == "accept":
-            self._set_task_state(run_id, task, "done")
-            return
-        task.replans += 1
-        if task.replans > self.config.budgets.max_replans_per_task:
-            task.last_feedback = verdict.feedback
-            self._set_task_state(run_id, task, "failed")
-            return
-        task.last_feedback = verdict.feedback or "validation rejected the result"
-        self._discard_plan(task)
-        self._set_task_state(run_id, task, "planning")
-
     @staticmethod
-    def _critic_payload(outcome: CriticOutcome) -> dict[str, Any]:
-        """The phase-row payload for a critic verdict: the verdict itself
-        plus the session's tooling health and whether the guard downgraded a
-        clean verdict — degraded critic runs must be auditable after the
-        fact (#123)."""
-        payload: dict[str, Any] = outcome.verdict.model_dump()
-        if outcome.health is not None:
-            payload["tooling_health"] = outcome.health.model_dump()
-        if outcome.downgraded:
-            payload["downgraded"] = True
-        return payload
+    def _discard_session(task: TaskRecord) -> None:
+        """Throw away the current approach so BUILD starts clean.
 
-    def _emit_verdict(self, run_id: str, task: TaskRecord, phase: str, verdict: Verdict) -> None:
-        """Put a critic's ruling — and what it rested on — in the live stream.
-
-        The critics answer in JSON, so without this the reasoning behind a
-        revise/reject reaches a human nowhere: the task state says
-        ``executing`` again and the feedback only exists in the
-        ``phase_attempts`` ledger.
+        A *revision* continues the same approach, so resuming that session
+        is the whole point — it is what stops the next attempt re-deriving
+        what this one established. A *replan* (or a steer) is the opposite:
+        the approach itself was wrong, and a resumed session would carry the
+        discarded one forward as though it were still the intent. Clearing
+        the id here is what keeps those two cases apart.
         """
-        self.bus.emit(
-            HostEventTypes.PHASE_VERDICT,
-            run_id,
-            task_id=task.spec.id,
-            phase=phase,
-            verdict=verdict.verdict,
-            attempt=task.revisions + 1,
-            message=f"{phase}: {verdict.verdict}",
-            issues=[{"severity": i.severity, "detail": i.detail} for i in verdict.issues],
-            feedback=verdict.feedback,
-        )
-
-    def _emit_critic_degraded(
-        self, run_id: str, task: TaskRecord, phase: str, outcome: CriticOutcome
-    ) -> None:
-        """Put a downgrade in the live stream: without this the transcript
-        shows an ordinary revise/reject and the real reason (a critic that
-        lost its tooling) only exists in the phase_attempts table."""
-        if not outcome.downgraded:
-            return
-        assert outcome.health is not None
-        self.bus.emit(
-            HostEventTypes.PHASE_END,
-            run_id,
-            task_id=task.spec.id,
-            phase=phase,
-            status="degraded",
-            message=(
-                f"critic tooling degraded ({outcome.health.summary()}); "
-                f"its clean verdict was not trusted and was downgraded to "
-                f"{outcome.verdict.verdict!r}"
-            ),
-        )
-
-    def _verify_evidence(self, run_id: str, task: TaskRecord) -> str | None:
-        """The task's latest committed verify-command transcript, or None.
-
-        phase_attempts is the single source of truth for this evidence: a
-        resumed run's VALIDATE judges with exactly what a fresh one would.
-        """
-        output = self.store.latest_phase_output(run_id, task.spec.id, "verify")
-        if output is None:
-            return None
-        results = json.loads(output).get("results")
-        return results if isinstance(results, str) else None
-
-    @staticmethod
-    def _discard_plan(task: TaskRecord) -> None:
-        """Throw away the current approach so PLAN starts clean.
-
-        The executor's session goes with it. A *revision* continues the same
-        plan, so resuming that session is the whole point — it is what stops
-        the next attempt re-deriving what this one established. A *replan*
-        is the opposite: the approach itself was wrong, and a resumed
-        session would carry the discarded one forward as though it were
-        still the intent. Clearing the id here is what keeps those two
-        cases apart.
-        """
-        task.plan = None
         task.revisions = 0
         task.session_id = None
 
     def _prior_attempt_report(self, run_id: str, task: TaskRecord) -> str:
-        """What the previous EXECUTE attempt on this task said it did.
+        """What the previous BUILD attempt on this task said it did.
 
         Field failure (run rrhb28j7n, task t5): five executor sessions each
         ran ``uv sync --all-packages`` and the whole lint gate from scratch
@@ -1491,9 +1241,14 @@ class LoopEngine:
         findings instead of re-deriving them.
 
         Read from the store rather than kept in memory so a resumed run's
-        revision gets the same context a fresh one would.
+        revision gets the same context a fresh one would. The fallback read
+        of the legacy ``execute`` phase hands a remapped mid-flight task its
+        old report across the six-phase → three-phase upgrade; delete it
+        once no pre-upgrade runs remain resumable.
         """
-        output = self.store.latest_phase_output(run_id, task.spec.id, "execute")
+        output = self.store.latest_phase_output(
+            run_id, task.spec.id, "build"
+        ) or self.store.latest_phase_output(run_id, task.spec.id, "execute")
         if output is None:
             return ""
         report = json.loads(output).get("report")
@@ -1508,19 +1263,19 @@ class LoopEngine:
             self._set_task_state(run_id, task, "executing")
             return
         if verify_failure and task.replans < self.config.budgets.max_replans_per_task:
-            # Verify commands come from the plan and task spec; the executor
-            # cannot edit them, so no number of revisions can fix a check
-            # that disagrees with where the work landed. A fresh plan
-            # regenerates its verify_commands and can route steps to where
-            # the spec-level commands expect files.
+            # Verify commands are decomposer-authored; the builder cannot
+            # edit them, so no number of revisions inside one session can
+            # fix an approach that disagrees with where the checks look. A
+            # fresh session starts the approach over and can route the work
+            # to where the commands expect files.
             task.replans += 1
-            self._discard_plan(task)
+            self._discard_session(task)
             task.last_feedback = (
-                "every revision failed the same verify commands; write a plan "
-                "whose steps and verify_commands agree on file locations and "
-                "setup:\n\n" + feedback
+                "every revision failed the same verify commands; start over "
+                "with a fresh approach whose file layout and setup satisfy "
+                "the commands exactly as written:\n\n" + feedback
             )
-            self._set_task_state(run_id, task, "planning")
+            self._set_task_state(run_id, task, "executing")
             return
         self._set_task_state(run_id, task, "failed")
 
@@ -1571,6 +1326,7 @@ class LoopEngine:
                     attempt=self._steer_attempts,
                     exc_info=True,
                 )
+                spend = phases.drain_spend()
                 self.store.record_phase(
                     run_id,
                     "steer",
@@ -1579,6 +1335,8 @@ class LoopEngine:
                     status="error",
                     output_json=json.dumps({"message": message.text, "error": str(exc)}),
                     started_at=started,
+                    usage=spend.usage,
+                    turns=spend.turns,
                 )
                 self.bus.emit(
                     HostEventTypes.CHAT_REPLY,
@@ -1588,6 +1346,7 @@ class LoopEngine:
                 )
                 continue
             action = self._apply_steer(run_id, task, verdict, phases)
+            spend = phases.drain_spend()
             self.store.record_phase(
                 run_id,
                 "steer",
@@ -1598,6 +1357,8 @@ class LoopEngine:
                     {"message": message.text} | verdict.model_dump() | {"applied": action}
                 ),
                 started_at=started,
+                usage=spend.usage,
+                turns=spend.turns,
             )
             self.bus.emit(
                 HostEventTypes.CHAT_REPLY,
@@ -1638,18 +1399,22 @@ class LoopEngine:
             action = "steer_run"
         if action == "steer_task":
             assert task is not None
-            # User direction, not a failure: the task re-plans with the
-            # guidance as feedback, and neither budget counter is spent.
+            # User direction, not a failure: the task's build session is
+            # discarded and restarted with the guidance as feedback, and
+            # neither budget counter is spent.
             task.last_feedback = f"user steering (must be honored): {verdict.guidance}"
-            self._discard_plan(task)
-            self._set_task_state(run_id, task, "planning")
+            self._discard_session(task)
+            self._set_task_state(run_id, task, "executing")
             self.bus.emit(
                 HostEventTypes.CHAT_ACTION,
                 run_id,
                 task_id=task.spec.id,
                 action=action,
                 guidance=verdict.guidance,
-                message=f"user steering: re-planning task {task.spec.id} — {verdict.guidance}",
+                message=(
+                    f"user steering: restarting task {task.spec.id} with guidance — "
+                    f"{verdict.guidance}"
+                ),
             )
         elif action == "steer_run":
             self.store.append_run_guidance(run_id, verdict.guidance)

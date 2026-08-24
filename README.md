@@ -10,7 +10,7 @@
 sbxloop turns a large outcome ("migrate this service to async", "add coverage
 to every untested module") into a supervised agentic loop: it **decomposes**
 the outcome into a task graph, then for each task
-**plans → executes → scrutinizes → verifies → validates**, with
+**builds → verifies**, with
 revision/replan budgets, checkpointing, resume, artifact harvesting, and
 optional delivery of the results as a GitHub pull request.
 
@@ -92,25 +92,26 @@ print(result.state, result.run_id)
 
 ```
 outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
-              PLAN ─▶ EXECUTE ─▶ SCRUTINIZE ─▶ VERIFY ─▶ VALIDATE ─▶ done
-                        ▲             │revise            │fail        │reject
-                        └─────────────┴──────────────────┘            │
-                        └── replan ◀──────────────────────────────────┘
+              BUILD ─▶ VERIFY ─▶ done
+                ▲        │fail (≤ revisions: same session resumes;
+                └────────┘        exhausted: fresh session, one replan)
 ```
 
-- **Plan** — produces the task's approach, its `verify_commands`, and
-  (optionally) declared network egress needs (see
+- **Decompose** — produces the task DAG, and with it every task's
+  `verify_commands` (the whole mechanical exam — the builder cannot edit
+  them) and any declared network egress needs (see
   [Network egress](#network-egress-least-privilege-by-plan)).
-- **Execute** — the Copilot agent session does the work in the sandbox
-  workspace.
-- **Scrutinize** — a fresh, read-only critic session reviews the diff and
-  artifacts. The read-only barrier is allowlist + default-deny: critic
-  sessions may only use known-read capabilities, so an SDK change can never
-  silently hand a critic write access to the workspace it reviews.
+- **Build** — one Copilot agent session plans and does the work in the
+  sandbox workspace, narrating its approach first. A revision resumes the
+  same session; a replan (or a chat steer) starts a fresh one.
 - **Verify** — mechanical: the task's `verify_commands` must exit 0, run from
   the workspace root. No LLM. The full command transcript is persisted with
   the attempt, so a resumed run judges with the real evidence.
-- **Validate** — a fresh read-only session judges the acceptance criteria.
+
+There is no in-run critic: the per-task review stages audited task
+completion and rubber-stamped it while diff-level defects leaked to the PR.
+Adversarial review lives in the daemon's post-delivery review lane, which
+sees the whole diff and drives bounded fix rounds on the delivered PR.
 
 **Budgets, not vibes.** Revisions, replans, task count, and wall clock are all
 bounded (`[budgets]` in config; defaults: 2 revisions and 1 replan per task,
@@ -118,8 +119,8 @@ bounded (`[budgets]` in config; defaults: 2 revisions and 1 replan per task,
 its dependents are skipped and the run continues, finishing `failed` if any
 task failed. One deliberate exception: when revisions are exhausted by
 *verify-command* failures, the task spends a replan first when budget
-remains — the executor cannot edit verify commands, so only a fresh plan can
-unstick a broken check.
+remains — the builder cannot edit verify commands, so only a fresh session's
+fresh approach can unstick work that disagrees with where a check looks.
 
 **Checkpointing and resume.** State is committed to SQLite after every
 transition. `sbxloop resume <run>` re-provisions a fresh sandbox pair and
@@ -165,20 +166,21 @@ the apt mirrors, and the supported languages' package registries (issue
 [#141](https://github.com/brettbergin/sbxloop/issues/141) — no language's
 build should fail for a reason another language's build never encounters).
 Well-known registries outside that set are one notch narrower: not reachable
-by default, but a plan may declare them in `egress` with no configuration,
-and every grant lands in the audit log. Anything else the PLAN phase
+by default, but the decomposer may declare them per task in `egress` with no
+configuration,
+and every grant lands in the audit log. Anything else the decomposer
 declares — each domain with a justification — is validated against
 operator-set bounds:
 
 ```toml
 # sbxloop.toml
 [policy]
-allow = ["nexus.corp.example.com"]  # what plans MAY request
+allow = ["nexus.corp.example.com"]  # what tasks MAY request
 deny  = []                          # never grantable, even if allowed
 ```
 
 Patterns are exact domains, `*.example.com` wildcards, or `*`. Empty `allow`
-(the default) means plans may only use the baseline and the well-known
+(the default) means tasks may only use the baseline and the well-known
 registries. `deny` wins over everything, including the always-reachable
 baseline: a denied registry is never seeded into the sandbox in the first
 place. In-bounds grants are
@@ -192,7 +194,7 @@ sbxloop logs <run> --type policy.   # who asked for what, and what was granted
 sbxloop config policy               # the effective per-phase policy
 ```
 
-Out-of-bounds requests fail plan validation with a remediation hint. Static
+Out-of-bounds requests fail graph validation with a remediation hint. Static
 extras that every run should have go in `[sandbox] extra_allow_domains`.
 
 ### Chatting with a running loop
@@ -204,10 +206,11 @@ inspect the workspace. The reply lands in the transcript, and the agent decides
 what your message means for the work:
 
 - **continue** — a question or status check; it answers and carries on.
-- **steer task** — the current task is re-planned immediately with your guidance
-  as feedback (user direction spends no revision/replan budget).
+- **steer task** — the current task's build session is discarded and restarted
+  immediately with your guidance as feedback (user direction spends no
+  revision/replan budget).
 - **steer run** — your guidance becomes a standing instruction injected into
-  every later planning/execution prompt, persisted so `sbxloop resume` keeps it.
+  every later build prompt, persisted so `sbxloop resume` keeps it.
 
 Messages queue while a phase is in flight (the status panel shows them), every
 chat turn is a persisted event (`sbxloop logs <run> --type chat.`), and
@@ -246,13 +249,16 @@ work came from, and keeps going. Two work sources, usable together:
   repo being worked on) carrying the trigger label (`sbxloop:run` by
   default). The daemon claims the issue (label swap + comment), runs it with
   reporting and delivery forced on (PRs arrive as **drafts** by default),
-  and on success comments the summary + PR link and **closes** the issue —
-  the PR is now the reviewable object. Failures retry with backoff, then
-  land in `sbxloop:failed` with re-trigger instructions. For a tracker whose
-  issues are design items rather than tasks, `close_on_success = false` in
-  `[daemon]` leaves the issue open with `sbxloop:delivered` for the human
-  who merges the PR, and `tracking_issue = false` skips the per-run tracking
-  issue (the summary comment on the source issue carries the same info).
+  and on success comments the summary + PR link and adds
+  `sbxloop:delivered`. The issue settles when the PR **merges**: the daemon
+  watches the delivered PR, and on merge closes the issue and swaps in
+  `sbxloop:completed` (the PR body also carries `Closes #N`, so GitHub
+  links the pair and closes the issue even when the daemon is down). A PR
+  closed without merging marks the item failed and leaves the issue open.
+  Run failures retry with backoff, then land in `sbxloop:failed` with
+  re-trigger instructions. `tracking_issue = false` in `[daemon]` skips the
+  per-run tracking issue (the summary comment on the source issue carries
+  the same info).
 - **Inbox files**: drop a `.md` (first `# heading` = title) into
   `<inbox>/pending/`; it moves through `running/` to `done/` or `failed/`
   with a `<name>.result.md` beside it.
@@ -300,7 +306,7 @@ Two more things close the loop. Every PR the daemon delivers gets a
 **review audit** (`[daemon] review_deliveries`): a fresh run reads the source
 issue and the diff as a skeptical maintainer and files defects, missing
 tests and scope drift as backlog issues — sbxloop evaluating the code
-sbxloop wrote. And findings *about the tool itself* — the planner wrote a
+sbxloop wrote. And findings *about the tool itself* — the decomposer wrote a
 bad verify command, a prompt misled the agent, delivery mishandled a case —
 are never dumped on the project's tracker: the audit contract routes them
 to `.sbxloop/backlog/tool/`, and `[daemon] tool_repo = "brettbergin/sbxloop"`
@@ -308,13 +314,13 @@ files them upstream (unset: they are noted in the closing comment only).
 
 **A PR the loop no longer owns is handed over.** A fix round clones the PR's
 branch and force-updates it, so a commit someone else pushed there would be
-replaced. The daemon therefore records the head sha of every PR it delivers,
-and checks it first on every review poll: a head it did not produce means a
-human has been working the branch, and `[daemon] hands_off_label`
-(`sbxloop:hands-off`, empty disables) on the PR says the same thing
-deliberately. Either way the loop is done with that PR — no fix round, no
-further delivery to its branch — the item is failed without requeue, a `✋`
-notification goes out, and the PR is left open for a human to finish.
+replaced. The daemon therefore baselines the head its own delivery produced
+and, on the next review poll that sees a head it did not deliver, stops.
+`[daemon] hands_off_label` (`sbxloop:hands-off`, empty disables) on the PR
+says the same thing deliberately, before anyone has pushed anything. Either
+way the item is failed without requeue at that poll, a `✋` notification goes
+out, and the PR is left open for a human to finish; re-triggering the source
+issue opts the loop back in.
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
 daemon owns, so the host still never holds the PAT. Runs are one at a time;
@@ -329,7 +335,8 @@ error); `sbxloop daemon abandon <item> [--reason …]` gives one up (a live
 daemon cancels its in-flight run and tells the issue/inbox file — the report
 is owed on the row and paid by the next tick or the next daemon start, once);
 `sbxloop daemon retry <item>` re-queues an abandoned or cancelled item with attempts
-reset and a **fresh plan** — not a resume of the plan that failed; and
+reset and a **fresh build session** — not a resume of the approach that
+failed; and
 `sbxloop daemon requeue <item>` drops a running item's pinned run so its
 next dispatch starts over (attempts and backoff kept). The same controls are
 `!sbx items|abandon|retry|requeue` on Discord.
@@ -370,15 +377,16 @@ tool call, `sbx` invocation and poll. See
 
 #### Working a design tracker
 
-The daemon's defaults are task-queue semantics: a delivered run closes the
-source issue (the PR is the reviewable object) and opens a per-run tracking
-issue. When the repository's issues are design discussions rather than a
-queue of chores, flip both knobs:
+A source issue always settles on **merge**, not on delivery: at acceptance
+the daemon comments the run summary and PR link, removes
+`sbxloop:in-progress`, and adds `sbxloop:delivered`; when the PR merges it
+closes the issue (`state_reason: completed`) and swaps `sbxloop:delivered`
+for `sbxloop:completed`. A PR closed without merging marks the item failed
+(`sbxloop:failed`) and leaves the issue open for the human to re-trigger or
+close. (`close_on_success`, which used to close the issue at acceptance, is
+now a deprecated no-op.) For a tracker whose issues are design discussions
+rather than a queue of chores:
 
-- `[daemon] close_on_success` (default `true`) — with `false` the daemon
-  comments on the source issue with the run summary and the PR link, removes
-  `sbxloop:in-progress`, adds `sbxloop:delivered`, and leaves the issue open
-  so the human who merges the PR decides when the discussion is settled.
 - `[daemon] tracking_issue` (default `true`) — with `false` no per-run
   tracking issue is opened; the summary comment on the source issue is the
   record, so the design thread stays in one place.
@@ -386,7 +394,6 @@ queue of chores, flip both knobs:
 ```toml
 [daemon]
 deliver_draft = true          # PRs arrive as drafts for review
-close_on_success = false      # leave the design issue open for the human
 tracking_issue = false        # the summary comment is the record
 workspace_isolation = "clone" # never touch the runner's checkout
 refresh_workspace = true      # fast-forward it before each fresh run
@@ -403,10 +410,8 @@ messages as Markdown with persona attribution, split at paragraph and
 code-fence boundaries instead of clipped — their **narration only**, never the
 JSON payload a structured phase returns; what that payload *decided* is posted
 in its own words instead: the task roster (`🧩 3 task(s)`, re-announced with
-persisted state on resume), each task's plan (numbered steps, expected
-artifacts, verify commands, egress grants) and every critic verdict
-(`♻ scrutinize: revise`, its issues by severity, the feedback quoted as the
-executor will receive it); each burst of tool calls
+persisted state on resume) — while the builder narrates its approach in
+prose, and each attempt closes with a `🔨 build` report-excerpt line; each burst of tool calls
 digested into **one line edited in place** (`⚙ 23 tool calls (bash x21, view x2) — last: pytest -q`, with a "may be stuck" nudge when the last
 calls are near-identical) — failed calls still get their own detail
 block, and `chronology_level = "verbose"` streams every call batched into
@@ -420,8 +425,13 @@ refused egress called out; and a finished report card (the headline turns
 shape — `🔎 audit #701 filed for charter flakes · audit: flakes`,
 `🔎 review #801 filed for PR #9 · gh:4`, `🔎 post-mortem #901 filed for gh:4 · abandoned: …`, `✅ gh:9 done (2/2 tasks done) · filed #50` — with every
 issue number a link. Mentions are always disabled, so model output can never ping the
-channel. `[discord] embeds`, `status_line`, `tool_batch_lines` and
-`chronology_level` tune it. **@mention the bot in a run's thread to steer that run**
+channel. `[discord] embeds`, `status_line`, `tool_batch_lines`,
+`tool_output_lines` (tail output lines echoed for a *successful* call,
+default `0` = none) and `tool_fail_output_lines` (head+tail lines echoed for a
+*failed* call, default `20` — a watcher needs the stderr) tune it, along with
+`chronology_level`. Excerpts are line-clipped, body-capped and clamped to
+Discord's 2000-character message limit, with any elision marked
+`… N lines elided …`. **@mention the bot in a run's thread to steer that run**
 (or reply to one of its messages there) — the same rule the control channel
 uses, so people can talk about a run in its own thread without derailing it.
 Your message is
@@ -484,12 +494,6 @@ above `DEBUG`/`INFO`/`WARNING`/`ERROR`, and `grep` is a plain
 case-insensitive substring — never a regular expression, so no pattern from
 chat can wedge the daemon. The result is clipped to
 `[concierge] max_tool_result_chars` like every other tool result.
-Ask "how is PR #41 doing?" and `pr_status(number)` answers with the CI check
-runs ("3 checks passed, 1 failed (test (3.13) — url)"), the review decision
-and reviewers, whether GitHub calls it mergeable, and whether the branch is
-behind its base — a PR that does not exist is answered plainly, and the
-result is clipped like every other tool result. It is read-only: the
-concierge never merges a PR from chat.
 Say "tell me when r7… is done" (a run id or a work item id) and `watch_run`
 registers your interest: it confirms, and when that run lands the daemon
 posts in the control channel @mentioning you with the outcome — final
@@ -706,7 +710,7 @@ release and the uv-managed Python 3.13 are both GitHub release assets
 (`github.com`, redirecting to `release-assets.githubusercontent.com`), and
 both hosts are in the agent sandbox's provisioning-time allowlist. The rest
 fetch from a vendor or registry, and
-**provisioning runs before the PLAN phase**, so a plan's `egress` declaration
+**provisioning runs before any task**, so a task's `egress` declaration
 is too late to help it. Until those domains are part of the provisioning
 baseline, allow them explicitly:
 
@@ -846,7 +850,7 @@ came from. The notable knobs:
 | `[sandbox] workspace_isolation`        | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                 |
 | `[sandbox] extra_allow_domains`        | `[]`               | Static egress allows applied to every run.                                                              |
 | `[sandbox] languages`                  | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                              |
-| `[policy] allow` / `deny`              | `[]`               | Bounds for plan-declared egress.                                                                        |
+| `[policy] allow` / `deny`              | `[]`               | Bounds for task-declared egress.                                                                        |
 | `[github] repo` / `report` / `deliver` | unset / `false`    | The GitHub integration gate and toggles.                                                                |
 | `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
 | `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
@@ -876,7 +880,7 @@ The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
 | `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
 | `[daemon] max_runs_per_day` | `12` | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there. |
 | `[daemon] run_cap_timezone` | `UTC` | IANA timezone defining the run cap's day boundary (also used by the per-day review and post-mortem caps). |
-| `[daemon] hands_off_label` | `sbxloop:hands-off` | Label on a delivered PR that hands it to a human: no fix round, no further delivery to its branch (empty disables). |
+| `[daemon] hands_off_label` | `sbxloop:hands-off` | Label on a delivered PR that hands it to a human at the next review poll: no fix round, no further delivery to its branch (empty disables). |
 | `[daemon] run_stale_after_s` | `21600` | With no run executing, non-terminal runs idle this long are reconciled to a terminal state (`0` disables). |
 
 ## Repository layout

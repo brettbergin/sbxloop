@@ -94,10 +94,6 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     item_id    TEXT PRIMARY KEY,
     pr_number  INTEGER NOT NULL,
     branch     TEXT NOT NULL DEFAULT '',
-    -- The head sha the loop itself last delivered to that branch. A head
-    -- that has moved since means someone else has been working in there,
-    -- and a fix round would force-update over their commits.
-    head_sha   TEXT NOT NULL DEFAULT '',
     rounds     INTEGER NOT NULL DEFAULT 0,
     -- Whether the review that was actually posted can hold the merge; a
     -- COMMENT cannot, and waiting for an approval nobody can give strands
@@ -112,7 +108,22 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     review_ref TEXT,
     -- What the next fix round is for; NULL when no round is queued.
     fix_brief  TEXT,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    -- Where the PR lives, so post-acceptance notices need not re-mine the
+    -- run's event stream for it.
+    pr_url     TEXT NOT NULL DEFAULT '',
+    -- The merge watch: acceptance is not the end of the story — the source
+    -- issue settles (close + completed label) only when the PR merges.
+    -- `settled` is 0 until the merge (or an unmerged close) has been seen
+    -- AND reported to the source, so a restart resumes the watch.
+    merged_at  REAL,
+    settled    INTEGER NOT NULL DEFAULT 0,
+    last_merge_check REAL NOT NULL DEFAULT 0,
+    -- The PR branch's head as of our own last delivery, observed on the
+    -- first poll after it. A later head that differs was pushed by someone
+    -- else: the PR has been taken over, and a fix round force-updating it
+    -- would silently replace their work (#412).
+    delivered_head TEXT
 );
 
 CREATE TABLE IF NOT EXISTS daemon_audits (
@@ -170,10 +181,35 @@ _MIGRATIONS = (
         "ALTER TABLE daemon_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0",
     ),
     ("daemon_pr_state", "verdict", "ALTER TABLE daemon_pr_state ADD COLUMN verdict TEXT"),
+    # The merge watch. `settled` defaults to 0 so rows from before the
+    # column — accepted items whose PRs merged with no one watching — are
+    # swept retroactively at the next tick.
     (
         "daemon_pr_state",
-        "head_sha",
-        "ALTER TABLE daemon_pr_state ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''",
+        "pr_url",
+        "ALTER TABLE daemon_pr_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "daemon_pr_state",
+        "merged_at",
+        "ALTER TABLE daemon_pr_state ADD COLUMN merged_at REAL",
+    ),
+    (
+        "daemon_pr_state",
+        "settled",
+        "ALTER TABLE daemon_pr_state ADD COLUMN settled INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "daemon_pr_state",
+        "last_merge_check",
+        "ALTER TABLE daemon_pr_state ADD COLUMN last_merge_check REAL NOT NULL DEFAULT 0",
+    ),
+    # The takeover guard (#412): rows from before the column re-baseline on
+    # their next poll, exactly like a fresh delivery.
+    (
+        "daemon_pr_state",
+        "delivered_head",
+        "ALTER TABLE daemon_pr_state ADD COLUMN delivered_head TEXT",
     ),
 )
 
@@ -190,8 +226,14 @@ class PrState(NamedTuple):
     fix_brief: str | None
     # What our own review asked for, when one has been posted.
     verdict: str | None = None
-    # The head sha this loop last delivered to ``branch``.
-    head_sha: str = ""
+    pr_url: str = ""
+    # The merge watch: set once the merge (or unmerged close) has been seen
+    # and reported to the source.
+    settled: bool = False
+    merged_at: float | None = None
+    # The branch head as of our own last delivery (#412); None until the
+    # first poll after a delivery observes it.
+    delivered_head: str | None = None
 
     @property
     def review_in_flight(self) -> bool:
@@ -818,42 +860,23 @@ class DaemonStore:
     # -- PR acceptance state ---------------------------------------------------
 
     def record_delivery(
-        self,
-        item_id: str,
-        pr_number: int,
-        branch: str,
-        now: float,
-        *,
-        head_sha: str = "",
+        self, item_id: str, pr_number: int, branch: str, now: float, *, url: str = ""
     ) -> None:
         """This item delivered ``pr_number``; start tracking its acceptance.
 
         Idempotent on the item: a re-delivery of the same PR (a fix round
         pushing to the same branch) must not reset the round count, which is
-        the only thing bounding the loop. The delivered head sha *is*
-        overwritten on redelivery — it is the new baseline for noticing a
-        head someone else has moved.
+        the only thing bounding the loop. It does re-arm the merge watch —
+        a fresh delivery means there is a PR to watch again.
         """
         with self._lock:
             self._conn.execute(
-                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, head_sha, updated_at) "
+                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, updated_at, pr_url) "
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
                 "pr_number = excluded.pr_number, branch = excluded.branch, "
-                "head_sha = excluded.head_sha, updated_at = excluded.updated_at",
-                (item_id, pr_number, branch, head_sha, now),
-            )
-            self._conn.commit()
-
-    def record_head(self, item_id: str, head_sha: str) -> None:
-        """Adopt ``head_sha`` as the baseline for this item's PR.
-
-        Touches nothing else: used for a PR delivered before the sha was
-        recorded, so the moved-head check has something to compare against.
-        """
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET head_sha = ? WHERE item_id = ?",
-                (head_sha, item_id),
+                "updated_at = excluded.updated_at, pr_url = excluded.pr_url, "
+                "settled = 0, merged_at = NULL, delivered_head = NULL",
+                (item_id, pr_number, branch, now, url),
             )
             self._conn.commit()
 
@@ -873,8 +896,60 @@ class DaemonStore:
             review_ref=row["review_ref"],
             fix_brief=row["fix_brief"],
             verdict=row["verdict"],
-            head_sha=str(row["head_sha"] or ""),
+            pr_url=str(row["pr_url"] or ""),
+            settled=bool(row["settled"]),
+            merged_at=row["merged_at"],
+            delivered_head=row["delivered_head"],
         )
+
+    def merge_watch(self, now: float, min_interval_s: float) -> list[tuple[str, int, str]]:
+        """(item_id, pr_number, pr_url) for every accepted-but-unsettled PR
+        due another merge check.
+
+        Joined on ``state = 'done'``: an item still reviewing is the
+        acceptance gate's to advance, and a failed/abandoned one has been
+        handed to a human — neither should cost a GitHub read here.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT p.item_id, p.pr_number, p.pr_url FROM daemon_pr_state p "
+                "JOIN daemon_work_items w ON w.item_id = p.item_id "
+                "WHERE p.settled = 0 AND w.state = 'done' AND p.last_merge_check <= ? "
+                "ORDER BY p.updated_at ASC",
+                (now - min_interval_s,),
+            ).fetchall()
+        return [(str(r["item_id"]), int(r["pr_number"]), str(r["pr_url"] or "")) for r in rows]
+
+    def settle_merge(self, item_id: str, now: float, *, merged_at: float | None) -> None:
+        """The PR's fate has been seen and reported: merged (``merged_at``
+        set) or closed without merging. Either way the watch is over."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET settled = 1, merged_at = ?, "
+                "last_merge_check = ?, updated_at = ? WHERE item_id = ?",
+                (merged_at, now, now, item_id),
+            )
+            self._conn.commit()
+
+    def touch_merge_check(self, item_id: str, now: float) -> None:
+        """One merge check spent; the next is not due for another interval."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET last_merge_check = ? WHERE item_id = ?",
+                (now, item_id),
+            )
+            self._conn.commit()
+
+    def set_delivered_head(self, item_id: str, sha: str) -> None:
+        """Record the PR branch head our own delivery produced, as observed
+        on the first poll after it. A later, different head means someone
+        else pushed — the takeover guard's baseline (#412)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET delivered_head = ? WHERE item_id = ?",
+                (sha, item_id),
+            )
+            self._conn.commit()
 
     def review_in_flight(self, item_id: str, review_ref: str | None) -> None:
         """Record the review charter now running for this PR, or None when

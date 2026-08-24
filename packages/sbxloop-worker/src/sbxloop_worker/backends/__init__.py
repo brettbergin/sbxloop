@@ -25,6 +25,7 @@ class BackendResult:
     output_json: dict[str, Any] | list[Any] | None = None
     session_id: str | None = None
     usage: Usage | None = None
+    turns: int | None = None
     health: SessionHealth | None = None
     artifacts: list[str] = field(default_factory=list)
 

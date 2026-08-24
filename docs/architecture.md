@@ -110,11 +110,7 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
   run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads and
   issue triage (file, list, comment, label for a run, close) through the ops
-  box, `pr_status` — a read-only PR health read served through the same
-  github-ops box via `GithubOps.raw` (`GET /repos/{repo}/pulls/{n}`,
-  `/commits/{sha}/check-runs`, `/pulls/{n}/reviews`) for check runs, review
-  decision, mergeability and behind-ness, with **no merge or write path** —
-  and `daemon_log` over the process's own recent log lines — relayed as
+  box, and `daemon_log` over the process's own recent log lines — relayed as
   `agent.tool_request` events and answered
   by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
   polls for. It is **kept across daemon restarts** when the installed worker
@@ -144,40 +140,40 @@ every failure degrades to "could not reach PyPI" rather than raising.
 
 ```
 outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
-             PLAN ─▶ EXECUTE ─▶ SCRUTINIZE ─▶ VERIFY ─▶ VALIDATE ─▶ done
-                       ▲            │revise            │fail        │reject
-                       └────────────┴──────────────────┘            ▼
-                       PLAN ◀── (plan cleared, revisions reset) ─ replan
+             BUILD ─▶ VERIFY ─▶ done
+               ▲        │fail (≤ max_revisions: same session resumes)
+               └────────┘
+               ▲ (revisions exhausted by verify: fresh session, one replan)
 ```
 
 - **DECOMPOSE** — one agent session turns the outcome into a validated task
-  DAG (unique ids, resolvable deps, acyclic; `max_tasks` budget).
-- **PLAN** — fresh session produces steps, expected artifacts, and
-  verify commands for one task.
-- **EXECUTE** — full tool access, does the work in the run workspace. The
-  one phase that *continues* rather than starting fresh: a revision resumes
-  the previous attempt's session where the SDK still has it, and is handed
-  that attempt's report either way, so it builds on what was already
-  established instead of re-deriving it. A replan clears the session — the
-  approach it holds was the one thrown away.
-- **SCRUTINIZE** — a fresh session in the *same sandbox* with **read-only
-  permissions** reviews the work against plan + acceptance criteria, with
-  evidence gathered mechanically (`git status`, `git diff HEAD`). Fresh
-  session: no anchoring to the executor's claims. Read-only: the critic
-  cannot "fix" things. Same sandbox: the workspace under review is
-  preserved. The diff is handed over in full (clipped head+tail at
-  `DIFF_CLIP`) rather than as a `--stat` summary: a critic that has to
-  rediscover the change by opening files spends turns, and turns are what a
-  run is billed and timed by.
-- **VERIFY** — mechanical: the union of task and plan `verify_commands` must
-  all exit 0. No LLM.
-- **VALIDATE** — fresh read-only session judges each acceptance criterion.
+  DAG (unique ids, resolvable deps, acyclic; `max_tasks` budget). It
+  authors every task's `verify_commands` — the whole mechanical exam, which
+  the builder cannot edit (#94: the agent that does the work must not
+  author its own exam) — and any per-task `egress` declarations, both
+  checked at JSON acceptance.
+- **BUILD** — full tool access, plans and does the work in one session,
+  narrating its approach first. The one phase that *continues* rather than
+  starting fresh: a revision resumes the previous attempt's session where
+  the SDK still has it, and is handed that attempt's report either way, so
+  it builds on what was already established instead of re-deriving it. A
+  replan (or a chat steer) clears the session — the approach it holds was
+  the one thrown away.
+- **VERIFY** — mechanical: the task's decomposer-authored `verify_commands`
+  must all exit 0. No LLM.
 
-Failures loop with budgets: scrutiny revisions and verify failures re-EXECUTE
-with feedback (`max_revisions_per_task`); validation rejections re-PLAN with
-the plan cleared (`max_replans_per_task`). Exhaustion fails the task, skips
-its dependents, and finishes the run `failed`. A wall-clock budget bounds the
-whole run.
+There is no in-run critic. The former SCRUTINIZE/VALIDATE stages audited
+task completion and rubber-stamped it (6/6 pass, 5/5 accept in the measured
+baseline) while diff-level defects — races, failure ordering, unguarded
+parses — leaked to the PR. Adversarial review lives in the daemon's
+post-delivery review lane, which sees the whole diff and drives bounded fix
+rounds on the delivered PR.
+
+Failures loop with budgets: verify failures re-BUILD with the failure
+transcript as feedback (`max_revisions_per_task`); exhausting revisions on
+verify failures spends a replan (`max_replans_per_task`) and restarts with a
+fresh session. Exhaustion fails the task, skips its dependents, and finishes
+the run `failed`. A wall-clock budget bounds the whole run.
 
 Structured JSON phases are validated against pydantic models with one retry
 that feeds the validation error back to the agent.
@@ -187,17 +183,29 @@ that feeds the validation error back to the agent.
 A run's spend and its wall clock are both governed by **turns**, not jobs.
 Every turn re-sends the whole session context, and field measurement (run
 `rews3ssdn`: 272 turns across 25 jobs) put ~22k tokens of fixed context on
-every one of them — roughly 62% of the run's input spend, against a phase
-prompt under 2k. Wall clock tracked the same count at ~10s/turn. Two knobs
-follow from that:
+every one of them, against a phase prompt under 2k. Wall clock tracked the
+same turn count at ~10s/turn.
 
-- `[budgets] trim_system_message` (default **off**) drops the agent SDK's
-  system-message sections a phase cannot act on (`PHASE_DROP_SECTIONS` in
-  `sbxloop.engine.phases`), so they are not re-sent every turn. Only
-  `code_change_rules`, and only from the phases that write no code. Off until
-  a real run says whether that 22k is billed or cached, and whether the SDK
-  accepts the `customize` config shape — a rejection fails every agent job,
-  and the deploy health check would not catch it because it starts no run.
+That fixed context is, however, overwhelmingly **cached**, not re-billed:
+run `rrhb28j7n` shows `cache_read_tokens` is a subset of `input_tokens` —
+turn 0 writes ~20k and turn 1 reads exactly that back — and 86.5% of the
+run's input tokens (3,615,785 / 4,180,827) are cache reads: executor 91.7%,
+planner 83.3%, validator 82.4%, scrutinizer 79.1%, decomposer 68.5%. The
+earlier "62% of spend" figure was 62% of *tokens*, and those tokens bill at
+cache-read rates. Trimming the static prefix therefore has little to win and
+would invalidate the cache; the knob that did it is gone.
+
+The same run also settles what `AssistantUsageData.cost` is *not*: it reports
+the same constant (15.0) on every turn of every session, so it is not a
+per-turn delta and summing it fabricates a figure. `Usage.merged` therefore
+carries it last-wins rather than additively. Its unit is unknown — a constant
+per turn reads far more like a premium-request multiplier or a quota unit than
+a currency amount — so it must not be rendered as currency; `run_usage` and
+`usage_today` report "cost: not reported by the agent backend" until the unit
+is established.
+
+One knob remains:
+
 - `[budgets] max_parallel_tasks` runs independent tasks concurrently. The
   task DAG already knows which tasks are independent; above 1 they share one
   agent sandbox and one workspace, so raising it is safe only for outcomes
@@ -214,9 +222,9 @@ and the registry tiers (`$baseline_registries`, `$declarable_registries`) are
 injected from `policy.py` rather than written into the files. The flip side is
 that a bare `$` anywhere else — a shell `$PID` in an example — breaks rendering
 (a literal dollar is `$$`), and `tests/unit/test_prompts.py` pins further
-section-level rules: plan.md's environment opener must stay language-neutral,
-every ecosystem's notes must keep their markers, and the response-format section
-must come last. Each template opens with an HTML comment stating its own
+section-level rules: build.md's environment notes and decompose.md's
+verify-authoring rules must keep their field-regression markers, and every
+ecosystem's notes must keep theirs. Each template opens with an HTML comment stating its own
 contract (variables, escaping, which test guards which section); `render` strips
 that header before the prompt reaches the model, so it costs no tokens and
 cannot be mistaken for instructions.
@@ -288,32 +296,39 @@ day boundary. Operator strings name both the day and the zone
 A delivered PR sits in `reviewing` and is advanced by exactly one step per
 poll. The gates are ordered by what they cost:
 
-| state                        | action           |
-| ---------------------------- | ---------------- |
-| head moved / hands-off label | hand over (free) |
-| checks pending               | wait (free)      |
-| checks red                   | fix round        |
-| green, review in flight      | wait             |
-| green, changes requested     | fix round        |
-| green, not yet reviewed      | file a review    |
-| green, review satisfied      | accept           |
+| state                        | action                      |
+| ---------------------------- | --------------------------- |
+| merged                       | accept and settle the issue |
+| closed without merge         | mark failed                 |
+| hands-off label / head moved | hand over (free)            |
+| checks pending               | wait (free)                 |
+| checks red                   | fix round                   |
+| green, review in flight      | wait                        |
+| green, changes requested     | fix round                   |
+| green, not yet reviewed      | file a review               |
+| green, review satisfied      | accept                      |
 
-CI comes before a review because it is GitHub's compute and costs nothing:
-a red PR never spends a review run on work that has to change anyway.
+The PR's own fate outranks every gate: a human merging it *is* the
+acceptance, and a human closing it unmerged is a rejection no review can
+override. Below that, CI comes before a review because it is GitHub's
+compute and costs nothing: a red PR never spends a review run on work that
+has to change anyway.
 
-The **hand-off gate is first** for a different reason. It is free — the head
-sha and the labels both come out of the single `pr_state` read the poll
-already makes — and it is the only gate that protects work the loop did not
-do. Every fix round clones the PR's branch and force-updates the ref (that
-is what makes a round update the PR instead of opening a second one), so a
-commit someone else pushed would be silently replaced. The loop records the
-head sha of every delivery in `daemon_pr_state`; a head it did not produce,
-or `[daemon] hands_off_label` on the PR, means someone else has taken the PR
+The **hand-off gate sits above the rest** for a different reason. It is free
+— the head sha and the labels both come out of the single `pr_state` read
+the poll already makes — and it is the only gate that protects work the loop
+did not do. Every fix round clones the PR's branch and force-updates the ref
+(that is what makes a round update the PR instead of opening a second one),
+so a commit someone else pushed would be silently replaced. The first poll
+after a delivery baselines the head that delivery produced in
+`daemon_pr_state.delivered_head`; a later head that differs, or
+`[daemon] hands_off_label` on the PR, means someone else has taken the PR
 over. The item is failed without requeue, a `✋` notification is sent, and
 the PR is left open for a human — no fix round, no further delivery to that
-branch. A stored sha of `''` (an old row, or a delivery that could not read
-the sha) adopts what the first poll observes as its baseline rather than
-guessing at a hand-off.
+branch, until the source issue is re-triggered. The window is not zero: the
+check runs at poll time, so a push that lands after the poll that queued a
+fix round but before that round delivers is still overwritten; the guard
+notices it at the next poll.
 
 ## Events
 
@@ -334,6 +349,62 @@ agent's reply did not — they exist so a surface can show the decision without
 showing the agent's JSON, which is what the Discord bridge does.
 
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
+
+### Tool calls in a run thread
+
+A watcher reads a run thread to see what the agents are *executing*, so tool
+calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
+`sbxloop.daemon.discord_format`):
+
+- **Informative truncation.** A command is rendered by
+  `cmdfmt.format_command`: whitespace collapses, the boilerplate
+  `cd <absolute run path> &&` prefix — identical on every call in a run, and
+  the thing naive middle-elision spends the whole budget on — collapses to
+  `cd $RUN &&`, and if the line is still over `COMMAND_DISPLAY_CLIP` (160
+  characters, a named default a caller may override) the *longest argument
+  tokens* are elided one at a time. The leading verb therefore always
+  survives, and any token that lost characters carries a literal `…`, so a
+  token in the output is never a silently truncated one. This is display-only:
+  the stored event keeps the full command, so `run_events`, `sbxloop logs` and
+  resume are unaffected.
+- **One entry per call.** `ToolBatcher` records `agent.tool_start` as pending
+  and emits nothing; the single line is written when `agent.tool_end` arrives:
+  `$ bash  cd $RUN && uv run mypy  ✓ 1.5s` or `✗ exit 1 · 1.5s`. Correlation is
+  by `tool_call_id`, never by comparing command text, so parallel calls
+  completing out of order still carry their own command. An end with no
+  matching start renders from its own `args` (falling back to the oldest
+  in-flight start for that tool, for workers predating `tool_call_id`). A
+  start still in flight survives routine flushes — its one line lands on
+  completion — and only the run-end `flush(final=True)` renders leftovers as
+  `… running`, so a mid-run flush (a failed sibling, the coalesce timer)
+  cannot print the same call twice.
+- **Bounded output excerpts.** `output_excerpt` gives a completed call a
+  header (✓/✗ plus exit status) and a fenced head+tail excerpt of its output,
+  with any elision marked `… N lines elided …` counted from the event's
+  `output_lines`. A failure gets the larger budget and prefers `error`
+  (stderr); a success is quiet by default, because the batched line already
+  reports it. The caps are named constants — `TOOL_OUTPUT_LINES_DEFAULT` (0),
+  `TOOL_FAIL_OUTPUT_LINES_DEFAULT` (20), `TOOL_EXCERPT_LINE_CLIP` (300
+  chars/line), `TOOL_EXCERPT_MAX_CHARS` (1200) — with the two line budgets
+  configurable as `[discord] tool_output_lines` / `tool_fail_output_lines`.
+  The finished message is additionally clamped to `DISCORD_MAX_MESSAGE`, so no
+  input can overflow Discord's limit.
+- **Redaction at the render seam.** The worker already redacts an event's
+  output before it leaves the sandbox; because this feature *publishes* more
+  of what a command printed, every rendered command and every excerpt passes
+  through `sbxloop.log.redact_text` again on the way to a thread. It is
+  idempotent, so text already masked upstream is unchanged. The credential
+  vocabulary is deliberately spelled twice — `sbxloop_worker.secrets` (worker
+  side; the worker cannot import sbxloop) and `sbxloop.log` (host side) — and
+  the two word lists differ slightly, so a word added to one should be
+  weighed for the other. Both anchor the word to whole `_`/`.`/`-`-delimited
+  name segments, so `PATH=`, `--patch`, `compat=1` or a pytest `tokens: 5`
+  line are never masked.
+- **Additive schema.** `tool_call_id`, `output_lines` and `duration_ms` on
+  `agent.tool_end` are optional; nothing was removed or renamed. Consumers
+  tolerate their absence, so an older worker's chronology renders (without
+  duration or elision counts) and no migration of existing chronologies is
+  required.
 
 ## Logging
 

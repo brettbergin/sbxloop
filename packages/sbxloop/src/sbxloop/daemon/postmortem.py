@@ -55,15 +55,11 @@ def _run_section(store: StateStore, run_id: str) -> list[str]:
             f"### Task `{spec.id}` — {spec.title} — **{task.state}** "
             f"(revisions {task.revisions}, replans {task.replans})"
         )
-        if task.plan is not None:
-            if task.plan.steps:
-                out.append("Plan steps:")
-                out.extend(f"- {step}" for step in task.plan.steps[:12])
-            if task.plan.verify_commands:
-                out.append("Verify commands (as run, under `sh -c`):")
-                out.append("```sh")
-                out.extend(task.plan.verify_commands)
-                out.append("```")
+        if spec.verify_commands:
+            out.append("Verify commands (decomposer-authored, run under `sh -c`):")
+            out.append("```sh")
+            out.extend(spec.verify_commands)
+            out.append("```")
         if task.last_feedback:
             out.append("Last feedback:")
             out.append("```text")

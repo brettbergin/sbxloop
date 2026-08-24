@@ -16,7 +16,6 @@ from pathlib import Path
 
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
-    PlanModel,
     RunRecord,
     RunState,
     TaskRecord,
@@ -24,7 +23,15 @@ from sbxloop.engine.model import (
     TaskState,
 )
 from sbxloop.errors import StateError
-from sbxloop_worker.protocol import Event
+from sbxloop_worker.protocol import Event, Usage
+
+# Task states written by the six-phase pipeline (pre-BUILD), remapped at
+# read time so mid-flight runs resume across the upgrade. See get_tasks.
+_LEGACY_TASK_STATES: dict[str, TaskState] = {
+    "planning": "executing",
+    "scrutinizing": "verifying",
+    "validating": "verifying",
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -62,7 +69,13 @@ CREATE TABLE IF NOT EXISTS phase_attempts (
     status     TEXT NOT NULL,
     output_json TEXT,
     started_at REAL NOT NULL,
-    ended_at   REAL NOT NULL
+    ended_at   REAL NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    cost       REAL,
+    turns      INTEGER
 );
 CREATE TABLE IF NOT EXISTS events (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,18 +88,34 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id, seq);
 """
 
-# Columns added after 0.2.0; applied idempotently so existing state
-# databases upgrade in place on open.
-_RUNS_MIGRATIONS = (
-    ("workspace", "ALTER TABLE runs ADD COLUMN workspace TEXT"),
-    ("mounted", "ALTER TABLE runs ADD COLUMN mounted INTEGER NOT NULL DEFAULT 0"),
-    ("kept_reason", "ALTER TABLE runs ADD COLUMN kept_reason TEXT"),
-    ("reason", "ALTER TABLE runs ADD COLUMN reason TEXT"),
-    (
-        "user_guidance",
-        "ALTER TABLE runs ADD COLUMN user_guidance TEXT NOT NULL DEFAULT '[]'",
+# Columns added after 0.2.0; applied idempotently per table so existing
+# state databases upgrade in place on open.
+_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "runs": (
+        ("workspace", "ALTER TABLE runs ADD COLUMN workspace TEXT"),
+        ("mounted", "ALTER TABLE runs ADD COLUMN mounted INTEGER NOT NULL DEFAULT 0"),
+        ("kept_reason", "ALTER TABLE runs ADD COLUMN kept_reason TEXT"),
+        ("reason", "ALTER TABLE runs ADD COLUMN reason TEXT"),
+        (
+            "user_guidance",
+            "ALTER TABLE runs ADD COLUMN user_guidance TEXT NOT NULL DEFAULT '[]'",
+        ),
     ),
-)
+    "phase_attempts": (
+        ("input_tokens", "ALTER TABLE phase_attempts ADD COLUMN input_tokens INTEGER"),
+        ("output_tokens", "ALTER TABLE phase_attempts ADD COLUMN output_tokens INTEGER"),
+        (
+            "cache_read_tokens",
+            "ALTER TABLE phase_attempts ADD COLUMN cache_read_tokens INTEGER",
+        ),
+        (
+            "cache_write_tokens",
+            "ALTER TABLE phase_attempts ADD COLUMN cache_write_tokens INTEGER",
+        ),
+        ("cost", "ALTER TABLE phase_attempts ADD COLUMN cost REAL"),
+        ("turns", "ALTER TABLE phase_attempts ADD COLUMN turns INTEGER"),
+    ),
+}
 
 
 class StateStore:
@@ -104,10 +133,11 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
-        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")}
-        for column, ddl in _RUNS_MIGRATIONS:
-            if column not in existing:
-                self._conn.execute(ddl)
+        for table, migrations in _MIGRATIONS.items():
+            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            for column, ddl in migrations:
+                if column not in existing:
+                    self._conn.execute(ddl)
         self._conn.commit()
 
     def close(self) -> None:
@@ -268,11 +298,10 @@ class StateStore:
     def update_task(self, run_id: str, task: TaskRecord) -> None:
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE tasks SET state = ?, plan_json = ?, revisions = ?, replans = ?,"
+                "UPDATE tasks SET state = ?, revisions = ?, replans = ?,"
                 " last_feedback = ?, session_id = ? WHERE run_id = ? AND task_id = ?",
                 (
                     task.state,
-                    task.plan.model_dump_json() if task.plan else None,
                     task.revisions,
                     task.replans,
                     task.last_feedback,
@@ -291,7 +320,15 @@ class StateStore:
         ).fetchall()
         records: list[TaskRecord] = []
         for row in rows:
-            state: TaskState = row["state"]
+            # Rows persisted by the six-phase pipeline are remapped onto the
+            # live vocabulary before pydantic sees them, extending the old
+            # resume-rewind precedent: `planning` never committed work, so
+            # BUILD starts fresh; `scrutinizing` is only set after the
+            # execute report committed, so idempotent mechanical VERIFY is
+            # the cheaper re-entry (a failure re-enters BUILD normally);
+            # `validating` re-derives its verify evidence the same way.
+            # plan_json is ignored — the column stays, unread and unwritten.
+            state: TaskState = _LEGACY_TASK_STATES.get(row["state"], row["state"])
             records.append(
                 TaskRecord(
                     spec=TaskSpec.model_validate_json(row["spec_json"]),
@@ -300,11 +337,6 @@ class StateStore:
                     replans=row["replans"],
                     last_feedback=row["last_feedback"],
                     session_id=row["session_id"],
-                    plan=(
-                        PlanModel.model_validate_json(row["plan_json"])
-                        if row["plan_json"]
-                        else None
-                    ),
                 )
             )
         return records
@@ -321,13 +353,32 @@ class StateStore:
         status: str,
         output_json: str | None,
         started_at: float,
+        usage: Usage | None = None,
+        turns: int | None = None,
     ) -> None:
+        u = usage or Usage()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO phase_attempts"
-                " (run_id, task_id, phase, attempt, status, output_json, started_at, ended_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, task_id, phase, attempt, status, output_json, started_at, time.time()),
+                " (run_id, task_id, phase, attempt, status, output_json, started_at, ended_at,"
+                "  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, turns)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    task_id,
+                    phase,
+                    attempt,
+                    status,
+                    output_json,
+                    started_at,
+                    time.time(),
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_tokens,
+                    u.cache_write_tokens,
+                    u.cost,
+                    turns,
+                ),
             )
             self._conn.commit()
 

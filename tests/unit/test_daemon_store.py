@@ -354,59 +354,70 @@ class TestOperatorControls:
         assert store.requeue("gh:7", now=5.0).pending_report is None
 
 
-class TestDeliveredHeadSha:
-    """The head sha the loop last delivered is what lets a later poll notice
-    that someone else has pushed to the PR branch."""
+class TestMergeWatchRows:
+    """The merge watch's bookkeeping: which rows are due, and what settles
+    them. The rows are the restart story — no memory is involved."""
 
-    def test_migration_adds_column_to_existing_database(self, tmp_path: Path) -> None:
-        import sqlite3
-
-        path = tmp_path / "old.db"
-        conn = sqlite3.connect(path)
-        conn.execute(
-            "CREATE TABLE daemon_pr_state ("
-            " item_id TEXT PRIMARY KEY, pr_number INTEGER NOT NULL,"
-            " branch TEXT NOT NULL DEFAULT '', rounds INTEGER NOT NULL DEFAULT 0,"
-            " gates INTEGER NOT NULL DEFAULT 0, reviewed INTEGER NOT NULL DEFAULT 0,"
-            " review_ref TEXT, fix_brief TEXT, updated_at REAL NOT NULL DEFAULT 0)"
-        )
-        conn.execute(
-            "INSERT INTO daemon_pr_state (item_id, pr_number, branch) VALUES (?, ?, ?)",
-            ("gh:7", 406, "sbxloop/old"),
-        )
-        conn.commit()
-        conn.close()
-
-        store = DaemonStore(path)
-        cols = {r[1] for r in store._conn.execute("PRAGMA table_info(daemon_pr_state)").fetchall()}
-        assert "head_sha" in cols
-        state = store.pr_state("gh:7")
-        assert state is not None and state.head_sha == ""
-        assert state.pr_number == 406 and state.branch == "sbxloop/old"
-
-    def test_round_trips_through_record_delivery(self, tmp_path: Path) -> None:
+    def _armed(self, tmp_path: Path) -> DaemonStore:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.record_delivery("gh:7", 406, "sbxloop/b", 2.0, head_sha="abc123")
-        state = store.pr_state("gh:7")
-        assert state is not None and state.head_sha == "abc123"
+        store.mark_done("gh:7", now=2.0)
+        store.record_delivery("gh:7", 9, "sbxloop/r1", 2.0, url="https://x/pull/9")
+        return store
 
-    def test_record_head_overwrites_only_the_sha(self, tmp_path: Path) -> None:
+    def test_record_delivery_stores_the_url_and_rearms_the_watch(self, tmp_path: Path) -> None:
+        store = self._armed(tmp_path)
+        state = store.pr_state("gh:7")
+        assert state is not None and state.pr_url == "https://x/pull/9"
+        assert not state.settled and state.merged_at is None
+        store.settle_merge("gh:7", 3.0, merged_at=3.0)
+        # A re-delivery (fix round) means there is a PR to watch again.
+        store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
+        state = store.pr_state("gh:7")
+        assert state is not None and not state.settled and state.merged_at is None
+
+    def test_delivered_head_baselines_and_redelivery_clears_it(self, tmp_path: Path) -> None:
+        """#412: the takeover guard's baseline. A fresh delivery (a fix
+        round) moves the branch itself, so it must clear the old head or the
+        guard would read the daemon's own push as a takeover."""
+        store = self._armed(tmp_path)
+        assert store.pr_state("gh:7").delivered_head is None  # type: ignore[union-attr]
+        store.set_delivered_head("gh:7", "abc123")
+        assert store.pr_state("gh:7").delivered_head == "abc123"  # type: ignore[union-attr]
+        store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
+        assert store.pr_state("gh:7").delivered_head is None  # type: ignore[union-attr]
+
+    def test_merge_watch_returns_only_done_unsettled_due_rows(self, tmp_path: Path) -> None:
+        store = self._armed(tmp_path)
+        assert store.merge_watch(1000.0, 300.0) == [("gh:7", 9, "https://x/pull/9")]
+        # Throttled: a fresh check pushes it past the interval.
+        store.touch_merge_check("gh:7", 1000.0)
+        assert store.merge_watch(1200.0, 300.0) == []
+        assert store.merge_watch(1301.0, 300.0) != []
+        # Settled rows never come back.
+        store.settle_merge("gh:7", 1400.0, merged_at=1400.0)
+        assert store.merge_watch(9999.0, 300.0) == []
+        state = store.pr_state("gh:7")
+        assert state is not None and state.settled and state.merged_at == 1400.0
+
+    def test_merge_watch_skips_items_not_done(self, tmp_path: Path) -> None:
+        """A reviewing item is the acceptance gate's to advance, and a
+        failed one has been handed to a human — neither costs a read."""
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.record_delivery("gh:7", 406, "sbxloop/b", 2.0)
-        assert store.pr_state("gh:7").head_sha == ""  # type: ignore[union-attr]
-        store.record_head("gh:7", "deadbeef")
-        state = store.pr_state("gh:7")
-        assert state is not None
-        assert state.head_sha == "deadbeef"
-        assert state.pr_number == 406 and state.branch == "sbxloop/b" and state.rounds == 0
+        store.record_delivery("gh:7", 9, "b", 1.0, url="u")
+        store.mark_reviewing("gh:7", now=2.0)
+        assert store.merge_watch(1000.0, 300.0) == []
+        store.mark_failed("gh:7", "boom", 3.0, requeue=False)
+        assert store.merge_watch(1000.0, 300.0) == []
+        store.set_state("gh:7", "done", 4.0)
+        assert store.merge_watch(1000.0, 300.0) == [("gh:7", 9, "u")]
 
-    def test_redelivery_updates_sha_but_preserves_rounds(self, tmp_path: Path) -> None:
-        store = DaemonStore(tmp_path / "state.db")
-        store.upsert_new(item(), now=1.0)
-        store.record_delivery("gh:7", 406, "sbxloop/b", 2.0, head_sha="aaa")
-        assert store.bump_pr_round("gh:7") == 1
-        store.record_delivery("gh:7", 406, "sbxloop/b", 3.0, head_sha="bbb")
-        state = store.pr_state("gh:7")
-        assert state is not None and state.head_sha == "bbb" and state.rounds == 1
+    def test_pre_migration_rows_are_swept_retroactively(self, tmp_path: Path) -> None:
+        """settled defaults to 0, so rows from before the columns existed —
+        accepted items whose PRs merged with nobody watching — come due on
+        the first tick after the upgrade. Opening the store twice also
+        proves the migrations are idempotent."""
+        self._armed(tmp_path)
+        again = DaemonStore(tmp_path / "state.db")
+        assert again.merge_watch(1000.0, 300.0) == [("gh:7", 9, "https://x/pull/9")]

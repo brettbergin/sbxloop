@@ -160,6 +160,7 @@ def deliver_workspace(
     draft: bool = False,
     exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES,
     branch: str | None = None,
+    closes: int | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
@@ -167,6 +168,10 @@ def deliver_workspace(
     pull request it was fixing: the refs POST 422s on the existing branch and
     force-updates it, and the PR create 422s on the existing head and reuses
     the open PR (see the module notes).
+
+    ``closes`` is the issue this delivery resolves; it becomes a
+    ``Closes #N`` line in the PR body, so GitHub links issue and PR and
+    closes the issue on merge on its own.
     """
     plan: DeliveryPlan | None = None
     if not _is_checkout_root(source_dir):
@@ -252,7 +257,7 @@ def deliver_workspace(
             base=base,
             head=branch,
             title=_title(outcome),
-            body=_body(run_id, outcome, plan),
+            body=_body(run_id, outcome, plan, closes=closes),
             draft=draft,
         )
     except GithubOpsError as exc:
@@ -474,7 +479,7 @@ def _title(outcome: str) -> str:
     return title if len(title) <= TITLE_CLIP else title[: TITLE_CLIP - 1] + "…"
 
 
-def _body(run_id: str, outcome: str, plan: DeliveryPlan) -> str:
+def _body(run_id: str, outcome: str, plan: DeliveryPlan, *, closes: int | None = None) -> str:
     listed = plan.lines[:BODY_FILE_LIST_CAP]
     if plan.count > BODY_FILE_LIST_CAP:
         listed.append(f"- … +{plan.count - BODY_FILE_LIST_CAP} more")
@@ -488,4 +493,6 @@ def _body(run_id: str, outcome: str, plan: DeliveryPlan) -> str:
         body += f"\n**Not delivered:** {plan.excluded_note}\n"
     if plan.note:
         body += f"\n_{plan.note}_\n"
+    if closes is not None:
+        body += f"\nCloses #{closes}\n"
     return body

@@ -1336,14 +1336,14 @@ def config_policy() -> None:
     table = Table(title="agent sandbox: effective egress per phase")
     table.add_column("phase", no_wrap=True)
     table.add_column("policy", overflow="fold")
-    table.add_row("decompose / plan", "baseline")
+    table.add_row("decompose", "baseline")
     table.add_row(
-        "execute",
-        "baseline + plan-declared grants (auto-granted just before execute, "
+        "build",
+        "baseline + task-declared grants (auto-granted just before build, "
         "within the [policy] bounds below; every grant/refusal is event-logged)",
     )
     table.add_row(
-        "scrutinize / verify / validate",
+        "verify",
         "baseline + grants already made — sbx has no policy revocation, so "
         "grants persist for the sandbox's lifetime (sandboxes are removed at "
         "run end; grants never outlive a run)",
@@ -1360,20 +1360,20 @@ def config_policy() -> None:
         )
     )
 
-    bounds = Table(title="[policy] bounds for plan-declared grants")
+    bounds = Table(title="[policy] bounds for task-declared grants")
     bounds.add_column("bound", no_wrap=True)
     bounds.add_column("patterns", overflow="fold")
     bounds.add_row(
         "allow",
         ", ".join(config.policy.allow)
-        or "(empty — plans may only use the baseline and well-known registries)",
+        or "(empty — tasks may only use the baseline and well-known registries)",
     )
     bounds.add_row("deny", ", ".join(config.policy.deny) or "(none)")
     console.print(bounds)
 
     if config.github.enabled:
         gh_domains = ", ".join([*GITHUB_ALLOW_DOMAINS, *extra])
-        console.print(f"github sandbox (all phases, no plan grants): {gh_domains}")
+        console.print(f"github sandbox (all phases, no task grants): {gh_domains}")
     console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
 
 
@@ -1540,8 +1540,9 @@ def daemon(
             config.daemon.in_progress_label,
             config.daemon.failed_label,
             config.daemon.backlog_label,
-            config.daemon.delivered_label,
-            config.daemon.audit_label,
+            delivered=config.daemon.delivered_label,
+            audit=config.daemon.audit_label,
+            completed=config.daemon.completed_label,
         )
         sources.append(
             GitHubIssueSource(
@@ -2151,6 +2152,7 @@ mem_abort = 0.0
 # failed_label = "sbxloop:failed"
 # backlog_label = "sbxloop:backlog"
 # delivered_label = "sbxloop:delivered"
+# completed_label = "sbxloop:completed"  # applied when the work lands (PR merged / audit closed)
 # audit_label = "sbxloop:audit"    # discovery lane: investigate, file findings, no PR
 # postmortems = true             # file a post-mortem audit when a patch item fails
 # postmortems_per_day = 3
@@ -2158,12 +2160,11 @@ mem_abort = 0.0
 # review_deliveries = true       # audit each PR the loop delivers (defects → backlog)
 # tool_repo = "brettbergin/sbxloop"  # findings ABOUT sbxloop go here, never to the project
 # audit_dir = ".github/sbxloop/audits"
-# What a delivered run does to the tracker. Defaults are task-queue
-# semantics: close the source issue (the PR is the reviewable object) and
-# open a per-run tracking issue. For a design/discussion tracker set both
-# false: the source issue gets the summary + delivered_label and stays open
-# until a human merges the PR, and no extra tracking issue is opened.
-# close_on_success = true         # false leaves the issue open for a human to close on merge
+# A delivered patch item settles its source issue when the PR MERGES: at
+# acceptance the issue gets the summary + delivered_label and stays open;
+# on merge the daemon closes it and swaps in completed_label. A PR closed
+# without merging marks the item failed instead.
+# close_on_success = true         # deprecated no-op: issues now close on merge, not acceptance
 # tracking_issue = true           # false skips the per-run tracking issue
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
@@ -2212,6 +2213,8 @@ mem_abort = 0.0
 # embeds = true                    # headline / finished / status as embed cards
 # status_line = true               # one per-run message edited as tasks progress
 # tool_batch_lines = 8             # verbose: consecutive tool calls per code block
+# tool_output_lines = 0            # tail output lines echoed for a successful call (0 = none)
+# tool_fail_output_lines = 20      # head+tail output lines echoed for a failed call
 
 [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask

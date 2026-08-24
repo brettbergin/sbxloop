@@ -1,9 +1,11 @@
 """End-to-end LoopEngine tests: fake sbx + real worker + scripted echo backend.
 
-Every agent phase consumes the next scripted echo response in order, so a
-whole run is scripted as a list. Shell jobs (evidence gathering, verify
-commands) run for real inside the fake sandbox fs and do not consume script
-entries.
+Every agent phase (decompose, build, steer) consumes the next scripted echo
+response in order, so a whole run is scripted as a list — one BUILD entry per
+task attempt. Shell jobs (the mechanical verify commands) run for real inside
+the fake sandbox fs and consume no script entries: a failing verify is
+scripted by giving the task a failing command, and a revision loop by a
+command that only passes once a later BUILD writes the file it looks for.
 """
 
 from __future__ import annotations
@@ -35,8 +37,13 @@ def taskgraph(*tasks: dict[str, Any]) -> dict[str, Any]:
     return {"json": {"tasks": list(tasks)}}
 
 
-def task(id: str, deps: list[str] | None = None, verify: list[str] | None = None) -> dict[str, Any]:
-    return {
+def task(
+    id: str,
+    deps: list[str] | None = None,
+    verify: list[str] | None = None,
+    egress: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {
         "id": id,
         "title": f"Task {id}",
         "description": f"description of {id}",
@@ -44,23 +51,20 @@ def task(id: str, deps: list[str] | None = None, verify: list[str] | None = None
         "acceptance_criteria": [f"{id} works"],
         "verify_commands": verify if verify is not None else ["true"],
     }
+    if egress is not None:
+        spec["egress"] = egress
+    return spec
 
 
-PLAN = {"json": {"steps": ["do the work"], "expected_artifacts": [], "verify_commands": []}}
-EXECUTE = {"text": "work complete, files changed"}
-PASS = {"json": {"verdict": "pass"}}
-REVISE = {"json": {"verdict": "revise", "feedback": "missed an edge case"}}
-PASS_SUSPECT = {
-    "json": {
-        "verdict": "pass",
-        "verify_suspect": True,
-        "verify_suspect_reason": "greps for an od column layout od never prints",
-    }
-}
-ACCEPT = {"json": {"verdict": "accept"}}
-REJECT = {"json": {"verdict": "reject", "feedback": "criterion 1 unmet"}}
+# BUILD plans and executes in one session and reports in prose (expect=text),
+# so one scripted entry covers one whole task attempt.
+BUILD = {"text": "work complete, files changed"}
 
-HAPPY_TASK = [PLAN, EXECUTE, PASS, ACCEPT]
+HAPPY_TASK = [BUILD]
+
+# Budgets that make the first verify failure terminal: no revisions, no
+# replans — the shortest scriptable path to a failed task.
+NO_RETRY_BUDGETS = {"max_revisions_per_task": 0, "max_replans_per_task": 0}
 
 
 class Harness:
@@ -119,6 +123,12 @@ class Harness:
         boxes = self.fake_sbx.state / "sandboxes"
         return sorted(p.name for p in boxes.iterdir()) if boxes.is_dir() else []
 
+    def agent_jobs(self, run_id: str) -> list[dict[str, Any]]:
+        """Every job request the agent sandbox received (keep_sandboxes runs
+        only — teardown removes the fs the job files live in)."""
+        fs = self.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent")
+        return [json.loads(p.read_text()) for p in (fs / "home/agent/.sbxloop/jobs").iterdir()]
+
 
 @pytest.fixture
 def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
@@ -161,25 +171,15 @@ class TestHappyPath:
         assert roster == [("t1", "pending"), ("t2", "pending")]
 
     def test_structured_phases_emit_what_they_decided(self, harness: Harness) -> None:
-        """The plan, the roster and the critics' rulings reach the bus as
-        parsed data. Their agents answer in JSON, so a surface that does not
-        show raw JSON (Discord) has no other way to say what was decided."""
+        """The roster reaches the bus as parsed data, and each build's report
+        excerpt rides on its phase.end. The decomposer answers in JSON and
+        the builder narrates in prose, so a surface that does not show raw
+        JSON (Discord) has no other way to say what was decided or done."""
         harness.script(
             [
                 taskgraph(task("t1"), task("t2", deps=["t1"])),
-                {
-                    "json": {
-                        "steps": ["write it", "test it"],
-                        "expected_artifacts": ["out.txt"],
-                        "verify_commands": ["true"],
-                    }
-                },
-                EXECUTE,
-                REVISE,
-                EXECUTE,
-                PASS,
-                ACCEPT,
-                *HAPPY_TASK,
+                {"text": "wrote it\nand tested it"},
+                BUILD,
             ]
         )
         result = harness.engine().start("build the feature")
@@ -192,35 +192,30 @@ class TestHappyPath:
         ]
         assert roster.data["tasks"][1]["depends_on"] == ["t1"]
 
-        plans = [e for e in harness.events if e.type == HostEventTypes.PHASE_PLAN]
-        assert plans[0].data["task_id"] == "t1"
-        assert plans[0].data["steps"] == ["write it", "test it"]
-        assert plans[0].data["expected_artifacts"] == ["out.txt"]
-        assert plans[0].data["verify_commands"] == ["true"]
-        assert plans[0].data["attempt"] == 1
-
-        verdicts = [
-            (e.data["phase"], e.data["verdict"], e.data["feedback"])
+        builds = [
+            e
             for e in harness.events
-            if e.type == HostEventTypes.PHASE_VERDICT and e.data["task_id"] == "t1"
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "build"
         ]
-        assert verdicts == [
-            ("scrutinize", "revise", "missed an edge case"),
-            ("scrutinize", "pass", ""),
-            ("validate", "accept", ""),
+        assert [(e.data["task_id"], e.data["status"], e.data["attempt"]) for e in builds] == [
+            ("t1", "ok", 1),
+            ("t2", "ok", 1),
         ]
+        # The excerpt is whitespace-collapsed prose, not the raw report.
+        assert builds[0].data["message"] == "wrote it and tested it"
+        assert builds[1].data["message"] == "work complete, files changed"
 
     def test_roster_is_re_announced_with_persisted_state_on_resume(self, harness: Harness) -> None:
         """A resumed run gets a fresh thread, so the roster is re-announced —
         carrying the state each task was left in, not a fresh 'pending'."""
-        harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), PLAN, {"fail": "boom"}])
+        harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), {"fail": "boom"}])
         engine = harness.engine()
         with pytest.raises(WorkerError, match="boom"):
             engine.start("crashy run")
         run_id = engine.store.list_runs()[0].run_id
 
         mark = len(harness.events)
-        harness.script([EXECUTE, PASS, ACCEPT, *HAPPY_TASK])
+        harness.script([*HAPPY_TASK, *HAPPY_TASK])
         assert harness.engine().resume(run_id).succeeded
         (roster,) = [e for e in harness.events[mark:] if e.type == HostEventTypes.RUN_TASKS]
         assert [(t["id"], t["state"]) for t in roster.data["tasks"]] == [
@@ -230,23 +225,20 @@ class TestHappyPath:
 
     def test_agent_messages_carry_phase_persona(self, harness: Harness) -> None:
         """Every agent.message names the persona that produced it, so the
-        transcript header says WHO responded (planner, executor, ...), not a
+        transcript header says WHO responded (decomposer, builder), not a
         generic "agent". Echo only emits agent.message for entries with
-        "text", so give each scripted phase reply some."""
+        "text", so give the decomposer's scripted reply some."""
         harness.script(
             [
                 {**taskgraph(task("t1")), "text": "breaking it down"},
-                {**PLAN, "text": "here is my plan"},
-                EXECUTE,
-                {**PASS, "text": "work checks out"},
-                {**ACCEPT, "text": "criteria met"},
+                BUILD,
             ]
         )
         result = harness.engine().start("build the feature")
 
         assert result.succeeded
         speakers = [e.data.get("agent") for e in harness.events if e.type == "agent.message"]
-        assert speakers == ["decomposer", "planner", "executor", "scrutinizer", "validator"]
+        assert speakers == ["decomposer", "builder"]
 
     def test_default_run_is_github_less(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
@@ -295,50 +287,78 @@ class TestHappyPath:
         engine = harness.engine()
         result = engine.start("record phases")
         phases = [row["phase"] for row in engine.store.phase_attempts(result.run_id)]
-        assert phases == ["decompose", "plan", "execute", "scrutinize", "verify", "validate"]
+        assert phases == ["decompose", "build", "verify"]
+
+    def test_phase_attempts_carry_usage(self, harness: Harness) -> None:
+        """Every agent phase row bills its session's tokens and turns; the
+        mechanical verify row stays NULL."""
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine()
+        result = engine.start("bill phases")
+        rows = {row["phase"]: row for row in engine.store.phase_attempts(result.run_id)}
+        for phase in ("decompose", "build"):
+            assert rows[phase]["input_tokens"] is not None, phase
+            assert rows[phase]["turns"] == 1, phase
+        assert rows["verify"]["input_tokens"] is None
+        assert rows["verify"]["turns"] is None
 
 
 class TestReviseAndVerify:
-    def test_scrutinize_revise_then_pass(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, REVISE, EXECUTE, PASS, ACCEPT])
+    def test_verify_failure_revises_then_passes(self, harness: Harness) -> None:
+        # The revision loop is verify-driven now: the first attempt leaves
+        # the checked file unwritten, verify fails, and the revision (same
+        # session, feedback in hand) produces it.
+        harness.script(
+            [
+                taskgraph(task("t1", verify=["test -f done.txt"])),
+                BUILD,
+                {"text": "wrote done.txt this time", "files": {"done.txt": "ok\n"}},
+            ]
+        )
         result = harness.engine().start("revise once")
         assert result.state == "completed"
         assert result.tasks[0].revisions == 1
+        assert result.tasks[0].replans == 0
 
-    def test_verify_exhaustion_spends_replan_with_fresh_plan(self, harness: Harness) -> None:
-        # Field failure (rv4zfdb1m): the executor cannot edit verify_commands,
-        # so a plan whose commands disagree with where the work landed burned
-        # every revision and killed the task. Exhaustion from verify failures
-        # must replan — a fresh plan regenerates the commands.
-        bad_plan = {
-            "json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": ["exit 1"]}
-        }
+    def test_verify_exhaustion_spends_replan_with_fresh_session(self, harness: Harness) -> None:
+        # Field failure (rv4zfdb1m): the builder cannot edit the
+        # decomposer-authored verify_commands, so an approach that disagrees
+        # with where the checks look burned every revision and killed the
+        # task. Exhaustion from verify failures must discard the session and
+        # start over — a fresh approach can route the work to where the
+        # commands expect files.
         harness.script(
             [
-                taskgraph(task("t1")),
-                bad_plan,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS,  # revisions exhausted -> replan instead of failed
-                PLAN,  # fresh plan drops the broken command
-                EXECUTE,
-                PASS,
-                ACCEPT,
+                taskgraph(task("t1", verify=["test -f done.txt"])),
+                BUILD,
+                BUILD,
+                BUILD,  # revisions exhausted -> replan with a fresh session
+                {"text": "fresh approach, wrote done.txt", "files": {"done.txt": "ok\n"}},
             ]
         )
-        result = harness.engine().start("verify unsticks via replan")
+        engine = harness.engine(keep_sandboxes=True)
+        result = engine.start("verify unsticks via fresh session")
         assert result.state == "completed"
         assert result.tasks[0].state == "done"
         assert result.tasks[0].replans == 1
+        # revisions were reset when the session was discarded, and the fresh
+        # attempt passed first try
+        assert result.tasks[0].revisions == 0
+
+        jobs = [j for j in harness.agent_jobs(result.run_id) if j.get("kind") == "agent.session"]
+        # The two in-budget revisions continued their own session; nothing
+        # else did (decompose is always fresh, and so is the replan build).
+        assert len([j for j in jobs if j.get("resume_session_id")]) == 2
+        (fresh,) = [
+            j for j in jobs if "start over with a fresh approach" in (j.get("prompt") or "")
+        ]
+        assert fresh.get("resume_session_id") is None
 
     def test_verify_failure_exhausts_revisions_and_replans(self, harness: Harness) -> None:
-        # A spec-level verify command no plan can fix: revisions burn, one
-        # replan burns, then the task fails — the loop is bounded.
-        cycle = [EXECUTE, PASS, EXECUTE, PASS, EXECUTE, PASS]
-        harness.script([taskgraph(task("t1", verify=["exit 1"])), PLAN, *cycle, PLAN, *cycle])
+        # A verify command no attempt can satisfy: revisions burn, one
+        # fresh-session replan burns, then the task fails — the loop is
+        # bounded.
+        harness.script([taskgraph(task("t1", verify=["false"])), *([BUILD] * 6)])
         result = harness.engine().start("verify never passes")
         assert result.state == "failed"
         assert result.tasks[0].state == "failed"
@@ -347,305 +367,39 @@ class TestReviseAndVerify:
         assert "verify command failed" in result.tasks[0].last_feedback
 
     def test_verify_exhaustion_without_replan_budget_fails(self, harness: Harness) -> None:
-        harness.script(
-            [
-                taskgraph(task("t1", verify=["exit 1"])),
-                PLAN,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS,
-            ]
-        )
+        harness.script([taskgraph(task("t1", verify=["false"])), *([BUILD] * 3)])
         result = harness.engine(budgets={"max_replans_per_task": 0}).start("verify never passes")
         assert result.state == "failed"
         assert result.tasks[0].state == "failed"
         assert result.tasks[0].revisions == 3
 
-    def test_verify_suspect_after_verify_failure_replans_immediately(
-        self, harness: Harness
-    ) -> None:
-        # Field failure (r567rsm4e, #231): a runnable verify command that
-        # asserts the wrong thing. Once verify has failed and the scrutinizer
-        # passes the work while flagging the check, the replan is spent now
-        # — no further revisions, no second verify run of the wrong check.
-        bad_plan = {
-            "json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": ["exit 1"]}
-        }
-        harness.script(
-            [
-                taskgraph(task("t1")),
-                bad_plan,
-                EXECUTE,
-                PASS,  # verify fails -> revision 1
-                EXECUTE,
-                PASS_SUSPECT,  # work fine, check wrong -> replan now
-                PLAN,  # fresh plan drops the wrong check
-                EXECUTE,
-                PASS,
-                ACCEPT,
-            ]
-        )
-        engine = harness.engine()
-        result = engine.start("wrong check replans early")
-        assert result.state == "completed"
-        assert result.tasks[0].state == "done"
-        assert result.tasks[0].replans == 1
-        phases = [row["phase"] for row in engine.store.phase_attempts(result.run_id)]
-        assert phases.count("verify") == 2  # the wrong check ran once, the fixed one once
-        assert phases.count("execute") == 3  # not the full revision budget
-        events = [
-            e
-            for e in harness.events
-            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
-        ]
-        assert len(events) == 1
-        assert events[0].data["honored"] is True
-        assert "od column layout" in events[0].data["message"]
-
-    def test_verify_suspect_before_verify_ran_is_ignored(self, harness: Harness) -> None:
-        # A speculative flag on a check that has never failed must not cost
-        # a replan on a fine plan: verify runs (and here passes) as usual.
-        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS_SUSPECT, ACCEPT])
-        result = harness.engine().start("speculative flag")
-        assert result.state == "completed"
-        assert result.tasks[0].replans == 0
-        events = [
-            e
-            for e in harness.events
-            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
-        ]
-        assert len(events) == 1
-        assert events[0].data["honored"] is False
-        assert "before it has failed" in events[0].data["message"]
-
-    def test_verify_suspect_evidence_ignores_lookalike_critic_feedback(
-        self, harness: Harness
-    ) -> None:
-        # Provenance comes from the persisted verify attempt, not from the
-        # feedback text: a critic's `revise` that happens to open with the
-        # verify-failure wording must not make a later flag look
-        # verify-triggered when VERIFY has never run.
-        spoof = {
-            "json": {
-                "verdict": "revise",
-                "feedback": "verify command failed: `grep -q x out.txt` (exit 1) -- fix it",
-            }
-        }
-        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, spoof, EXECUTE, PASS_SUSPECT, ACCEPT])
-        result = harness.engine().start("spoofed evidence")
-        assert result.state == "completed"
-        assert result.tasks[0].replans == 0
-        events = [
-            e
-            for e in harness.events
-            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
-        ]
-        assert len(events) == 1
-        assert events[0].data["honored"] is False
-        assert "before it has failed" in events[0].data["message"]
-
-    def test_verify_suspect_with_revise_is_surfaced_not_honored(self, harness: Harness) -> None:
-        # `revise` + verify_suspect: the work is not done either, so the
-        # revision comes first; the ruling is still put in the live stream
-        # rather than swallowed by the revise branch.
-        revise_suspect = {
-            "json": {
-                "verdict": "revise",
-                "feedback": "missing the CLI flag",
-                "verify_suspect": True,
-                "verify_suspect_reason": "asserts a column od never prints",
-            }
-        }
-        harness.script(
-            [
-                taskgraph(task("t1", verify=["exit 1"])),
-                PLAN,
-                EXECUTE,
-                PASS,  # verify fails -> revision 1
-                EXECUTE,
-                revise_suspect,  # revision 2: flag surfaced, revision registered
-                EXECUTE,
-                PASS,  # verify fails -> revision 3
-                EXECUTE,
-                PASS,
-            ]
-        )
-        result = harness.engine(budgets={"max_replans_per_task": 0}).start("revise first")
-        assert result.state == "failed"
-        assert result.tasks[0].replans == 0
-        assert result.tasks[0].revisions == 3
-        events = [
-            e
-            for e in harness.events
-            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
-        ]
-        assert len(events) == 1
-        assert events[0].data["honored"] is False
-        assert "revisions first" in events[0].data["message"]
-
-    def test_verify_suspect_without_replan_budget_verifies_anyway(self, harness: Harness) -> None:
-        # No replan budget: the flag is surfaced but the loop stays bounded
-        # by the ordinary revision path.
-        harness.script(
-            [
-                taskgraph(task("t1", verify=["exit 1"])),
-                PLAN,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS_SUSPECT,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS,
-            ]
-        )
-        result = harness.engine(budgets={"max_replans_per_task": 0}).start("no budget")
-        assert result.state == "failed"
-        assert result.tasks[0].replans == 0
-        assert result.tasks[0].revisions == 3
-        events = [
-            e
-            for e in harness.events
-            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "verify_suspect"
-        ]
-        assert len(events) == 1
-        assert events[0].data["honored"] is False
-        assert "no replan budget" in events[0].data["message"]
-
     def test_verify_failure_surfaces_in_event_stream(self, harness: Harness) -> None:
         # Field failure (rv4zfdb1m): the transcript jumped verifying -> failed
         # with the failing command visible only via sqlite on phase_attempts.
-        harness.script(
-            [
-                taskgraph(task("t1", verify=["exit 1", "exit 2"])),
-                PLAN,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS,
-                EXECUTE,
-                PASS,
-            ]
-        )
-        harness.engine(budgets={"max_replans_per_task": 0}).start("loud verify failure")
-        fails = [e for e in harness.events if e.type == HostEventTypes.PHASE_END]
+        harness.script([taskgraph(task("t1", verify=["exit 1", "exit 2"])), BUILD])
+        harness.engine(budgets=NO_RETRY_BUDGETS).start("loud verify failure")
+        fails = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "verify"
+        ]
         assert fails, "verify failure emitted no phase.end event"
         first = fails[0].data
         assert first["task_id"] == "t1"
-        assert first["phase"] == "verify"
         assert first["status"] == "failed"
         assert "verify command failed" in first["message"]
         assert "(+1 more)" in first["message"]  # both failing commands counted
 
 
-DEGRADED_HEALTH = {"tool_failures": {"grep": 3, "glob": 1}, "permission_denials": {"shell": 1}}
-DEGRADED_PASS = {"json": {"verdict": "pass"}, "health": DEGRADED_HEALTH}
-DEGRADED_ACCEPT = {"json": {"verdict": "accept"}, "health": DEGRADED_HEALTH}
-
-
-class TestDegradedCritic:
-    """A critic that lost its tooling must not green-light work (#123)."""
-
-    def test_degraded_pass_twice_is_downgraded_to_revise(self, harness: Harness) -> None:
-        # Two blind passes -> downgrade -> one revision -> healthy pass.
-        harness.script(
-            [
-                taskgraph(task("t1")),
-                PLAN,
-                EXECUTE,
-                DEGRADED_PASS,
-                DEGRADED_PASS,  # the guard's one re-run, still blind
-                EXECUTE,
-                PASS,
-                ACCEPT,
-            ]
-        )
-        engine = harness.engine()
-        result = engine.start("blind critic must not pass")
-        assert result.state == "completed"
-        assert result.tasks[0].revisions == 1
-
-        # The downgrade is persisted on the phase row: status revise, with
-        # the session's tooling health and the downgraded marker.
-        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "scrutinize"]
-        first = json.loads(rows[0]["output_json"])
-        assert rows[0]["status"] == "revise"
-        assert first["downgraded"] is True
-        assert first["tooling_health"]["tool_failures"] == {"grep": 3, "glob": 1}
-        assert any("degraded tooling" in i["detail"] for i in first["issues"])
-        # ...and the healthy final pass carries neither marker.
-        last = json.loads(rows[-1]["output_json"])
-        assert rows[-1]["status"] == "pass"
-        assert "tooling_health" not in last and "downgraded" not in last
-
-        # The downgrade is in the live stream, not only in sqlite.
-        degraded = [
-            e
-            for e in harness.events
-            if e.type == HostEventTypes.PHASE_END and e.data.get("status") == "degraded"
-        ]
-        assert len(degraded) == 1
-        assert degraded[0].data["phase"] == "scrutinize"
-        assert "grep x3" in degraded[0].data["message"]
-
-    def test_degraded_pass_then_healthy_rerun_is_trusted(self, harness: Harness) -> None:
-        # A transient tool crash gets its second chance: the re-run comes
-        # back healthy and clean, so no revision is spent.
-        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, DEGRADED_PASS, PASS, ACCEPT])
-        result = harness.engine().start("transient tool crash")
-        assert result.state == "completed"
-        assert result.tasks[0].revisions == 0
-
-    def test_degraded_accept_twice_is_downgraded_to_reject(self, harness: Harness) -> None:
-        harness.script(
-            [
-                taskgraph(task("t1")),
-                PLAN,
-                EXECUTE,
-                PASS,
-                DEGRADED_ACCEPT,
-                DEGRADED_ACCEPT,  # re-run, still blind -> reject -> replan
-                PLAN,
-                EXECUTE,
-                PASS,
-                ACCEPT,
-            ]
-        )
-        result = harness.engine().start("blind validator must not accept")
-        assert result.state == "completed"
-        assert result.tasks[0].replans == 1
-        assert result.tasks[0].state == "done"
-
-
 class TestReplanAndSkip:
-    def test_validate_reject_replans_then_accepts(self, harness: Harness) -> None:
-        harness.script(
-            [taskgraph(task("t1")), PLAN, EXECUTE, PASS, REJECT, PLAN, EXECUTE, PASS, ACCEPT]
-        )
-        result = harness.engine().start("reject then accept")
-        assert result.state == "completed"
-        assert result.tasks[0].replans == 1
-        assert result.tasks[0].state == "done"
-
     def test_replan_budget_exhaustion_skips_dependents(self, harness: Harness) -> None:
         harness.script(
             [
-                taskgraph(task("t1"), task("t2", deps=["t1"])),
-                PLAN,
-                EXECUTE,
-                PASS,
-                REJECT,  # replan 1
-                PLAN,
-                EXECUTE,
-                PASS,
-                REJECT,  # replans exhausted -> t1 failed
+                taskgraph(task("t1", verify=["false"]), task("t2", deps=["t1"])),
+                BUILD,  # verify fails with no budget left -> t1 failed
             ]
         )
-        result = harness.engine().start("fail and skip")
+        result = harness.engine(budgets=NO_RETRY_BUDGETS).start("fail and skip")
         assert result.state == "failed"
         by_id = {t.spec.id: t for t in result.tasks}
         assert by_id["t1"].state == "failed"
@@ -712,8 +466,8 @@ class TestBudgetsAndCancel:
 
 class TestResume:
     def test_resume_after_crash_continues(self, harness: Harness) -> None:
-        # Crash during t1's execute (worker returns an error result).
-        harness.script([taskgraph(task("t1")), PLAN, {"fail": "sandbox exploded"}])
+        # Crash during t1's build (worker returns an error result).
+        harness.script([taskgraph(task("t1")), {"fail": "sandbox exploded"}])
         engine = harness.engine()
         with pytest.raises(WorkerError, match="sandbox exploded"):
             engine.start("crashy run")
@@ -723,82 +477,49 @@ class TestResume:
         assert run.state == "running"  # persisted mid-flight
         tasks = engine.store.get_tasks(run_id)
         assert tasks[0].state == "executing"
-        assert tasks[0].plan is not None  # plan was committed before the crash
 
         # Fresh engine (new sandbox pair), remaining script picks up at
-        # EXECUTE - decompose and plan are NOT re-run.
-        harness.script([EXECUTE, PASS, ACCEPT])
+        # BUILD - decompose is NOT re-run.
+        harness.script([*HAPPY_TASK])
         engine2 = harness.engine()
         result = engine2.resume(run_id)
         assert result.state == "completed"
         assert result.tasks[0].state == "done"
         phases = [row["phase"] for row in engine2.store.phase_attempts(run_id)]
         assert phases.count("decompose") == 1
-        assert phases.count("plan") == 1
         # the crashed attempt never committed a phase row - that is exactly the
         # "uncommitted phases re-run" resume semantic
-        assert phases.count("execute") == 1
+        assert phases.count("build") == 1
 
-    def test_resume_into_validating_carries_verify_evidence(self, harness: Harness) -> None:
-        # #61: a task checkpointed 'validating' resumes straight into
-        # VALIDATE in a fresh process. The judge must see the persisted
-        # verify transcript, not a "(verification not run)" placeholder.
-        harness.script(
-            [
-                taskgraph(task("t1", verify=["echo verify-evidence-61"])),
-                PLAN,
-                EXECUTE,
-                PASS,
-                {"fail": "killed before validate"},
-            ]
-        )
+    def test_resume_remaps_legacy_task_states(self, harness: Harness) -> None:
+        # A run checkpointed by the six-phase pipeline resumes across the
+        # upgrade: the store remaps its persisted states onto the live
+        # vocabulary (planning -> executing: no committed work, BUILD starts
+        # fresh; scrutinizing/validating -> verifying: the work was done, so
+        # idempotent mechanical VERIFY is the cheaper re-entry).
+        harness.script([taskgraph(task("t1"), task("t2"), task("t3")), {"fail": "boom"}])
         engine = harness.engine()
-        with pytest.raises(WorkerError, match="killed before validate"):
-            engine.start("die in validate")
+        with pytest.raises(WorkerError, match="boom"):
+            engine.start("pre-upgrade run")
         run_id = engine.store.list_runs()[0].run_id
-        assert engine.store.get_tasks(run_id)[0].state == "validating"
+        for task_id, legacy in (("t1", "planning"), ("t2", "scrutinizing"), ("t3", "validating")):
+            engine.store._conn.execute(
+                "UPDATE tasks SET state = ? WHERE run_id = ? AND task_id = ?",
+                (legacy, run_id, task_id),
+            )
+        engine.store._conn.commit()
+        assert [t.state for t in engine.store.get_tasks(run_id)] == [
+            "executing",
+            "verifying",
+            "verifying",
+        ]
 
-        harness.script([ACCEPT])
-        engine2 = harness.engine(keep_sandboxes=True)
-        result = engine2.resume(run_id)
+        # t1 re-enters BUILD (one script entry); t2/t3 re-run their verify
+        # commands mechanically and pass without consuming any.
+        harness.script([*HAPPY_TASK])
+        result = harness.engine().resume(run_id)
         assert result.state == "completed"
-        # evidence came from the stored verify attempt - verify did not re-run
-        phases = [row["phase"] for row in engine2.store.phase_attempts(run_id)]
-        assert phases.count("verify") == 1
-        # the resumed validate job's prompt carried the real transcript
-        fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent")
-        jobs = [json.loads(p.read_text()) for p in (fs / "home/agent/.sbxloop/jobs").iterdir()]
-        (validate_prompt,) = [j["prompt"] for j in jobs if j.get("prompt")]
-        assert "verify-evidence-61" in validate_prompt
-        assert "(verification not run)" not in validate_prompt
-
-    def test_resume_validating_without_verify_row_reruns_verify(self, harness: Harness) -> None:
-        # Defensive path for pre-upgrade checkpoints whose verify rows carry
-        # no transcript: rewind to verifying (mechanical, idempotent) instead
-        # of judging evidence-free.
-        from sbxloop.engine.model import PlanModel, TaskSpec
-
-        engine = harness.engine()
-        engine.store.create_run("r61", "old checkpoint")
-        engine.store.save_tasks("r61", [TaskSpec.model_validate(task("t1"))])
-        record = engine.store.get_tasks("r61")[0]
-        record.plan = PlanModel(steps=["do"], expected_artifacts=[], verify_commands=[])
-        record.state = "validating"
-        engine.store.update_task("r61", record)
-        engine.store.set_run_state("r61", "running")
-
-        harness.script([ACCEPT])
-        result = engine.resume("r61")
-        assert result.state == "completed"
-        phases = [row["phase"] for row in engine.store.phase_attempts("r61")]
-        assert phases == ["verify", "validate"]
-
-    def test_no_class_level_verify_state(self) -> None:
-        # #61: the per-run verify transcript must not live as mutable
-        # class-level state on PhaseRunner.
-        from sbxloop.engine.phases import PhaseRunner
-
-        assert not hasattr(PhaseRunner, "_last_verify_results")
+        assert [t.state for t in result.tasks] == ["done", "done", "done"]
 
     def test_resume_completed_run_refused(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
@@ -807,23 +528,37 @@ class TestResume:
         with pytest.raises(StateError, match="only unfinished runs"):
             engine.resume(result.run_id)
 
-    def _crashed_run(self, harness: Harness, **config_overrides: Any) -> str:
-        """Start a run that crashes during t1's execute; returns its run id."""
-        harness.script([taskgraph(task("t1")), PLAN, {"fail": "sandbox exploded"}])
+    def _crashed_run(
+        self,
+        harness: Harness,
+        *,
+        verify: list[str] | None = None,
+        **config_overrides: Any,
+    ) -> str:
+        """Start a run that crashes during t1's build; returns its run id."""
+        harness.script([taskgraph(task("t1", verify=verify)), {"fail": "sandbox exploded"}])
         engine = harness.engine(**config_overrides)
         with pytest.raises(WorkerError, match="sandbox exploded"):
             engine.start("crashy run")
         return engine.store.list_runs()[0].run_id
 
     def test_resume_uses_persisted_config_not_current(self, harness: Harness) -> None:
-        run_id = self._crashed_run(harness, budgets={"max_revisions_per_task": 2})
+        run_id = self._crashed_run(
+            harness,
+            verify=["test -f done.txt"],
+            budgets={"max_revisions_per_task": 2},
+        )
 
         # Resume under a *tighter* on-disk config (zero revisions). The
-        # persisted budget must govern: one revise round still completes.
-        harness.script([EXECUTE, REVISE, EXECUTE, PASS, ACCEPT])
+        # persisted budget must govern: one revise round still completes —
+        # as an in-budget revision, not by spending the replan the current
+        # config would force.
+        harness.script([BUILD, {"text": "wrote it", "files": {"done.txt": "ok\n"}}])
         engine2 = harness.engine(budgets={"max_revisions_per_task": 0})
         result = engine2.resume(run_id)
         assert result.state == "completed"
+        assert result.tasks[0].revisions == 1
+        assert result.tasks[0].replans == 0
         assert engine2.config.budgets.max_revisions_per_task == 2
 
         drift = [e for e in harness.events if e.type == HostEventTypes.RUN_CONFIG_DRIFT]
@@ -832,7 +567,7 @@ class TestResume:
 
     def test_resume_with_unchanged_config_reports_no_drift(self, harness: Harness) -> None:
         run_id = self._crashed_run(harness)
-        harness.script([EXECUTE, PASS, ACCEPT])
+        harness.script([*HAPPY_TASK])
         result = harness.engine().resume(run_id)
         assert result.state == "completed"
         assert HostEventTypes.RUN_CONFIG_DRIFT not in harness.event_types()
@@ -842,7 +577,7 @@ class TestResume:
         # (debug this attempt), not run identity: the CURRENT config wins for
         # them, with no drift warning — unlike everything else rehydrated.
         run_id = self._crashed_run(harness)
-        harness.script([EXECUTE, PASS, ACCEPT])
+        harness.script([*HAPPY_TASK])
         engine2 = harness.engine(keep_sandboxes=True)
         result = engine2.resume(run_id)
         assert result.state == "completed"
@@ -858,7 +593,7 @@ class TestResume:
         # The current config now points the workspace somewhere else — the
         # run must continue in its recorded workspace, not a fresh empty one.
         elsewhere = harness.tmp_path / "elsewhere"
-        harness.script([EXECUTE, PASS, ACCEPT])
+        harness.script([*HAPPY_TASK])
         engine2 = harness.engine(sandbox={"workspace": str(elsewhere)})
         result = engine2.resume(run_id)
         assert result.state == "completed"
@@ -917,7 +652,7 @@ class TestResume:
         sentinel = pinned / "agent-work.txt"
         sentinel.write_text("precious\n")
 
-        harness.script([EXECUTE, PASS, ACCEPT])
+        harness.script([*HAPPY_TASK])
         result = harness.engine().resume(run_id)
         assert result.state == "completed"
         assert result.workspace == pinned
@@ -940,7 +675,7 @@ class TestResume:
         engine.store._conn.commit()
 
         elsewhere = harness.tmp_path / "elsewhere"
-        harness.script([EXECUTE, PASS, ACCEPT])
+        harness.script([*HAPPY_TASK])
         engine2 = harness.engine(sandbox={"workspace": str(elsewhere)})
         result = engine2.resume(run_id)
         assert result.state == "completed"
@@ -966,41 +701,20 @@ class TestJsonRetry:
             harness.engine().start("never valid")
 
 
-PLAN_NPM = {
-    "json": {
-        "steps": ["npm install"],
-        "expected_artifacts": [],
-        "verify_commands": [],
-        "egress": [{"domain": "registry.npmjs.org", "reason": "npm install"}],
-    }
-}
-
-PLAN_GEMS = {
-    "json": {
-        "steps": ["bundle install"],
-        "expected_artifacts": [],
-        "verify_commands": [],
-        "egress": [{"domain": "rubygems.org", "reason": "bundle install"}],
-    }
-}
+NPM_EGRESS = [{"domain": "registry.npmjs.org", "reason": "npm install"}]
+GEMS_EGRESS = [{"domain": "rubygems.org", "reason": "bundle install"}]
 
 # Every supported language's registry is baseline (#141), so out-of-bounds
 # tests need a domain no built-in tier covers.
-PLAN_SAAS_API = {
-    "json": {
-        "steps": ["call the API"],
-        "expected_artifacts": [],
-        "verify_commands": [],
-        "egress": [{"domain": "api.example-saas.com", "reason": "fetch data"}],
-    }
-}
+SAAS_EGRESS = [{"domain": "api.example-saas.com", "reason": "fetch data"}]
 
 
-class TestPlanEgress:
-    """Plan-declared egress: bounded by [policy], granted just before EXECUTE."""
+class TestTaskEgress:
+    """Task-declared egress: authored by the decomposer on the taskgraph,
+    bounded by [policy] at graph acceptance, granted just before BUILD."""
 
     def test_in_bounds_egress_granted_and_event_logged(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN_SAAS_API, EXECUTE, PASS, ACCEPT])
+        harness.script([taskgraph(task("t1", egress=SAAS_EGRESS)), *HAPPY_TASK])
         result = harness.engine(policy={"allow": ["api.example-saas.com"]}).start("saas task")
         assert result.state == "completed"
         agent = f"sbxloop-{result.run_id}-agent"
@@ -1015,13 +729,16 @@ class TestPlanEgress:
         assert event.data["domain"] == "api.example-saas.com"
         assert event.data["reason"] == "fetch data"
         assert event.data["task_id"] == "t1"
+        # granted at BUILD entry: the grant precedes the build's phase.end
+        types = harness.event_types()
+        assert types.index("policy.allow") < types.index(HostEventTypes.PHASE_END)
 
     def test_rails_app_bundle_installs_without_a_declaration(self, harness: Harness) -> None:
         # #159: the motivating case for the declarable tier — "write a Rails
         # app" — now runs off the baseline. Declaring rubygems.org anyway
-        # (as PLAN_GEMS does) stays valid and costs nothing: seeded at
-        # provision time, so no grant-late call and no policy event.
-        harness.script([taskgraph(task("t1")), PLAN_GEMS, EXECUTE, PASS, ACCEPT])
+        # stays valid and costs nothing: seeded at provision time, so no
+        # grant-late call and no policy event.
+        harness.script([taskgraph(task("t1", egress=GEMS_EGRESS)), *HAPPY_TASK])
         result = harness.engine().start("gem task, default policy")
         assert result.state == "completed"
         seeds = [c for c in harness.fake_sbx.policies() if "rubygems.org" in c]
@@ -1029,14 +746,14 @@ class TestPlanEgress:
         assert [e for e in harness.events if e.type.startswith("policy.")] == []
 
     def test_baseline_registry_needs_no_grant(self, harness: Harness) -> None:
-        # #148: an npm build must not depend on the planner remembering to
-        # declare the registry — and declaring it anyway costs nothing,
+        # #148: an npm build must not depend on the decomposer remembering
+        # to declare the registry — and declaring it anyway costs nothing,
         # because the sandbox was provisioned with it.
-        harness.script([taskgraph(task("t1")), PLAN_NPM, EXECUTE, PASS, ACCEPT])
+        harness.script([taskgraph(task("t1", egress=NPM_EGRESS)), *HAPPY_TASK])
         result = harness.engine().start("npm task, default policy")
         assert result.state == "completed"
-        # Seeded once, at provision time — not granted late at EXECUTE
-        # entry, and so not event-logged: there is no grant to log.
+        # Seeded once, at provision time — not granted late at BUILD entry,
+        # and so not event-logged: there is no grant to log.
         seeds = [c for c in harness.fake_sbx.policies() if "registry.npmjs.org" in c]
         assert len(seeds) == 1
         assert seeds[0][:3] == ["allow", "network", "registry.npmjs.org"]
@@ -1045,22 +762,25 @@ class TestPlanEgress:
     def test_typecheck_only_task_needs_no_egress(self, harness: Harness) -> None:
         # #151: the minimal TypeScript case — dependencies already vendored,
         # so the task only runs `tsc`. An empty `egress` must be a complete
-        # plan, not a plan that forgot something: no grants, no policy
+        # declaration, not one that forgot something: no grants, no policy
         # events, no failure.
-        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, PASS, ACCEPT])
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         result = harness.engine().start("type-check the project")
         assert result.state == "completed"
         assert [e for e in harness.events if e.type.startswith("policy.")] == []
 
     def test_out_of_bounds_egress_rejected_then_retried(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN_SAAS_API, PLAN, EXECUTE, PASS, ACCEPT])
+        harness.script(
+            [taskgraph(task("t1", egress=SAAS_EGRESS)), taskgraph(task("t1")), *HAPPY_TASK]
+        )
         result = harness.engine().start("saas api denied")
         assert result.state == "completed"
         grants = [c for c in harness.fake_sbx.policies() if "api.example-saas.com" in c]
         assert grants == []
 
     def test_out_of_bounds_egress_twice_fails(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN_SAAS_API, PLAN_SAAS_API])
+        bad_graph = taskgraph(task("t1", egress=SAAS_EGRESS))
+        harness.script([bad_graph, bad_graph])
         with pytest.raises(WorkerError, match="invalid output twice"):
             harness.engine().start("insists on the saas api")
 
@@ -1068,7 +788,8 @@ class TestPlanEgress:
 class TestVerifyCommandLint:
     """Bare-interpreter verify commands are rejected at JSON acceptance —
     one retry with the rule quoted, never a revision cycle plus an in-VM
-    apt workaround (field failure r12ygfd7t)."""
+    apt workaround (field failure r12ygfd7t). Verify commands only come
+    from the decomposer now, so every rejection is a decompose retry."""
 
     def test_decomposer_bare_python_rejected_then_retried(self, harness: Harness) -> None:
         bad_graph = taskgraph(task("t1", verify=["python -m pytest test_app.py -q"]))
@@ -1083,15 +804,12 @@ class TestVerifyCommandLint:
         with pytest.raises(WorkerError, match="invalid output twice"):
             harness.engine().start("insists on bare python")
 
-    def test_planner_sudo_rejected_then_retried(self, harness: Harness) -> None:
-        bad_plan = {
-            "json": {
-                "steps": ["do"],
-                "expected_artifacts": [],
-                "verify_commands": ["sudo apt-get install -y jq && test -f out.json"],
-            }
-        }
-        harness.script([taskgraph(task("t1")), bad_plan, PLAN, EXECUTE, PASS, ACCEPT])
+    def test_decomposer_sudo_rejected_then_retried(self, harness: Harness) -> None:
+        # Environment mutation (sudo/apt) in a verify command is rejected
+        # the same way — the retried graph drops it.
+        bad_graph = taskgraph(task("t1", verify=["sudo apt-get install -y jq && test -f out.json"]))
+        good_graph = taskgraph(task("t1", verify=["true"]))
+        harness.script([bad_graph, good_graph, *HAPPY_TASK])
         result = harness.engine().start("no sudo in verify")
         assert result.state == "completed"
 
@@ -1106,8 +824,8 @@ class TestVerifyCommandLint:
 
 class TestKeepOnFailure:
     def test_failed_run_keeps_pair_and_marks_db(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), PLAN, EXECUTE, REVISE])
-        engine = harness.engine(keep_on_failure=True, budgets={"max_revisions_per_task": 0})
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        engine = harness.engine(keep_on_failure=True, budgets=NO_RETRY_BUDGETS)
         result = engine.start("doomed outcome")
 
         assert result.state == "failed"
@@ -1153,11 +871,11 @@ class TestKeepOnFailure:
 
 class TestWorkspaceExecution:
     """The artifacts linchpin: jobs run in the workspace mount, so files the
-    executor writes appear on the host live and survive sandbox teardown."""
+    builder writes appear on the host live and survive sandbox teardown."""
 
     def test_mounted_run_lands_artifacts_on_host(self, harness: Harness) -> None:
-        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        build = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        harness.script([taskgraph(task("t1")), build])
         engine = harness.engine()
         result = engine.start("write hello.txt containing hi")
 
@@ -1178,11 +896,10 @@ class TestWorkspaceExecution:
         engine = harness.engine(keep_sandboxes=True)
         result = engine.start("check job cwd")
         assert result.state == "completed"
-        fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{result.run_id}-agent")
-        jobs = [json.loads(p.read_text()) for p in (fs / "home/agent/.sbxloop/jobs").iterdir()]
+        jobs = harness.agent_jobs(result.run_id)
         assert jobs
-        # every job of every kind — agent phases, evidence, verify — runs in
-        # the workspace, so scrutiny and verification see the produced files
+        # every job of every kind — agent phases and verify — runs in the
+        # workspace, so verification sees the produced files
         workdirs = {j["cwd"] for j in jobs}
         assert len(workdirs) == 1
         assert workdirs != {None}
@@ -1191,8 +908,8 @@ class TestWorkspaceExecution:
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
-        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n", "sub/deep.txt": "d"}}
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        build = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n", "sub/deep.txt": "d"}}
+        harness.script([taskgraph(task("t1")), build])
         engine = harness.engine()
         result = engine.start("write hello.txt in harvest mode")
 
@@ -1215,8 +932,8 @@ class TestWorkspaceExecution:
         }
 
     def test_mounted_run_reports_artifacts_event(self, harness: Harness) -> None:
-        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        build = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        harness.script([taskgraph(task("t1")), build])
         result = harness.engine().start("write hello.txt")
         assert result.state == "completed"
         reports = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS]
@@ -1228,7 +945,7 @@ class TestWorkspaceExecution:
     def test_artifacts_event_surfaces_exclusions(self, harness: Harness) -> None:
         """Dot-path artifacts count as files; only the denylist (.git) is
         excluded, and the exclusion is visible in the event (#67)."""
-        execute = {
+        build = {
             "text": "added CI",
             "files": {
                 ".github/workflows/ci.yml": "on: push\n",
@@ -1236,7 +953,7 @@ class TestWorkspaceExecution:
                 ".git/HEAD": "ref\n",
             },
         }
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        harness.script([taskgraph(task("t1")), build])
         result = harness.engine().start("add CI")
         assert result.state == "completed"
         reports = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS]
@@ -1250,7 +967,7 @@ class TestWorkspaceExecution:
         even in unmounted mode — they must be stripped by tar inside the VM,
         not just at listing/delivery time (#128)."""
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
-        execute = {
+        build = {
             "text": "wrote files",
             "files": {
                 "hello.txt": "hi\n",
@@ -1258,7 +975,7 @@ class TestWorkspaceExecution:
                 ".git/objects/abc": "blob",
             },
         }
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        harness.script([taskgraph(task("t1")), build])
         result = harness.engine().start("write files in harvest mode")
 
         assert result.state == "completed"
@@ -1275,7 +992,7 @@ class TestWorkspaceExecution:
         unmounted run never pays to copy it back — so it must be stripped by
         tar in the VM, not merely filtered out of the host-side listing."""
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
-        execute = {
+        build = {
             "text": "built it",
             "files": {
                 "package.json": '{"name":"app"}\n',
@@ -1284,7 +1001,7 @@ class TestWorkspaceExecution:
                 "src/__pycache__/main.cpython-312.pyc": "\x00\n",
             },
         }
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        harness.script([taskgraph(task("t1")), build])
         result = harness.engine().start("build the app")
 
         assert result.state == "completed"
@@ -1301,20 +1018,8 @@ class TestWorkspaceExecution:
         authoritative sweep at finalize runs.  The result is still complete
         and artifacts are delivered — just with fewer sbx exec tar calls."""
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
-        execute = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
-        harness.script(
-            [
-                taskgraph(task("t1"), task("t2", deps=["t1"])),
-                PLAN,
-                execute,
-                PASS,
-                ACCEPT,
-                PLAN,
-                execute,
-                PASS,
-                ACCEPT,
-            ]
-        )
+        build = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
+        harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), build, build])
         engine = harness.engine(artifacts={"harvest_mode": "final"})
         result = engine.start("two-task harvest-final run")
 
@@ -1332,8 +1037,8 @@ class TestDeliverHook:
     """The engine's finalize hook; the git-data flow itself is covered in
     test_deliver.py. deliver_workspace is patched — no GitHub, no network."""
 
-    def deliver_engine(self, harness: Harness) -> LoopEngine:
-        return harness.engine(github={"repo": "o/r", "deliver": True})
+    def deliver_engine(self, harness: Harness, **overrides: Any) -> LoopEngine:
+        return harness.engine(github={"repo": "o/r", "deliver": True}, **overrides)
 
     def test_completed_run_delivers_and_emits_pr(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
@@ -1349,8 +1054,8 @@ class TestDeliverHook:
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
         monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        execute = {"text": "done", "files": {"hello.txt": "hi"}}
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        build = {"text": "done", "files": {"hello.txt": "hi"}}
+        harness.script([taskgraph(task("t1")), build])
         result = self.deliver_engine(harness).start("ship it")
 
         assert result.state == "completed"
@@ -1422,11 +1127,9 @@ class TestDeliverHook:
 
         monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
         monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        # execute passes but validate rejects until replan budget exhausts
-        harness.script(
-            [taskgraph(task("t1")), PLAN, EXECUTE, PASS, REJECT, PLAN, EXECUTE, PASS, REJECT]
-        )
-        result = self.deliver_engine(harness).start("doomed")
+        # the build reports success but verify never passes
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        result = self.deliver_engine(harness, budgets=NO_RETRY_BUDGETS).start("doomed")
         assert result.state == "failed"
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
 
@@ -1452,8 +1155,8 @@ class TestDeliverCommand:
     github-only sandbox; deliver_workspace/ensure_repository are patched."""
 
     def completed_run(self, harness: Harness, **config_overrides: Any) -> str:
-        execute = {"text": "done", "files": {"hello.txt": "hi"}}
-        harness.script([taskgraph(task("t1")), PLAN, execute, PASS, ACCEPT])
+        build = {"text": "done", "files": {"hello.txt": "hi"}}
+        harness.script([taskgraph(task("t1")), build])
         result = harness.engine(**config_overrides).start("ship it")
         assert result.state == "completed"
         harness.events.clear()
@@ -1781,10 +1484,10 @@ class TestGithubReporting:
         assert "finished: **completed**" in ops.comments[1]
 
     def test_failed_run_summary_reports_failed(self, harness: Harness) -> None:
-        harness.script(
-            [taskgraph(task("t1")), PLAN, EXECUTE, PASS, REJECT, PLAN, EXECUTE, PASS, REJECT]
-        )
-        result = harness.engine(github={"repo": "o/r", "report": True}).start("doomed")
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        result = harness.engine(
+            github={"repo": "o/r", "report": True}, budgets=NO_RETRY_BUDGETS
+        ).start("doomed")
 
         assert result.state == "failed"
         ops = self.RecordingOps.instances[0]
@@ -1813,7 +1516,7 @@ class TestInteractiveChat:
     }
     STEER_TASK: ClassVar[dict[str, Any]] = {
         "json": {
-            "reply": "re-planning this task",
+            "reply": "restarting this task",
             "action": "steer_task",
             "guidance": "write it in Go instead",
         }
@@ -1861,9 +1564,11 @@ class TestInteractiveChat:
         ]
         assert persisted == ["chat.message", "chat.action", "chat.reply"]
 
-    def test_steer_task_replans_without_spending_budgets(self, harness: Harness) -> None:
-        # Message absorbed at the first boundary (task in `planning`): the
-        # steer verdict re-plans it with the guidance as feedback.
+    def test_steer_task_restarts_build_without_spending_budgets(self, harness: Harness) -> None:
+        # Message absorbed at the first boundary (task in `executing`): the
+        # steer verdict discards the build session and restarts it with the
+        # guidance as feedback — user direction, not a failure, so neither
+        # budget counter is spent.
         harness.script([taskgraph(task("t1")), self.STEER_TASK, *HAPPY_TASK])
         engine = harness.engine()
         engine.post_user_message("do it in Go")
@@ -1875,6 +1580,7 @@ class TestInteractiveChat:
         action = next(e for e in harness.events if e.type == "chat.action")
         assert action.data["action"] == "steer_task"
         assert action.data["task_id"] == "t1"
+        assert "restarting task t1" in action.data["message"]
         attempts = engine.store.phase_attempts(result.run_id)
         steer = next(a for a in attempts if a["phase"] == "steer")
         assert steer["status"] == "steer_task"
@@ -1924,9 +1630,9 @@ class TestInteractiveChat:
         from sbxloop.engine.phases import PhaseRunner
 
         # Run 1: steer_run lands guidance, then the task fails its only
-        # scrutiny (max_revisions=0) and the run fails — a resumable state.
-        harness.script([taskgraph(task("t1")), self.STEER_RUN, PLAN, EXECUTE, REVISE])
-        engine = harness.engine(budgets={"max_revisions_per_task": 0})
+        # verify (no retry budgets) and the run fails — a resumable state.
+        harness.script([taskgraph(task("t1", verify=["false"])), self.STEER_RUN, BUILD])
+        engine = harness.engine(budgets=NO_RETRY_BUDGETS)
         engine.post_user_message("use postgres")
         result = engine.start("build the feature")
         assert result.state == "failed"
@@ -1943,7 +1649,7 @@ class TestInteractiveChat:
 
         harness.monkeypatch.setattr(PhaseRunner, "__init__", spy_init)
         harness.script([])
-        resumed = harness.engine(budgets={"max_revisions_per_task": 0}).resume(result.run_id)
+        resumed = harness.engine(budgets=NO_RETRY_BUDGETS).resume(result.run_id)
         assert resumed.state == "failed"  # all tasks already terminal
         assert captured["phases"].user_guidance == ["use postgres everywhere"]
 

@@ -57,6 +57,7 @@ class EchoBackend:
             output_json=output_json,
             session_id=f"echo-{job.job_id}",
             usage=Usage(model="echo", input_tokens=len(job.prompt.split()), output_tokens=2),
+            turns=1,
         )
 
     # -- scripted mode -----------------------------------------------------
@@ -103,7 +104,12 @@ class EchoBackend:
             output_text=text,
             output_json=output_json,
             session_id=str(response.get("session_id", f"echo-{job.job_id}")),
-            usage=Usage(model="echo"),
+            usage=Usage(
+                model="echo",
+                input_tokens=len(job.prompt.split()) if job.prompt else 0,
+                output_tokens=len(text.split()),
+            ),
+            turns=1,
             health=SessionHealth.model_validate(health) if health is not None else None,
         )
 

@@ -188,6 +188,11 @@ class GithubConfig(_ConfigModel):
     # needs a token that may create repositories for the owner.
     create_repo: bool = False
     create_public: bool = False  # created repositories are private by default
+    # Issue in `repo` this delivery resolves; rendered as "Closes #N" in the
+    # PR body so GitHub links issue and PR and closes the issue on merge
+    # even when the daemon is not running. Set per-run by the daemon for
+    # issue-sourced patch items; inbox work has no issue and leaves it unset.
+    deliver_closes: int | None = Field(default=None, ge=1)
 
     @field_validator("repo")
     @classmethod
@@ -325,23 +330,10 @@ class Budgets(_ConfigModel):
     per_job_timeout_s: float = 1800.0
     # Per-phase tool-call ceiling (#228): an agent session past this many
     # tool calls has further calls turned away with a nudge to stop
-    # investigating and report. 0 disables.
-    max_tool_calls_per_phase: int = Field(default=40, ge=0)
-    # Drop system-message sections a phase cannot use (see PHASE_DROP_SECTIONS
-    # in sbxloop.engine.phases). Field measurement put ~22k tokens of fixed
-    # context on EVERY turn of every session — roughly 62% of a run's input
-    # spend — and the phase prompt is under 2k of it; the rest is the agent
-    # SDK's system message and tool schemas.
-    #
-    # Off by default until two things are known, both of which the usage
-    # fields shipped alongside this now answer. First, whether that 22k is
-    # billed at all or served from cache — an unmeasured optimisation should
-    # not be on. Second, whether the SDK accepts the `customize` config shape
-    # in the field: if it does not, every agent job fails, and the deploy's
-    # health check would not catch it because it never starts a run. Turn it
-    # on once a real run has answered both, and watch the per-task revision
-    # rate — a trimmed phase producing worse work shows up there first.
-    trim_system_message: bool = False
+    # investigating and report. 0 disables. 60 (was 40) since BUILD merged
+    # planning and execution into one session; retune from measured
+    # phase_attempts usage once the merged pipeline has field data.
+    max_tool_calls_per_phase: int = Field(default=60, ge=0)
     # How many tasks may be in flight at once. A run's wall clock is
     # essentially its turn count times the per-turn latency, and the task
     # loop is otherwise strictly serial even where the task DAG says two
@@ -385,15 +377,13 @@ class DaemonConfig(_ConfigModel):
     ``backlog_auto_trigger`` is set — a self-feeding queue is the failure
     mode that flag guards.
 
-    ``close_on_success`` / ``tracking_issue`` shape how loudly a delivered
-    run touches the issue tracker. The defaults suit a task queue where the
-    PR is the reviewable object: close the source issue, open a per-run
-    tracking issue. Pointed at a repo whose issues are design/discussion
-    items (sbxloop's own tracker, #251) that auto-closes a design issue the
-    moment a *draft* PR appears and doubles issue volume with self-closing
-    tracking issues — set both to false there: the source issue gets the
-    summary comment plus ``delivered_label`` and stays open for the human
-    who merges the PR.
+    A delivered patch item settles its source issue on *merge*, not on
+    acceptance: at acceptance the issue gets the summary comment plus
+    ``delivered_label`` and stays open; when the PR merges the daemon
+    closes it and swaps in ``completed_label``, and a PR closed without
+    merging marks the item failed instead. ``close_on_success`` used to
+    close at acceptance and is now a deprecated no-op; ``tracking_issue``
+    still governs the per-run tracking issue.
 
     Unattended runs need a different workspace posture from a one-shot
     ``sbxloop run`` (#255). ``workspace_isolation`` replaces the
@@ -422,6 +412,9 @@ class DaemonConfig(_ConfigModel):
     failed_label: str = "sbxloop:failed"
     backlog_label: str = "sbxloop:backlog"
     delivered_label: str = "sbxloop:delivered"
+    # Applied when the work actually lands: at merge for patch items, at
+    # close for audits. The durable "sbxloop did this" mark on the issue.
+    completed_label: str = "sbxloop:completed"
     # Discovery lane: an issue carrying this label is a charter — the run
     # investigates and files findings as backlog issues, never a PR.
     audit_label: str = "sbxloop:audit"
@@ -460,15 +453,18 @@ class DaemonConfig(_ConfigModel):
     # next delivery deserves one.
     await_review: bool = True
     review_rounds: int = 3
-    # A PR (or its source issue) carrying this label is never touched again by
-    # the loop: no fix round, no delivery to its branch — it is handed to a
-    # human. The deliberate counterpart to the moved-head hand-off, which
-    # catches the case where nobody had a chance to declare anything.
+    # A delivered PR carrying this label is handed to a human at the next
+    # review poll: no fix round, no further delivery to its branch. The
+    # deliberate counterpart to the moved-head hand-off, which catches the
+    # case where nobody had a chance to declare anything. Empty disables it.
     hands_off_label: str = "sbxloop:hands-off"
     # Where findings ABOUT THE TOOL (sbxloop's planner, prompts, lint,
     # delivery) go — the tool's own tracker, never the project's. Unset:
     # such findings are only noted in the closing comment.
     tool_repo: str | None = None
+    # Deprecated: patch items now settle their source issue when the PR
+    # merges (close + `completed_label`), never at acceptance, so this flag
+    # no longer closes anything. Kept so existing configs still load.
     close_on_success: bool = True
     tracking_issue: bool = True
     max_runs_per_day: int = 12
@@ -529,6 +525,7 @@ class DaemonConfig(_ConfigModel):
             self.failed_label,
             self.backlog_label,
             self.delivered_label,
+            self.completed_label,
             self.audit_label,
         ]
         if any(not label.strip() for label in labels):
@@ -587,6 +584,13 @@ class DiscordConfig(_ConfigModel):
     embeds: bool = True
     status_line: bool = True
     tool_batch_lines: int = Field(default=8, ge=1, le=40)
+    # How much of a completed tool call's output is echoed into the thread:
+    # tail lines for a success (0 = none) and head+tail lines for a failure,
+    # which gets the larger budget because that is what a watcher needs to
+    # act. Both are upper bounds — the renderer additionally caps the body
+    # and clamps the message to Discord's 2000-character limit.
+    tool_output_lines: int = Field(default=0, ge=0, le=20)
+    tool_fail_output_lines: int = Field(default=20, ge=0, le=60)
 
     @property
     def enabled(self) -> bool:

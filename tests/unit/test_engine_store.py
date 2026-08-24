@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
+from sbxloop.engine.model import TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import StateError
-from sbxloop_worker.protocol import Event
+from sbxloop_worker.protocol import Event, Usage
 
 
 @pytest.fixture
@@ -60,7 +60,6 @@ class TestTasks:
         task.revisions = 2
         task.last_feedback = "try harder"
         task.session_id = "s-1"
-        task.plan = PlanModel(steps=["one"], verify_commands=["true"])
         store.update_task("r1", task)
 
         loaded = store.get_tasks("r1")[0]
@@ -68,8 +67,42 @@ class TestTasks:
         assert loaded.revisions == 2
         assert loaded.last_feedback == "try harder"
         assert loaded.session_id == "s-1"
-        assert loaded.plan is not None
-        assert loaded.plan.steps == ["one"]
+
+    def test_legacy_states_remap_on_read(self, store: StateStore) -> None:
+        """Rows persisted by the six-phase pipeline remap onto the live
+        vocabulary before pydantic sees them, so mid-flight runs resume
+        across the upgrade: planning never committed work (fresh BUILD);
+        scrutinizing has a committed report (idempotent VERIFY re-entry);
+        validating re-derives its verify evidence the same way."""
+        store.create_run("r1", "x")
+        store.save_tasks("r1", [TaskSpec(id=t, title=t.upper()) for t in ("t1", "t2", "t3", "t4")])
+        for task_id, legacy in (
+            ("t1", "planning"),
+            ("t2", "scrutinizing"),
+            ("t3", "validating"),
+            ("t4", "done"),
+        ):
+            store._conn.execute(
+                "UPDATE tasks SET state = ? WHERE run_id = 'r1' AND task_id = ?",
+                (legacy, task_id),
+            )
+        store._conn.commit()
+        states = {t.spec.id: t.state for t in store.get_tasks("r1")}
+        assert states == {
+            "t1": "executing",
+            "t2": "verifying",
+            "t3": "verifying",
+            "t4": "done",
+        }
+
+    def test_legacy_plan_json_is_ignored_not_fatal(self, store: StateStore) -> None:
+        """A pre-upgrade row's plan_json column may hold anything; reading
+        the task must not parse it (the column stays, unread)."""
+        store.create_run("r1", "x")
+        store.save_tasks("r1", [TaskSpec(id="t1", title="A")])
+        store._conn.execute("UPDATE tasks SET plan_json = '{not even json' WHERE run_id = 'r1'")
+        store._conn.commit()
+        assert store.get_tasks("r1")[0].spec.id == "t1"
 
     def test_update_unknown_task(self, store: StateStore) -> None:
         store.create_run("r1", "x")
@@ -97,6 +130,86 @@ class TestPhasesAndEvents:
         t1_attempts = store.phase_attempts("r1", "t1")
         assert [row["phase"] for row in t1_attempts] == ["plan"]
 
+    def test_phase_usage_roundtrips(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        store.record_phase(
+            "r1",
+            "execute",
+            task_id="t1",
+            attempt=1,
+            status="ok",
+            output_json=None,
+            started_at=1.0,
+            usage=Usage(
+                input_tokens=1200,
+                output_tokens=34,
+                cache_read_tokens=900,
+                cache_write_tokens=10,
+                cost=15.0,
+            ),
+            turns=3,
+        )
+        row = store.phase_attempts("r1")[0]
+        assert row["input_tokens"] == 1200
+        assert row["output_tokens"] == 34
+        assert row["cache_read_tokens"] == 900
+        assert row["cache_write_tokens"] == 10
+        assert row["cost"] == 15.0
+        assert row["turns"] == 3
+
+    def test_phase_usage_defaults_to_null(self, store: StateStore) -> None:
+        """A mechanical phase (verify) records no usage — columns stay NULL."""
+        store.create_run("r1", "x")
+        store.record_phase(
+            "r1", "verify", task_id="t1", attempt=1, status="ok", output_json=None, started_at=1.0
+        )
+        row = store.phase_attempts("r1")[0]
+        assert row["input_tokens"] is None
+        assert row["output_tokens"] is None
+        assert row["cost"] is None
+        assert row["turns"] is None
+
+    def test_pre_usage_database_migrates_in_place(self, tmp_path: Path) -> None:
+        """A state.db whose phase_attempts predates the usage columns opens
+        cleanly, gains them, and keeps its old rows readable."""
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
+            " state TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}',"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL);"
+            "CREATE TABLE phase_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " run_id TEXT NOT NULL, task_id TEXT, phase TEXT NOT NULL,"
+            " attempt INTEGER NOT NULL, status TEXT NOT NULL, output_json TEXT,"
+            " started_at REAL NOT NULL, ended_at REAL NOT NULL);"
+        )
+        conn.execute("INSERT INTO runs VALUES ('r1', 'old', 'completed', '{}', 1.0, 1.0)")
+        conn.execute(
+            "INSERT INTO phase_attempts"
+            " (run_id, task_id, phase, attempt, status, output_json, started_at, ended_at)"
+            " VALUES ('r1', 't1', 'execute', 1, 'ok', NULL, 1.0, 2.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = StateStore(db)
+        old_row = store.phase_attempts("r1")[0]
+        assert old_row["input_tokens"] is None
+        store.record_phase(
+            "r1",
+            "execute",
+            task_id="t1",
+            attempt=2,
+            status="ok",
+            output_json=None,
+            started_at=3.0,
+            usage=Usage(input_tokens=5),
+            turns=1,
+        )
+        assert store.phase_attempts("r1")[1]["input_tokens"] == 5
+        # reopening does not re-apply the ALTERs
+        StateStore(db).phase_attempts("r1")
+
     def test_events_append_and_filter(self, store: StateStore) -> None:
         for i, type_ in enumerate(["run.start", "task.state", "agent.message"]):
             store.append_event(Event(ts=float(i), run_id="r1", type=type_, data={"i": i}))
@@ -110,6 +223,30 @@ class TestPhasesAndEvents:
 
         last_seq = all_events[-1][0]
         assert list(store.events("r1", after_seq=last_seq)) == []
+
+    def test_mixed_shape_tool_events_round_trip_verbatim(self, tmp_path: Path) -> None:
+        """The chronology stores tool events verbatim, whether or not they
+        carry the additive `tool_call_id`/`output_lines`/`duration_ms` fields,
+        so a run checkpointed by one worker version replays under another
+        without migration (#403 t7)."""
+        long_cmd = (
+            "cd /home/x/.local/state/sbxloop/sbxloop-work/runs/r1/workspace"
+            " && uv run pytest -q " + "x" * 500
+        )
+        old = {"tool": "bash", "args": long_cmd, "success": True, "exit_code": 0}
+        new = {**old, "tool_call_id": "c1", "output_lines": 120, "duration_ms": 1500}
+        db = tmp_path / "state.db"
+        store = StateStore(db)
+        store.append_event(Event(ts=1.0, run_id="r1", type="agent.tool_end", data=dict(old)))
+        store.append_event(Event(ts=2.0, run_id="r1", type="agent.tool_end", data=dict(new)))
+        replayed = [e.data for _, e in store.events("r1", type_prefix="agent.")]
+        assert replayed == [old, new]
+        # The stored command is the full one; truncation is display-only.
+        assert replayed[0]["args"] == long_cmd
+        # A resume reopens the database: the same events come back unchanged.
+        store.close()
+        reopened = StateStore(db)
+        assert [e.data for _, e in reopened.events("r1")] == [old, new]
 
     def test_last_event_ts(self, store: StateStore) -> None:
         assert store.last_event_ts("r1") is None

@@ -35,16 +35,17 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from sbxloop.cli.cmdfmt import COMMAND_DISPLAY_CLIP, format_command
 from sbxloop.events import Event, HostEventTypes, summarize_event
 from sbxloop_worker.protocol import EventTypes
 
+# Live task states only; historical events replayed from a pre-BUILD run
+# may carry retired states (planning/scrutinizing/validating), which fall
+# through to the "dim" default in every lookup.
 TASK_STATE_STYLES = {
     "pending": "dim",
-    "planning": "yellow",
     "executing": "cyan",
-    "scrutinizing": "magenta",
     "verifying": "blue",
-    "validating": "magenta",
     "done": "green",
     "failed": "red",
     "skipped": "dim red",
@@ -74,7 +75,8 @@ _TRANSCRIPT_SKIP = {
 RESOURCE_LEVEL_STYLES = {"ok": "dim", "warn": "yellow", "abort": "bold red"}
 
 AGENT_MESSAGE_CLIP = 4000
-# One-line clip for tool arguments; output tail lines shown on tool failure.
+# One-line clip for generic text (see _one_line); tool commands themselves
+# clip via cmdfmt.COMMAND_DISPLAY_CLIP. Output tail lines shown on tool failure.
 TOOL_ARGS_LINE_CLIP = 160
 TOOL_FAIL_TAIL_LINES = 6
 
@@ -130,7 +132,7 @@ def render_event(event: Event) -> RenderableType | None:
     if event.type == EventTypes.AGENT_TOOL_START:
         tool = data.get("tool") or "tool"
         start = Text(f"{_stamp(event)}  ⚙ {tool}", style="yellow")
-        args = _one_line(str(data.get("args") or ""))
+        args = format_command(str(data.get("args") or ""), COMMAND_DISPLAY_CLIP)
         if args:
             start.append(" $ ", style="bold yellow")
             start.append(args, style="yellow dim")
@@ -156,7 +158,7 @@ def render_event(event: Event) -> RenderableType | None:
             return Text(f"{_stamp(event)}  ✓ {tool}{suffix}", style="green dim")
         suffix = f" exit {exit_code}" if exit_code is not None else ""
         failure = Text(f"{_stamp(event)}  ✗ {tool}{suffix}", style="red")
-        args = _one_line(str(data.get("args") or ""))
+        args = format_command(str(data.get("args") or ""), COMMAND_DISPLAY_CLIP)
         if args:
             failure.append(" $ ", style="bold red")
             failure.append(args, style="red dim")
@@ -217,8 +219,7 @@ def render_event(event: Event) -> RenderableType | None:
         elif event.type == HostEventTypes.PHASE_END and data.get("status") == "failed":
             style = "red"
         elif (
-            (event.type == HostEventTypes.PHASE_END and data.get("status") == "verify_suspect")
-            or "fallback" in event.type
+            "fallback" in event.type
             or "missing" in event.type
             or "warning" in event.type
             or event.type == HostEventTypes.POLICY_DENY

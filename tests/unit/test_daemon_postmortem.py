@@ -9,8 +9,8 @@ from typing import Any
 from sbxloop.config import Config
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.postmortem import DOSSIER_MAX_CHARS, build_dossier, postmortem_marker
-from sbxloop.daemon.sources import PrObservation
-from sbxloop.engine.model import PlanModel, TaskRecord, TaskSpec
+from sbxloop.daemon.sources import PrSnapshot
+from sbxloop.engine.model import TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
 from sbxloop.gh.ops import ChecksVerdict
@@ -31,7 +31,11 @@ def gh_item(kind: str = "patch") -> WorkItem:
 
 def seed_failed_run(store: StateStore, run_id: str) -> None:
     store.create_run(run_id, "outcome")
-    spec = TaskSpec(id="t1", title="Do it", verify_commands=["uv run pytest -q"])
+    spec = TaskSpec(
+        id="t1",
+        title="Do it",
+        verify_commands=["uv run pytest -q", "sh -c \"git status | awk '{print $2}'\""],
+    )
     store.save_tasks(run_id, [spec])
     store.update_task(
         run_id,
@@ -41,10 +45,6 @@ def seed_failed_run(store: StateStore, run_id: str) -> None:
             revisions=2,
             replans=1,
             last_feedback="verify keeps failing",
-            plan=PlanModel(
-                steps=["write code"],
-                verify_commands=["sh -c \"git status | awk '{print $2}'\""],
-            ),
         ),
     )
     store.record_phase(
@@ -82,7 +82,7 @@ class TestDossier:
         assert text.startswith("# Post-mortem: Fix the thing")
         assert "ended **abandoned: run ended failed** after 2 attempt(s)" in text
         assert "## Run `r1`" in text and "State: **failed**" in text
-        assert "Verify commands (as run, under `sh -c`):" in text
+        assert "Verify commands (decomposer-authored, run under `sh -c`):" in text
         assert "sh -c \"git status | awk '{print $2}'\"" in text
         assert "Last verify attempt (failed, attempt 1):" in text and "M README.md" in text
         assert "verify command failed" in text  # failure events section
@@ -196,15 +196,13 @@ class ReviewingSource(GithubLikeSource):
         super().__init__()
         self.reviews: list[tuple[str, int, str]] = []
         self.checks = ChecksVerdict("green", 1, (), ())
-        self.head_sha = "sha0"
-        self.labels: tuple[str, ...] = ()
 
     def file_review(self, item: WorkItem, pr_number: int, pr_url: str, run_id: str) -> str:
         self.reviews.append((item.item_id, pr_number, run_id))
         return f"gh:{800 + len(self.reviews)}"
 
-    def pr_state(self, pr_number: int) -> PrObservation:
-        return PrObservation(self.checks, "NONE", self.head_sha, self.labels)
+    def pr_state(self, pr_number: int) -> PrSnapshot:
+        return PrSnapshot(self.checks, "NONE", False, "open")
 
 
 def reviewing_harness(tmp_path: Path, **daemon: Any) -> Harness:

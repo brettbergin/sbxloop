@@ -24,11 +24,8 @@ RunState = Literal[
 
 TaskState = Literal[
     "pending",
-    "planning",
     "executing",
-    "scrutinizing",
     "verifying",
-    "validating",
     "done",
     "failed",
     "skipped",
@@ -44,11 +41,38 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {"created", "provisioning", "decomposing", "running", "finalizing", "failed", "cancelled"}
 )
 
-Phase = Literal["decompose", "plan", "execute", "scrutinize", "verify", "validate"]
+Phase = Literal["decompose", "build", "verify"]
 
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class EgressSpec(_Model):
+    """One declared network need: a domain BUILD must reach, and why.
+
+    Declared by the decomposer per task and granted to the agent sandbox
+    just before BUILD — but only within the operator's ``[policy]`` bounds
+    (checked at graph acceptance, enforced again at grant time). ``domain``
+    is a bare domain or ``*.domain`` wildcard; no scheme, path, or port,
+    and never the bare ``"*"``.
+    """
+
+    domain: str
+    reason: str = ""
+
+    @field_validator("domain")
+    @classmethod
+    def _check_domain(cls, value: str) -> str:
+        from sbxloop.policy import valid_pattern
+
+        value = value.strip().lower()
+        if not valid_pattern(value):
+            raise ValueError(
+                f"egress domain must be a domain or *.domain wildcard "
+                f"(no scheme/path/port), got {value!r}"
+            )
+        return value
 
 
 class TaskSpec(_Model):
@@ -60,6 +84,9 @@ class TaskSpec(_Model):
     depends_on: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
     verify_commands: list[str] = Field(default_factory=list)
+    # External domains this task's BUILD needs beyond the baseline, with
+    # justification. Decomposer-authored, like the verify commands.
+    egress: list[EgressSpec] = Field(default_factory=list)
 
 
 class TaskGraph(_Model):
@@ -103,81 +130,6 @@ class TaskGraph(_Model):
         return 1 + max(self._depth(by_id[d], by_id) for d in task.depends_on)
 
 
-class EgressSpec(_Model):
-    """One plan-declared network need: a domain EXECUTE must reach, and why.
-
-    Granted to the agent sandbox just before EXECUTE — but only within the
-    operator's ``[policy]`` bounds (checked at plan time, enforced again at
-    grant time). ``domain`` is a bare domain or ``*.domain`` wildcard; no
-    scheme, path, or port, and never the bare ``"*"``.
-    """
-
-    domain: str
-    reason: str = ""
-
-    @field_validator("domain")
-    @classmethod
-    def _check_domain(cls, value: str) -> str:
-        from sbxloop.policy import valid_pattern
-
-        value = value.strip().lower()
-        if not valid_pattern(value):
-            raise ValueError(
-                f"egress domain must be a domain or *.domain wildcard "
-                f"(no scheme/path/port), got {value!r}"
-            )
-        return value
-
-
-class PlanModel(_Model):
-    """The agent's plan for one task."""
-
-    steps: list[str]
-    expected_artifacts: list[str] = Field(default_factory=list)
-    verify_commands: list[str] = Field(default_factory=list)
-    # External domains EXECUTE needs beyond the baseline, with justification.
-    egress: list[EgressSpec] = Field(default_factory=list)
-
-
-class Issue(_Model):
-    severity: Literal["low", "medium", "high"] = "medium"
-    detail: str
-
-
-class Verdict(_Model):
-    """Critic output: scrutinize uses pass/revise, validate uses accept/reject.
-
-    ``verify_suspect`` is the scrutinizer's ruling on the *check* rather
-    than the work (#231): a verify command can be portable and runnable and
-    still assert the wrong thing (field failure r567rsm4e — an ``od``
-    column layout that never matches). The executor cannot edit verify
-    commands and the mechanical verify phase has no opinion, so the
-    scrutinizer — which sees the failing command next to the passing code
-    — is the only stage placed to say "this check itself is wrong". The
-    engine turns a ``pass`` + ``verify_suspect`` into an immediate replan
-    instead of letting revisions burn against a check no revision can fix.
-    """
-
-    verdict: Literal["pass", "revise", "accept", "reject"]
-    issues: list[Issue] = Field(default_factory=list)
-    feedback: str = ""
-    verify_suspect: bool = False
-    verify_suspect_reason: str = ""
-
-    @model_validator(mode="after")
-    def _check_verify_suspect(self) -> Verdict:
-        # The reason is the whole payload: it is what the planner is told
-        # about why the old check was wrong. A bare flag would spend a
-        # replan on "no reason given", so it is retried like a steer
-        # without guidance.
-        if self.verify_suspect and not self.verify_suspect_reason.strip():
-            raise ValueError(
-                "`verify_suspect: true` requires a non-empty `verify_suspect_reason` "
-                "saying concretely what the check asserts wrongly"
-            )
-        return self
-
-
 SteerAction = Literal["continue", "steer_task", "steer_run"]
 
 
@@ -187,12 +139,13 @@ class SteerVerdict(_Model):
 
     - ``continue``: the message changes nothing (a question, a status check);
       only ``reply`` is used.
-    - ``steer_task``: the current task must be done differently — it is
-      re-planned with ``guidance`` as feedback (without spending its replan
-      budget: this is user direction, not a failure).
+    - ``steer_task``: the current task must be done differently — its build
+      session is discarded and restarted with ``guidance`` as feedback
+      (without spending its replan budget: this is user direction, not a
+      failure).
     - ``steer_run``: the whole remaining run changes direction — ``guidance``
-      becomes standing guidance injected into every later plan/execute
-      prompt, persisted so a resumed run keeps it.
+      becomes standing guidance injected into every later build prompt,
+      persisted so a resumed run keeps it.
     """
 
     reply: str
@@ -217,7 +170,6 @@ class TaskRecord(_Model):
     replans: int = 0
     last_feedback: str = ""
     session_id: str | None = None
-    plan: PlanModel | None = None
 
     @property
     def terminal(self) -> bool:

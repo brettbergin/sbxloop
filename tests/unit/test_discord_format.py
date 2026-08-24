@@ -13,6 +13,8 @@ from sbxloop.daemon.discord_format import (
     COLOR_WARN,
     DISCORD_MAX_MESSAGE,
     EMBED_TOTAL_MAX,
+    TOOL_FAIL_OUTPUT_LINES_DEFAULT,
+    TOOL_OUTPUT_LINES_DEFAULT,
     EmbedSpec,
     RunStats,
     StatusLine,
@@ -33,7 +35,7 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     issue_url,
     mask_urls,
-    plan_text,
+    output_excerpt,
     queue_lines,
     ref_link,
     refs_text,
@@ -44,7 +46,6 @@ from sbxloop.daemon.discord_format import (
     strip_json_payload,
     summary_embed,
     summary_text,
-    verdict_text,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.events import Event
@@ -173,71 +174,10 @@ class TestDecisionCards:
             "3. ⏭ `t3` Docs — after `t1`, `t2`",
         ]
 
-    def test_plan_numbers_its_steps_and_names_its_promises(self) -> None:
-        text = plan_text(
-            {
-                "task_id": "t2",
-                "attempt": 1,
-                "steps": ["write it", "test it"],
-                "expected_artifacts": ["out.txt"],
-                "verify_commands": ["uv run pytest -q"],
-                "egress": [{"domain": "pypi.org", "reason": "install deps"}],
-            }
-        )
-        assert text.splitlines() == [
-            "🗺 **plan** · task `t2`",
-            "1. write it",
-            "2. test it",
-            "**expects:** `out.txt`",
-            "**verify:** `uv run pytest -q`",
-            "**egress:** `pypi.org` — install deps",
-        ]
-
-    def test_replan_says_which_attempt_it_is(self) -> None:
-        text = plan_text({"task_id": "t2", "attempt": 3, "steps": ["try again"]})
-        assert text.splitlines() == ["🗺 **plan** · task `t2` *(replan 3)*", "1. try again"]
-
-    def test_verdict_carries_issues_and_the_feedback_verbatim(self) -> None:
-        text = verdict_text(
-            {
-                "task_id": "t1",
-                "phase": "scrutinize",
-                "verdict": "revise",
-                "issues": [
-                    {"severity": "high", "detail": "quoted fields are ignored"},
-                    {"severity": "low", "detail": "no empty-file test"},
-                ],
-                "feedback": "Handle quotes.\nThen add the test.",
-            }
-        )
-        assert text.splitlines() == [
-            "♻ **scrutinize: revise** · task `t1`",
-            "🔴 **high** — quoted fields are ignored",
-            "⚪ **low** — no empty-file test",
-            "> Handle quotes.",
-            "> Then add the test.",
-        ]
-
-    def test_a_clean_verdict_is_one_line(self) -> None:
-        assert verdict_text(
-            {
-                "task_id": "t1",
-                "phase": "validate",
-                "verdict": "accept",
-                "issues": [],
-                "feedback": "",
-            }
-        ) == ("✅ **validate: accept** · task `t1`")
-
     def test_missing_and_misshapen_fields_do_not_break_a_card(self) -> None:
         # Event data is agent-shaped: a renderer must not assume a list.
         assert roster_text({}).splitlines() == ["🧩 **0 task(s)**"]
         assert roster_text({"tasks": "nope"}).splitlines() == ["🧩 **0 task(s)**"]
-        assert plan_text({"task_id": "t1", "steps": []}).splitlines() == [
-            "🗺 **plan** · task `t1`",
-            "· (no steps)",
-        ]
-        assert verdict_text({}).splitlines() == ["🔎 **critic: ** · task ``"]
 
     def test_events_render_at_every_level(self) -> None:
         for level in ("quiet", "normal", "verbose"):
@@ -247,22 +187,6 @@ class TestDecisionCards:
             )
             assert texts(roster) == ["🧩 **1 task(s)**\n1. `t1` T"]
             assert roster[0].kind == "block"
-            plan = format_for_discord(ev("phase.plan", task_id="t1", steps=["go"]), level=level)
-            assert texts(plan) == ["🗺 **plan** · task `t1`\n1. go"]
-            verdict = format_for_discord(
-                ev("phase.verdict", task_id="t1", phase="validate", verdict="reject"), level=level
-            )
-            assert texts(verdict) == ["❌ **validate: reject** · task `t1`"]
-
-    def test_a_long_plan_is_split_not_clipped(self) -> None:
-        chunks = format_for_discord(
-            ev("phase.plan", task_id="t1", steps=[f"step {i} " + "x" * 120 for i in range(40)]),
-            max_chars=400,
-        )
-        assert len(chunks) > 1
-        assert all(len(c.text) <= 400 for c in chunks)
-        assert chunks[1].text.startswith(f"🗺 *(cont. 2/{len(chunks)})*")
-        assert "step 39" in chunks[-1].text
 
 
 class TestFormat:
@@ -355,23 +279,20 @@ class TestFormat:
                 )
             )
         ) == ["✗ **verify** · task `t2` — pytest: 1 failed"]
-        assert texts(
-            format_for_discord(
-                ev("phase.end", task_id="t2", phase="critic", status="degraded", message="skipped")
-            )
-        ) == ["⚠ **critic degraded** · task `t2` — skipped"]
+        # The builder's report excerpt is the plan card's replacement in the
+        # chronology; other ok phase-ends stay verbose-only.
         assert texts(
             format_for_discord(
                 ev(
                     "phase.end",
                     task_id="t2",
-                    phase="scrutinize",
-                    status="verify_suspect",
-                    message="wrong od layout",
+                    phase="build",
+                    status="ok",
+                    message="added the parser and its tests",
                 )
             )
-        ) == ["🔎 **scrutinize suspects the check** · task `t2` — wrong od layout"]
-        assert format_for_discord(ev("phase.end", task_id="t2", phase="plan", status="ok")) == []
+        ) == ["🔨 **build** · task `t2` — added the parser and its tests"]
+        assert format_for_discord(ev("phase.end", task_id="t2", phase="verify", status="ok")) == []
 
     def test_newly_surfaced_events_and_levels(self) -> None:
         err = format_for_discord(ev("worker.error", message="job died"))
@@ -495,40 +416,104 @@ class TestToolDigest:
 
 
 class TestToolBatcher:
-    def test_batch_renders_one_block_and_marks_failures(self) -> None:
+    def test_batch_renders_one_line_per_call_with_outcome(self) -> None:
         b = ToolBatcher(max_lines=8)
         b.add_start("bash", "ls -la", "c1")
-        assert b.add_end("bash", "c1", success=True, exit_code=0, detail="") is None
+        assert len(b) == 0  # a start emits nothing
+        assert (
+            b.add_end("bash", "c1", success=True, exit_code=0, detail="", duration_ms=1200) is None
+        )
+        assert len(b) == 1
         b.add_start("bash", "pytest -q", "c2")
         detail = b.add_end("bash", "c2", success=False, exit_code=1, detail="FAILED a\n1 failed\n")
         assert detail is not None
         assert detail.text == "✗ `bash` failed (exit 1)\n```text\nFAILED a\n1 failed\n```"
-        assert b.flush().text == "```text\n$ bash  ls -la\n$ bash  pytest -q   ✗ exit 1\n```"  # type: ignore[union-attr]
+        text = b.flush().text  # type: ignore[union-attr]
+        assert text == "```text\n$ bash  ls -la  ✓ 1.2s\n$ bash  pytest -q  ✗ exit 1\n```"
         assert b.flush() is None
+
+    def test_concurrent_calls_ending_out_of_order_pair_by_id(self) -> None:
+        b = ToolBatcher(max_lines=8)
+        b.add_start("bash", "ruff check .", "c1")
+        b.add_start("bash", "mypy packages", "c2")
+        assert len(b) == 0
+        b.add_end("bash", "c2", success=True, exit_code=0, detail="", duration_ms=500)
+        b.add_end("bash", "c1", success=False, exit_code=2, detail="boom", duration_ms=2000)
+        lines = b.flush().text.strip("`").strip().splitlines()[1:]  # type: ignore[union-attr]
+        assert len(lines) == 2
+        assert lines[0] == "$ bash  mypy packages  ✓ 500ms"
+        assert lines[1] == "$ bash  ruff check .  ✗ exit 2 · 2.0s"
+        assert "mypy" not in lines[1] and "ruff" not in lines[0]
+
+    def test_unmatched_end_renders_from_its_own_args(self) -> None:
+        b = ToolBatcher()
+        assert b.add_end("bash", "zz", success=True, exit_code=0, detail="", args="echo hi") is None
+        assert "$ bash  echo hi  ✓" in b.flush().text  # type: ignore[union-attr]
+
+    def test_unfinished_start_is_flushed_as_running_only_when_final(self) -> None:
+        b = ToolBatcher()
+        b.add_start("bash", "sleep 100", "c1")
+        assert b.flush() is None  # routine flush: in-flight calls stay pending
+        text = b.flush(final=True).text  # type: ignore[union-attr]
+        assert text == "```text\n$ bash  sleep 100  … running\n```"
+        assert b.flush(final=True) is None
+
+    def test_call_in_flight_at_flush_renders_exactly_once(self) -> None:
+        # The PR #420 review repro: a failed sibling forces a mid-batch
+        # flush; the call still in flight must not appear as `… running`
+        # then again on completion.
+        b = ToolBatcher()
+        b.add_start("bash", "uv run mypy", "c1")
+        b.add_start("bash", "uv run pytest -q", "c2")
+        b.add_end("bash", "c2", success=False, exit_code=1, detail="1 failed")
+        first = b.flush()  # the failure triggers an immediate flush
+        assert first is not None
+        assert "pytest" in first.text and "mypy" not in first.text
+        b.add_end("bash", "c1", success=True, exit_code=0, detail="", duration_ms=500)
+        second = b.flush(final=True)
+        assert second is not None
+        assert second.text == "```text\n$ bash  uv run mypy  ✓ 500ms\n```"
+        assert "running" not in second.text
 
     def test_full_and_quiet(self) -> None:
         b = ToolBatcher(max_lines=2)
         b.add_start("read_file", "a.py", "c1")
+        b.add_end("read_file", "c1", success=True, exit_code=0, detail="")
         assert not b.full
         b.add_start("read_file", "b.py", "c2")
+        b.add_end("read_file", "c2", success=True, exit_code=0, detail="")
         assert b.full and len(b) == 2
         q = ToolBatcher(quiet=True)
         q.add_start("bash", "ls", "c1")
         assert len(q) == 0 and q.flush() is None
         # failures still surface in quiet mode
         assert q.add_end("bash", "c1", success=False, exit_code=2, detail="") is not None
+        assert len(q) == 0 and q.flush() is None
 
-    def test_long_args_are_middle_elided_and_fences_neutralised(self) -> None:
+    def test_long_args_are_elided_and_fences_neutralised(self) -> None:
         b = ToolBatcher()
         b.add_start("bash", "echo " + "a" * 500 + " ```", "c1")
+        b.add_end("bash", "c1", success=True, exit_code=0, detail="")
         text = b.flush().text  # type: ignore[union-attr]
         assert "…" in text and text.count("```") == 2  # only the block fence itself
+        assert "$ bash  echo " in text  # the verb always survives
+
+    def test_run_path_prefix_collapses(self) -> None:
+        b = ToolBatcher()
+        args = (
+            "cd /home/x/.local/state/sbxloop/sbxloop-work/runs/rfxm7ad23/workspace"
+            " && git diff -- README.md"
+        )
+        b.add_start("bash", args, "c1")
+        b.add_end("bash", "c1", success=True, exit_code=0, detail="")
+        text = b.flush().text  # type: ignore[union-attr]
+        assert "cd $RUN && git diff" in text
 
 
 class TestStatusLine:
     def test_progression(self) -> None:
         s = StatusLine()
-        assert s.render() == "⏳ planning"
+        assert s.render() == "⏳ decomposing"
         s.observe(ev("task.state", task_id="t1", title="Add tests", state="pending", revisions=0))
         s.observe(ev("task.state", task_id="t2", title="Wire CLI", state="pending", revisions=0))
         assert s.render() == "⏳ 2 task(s) planned"
@@ -567,7 +552,7 @@ class TestSteerProgress:
         for _ in range(12):
             p.observe(ev("agent.tool_start", tool="bash", args="ls"))
         assert p.render() == (
-            "⏳ steer queued — agent is mid-**execute** on `t2` · Wire CLI "
+            "⏳ steer queued — agent is mid-**build** on `t2` · Wire CLI "
             "(12/40 tool calls so far); answered at the next checkpoint"
         )
         # a phase boundary is a checkpoint: the count restarts with the new job
@@ -580,15 +565,15 @@ class TestSteerProgress:
         p.observe(ev("task.end", task_id="t2", title="Wire CLI", state="done"))
         assert p.render() == "⏳ steer queued; answered at the next checkpoint"
 
-    def test_production_event_order_keeps_the_planning_phase(self) -> None:
-        # LoopEngine._run_task emits task.state=planning BEFORE task.start
+    def test_production_event_order_keeps_the_build_phase(self) -> None:
+        # LoopEngine._run_task emits task.state=executing BEFORE task.start
         # (and the persisted phase first on resume); the start must not
         # wipe the phase already observed for the same task.
         p = SteerProgress(cap=40)
-        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
-        p.observe(ev("task.start", task_id="t1", title="Plan it"))
+        p.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
+        p.observe(ev("task.start", task_id="t1", title="Build it"))
         assert p.render() == (
-            "⏳ steer queued — agent is mid-**plan** on `t1` · Plan it; "
+            "⏳ steer queued — agent is mid-**build** on `t1` · Build it; "
             "answered at the next checkpoint"
         )
         p.observe(ev("task.state", task_id="t3", state="verifying", revisions=0))
@@ -603,7 +588,7 @@ class TestSteerProgress:
 
     def test_unbounded_cap_and_terminal_states(self) -> None:
         p = SteerProgress(cap=0)  # 0 = unbounded in [budgets]
-        p.observe(ev("task.state", task_id="t1", state="planning", revisions=0))
+        p.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
         p.observe(ev("agent.tool_start", tool="bash", args="ls"))
         assert "(1 tool call so far)" in p.render()
         p.observe(ev("agent.tool_start", tool="bash", args="ls"))
@@ -805,15 +790,13 @@ class TestRunSummary:
             tev(110.0, "agent.usage", input_tokens=1000, output_tokens=200, cost=0.10),
             tev(111.0, "agent.tool_start", tool="bash"),
             tev(112.0, "agent.tool_start", tool="bash"),
-            tev(120.0, "phase.verdict", task_id="t1", phase="verify", verdict="pass"),
             tev(
                 130.0,
-                "phase.verdict",
+                "phase.end",
                 task_id="t2",
-                phase="scrutinize",
-                verdict="revise",
-                issues=[{"severity": "major", "detail": "tests missing"}],
-                feedback="add tests",
+                phase="verify",
+                status="failed",
+                message="verify command failed: `pytest -q` (exit 1)",
             ),
             tev(140.0, "agent.usage", input_tokens=2000, output_tokens=300, cost=0.15),
             tev(150.0, "chat.message", message_id="m1", text="go faster"),
@@ -832,8 +815,9 @@ class TestRunSummary:
         assert stats.turns == 2 and stats.tool_calls == 2
         assert stats.input_tokens == 3000 and stats.output_tokens == 500
         assert stats.cost == pytest.approx(0.25)
-        assert stats.verdict_passes == 1
-        assert stats.rework == [("t2", "scrutinize", "revise", "tests missing")]
+        assert stats.rework == [
+            ("t2", "verify", "failed", "verify command failed: `pytest -q` (exit 1)")
+        ]
         assert stats.steers == 1 and stats.steers_answered == 1 and stats.steers_failed == 0
         assert stats.denies == 1
         assert stats.task_counts() == (2, 2)
@@ -863,7 +847,7 @@ class TestRunSummary:
         assert "all 2 task(s) completed" in well
         assert "answered all 1 steering message(s)" in well
         work = fields["Needed work"]
-        assert "• `t2` scrutinize: **revise** — tests missing" in work
+        assert "• `t2` verify: **failed** — verify command failed: `pytest -q` (exit 1)" in work
         assert "• 1 policy denial(s)" in work
 
     def test_summary_card_degrades_without_stats(self) -> None:
@@ -990,3 +974,258 @@ def test_embed_converter_roundtrip() -> None:
     assert [(f.name, f.value, f.inline) for f in embed.fields] == [("a", "b", True)]
     assert embed.footer.text == "f"
     assert _allowed_mentions_none() is not None
+
+
+class TestOutputExcerpt:
+    """Bounded, informative output excerpts for completed tool calls."""
+
+    def _big(self, n: int = 10_000, width: int = 100) -> str:
+        return "\n".join(f"L{i} " + "x" * width for i in range(n))
+
+    def test_pathological_output_stays_under_discord_limit(self) -> None:
+        big = self._big()
+        assert len(big) > 1_000_000 - 1
+        fail = output_excerpt("bash", 1, big, success=False, output_lines=10_000)
+        assert fail is not None
+        assert len(fail.text) <= DISCORD_MAX_MESSAGE
+        ok = output_excerpt("bash", 0, big, success=True, max_lines=5)
+        assert ok is not None
+        assert len(ok.text) <= DISCORD_MAX_MESSAGE
+        assert ok.text.count("```") == 2
+
+    def test_single_huge_line_is_clipped(self) -> None:
+        chunk = output_excerpt("bash", 1, "y" * 1_000_000, success=False)
+        assert chunk is not None
+        assert len(chunk.text) <= DISCORD_MAX_MESSAGE
+        assert chunk.text.endswith("```")
+
+    def test_elided_marker_counts_omitted_lines(self) -> None:
+        detail = "\n".join(f"L{i}" for i in range(100))
+        chunk = output_excerpt("bash", 2, detail, success=False, max_lines=20)
+        assert chunk is not None
+        assert "… 80 lines elided …" in chunk.text
+        body = chunk.text.split("```text\n")[1].rsplit("\n```", 1)[0].splitlines()
+        assert body[0] == "L0" and body[9] == "L9"
+        assert body[10] == "… 80 lines elided …"
+        assert body[-1] == "L99"
+
+    def test_elided_count_uses_event_output_lines(self) -> None:
+        # The stored text was itself truncated upstream: the marker must
+        # report the true omitted count, not what happens to be present.
+        detail = "\n".join(f"L{i}" for i in range(30))
+        chunk = output_excerpt("bash", 1, detail, success=False, max_lines=20, output_lines=5000)
+        assert chunk is not None
+        assert "… 4980 lines elided …" in chunk.text
+
+    def test_no_marker_when_nothing_omitted(self) -> None:
+        chunk = output_excerpt("bash", 1, "a\nb\nc", success=False, max_lines=20)
+        assert chunk is not None
+        assert "elided" not in chunk.text
+
+    def test_failure_surfaces_stderr_and_exit_status(self) -> None:
+        chunk = output_excerpt("bash", 2, "ModuleNotFoundError: sbxloop", success=False)
+        assert chunk is not None
+        assert "✗" in chunk.text and "(exit 2)" in chunk.text
+        assert "ModuleNotFoundError: sbxloop" in chunk.text
+
+    def test_success_budget_is_smaller_than_failure(self) -> None:
+        detail = "\n".join(f"L{i}" for i in range(50))
+        ok = output_excerpt("bash", 0, detail, success=True, max_lines=3)
+        bad = output_excerpt("bash", 1, detail, success=False, max_lines=20)
+        assert ok is not None and bad is not None
+        assert len(ok.text) < len(bad.text)
+        assert "✓" in ok.text and "(exit 0)" in ok.text
+        assert ok.text.rstrip("`\n").endswith("L49")
+
+    def test_success_with_zero_budget_renders_nothing(self) -> None:
+        assert output_excerpt("bash", 0, "hello", success=True, max_lines=0) is None
+
+    def test_failure_with_no_output_still_reports(self) -> None:
+        chunk = output_excerpt("bash", 3, "", success=False)
+        assert chunk is not None
+        assert chunk.text == "✗ `bash` failed (exit 3)"
+
+    def test_fences_escaped_and_balanced(self) -> None:
+        chunk = output_excerpt("bash", 1, "before\n```\ninside\n```\nafter", success=False)
+        assert chunk is not None
+        assert chunk.text.count("```") == 2
+        assert "'''" in chunk.text
+
+    def test_redacted_upstream_text_stays_redacted(self) -> None:
+        # The renderer reads only the (already redacted) payload text; it
+        # must not resurrect anything, and must not invent a new source.
+        chunk = output_excerpt("bash", 1, "token=***REDACTED***", success=False)
+        assert chunk is not None
+        assert "***REDACTED***" in chunk.text
+
+    def test_batcher_uses_configured_budgets(self) -> None:
+        detail = "\n".join(f"L{i}" for i in range(50))
+        b = ToolBatcher(max_lines=8, output_lines=2, fail_output_lines=6)
+        ok = b.add_end("bash", "c1", success=True, exit_code=0, detail=detail)
+        assert ok is not None and ok.text.endswith("L48\nL49\n```")
+        assert "… 48 lines elided …" in ok.text
+        bad = b.add_end("bash", "c2", success=False, exit_code=1, detail=detail, output_lines=50)
+        assert bad is not None and "… 44 lines elided …" in bad.text
+
+    def test_batcher_success_quiet_by_default(self) -> None:
+        b = ToolBatcher(max_lines=8)
+        assert b.add_end("bash", "c1", success=True, exit_code=0, detail="out") is None
+
+    def test_digest_success_quiet_failure_loud(self) -> None:
+        d = ToolDigest()
+        d.add_start("bash", "ls", "c1")
+        assert d.add_end("bash", "c1", success=True, exit_code=0, detail="x") is None
+        d.add_start("bash", "ls", "c2")
+        chunk = d.add_end("bash", "c2", success=False, exit_code=1, detail="boom", output_lines=1)
+        assert chunk is not None and "boom" in chunk.text
+
+    def test_config_defaults_match_constants(self) -> None:
+        from sbxloop.config import DiscordConfig
+
+        cfg = DiscordConfig()
+        assert cfg.tool_output_lines == TOOL_OUTPUT_LINES_DEFAULT
+        assert cfg.tool_fail_output_lines == TOOL_FAIL_OUTPUT_LINES_DEFAULT
+
+
+# Concrete credential literals: nothing here may survive into a chunk.
+PAT = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+FINE_PAT = "github_pat_11ABCDEFG0" + "abcdefghijklmnopqrstuvwxyz012345"
+BEARER = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature"
+APIKEY = "API_KEY=sk-live-abcdef0123456789"
+SECRETS = (PAT, FINE_PAT, BEARER.split()[-1], APIKEY.split("=", 1)[1])
+SECRET_TEXT = f"exporting {APIKEY}\ncurl -H '{BEARER}'\nusing {PAT} and {FINE_PAT}\n"
+
+
+def _assert_clean(text: str) -> None:
+    for literal in SECRETS:
+        assert literal not in text, literal
+    assert "***" in text
+
+
+class TestRenderRedaction:
+    """Everything published to a thread is scrubbed at the render seam (#403 t6)."""
+
+    def test_failure_excerpt_is_redacted(self) -> None:
+        chunk = output_excerpt("bash", 1, SECRET_TEXT, success=False)
+        assert chunk is not None
+        _assert_clean(chunk.text)
+
+    def test_success_excerpt_is_redacted(self) -> None:
+        chunk = output_excerpt("bash", 0, SECRET_TEXT, success=True, max_lines=5)
+        assert chunk is not None
+        _assert_clean(chunk.text)
+
+    def test_batcher_line_and_detail_are_redacted(self) -> None:
+        b = ToolBatcher(max_lines=8, fail_output_lines=10)
+        detail = b.add_end(
+            "bash",
+            "c1",
+            success=False,
+            exit_code=1,
+            detail=SECRET_TEXT,
+            args=f"curl -H '{BEARER}' && {APIKEY} gh auth login --with-token {PAT}",
+        )
+        assert detail is not None
+        _assert_clean(detail.text)
+        batch = b.flush()
+        assert batch is not None
+        _assert_clean(batch.text)
+
+    def test_batcher_running_line_is_redacted(self) -> None:
+        b = ToolBatcher(max_lines=8)
+        b.add_start("bash", f"gh auth login --with-token {PAT} && {APIKEY} run", "c1")
+        chunk = b.flush(final=True)
+        assert chunk is not None
+        _assert_clean(chunk.text)
+        assert "running" in chunk.text
+
+    def test_digest_render_and_detail_are_redacted(self) -> None:
+        d = ToolDigest(fail_output_lines=10)
+        d.add_start("bash", f"curl -H '{BEARER}' {APIKEY} {PAT}", "c1")
+        _assert_clean(d.render())
+        chunk = d.add_end("bash", "c1", success=False, exit_code=1, detail=SECRET_TEXT)
+        assert chunk is not None
+        _assert_clean(chunk.text)
+
+    def test_redaction_is_idempotent_and_preserves_upstream_marker(self) -> None:
+        from sbxloop.log import redact_text
+
+        once = redact_text(SECRET_TEXT)
+        assert redact_text(once) == once
+        chunk = output_excerpt("bash", 1, "token=***REDACTED***", success=False)
+        assert chunk is not None
+        assert "***REDACTED***" in chunk.text
+
+    def test_ordinary_command_survives_untouched(self) -> None:
+        b = ToolBatcher(max_lines=8)
+        b.add_end("bash", "c1", success=True, exit_code=0, detail="", args="uv run pytest -q")
+        chunk = b.flush()
+        assert chunk is not None
+        assert "uv run pytest -q" in chunk.text
+
+
+class TestOldWorkerEventCompatibility:
+    """A worker that predates `output_lines`/`duration_ms`/`tool_call_id`
+    still renders: the new fields are additive and optional (#403 t7)."""
+
+    def test_batcher_without_any_new_fields(self) -> None:
+        b = ToolBatcher(max_lines=8)
+        # No tool_call_id, no duration_ms, no output_lines: exactly what an
+        # old worker's agent.tool_start/agent.tool_end carry.
+        b.add_start("bash", "uv run pytest -q", None)
+        assert b.add_end("bash", None, success=True, exit_code=0, detail="") is None
+        chunk = b.flush()
+        assert chunk is not None
+        # One line, command visible, no duration and no crash.
+        body = chunk.text.strip("`").strip().splitlines()[1:]
+        assert body == ["$ bash  uv run pytest -q  ✓"]
+
+    def test_batcher_old_failure_without_new_fields(self) -> None:
+        b = ToolBatcher(max_lines=8, fail_output_lines=4)
+        b.add_start("bash", "uv run mypy", None)
+        detail = b.add_end("bash", None, success=False, exit_code=1, detail="error: bad type")
+        assert detail is not None and "error: bad type" in detail.text
+        assert "✗ `bash` failed (exit 1)" in detail.text
+        chunk = b.flush()
+        assert chunk is not None and "$ bash" in chunk.text and "✗ exit 1" in chunk.text
+
+    def test_digest_without_call_id_or_output_lines(self) -> None:
+        d = ToolDigest()
+        d.add_start("bash", "ls")
+        assert d.add_end("bash", success=True, exit_code=0, detail="ok") is None
+        assert d.count == 1
+        chunk = d.add_end("bash", success=False, exit_code=1, detail="boom")
+        assert chunk is not None and "boom" in chunk.text
+        assert "⚙" in d.render()
+
+    def test_rich_form_shows_duration_and_elision(self) -> None:
+        b = ToolBatcher(max_lines=8, fail_output_lines=6)
+        b.add_start("bash", "uv run pytest -q", "c1")
+        detail = b.add_end(
+            "bash",
+            "c1",
+            success=False,
+            exit_code=1,
+            detail="\n".join(f"L{i}" for i in range(40)),
+            duration_ms=1500,
+            output_lines=40,
+        )
+        assert detail is not None and "… 34 lines elided …" in detail.text
+        chunk = b.flush()
+        assert chunk is not None
+        assert "$ bash  uv run pytest -q  ✗ exit 1 · 1.5s" in chunk.text
+
+    @pytest.mark.parametrize("duration", [None, "", "not-a-number"])
+    def test_bad_duration_values_are_ignored(self, duration: Any) -> None:
+        b = ToolBatcher(max_lines=8)
+        b.add_end(
+            "bash", "c1", success=True, exit_code=0, detail="", args="ls", duration_ms=duration
+        )
+        chunk = b.flush()
+        assert chunk is not None and "$ bash  ls  ✓" in chunk.text
+
+    def test_excerpt_never_exceeds_discord_limit(self) -> None:
+        chunk = output_excerpt(
+            "bash", 1, "x" * 200000 + "\n" + "y\n" * 5000, success=False, max_lines=200
+        )
+        assert chunk is not None and len(chunk.text) <= DISCORD_MAX_MESSAGE

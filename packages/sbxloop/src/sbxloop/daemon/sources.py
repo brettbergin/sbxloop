@@ -38,23 +38,6 @@ from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 
-
-class PrObservation(NamedTuple):
-    """Everything one PR read can tell the acceptance gate.
-
-    The checks verdict and the review state are what the gate has always
-    used; the head sha and the PR's label names (lowercased) come free with
-    the payload already fetched. Surfacing them lets a later gate notice
-    that the head moved under it — someone else pushed to the branch — or
-    that a hands-off label is present, without a single extra API call.
-    """
-
-    checks: ChecksVerdict
-    review: str
-    head_sha: str
-    labels: tuple[str, ...]
-
-
 # A file still being written must not be claimed half-way; operators are
 # told to write elsewhere and rename, but a small mtime guard costs nothing.
 INBOX_SETTLE_S = 2.0
@@ -67,6 +50,11 @@ _CLAIM_RE = re.compile(re.escape(CLAIM_MARKER) + r"([0-9a-f]{32}) -->")
 # GitHub list endpoints page at 100; an issue with more history than this
 # many pages is not one the daemon should be arbitrating by comment anyway.
 _MAX_PAGES = 10
+
+# How much fetched review feedback one fix brief may carry. Enough for a
+# review body plus a couple dozen inline comments; a brief is a prompt, not
+# an archive.
+_REVIEW_FEEDBACK_CLIP = 6_000
 
 
 class WorkSource(Protocol):
@@ -282,6 +270,7 @@ class GitHubLabels:
         backlog: str,
         delivered: str = "sbxloop:delivered",
         audit: str = "sbxloop:audit",
+        completed: str = "sbxloop:completed",
     ) -> None:
         self.trigger = trigger
         self.in_progress = in_progress
@@ -291,10 +280,29 @@ class GitHubLabels:
         # The discovery lane's trigger: an issue carrying it is a charter to
         # investigate and file findings, not a change to deliver.
         self.audit = audit
+        # The durable "sbxloop did this" mark, applied when the work lands:
+        # at merge for patch items, at close for audits.
+        self.completed = completed
 
     def trigger_for(self, kind: str) -> str:
         """The label that put an item of ``kind`` in the queue."""
         return self.audit if kind == "audit" else self.trigger
+
+
+class PrSnapshot(NamedTuple):
+    """One poll's view of a delivered PR — everything the gates consult."""
+
+    checks: ChecksVerdict
+    review: str  # APPROVED | CHANGES_REQUESTED | NONE
+    merged: bool
+    state: str  # open | closed
+    # The branch head this poll saw; "" when it could not be read (and for
+    # merged/closed PRs, whose snapshot skips the read). Feeds the takeover
+    # guard (#412).
+    head_sha: str = ""
+    # The PR's label names, lowercased; they come free with the payload the
+    # sha is read from. Feeds the deliberate half of the hand-off guard.
+    labels: tuple[str, ...] = ()
 
 
 class GitHubIssueSource:
@@ -304,10 +312,10 @@ class GitHubIssueSource:
     fixed :class:`GithubOps`: the daemon may re-provision its sandbox at
     any time and the source must follow.
 
-    ``close_on_success`` decides what "delivered" does to the source issue:
-    close it (task-queue semantics — the PR is now the reviewable object) or
-    leave it open with ``labels.delivered`` so a human closes it once the
-    PR merges (design-tracker semantics, #251).
+    A patch item's source issue settles when its PR *merges* — close plus
+    ``labels.completed`` (see :meth:`report_merged`) — never at acceptance,
+    where it only gains ``labels.delivered``. ``close_on_success`` used to
+    close at acceptance and is now accepted but ignored.
     """
 
     name = "github"
@@ -327,6 +335,8 @@ class GitHubIssueSource:
         self.repo = repo
         self.labels = labels
         self.host = host or socket.gethostname()
+        # Deprecated: kept so existing wiring still constructs, but the
+        # issue now settles on merge regardless (see report_merged).
         self.close_on_success = close_on_success
         # Findings ABOUT sbxloop go to its own tracker (never the project's);
         # unset means "note them in the closing comment only".
@@ -614,20 +624,22 @@ class GitHubIssueSource:
             n = item.source_key
             lines = _report_lines(report)
             # An audit is a chore whose output is the issues it filed: it
-            # closes on completion whatever close_on_success says (that knob
-            # is about leaving a *design* issue open until its PR merges).
-            close = self.close_on_success or item.kind == "audit"
+            # closes on completion — there is no PR whose merge could settle
+            # it. A patch item's issue settles when its PR merges, so here
+            # it stays open wearing the delivered label.
+            close = item.kind == "audit"
             if item.kind == "audit" and not report.filed:
                 lines.append("The audit filed no findings.")
             if not close:
                 lines.append(
-                    "Leaving this issue open (`close_on_success = false`); close it "
-                    f"once the PR is merged, or re-add `{self.labels.trigger}` to "
-                    "run it again if the PR is rejected."
+                    "Leaving this issue open; it will be closed when the PR merges. "
+                    f"If the PR is rejected, re-add `{self.labels.trigger}` to run "
+                    "it again."
                 )
             self._comment(ops, n, "\n".join(lines))
             self._remove_label(ops, n, self.labels.in_progress)
             if close:
+                self._add_label(ops, n, self.labels.completed)
                 ops.raw(
                     "PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"}
                 )
@@ -638,6 +650,52 @@ class GitHubIssueSource:
                 self._add_label(ops, n, self.labels.delivered)
 
         self._guard("success report", go)
+
+    def report_merged(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
+        """The delivered PR merged: the work landed. Close the source issue
+        and leave ``labels.completed`` as the durable mark.
+
+        Returns True only when every step succeeded, so the caller retries
+        an interrupted settle instead of recording it as done. Labels come
+        before the close: a failure mid-way leaves an open, correctly
+        labelled issue rather than a closed one with no mark.
+        """
+
+        def go(ops: GithubOps) -> bool:
+            n = item.source_key
+            ref = f"[PR #{pr_number}]({pr_url})" if pr_url else f"PR #{pr_number}"
+            self._comment(ops, n, f"{ref} was merged — work completed by sbxloop; closing.")
+            self._remove_label(ops, n, self.labels.in_progress)
+            self._remove_label(ops, n, self.labels.delivered)
+            self._add_label(ops, n, self.labels.completed)
+            # Blind PATCH, no state pre-read: the PR body's `Closes #N` may
+            # have closed the issue already, and re-closing a closed issue
+            # is a no-op success.
+            ops.raw("PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"})
+            return True
+
+        return bool(self._guard("merge report", go))
+
+    def report_pr_closed(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
+        """The delivered PR was closed without merging — a human rejected
+        it. The issue stays open, marked failed, for the human to decide."""
+
+        def go(ops: GithubOps) -> bool:
+            n = item.source_key
+            ref = f"[PR #{pr_number}]({pr_url})" if pr_url else f"PR #{pr_number}"
+            self._comment(
+                ops,
+                n,
+                f"{ref} was closed without being merged. Marking this failed — "
+                f"re-add `{self.labels.trigger}` to try again, or close this "
+                "issue if the work is no longer wanted.",
+            )
+            self._remove_label(ops, n, self.labels.delivered)
+            self._remove_label(ops, n, self.labels.in_progress)
+            self._add_label(ops, n, self.labels.failed)
+            return True
+
+        return bool(self._guard("pr-closed report", go))
 
     def report_delivery_failed(self, item: WorkItem, report: RunReport) -> None:
         def go(ops: GithubOps) -> None:
@@ -716,6 +774,7 @@ class GitHubIssueSource:
             # first would leave the issue wearing two lifecycle labels.
             self._remove_label(ops, n, self.labels.failed)
             self._remove_label(ops, n, self.labels.delivered)
+            self._remove_label(ops, n, self.labels.completed)
             # in-progress is the claim marker; a re-queued item is claimed
             # again without a fresh label swap.
             self._add_label(ops, n, self.labels.in_progress)
@@ -794,19 +853,22 @@ class GitHubIssueSource:
             title=title,
         )
 
-    def pr_state(self, pr_number: int) -> PrObservation:
-        """What the acceptance gate can learn about a PR in one poll.
+    def pr_state(self, pr_number: int) -> PrSnapshot:
+        """Everything the acceptance gate needs to know about a PR.
 
-        Two reads rather than one: the check runs hang off the *head commit*,
-        so the sha has to be fetched first, and fetching it fresh each poll
-        is what makes a PR that was pushed to since the last look report on
-        its new commit rather than the old one's checks.
-
-        That same payload already carries the head sha and the PR's labels,
-        so both are returned alongside the verdicts rather than discarded —
-        no extra round-trip buys them.
+        Up to three reads rather than one: the check runs hang off the
+        *head commit*, so the sha has to be fetched first, and fetching it
+        fresh each poll is what makes a PR that was pushed to since the
+        last look report on its new commit rather than the old one's
+        checks. A merged or closed PR is past checks and review, so those
+        two reads are skipped and their fields are placeholders the gate
+        never consults.
         """
         pr = self._ops().pr_get(self.repo, pr_number)
+        merged = bool(pr.get("merged"))
+        state = str(pr.get("state") or "")
+        if merged or state == "closed":
+            return PrSnapshot(ChecksVerdict("pending", 0, (), ()), "NONE", merged, state)
         sha = str(((pr.get("head") or {}).get("sha")) or "")
         labels = tuple(
             name
@@ -822,7 +884,57 @@ class GitHubIssueSource:
             # and the gate must not read that as permission to merge.
             else ChecksVerdict("pending", 0, ("unknown head commit",), ())
         )
-        return PrObservation(checks, self._ops().pr_review_state(self.repo, pr_number), sha, labels)
+        return PrSnapshot(
+            checks,
+            self._ops().pr_review_state(self.repo, pr_number),
+            merged,
+            state,
+            head_sha=sha,
+            labels=labels,
+        )
+
+    def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
+        """(merged, open/closed state) for a delivered PR.
+
+        Raises on failure — the merge watch throttles and retries; a
+        swallowed error would read as "still open" and silently postpone
+        the settle.
+        """
+        pr = self._ops().pr_get(self.repo, pr_number)
+        return bool(pr.get("merged")), str(pr.get("state") or "")
+
+    def pr_review_feedback(self, pr_number: int) -> str:
+        """The objections standing on a PR, as text a fix round can act on.
+
+        The fix agent's sandbox holds no GitHub credential (#437), so the
+        daemon reads the change-requesting review bodies and the inline
+        review comments through the github-ops sandbox and bakes them into
+        the fix brief. Latest verdict per reviewer only, matching how
+        ``fold_reviews`` judges the PR; inline comments are quoted with
+        their anchors so the fix agent can find the lines.
+        """
+        ops = self._ops()
+        latest: dict[str, dict[str, object]] = {}
+        for review in ops.raw("GET", f"/repos/{self.repo}/pulls/{pr_number}/reviews") or []:
+            login = str(((review.get("user") or {}).get("login")) or "")
+            if str(review.get("state") or "") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                latest[login] = review
+        parts: list[str] = []
+        for review in latest.values():
+            if str(review.get("state")) != "CHANGES_REQUESTED":
+                continue
+            body = str(review.get("body") or "").strip()
+            if body:
+                parts.append(body)
+        for comment in ops.raw("GET", f"/repos/{self.repo}/pulls/{pr_number}/comments") or []:
+            body = str(comment.get("body") or "").strip()
+            if not body:
+                continue
+            path = str(comment.get("path") or "")
+            line = comment.get("line") or comment.get("original_line")
+            anchor = f"`{path}:{line}`: " if path and line else f"`{path}`: " if path else ""
+            parts.append(f"- {anchor}{body}")
+        return "\n\n".join(parts)[:_REVIEW_FEEDBACK_CLIP]
 
     def post_review(
         self, run: RunRecord, pr_number: int, origin_run_id: str
@@ -847,12 +959,13 @@ class GitHubIssueSource:
         body = (
             f"# Review: PR #{pr_number} (delivered by run `{run_id}` for {item.item_id})\n\n"
             f"PR: {pr_url}\nSource issue: {item.url or item.source_key}\n\n"
-            "Charter: review this PR as a skeptical maintainer. Read the source issue and the "
-            "full diff (`gh pr diff` / `gh pr view` are available; the workspace is a fresh "
-            "clone — check out the PR's branch to run its tests). Look for: defects and "
-            "wrong behaviour, missing edge cases and tests, scope drift from the issue, "
-            "unjustified claims in the PR body, style that contradicts the repository's "
-            "conventions, and anything a reviewer would block on.\n\n"
+            "Charter: review this PR as a skeptical maintainer. The source issue's text is "
+            "quoted in this charter, and the workspace is a fresh clone — check out the PR's "
+            "branch, and read the full diff with git, not `gh` (`gh` is not authenticated in "
+            "this sandbox): `git fetch origin <base>` then `git diff origin/<base>...HEAD`. "
+            "Look for: defects and wrong behaviour, missing edge cases and tests, scope "
+            "drift from the issue, unjustified claims in the PR body, style that contradicts "
+            "the repository's conventions, and anything a reviewer would block on.\n\n"
             f"{REVIEW_INSTRUCTIONS}\n\n"
             f"<!-- sbxloop-review {run_id} -->"
         )

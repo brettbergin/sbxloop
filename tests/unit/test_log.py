@@ -295,3 +295,83 @@ class TestLogBuffer:
             assert foreign in root.handlers
         finally:
             root.removeHandler(foreign)
+
+
+class TestRedactText:
+    """Free-form text scrubbing: credential shapes with no key name (#403 t6)."""
+
+    PAT = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    FINE = "github_pat_11ABCDEFG0" + "abcdefghijklmnopqrstuvwxyz012345"
+    JWT = "eyJhbGciOiJIUzI1NiJ9.payload.signature"
+
+    def test_github_token_shapes_masked(self) -> None:
+        from sbxloop.log import redact_text
+
+        for token in (self.PAT, self.FINE, "gho_" + "z" * 30, "ghs_" + "q" * 24):
+            out = redact_text(f"gh auth login --with-token {token} now")
+            assert token not in out
+            assert "***" in out
+
+    def test_authorization_header_masked_but_named(self) -> None:
+        from sbxloop.log import redact_text
+
+        out = redact_text(f"curl -H 'Authorization: Bearer {self.JWT}' https://api")
+        assert self.JWT not in out
+        assert "Authorization:" in out
+        assert "https://api" in out
+
+    def test_assignments_and_flags_masked(self) -> None:
+        from sbxloop.log import redact_text
+
+        out = redact_text("env API_KEY=sk-live-abc123 PASSWORD: hunter2 --token=t0psecret")
+        for literal in ("sk-live-abc123", "hunter2", "t0psecret"):
+            assert literal not in out
+        assert out.count("***") == 3
+
+    def test_ordinary_text_untouched(self) -> None:
+        from sbxloop.log import redact_text
+
+        for text in (
+            "uv run pytest -q tests/unit",
+            "grep -rn 'daemon_log' README.md | head -40",
+            "cd /home/x && git diff -- README.md docs/architecture.md",
+            "",
+        ):
+            assert redact_text(text) == text
+
+    def test_credential_word_must_be_a_whole_name_segment(self) -> None:
+        # `pat` inside PATH/patch/compat is not a credential; masking these
+        # made rendered commands unreadable (PR #420 review).
+        from sbxloop.log import redact_text
+
+        for text in (
+            "PATH=/usr/local/bin:/usr/bin",
+            "export PATH=$HOME/bin",
+            "git apply --patch=foo",
+            "ls --path /tmp",
+            "patch: 3",
+            "compat=1",
+            "dispatch=async",
+        ):
+            assert redact_text(text) == text
+
+    def test_delimited_credential_segments_still_masked(self) -> None:
+        from sbxloop.log import redact_text
+
+        for text, literal in (
+            ("GITHUB_PAT=ghx-abc123", "ghx-abc123"),
+            ("MY_PAT: sekrit", "sekrit"),
+            ("gh --api-key k3y", "k3y"),
+            ("app.token=t0k", "t0k"),
+            ("--access-token=abc123", "abc123"),
+        ):
+            out = redact_text(text)
+            assert literal not in out
+            assert "***" in out
+
+    def test_idempotent_and_never_raises(self) -> None:
+        from sbxloop.log import redact_text
+
+        once = redact_text(f"API_KEY=abc {self.PAT} Authorization: Bearer {self.JWT}")
+        assert redact_text(once) == once
+        assert redact_text(None) == "None"  # type: ignore[arg-type]

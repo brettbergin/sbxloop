@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from sbxloop.config import Config
-from sbxloop.daemon.model import RunReport
 from sbxloop.daemon.review import FIX_TASK_TITLE, fix_brief, fix_tasks
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RunResult
@@ -38,6 +37,17 @@ class TestFixBrief:
     def test_no_failing_checks_means_no_checks_section(self) -> None:
         assert "Failing checks" not in fix_brief(7, "the review requested changes")
 
+    def test_it_never_claims_gh_works(self) -> None:
+        """The fix agent's sandbox has no GitHub credential (#437); a brief
+        telling it to run `gh pr view` hands it a tool that cannot work."""
+        assert "gh pr view" not in fix_brief(7, "the review requested changes")
+        assert "gh pr view" not in fix_brief(7, "checks failed", ("lint",), objections="fix line 9")
+
+    def test_objections_are_quoted_verbatim(self) -> None:
+        brief = fix_brief(7, "the review requested changes", objections="- `a.py:9`: off by one")
+        assert "- `a.py:9`: off by one" in brief
+        assert "Address each one" in brief
+
 
 class TestFixTasks:
     def test_a_round_is_exactly_one_task(self) -> None:
@@ -50,9 +60,12 @@ class TestFixTasks:
         criteria = " ".join(tasks[0].acceptance_criteria)
         assert "lint" in criteria and "mdformat" in criteria
 
-    def test_the_brief_rides_on_the_task(self) -> None:
-        tasks = fix_tasks(7, "the review requested changes")
-        assert "#7" in tasks[0].description
+    def test_the_brief_rides_on_the_task_verbatim(self) -> None:
+        """The dispatch site passes the persisted brief; re-wrapping it in
+        fix_brief again nested one brief's boilerplate inside another's."""
+        brief = fix_brief(7, "the review requested changes")
+        tasks = fix_tasks(7, brief)
+        assert tasks[0].description == brief
 
 
 class TestSeededRunSkipsDecompose:
@@ -85,30 +98,3 @@ class TestSeededRunSkipsDecompose:
         engine = self._engine(tmp_path)
         engine.start("do the thing", run_id="rord00001")
         assert engine.store.get_tasks("rord00001") == []
-
-
-class TestFixRoundHeadTracking:
-    """The loop's own fix-round push must not look like a human's.
-
-    Every fix round finishes back through `_hold_for_review`, which re-reads
-    the PR's head — so the sha it force-pushed becomes the new baseline and
-    the next poll does not trip the hand-off guard (#412).
-    """
-
-    def test_a_fix_round_delivery_updates_the_recorded_head(self, tmp_path: Path) -> None:
-        from tests.unit.test_daemon_loop import TestHandOffGuard
-
-        h, source = TestHandOffGuard()._delivered(tmp_path)
-        assert h.dstore.pr_state("gh:1").head_sha == "sha0"  # type: ignore[union-attr]
-        # The fix round pushes: GitHub now reports the sha the loop wrote.
-        source.head_sha = "B-sha"
-        h.dstore.review_settled("gh:1", gates=True, verdict="REQUEST_CHANGES")
-        source.review_state = "CHANGES_REQUESTED"
-        report = RunReport(run_id="r2", state="completed", task_summary="", delivery=(9, "u9"))
-        item = h.dstore.get("gh:1")
-        assert item is not None
-        assert h.loop._hold_for_review(item, "r2", report, 100.0)
-        assert h.dstore.pr_state("gh:1").head_sha == "B-sha"  # type: ignore[union-attr]
-        # The following poll sees B-sha and works the item as normal.
-        h.loop._poll_reviews(101.0)
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]

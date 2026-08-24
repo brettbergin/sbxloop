@@ -21,8 +21,8 @@ import contextlib
 import json
 import os
 import shutil
+import time
 from collections import Counter
-from collections.abc import Sequence
 from typing import Any, get_args
 
 from sbxloop_worker._json import extract_json
@@ -36,7 +36,7 @@ from sbxloop_worker.protocol import (
     SessionHealth,
     Usage,
 )
-from sbxloop_worker.secrets import looks_like_github_token
+from sbxloop_worker.secrets import looks_like_github_token, redact_secrets
 
 # The SDK's permission-request ``kind`` vocabulary, field-verified against
 # github-copilot-sdk 1.0.9 (2026-08-13): ``copilot.session.PermissionRequest``
@@ -194,7 +194,19 @@ def _auth_diagnostic() -> str:
 # Transcript-facing clips: the event stream is telemetry, not the artifact
 # channel, so payloads are bounded aggressively.
 TOOL_ARGS_CLIP = 400
+# Hard char cap on a rendered excerpt. The outer bound: whatever the line
+# budget below admits, the excerpt can never approach Discord's 2000-char
+# message limit.
 TOOL_OUTPUT_CLIP = 1_000
+# How much of the output is shown when it is longer than the budget: the
+# first N and last M lines, with an explicit elision marker between them.
+TOOL_OUTPUT_HEAD_LINES = 20
+TOOL_OUTPUT_TAIL_LINES = 20
+# Per-line cap inside an excerpt. Without it a single wide line (a pytest
+# progress bar, a minified blob) would eat the whole char budget and force
+# the head or the elision marker out. Must stay well under half of
+# TOOL_OUTPUT_CLIP so one head line, the marker and one tail line always fit.
+TOOL_OUTPUT_LINE_CLIP = 200
 
 
 def _tool_args(arguments: Any) -> str | None:
@@ -233,15 +245,99 @@ def _tool_exit_code(data: Any) -> int | None:
     return None
 
 
-def _tool_output(data: Any) -> str | None:
-    """A bounded tail of the tool's output, for transcript display."""
+class ToolCallRegistry:
+    """Correlates tool completions with their starts by ``tool_call_id``.
+
+    Parallel calls interleave and complete out of order, so a completion
+    recovers the tool name, displayed args and elapsed time from the id it
+    carries rather than by comparing command text. Entries are dropped on
+    completion, bounding memory over a long session.
+    """
+
+    def __init__(self) -> None:
+        self._starts: dict[str, tuple[str | None, str | None, float]] = {}
+
+    def start(self, call_id: Any, tool: Any, args: str | None) -> None:
+        if call_id:
+            self._starts[str(call_id)] = (
+                str(tool) if tool else None,
+                args,
+                time.monotonic(),
+            )
+
+    def end(self, call_id: Any) -> tuple[str | None, str | None, int | None]:
+        """(tool, args, duration_ms) for a completion; blanks when unmatched."""
+        started = self._starts.pop(str(call_id), None)
+        if started is None:
+            return (None, None, None)
+        tool, args, began = started
+        return (tool, args, max(0, int((time.monotonic() - began) * 1000)))
+
+
+def excerpt_output(text: str) -> str:
+    """A bounded, secret-redacted head+tail excerpt of tool output.
+
+    Long output keeps the first :data:`TOOL_OUTPUT_HEAD_LINES` and last
+    :data:`TOOL_OUTPUT_TAIL_LINES` lines, separated by an explicit
+    ``… N lines elided …`` marker naming the omitted line count. Redaction
+    runs on the full text before any cutting, so no credential shape is
+    split across a cut boundary.
+
+    The char cap (:data:`TOOL_OUTPUT_CLIP`) is enforced structurally, never
+    by slicing the finished string: each line is first clipped to
+    :data:`TOOL_OUTPUT_LINE_CLIP`, then whole lines are dropped from the
+    middle — the end of the head and the start of the tail — with the
+    marker recounted, so however wide the input lines are, the first line,
+    the elision marker and the last line always survive.
+    """
+    half = TOOL_OUTPUT_LINE_CLIP // 2
+    lines = [
+        ln if len(ln) <= TOOL_OUTPUT_LINE_CLIP else ln[:half] + "…" + ln[-(half - 1) :]
+        for ln in redact_secrets(text).splitlines()
+    ]
+    head = lines[:TOOL_OUTPUT_HEAD_LINES]
+    tail = lines[TOOL_OUTPUT_HEAD_LINES:][-TOOL_OUTPUT_TAIL_LINES:]
+    if not tail and len(head) > 1:
+        # Short-but-wide output lands entirely in `head`; keep the last line
+        # on the tail side so char-budget trimming can never drop it.
+        head, tail = head[:-1], head[-1:]
+
+    def render(h: list[str], t: list[str]) -> str:
+        omitted = len(lines) - len(h) - len(t)
+        marker = [f"… {omitted} lines elided …"] if omitted > 0 else []
+        return "\n".join([*h, *marker, *t])
+
+    out = render(head, tail)
+    while len(out) > TOOL_OUTPUT_CLIP and (len(head) > 1 or len(tail) > 1):
+        if len(head) >= len(tail):
+            head = head[:-1]
+        else:
+            tail = tail[1:]
+        out = render(head, tail)
+    return out
+
+
+def _tool_output_text(data: Any) -> str | None:
+    """The tool's raw output text, unbounded (None when absent/blank)."""
     result = getattr(data, "result", None)
     content = getattr(result, "content", None)
     if not content and result is not None:
         content = getattr(result, "detailed_content", None)
     if not isinstance(content, str) or not content.strip():
         return None
-    return content[-TOOL_OUTPUT_CLIP:]
+    return content
+
+
+def _tool_output(data: Any) -> str | None:
+    """A bounded excerpt of the tool's output, for transcript display."""
+    content = _tool_output_text(data)
+    return None if content is None else excerpt_output(content)
+
+
+def _tool_output_lines(data: Any) -> int | None:
+    """Total line count of the tool's untruncated output."""
+    content = _tool_output_text(data)
+    return None if content is None else len(content.splitlines())
 
 
 # The Copilot CLI's built-in command validator declines to run some commands
@@ -379,85 +475,18 @@ def _tool_error(data: Any) -> str | None:
     message = getattr(error, "message", None)
     if not isinstance(message, str) or not message.strip():
         return None
-    return message[-TOOL_OUTPUT_CLIP:]
+    return excerpt_output(message)
 
 
-# The SDK's system-message section vocabulary, field-verified against
-# github-copilot-sdk 1.0.9 (``copilot.session.SYSTEM_MESSAGE_SECTIONS``, whose
-# keys are the ``SystemMessageSection`` literal). Every turn of a session
-# re-sends the whole system message, so a section a phase cannot use is not
-# paid for once — it is paid for on every turn. ``sbxloop doctor`` compares
-# the installed SDK against this snapshot so vocabulary drift on an SDK bump
-# is surfaced there rather than as a silently un-trimmed (or, worse,
-# over-trimmed) phase in the field.
-SDK_SYSTEM_MESSAGE_SECTIONS = frozenset(
-    {
-        "preamble",
-        "identity",
-        "tone",
-        "tool_efficiency",
-        "environment_context",
-        "code_change_rules",
-        "guidelines",
-        "safety",
-        "tool_instructions",
-        "custom_instructions",
-        "runtime_instructions",
-        "last_instructions",
-    }
-)
-
-
-def installed_sdk_system_message_sections() -> frozenset[str] | None:
-    """The installed SDK's system-message section vocabulary, or None.
-
-    Returns None when github-copilot-sdk is not installed, or when it is too
-    old to expose ``SYSTEM_MESSAGE_SECTIONS`` — an SDK without the mapping
-    cannot be trimmed, and the caller treats that as "leave the system
-    message alone" rather than an error.
-    """
-    try:
-        from copilot.session import SYSTEM_MESSAGE_SECTIONS
-    except ImportError:
-        return None
-    if not isinstance(SYSTEM_MESSAGE_SECTIONS, dict):
-        return None
-    return frozenset(str(name) for name in SYSTEM_MESSAGE_SECTIONS)
-
-
-def system_message_config(
-    content: str | None,
-    drop_sections: Sequence[str] = (),
-    known_sections: frozenset[str] | None = None,
-) -> dict[str, Any] | None:
+def system_message_config(content: str | None) -> dict[str, Any] | None:
     """The SDK ``system_message`` kwarg for one job, or None to leave the
     SDK's default prompt untouched.
 
-    ``customize`` mode keeps the SDK-managed prompt structure and removes
-    only the named sections, so the guardrails a ``replace`` would discard
-    stay in place. Sections the installed SDK does not know are dropped from
-    the request rather than sent: a host running ahead of the sandbox's SDK
-    degrades to today's behaviour instead of failing the job on a name the
-    SDK would reject.
-
-    ``known_sections=None`` means the installed SDK reported no vocabulary at
-    all — it predates ``SYSTEM_MESSAGE_SECTIONS``, and an SDK that cannot
-    name the sections cannot be assumed to accept a ``customize`` config
-    either. That trims **nothing**: sending the request anyway would fail
-    every trimmed job, which is the opposite of the fallback this is for.
+    ``append`` mode keeps the SDK-managed prompt structure intact and adds
+    the job's extra content after it; with no extra content there is nothing
+    to send.
     """
-    if known_sections is None:
-        return {"mode": "append", "content": content} if content else None
-    wanted = [name for name in dict.fromkeys(drop_sections) if name in known_sections]
-    if not wanted:
-        return {"mode": "append", "content": content} if content else None
-    config: dict[str, Any] = {
-        "mode": "customize",
-        "sections": {name: {"action": "remove"} for name in wanted},
-    }
-    if content:
-        config["content"] = content
-    return config
+    return {"mode": "append", "content": content} if content else None
 
 
 def _sdk_field(data: Any, name: str) -> Any:
@@ -479,18 +508,23 @@ def _sdk_field(data: Any, name: str) -> Any:
 def usage_from_sdk_sample(data: Any) -> Usage:
     """One ``AssistantUsageData`` turn sample as a protocol :class:`Usage`.
 
-    The SDK reports far more than tokens (field-verified against
-    github-copilot-sdk 1.0.9, ``copilot.generated.session_events``): cost
-    and the prompt-cache counters ride on every sample. Dropping them made
-    a run's real spend unknowable — the whole chain downstream already
-    carries the fields (``Usage`` in the worker protocol, the concierge's
-    ``_USAGE_FIELDS`` and ``_cost_line``), so ``run_usage`` was telling
-    operators cost was "not reported by the agent backend" while the
-    backend reported it on every turn.
+    The prompt-cache counters ride on every sample (field-verified against
+    github-copilot-sdk 1.0.9, ``copilot.generated.session_events``) and are
+    read here because they are genuine per-turn deltas that the whole chain
+    downstream already carries (``Usage`` in the worker protocol, the
+    concierge's ``_USAGE_FIELDS``).
 
-    ``cost`` is flagged experimental by the SDK, so it is read defensively
-    like everything else here: a field that disappears on an SDK bump
-    degrades to None rather than failing the session.
+    ``AssistantUsageData.cost`` is deliberately NOT read. It is not a
+    per-turn delta: it was observed as the same constant 15.0 on every turn
+    of every session in run rrhb28j7n (sbxloop 0.7.26). ``Usage.merged``
+    sums every numeric field — correct for token counters — so a 147-turn
+    run folds to 147 x 15.0 = 2205.0 and ``_cost_line`` renders a fabricated
+    figure that the concierge then repeats as fact. A value identical on
+    every turn is far more likely a premium-request multiplier or quota unit
+    than a currency amount, so the field stays unread until its unit is
+    established; "cost: not reported by the agent backend" is the honest
+    fallback. If it is ever surfaced it must be carried non-additively
+    (last/max wins, as ``Usage.merged`` already does for ``model``).
     """
     return Usage(
         model=_sdk_field(data, "model"),
@@ -498,7 +532,6 @@ def usage_from_sdk_sample(data: Any) -> Usage:
         output_tokens=_sdk_field(data, "output_tokens"),
         cache_read_tokens=_sdk_field(data, "cache_read_tokens"),
         cache_write_tokens=_sdk_field(data, "cache_write_tokens"),
-        cost=_sdk_field(data, "cost"),
     )
 
 
@@ -557,6 +590,7 @@ class CopilotBackend:
         from copilot import CopilotClient
 
         usage = Usage()
+        turns = 0
         tracker = SessionHealthTracker()
         governor = ToolCallGovernor(job.max_tool_calls)
         final_text: list[str] = []
@@ -567,10 +601,12 @@ class CopilotBackend:
         model_slug = job.model if job.model and job.model != "auto" else None
         # tool_call_id -> (tool name, displayed args), so completion events
         # can say what ran (the SDK's Complete event carries only the call id).
-        tool_calls: dict[str, tuple[str | None, str | None]] = {}
+        # Completions correlate to their start by id (not by comparing
+        # command text), which also yields a per-call duration.
+        tool_calls = ToolCallRegistry()
 
         def on_event(event: Any) -> None:
-            nonlocal usage, model_slug
+            nonlocal usage, turns, model_slug
             data = getattr(event, "data", None)
             type_name = type(data).__name__ if data is not None else type(event).__name__
             if type_name == "AssistantMessageDeltaData":
@@ -591,8 +627,7 @@ class CopilotBackend:
                 tool = getattr(data, "tool_name", None) or getattr(data, "toolName", None)
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
                 args = _tool_args(getattr(data, "arguments", None))
-                if call_id:
-                    tool_calls[str(call_id)] = (str(tool) if tool else None, args)
+                tool_calls.start(call_id, tool, args)
                 emit(
                     EventTypes.AGENT_TOOL_START,
                     tool=tool,
@@ -601,7 +636,7 @@ class CopilotBackend:
                 )
             elif type_name.startswith("ToolExecutionComplete"):
                 call_id = getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", None)
-                tool, args = tool_calls.get(str(call_id), (None, None))
+                tool, args, duration_ms = tool_calls.end(call_id)
                 success = getattr(data, "success", None)
                 output = _tool_output(data)
                 error = _tool_error(data)
@@ -620,10 +655,13 @@ class CopilotBackend:
                     exit_code=_tool_exit_code(data),
                     output=output,
                     error=error,
+                    output_lines=_tool_output_lines(data),
+                    duration_ms=duration_ms,
                 )
             elif type_name == "AssistantUsageData":
                 sample = usage_from_sdk_sample(data)
                 usage = usage.merged(sample)
+                turns += 1
                 if sample.model:
                     model_slug = sample.model
                 payload = sample.model_dump(exclude_none=True)
@@ -648,6 +686,7 @@ class CopilotBackend:
                     output_json=output_json,
                     session_id=session_id,
                     usage=usage if usage != Usage() else None,
+                    turns=turns or None,
                     health=tracker.health(governor),
                 )
             finally:
@@ -670,11 +709,7 @@ class CopilotBackend:
         }
         if job.model and job.model != "auto":
             kwargs["model"] = job.model
-        system_message = system_message_config(
-            job.system_message,
-            job.drop_system_sections,
-            installed_sdk_system_message_sections(),
-        )
+        system_message = system_message_config(job.system_message)
         if system_message is not None:
             kwargs["system_message"] = system_message
         if job.cwd:

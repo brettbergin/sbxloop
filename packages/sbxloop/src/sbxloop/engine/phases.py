@@ -2,22 +2,26 @@
 
 Session strategy per phase (a deliberate design decision):
 
-- DECOMPOSE / PLAN / EXECUTE run with full ("auto") permissions — the
-  microVM is the security boundary. DECOMPOSE and PLAN are always fresh;
-  EXECUTE is the one phase that continues, resuming its own previous attempt
-  on a revision so the work already done is not re-derived (a replan clears
-  it — the approach that session holds is the one being discarded).
-- SCRUTINIZE / VALIDATE run as **fresh sessions in the same agent sandbox
-  with read-only permissions**: a fresh session removes conversational
-  anchoring to the executor's claims, read-only permissions stop the critic
-  from "fixing" things itself, and reusing the sandbox preserves the
-  workspace state the critic must inspect (a fresh sandbox per critic would
-  cost minutes and lose it).
-- VERIFY is mechanical — shell commands, no LLM, no opinions.
-- STEER (interactive chat) runs as a fresh read-only session, like the
-  critics: it may inspect the workspace to answer the user accurately but
-  must not "helpfully" edit anything — direction changes flow back through
-  the engine as re-plans or standing guidance, never as direct edits.
+- DECOMPOSE / BUILD run with full ("auto") permissions — the microVM is the
+  security boundary. DECOMPOSE is always fresh; BUILD plans and executes in
+  one session and is the one phase that continues, resuming its own
+  previous attempt on a revision so the work already done is not re-derived
+  (a replan clears it — the approach that session holds is the one being
+  discarded).
+- VERIFY is mechanical — shell commands, no LLM, no opinions. Its commands
+  are DECOMPOSER-authored only: the agent that does the work must never
+  author its own exam (#94), which is also why the builder is shown the
+  commands verbatim but cannot edit them.
+- STEER (interactive chat) runs as a fresh read-only session: it may
+  inspect the workspace to answer the user accurately but must not
+  "helpfully" edit anything — direction changes flow back through the
+  engine as build restarts or standing guidance, never as direct edits.
+
+There is no in-run critic. The per-task SCRUTINIZE/VALIDATE stages audited
+task completion and rubber-stamped it (6/6 pass, 5/5 accept in the measured
+baseline) while diff-level defects leaked to the PR; the adversarial review
+now lives in the daemon's post-delivery review lane, which sees the whole
+diff and can drive bounded fix rounds.
 """
 
 from __future__ import annotations
@@ -30,44 +34,14 @@ from typing import Literal, NamedTuple, TypeVar
 from pydantic import BaseModel
 
 from sbxloop.config import Config
-from sbxloop.engine.model import Issue, PlanModel, SteerVerdict, TaskGraph, TaskRecord, Verdict
+from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.verifylint import UV_LOCKFILE, gate_rule, lint_verify_commands, project_gate
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, SessionHealth
-
-
-class EvidenceCommand(NamedTuple):
-    """One mechanical command whose output is handed to the critic, with the
-    character budget its output gets in the prompt."""
-
-    label: str
-    command: str
-    limit: int = 1_500
-
-
-# The diff gets an order of magnitude more room than the other evidence
-# because it replaces work the critic would otherwise do by hand. Handing
-# over ~5k tokens of patch once is far cheaper than the ten-plus tool-call
-# turns it takes to rediscover the same thing: every turn re-sends the whole
-# session context (~22k tokens of fixed overhead measured in the field), so
-# a turn saved is worth vastly more than the bytes it costs to save it.
-DIFF_CLIP = 20_000
-
-EVIDENCE_COMMANDS: tuple[EvidenceCommand, ...] = (
-    EvidenceCommand("git status", "git status --short 2>&1 | head -50"),
-    # `git diff HEAD` (not bare `git diff`) so staged work is included — the
-    # executor is free to `git add` and frequently does, and a critic shown
-    # an empty diff concludes nothing was done.
-    EvidenceCommand("git diff", "git diff HEAD 2>&1", DIFF_CLIP),
-    EvidenceCommand(
-        "recent files",
-        "find . -type f -newer /tmp -not -path './.git/*' 2>/dev/null | head -30",
-    ),
-)
+from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, Usage
 
 OUTPUT_CLIP = 6_000
 # Verify output keeps head + tail (#253): a pytest run over hundreds of
@@ -86,38 +60,11 @@ VERIFY_FAILURE_PREFIX = "verify command failed:"
 
 # Persona label per phase prompt: stamped onto the job's agent.* events (via
 # WorkerClient.submit) so the transcript header says WHO is responding
-# (planner, executor, ...) instead of a generic "agent".
+# (decomposer, builder, ...) instead of a generic "agent".
 AGENT_NAMES = {
     "decompose": "decomposer",
-    "plan": "planner",
-    "execute": "executor",
-    "scrutinize": "scrutinizer",
-    "validate": "validator",
+    "build": "builder",
     "steer": "steering",
-}
-
-# System-message sections dropped per phase (see Budgets.trim_system_message).
-# The whole system message is re-sent on every turn of a session, so a section
-# a phase cannot act on is charged once per turn for the life of the session —
-# and turns are what a run is billed and timed by.
-#
-# Only ``code_change_rules`` (coding rules, linting/testing, ecosystem tools,
-# style) is dropped, and only from the phases that write no code: EXECUTE is
-# the sole phase with write permission, and the critics are read-only by
-# construction. Everything else stays, deliberately:
-#
-# - ``tool_instructions`` and ``tool_efficiency`` make sessions cheaper, not
-#   dearer — a critic that cannot drive its tools is the #123 failure mode.
-# - ``tone`` governs output format; a chattier reply is an ExpectedJsonMissing
-#   retry, which costs a whole extra session.
-# - ``safety`` is not worth trimming for the bytes it saves.
-PHASE_DROP_SECTIONS: dict[str, tuple[str, ...]] = {
-    "decompose": ("code_change_rules",),
-    "plan": ("code_change_rules",),
-    "execute": (),
-    "scrutinize": ("code_change_rules",),
-    "validate": ("code_change_rules",),
-    "steer": ("code_change_rules",),
 }
 
 log = get_logger(__name__)
@@ -126,24 +73,21 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 class VerifyOutcome(NamedTuple):
-    """VERIFY's result: pass/fail, failure feedback for the executor, and
-    the full command transcript — persisted on the phase row so VALIDATE
-    (including a resumed one) judges with the same evidence."""
+    """VERIFY's result: pass/fail, failure feedback for the builder, and
+    the full command transcript — persisted on the phase row so a resumed
+    run re-enters with the same evidence."""
 
     passed: bool
     feedback: str
     results: str
 
 
-class CriticOutcome(NamedTuple):
-    """A critic phase's verdict plus the tooling health of the session that
-    produced it, so the engine can persist how blind the critic actually was
-    (#123). ``downgraded`` is True when a clean verdict was replaced because
-    the session had lost its inspection tooling."""
+class PhaseSpend(NamedTuple):
+    """Model usage accumulated since the last drain — the token bill for the
+    phase attempt the engine is about to record."""
 
-    verdict: Verdict
-    health: SessionHealth | None
-    downgraded: bool
+    usage: Usage | None
+    turns: int | None
 
 
 def clip(text: str | None, limit: int = OUTPUT_CLIP) -> str:
@@ -166,7 +110,7 @@ def clip_head_tail(
 
 
 class PhaseRunner:
-    """Runs the six phases for one run against the agent sandbox's worker."""
+    """Runs the three phases for one run against the agent sandbox's worker."""
 
     def __init__(
         self,
@@ -195,12 +139,30 @@ class PhaseRunner:
         # still starts from this clone.
         self.workspace = workspace
         # Standing chat guidance (steer_run verdicts), injected into every
-        # later plan/execute prompt. The engine appends live entries and
+        # later build prompt. The engine appends live entries and
         # replays persisted ones on resume.
         self.user_guidance: list[str] = []
+        # Running usage tally across agent jobs, drained by the engine when
+        # it records a phase attempt (drain_spend) so retries and critic
+        # re-runs bill to the phase row they served.
+        self._spend_usage = Usage()
+        self._spend_turns = 0
 
     def add_guidance(self, text: str) -> None:
         self.user_guidance.append(text)
+
+    def drain_spend(self) -> PhaseSpend:
+        """Usage accumulated since the last drain (every agent job, retries
+        included), then reset. A phase that fails before being recorded leaks
+        its spend into the next drained row — accepted: the columns serve
+        aggregate per-phase accounting, not billing."""
+        spend = PhaseSpend(
+            usage=self._spend_usage if self._spend_usage != Usage() else None,
+            turns=self._spend_turns or None,
+        )
+        self._spend_usage = Usage()
+        self._spend_turns = 0
+        return spend
 
     def _guidance(self) -> str:
         return bullet_list(self.user_guidance)
@@ -219,13 +181,6 @@ class PhaseRunner:
         )
 
     # -- job plumbing ------------------------------------------------------
-
-    def _drop_sections(self, phase: str) -> list[str]:
-        """System-message sections this phase does not need, or nothing when
-        the operator has turned trimming off."""
-        if not self.config.budgets.trim_system_message:
-            return []
-        return list(PHASE_DROP_SECTIONS.get(phase, ()))
 
     def _agent_job(
         self,
@@ -248,11 +203,8 @@ class PhaseRunner:
             cwd=self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
             max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
-            drop_system_sections=self._drop_sections(phase),
-            # Only EXECUTE ever passes one. The critics are fresh by design
-            # (module docstring): a reviewer that inherited the executor's
-            # session would inherit its conclusions with it, and that
-            # independence is the loop's integrity check.
+            # Only BUILD ever passes one: a revision continues its own prior
+            # attempt's session so the work already done is not re-derived.
             resume_session_id=resume_session_id,
         )
         started = time.monotonic()
@@ -265,11 +217,14 @@ class PhaseRunner:
             permission_mode=permission_mode,
             expect=expect,
             prompt_chars=len(prompt),
-            dropped_sections=len(job.drop_system_sections) or None,
             resumed=bool(resume_session_id),
         )
         result = self.agent.submit(job, agent=agent_name)
         usage = result.usage
+        if usage is not None:
+            self._spend_usage = self._spend_usage.merged(usage)
+        if result.turns:
+            self._spend_turns += result.turns
         log.info(
             "phase.agent_done",
             run=self.run_id,
@@ -420,7 +375,7 @@ class PhaseRunner:
                 "max_tasks": str(self.config.budgets.max_tasks),
                 "project_gate": gate_rule(self.project_gate()),
             },
-            check=self._check_taskgraph_verify_commands,
+            check=self._check_taskgraph,
         )
         return graph
 
@@ -433,11 +388,12 @@ class PhaseRunner:
         """
         return project_gate(self.workspace, self.config.sandbox.gate_command)
 
-    def _check_taskgraph_verify_commands(self, graph: TaskGraph) -> None:
-        """Reject task verify commands that violate toolchain conventions,
-        and require the graph as a whole to run the project's own gate.
+    def _check_taskgraph(self, graph: TaskGraph) -> None:
+        """Reject graphs whose verify commands violate toolchain conventions
+        or whose egress is outside the operator's bounds, and require the
+        graph as a whole to run the project's own gate.
 
-        The executor cannot edit verify commands, so a bare `python -m
+        The builder cannot edit verify commands, so a bare `python -m
         pytest` from the decomposer costs a revision cycle plus an in-VM
         workaround at verify time (field failure r12ygfd7t); rejecting at
         JSON acceptance costs one retry with the rule quoted.
@@ -449,7 +405,14 @@ class PhaseRunner:
         per task for no extra signal, so one task carrying it is the
         requirement; decompositions already tend to end with a "everything
         green" task, which is exactly where it belongs.
+
+        Egress bounds are the "grant only within operator-set limits"
+        guardrail: the decomposer gets one retry to drop an out-of-bounds
+        domain (or find a baseline-reachable alternative) before the run
+        fails.
         """
+        from sbxloop.policy import effective_egress_bounds, egress_rejection
+
         problems = [
             f"- task {task.id}: {message}"
             for task in graph.tasks
@@ -466,68 +429,31 @@ class PhaseRunner:
                 "verify commands violate the sandbox's toolchain conventions:\n"
                 + "\n".join(problems)
             )
-
-    def plan(self, task: TaskRecord) -> PlanModel:
-        plan, _ = self._agent_json(
-            PlanModel,
-            "plan",
-            {
-                "outcome": self.outcome,
-                "task_id": task.spec.id,
-                "task_title": task.spec.title,
-                "task_description": task.spec.description or "(no further description)",
-                "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
-                "feedback": task.last_feedback or "(none — first attempt)",
-                "user_guidance": self._guidance(),
-            },
-            check=self._check_plan,
-        )
-        return plan
-
-    def _check_plan(self, plan: PlanModel) -> None:
-        """Semantic plan validation: egress bounds + verify-command lint."""
-        self._check_plan_egress(plan)
-        problems = self._lint_verify_commands(plan.verify_commands)
-        if problems:
-            raise ValueError(
-                "verify commands violate the sandbox's toolchain conventions:\n"
-                + "\n".join(f"- {message}" for message in problems)
-            )
-
-    def _check_plan_egress(self, plan: PlanModel) -> None:
-        """Reject plans declaring egress outside the operator's bounds.
-
-        Feeds the retry loop, so the planner gets one chance to drop the
-        domain (or find a baseline-reachable alternative) before the run
-        fails — the "grant only within operator-set limits" guardrail.
-        """
-        from sbxloop.policy import effective_egress_bounds, egress_rejection
-
         allow, deny = effective_egress_bounds(self.config)
-        problems = [
-            f"- {egress.domain}: {rejection}"
-            for egress in plan.egress
+        egress_problems = [
+            f"- task {task.id}: {egress.domain}: {rejection}"
+            for task in graph.tasks
+            for egress in task.egress
             if (rejection := egress_rejection(egress.domain, allow, deny)) is not None
         ]
-        if problems:
+        if egress_problems:
             raise ValueError(
-                "plan-declared egress is outside the operator's bounds:\n"
-                + "\n".join(problems)
+                "task-declared egress is outside the operator's bounds:\n"
+                + "\n".join(egress_problems)
                 + "\nDrop these domains from `egress` (prefer baseline-reachable hosts: "
                 "PyPI, GitHub, apt mirrors — or the well-known package registries, "
                 "which are always declarable). Only the operator can extend the "
                 "bounds, via [policy] allow in sbxloop.toml."
             )
 
-    def execute(
+    def build(
         self,
         task: TaskRecord,
-        plan: PlanModel,
         *,
         prior_report: str = "",
         resume_session_id: str | None = None,
     ) -> JobResult:
-        """Do the work for one task.
+        """Plan and do the work for one task, in one session.
 
         ``prior_report`` is what the previous attempt on this task said it
         did, and ``resume_session_id`` continues that attempt's own agent
@@ -538,20 +464,22 @@ class PhaseRunner:
         same gate from scratch (field failure rrhb28j7n/t5).
         """
         prompt = render(
-            "execute",
+            "build",
             outcome=self.outcome,
             task_id=task.spec.id,
             task_title=task.spec.title,
             task_description=task.spec.description or "(no further description)",
-            plan_steps=bullet_list(plan.steps),
-            expected_artifacts=bullet_list(plan.expected_artifacts),
+            acceptance_criteria=bullet_list(task.spec.acceptance_criteria),
+            verify_commands=bullet_list(
+                task.spec.verify_commands, empty="(no verify commands for this task)"
+            ),
             feedback=task.last_feedback or "(none — first attempt)",
             prior_attempt=clip(prior_report) or "(none — this is the first attempt)",
             user_guidance=self._guidance(),
         )
         return self._agent_job(
             prompt,
-            phase="execute",
+            phase="build",
             permission_mode="auto",
             expect="text",
             resume_session_id=resume_session_id,
@@ -573,12 +501,10 @@ class PhaseRunner:
         if task is None:
             current = "(no task is active right now — the run is between tasks)"
         else:
-            plan_steps = bullet_list(task.plan.steps) if task.plan else "(not yet planned)"
             current = (
                 f"Task {task.spec.id}: {task.spec.title} (state: {task.state}, "
                 f"revisions: {task.revisions}, replans: {task.replans})\n\n"
                 f"{task.spec.description or '(no further description)'}\n\n"
-                f"Plan steps:\n{plan_steps}\n\n"
                 f"Prior feedback:\n{task.last_feedback or '(none)'}"
             )
         verdict, _ = self._agent_json(
@@ -595,135 +521,10 @@ class PhaseRunner:
         )
         return verdict
 
-    @staticmethod
-    def verify_commands(task: TaskRecord, plan: PlanModel) -> list[str]:
-        """The exact command list VERIFY will run: spec-level checks first,
-        then the plan's, deduplicated. Shown to the scrutinizer verbatim so
-        it judges the same checks the mechanical phase runs (#231)."""
-        return list(dict.fromkeys(task.spec.verify_commands + plan.verify_commands))
-
-    def scrutinize(self, task: TaskRecord, plan: PlanModel, executor_report: str) -> CriticOutcome:
-        try:
-            evidence = self.shell_batch([item.command for item in EVIDENCE_COMMANDS])
-        except WorkerError:
-            # Evidence is best-effort context for the critic, never fatal.
-            log.warning(
-                "phase.evidence_failed",
-                run=self.run_id,
-                task=task.spec.id,
-                hint="the critic judges without repo evidence",
-                exc_info=True,
-            )
-            evidence = []
-        evidence_parts: list[str] = []
-        for item, result in zip(EVIDENCE_COMMANDS, evidence, strict=False):
-            # Head+tail rather than tail-only: a long diff's first hunk is as
-            # load-bearing as its last, and the same clip is a no-op for the
-            # short outputs, so one rule covers every evidence command.
-            output = clip_head_tail(
-                result.output, head=item.limit // 3, tail=item.limit - item.limit // 3
-            ).strip()
-            if output:
-                evidence_parts.append(f"### {item.label}\n```\n{output}\n```")
-        return self._critic_json(
-            "scrutinize",
-            {
-                "task_id": task.spec.id,
-                "task_title": task.spec.title,
-                "task_description": task.spec.description or "(no further description)",
-                "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
-                "plan_steps": bullet_list(plan.steps),
-                "prior_feedback": clip(task.last_feedback) or "(none — first attempt)",
-                "executor_report": clip(executor_report) or "(executor produced no report)",
-                "evidence": "\n\n".join(evidence_parts) or "(no evidence gathered)",
-                "verify_commands": bullet_list(
-                    self.verify_commands(task, plan), empty="(no verify commands)"
-                ),
-            },
-            allowed=("pass", "revise"),
-        )
-
-    def _critic_json(
-        self,
-        prompt_name: str,
-        context: dict[str, str],
-        *,
-        allowed: tuple[str, str],
-    ) -> CriticOutcome:
-        """Run a critic phase with the degraded-tooling guard (#123).
-
-        ``allowed`` is (clean, dirty) for the phase's verdict vocabulary. A
-        clean verdict from a session whose tool calls failed is not trusted:
-        the phase re-runs once in a fresh session that is confronted with
-        the failures and must account for the reduced coverage (a transient
-        crash gets its second chance here). If the re-run is also degraded
-        and still claims clean, the verdict is downgraded to the dirty one —
-        a critic that could not inspect the work must not green-light it.
-        Permission denials never trigger the guard: a read-only critic
-        probing ``shell`` is the barrier working as designed.
-        """
-        clean, dirty = allowed
-        verdict, result = self._critic_attempt(prompt_name, context, allowed)
-        health = result.health
-        if verdict.verdict != clean or health is None or not health.degraded:
-            return CriticOutcome(verdict, health, False)
-        preamble = (
-            "\n## Degraded tooling warning\n\n"
-            "A previous review session lost part of its inspection tooling "
-            f"({health.summary()}) and still claimed {clean!r} — that verdict "
-            "was discarded. Verify the work with the tools that DO function; "
-            f"if you cannot actually inspect it, respond {dirty!r} and say "
-            "which checks you could not perform. Do not claim verification "
-            "you could not carry out."
-        )
-        verdict, result = self._critic_attempt(prompt_name, context, allowed, preamble=preamble)
-        health = result.health
-        if verdict.verdict != clean or health is None or not health.degraded:
-            return CriticOutcome(verdict, health, False)
-        detail = (
-            f"{prompt_name} session had degraded tooling ({health.summary()}) "
-            f"and could not reliably verify the work; its {clean!r} was "
-            f"downgraded to {dirty!r}"
-        )
-        return CriticOutcome(
-            Verdict(
-                verdict=dirty,  # type: ignore[arg-type]
-                issues=[*verdict.issues, Issue(severity="high", detail=detail)],
-                feedback=(
-                    "the reviewer's session lost part of its inspection tooling "
-                    f"({health.summary()}), so the work could not be verified and "
-                    "must be treated as unreviewed. Re-check the acceptance "
-                    "criteria yourself and report concrete evidence (exact file "
-                    "paths and the relevant contents) so the work is verifiable "
-                    "even by file reads alone."
-                ),
-            ),
-            health,
-            True,
-        )
-
-    def _critic_attempt(
-        self,
-        prompt_name: str,
-        context: dict[str, str],
-        allowed: tuple[str, str],
-        *,
-        preamble: str = "",
-    ) -> tuple[Verdict, JobResult]:
-        verdict, result = self._agent_json(
-            Verdict,
-            prompt_name,
-            context,
-            permission_mode="read_only",
-            preamble=preamble,
-        )
-        if verdict.verdict not in allowed:
-            raise WorkerError(f"{prompt_name} returned invalid verdict {verdict.verdict!r}")
-        return verdict, result
-
-    def verify(self, task: TaskRecord, plan: PlanModel) -> VerifyOutcome:
-        """Run every verify command; the transcript rides on the outcome."""
-        commands = self.verify_commands(task, plan)
+    def verify(self, task: TaskRecord) -> VerifyOutcome:
+        """Run the task's decomposer-authored verify commands; the transcript
+        rides on the outcome."""
+        commands = list(dict.fromkeys(task.spec.verify_commands))
         failures: list[str] = []
         results: list[str] = []
         for result in self.shell_batch(commands) if commands else []:
@@ -738,18 +539,4 @@ class PhaseRunner:
             passed=not failures,
             feedback="\n\n".join(failures),
             results="\n\n".join(results) or "(no verify commands)",
-        )
-
-    def validate(self, task: TaskRecord, verify_results: str) -> CriticOutcome:
-        return self._critic_json(
-            "validate",
-            {
-                "outcome": self.outcome,
-                "task_id": task.spec.id,
-                "task_title": task.spec.title,
-                "task_description": task.spec.description or "(no further description)",
-                "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
-                "verify_results": verify_results,
-            },
-            allowed=("accept", "reject"),
         )

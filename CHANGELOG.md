@@ -6,22 +6,165 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The per-task pipeline is three phases, not six: DECOMPOSE → BUILD →
+  VERIFY.** PLAN and EXECUTE merged into one BUILD session that plans and
+  does the work (narrating its approach first — the chronology's plan-card
+  replacement, carried as a report excerpt on the build `phase.end`), and
+  the SCRUTINIZE and VALIDATE critics are gone along with the
+  `verify_suspect` protocol and the degraded-critic guard (#123's guard
+  protected clean critic verdicts; with no JSON critics left there is
+  nothing to guard — mechanical VERIFY fails loudly on its own, and the
+  review lane's missing-verdict handling already leaves a broken review
+  visibly un-reviewed). Rationale, measured on the `rews3ssdn` baseline:
+  the critics rubber-stamped task completion (scrutinize 6/6 pass, validate
+  5/5 accept) while the defect classes that actually leak to delivered PRs
+  are diff-level and cross-cutting — invisible to a per-task completion
+  audit by construction; meanwhile the non-executor stages cost ~35% of
+  tokens and ~43% of wall clock, much of it fresh sessions re-deriving what
+  the previous stage had already read. Adversarial review now lives solely
+  in the daemon's post-delivery review lane, which sees the whole diff and
+  drives bounded fix rounds. Consequences through the system:
+  - `verify_commands` are **decomposer-authored only** (the plan-level set
+    is gone): the agent that does the work never writes its own exam (#94),
+    and the builder is shown the commands verbatim. The wrong-exam failure
+    class formerly caught by `verify_suspect` is mitigated at authoring
+    time — plan.md's workspace-root/`sh -c`/portability rules moved into
+    decompose.md — and by the verify-exhaustion escape hatch, which now
+    restarts BUILD in a fresh session (spending a replan) instead of
+    re-planning.
+  - **Egress is task-declared**: the decompose JSON gains per-task
+    `egress`, bounds-checked at graph acceptance (one retry with the
+    operator-bounds message) and granted at BUILD entry, same grant-late
+    rationale as before.
+  - Task states are `pending/executing/verifying/done/failed/skipped`;
+    rows persisted by the six-phase pipeline are remapped at read time
+    (`planning`→`executing`, `scrutinizing`/`validating`→`verifying`), so
+    mid-flight runs resume across the upgrade with no data migration — and
+    the new vocabulary is a strict subset of the old, so a rollback can
+    still resume runs the new code wrote.
+  - `steer_task` restarts the build session with the guidance (budget-free)
+    rather than re-planning; `phase.plan`/`phase.verdict` events are gone
+    (`phase.start` was dead code and went too), the Discord plan and
+    verdict cards with them — the roster card, status line, builder prose,
+    build report excerpts, and end-of-run summary (rework now counted from
+    verify failures) remain the chronology.
+  - A fix round's seeded task now carries the operator's
+    `sandbox.gate_command` as its verify command when one is set
+    (host-authored; with none set the PR's own CI stays the mechanical
+    arbiter, which the acceptance gate already polls).
+  - `budgets.max_tool_calls_per_phase` default 40 → 60 for the merged
+    session; retune from per-phase usage data once the merged pipeline has
+    field numbers.
+
+### Removed
+
+- **The per-phase system-message trimming flag under `[budgets]`, and the
+  whole trimming code path behind it.** #386. The flag was added earlier in
+  this same unreleased cycle on the premise that the ~22k tokens of fixed
+  context riding every turn were ~62% of a run's input spend. The usage fields
+  shipped alongside it now answer that: run `rrhb28j7n` shows
+  `cache_read_tokens` is a *subset* of `input_tokens` — turn 0 writes ~20k and
+  turn 1 reads exactly that back — and 86.5% of the run's input tokens
+  (3,615,785 / 4,180,827) are cache reads (executor 91.7%, planner 83.3%,
+  validator 82.4%, scrutinizer 79.1%, decomposer 68.5%). The static
+  system-prompt prefix the flag trimmed is precisely the most-cached region,
+  and the "62% of spend" premise was 62% of *tokens*, billed at cache-read
+  rates. Left in place the flag was a trap for a future operator expecting a
+  62% reduction, so the code path is gone with it: the per-phase drop-section
+  table and the `PhaseRunner` method that consulted it, the job-request field
+  that carried the section list to the worker, the SDK `customize` branch of
+  `system_message_config` (now append-only) along with the SDK section
+  vocabulary snapshot and its lookup helper, and the `sbxloop doctor`
+  prompt-sections drift check. Prompt assembly is byte-identical to the flag's
+  default-off behaviour, so no run changes. **Breaking config change:** the
+  loader forbids unknown keys, so a config still setting that key under
+  `[budgets]` is now rejected — delete the key.
+
+### Changed
+
+- **The PR review lane hunts defects adversarially, and its briefs stop
+  pointing at tools that cannot work.** #437. `REVIEW_INSTRUCTIONS` now
+  names the defect lenses that field-verified as leaking past the pipeline
+  to outside reviewers — concurrency/locking (TOCTOU), failure ordering and
+  partial writes, input validation at trust boundaries, and cross-module
+  interaction ("walk every caller") — with an explicit "a green gate is
+  necessary, not sufficient". The review charter sends the reviewer to
+  `git diff origin/<base>...HEAD` instead of claiming `gh pr diff` works
+  (the agent sandbox holds no GitHub credential), and a review-driven fix
+  round now *quotes the standing objections into its brief*: the daemon
+  fetches the change-requesting review bodies and inline comments through
+  the github-ops sandbox (`pr_review_feedback`, latest verdict per reviewer,
+  anchors preserved) rather than telling the fix agent to run
+  `gh pr view --comments` in a sandbox where it cannot. Fix-round dispatch
+  also stops nesting one brief's boilerplate inside another's: the persisted
+  brief rides on the seeded task verbatim.
+
+### Fixed
+
+- **The end-of-run summary card is back as the thread's last post.** The
+  fix delivered for #420 (tool-call rendering) also deleted the summary
+  card machinery shipped hours earlier — `RunStats`, `summary_text`,
+  `summary_embed`, their bridge wiring and tests — without its outcome
+  calling for it; the removal was unintentional and is restored here,
+  adapted to the three-phase pipeline: the "needed work" ledger now counts
+  verify failures (there are no critic verdicts to count), and "went well"
+  reports tasks verified without revision.
+
+- **A fix round can no longer force-update a PR branch a human has taken
+  over.** #412. The daemon now baselines the branch head its own delivery
+  produced (observed on the first poll after delivering; a re-delivery
+  re-baselines) and, when a later poll sees a head it did not deliver,
+  hands the item over instead of queueing a fix round: the item is
+  abandoned out loud with the PR left open and theirs, and re-triggering
+  the source issue opts the loop back in. Previously whoever pushed last
+  won.
+
+- **Verify commands may no longer reach for the network.** #440. A
+  decomposer-authored `gh pr view … | grep -q .` failed a review task whose
+  deliverable — a local file — was present and valid, because the sandbox's
+  anonymous GitHub quota was exhausted. The verify-command lint now rejects
+  `gh` outright and `curl`/`wget` against anything but an unambiguously
+  local address (probing a server the command itself started stays legal),
+  with the rule quoted in the retry feedback and stated in the decompose
+  prompt: a verify command judges the workspace, not the network.
+
+- **Review charters are filed once, stay abandoned, and never run against a
+  PR that already merged.** #442. Filing now consults the existing
+  `daemon_reviews` record: a charter that already exists — or existed, in
+  any terminal state — for a delivery is not re-derived under a new issue
+  number, so an operator's abandon is durable and green checks become the
+  whole bar (the "no reviewer" precedent). And a charter whose PR merged or
+  closed while it waited in the queue is settled at dispatch without
+  spending an engine run — the field case burned three items and four runs
+  auditing a PR that had already landed.
+
 ### Added
 
-- **A PR someone else has taken over is handed back, not force-updated.**
-  #412. The daemon now records the head sha of every PR it delivers in
-  `daemon_pr_state` (new `head_sha` column, migrated in place on an existing
-  database; a row with no sha adopts what the first poll observes as its
-  baseline). On every review poll, before any other gate, a head the loop did
-  not produce — or the `sbxloop:hands-off` label on the PR — takes the PR out
-  of its hands. Until now nothing distinguished "this PR is waiting for me to
-  fix it" from "a human is fixing it right now": the fix round would clone
-  that branch and force-update the ref, silently replacing their work, and
-  only someone noticing and running `!sbx abandon` stopped it. The item is now
-  failed without requeue, a `✋` notification is sent, no fix round is queued,
-  the branch is never force-updated again, and the PR is left open for a
-  human. The label name is `[daemon] hands_off_label`, defaulting to
-  `sbxloop:hands-off`; setting it empty disables that half of the check.
+- **Per-phase usage columns on `phase_attempts`.** Every phase attempt row
+  now bills the tokens and model turns its agent sessions actually spent:
+  `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+  `cost`, and `turns`, populated from the worker's per-turn usage samples
+  (`JobResult` gains a `turns` count) and accumulated across JSON retries and
+  critic re-runs so a failed first attempt still bills to the phase it served.
+  Mechanical phases (verify) record NULLs. Existing state databases gain the
+  columns in place on open — the additive-migration mechanism previously
+  covering only `runs` now covers any table. This is the instrument for
+  before/after cost comparison of upcoming pipeline changes; until now
+  per-phase spend attribution required folding `agent.usage` events by
+  persona.
+
+- **`sbxloop:hands-off`, the deliberate half of the takeover guard.** #412.
+  The moved-head check hands a PR back once someone has pushed to it; the
+  new `[daemon] hands_off_label` (default `sbxloop:hands-off`, empty
+  disables) lets a human claim a delivered PR *before* touching its branch.
+  The label is read off the same `pr_state` payload the poll already
+  fetches, so it costs no extra API call, and it is checked with the
+  moved-head guard above every other acceptance gate: the item is failed
+  without requeue, a `✋` notification is sent, and no fix round ever
+  force-updates the branch. Removing the label and re-triggering the source
+  issue opts the loop back in.
 
 - **`pr_status(number)`, a concierge host tool for how a delivered PR is
   doing.** #333. "How is PR #41 doing?" now gets an answer without a
@@ -35,6 +178,66 @@ All notable changes to sbxloop are documented here. The project adheres to
   there is no merge or write path — the concierge cannot merge from chat.**
 
 ### Changed
+
+- **Run threads now show what a tool call ran and what it produced.** A bash
+  call used to render as two near-identical lines — `agent.tool_start` and
+  `agent.tool_end` — each showing an ellipsised command whose only surviving
+  text was the long, identical run path, and neither carrying the outcome, so
+  a watcher could see that `ruff` and `mypy` ran for 95 seconds without
+  learning whether they passed. Now:
+
+  - **Commands truncate informatively.** The new `sbxloop.cli.cmdfmt` collapses
+    the boilerplate `cd <absolute run path> &&` prefix to `cd $RUN &&` and, if
+    the line still exceeds `COMMAND_DISPLAY_CLIP` (160 chars, a named default),
+    elides the *longest argument tokens* rather than the middle of the whole
+    string — the leading verb always survives and every shortened token carries
+    a literal `…`, so nothing is ever cut mid-token without a marker. Applied
+    to the Discord chronology, the TUI and `sbxloop logs` alike.
+  - **One thread entry per call.** `ToolBatcher` records a start as pending
+    (emitting nothing) and writes a single line on completion — `$ bash  cd $RUN && uv run mypy  ✓ 1.5s` / `✗ exit 1 · 1.5s`. Pairing is strictly by
+    `tool_call_id`, never by comparing command text, so concurrent calls
+    finishing out of order still carry their own command; an unmatched end
+    renders from its own args. A call still in flight survives routine
+    flushes untouched (its one line lands on completion) and only the
+    run-end flush renders leftovers as `… running`, so no call is ever
+    printed twice.
+  - **Results reach the thread, bounded.** A completed call gets a ✓/✗ header
+    with its exit status and a fenced head+tail excerpt of its output, with
+    elision marked `… N lines elided …` counted from the new `output_lines`.
+    Failures get the larger budget and prefer stderr; successes are quiet by
+    default. Caps are named constants (`TOOL_OUTPUT_LINES_DEFAULT` 0,
+    `TOOL_FAIL_OUTPUT_LINES_DEFAULT` 20, `TOOL_EXCERPT_LINE_CLIP` 300,
+    `TOOL_EXCERPT_MAX_CHARS` 1200), the two line budgets are configurable as
+    `[discord] tool_output_lines` / `tool_fail_output_lines`, and the rendered
+    message is clamped to `DISCORD_MAX_MESSAGE` so nothing can overflow
+    Discord. The worker-side excerpt likewise keeps the first and last 20 lines
+    instead of a blind 1000-char tail, so the *start* of a failure survives.
+  - **Redaction is guaranteed at both ends.** Because this publishes more of
+    what a command printed, the worker redacts output and error text before
+    emission (`sbxloop_worker.secrets.redact_secrets`) and the renderer scrubs
+    every command and excerpt again with the new, idempotent
+    `sbxloop.log.redact_text` before it can reach a thread.
+  - **The protocol change is additive only.** `agent.tool_end` gained optional
+    `output_lines` and `duration_ms` (measured from the matching start);
+    nothing was removed or renamed, older workers simply omit them, and
+    consumers tolerate their absence — so `run_events`, `sbxloop logs`, the log
+    sink and checkpoint/resume all keep working and **existing chronologies
+    need no migration**. Truncation and excerpting are display-only: the stored
+    event keeps the full command and output. See `docs/worker-protocol.md` and
+    `docs/architecture.md`.
+
+- **Cost is no longer summed across turns.** #386. The Copilot SDK's
+  `AssistantUsageData.cost` is a per-turn *constant* (15.0 on every turn of
+  every session), not a delta, so folding it through `Usage.merged` turned a
+  147-turn run into `cost: 2205.0000` — a fabricated figure the concierge
+  would repeat in Discord as fact. The host no longer lifts `cost` out of
+  `agent.usage` events, `Usage.merged` carries it last-wins rather than
+  additively, and `_cost_line` renders a figure only when it is strictly
+  positive; `run_usage` and `usage_today` say "cost: not reported by the agent
+  backend" instead. The field's *unit is unknown*: a value identical on every
+  turn of every session is far more likely a premium-request multiplier or a
+  quota unit than a currency amount, so it must never be rendered as a
+  currency figure until the unit is established.
 
 - **The acceptance loop now runs its gates cheapest-first, and a fix round is
   one task.** #399 shipped the gate; this makes it efficient enough to run.
@@ -292,21 +495,6 @@ All notable changes to sbxloop are documented here. The project adheres to
     now a pure `usage_from_sdk_sample` (unit-tested despite the module being
     coverage-omitted, like `read_only_denial` before it), and `run_usage` breaks
     spend down by turns and jobs per persona.
-  - **`[budgets] trim_system_message`** (default **off**) drops the agent SDK
-    system-message sections a phase cannot act on, so they stop being re-sent
-    every turn. Deliberately narrow: only `code_change_rules`, and only from the
-    five phases that write no code — EXECUTE, the one phase with write
-    permission, keeps everything. Off by default until a field run answers two
-    questions the usage fields above now make answerable: whether that 22k is
-    billed or served from cache (an unmeasured optimisation should not be on),
-    and whether the SDK accepts the `customize` config shape — if it does not,
-    every agent job fails, and the deploy's health check would not catch it
-    because it never starts a run. `tool_instructions`/`tool_efficiency` make
-    sessions cheaper rather than dearer, `tone` governs output format (a
-    chattier reply costs a whole retry session), and `safety` is not worth
-    trimming for the bytes. `sbxloop doctor` gains a section-vocabulary drift
-    check mirroring the permission-kinds one, because a renamed section fails
-    silently — spend just returns to baseline.
   - **`[budgets] max_parallel_tasks`** (default 1) runs independent tasks
     concurrently. The task DAG already knew which tasks were independent; the
     loop walked them one at a time regardless. Readiness is now evaluated
