@@ -1233,6 +1233,7 @@ class TestRunWatches:
             # a second registration by the same person is not duplicated
             assert bridge.on_watch("r1", "Discord user `brett`") is None
             assert bridge._watchers == {"r1": ["1"]}
+            assert bridge.dstore.run_watchers("r1") == ["1"]
         finally:
             bridge.close()
 
@@ -1338,20 +1339,55 @@ class TestRunWatches:
         finally:
             bridge.close()
 
-    def test_a_restart_forgets_every_watch(self, tmp_path: Path) -> None:
-        # watches (and the requester-id map) live in bridge memory only: a
-        # freshly constructed bridge over the same state dir knows nothing,
-        # which is what the concierge's confirmation warns about.
+    def test_a_restart_reloads_every_watch(self, tmp_path: Path) -> None:
+        # watches are persisted in daemon_state: a freshly constructed bridge
+        # over the same state dir repopulates `_watchers` at startup.
         bridge, _, _ = make_bridge(tmp_path)
         bridge._remember_requester("Discord user `brett`", "1")
         assert bridge.on_watch("r1", "Discord user `brett`") is None
         assert bridge._watchers == {"r1": ["1"]}
+        assert bridge.dstore.run_watchers("r1") == ["1"]
 
         restarted, _, _ = make_bridge(tmp_path)
-        assert restarted._watchers == {}
-        note = restarted.on_watch("r1", "Discord user `brett`")
+        assert restarted._watchers == {"r1": ["1"]}
+        # the requester-id map is still memory-only, so a re-registration
+        # from a bridge that has not seen the author yet says so
+        note = restarted.on_watch("r2", "Discord user `brett`")
         assert note is not None and "mentionable id" in note
-        assert restarted._watchers == {}
+
+    def test_reloaded_watch_is_pinged_once_after_a_restart(self, tmp_path: Path) -> None:
+        first, _, _ = make_bridge(tmp_path)
+        first._remember_requester("Discord user `brett`", "1")
+        assert first.on_watch("r1", "Discord user `brett`") is None
+
+        bridge, client, _ = make_bridge(tmp_path)
+        assert bridge._watchers == {"r1": ["1"]}
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            control = client.channels[42]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert wait_for(lambda: any(s.startswith("<@1> run `r1`") for s in control.sent))
+            assert bridge._watchers == {}
+            assert wait_for(lambda: bridge.dstore.run_watchers("r1") == [])
+            # a second finish pings nobody: the persisted rows are gone too
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert not wait_for(
+                lambda: sum(1 for s in control.sent if s.startswith("<@1>")) > 1, timeout=1.0
+            )
+        finally:
+            bridge.close()
+
+    def test_watches_work_without_a_store_wired(self, tmp_path: Path) -> None:
+        bridge, _, _ = make_bridge(tmp_path)
+        bridge.dstore = None  # type: ignore[assignment]
+        bridge._remember_requester("Discord user `brett`", "1")
+        assert bridge.on_watch("r1", "Discord user `brett`") is None
+        assert bridge._watchers == {"r1": ["1"]}
+        assert bridge._take_watchers("r1") == ["1"]
+        assert bridge._take_watchers("r1") == []
 
     def test_post_failure_is_not_fatal(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)

@@ -11,8 +11,9 @@ recovery) go to the control channel itself. In the control channel,
 replying to it) talks to the **concierge** — the channel's agent
 (``sbxloop.daemon.concierge``). Its ``watch_run`` tool calls back into
 ``DiscordBridge.on_watch``, which remembers the asker's Discord id and
-@mentions them here when the run finishes; that registry is in-memory
-only, so a daemon restart forgets every watch. Routing rules live in
+@mentions them here when the run finishes; watches are persisted in
+``daemon_state`` and reloaded at startup, so a daemon restart mid-run
+still pings whoever asked. Routing rules live in
 ``sbxloop.daemon.discord_routing``.
 
 Two rules make this safe to bolt onto the engine:
@@ -222,11 +223,13 @@ class DiscordBridge:
         self._lock = threading.Lock()
         # Run watches (#335). The concierge is transport-agnostic: it hands a
         # requester *display string* to `on_watch`, and the bridge turns it
-        # back into a mentionable id through `_requester_ids`. Both live in
-        # memory only — a daemon restart forgets every registration.
+        # back into a mentionable id through `_requester_ids`. The watches are
+        # persisted in `daemon_state` and reloaded here, so a daemon restart
+        # mid-run still pings whoever asked; `_requester_ids` stays in memory.
         self._watch_lock = threading.Lock()
         self._watchers: dict[str, list[str]] = {}  # run_id -> discord user ids
         self._requester_ids: dict[str, str] = {}  # author display string -> user id
+        self._reload_watches()
         # Per-run rendering state, owned by the pump (discord thread only).
         self._batchers: dict[str, ToolBatcher] = {}
         self._digests: dict[str, ToolDigest] = {}
@@ -538,6 +541,27 @@ class DiscordBridge:
             while len(self._requester_ids) > REQUESTER_ID_CAP:
                 self._requester_ids.pop(next(iter(self._requester_ids)))
 
+    def _reload_watches(self) -> None:
+        """Repopulate `_watchers` from the store at startup, so a run started
+        before a restart still pings whoever asked. Never raises: a bad or
+        missing store leaves the bridge on its in-memory registry."""
+        store = getattr(self, "dstore", None)
+        if store is None:
+            return
+        try:
+            watches = store.all_run_watches()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("discord.watch_reload_failed", error=str(exc), exc_info=True)
+            return
+        if not watches:
+            return
+        with self._watch_lock:
+            for run_id, ids in watches.items():
+                self._watchers[run_id] = list(dict.fromkeys(ids))
+            while len(self._watchers) > WATCHERS_CAP:
+                self._watchers.pop(next(iter(self._watchers)))
+        log.info("discord.watches_reloaded", runs=len(self._watchers))
+
     def on_watch(self, run_id: str, requester: str) -> str | None:
         """Register interest in a run's outcome; the callback handed to the
         Concierge (the transport seam — the concierge never imports discord).
@@ -564,11 +588,35 @@ class DiscordBridge:
                     watchers.append(user_id)
                 while len(self._watchers) > WATCHERS_CAP:
                     self._watchers.pop(next(iter(self._watchers)))
+            self._persist_watch(run_id, user_id)
             log.info("discord.watch_registered", run=run_id, by=requester)
             return None
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("discord.watch_register_failed", run=run_id, error=str(exc), exc_info=True)
             return None
+
+    def _persist_watch(self, run_id: str, user_id: str) -> None:
+        store = getattr(self, "dstore", None)
+        if store is None:
+            return
+        try:
+            store.add_run_watch(run_id, user_id, time.time())
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("discord.watch_persist_failed", run=run_id, error=str(exc), exc_info=True)
+
+    def _take_watchers(self, run_id: str) -> list[str]:
+        """Drain both registries for a run: the in-memory entry and the
+        persisted rows, unioned and de-duplicated, order preserved. Both are
+        cleared, so a second finish for the same run pings nobody."""
+        with self._watch_lock:
+            watchers = list(self._watchers.pop(run_id, []))
+        store = getattr(self, "dstore", None)
+        if store is not None:
+            try:
+                watchers.extend(store.take_run_watchers(run_id))
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("discord.watch_take_failed", run=run_id, error=str(exc), exc_info=True)
+        return list(dict.fromkeys(watchers))
 
     def _watch_notice(
         self, run_id: str, watchers: list[str], state: str, report: RunReport, thread: Any
@@ -594,13 +642,13 @@ class DiscordBridge:
         """Ping everyone watching this run, once. `_watchers` is keyed by run
         id only: a watch asked for by work item is resolved to that item's
         newest run concierge-side, before `on_watch` is called, so there is no
-        item-id key to pop here. The pop is final — a second finish for the
-        same run pings nobody. A run that never reaches this path at all
-        (shutdown mid-run, a crash, a breaker teardown) leaves its entry
-        in `_watchers` — `WATCHERS_CAP` bounds that instead of leaking it
-        forever, evicting the oldest registrations first."""
-        with self._watch_lock:
-            watchers = self._watchers.pop(run_id, [])
+        item-id key to pop here. The drain covers the in-memory entry *and*
+        the persisted rows (a watch registered before a daemon restart), and
+        is final — a second finish for the same run pings nobody. A run that
+        never reaches this path at all (shutdown mid-run, a crash, a breaker
+        teardown) leaves its entry in `_watchers` — `WATCHERS_CAP` bounds that
+        instead of leaking it forever, evicting the oldest registrations first."""
+        watchers = self._take_watchers(run_id)
         if not watchers:
             return
         try:

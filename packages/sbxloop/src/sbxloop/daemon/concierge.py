@@ -485,8 +485,8 @@ class Concierge:
                         "Register interest in a run (or a work item, by its id) so the person "
                         "who asked is @mentioned in the control channel with the outcome when "
                         "it finishes. If the run has already finished, answers with the "
-                        "outcome immediately instead of registering. Watches are kept in "
-                        "memory only — a daemon restart forgets them."
+                        "outcome immediately instead of registering. Watches are persisted, so "
+                        "they survive a daemon restart."
                     ),
                     parameters=_schema(
                         {"run_id_or_item_id": {"type": "string"}}, ["run_id_or_item_id"]
@@ -920,8 +920,8 @@ class Concierge:
         note = self._on_watch(run_id, by)
         confirm = (
             f"watching {run_id} (state {run.state}) — I'll ping {by} in the control "
-            "channel with the outcome when it finishes. Note: watches live in memory, "
-            "so a daemon restart forgets them."
+            "channel with the outcome when it finishes. The watch is persisted, so it "
+            "survives a daemon restart."
         )
         return f"{confirm}\n{note}" if note else confirm
 

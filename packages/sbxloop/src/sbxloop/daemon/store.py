@@ -64,6 +64,18 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     value       TEXT
 );
 
+-- Who asked to be pinged when a run finishes. The bridge's watch registry
+-- is in-memory, so without this a daemon restart silently drops every
+-- pending watch — and runs last minutes to hours, exactly the window in
+-- which a restart happens.
+CREATE TABLE IF NOT EXISTS daemon_run_watches (
+    run_id     TEXT NOT NULL,
+    watcher_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(run_id, watcher_id)
+);
+CREATE INDEX IF NOT EXISTS idx_daemon_run_watches_run ON daemon_run_watches(run_id);
+
 CREATE TABLE IF NOT EXISTS daemon_backlog_filed (
     fingerprint TEXT PRIMARY KEY,
     run_id      TEXT NOT NULL,
@@ -1128,4 +1140,55 @@ class DaemonStore:
                 "(run_id, channel_id, thread_id, headline_id) VALUES (?, ?, ?, ?)",
                 (run_id, channel_id, thread_id, headline_id),
             )
+            self._conn.commit()
+
+    # -- run watches -----------------------------------------------------------
+
+    def add_run_watch(self, run_id: str, watcher_id: str, now: float) -> None:
+        """Register interest in a run's completion; idempotent per watcher."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_run_watches (run_id, watcher_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (run_id, watcher_id, now),
+            )
+            self._conn.commit()
+
+    def run_watchers(self, run_id: str) -> list[str]:
+        with self._lock:
+            return [
+                str(r["watcher_id"])
+                for r in self._conn.execute(
+                    "SELECT watcher_id FROM daemon_run_watches WHERE run_id = ? ORDER BY rowid",
+                    (run_id,),
+                )
+            ]
+
+    def take_run_watchers(self, run_id: str) -> list[str]:
+        """Return the run's watchers and clear them in one transaction."""
+        with self._lock:
+            watchers = [
+                str(r["watcher_id"])
+                for r in self._conn.execute(
+                    "SELECT watcher_id FROM daemon_run_watches WHERE run_id = ? ORDER BY rowid",
+                    (run_id,),
+                )
+            ]
+            self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
+            self._conn.commit()
+            return watchers
+
+    def all_run_watches(self) -> dict[str, list[str]]:
+        """Every pending watch, for reloading the bridge registry at startup."""
+        with self._lock:
+            watches: dict[str, list[str]] = {}
+            for r in self._conn.execute(
+                "SELECT run_id, watcher_id FROM daemon_run_watches ORDER BY rowid"
+            ):
+                watches.setdefault(str(r["run_id"]), []).append(str(r["watcher_id"]))
+            return watches
+
+    def clear_run_watch(self, run_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
             self._conn.commit()
