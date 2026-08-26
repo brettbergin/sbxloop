@@ -25,7 +25,7 @@ from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, Tas
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
-from sbxloop.gh.ops import ChecksVerdict, SubmittedReview
+from sbxloop.gh.ops import ChecksVerdict, MergeOutcome, SubmittedReview
 from tests.fakes.github_errors import field_error
 from tests.unit.test_hostgit import make_repo, make_upstream_and_clone, push_upstream_commit
 
@@ -1888,6 +1888,18 @@ class ReviewingSource(FakeSource):
         self.polls = 0
         self.merge_polls = 0
         self.reviews: list[int] = []
+        # The landing stage's view. Defaults describe a PR GitHub would merge
+        # right now, so a test only spells out the state it is about.
+        self.draft = False
+        self.node_id = "PR_node9"
+        self.mergeable: bool | None = True
+        self.mergeable_state = "clean"
+        self.undraft_ok = True
+        self.update_ok = True
+        self.merge_outcome = MergeOutcome(True, "merged01", "ok")
+        self.merges: list[tuple[int, str, str]] = []
+        self.updates: list[tuple[int, str]] = []
+        self.deleted: list[str] = []
         self.labels = GitHubLabels(
             "sbxloop:run", "sbxloop:in-progress", "sbxloop:failed", "sbxloop:backlog"
         )
@@ -1902,7 +1914,17 @@ class ReviewingSource(FakeSource):
         state = "open" if self.pr_open else "closed"
         if self.merged or not self.pr_open:
             return PrSnapshot(ChecksVerdict("pending", 0, (), ()), "NONE", self.merged, state)
-        return PrSnapshot(self.checks, self.review_state, False, state, head_sha=self.head_sha)
+        return PrSnapshot(
+            self.checks,
+            self.review_state,
+            False,
+            state,
+            head_sha=self.head_sha,
+            draft=self.draft,
+            node_id=self.node_id,
+            mergeable=self.mergeable,
+            mergeable_state=self.mergeable_state,
+        )
 
     def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
         self.merge_polls += 1
@@ -1919,6 +1941,27 @@ class ReviewingSource(FakeSource):
     def report_pr_closed(self, item: WorkItem, pr_number: int, pr_url: str) -> bool:
         self.calls.append(("pr_closed", pr_number))
         return True
+
+    def pr_ready_for_review(self, node_id: str) -> bool:
+        self.calls.append(("undraft", node_id))
+        if not self.undraft_ok:
+            return False
+        self.draft = False
+        self.mergeable_state = "clean"
+        return True
+
+    def pr_update_branch(self, pr_number: int, *, expected_head_sha: str = "") -> bool:
+        self.updates.append((pr_number, expected_head_sha))
+        return self.update_ok
+
+    def pr_merge(self, pr_number: int, *, method: str = "squash", sha: str = "") -> MergeOutcome:
+        self.merges.append((pr_number, method, sha))
+        if self.merge_outcome.merged:
+            self.merged = True
+        return self.merge_outcome
+
+    def branch_delete(self, branch: str) -> None:
+        self.deleted.append(branch)
 
 
 class TestAcceptanceGate:
@@ -2360,3 +2403,248 @@ class TestMergeWatch:
         h.source.items = [inbox_item()]
         assert h.loop.tick().outcome == "done"
         assert h.run_configs[0].github.deliver_closes is None
+
+
+class TestLandingStage:
+    """The last step out of the loop: the daemon merges the PR itself.
+
+    Reached only from the full acceptance bar — green checks AND a satisfied
+    review. Everything weaker keeps handing the PR to a human, because
+    merging is the one irreversible thing the loop does to a repository.
+    """
+
+    def _accepted(self, tmp_path: Path, **daemon: object) -> tuple[Harness, ReviewingSource]:
+        """A delivered item polled all the way to green-and-approved."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": dict({"await_review": True, "auto_merge": True}, **daemon),
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
+        assert h.loop.tick().outcome == "reviewing"
+        source.head_sha = "ours0001"
+        h.loop.tick()  # green + unreviewed: baselines the head, files the review
+        h.dstore.review_settled("gh:1", gates=True, verdict="APPROVE")
+        source.review_state = "APPROVED"
+        return h, source
+
+    def test_auto_merge_off_leaves_the_pr_to_a_human(self, tmp_path: Path) -> None:
+        """The flag is the whole feature: with it off the gate settles exactly
+        as it always did, and nothing is merged."""
+        h, source = self._accepted(tmp_path, auto_merge=False)
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert source.merges == []
+        assert any(kind == "success" for kind, _ in source.calls)
+
+    def test_a_clean_pr_is_merged_and_its_issue_closed(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        h.loop.tick()
+        assert source.merges == [(9, "squash", "ours0001")], "the judged head rides on the merge"
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert ("merged", 9) in source.calls, "the issue settles as merged, not as delivered"
+
+    def test_the_merge_method_is_the_operators(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path, merge_method="rebase")
+        h.loop.tick()
+        assert source.merges == [(9, "rebase", "ours0001")]
+
+    def test_the_branch_is_tidied_away(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        h.loop.tick()
+        assert [b.startswith("sbxloop/") for b in source.deleted] == [True]
+
+    def test_the_branch_is_kept_when_the_operator_says_so(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path, delete_branch_on_merge=False)
+        h.loop.tick()
+        assert source.deleted == []
+        assert source.merges, "the merge itself still happened"
+
+    def test_a_draft_is_undrafted_before_it_is_merged(self, tmp_path: Path) -> None:
+        """And not in the same poll: GitHub reports a draft's mergeable_state
+        as ``draft``, so what the PR's real merge state is only becomes
+        readable once it is out of draft."""
+        h, source = self._accepted(tmp_path)
+        source.draft = True
+        source.mergeable_state = "draft"
+        h.loop.tick()
+        assert ("undraft", "PR_node9") in source.calls
+        assert source.merges == [], "un-drafting and merging are separate polls"
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        h.loop.tick()
+        assert source.merges == [(9, "squash", "ours0001")]
+
+    def test_a_draft_that_will_not_clear_is_handed_over(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        source.draft = True
+        source.undraft_ok = False
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "draft status could not be cleared" in (item.last_error or "")  # type: ignore[union-attr]
+        assert source.merges == []
+
+    def test_unknown_mergeability_waits_rather_than_merging(self, tmp_path: Path) -> None:
+        """GitHub computes mergeability asynchronously and says None while it
+        is still thinking. That is not permission to merge."""
+        h, source = self._accepted(tmp_path)
+        source.mergeable = None
+        h.loop.tick()
+        assert source.merges == []
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_a_conflicted_pr_goes_back_for_a_fix_round(self, tmp_path: Path) -> None:
+        """A re-delivery rebuilds the commit on the current base, so a real
+        conflict is genuinely fixable — on the fix-round budget, because
+        unlike every other landing step it costs a whole run."""
+        h, source = self._accepted(tmp_path)
+        source.mergeable = False
+        source.mergeable_state = "dirty"
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert "conflicts with its base" in h.dstore.pr_state("gh:1").fix_brief  # type: ignore[union-attr]
+        assert source.merges == []
+
+    def test_a_behind_pr_updates_its_branch_instead_of_spending_a_run(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        before = len(h.runs)
+        source.mergeable_state = "behind"
+        h.loop.tick()
+        assert source.updates == [(9, "ours0001")], "the expected head guards the update"
+        assert source.merges == []
+        assert len(h.runs) == before, "keeping a branch current must not cost an engine run"
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and state.updates == 1 and state.landing
+
+    def test_our_own_update_commit_is_not_read_as_a_takeover(self, tmp_path: Path) -> None:
+        """#412's guard fails the item on a head it did not deliver, and an
+        update-branch moves the head by design. Without the in-flight marker
+        every PR that ever fell behind would be handed off."""
+        h, source = self._accepted(tmp_path)
+        source.mergeable_state = "behind"
+        h.loop.tick()  # asks for the update
+        source.head_sha = "updated1"  # its merge commit appears
+        source.mergeable_state = "clean"
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "done", "the update commit must not read as a takeover"  # type: ignore[union-attr]
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and not state.landing
+        assert source.merges == [(9, "squash", "updated1")], "merged at the new head"
+
+    def test_a_foreign_push_during_a_landing_still_hands_over(self, tmp_path: Path) -> None:
+        """The marker only excuses ONE head move; once it is cleared the
+        guard is back to its old self."""
+        h, source = self._accepted(tmp_path)
+        source.mergeable_state = "behind"
+        h.loop.tick()  # asks for the update
+        source.head_sha = "updated1"
+        source.mergeable_state = "clean"
+        source.merge_outcome = MergeOutcome(False, "", "head moved", stale=True)
+        h.loop.tick()  # adopts the update commit, merge races and loses
+        source.head_sha = "theirs02"
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "taken over" in (item.last_error or "")  # type: ignore[union-attr]
+
+    def test_only_one_update_is_in_flight_at_a_time(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        source.mergeable_state = "behind"
+        h.loop.tick()
+        h.loop.tick()  # head has not moved yet — do not ask again
+        assert source.updates == [(9, "ours0001")]
+
+    def test_update_attempts_are_bounded_then_handed_over(self, tmp_path: Path) -> None:
+        """A base moving faster than CI finishes would update for ever."""
+        h, source = self._accepted(tmp_path, merge_update_attempts=1)
+        source.mergeable_state = "behind"
+        h.loop.tick()  # update 1 of 1
+        source.head_sha = "updated1"
+        h.loop.tick()  # adopts it; still behind
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "behind its base" in (item.last_error or "")  # type: ignore[union-attr]
+        assert len(source.updates) == 1
+
+    def test_branch_updating_can_be_disabled_outright(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path, merge_update_attempts=0)
+        source.mergeable_state = "behind"
+        h.loop.tick()
+        assert source.updates == []
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "branch updating is disabled" in (item.last_error or "")  # type: ignore[union-attr]
+
+    def test_a_refused_update_is_not_charged_or_marked(self, tmp_path: Path) -> None:
+        """GitHub refusing the update means the PR moved under us; the next
+        poll re-reads it rather than this one inventing a verdict."""
+        h, source = self._accepted(tmp_path)
+        source.mergeable_state = "behind"
+        source.update_ok = False
+        h.loop.tick()
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and state.updates == 0 and not state.landing
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+
+    def test_a_blocked_merge_hands_over_with_the_pr_left_open(self, tmp_path: Path) -> None:
+        """A protection rule wanting an approval this identity cannot give is
+        not fixable by another round. Stop, and leave a PR a human can finish
+        in one click."""
+        h, source = self._accepted(tmp_path)
+        source.merge_outcome = MergeOutcome(
+            False, "", "Pull Request is not mergeable", blocked=True
+        )
+        h.loop.tick()
+        item = h.dstore.get("gh:1")
+        assert item.state == "abandoned"  # type: ignore[union-attr]
+        assert "not mergeable" in (item.last_error or "")  # type: ignore[union-attr]
+        assert source.deleted == [], "a PR that did not merge keeps its branch"
+
+    def test_a_stale_merge_just_waits_for_the_next_poll(self, tmp_path: Path) -> None:
+        h, source = self._accepted(tmp_path)
+        source.merge_outcome = MergeOutcome(False, "", "Head branch was modified", stale=True)
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None and state.rounds == 0, "a race costs no budget"
+
+    def test_a_merge_that_raises_costs_a_round(self, tmp_path: Path) -> None:
+        """The one outcome an unattended daemon must never produce is silence:
+        a persistently failing merge ends the way any unaccepted PR does."""
+
+        def explode(pr_number: int, **kwargs: object) -> MergeOutcome:
+            raise RuntimeError("github down")
+
+        h, source = self._accepted(tmp_path, review_rounds=1)
+        source.pr_merge = explode  # type: ignore[assignment]
+        h.loop.tick()
+        assert h.dstore.pr_state("gh:1").rounds == 1  # type: ignore[union-attr]
+        h.loop.tick()
+        assert h.dstore.get("gh:1").state == "abandoned"  # type: ignore[union-attr]
+
+    def test_green_with_no_reviewer_is_never_merged(self, tmp_path: Path) -> None:
+        """The bar for a merge is the full one. An acceptance that only ever
+        meant "green CI, and nobody could review it" is handed to a human."""
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": {"await_review": True, "auto_merge": True, "review_deliveries": False},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        source = ReviewingSource()
+        h.source = source
+        h.loop.sources = [source]
+        source.items = [WorkItem(item_id="gh:1", source="github", source_key="1", title="Do it")]
+        assert h.loop.tick().outcome == "reviewing"
+        h.loop.tick()  # green, and no review can be filed
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert source.merges == [], "no reviewer means no merge"

@@ -49,6 +49,24 @@ def field_error(name: str) -> str:
     return str(field_errors()[name]["message"])
 
 
+def worker_error(name: str) -> tuple[str, str, int]:
+    """``(type, message, status)`` as the WORKER hands them to the host.
+
+    :func:`github_error` replays a fixture at the ``GithubOps`` boundary,
+    where the message already carries the facade's own
+    ``github op <op> failed: ...`` prefix. A stub standing in for the
+    *worker* has to hand over the half before that prefix, which the facade
+    then adds back — so the error the host finally raises is the recorded
+    string, character for character, rather than a near-miss.
+    """
+    entry = field_errors()[name]
+    message = str(entry["message"])
+    match = re.match(_HOST_PREFIX, message)
+    if match is None:  # pragma: no cover - the guard test rejects such entries
+        raise AssertionError(f"{name}: fixture message is not host-prefixed: {message!r}")
+    return "GithubOpError", message[match.end() :], int(entry["status"])
+
+
 def github_error(name: str) -> GithubOpsError:
     """A GithubOpsError carrying the recorded string AND its status as
     structured data (#221) — the shape the worker really hands the host."""

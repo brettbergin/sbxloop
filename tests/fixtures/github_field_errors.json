@@ -50,6 +50,24 @@
       "status": 422,
       "provenance": "synthetic",
       "observed": "not yet captured: re-delivering a run whose PR is already open (#223; deliver.py TODO(e2e))"
+    },
+    "pr_not_mergeable_405": {
+      "message": "github op raw.api failed: GithubOpError: gh api PUT /repos/o/r/pulls/42/merge failed (rc=1): gh: Pull Request is not mergeable (HTTP 405)",
+      "status": 405,
+      "provenance": "synthetic",
+      "observed": "not yet captured: GitHub's blanket refusal for a PR it will not merge right now - a draft, a failing required check, or a protection rule wanting an approval the loop's identity cannot give. The landing stage treats it as a hand-off, not a retry."
+    },
+    "pr_head_moved_409": {
+      "message": "github op raw.api failed: GithubOpError: PUT https://api.github.com/repos/o/r/pulls/42/merge -> HTTP 409: {\"message\":\"Head branch was modified. Review and try the merge again.\"}",
+      "status": 409,
+      "provenance": "synthetic",
+      "observed": "not yet captured: the head moved between the poll that judged the PR green and the merge that acted on it, which is why the merge always sends the sha it decided against."
+    },
+    "update_branch_refused_422": {
+      "message": "github op raw.api failed: GithubOpError: gh api PUT /repos/o/r/pulls/42/update-branch failed (rc=1): gh: merge conflict between base and head (HTTP 422)",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: GitHub's answer when a branch cannot be updated - already current, expected_head_sha stale, or the update itself would conflict."
     }
   }
 }

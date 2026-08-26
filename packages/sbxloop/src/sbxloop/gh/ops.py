@@ -13,6 +13,7 @@ from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel
 
+from sbxloop.config import MergeMethod
 from sbxloop.errors import GithubOpsError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
@@ -41,6 +42,27 @@ ReviewEvent = Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"]
 
 # Folded verdict of a head commit's check runs.
 CheckState = Literal["pending", "red", "green"]
+
+
+class MergeOutcome(NamedTuple):
+    """The result of asking GitHub to merge a PR.
+
+    ``blocked`` is the one refusal that is an *answer* rather than an error:
+    GitHub says 405 for every "this PR is not mergeable right now" — a draft,
+    a failing required check, a protection rule wanting an approval this
+    identity cannot give. None of those is fixable by retrying, so the caller
+    hands the PR to a human instead of spinning.
+
+    ``stale`` is 409: the head moved between the poll that decided to merge
+    and the merge itself. That is a race, not a refusal, and the next poll
+    re-decides against the new head.
+    """
+
+    merged: bool
+    sha: str
+    reason: str
+    blocked: bool = False
+    stale: bool = False
 
 
 class ReviewComment(BaseModel):
@@ -338,6 +360,130 @@ class GithubOps:
                 ),
             )
             return submit("COMMENT")
+
+    # -- landing a pull request ---------------------------------------------
+    #
+    # The last stretch of an autonomous run: take the delivery out of draft,
+    # keep it current with its base, and merge it. Same `raw.api` rationale as
+    # the review block above — no request shaping the generic transport does
+    # not already do, so no new worker op.
+
+    # REST cannot un-draft a pull request; `markPullRequestReadyForReview` is
+    # the only path GitHub offers, so this one call is GraphQL. Both worker
+    # transports reach it unchanged: `gh api -X POST /graphql --input -` and
+    # the stdlib client both POST this body to the same endpoint.
+    _READY_MUTATION = (
+        "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) "
+        "{ pullRequest { isDraft } } }"
+    )
+
+    def pr_ready_for_review(self, node_id: str) -> bool:
+        """Take a draft PR out of draft; True when it is now ready.
+
+        GraphQL answers a failed mutation with **a 200 status and an ``errors``
+        array**, so unlike every other call here the status is not the verdict
+        and the body has to be read. Trusting the status would report a PR as
+        ready that is still a draft, and a draft cannot be merged — the loop
+        would then spend its whole merge budget on a refusal it caused itself.
+        """
+        data = self.raw(
+            "POST", "/graphql", {"query": self._READY_MUTATION, "variables": {"id": node_id}}
+        )
+        if not isinstance(data, dict):
+            raise GithubOpsError(
+                f"markPullRequestReadyForReview returned a malformed result: {data!r}"
+            )
+        errors = data.get("errors")
+        if errors:
+            raise GithubOpsError(f"markPullRequestReadyForReview failed: {errors!r}")
+        result = ((data.get("data") or {}).get("markPullRequestReadyForReview") or {}).get(
+            "pullRequest"
+        )
+        # A mutation that reported no error but also no pull request is not an
+        # answer we can act on; fail closed rather than assume it worked.
+        if not isinstance(result, dict) or "isDraft" not in result:
+            raise GithubOpsError(
+                f"markPullRequestReadyForReview returned no pull request: {data!r}"
+            )
+        return not bool(result["isDraft"])
+
+    def pr_merge(
+        self,
+        repo: str,
+        number: int,
+        *,
+        method: MergeMethod = "squash",
+        sha: str = "",
+        title: str = "",
+        message: str = "",
+    ) -> MergeOutcome:
+        """Merge a PR. ``sha`` is the head the caller decided against.
+
+        Sending ``sha`` makes a concurrent push lose the race with a 409
+        instead of being merged over: the poll that judged this PR green read
+        one head, and anything else on the branch by now has not been judged
+        at all. See :class:`MergeOutcome` for why 405 and 409 come back as
+        data rather than exceptions.
+        """
+        body: dict[str, Any] = {"merge_method": method}
+        if sha:
+            body["sha"] = sha
+        if title:
+            body["commit_title"] = title
+        if message:
+            body["commit_message"] = message
+        try:
+            data = self.raw("PUT", f"/repos/{repo}/pulls/{number}/merge", body)
+        except GithubOpsError as exc:
+            if exc.http_status == 405:
+                return MergeOutcome(False, "", str(exc), blocked=True)
+            if exc.http_status == 409:
+                return MergeOutcome(False, "", str(exc), stale=True)
+            raise
+        if not isinstance(data, dict) or not data.get("merged"):
+            # A 200 that does not claim a merge is not one. Treat it as
+            # blocked: something about the PR said no, and no retry fixes it.
+            return MergeOutcome(False, "", f"merge was not confirmed: {data!r}", blocked=True)
+        return MergeOutcome(True, str(data.get("sha") or ""), str(data.get("message") or "merged"))
+
+    def pr_update_branch(self, repo: str, number: int, *, expected_head_sha: str = "") -> bool:
+        """Merge the base branch into the PR's branch; True when accepted.
+
+        Needed wherever protection requires branches to be up to date before
+        merging. GitHub answers 202 with a message and **not** the new head
+        sha, so the caller cannot record what this produced — it has to
+        observe the branch on its next poll.
+        """
+        body: dict[str, Any] = {}
+        if expected_head_sha:
+            body["expected_head_sha"] = expected_head_sha
+        try:
+            self.raw("PUT", f"/repos/{repo}/pulls/{number}/update-branch", body)
+        except GithubOpsError as exc:
+            # 422 is GitHub's answer for "the branch cannot be updated" —
+            # already current, or the expected head moved. Neither is worth
+            # raising over: the next poll re-reads the PR either way.
+            if exc.http_status == 422:
+                log.info("gh.update_branch_refused", repo=repo, pr=number, detail=str(exc))
+                return False
+            raise
+        return True
+
+    def branch_delete(self, repo: str, branch: str) -> None:
+        """Delete a branch ref, tolerating one that is already gone.
+
+        Best-effort tidying after a merge: a repository with
+        ``delete_branch_on_merge`` on has already removed it (404), and a
+        protected branch refuses (422). Neither should be reported as a
+        failure of the merge that just succeeded.
+        """
+        try:
+            self.raw("DELETE", f"/repos/{repo}/git/refs/heads/{branch}")
+        except GithubOpsError as exc:
+            if exc.http_status in (404, 422):
+                log.debug("gh.branch_already_gone", repo=repo, branch=branch, detail=str(exc))
+                return
+            raise
 
     def contents_read(self, repo: str, path: str, ref: str | None = None) -> str:
         params: dict[str, Any] = {"repo": repo, "path": path}
