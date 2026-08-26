@@ -894,6 +894,13 @@ class DaemonStore:
         pushing to the same branch) must not reset the round count, which is
         the only thing bounding the loop. It does re-arm the merge watch —
         a fresh delivery means there is a PR to watch again.
+
+        It also clears ``delivered_head`` and ``landing`` together, for one
+        reason: the branch this row was tracking no longer exists as it was.
+        A landing marker that outlived the round it was set in would excuse
+        the *next* head move too, and the next head move might be a human's
+        — which is the whole thing #412's takeover guard exists to catch.
+        ``updates`` deliberately survives, like ``rounds``: it is a budget.
         """
         with self._lock:
             self._conn.execute(
@@ -901,7 +908,7 @@ class DaemonStore:
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
                 "pr_number = excluded.pr_number, branch = excluded.branch, "
                 "updated_at = excluded.updated_at, pr_url = excluded.pr_url, "
-                "settled = 0, merged_at = NULL, delivered_head = NULL",
+                "settled = 0, merged_at = NULL, delivered_head = NULL, landing = 0",
                 (item_id, pr_number, branch, now, url),
             )
             self._conn.commit()

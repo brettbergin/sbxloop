@@ -473,3 +473,19 @@ class TestLandingRows:
         state = reopened.pr_state("gh:7")
         assert state is not None and state.updates == 0 and state.landing is False
         assert state.pr_number == 9, "the pre-existing row survived"
+
+    def test_a_re_delivery_clears_the_marker_but_keeps_the_budget(self, tmp_path: Path) -> None:
+        """A fix round rewrites the branch, so an update-branch that was in
+        flight against the old one is moot. Leaving the marker up would
+        excuse the next head move as ours — and the next one could be a
+        human's. The spend, like `rounds`, survives the round."""
+        store = self._armed(tmp_path)
+        store.set_delivered_head("gh:7", "aaa")
+        store.bump_pr_update("gh:7")
+        store.set_landing("gh:7", True)
+        store.record_delivery("gh:7", 9, "sbxloop/r1", 3.0, url="https://x/pull/9")
+        state = store.pr_state("gh:7")
+        assert state is not None
+        assert not state.landing, "a stale marker disarms the takeover guard"
+        assert state.delivered_head is None
+        assert state.updates == 1, "the update budget is not refunded by a fix round"

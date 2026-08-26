@@ -2629,6 +2629,32 @@ class TestLandingStage:
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "abandoned"  # type: ignore[union-attr]
 
+    def test_a_fix_round_during_a_landing_re_arms_the_takeover_guard(self, tmp_path: Path) -> None:
+        """The base can move again — into a real conflict — while an
+        update-branch is still in flight. The fix round that resolves it
+        rewrites the branch, so the marker set against the old one is moot.
+        If it survived the re-delivery it would excuse the NEXT head move
+        too, and that one could be a human's push.
+        """
+        h, source = self._accepted(tmp_path)
+        source.mergeable_state = "behind"
+        h.loop.tick()  # asks for the update; the marker goes up
+        assert h.dstore.pr_state("gh:1").landing  # type: ignore[union-attr]
+        # Before its commit appears, the base moves again and conflicts.
+        source.mergeable, source.mergeable_state = False, "dirty"
+        h.loop.tick()
+        assert h.dstore.pr_state("gh:1").fix_brief, "the conflict costs a round"  # type: ignore[union-attr]
+        # The round rebuilds the branch and delivers it again.
+        h.dstore.record_delivery("gh:1", 9, "sbxloop/r1", h.clock.t, url="https://x/pull/9")
+        h.dstore.mark_reviewing("gh:1", h.clock.t)
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None
+        assert not state.landing, "a marker that outlives its branch disarms the guard"
+        assert state.updates == 1, "the update budget is not refunded by a fix round"
+        # From here the guard is its old self: the next head the poll sees is
+        # baselined as the re-delivery's, and a later stranger's push is a
+        # takeover again — which is what TestAcceptanceGate already pins.
+
     def test_green_with_no_reviewer_is_never_merged(self, tmp_path: Path) -> None:
         """The bar for a merge is the full one. An acceptance that only ever
         meant "green CI, and nobody could review it" is handed to a human."""
