@@ -47,7 +47,7 @@ from sbxloop.daemon.discord_format import (
     summary_embed,
     summary_text,
 )
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
 from sbxloop.events import Event
 
 
@@ -1229,3 +1229,68 @@ class TestOldWorkerEventCompatibility:
             "bash", 1, "x" * 200000 + "\n" + "y\n" * 5000, success=False, max_lines=200
         )
         assert chunk is not None and len(chunk.text) <= DISCORD_MAX_MESSAGE
+
+
+class TestReviewReporting:
+    """#469: a review run files no backlog issues, so the audit wording made
+    a REQUEST_CHANGES with eleven inline comments read as "no findings"."""
+
+    item = WorkItem(item_id="gh:467", source="github", source_key="467", title="R", kind="audit")
+
+    def _report(self, review: ReviewOutcome) -> RunReport:
+        return RunReport("r1", "completed", "4/4 tasks done", review=review)
+
+    def test_request_changes_posted_as_non_gating_comment(self) -> None:
+        review = ReviewOutcome(
+            pr_number=463,
+            url="https://github.com/o/r/pull/463#pullrequestreview-1",
+            requested_event="REQUEST_CHANGES",
+            posted_event="COMMENT",
+            comments=11,
+            gates_merge=False,
+        )
+        report = self._report(review)
+        summary = findings_summary(report, repo="o/r", kind="audit")
+        assert summary == (
+            "review requested changes · 11 inline comment(s)"
+            " · <https://github.com/o/r/pull/463#pullrequestreview-1>"
+            " · ⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
+            " so nothing on the PR blocks the merge"
+        )
+        card = finish_embed(self.item, report, "completed", repo="o/r")
+        field = {n: v for n, v, _ in card.fields}["Review"]
+        assert field == (
+            "[requested changes · 11 inline comment(s)]"
+            "(https://github.com/o/r/pull/463#pullrequestreview-1)\n"
+            "⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
+            " so nothing on the PR blocks the merge"
+        )
+        # The whole point of the bug: never claim a clean PR here.
+        assert "no findings" not in summary
+        assert not any("no findings" in v for _, v, _ in card.fields)
+
+    def test_approve_with_zero_comments_reads_as_a_clean_review(self) -> None:
+        review = ReviewOutcome(
+            pr_number=470,
+            url="https://github.com/o/r/pull/470#pullrequestreview-9",
+            requested_event="APPROVE",
+            posted_event="APPROVE",
+            comments=0,
+            gates_merge=True,
+        )
+        report = self._report(review)
+        summary = findings_summary(report, repo="o/r", kind="audit")
+        assert summary == (
+            "review approved · no comments · <https://github.com/o/r/pull/470#pullrequestreview-9>"
+        )
+        assert "no findings" not in summary
+        card = finish_embed(self.item, report, "completed", repo="o/r")
+        assert {n: v for n, v, _ in card.fields}["Review"] == (
+            "[approved · no comments](https://github.com/o/r/pull/470#pullrequestreview-9)"
+        )
+
+    def test_audit_without_a_review_keeps_its_wording(self) -> None:
+        none = RunReport("r1", "completed", "x")
+        assert findings_summary(none, kind="audit") == "no findings"
+        card = finish_embed(self.item, none, "completed", repo="o/r")
+        assert card.fields == (("Filed", "no findings", True),)

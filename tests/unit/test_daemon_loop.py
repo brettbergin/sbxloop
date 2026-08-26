@@ -19,6 +19,7 @@ from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
 from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.review import PostedReview
 from sbxloop.daemon.sources import GitHubLabels, PrSnapshot
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
@@ -1846,9 +1847,14 @@ class TestReviewGoesToThePr:
         h.dstore.record_review("rorigin01", 7, "gh:391", 0.0)
         posted: list[tuple[int, str]] = []
 
-        def post_review(run: object, pr_number: int, origin_run_id: str) -> SubmittedReview:
+        def post_review(run: object, pr_number: int, origin_run_id: str) -> PostedReview:
             posted.append((pr_number, origin_run_id))
-            return SubmittedReview("https://gh/r/1", "REQUEST_CHANGES")
+            return PostedReview(
+                SubmittedReview("https://gh/r/1", "COMMENT"),
+                "REQUEST_CHANGES",
+                11,
+                pr_number,
+            )
 
         h.source.post_review = post_review  # type: ignore[attr-defined]
         return h, posted
@@ -1860,6 +1866,27 @@ class TestReviewGoesToThePr:
         assert posted == [(7, "rorigin01")]
         report = h.source.calls[-1][1]
         assert report.filed == (), "a review must not file issues for its findings"
+
+    def test_the_report_carries_the_review_outcome(self, tmp_path: Path) -> None:
+        """#469: a review files no issues, so the summary must report on the
+        review itself — verdict, comment count, url, and whether it gates."""
+        h, _ = self._reviewed(tmp_path)
+        assert h.loop.tick().outcome == "done"
+        outcome = h.source.calls[-1][1].review
+        assert outcome is not None
+        assert outcome.pr_number == 7
+        assert outcome.url == "https://gh/r/1"
+        assert outcome.requested_event == "REQUEST_CHANGES"
+        assert outcome.posted_event == "COMMENT"
+        assert outcome.comments == 11
+        assert outcome.gates_merge is False
+        assert outcome.approved is False
+
+    def test_an_ordinary_item_has_no_review_outcome(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        assert h.loop.tick().outcome == "done"
+        assert h.source.calls[-1][1].review is None
 
     def test_an_ordinary_item_is_untouched(self, tmp_path: Path) -> None:
         """No review recorded for this item, so the backlog lane runs as

@@ -411,7 +411,12 @@ and branch as links; verify failures, worker errors, denied permissions and
 refused egress called out; and a finished report card (the headline turns
 ✅/❌/⚠) that also names what the run filed — an audit's findings, linked
 (`Filed`, `Upstream` for findings routed to `[daemon] tool_repo`, or
-`no findings`). Audit-lane notices in the control channel follow the same
+`no findings`). A review run reports its review instead — its deliverable is
+never a filed issue, so the card and notice name the verdict, the inline
+comment count and a link to the posted review (`review requested changes · 11 inline comment(s)`), plus an explicit warning when GitHub refused the
+requested event and the review went up as a non-gating `COMMENT` that blocks
+nothing. `no findings` is audit-lane wording only and never appears for a
+review. Audit-lane notices in the control channel follow the same
 shape — `🔎 audit #701 filed for charter flakes · audit: flakes`,
 `🔎 review #801 filed for PR #9 · gh:4`, `🔎 post-mortem #901 filed for gh:4 · abandoned: …`, `✅ gh:9 done (2/2 tasks done) · filed #50` — with every
 issue number a link. Mentions are always disabled, so model output can never ping the

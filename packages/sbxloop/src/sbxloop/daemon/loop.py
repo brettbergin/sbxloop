@@ -48,9 +48,9 @@ from sbxloop.daemon.discord_format import (
     refs_text,
 )
 from sbxloop.daemon.logsink import event_log_subscriber
-from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
+from sbxloop.daemon.model import ReviewOutcome, RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.postmortem import build_dossier
-from sbxloop.daemon.review import fix_brief, fix_tasks
+from sbxloop.daemon.review import PostedReview, fix_brief, fix_tasks
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore, PrState
 from sbxloop.engine.engine import LoopEngine
@@ -71,7 +71,6 @@ from sbxloop.errors import (
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
-from sbxloop.gh.ops import SubmittedReview
 from sbxloop.ids import branch_name, new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -146,6 +145,21 @@ _TERMINAL_ITEM_STATES = frozenset({"done", "failed", "abandoned", "cancelled"})
 # Merges are human-paced (hours to days), so a five-minute floor keeps the
 # watch responsive without spending a GitHub read per PR per tick.
 _MERGE_POLL_MIN_S = 300.0
+
+
+def _review_outcome(posted: PostedReview | None) -> ReviewOutcome | None:
+    """The run report's view of a posted review — None when the item was
+    not a review, which leaves patch and audit reports untouched."""
+    if posted is None:
+        return None
+    return ReviewOutcome(
+        pr_number=posted.pr_number,
+        url=posted.url,
+        requested_event=posted.requested_event,
+        posted_event=posted.event,
+        comments=posted.comments,
+        gates_merge=posted.gates_merge,
+    )
 
 
 class DaemonLoop:
@@ -984,7 +998,10 @@ class DaemonLoop:
             filed = [] if posted is not None else self._collect_backlog(run_id, source)
             tool = self._collect_tool_findings(run_id, source)
             report = report._replace(
-                filed=tuple(filed), tool_filed=tuple(tool.filed), tool_noted=tuple(tool.unfiled)
+                filed=tuple(filed),
+                tool_filed=tuple(tool.filed),
+                tool_noted=tuple(tool.unfiled),
+                review=_review_outcome(posted),
             )
             self.dstore.finish_ledger(run_id, "done", now)
             if self._consecutive_failures:
@@ -1019,6 +1036,11 @@ class DaemonLoop:
                 tasks=report.task_summary,
                 pr=report.delivery[1] if report.delivery else None,
                 filed=len(report.filed),
+                # A review item files nothing, so `filed=0` alone read as
+                # "no findings"; the verdict is its real outcome (#469).
+                verdict=report.review.requested_event if report.review else None,
+                comments=report.review.comments if report.review else None,
+                gates_merge=report.review.gates_merge if report.review else None,
                 attempt=item.attempts,
             )
             return "done"
@@ -2029,7 +2051,7 @@ class DaemonLoop:
                 continue
             self.dstore.touch_merge_check(item_id, now)
 
-    def _post_review(self, item: WorkItem, run_id: str) -> SubmittedReview | None:
+    def _post_review(self, item: WorkItem, run_id: str) -> PostedReview | None:
         """Post this run's review to the PR it reviewed, when it is one.
 
         Returns None for every item that is not a review, which is what
@@ -2080,7 +2102,7 @@ class DaemonLoop:
             verdict=posted.event,
             gates_merge=posted.gates_merge,
         )
-        assert isinstance(posted, SubmittedReview)
+        assert isinstance(posted, PostedReview)
         return posted
 
     def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:

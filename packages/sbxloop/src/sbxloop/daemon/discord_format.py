@@ -41,7 +41,7 @@ from sbxloop.cli.tui import (
     TOOL_ARGS_LINE_CLIP,
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.log import redact_text
 
@@ -1375,10 +1375,15 @@ def finish_embed(
         fields.append(("PR", link(f"#{report.delivery[0]}", report.delivery[1]), True))
     # What the run filed is an audit's deliverable (and a patch run's side
     # findings): show it where the PR is shown.
-    if report.filed:
+    if report.review is not None:
+        # A review's deliverable is the review, not filed issues (#469).
+        fields.append(("Review", _review_field(report.review), False))
+    elif report.filed:
         fields.append(("Filed", refs_text(report.filed, repo), True))
     elif item.kind == "audit":
         fields.append(("Filed", "no findings", True))
+    if report.review is not None and report.filed:
+        fields.append(("Filed", refs_text(report.filed, repo), True))
     if report.tool_filed:
         fields.append(("Upstream", refs_text(report.tool_filed, repo), True))
     if report.tool_noted:
@@ -1790,10 +1795,48 @@ def filed_notice(
     return text
 
 
+def _review_verdict(review: ReviewOutcome) -> str:
+    return "approved" if review.approved else "requested changes"
+
+
+def _review_comments(n: int) -> str:
+    return "no comments" if n == 0 else f"{n} inline comment(s)"
+
+
+def _non_gating_note(review: ReviewOutcome) -> str:
+    """The operator needs to know a `request_changes` review does not block
+    the merge, which is only true when GitHub refused the requested event."""
+    return (
+        f"⚠ posted as a non-gating {code(review.posted_event)} — "
+        f"{code(review.requested_event)} was refused, so nothing on the PR blocks the merge"
+    )
+
+
+def review_summary(review: ReviewOutcome) -> str:
+    """The ``·``-joinable tail describing a posted review."""
+    parts = [f"review {_review_verdict(review)}", _review_comments(review.comments)]
+    if review.url:
+        parts.append(nolink(review.url))
+    if not review.gates_merge:
+        parts.append(_non_gating_note(review))
+    return " · ".join(parts)
+
+
+def _review_field(review: ReviewOutcome) -> str:
+    head = f"{_review_verdict(review)} · {_review_comments(review.comments)}"
+    text = link(head, review.url) if review.url else head
+    if not review.gates_merge:
+        text += f"\n{_non_gating_note(review)}"
+    return text
+
+
 def findings_summary(report: RunReport, *, repo: str | None = None, kind: str = "patch") -> str:
     """The ``·``-joinable tail saying what a run filed; empty when a patch
-    run filed nothing, ``no findings`` when an audit did."""
+    run filed nothing, ``no findings`` when an audit did. A review run
+    reports its review instead — its deliverable is never a filed issue."""
     parts = []
+    if report.review is not None:
+        parts.append(review_summary(report.review))
     if report.filed:
         parts.append(f"filed {refs_text(report.filed, repo)}")
     if report.tool_filed:
@@ -1803,7 +1846,7 @@ def findings_summary(report: RunReport, *, repo: str | None = None, kind: str = 
             f"noted {len(report.tool_noted)} finding(s) about sbxloop — "
             "set `[daemon] tool_repo` to file them upstream"
         )
-    if not parts and kind == "audit":
+    if not parts and kind == "audit" and report.review is None:
         return "no findings"
     return " · ".join(parts)
 

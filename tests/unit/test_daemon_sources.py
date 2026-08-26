@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
 from sbxloop.daemon.sources import (
     CLAIM_MARKER,
     GitHubIssueSource,
@@ -407,6 +407,40 @@ class TestGitHubSource:
         item = self.make(ops).poll()[0]
         self.make(ops).report_success(item, report())
         assert any("filed no findings" in body for _, body in ops.comments)
+
+    def test_review_item_reports_verdict_not_findings(self) -> None:
+        ops = RecordingOps({"5": issue(5, "sbxloop:audit")})
+        item = self.make(ops).poll()[0]
+        outcome = ReviewOutcome(
+            pr_number=463,
+            url="https://x/pull/463#pullrequestreview-1",
+            requested_event="REQUEST_CHANGES",
+            posted_event="COMMENT",
+            comments=11,
+            gates_merge=False,
+        )
+        self.make(ops).report_success(item, report(review=outcome, delivery=None))
+        body = "\n".join(b for _, b in ops.comments)
+        assert "no findings" not in body
+        assert "Review requested changes on PR #463 with 11 inline comment(s)" in body
+        assert "https://x/pull/463#pullrequestreview-1" in body
+        assert "non-gating COMMENT" in body and "REQUEST_CHANGES was refused" in body
+
+    def test_review_item_clean_approval_reads_clearly(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:audit")})
+        item = self.make(ops).poll()[0]
+        outcome = ReviewOutcome(
+            pr_number=9,
+            url="https://x/pull/9#r2",
+            requested_event="APPROVE",
+            posted_event="APPROVE",
+            comments=0,
+            gates_merge=True,
+        )
+        self.make(ops).report_success(item, report(review=outcome, delivery=None))
+        body = "\n".join(b for _, b in ops.comments)
+        assert "Review approved on PR #9 with no inline comments" in body
+        assert "no findings" not in body and "non-gating" not in body
 
     def test_claim_reverifies_then_swaps_labels_and_comments(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})
