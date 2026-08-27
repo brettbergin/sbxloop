@@ -2083,16 +2083,18 @@ class DaemonLoop:
         A protection rule wanting an approval this identity cannot give, a
         base that keeps moving, a draft that would not clear — none of these
         is fixable by another round, so the item stops here rather than
-        spending its budget on a refusal. The PR is left OPEN and out of
-        draft: everything a human needs to finish it themselves is done.
+        spending its budget on a refusal. The PR is left OPEN either way, but
+        its draft/behind status is whatever it was when this fired — a draft
+        that would not clear stays a draft, and a base that outran the update
+        budget stays behind — so a human may still have that one step left
+        before merging.
         """
         self.dstore.mark_failed(
             item.item_id, f"PR #{state.pr_number} could not be merged: {why}", now, requeue=False
         )
         self._notify(
             f"✋ {item.item_id}: PR #{state.pr_number} passed its checks and review but "
-            f"GitHub would not merge it — {why}. Handing it over; the PR is open and "
-            "ready to merge by hand.",
+            f"GitHub would not merge it — {why}. Handing it over for a human to finish.",
             "land.blocked",
             level="error",
             item=item.item_id,
