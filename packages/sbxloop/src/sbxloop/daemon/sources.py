@@ -28,12 +28,13 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 from urllib.parse import quote
 
+from sbxloop.config import MergeMethod
 from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
 from sbxloop.daemon.postmortem import postmortem_marker
 from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, collect_review
 from sbxloop.engine.model import RunRecord
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import ChecksVerdict, GithubOps, SubmittedReview
+from sbxloop.gh.ops import ChecksVerdict, GithubOps, MergeOutcome, SubmittedReview
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -300,6 +301,20 @@ class PrSnapshot(NamedTuple):
     # merged/closed PRs, whose snapshot skips the read). Feeds the takeover
     # guard (#412).
     head_sha: str = ""
+    # What the landing stage needs, all of it already in the `pr_get` payload
+    # the checks read costs anyway — no extra request.
+    #
+    # A draft cannot be merged, so `draft` is what tells the loop to un-draft
+    # first; `node_id` is the handle the GraphQL mutation that does it takes.
+    draft: bool = False
+    node_id: str = ""
+    # GitHub computes mergeability asynchronously and reports None while it is
+    # still thinking. That is deliberately NOT False: "we do not know yet"
+    # must read as wait, the same way a pending check does, or the loop calls
+    # a PR conflicted on the strength of an answer nobody gave.
+    mergeable: bool | None = None
+    # `clean` | `behind` | `dirty` | `blocked` | `unstable` | `unknown`.
+    mergeable_state: str = ""
 
 
 class GitHubIssueSource:
@@ -874,8 +889,17 @@ class GitHubIssueSource:
             # and the gate must not read that as permission to merge.
             else ChecksVerdict("pending", 0, ("unknown head commit",), ())
         )
+        raw_mergeable = pr.get("mergeable")
         return PrSnapshot(
-            checks, self._ops().pr_review_state(self.repo, pr_number), merged, state, head_sha=sha
+            checks,
+            self._ops().pr_review_state(self.repo, pr_number),
+            merged,
+            state,
+            head_sha=sha,
+            draft=bool(pr.get("draft")),
+            node_id=str(pr.get("node_id") or ""),
+            mergeable=raw_mergeable if isinstance(raw_mergeable, bool) else None,
+            mergeable_state=str(pr.get("mergeable_state") or ""),
         )
 
     def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
@@ -887,6 +911,27 @@ class GitHubIssueSource:
         """
         pr = self._ops().pr_get(self.repo, pr_number)
         return bool(pr.get("merged")), str(pr.get("state") or "")
+
+    def pr_ready_for_review(self, node_id: str) -> bool:
+        """Take the delivery out of draft. Raises; the caller hands off."""
+        return self._ops().pr_ready_for_review(node_id)
+
+    def pr_update_branch(self, pr_number: int, *, expected_head_sha: str = "") -> bool:
+        """Merge the base branch into the PR's branch; False when refused."""
+        return self._ops().pr_update_branch(
+            self.repo, pr_number, expected_head_sha=expected_head_sha
+        )
+
+    def pr_merge(
+        self, pr_number: int, *, method: MergeMethod = "squash", sha: str = ""
+    ) -> MergeOutcome:
+        """Merge the PR at ``sha``. No commit title or message is sent, so
+        the repository's own merge-commit settings decide the wording."""
+        return self._ops().pr_merge(self.repo, pr_number, method=method, sha=sha)
+
+    def branch_delete(self, branch: str) -> None:
+        """Tidy a merged PR's branch away; already-gone is not a failure."""
+        self._ops().branch_delete(self.repo, branch)
 
     def pr_review_feedback(self, pr_number: int) -> str:
         """The objections standing on a PR, as text a fix round can act on.
