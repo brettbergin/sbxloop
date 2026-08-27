@@ -28,12 +28,13 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 from urllib.parse import quote
 
-from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
+from sbxloop.config import MergeMethod
+from sbxloop.daemon.model import ItemKind, ReviewOutcome, RunReport, WorkItem
 from sbxloop.daemon.postmortem import postmortem_marker
-from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, collect_review
+from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, PostedReview, collect_review
 from sbxloop.engine.model import RunRecord
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import ChecksVerdict, GithubOps, SubmittedReview
+from sbxloop.gh.ops import ChecksVerdict, GithubOps, MergeOutcome
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -109,6 +110,29 @@ def _report_lines(report: RunReport) -> list[str]:
         )
     if report.workspace:
         lines.append(f"Workspace: `{report.workspace}`")
+    return lines
+
+
+def _review_report_lines(review: ReviewOutcome) -> list[str]:
+    """A review item's deliverable is the posted review, not filed issues:
+    say what verdict went up, how many inline comments came with it, and
+    whether it actually blocks the merge (#469)."""
+    verdict = "approved" if review.approved else "requested changes"
+    n = review.comments
+    comments = "no inline comments" if n == 0 else f"{n} inline comment(s)"
+    lines = [f"Review {verdict} on PR #{review.pr_number} with {comments}: {review.url}"]
+    if not review.gates_merge:
+        # What a downgrade costs differs by verdict, and saying the wrong one
+        # misleads whoever reads the issue. An approval never blocked the
+        # merge to begin with — what it loses is the ability to *satisfy* a
+        # required-review gate. Only `request_changes` loses its block.
+        lines.append(
+            f"Posted as {review.posted_event}, not {review.requested_event} — it does not "
+            "satisfy a required-review gate; a human approval is still needed."
+            if review.approved
+            else f"Posted as a non-gating {review.posted_event} — {review.requested_event} "
+            "was refused, so nothing on the PR blocks the merge."
+        )
     return lines
 
 
@@ -300,6 +324,20 @@ class PrSnapshot(NamedTuple):
     # merged/closed PRs, whose snapshot skips the read). Feeds the takeover
     # guard (#412).
     head_sha: str = ""
+    # What the landing stage needs, all of it already in the `pr_get` payload
+    # the checks read costs anyway — no extra request.
+    #
+    # A draft cannot be merged, so `draft` is what tells the loop to un-draft
+    # first; `node_id` is the handle the GraphQL mutation that does it takes.
+    draft: bool = False
+    node_id: str = ""
+    # GitHub computes mergeability asynchronously and reports None while it is
+    # still thinking. That is deliberately NOT False: "we do not know yet"
+    # must read as wait, the same way a pending check does, or the loop calls
+    # a PR conflicted on the strength of an answer nobody gave.
+    mergeable: bool | None = None
+    # `clean` | `behind` | `dirty` | `blocked` | `unstable` | `unknown`.
+    mergeable_state: str = ""
 
 
 class GitHubIssueSource:
@@ -625,7 +663,9 @@ class GitHubIssueSource:
             # it. A patch item's issue settles when its PR merges, so here
             # it stays open wearing the delivered label.
             close = item.kind == "audit"
-            if item.kind == "audit" and not report.filed:
+            if report.review is not None:
+                lines.extend(_review_report_lines(report.review))
+            elif item.kind == "audit" and not report.filed:
                 lines.append("The audit filed no findings.")
             if not close:
                 lines.append(
@@ -874,8 +914,17 @@ class GitHubIssueSource:
             # and the gate must not read that as permission to merge.
             else ChecksVerdict("pending", 0, ("unknown head commit",), ())
         )
+        raw_mergeable = pr.get("mergeable")
         return PrSnapshot(
-            checks, self._ops().pr_review_state(self.repo, pr_number), merged, state, head_sha=sha
+            checks,
+            self._ops().pr_review_state(self.repo, pr_number),
+            merged,
+            state,
+            head_sha=sha,
+            draft=bool(pr.get("draft")),
+            node_id=str(pr.get("node_id") or ""),
+            mergeable=raw_mergeable if isinstance(raw_mergeable, bool) else None,
+            mergeable_state=str(pr.get("mergeable_state") or ""),
         )
 
     def pr_merge_state(self, pr_number: int) -> tuple[bool, str]:
@@ -887,6 +936,27 @@ class GitHubIssueSource:
         """
         pr = self._ops().pr_get(self.repo, pr_number)
         return bool(pr.get("merged")), str(pr.get("state") or "")
+
+    def pr_ready_for_review(self, node_id: str) -> bool:
+        """Take the delivery out of draft. Raises; the caller hands off."""
+        return self._ops().pr_ready_for_review(node_id)
+
+    def pr_update_branch(self, pr_number: int, *, expected_head_sha: str = "") -> bool:
+        """Merge the base branch into the PR's branch; False when refused."""
+        return self._ops().pr_update_branch(
+            self.repo, pr_number, expected_head_sha=expected_head_sha
+        )
+
+    def pr_merge(
+        self, pr_number: int, *, method: MergeMethod = "squash", sha: str = ""
+    ) -> MergeOutcome:
+        """Merge the PR at ``sha``. No commit title or message is sent, so
+        the repository's own merge-commit settings decide the wording."""
+        return self._ops().pr_merge(self.repo, pr_number, method=method, sha=sha)
+
+    def branch_delete(self, branch: str) -> None:
+        """Tidy a merged PR's branch away; already-gone is not a failure."""
+        self._ops().branch_delete(self.repo, branch)
 
     def pr_review_feedback(self, pr_number: int) -> str:
         """The objections standing on a PR, as text a fix round can act on.
@@ -923,7 +993,7 @@ class GitHubIssueSource:
 
     def post_review(
         self, run: RunRecord, pr_number: int, origin_run_id: str
-    ) -> SubmittedReview | None:
+    ) -> PostedReview | None:
         """Post a finished review run's verdict to the PR it reviewed.
 
         The counterpart to :meth:`file_review`, which queues the work: this

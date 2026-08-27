@@ -179,6 +179,11 @@ class TestCollectReview:
             origin_run_id="r1abcdefg",
         )
         assert posted is not None and posted.event == "REQUEST_CHANGES"
+        assert posted.requested_event == "REQUEST_CHANGES"
+        assert posted.comments == 1
+        assert posted.pr_number == 7
+        assert posted.url == "https://gh/review/1"
+        assert posted.gates_merge is True
         repo, number, event, body, comments = ops.calls[0]
         assert (repo, number, event, comments) == ("o/r", 7, "REQUEST_CHANGES", 1)
         assert "two problems" in body

@@ -183,14 +183,13 @@ class TestEvent:
 
 class TestUsage:
     def test_merged_sums_and_prefers_latest_model(self) -> None:
-        a = Usage(model="m1", input_tokens=10, output_tokens=5, cost=0.5)
+        a = Usage(model="m1", input_tokens=10, output_tokens=5)
         b = Usage(model="m2", input_tokens=3, cache_read_tokens=7)
         merged = a.merged(b)
         assert merged.model == "m2"
         assert merged.input_tokens == 13
         assert merged.output_tokens == 5
         assert merged.cache_read_tokens == 7
-        assert merged.cost == 0.5
 
     def test_merged_all_none(self) -> None:
         merged = Usage().merged(Usage())

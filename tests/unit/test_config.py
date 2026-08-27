@@ -476,3 +476,32 @@ def test_run_stale_after_s_default_override_and_validation(tmp_path: Path) -> No
     (tmp_path / "sbxloop.toml").write_text("[daemon]\nrun_stale_after_s = -1\n")
     with pytest.raises(ConfigError, match=r"run_stale_after_s"):
         load_config(cwd=tmp_path, env={})
+
+
+def test_auto_merge_defaults_off_and_is_operator_set(tmp_path: Path) -> None:
+    """Merging is the one irreversible thing the loop does to a repository,
+    and on a repo whose merges publish a release it means unattended
+    releases — so it never arrives switched on."""
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.auto_merge is False
+    assert config.daemon.merge_method == "squash"
+    assert config.daemon.delete_branch_on_merge is True
+    assert config.daemon.merge_update_attempts == 3
+    over = load_config(
+        cwd=tmp_path,
+        env={
+            "SBXLOOP_DAEMON__AUTO_MERGE": "true",
+            "SBXLOOP_DAEMON__MERGE_METHOD": "rebase",
+            "SBXLOOP_DAEMON__DELETE_BRANCH_ON_MERGE": "false",
+            "SBXLOOP_DAEMON__MERGE_UPDATE_ATTEMPTS": "0",
+        },
+    )
+    assert over.daemon.auto_merge is True
+    assert over.daemon.merge_method == "rebase"
+    assert over.daemon.delete_branch_on_merge is False
+    # 0 is a real setting, not a mistake: it disables branch updating.
+    assert over.daemon.merge_update_attempts == 0
+    with pytest.raises(ConfigError):
+        load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__MERGE_METHOD": "yolo"})
+    with pytest.raises(ConfigError):
+        load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__MERGE_UPDATE_ATTEMPTS": "-1"})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -421,3 +422,79 @@ class TestMergeWatchRows:
         self._armed(tmp_path)
         again = DaemonStore(tmp_path / "state.db")
         assert again.merge_watch(1000.0, 300.0) == [("gh:7", 9, "https://x/pull/9")]
+
+
+class TestLandingRows:
+    """The landing stage's bookkeeping. `landing` is the only thing that
+    tells the daemon's own update-branch commit apart from a human's push,
+    so it is the row that keeps #412's guard from firing on every PR that
+    ever falls behind."""
+
+    def _armed(self, tmp_path: Path) -> DaemonStore:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.record_delivery("gh:7", 9, "sbxloop/r1", 2.0, url="https://x/pull/9")
+        return store
+
+    def test_a_fresh_row_has_spent_nothing_and_is_not_landing(self, tmp_path: Path) -> None:
+        state = self._armed(tmp_path).pr_state("gh:7")
+        assert state is not None and state.updates == 0 and state.landing is False
+
+    def test_update_attempts_and_the_in_flight_marker_round_trip(self, tmp_path: Path) -> None:
+        store = self._armed(tmp_path)
+        assert store.bump_pr_update("gh:7") == 1
+        assert store.bump_pr_update("gh:7") == 2
+        store.set_landing("gh:7", True)
+        state = store.pr_state("gh:7")
+        assert state is not None and state.updates == 2 and state.landing is True
+        store.set_landing("gh:7", False)
+        assert store.pr_state("gh:7").landing is False  # type: ignore[union-attr]
+
+    def test_update_attempts_survive_a_redelivery(self, tmp_path: Path) -> None:
+        """A fix round re-arms the merge watch and re-baselines the head, but
+        it must not refund the updates already spent — that is the only bound
+        on a base that moves faster than CI finishes."""
+        store = self._armed(tmp_path)
+        store.bump_pr_update("gh:7")
+        store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
+        assert store.pr_state("gh:7").updates == 1  # type: ignore[union-attr]
+
+    @pytest.mark.skipif(
+        sqlite3.sqlite_version_info < (3, 35, 0),
+        reason="ALTER TABLE ... DROP COLUMN needs SQLite >= 3.35.0",
+    )
+    def test_the_columns_are_added_to_a_db_that_predates_them(self, tmp_path: Path) -> None:
+        """Additive migration, applied at open: an existing daemon upgrades in
+        place rather than losing its queue.
+
+        DROP COLUMN (SQLite >= 3.35.0) is only how this test *simulates* a
+        pre-migration database; the migration path under test does not use
+        it, so an older SQLite skips the simulation rather than failing the
+        suite over unrelated tooling."""
+        path = tmp_path / "state.db"
+        store = self._armed(tmp_path)
+        store.close()
+        with sqlite3.connect(path) as conn:
+            conn.execute("ALTER TABLE daemon_pr_state DROP COLUMN updates")
+            conn.execute("ALTER TABLE daemon_pr_state DROP COLUMN landing")
+            conn.commit()
+        reopened = DaemonStore(path)
+        state = reopened.pr_state("gh:7")
+        assert state is not None and state.updates == 0 and state.landing is False
+        assert state.pr_number == 9, "the pre-existing row survived"
+
+    def test_a_re_delivery_clears_the_marker_but_keeps_the_budget(self, tmp_path: Path) -> None:
+        """A fix round rewrites the branch, so an update-branch that was in
+        flight against the old one is moot. Leaving the marker up would
+        excuse the next head move as ours — and the next one could be a
+        human's. The spend, like `rounds`, survives the round."""
+        store = self._armed(tmp_path)
+        store.set_delivered_head("gh:7", "aaa")
+        store.bump_pr_update("gh:7")
+        store.set_landing("gh:7", True)
+        store.record_delivery("gh:7", 9, "sbxloop/r1", 3.0, url="https://x/pull/9")
+        state = store.pr_state("gh:7")
+        assert state is not None
+        assert not state.landing, "a stale marker disarms the takeover guard"
+        assert state.delivered_head is None
+        assert state.updates == 1, "the update budget is not refunded by a fix round"

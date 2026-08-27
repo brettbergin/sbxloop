@@ -41,7 +41,7 @@ from sbxloop.cli.tui import (
     TOOL_ARGS_LINE_CLIP,
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.log import redact_text
 
@@ -1374,8 +1374,16 @@ def finish_embed(
     if report.delivery:
         fields.append(("PR", link(f"#{report.delivery[0]}", report.delivery[1]), True))
     # What the run filed is an audit's deliverable (and a patch run's side
-    # findings): show it where the PR is shown.
-    if report.filed:
+    # findings): show it where the PR is shown. A review never files (loop.py
+    # `_settle` sets `filed=()` whenever `is_review`, whether or not the post
+    # itself succeeded), so this is one chain deciding the "Filed"/"Review"
+    # field rather than a separate check a reader has to prove impossible.
+    if report.review is not None:
+        # A review's deliverable is the review, not filed issues (#469).
+        fields.append(("Review", _review_field(report.review), False))
+    elif report.review_failed:
+        fields.append(("Review", f"⚠ {_review_failed_text()}", False))
+    elif report.filed:
         fields.append(("Filed", refs_text(report.filed, repo), True))
     elif item.kind == "audit":
         fields.append(("Filed", "no findings", True))
@@ -1419,12 +1427,12 @@ class RunStats:
         self.last_ts: float | None = None
         self.resumed = False
         # One ``agent.usage`` event is one assistant turn — the unit runs
-        # are billed and timed by. Token/cost fields stay None until a
-        # backend actually reports them: "not reported" is not zero.
+        # are billed and timed by. Token fields stay None until a backend
+        # actually reports them: "not reported" is not zero. No backend
+        # reports a spend figure in a known unit, so none is tracked (#439).
         self.turns = 0
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
-        self.cost: float | None = None
         self.tool_calls = 0
         self.capped = False
         self.denies = 0
@@ -1453,8 +1461,6 @@ class RunStats:
                 self.input_tokens = (self.input_tokens or 0) + int(d["input_tokens"])
             if d.get("output_tokens") is not None:
                 self.output_tokens = (self.output_tokens or 0) + int(d["output_tokens"])
-            if d.get("cost") is not None:
-                self.cost = (self.cost or 0.0) + float(d["cost"])
         elif t == "agent.tool_start":
             self.tool_calls += 1
         elif t == "agent.tool_cap":
@@ -1527,8 +1533,6 @@ def summary_text(stats: RunStats | None, state: str) -> str:
         bits.append(
             f"{_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out tokens"
         )
-    if stats.cost is not None:
-        bits.append(f"${stats.cost:,.2f}")
     return head + (f" — {' · '.join(bits)}" if bits else "")
 
 
@@ -1545,11 +1549,7 @@ def _stat_rows(stats: RunStats) -> list[str]:
         spend = (
             f"tokens {_fmt_count(stats.input_tokens)} in / {_fmt_count(stats.output_tokens)} out"
         )
-        if stats.cost is not None:
-            spend += f" · cost ${stats.cost:,.2f}"
         rows.append(spend)
-    elif stats.cost is not None:
-        rows.append(f"cost ${stats.cost:,.2f}")
     if stats.steers:
         rows.append(f"steering {stats.steers} asked / {stats.steers_answered} answered")
     return rows
@@ -1790,10 +1790,73 @@ def filed_notice(
     return text
 
 
+def _review_verdict(review: ReviewOutcome) -> str:
+    return "approved" if review.approved else "requested changes"
+
+
+def _review_comments(n: int) -> str:
+    return "no comments" if n == 0 else f"{n} inline comment(s)"
+
+
+def _non_gating_note(review: ReviewOutcome) -> str:
+    """What a downgraded review costs the operator — which differs by verdict.
+
+    `gh/ops.py:pr_review_create` downgrades either verdict to `COMMENT` when
+    the daemon identity is refused as a reviewer. For `request_changes` that
+    means nothing on the PR blocks the merge, which is the useful warning.
+    But an approval never blocked the merge in the first place; a downgraded
+    approve instead loses the ability to *satisfy* a required-approval gate,
+    which is a different fact and the one worth telling the operator. Before
+    this branch, an approval downgrade rendered as "posted as a non-gating
+    COMMENT — APPROVE was refused, so nothing on the PR blocks the merge",
+    which is only ever true of `request_changes`.
+    """
+    if review.approved:
+        return (
+            f"⚠ posted as {code(review.posted_event)}, not {code(review.requested_event)} — "
+            "it does not satisfy a required-review gate; a human approval is still needed"
+        )
+    return (
+        f"⚠ posted as a non-gating {code(review.posted_event)} — "
+        f"{code(review.requested_event)} was refused, so nothing on the PR blocks the merge"
+    )
+
+
+def _review_failed_text() -> str:
+    """A review was requested but never reached the PR: `.sbxloop/review.json`
+    was missing or unparseable, no GitHub source was wired, or the POST
+    itself raised. Distinct from "no findings" — that wording is only for a
+    review that either was never attempted or genuinely found nothing."""
+    return "review could not be posted to the pull request — see the daemon log"
+
+
+def review_summary(review: ReviewOutcome) -> str:
+    """The ``·``-joinable tail describing a posted review."""
+    parts = [f"review {_review_verdict(review)}", _review_comments(review.comments)]
+    if review.url:
+        parts.append(nolink(review.url))
+    if not review.gates_merge:
+        parts.append(_non_gating_note(review))
+    return " · ".join(parts)
+
+
+def _review_field(review: ReviewOutcome) -> str:
+    head = f"{_review_verdict(review)} · {_review_comments(review.comments)}"
+    text = link(head, review.url) if review.url else head
+    if not review.gates_merge:
+        text += f"\n{_non_gating_note(review)}"
+    return text
+
+
 def findings_summary(report: RunReport, *, repo: str | None = None, kind: str = "patch") -> str:
     """The ``·``-joinable tail saying what a run filed; empty when a patch
-    run filed nothing, ``no findings`` when an audit did."""
+    run filed nothing, ``no findings`` when an audit did. A review run
+    reports its review instead — its deliverable is never a filed issue."""
     parts = []
+    if report.review is not None:
+        parts.append(review_summary(report.review))
+    elif report.review_failed:
+        parts.append(f"⚠ {_review_failed_text()}")
     if report.filed:
         parts.append(f"filed {refs_text(report.filed, repo)}")
     if report.tool_filed:
@@ -1803,14 +1866,27 @@ def findings_summary(report: RunReport, *, repo: str | None = None, kind: str = 
             f"noted {len(report.tool_noted)} finding(s) about sbxloop — "
             "set `[daemon] tool_repo` to file them upstream"
         )
+    # `report.review is not None` and `report.review_failed` each already
+    # appended a part above, so `parts` is non-empty whenever either is set —
+    # a review (posted or lost) never falls through to "no findings".
     if not parts and kind == "audit":
         return "no findings"
     return " · ".join(parts)
 
 
 def filed_lines(report: RunReport, *, repo: str | None = None) -> list[str]:
-    """Finish-text fallback lines, in the ``🔀 PR #34 <url>`` style."""
+    """Finish-text fallback lines, in the ``🔀 PR #34 <url>`` style.
+
+    Not a redundant duplicate of :func:`findings_summary`: this is what
+    ``discord.py``'s plain-text watch notice renders (no embed attached
+    there), so a review's verdict has to reach the operator through this
+    list too, not only through :func:`_review_field` on the embed.
+    """
     out = []
+    if report.review is not None:
+        out.append("🔎 " + review_summary(report.review))
+    elif report.review_failed:
+        out.append(f"⚠ {_review_failed_text()}")
     if report.filed:
         out.append("🔎 filed " + ", ".join(_ref_plain(r, repo) for r in report.filed))
     if report.tool_filed:

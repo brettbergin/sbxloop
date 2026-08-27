@@ -446,7 +446,7 @@ class TestTools:
                 agent="planner",
             )
         )
-        turn(concierge, "what did r1abcdefg cost?")
+        turn(concierge, "what did r1abcdefg spend?")
         (resp,) = client.responses
         assert resp.ok
         assert "claude-opus-5" in resp.text and "3 sample(s)" in resp.text
@@ -454,8 +454,8 @@ class TestTools:
         assert resp.text.index("executor") < resp.text.index("planner")
         assert "2,000 in" in resp.text and "180 out" in resp.text
         assert "total" in resp.text and "2,300 in" in resp.text and "200 out" in resp.text
-        # The backend reports tokens, never cost: say so rather than show 0.
-        assert "cost: not reported" in resp.text and "0.00" not in resp.text
+        # The backend reports tokens, never spend: say so rather than show 0.
+        assert "spend: not reported" in resp.text and "0.00" not in resp.text
 
     def test_run_usage_breaks_spend_down_by_turns_jobs_and_cache(self, tmp_path: Path) -> None:
         """Turns — not jobs — are what a run is billed and timed by: every turn
@@ -480,20 +480,19 @@ class TestTools:
                     input_tokens=tokens,
                     output_tokens=90,
                     cache_read_tokens=100,
-                    cost=0.25,
                     agent="executor",
                 )
             )
-        turn(concierge, "what did r1abcdefg cost?")
+        turn(concierge, "what did r1abcdefg spend?")
         (resp,) = client.responses
         assert resp.ok
         assert "3 turns/2 jobs" in resp.text
         assert "300 cached" in resp.text
-        # Cost stays unread (#386): the backend's per-turn `cost` is a
-        # constant, so accumulating it across turns fabricates a total
-        # (3 x 0.25 = 0.75 here, 147 x 15.0 = 2205.0 in the field). The
-        # honest answer is that it was not reported.
-        assert "cost: not reported" in resp.text
+        # Spend stays unreported (#386, #439): the backend's per-turn figure
+        # is a constant of unknown unit, so accumulating it across turns
+        # fabricates a total (147 x 15.0 = 2205.0 in the field). `Usage` has
+        # no field for it, and the block says so.
+        assert "spend: not reported" in resp.text
         assert "0.7500" not in resp.text
 
     def test_a_run_without_usage_events_says_not_recorded(self, tmp_path: Path) -> None:
