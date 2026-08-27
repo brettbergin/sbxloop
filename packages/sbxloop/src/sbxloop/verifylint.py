@@ -198,6 +198,40 @@ _NESTED_SHELL = re.compile(
 )
 
 
+# A nested shell is a hazard when it can change what runs. `bash`/`dash`/
+# `zsh` may not be installed; a login or extra flag (`sh -lc`) changes the
+# environment; and a double-quoted or unquoted payload is expanded by the
+# OUTER shell before the inner one ever sees it (field failure r7ef26eht).
+#
+# `sh -c '...'` whose payload holds no `$` and no backtick is none of those:
+# the outer shell hands the single-quoted span through verbatim, so it runs
+# exactly as the payload would have run unwrapped. Rejecting that inert form
+# is what cost item gh:478 both of its decompose attempts — twice over a
+# `sh -c 'git diff --quiet && git diff --cached --quiet'` that would have
+# behaved identically either way — and PR #476 went unreviewed for it.
+_INERT_SHELL_WRAPPER = re.compile(r"^(?:/bin/|/usr/bin/)?sh\s+-c\s+'([^']*)'$")
+
+
+def unwrap_inert_shell(command: str) -> str:
+    """The payload of a provably-inert ``sh -c '...'``, else the command.
+
+    Unwrapping rather than merely allowing is the point: the payload is what
+    actually runs, so every other rule here has to keep seeing it. A wrapper
+    waved through whole would hide its payload from the toolchain and
+    mutating-command checks (single-quoted spans are blanked before those
+    scans), which is a larger hole than the one it closes.
+    """
+    match = _INERT_SHELL_WRAPPER.match(command.strip())
+    if match is None:
+        return command
+    payload = match.group(1)
+    if "$" in payload or "`" in payload:
+        # Expansion the wrapper's own quoting decides — out of scope for
+        # "provably identical", so leave it to the nested-shell rule.
+        return command
+    return payload
+
+
 def bashisms(command: str) -> list[str]:
     """Portable-shell violations in one verify command (empty = clean)."""
     problems: list[str] = []
@@ -459,7 +493,11 @@ def lint_verify_commands(
         if lang in LANGUAGE_RULES
     ]
     problems: list[str] = []
-    for command in commands:
+    for raw in commands:
+        # An inert `sh -c '...'` runs exactly as its payload does, so lint
+        # the payload — and name it in the messages, since it is what the
+        # runner will execute.
+        command = unwrap_inert_shell(raw)
         for problem in bashisms(command):
             problems.append(f"verify command `{command}` {problem}")
         for head in command_heads(command):
@@ -487,7 +525,7 @@ def lint_verify_commands(
                         f"verify command `{command}` invokes bare `{head}` — {rule.remedy}"
                     )
                     break
-    if gate and not any(runs_gate(command, gate) for command in commands):
+    if gate and not any(runs_gate(unwrap_inert_shell(command), gate) for command in commands):
         problems.append(
             f"none of the verify commands runs `{gate}`, this project's own gate — "
             "the checks it bundles are what CI enforces on the pull request, so "

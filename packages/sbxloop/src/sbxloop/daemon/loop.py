@@ -931,6 +931,42 @@ class DaemonLoop:
             )
         return self._settle(item, source, run_id, result_box.get("result"), error)
 
+    def _close_run_record(self, run_id: str, reason: str) -> None:
+        """Terminate the *run* row for a run this settle just ended for good.
+
+        ``finish_ledger`` closes the daemon's own ledger, but the engine's
+        ``runs`` row is written only by the in-process run loop — so a run
+        that died inside a phase (a decompose the verify lint rejected, say)
+        left ``decomposing`` behind it. Recovery's stale sweep does close it
+        eventually, after ``run_stale_after_s``: six hours in the field
+        (runs rv2y1a8ke and rq826h546 of item gh:478), and until then
+        ``list_runs`` and everything counting active runs disagreed with
+        reality — the very mismatch #374 exists to prevent, on a path its
+        sweep only reaches by timeout.
+
+        Nothing here is resumable. A requeued item drops its run pin (see
+        ``DaemonStore.mark_failed``: queued + ``run_id`` means "resume this
+        run"), and an abandoned item is terminal. Best-effort — the item is
+        already settled and no bookkeeping failure may unsettle it.
+        """
+        try:
+            record = self.store.get_run(run_id)
+            if record.state in TERMINAL_RUN_STATES:
+                return
+            self.store.reconcile_run(run_id, "failed", reason)
+            self.store.append_event(
+                Event.now(
+                    "run.reconciled",
+                    run_id,
+                    state="failed",
+                    reason=reason,
+                    previous_state=record.state,
+                )
+            )
+            log.info("run.record_closed", run=run_id, previous_state=record.state, reason=reason)
+        except (SbxloopError, StateError) as exc:
+            log.warning("run.record_close_failed", run=run_id, error=str(exc))
+
     def _settle_override(
         self,
         item: WorkItem,
@@ -1056,6 +1092,7 @@ class DaemonLoop:
                 item.item_id, f"delivery failed: {report.delivery_error}", now, requeue=False
             )
             self.dstore.finish_ledger(run_id, "delivery_failed", now)
+            self._close_run_record(run_id, f"delivery failed: {report.delivery_error}")
             source.report_delivery_failed(item, report)
             self._frontend_finished(item, report)
             findings = findings_summary(report._replace(filed=tuple(filed)), repo=self._repo)
@@ -1090,6 +1127,7 @@ class DaemonLoop:
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
         self._set_breaker(self._breaker_opened_at, self._consecutive_failures + 1)
         self.dstore.finish_ledger(run_id, "failed", now)
+        self._close_run_record(run_id, reason)
         if attempts_left > 0:
             self.dstore.mark_failed(item.item_id, reason, now, requeue=True)
             source.report_retry(item, reason, attempts_left)
@@ -1503,22 +1541,28 @@ class DaemonLoop:
             log.warning("backlog.tool_findings_failed", run=run_id, exc_info=True)
             return ToolFindings([], [])
 
-    def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> bool:
+    def _file_review(self, item: WorkItem, run_id: str, report: RunReport) -> str:
         """The loop evaluating the code it just wrote: after a patch item
         delivers a PR, open a review of that PR. Once per run, patch items
         only (an audit has no PR), capped per calendar day, best-effort.
 
-        Returns whether a review was actually queued — which is what the
+        Returns ``"filed"``, or *why* nothing was queued — which is what the
         acceptance gate keys on. No reviewer means no verdict to converge
         on, and holding an item open for one that will never come is how a
-        queue silently stops.
+        queue silently stops. The reason matters as much as the fact: a
+        deployment with no reviewer at all and a charter that was filed and
+        then died settle the same way but are not the same event, and
+        reporting the second as the first tells an operator the PR was never
+        going to be reviewed when in truth its review broke (field: item
+        gh:478's charter abandoned in decompose, after which PR #476 was
+        accepted as "no reviewer").
         """
         daemon = self.config.daemon
         if not daemon.review_deliveries or item.kind != "patch" or report.delivery is None:
-            return False
+            return "no reviewer"
         github: Any = next((s for s in self.sources if s.name == "github"), None)
         if github is None or not hasattr(github, "file_review"):
-            return False
+            return "no reviewer"
         now = self.clock()
         try:
             state = self.dstore.pr_state(item.item_id)
@@ -1528,7 +1572,7 @@ class DaemonLoop:
                 # keeps the previous CHANGES_REQUESTED standing until the
                 # reviewer says otherwise (new commits do not clear it).
                 # Without a second review the loop could only run one way.
-                return False
+                return "a review is already in flight"
             number, url = report.delivery
             if self.dstore.review_filed(run_id):
                 # A charter for this delivery already exists — or existed:
@@ -1539,7 +1583,7 @@ class DaemonLoop:
                 # become the whole bar, the same as a deployment with no
                 # reviewer; re-triggering the charter issue opts back in.
                 log.info("review.already_filed", item=item.item_id, run=run_id, pr=number)
-                return False
+                return "its review charter did not complete"
             ref = github.file_review(item, number, url, run_id)
             self.dstore.record_review(run_id, number, ref, now)
             self.dstore.review_in_flight(item.item_id, ref)
@@ -1556,10 +1600,10 @@ class DaemonLoop:
                 pr=number,
                 ref=ref,
             )
-            return True
+            return "filed"
         except Exception:
             log.warning("review.file_failed", item=item.item_id, run=run_id, exc_info=True)
-        return False
+        return "filing its review failed"
 
     def _file_postmortem(self, item: WorkItem, run_id: str, reason: str) -> None:
         """Turn the daemon's own failure into a discovery-lane charter.
@@ -1789,10 +1833,14 @@ class DaemonLoop:
         if not state.reviewed:
             # Green and unreviewed: only now is a review run worth spending.
             report = self._report(item.run_id or "", None)
-            if not self._file_review(item, item.run_id or "", report):
-                # No reviewer for this deployment — green CI is the whole
-                # bar it has, so honour that rather than wait for nobody.
-                self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, no reviewer")
+            why = self._file_review(item, item.run_id or "", report)
+            if why != "filed":
+                # Nothing will review this PR — green CI is the whole bar it
+                # has, so honour that rather than wait for nobody. Say which
+                # "nothing" it was: an operator reading "no reviewer" about a
+                # PR whose charter died learns the wrong lesson about their
+                # own deployment.
+                self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, {why}")
             return
         # An approval nobody can give is not worth waiting for: a review the
         # repo would only accept as a COMMENT never produces one on GitHub.
