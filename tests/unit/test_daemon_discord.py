@@ -1233,6 +1233,7 @@ class TestRunWatches:
             # a second registration by the same person is not duplicated
             assert bridge.on_watch("r1", "Discord user `brett`") is None
             assert bridge._watchers == {"r1": ["1"]}
+            assert bridge.dstore.run_watchers("r1") == ["1"]
         finally:
             bridge.close()
 
@@ -1338,20 +1339,159 @@ class TestRunWatches:
         finally:
             bridge.close()
 
-    def test_a_restart_forgets_every_watch(self, tmp_path: Path) -> None:
-        # watches (and the requester-id map) live in bridge memory only: a
-        # freshly constructed bridge over the same state dir knows nothing,
-        # which is what the concierge's confirmation warns about.
+    def test_a_restart_reloads_every_watch(self, tmp_path: Path) -> None:
+        # watches are persisted in daemon_state: a freshly constructed bridge
+        # over the same state dir repopulates `_watchers` at startup.
         bridge, _, _ = make_bridge(tmp_path)
         bridge._remember_requester("Discord user `brett`", "1")
         assert bridge.on_watch("r1", "Discord user `brett`") is None
         assert bridge._watchers == {"r1": ["1"]}
+        assert bridge.dstore.run_watchers("r1") == ["1"]
+
+        restarted, _, _ = make_bridge(tmp_path)
+        assert restarted._watchers == {"r1": ["1"]}
+        # the requester-id map is still memory-only, so a re-registration
+        # from a bridge that has not seen the author yet says so
+        note = restarted.on_watch("r2", "Discord user `brett`")
+        assert note is not None and "mentionable id" in note
+
+    def test_reloaded_watch_is_pinged_once_after_a_restart(self, tmp_path: Path) -> None:
+        first, _, _ = make_bridge(tmp_path)
+        first._remember_requester("Discord user `brett`", "1")
+        assert first.on_watch("r1", "Discord user `brett`") is None
+
+        bridge, client, _ = make_bridge(tmp_path)
+        assert bridge._watchers == {"r1": ["1"]}
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            control = client.channels[42]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert wait_for(lambda: any(s.startswith("<@1> run `r1`") for s in control.sent))
+            assert bridge._watchers == {}
+            assert wait_for(lambda: bridge.dstore.run_watchers("r1") == [])
+            # a second finish pings nobody: the persisted rows are gone too
+            bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
+            assert not wait_for(
+                lambda: sum(1 for s in control.sent if s.startswith("<@1>")) > 1, timeout=1.0
+            )
+        finally:
+            bridge.close()
+
+    def test_persist_and_drain_are_atomic_under_the_same_lock(self, tmp_path: Path) -> None:
+        """Regression for the TOCTOU: before the fix, `_persist_watch` ran
+        after `_watch_lock` was released, so a `_take_watchers` drain could
+        interleave between the in-memory append and the store INSERT — the
+        drain would pop an empty in-memory entry and delete zero store
+        rows, and the INSERT would land afterward, orphaning the row
+        forever (nothing else ever deletes a row for a run that already
+        finished). Now the persist happens inside `on_watch`'s
+        `_watch_lock`, the same lock `_take_watchers` holds across its own
+        pop-plus-drain, so a concurrent drain cannot even start until a
+        registration in flight has fully committed to both registries."""
+        bridge, _, _ = make_bridge(tmp_path)
+        bridge._remember_requester("Discord user `brett`", "1")
+
+        entered_persist = threading.Event()
+        release_persist = threading.Event()
+        real_add = bridge.dstore.add_run_watch
+
+        def slow_add_run_watch(run_id: str, watcher_id: str, now: float) -> None:
+            entered_persist.set()
+            assert release_persist.wait(timeout=5.0)
+            real_add(run_id, watcher_id, now)
+
+        bridge.dstore.add_run_watch = slow_add_run_watch  # type: ignore[method-assign]
+
+        result: dict[str, object] = {}
+
+        def register() -> None:
+            result["note"] = bridge.on_watch("r1", "Discord user `brett`")
+
+        registrar = threading.Thread(target=register)
+        registrar.start()
+        assert entered_persist.wait(timeout=5.0)
+
+        drained: list[str] = []
+        drain_done = threading.Event()
+
+        def drain() -> None:
+            drained.extend(bridge._take_watchers("r1"))
+            drain_done.set()
+
+        drainer = threading.Thread(target=drain)
+        drainer.start()
+        # The registration is mid-flight, still holding `_watch_lock` —
+        # a concurrent drain must not be able to complete (or even see a
+        # partial state) until it releases.
+        assert not drain_done.wait(timeout=0.3), (
+            "drain proceeded while a registration was in flight"
+        )
+
+        release_persist.set()
+        registrar.join(timeout=5.0)
+        drainer.join(timeout=5.0)
+        assert not registrar.is_alive()
+        assert not drainer.is_alive()
+
+        assert result["note"] is None
+        # The drain necessarily runs after the registration fully commits,
+        # so it sees a consistent state: the watcher, and no orphaned row.
+        assert drained == ["1"]
+        assert bridge.dstore.run_watchers("r1") == []
+
+    def test_watchers_cap_eviction_clears_the_persisted_row_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: the `WATCHERS_CAP` trim evicted the in-memory entry
+        but left its row in `daemon_run_watches`, so the persisted registry
+        grew without bound for runs evicted before they ever finish (and
+        left `DaemonStore.clear_run_watch` dead code, exercised only by a
+        store-level unit test). The eviction path now calls it."""
+        import sbxloop.daemon.discord as discord_mod
+
+        monkeypatch.setattr(discord_mod, "WATCHERS_CAP", 1)
+        bridge, _, _ = make_bridge(tmp_path)
+        bridge._remember_requester("brett", "1")
+        bridge._remember_requester("dana", "2")
+        assert bridge.on_watch("r1", "brett") is None
+        assert bridge.dstore.run_watchers("r1") == ["1"]
+
+        # registering a second run trips the cap and evicts r1's entry.
+        assert bridge.on_watch("r2", "dana") is None
+        assert "r1" not in bridge._watchers
+        assert bridge.dstore.run_watchers("r1") == []
+        assert bridge.dstore.run_watchers("r2") == ["2"]
+
+    def test_reload_drops_a_watch_whose_run_already_finished(self, tmp_path: Path) -> None:
+        """A watch for a run that reached a terminal ledger state while the
+        daemon was down is dropped at reload instead of revived: the
+        `run_finished` event that would drain it has already fired, so
+        reviving the entry would leave it waiting for an event that will
+        never happen again. Reconciled via `DaemonStore.finished_run_ids`."""
+        bridge, _, _ = make_bridge(tmp_path)
+        bridge._remember_requester("Discord user `brett`", "1")
+        assert bridge.on_watch("r1", "Discord user `brett`") is None
+        bridge.dstore.upsert_new(
+            WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A"), 1.0
+        )
+        bridge.dstore.mark_running("inbox:a.md", "r1", 1.0)
+        bridge.dstore.finish_ledger("r1", "completed", 2.0)
 
         restarted, _, _ = make_bridge(tmp_path)
         assert restarted._watchers == {}
-        note = restarted.on_watch("r1", "Discord user `brett`")
-        assert note is not None and "mentionable id" in note
-        assert restarted._watchers == {}
+        assert restarted.dstore.run_watchers("r1") == []
+
+    def test_watches_work_without_a_store_wired(self, tmp_path: Path) -> None:
+        bridge, _, _ = make_bridge(tmp_path)
+        bridge.dstore = None  # type: ignore[assignment]
+        bridge._remember_requester("Discord user `brett`", "1")
+        assert bridge.on_watch("r1", "Discord user `brett`") is None
+        assert bridge._watchers == {"r1": ["1"]}
+        assert bridge._take_watchers("r1") == ["1"]
+        assert bridge._take_watchers("r1") == []
 
     def test_post_failure_is_not_fatal(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)

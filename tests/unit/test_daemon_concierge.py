@@ -1449,7 +1449,7 @@ class TestWatchRun:
         text = client.responses[0].text
         assert seen == [("r7abcdefg", "alice (via concierge)")]
         assert "r7abcdefg" in text
-        assert "restart" in text
+        assert "survives a daemon restart" in text
 
     def test_finished_run_answers_immediately(self, tmp_path: Path) -> None:
         seen, on_watch = self._watcher()

@@ -64,6 +64,18 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     value       TEXT
 );
 
+-- Who asked to be pinged when a run finishes. The bridge's watch registry
+-- is in-memory, so without this a daemon restart silently drops every
+-- pending watch — and runs last minutes to hours, exactly the window in
+-- which a restart happens.
+CREATE TABLE IF NOT EXISTS daemon_run_watches (
+    run_id     TEXT NOT NULL,
+    watcher_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(run_id, watcher_id)
+);
+CREATE INDEX IF NOT EXISTS idx_daemon_run_watches_run ON daemon_run_watches(run_id);
+
 CREATE TABLE IF NOT EXISTS daemon_backlog_filed (
     fingerprint TEXT PRIMARY KEY,
     run_id      TEXT NOT NULL,
@@ -718,6 +730,23 @@ class DaemonStore:
             )
             return [(str(row["run_id"]), str(row["item_id"])) for row in rows]
 
+    def finished_run_ids(self, run_ids: Sequence[str]) -> set[str]:
+        """Which of these runs already have a ledger `finished_at`. Used at
+        Discord watch reload to drop watches for runs that completed while
+        the daemon was down: the `run_finished` event that would have
+        pinged them has already fired, so reviving the entry would just
+        leave it waiting for an event that will never come again."""
+        if not run_ids:
+            return set()
+        with self._lock:
+            placeholders = ", ".join("?" for _ in run_ids)
+            rows = self._conn.execute(
+                f"SELECT run_id FROM daemon_runs WHERE run_id IN ({placeholders}) "  # nosec B608
+                "AND finished_at IS NOT NULL",
+                tuple(run_ids),
+            )
+            return {str(r["run_id"]) for r in rows}
+
     def finish_ledger(self, run_id: str, result: str, now: float) -> None:
         with self._lock:
             self._conn.execute(
@@ -1189,4 +1218,60 @@ class DaemonStore:
                 "(run_id, channel_id, thread_id, headline_id) VALUES (?, ?, ?, ?)",
                 (run_id, channel_id, thread_id, headline_id),
             )
+            self._conn.commit()
+
+    # -- run watches -----------------------------------------------------------
+
+    def add_run_watch(self, run_id: str, watcher_id: str, now: float) -> None:
+        """Register interest in a run's completion; idempotent per watcher."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_run_watches (run_id, watcher_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (run_id, watcher_id, now),
+            )
+            self._conn.commit()
+
+    def run_watchers(self, run_id: str) -> list[str]:
+        with self._lock:
+            return [
+                str(r["watcher_id"])
+                for r in self._conn.execute(
+                    "SELECT watcher_id FROM daemon_run_watches WHERE run_id = ? ORDER BY rowid",
+                    (run_id,),
+                )
+            ]
+
+    def take_run_watchers(self, run_id: str) -> list[str]:
+        """Return the run's watchers and clear them in one transaction."""
+        with self._lock:
+            watchers = [
+                str(r["watcher_id"])
+                for r in self._conn.execute(
+                    "SELECT watcher_id FROM daemon_run_watches WHERE run_id = ? ORDER BY rowid",
+                    (run_id,),
+                )
+            ]
+            self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
+            self._conn.commit()
+            return watchers
+
+    def all_run_watches(self) -> dict[str, list[str]]:
+        """Every pending watch, for reloading the bridge registry at startup."""
+        with self._lock:
+            watches: dict[str, list[str]] = {}
+            for r in self._conn.execute(
+                "SELECT run_id, watcher_id FROM daemon_run_watches ORDER BY rowid"
+            ):
+                watches.setdefault(str(r["run_id"]), []).append(str(r["watcher_id"]))
+            return watches
+
+    def clear_run_watch(self, run_id: str) -> None:
+        """Drop a run's watch row without returning it — used by the bridge's
+        `_evict_watch` when an entry is dropped for a reason other than a
+        normal finish (a `WATCHERS_CAP` trim, or reconciling a reload
+        against a run that already finished while the daemon was down),
+        where `take_run_watchers`'s return value would just be discarded."""
+        with self._lock:
+            self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
             self._conn.commit()
