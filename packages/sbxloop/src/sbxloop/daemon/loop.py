@@ -1679,7 +1679,8 @@ class DaemonLoop:
         green, review in flight          wait
         green, changes requested         fix round
         green, not yet reviewed          file a review
-        green, review satisfied          accept
+        green, review satisfied          land it (accept when auto-merge
+                                         is off)
         ===============================  ===========================
 
         The PR's own fate outranks every gate: a human merging it IS the
@@ -1713,8 +1714,25 @@ class DaemonLoop:
                 self.dstore.set_delivered_head(item.item_id, snap.head_sha)
                 state = state._replace(delivered_head=snap.head_sha)
             elif snap.head_sha != state.delivered_head:
-                self._hand_off_taken_over(item, state, now, snap.head_sha)
-                return
+                if not state.landing:
+                    self._hand_off_taken_over(item, state, now, snap.head_sha)
+                    return
+                # An update-branch the landing stage asked for has landed.
+                # GitHub does not answer that request with the sha it will
+                # produce, so this poll is where we learn it — and because
+                # the request carried `expected_head_sha`, a human who had
+                # pushed first would have made it fail rather than let this
+                # adopt their commit as ours.
+                log.info(
+                    "review.update_branch_landed",
+                    item=item.item_id,
+                    pr=state.pr_number,
+                    was=state.delivered_head,
+                    now=snap.head_sha,
+                )
+                self.dstore.set_delivered_head(item.item_id, snap.head_sha)
+                self.dstore.set_landing(item.item_id, False)
+                state = state._replace(delivered_head=snap.head_sha, landing=False)
         checks, review_state = snap.checks, snap.review
         if checks.state == "pending":
             log.debug("review.waiting", item=item.item_id, pr=pr, on="checks")
@@ -1782,7 +1800,9 @@ class DaemonLoop:
         # assuming satisfaction.
         satisfied = review_state == "APPROVED" if state.gates else state.verdict == "APPROVE"
         if satisfied:
-            self._accept(item, now, detail=f"PR #{pr}: {checks.summary()}, review satisfied")
+            self._land(
+                item, state, snap, now, detail=f"PR #{pr}: {checks.summary()}, review satisfied"
+            )
             return
         log.debug("review.waiting", item=item.item_id, pr=pr, on="approval")
 
@@ -1928,6 +1948,187 @@ class DaemonLoop:
             why=why,
         )
 
+    def _land(
+        self,
+        item: WorkItem,
+        state: PrState,
+        snap: Any,
+        now: float,
+        *,
+        detail: str,
+    ) -> None:
+        """The last step out of the loop: merge the PR the gate just accepted.
+
+        Reached only from the full bar — green checks AND a satisfied review.
+        The weaker acceptances above (a merged PR, a PR with no reviewer
+        available) keep calling :meth:`_accept`: merging is the one
+        irreversible thing the loop does to a repository, and it is not
+        something to do on a partial verdict.
+
+        One step per poll, like every other gate. Un-drafting in particular
+        cannot be followed by a merge in the same call — GitHub reports a
+        draft's ``mergeable_state`` as ``draft``, so what this PR's real merge
+        state is only becomes readable on the next poll.
+        """
+        daemon = self.config.daemon
+        pr = state.pr_number
+        if not daemon.auto_merge:
+            self._accept(item, now, detail=detail)
+            return
+        if snap.draft:
+            source: Any = self._source_for(item)
+            try:
+                ready = bool(snap.node_id) and bool(source.pr_ready_for_review(snap.node_id))
+            except Exception:
+                log.warning("land.undraft_failed", item=item.item_id, pr=pr, exc_info=True)
+                ready = False
+            if not ready:
+                self._hand_off_unmergeable(
+                    item, state, now, why="its draft status could not be cleared"
+                )
+                return
+            self._notify(
+                f"📤 {item.item_id}: PR #{pr} is out of draft — {detail}",
+                "land.undrafted",
+                item=item.item_id,
+                pr=pr,
+            )
+            return
+        if snap.mergeable is None:
+            # GitHub computes mergeability asynchronously. "Not known yet" is
+            # not "mergeable"; the next poll asks again.
+            log.debug("land.waiting", item=item.item_id, pr=pr, on="mergeability")
+            return
+        if snap.mergeable_state == "behind":
+            self._update_branch(item, state, snap, now)
+            return
+        if not snap.mergeable:
+            # A real conflict with the base. A fix round re-delivers, and a
+            # re-delivery rebuilds the commit on the current base, so this is
+            # genuinely fixable — on the existing round budget, because unlike
+            # every other step here it costs a whole run.
+            self._fix_round(
+                item, state, now, why="the PR conflicts with its base branch", failed=()
+            )
+            return
+        self._merge(item, state, now, detail=detail)
+
+    def _update_branch(self, item: WorkItem, state: PrState, snap: Any, now: float) -> None:
+        """Bring a behind PR up to date with its base, once per poll.
+
+        Branch protection commonly requires this before a merge, and the base
+        moves. Each update is one API call rather than a run — but a base
+        moving faster than CI finishes would update forever, so it is bounded
+        and the PR is handed over at the cap.
+        """
+        pr = state.pr_number
+        if state.landing:
+            # One already asked for; the takeover guard above adopts its
+            # commit when it appears.
+            log.debug("land.waiting", item=item.item_id, pr=pr, on="update-branch")
+            return
+        budget = self.config.daemon.merge_update_attempts
+        if state.updates >= budget:
+            self._hand_off_unmergeable(
+                item,
+                state,
+                now,
+                why=(
+                    f"it is behind its base branch and {budget} update(s) did not get it merged"
+                    if budget
+                    else "it is behind its base branch and branch updating is disabled"
+                ),
+            )
+            return
+        source: Any = self._source_for(item)
+        try:
+            accepted = source.pr_update_branch(pr, expected_head_sha=state.delivered_head or "")
+        except Exception:
+            log.warning("land.update_branch_failed", item=item.item_id, pr=pr, exc_info=True)
+            self._poll_failed(item, now)
+            return
+        if not accepted:
+            # GitHub refused the update — most often because the head moved
+            # under us. Nothing to record: the next poll re-reads the PR and
+            # the takeover guard decides what that head means.
+            log.info("land.update_branch_refused", item=item.item_id, pr=pr)
+            return
+        spent = self.dstore.bump_pr_update(item.item_id)
+        self.dstore.set_landing(item.item_id, True)
+        self._notify(
+            f"⬆ {item.item_id}: PR #{pr} was behind its base — updating the branch "
+            f"({spent}/{budget}); its checks will re-run",
+            "land.update_branch",
+            item=item.item_id,
+            pr=pr,
+            attempt=spent,
+            budget=budget,
+        )
+
+    def _merge(self, item: WorkItem, state: PrState, now: float, *, detail: str) -> None:
+        """Merge the PR, and settle the item on what GitHub answers."""
+        daemon = self.config.daemon
+        pr = state.pr_number
+        source: Any = self._source_for(item)
+        try:
+            outcome = source.pr_merge(
+                pr, method=daemon.merge_method, sha=state.delivered_head or ""
+            )
+        except Exception:
+            log.warning("land.merge_failed", item=item.item_id, pr=pr, exc_info=True)
+            self._poll_failed(item, now)
+            return
+        if outcome.stale:
+            # The head moved between the poll that judged this PR and the
+            # merge. The next poll judges the new head; the takeover guard
+            # decides whether it is ours at all.
+            log.info("land.merge_stale", item=item.item_id, pr=pr, detail=outcome.reason)
+            return
+        if outcome.blocked:
+            self._hand_off_unmergeable(item, state, now, why=outcome.reason)
+            return
+        if daemon.delete_branch_on_merge and state.branch:
+            try:
+                source.branch_delete(state.branch)
+            except Exception:
+                # The merge already happened; a leftover branch is untidy,
+                # not a failure of the thing that just succeeded.
+                log.warning(
+                    "land.branch_delete_failed",
+                    item=item.item_id,
+                    branch=state.branch,
+                    exc_info=True,
+                )
+        log.info("land.merged", item=item.item_id, pr=pr, sha=outcome.sha, detail=detail)
+        self._accept_merged(item, now, pr, state.pr_url, by_loop=True)
+
+    def _hand_off_unmergeable(
+        self, item: WorkItem, state: PrState, now: float, *, why: str
+    ) -> None:
+        """The PR cleared the review bar but GitHub will not merge it.
+
+        A protection rule wanting an approval this identity cannot give, a
+        base that keeps moving, a draft that would not clear — none of these
+        is fixable by another round, so the item stops here rather than
+        spending its budget on a refusal. The PR is left OPEN either way, but
+        its draft/behind status is whatever it was when this fired — a draft
+        that would not clear stays a draft, and a base that outran the update
+        budget stays behind — so a human may still have that one step left
+        before merging.
+        """
+        self.dstore.mark_failed(
+            item.item_id, f"PR #{state.pr_number} could not be merged: {why}", now, requeue=False
+        )
+        self._notify(
+            f"✋ {item.item_id}: PR #{state.pr_number} passed its checks and review but "
+            f"GitHub would not merge it — {why}. Handing it over for a human to finish.",
+            "land.blocked",
+            level="error",
+            item=item.item_id,
+            pr=state.pr_number,
+            why=why,
+        )
+
     def _accept(self, item: WorkItem, now: float, *, detail: str) -> None:
         """The PR earned its merge: settle the item the way a successful run
         used to, now that "successful" means accepted."""
@@ -1946,8 +2147,14 @@ class DaemonLoop:
             run=item.run_id,
         )
 
-    def _accept_merged(self, item: WorkItem, now: float, pr: int, url: str) -> None:
-        """A human merged the PR while the item was still in review.
+    def _accept_merged(
+        self, item: WorkItem, now: float, pr: int, url: str, *, by_loop: bool = False
+    ) -> None:
+        """The PR merged while the item was in review — settle it now.
+
+        ``by_loop`` distinguishes the landing stage merging it from a human
+        doing so. Only the wording differs: either way the merge IS the
+        acceptance, and the issue settles the same way.
 
         The merge is the acceptance, and the issue settles right now —
         through :meth:`report_merged`, not ``report_success``, whose
@@ -1964,12 +2171,14 @@ class DaemonLoop:
         )
         if settled:
             self.dstore.settle_merge(item.item_id, now, merged_at=now)
+        who = "merged by the loop" if by_loop else "was merged"
         self._notify(
-            f"✅ {item.item_id} accepted — PR #{pr} was merged; issue closed as completed",
+            f"✅ {item.item_id} accepted — PR #{pr} {who}; issue closed as completed",
             "item.merged",
             item=item.item_id,
             run=item.run_id,
             pr=pr,
+            by_loop=by_loop,
         )
 
     def _reject_closed(self, item: WorkItem, now: float, pr: int, url: str) -> None:

@@ -6,6 +6,46 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **The loop can land its own pull request (`[daemon] auto_merge`, default
+  off).** A delivered PR that clears the full acceptance bar — every check
+  green *and* the review satisfied — is taken out of draft, brought up to
+  date with its base if protection requires that, and merged; the source
+  issue then settles through the merge path that already existed (closed,
+  `sbxloop:completed`). Before this, a green approved PR was still a draft
+  waiting on a person, so every run ended with a human doing the last step.
+  New knobs: `merge_method` (`squash` | `merge` | `rebase`, default
+  `squash`), `delete_branch_on_merge` (default `true`), and
+  `merge_update_attempts` (default 3, `0` disables branch updating).
+  Details:
+  - Off by default on purpose. Merging is the only irreversible thing
+    sbxloop does to a repository, and on a repo whose merges publish — this
+    one releases to PyPI and redeploys the daemon host on every merge to
+    `main` — turning it on means unattended releases.
+  - The bar is the *full* one. A PR the gate accepted for a weaker reason
+    (green CI with no reviewer available) still settles the old way and is
+    never merged, and a PR someone else has pushed to still trips the
+    takeover guard untouched.
+  - `GithubOps` grew `pr_ready_for_review`, `pr_merge`, `pr_update_branch`
+    and `branch_delete`, all through the existing `raw.api` transport — no
+    new worker op. Un-drafting is the one GraphQL call in the codebase
+    (`markPullRequestReadyForReview`; REST cannot un-draft a PR), and it
+    reads the response *body* rather than its status, because GraphQL
+    answers a failed mutation with a 200 and an `errors` array.
+  - Two GitHub refusals arrive as data, not exceptions: `405` ("not
+    mergeable right now" — commonly a protection rule wanting an approval
+    sbxloop's identity cannot give) hands the item over with the PR left
+    open and out of draft, one click from done, rather than spending budget
+    on a refusal no round can fix; `409` is a race, and the next poll
+    re-judges the new head.
+  - `daemon_pr_state` gained `updates` and `landing` (additive migration,
+    applied at open). `landing` is what tells the daemon's own
+    update-branch commit apart from a human's push — without it the
+    takeover guard (#412) would hand off every PR that ever fell behind.
+    The update request carries `expected_head_sha`, so a human who pushed
+    first makes it fail rather than having their commit adopted.
+
 ### Changed
 
 - **The per-task pipeline is three phases, not six: DECOMPOSE → BUILD →

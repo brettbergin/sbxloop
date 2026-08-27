@@ -2181,6 +2181,18 @@ mem_abort = 0.0
 # backlog_max_per_run = 5
 # backlog_auto_trigger = false
 # deliver_draft = true             # autonomous PRs arrive as drafts
+# The last step out of the loop. With auto_merge on, a PR that clears the full
+# acceptance bar — green checks AND a satisfied review — is taken out of draft
+# and merged by the daemon. Off by default: merging is the one irreversible
+# thing the loop does to a repo, and on a repo whose merges publish a release
+# this means unattended releases. A PR accepted for any weaker reason (green
+# CI with no reviewer available) is still handed to a human.
+# auto_merge = false
+# merge_method = "squash"          # squash | merge | rebase
+# delete_branch_on_merge = true
+# Branch protection often requires a PR to be up to date before merging, and
+# the base moves. Each update is one API call, not a run; 0 disables updating.
+# merge_update_attempts = 3
 # Retention for .sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
 # swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
 # prune_runs_after_days = 14

@@ -371,7 +371,9 @@ A source issue always settles on **merge**, not on delivery: at acceptance
 the daemon comments the run summary and PR link, removes
 `sbxloop:in-progress`, and adds `sbxloop:delivered`; when the PR merges it
 closes the issue (`state_reason: completed`) and swaps `sbxloop:delivered`
-for `sbxloop:completed`. A PR closed without merging marks the item failed
+for `sbxloop:completed`. Who does the merging is
+[`auto_merge`](#merging-without-a-human-auto_merge)'s call — by default, a
+human. A PR closed without merging marks the item failed
 (`sbxloop:failed`) and leaves the issue open for the human to re-trigger or
 close. (`close_on_success`, which used to close the issue at acceptance, is
 now a deprecated no-op.) For a tracker whose issues are design discussions
@@ -388,6 +390,50 @@ tracking_issue = false        # the summary comment is the record
 workspace_isolation = "clone" # never touch the runner's checkout
 refresh_workspace = true      # fast-forward it before each fresh run
 ```
+
+#### Merging without a human: `auto_merge`
+
+By default the loop stops one step short of done. It delivers the PR, files
+a review of it, runs bounded fix rounds against red checks and requested
+changes — and then hands a green, approved, still-draft PR to a person to
+merge.
+
+`[daemon] auto_merge` closes that gap. A PR that clears the **full**
+acceptance bar — every check green *and* the review satisfied — is taken out
+of draft (a GraphQL `markPullRequestReadyForReview`; REST cannot un-draft),
+brought up to date with its base if protection requires that, and merged.
+The merge then settles the source issue through the path that already
+existed: closed, `sbxloop:completed`.
+
+It is off by default, and deliberately:
+
+> Merging is the only irreversible thing sbxloop does to a repository. On a
+> repo whose merges publish — this one releases to PyPI and redeploys the
+> daemon host on every merge to `main` — turning it on means unattended
+> releases. That is the existing pipeline working as designed, with nobody
+> in front of it.
+
+The bar is the full one. A PR the gate accepted for a *weaker* reason —
+green CI with no reviewer available to judge it — is never merged; it
+settles the way it always did. Neither is a PR someone else has pushed to:
+the takeover guard still hands those over untouched.
+
+When GitHub refuses the merge (a protection rule wanting an approval
+sbxloop's identity cannot give, a base that keeps moving out from under it),
+the item is handed to a human with the PR **open and out of draft** — one
+click from done — rather than spending its budget on a refusal no round can
+fix.
+
+```toml
+[daemon]
+auto_merge = true             # merge the PR once it is green and approved
+merge_method = "squash"       # squash | merge | rebase
+delete_branch_on_merge = true
+merge_update_attempts = 3     # keep it current with a moving base; 0 disables
+```
+
+Watch it happen in the log: `land.undrafted` → `land.update_branch` →
+`item.merged`, or `land.blocked` when it stopped and why.
 
 ### Discord: chronology out, steering in
 
