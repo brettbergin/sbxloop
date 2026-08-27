@@ -62,6 +62,16 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **`sbxloop watch` shows the same bounded excerpt of a failed tool call
+  that Discord threads do.** The line-selection half of the excerpt policy
+  — the head+tail split, the per-line clip, and the `… N lines elided …`
+  marker counted from the event's `output_lines` — moved into a shared
+  `sbxloop.excerpt` module. The TUI previously kept its own ad-hoc
+  last-N-lines tail, so a failure whose cause was near the top of its
+  output showed only the trailing noise and gave no sign that anything had
+  been dropped. There is now one copy of the truncation rules, documented
+  in that module; only Discord's character caps remain layer-specific.
+
 - **Run watches are persistent.** `watch_run` registrations are stored in
   `daemon_run_watches` (`run_id -> [requester ids]`) and reloaded when the
   daemon starts, so a watch registered before a restart or upgrade still
