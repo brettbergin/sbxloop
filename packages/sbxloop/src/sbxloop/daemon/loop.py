@@ -48,9 +48,9 @@ from sbxloop.daemon.discord_format import (
     refs_text,
 )
 from sbxloop.daemon.logsink import event_log_subscriber
-from sbxloop.daemon.model import RunReport, TickOutcome, TickResult, WorkItem
+from sbxloop.daemon.model import ReviewOutcome, RunReport, TickOutcome, TickResult, WorkItem
 from sbxloop.daemon.postmortem import build_dossier
-from sbxloop.daemon.review import fix_brief, fix_tasks
+from sbxloop.daemon.review import PostedReview, fix_brief, fix_tasks
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore, PrState
 from sbxloop.engine.engine import LoopEngine
@@ -71,7 +71,6 @@ from sbxloop.errors import (
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
-from sbxloop.gh.ops import SubmittedReview
 from sbxloop.ids import branch_name, new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -146,6 +145,21 @@ _TERMINAL_ITEM_STATES = frozenset({"done", "failed", "abandoned", "cancelled"})
 # Merges are human-paced (hours to days), so a five-minute floor keeps the
 # watch responsive without spending a GitHub read per PR per tick.
 _MERGE_POLL_MIN_S = 300.0
+
+
+def _review_outcome(posted: PostedReview | None) -> ReviewOutcome | None:
+    """The run report's view of a posted review — None when the item was
+    not a review, which leaves patch and audit reports untouched."""
+    if posted is None:
+        return None
+    return ReviewOutcome(
+        pr_number=posted.pr_number,
+        url=posted.url,
+        requested_event=posted.requested_event,
+        posted_event=posted.event,
+        comments=posted.comments,
+        gates_merge=posted.gates_merge,
+    )
 
 
 class DaemonLoop:
@@ -977,14 +991,22 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         if result is not None and report.succeeded:
-            posted = self._post_review(item, run_id)
+            posted, is_review = self._post_review(item, run_id)
             # A review's findings go on the pull request, never into the
             # tracker: filing them as issues is the behaviour being replaced,
-            # and a reviewer with an issue-shaped outlet will use it.
-            filed = [] if posted is not None else self._collect_backlog(run_id, source)
+            # and a reviewer with an issue-shaped outlet will use it. That
+            # holds whether or not the post itself succeeded — a review item
+            # has no backlog to fall back to collecting (`is_review`, not
+            # `posted is not None`, which conflated "not a review" with "was
+            # a review but the post was lost").
+            filed = [] if is_review else self._collect_backlog(run_id, source)
             tool = self._collect_tool_findings(run_id, source)
             report = report._replace(
-                filed=tuple(filed), tool_filed=tuple(tool.filed), tool_noted=tuple(tool.unfiled)
+                filed=tuple(filed),
+                tool_filed=tuple(tool.filed),
+                tool_noted=tuple(tool.unfiled),
+                review=_review_outcome(posted),
+                review_failed=is_review and posted is None,
             )
             self.dstore.finish_ledger(run_id, "done", now)
             if self._consecutive_failures:
@@ -1019,6 +1041,11 @@ class DaemonLoop:
                 tasks=report.task_summary,
                 pr=report.delivery[1] if report.delivery else None,
                 filed=len(report.filed),
+                # A review item files nothing, so `filed=0` alone read as
+                # "no findings"; the verdict is its real outcome (#469).
+                verdict=report.review.requested_event if report.review else None,
+                comments=report.review.comments if report.review else None,
+                gates_merge=report.review.gates_merge if report.review else None,
                 attempt=item.attempts,
             )
             return "done"
@@ -2238,32 +2265,38 @@ class DaemonLoop:
                 continue
             self.dstore.touch_merge_check(item_id, now)
 
-    def _post_review(self, item: WorkItem, run_id: str) -> SubmittedReview | None:
+    def _post_review(self, item: WorkItem, run_id: str) -> tuple[PostedReview | None, bool]:
         """Post this run's review to the PR it reviewed, when it is one.
 
-        Returns None for every item that is not a review, which is what
-        keeps the ordinary backlog lane untouched. Best-effort: the run has
-        already succeeded, and a GitHub hiccup here must not turn that into
-        a failure — the review is visibly absent on the PR either way, which
+        Returns ``(posted, is_review)``. ``is_review`` is what lets the
+        caller tell "this item was never a review" (``is_review=False``)
+        apart from "this item was a review whose post did not happen"
+        (``is_review=True, posted=None``) — collapsing those into a single
+        ``posted is None`` used to route a lost review through the audit
+        lane's clean-bill wording, reporting "no findings" for exactly the
+        runs where a review was requested and never made it to the PR
+        (#469 field failure). Best-effort beyond that: the run has already
+        succeeded, and a GitHub hiccup here must not turn that into a
+        failure — the review is visibly absent on the PR either way, which
         is the honest signal.
         """
         target = self.dstore.review_target(item.item_id)
         if target is None:
-            return None
+            return None, False
         pr_number, origin_run_id = target
         github: Any = next((s for s in self.sources if s.name == "github"), None)
         if github is None or not hasattr(github, "post_review"):
             log.warning("review.no_github_source", item=item.item_id, pr=pr_number)
-            return None
+            return None, True
         try:
             posted = github.post_review(self.store.get_run(run_id), pr_number, origin_run_id)
         except Exception:
             log.warning(
                 "review.post_failed", item=item.item_id, run=run_id, pr=pr_number, exc_info=True
             )
-            return None
+            return None, True
         if posted is None:
-            return None
+            return None, True
         # `item` is the review's own work item; the item *waiting* on this PR
         # is a different one. Settling against the charter updated no row and
         # left the waiter marked "review in flight" for ever (field: gh:335
@@ -2289,8 +2322,8 @@ class DaemonLoop:
             verdict=posted.event,
             gates_merge=posted.gates_merge,
         )
-        assert isinstance(posted, SubmittedReview)
-        return posted
+        assert isinstance(posted, PostedReview)
+        return posted, True
 
     def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:
         """File the run's backlog items; returns their refs (``gh:<n>``)."""

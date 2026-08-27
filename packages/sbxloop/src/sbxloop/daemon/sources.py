@@ -29,12 +29,12 @@ from typing import Any, NamedTuple, Protocol
 from urllib.parse import quote
 
 from sbxloop.config import MergeMethod
-from sbxloop.daemon.model import ItemKind, RunReport, WorkItem
+from sbxloop.daemon.model import ItemKind, ReviewOutcome, RunReport, WorkItem
 from sbxloop.daemon.postmortem import postmortem_marker
-from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, collect_review
+from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, PostedReview, collect_review
 from sbxloop.engine.model import RunRecord
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import ChecksVerdict, GithubOps, MergeOutcome, SubmittedReview
+from sbxloop.gh.ops import ChecksVerdict, GithubOps, MergeOutcome
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -110,6 +110,29 @@ def _report_lines(report: RunReport) -> list[str]:
         )
     if report.workspace:
         lines.append(f"Workspace: `{report.workspace}`")
+    return lines
+
+
+def _review_report_lines(review: ReviewOutcome) -> list[str]:
+    """A review item's deliverable is the posted review, not filed issues:
+    say what verdict went up, how many inline comments came with it, and
+    whether it actually blocks the merge (#469)."""
+    verdict = "approved" if review.approved else "requested changes"
+    n = review.comments
+    comments = "no inline comments" if n == 0 else f"{n} inline comment(s)"
+    lines = [f"Review {verdict} on PR #{review.pr_number} with {comments}: {review.url}"]
+    if not review.gates_merge:
+        # What a downgrade costs differs by verdict, and saying the wrong one
+        # misleads whoever reads the issue. An approval never blocked the
+        # merge to begin with — what it loses is the ability to *satisfy* a
+        # required-review gate. Only `request_changes` loses its block.
+        lines.append(
+            f"Posted as {review.posted_event}, not {review.requested_event} — it does not "
+            "satisfy a required-review gate; a human approval is still needed."
+            if review.approved
+            else f"Posted as a non-gating {review.posted_event} — {review.requested_event} "
+            "was refused, so nothing on the PR blocks the merge."
+        )
     return lines
 
 
@@ -640,7 +663,9 @@ class GitHubIssueSource:
             # it. A patch item's issue settles when its PR merges, so here
             # it stays open wearing the delivered label.
             close = item.kind == "audit"
-            if item.kind == "audit" and not report.filed:
+            if report.review is not None:
+                lines.extend(_review_report_lines(report.review))
+            elif item.kind == "audit" and not report.filed:
                 lines.append("The audit filed no findings.")
             if not close:
                 lines.append(
@@ -968,7 +993,7 @@ class GitHubIssueSource:
 
     def post_review(
         self, run: RunRecord, pr_number: int, origin_run_id: str
-    ) -> SubmittedReview | None:
+    ) -> PostedReview | None:
         """Post a finished review run's verdict to the PR it reviewed.
 
         The counterpart to :meth:`file_review`, which queues the work: this
