@@ -62,6 +62,12 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **Run watches are persistent.** `watch_run` registrations are stored in
+  `daemon_run_watches` (`run_id -> [requester ids]`) and reloaded when the
+  daemon starts, so a watch registered before a restart or upgrade still
+  pings the person who asked when the run finishes. The tool description,
+  confirmation text and docs no longer warn that a restart forgets watches.
+
 - **The per-task pipeline is three phases, not six: DECOMPOSE → BUILD →
   VERIFY.** PLAN and EXECUTE merged into one BUILD session that plans and
   does the work (narrating its approach first — the chronology's plan-card
@@ -80,6 +86,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   the previous stage had already read. Adversarial review now lives solely
   in the daemon's post-delivery review lane, which sees the whole diff and
   drives bounded fix rounds. Consequences through the system:
+
   - `verify_commands` are **decomposer-authored only** (the plan-level set
     is gone): the agent that does the work never writes its own exam (#94),
     and the builder is shown the commands verbatim. The wrong-exam failure
