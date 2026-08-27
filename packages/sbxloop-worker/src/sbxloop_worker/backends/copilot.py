@@ -514,17 +514,22 @@ def usage_from_sdk_sample(data: Any) -> Usage:
     downstream already carries (``Usage`` in the worker protocol, the
     concierge's ``_USAGE_FIELDS``).
 
-    The sample's per-turn spend attribute is deliberately NOT read, and
-    ``Usage`` carries no field for it (#386, #439). It is not a per-turn
-    delta: it was observed as the same constant 15.0 on every turn of every
-    session in run rrhb28j7n (sbxloop 0.7.26), so folding it through
-    ``Usage.merged`` fabricated a run total the concierge then repeated as
-    fact. A value identical on every turn is far more likely a
-    premium-request multiplier or quota unit than a currency amount, so it
-    stays unread until its unit is established; "spend: not reported by the
-    agent backend" is the honest answer. If it is ever surfaced it must be
-    carried non-additively (last/max wins, as ``Usage.merged`` already does
-    for ``model``) and never rendered in a currency shape.
+    The sample's ``cost`` attribute is deliberately NOT read, and ``Usage``
+    carries no field for it (#386, #439). What it denotes was investigated
+    in ``docs/spikes/431-assistant-usage-cost.md`` (issue #431) and the
+    answer is **UNCONFIRMED**: nothing shipped in github-copilot-sdk 1.0.11
+    states a unit for it — it is a bare, undocumented, experimental
+    ``float | None`` — while sibling declarations use "cost" for
+    premium-request counts, multipliers and AI-credit/nano-AIU units rather
+    than money. What field observation does settle is what it is *not*: it
+    was the same constant 15.0 on every turn of every session in run
+    rrhb28j7n (sbxloop 0.7.26) regardless of token counts, so it is not a
+    per-turn delta and folding it through ``Usage.merged`` fabricated a run
+    total the concierge then repeated as fact. It therefore stays unread
+    until a citation establishes its unit; "spend: not reported by the agent
+    backend" is the honest answer. If it is ever surfaced it must be carried
+    non-additively (last/max wins, as ``Usage.merged`` already does for
+    ``model``) and never rendered in a currency shape.
     """
     return Usage(
         model=_sdk_field(data, "model"),

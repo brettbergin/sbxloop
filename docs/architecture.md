@@ -202,9 +202,15 @@ would invalidate the cache; the knob that did it is gone.
 
 The same run also settles what `AssistantUsageData.cost` is *not*: it reports
 the same constant (15.0) on every turn of every session, so it is not a
-per-turn delta and summing it fabricates a figure. Its unit is unknown — a
-constant per turn reads far more like a premium-request multiplier or a quota
-unit than a currency amount — so it must not be rendered as currency. The
+per-turn delta and summing it fabricates a figure. What it *does* denote was
+investigated in [`docs/spikes/431-assistant-usage-cost.md`](spikes/431-assistant-usage-cost.md),
+and the answer is UNCONFIRMED: the SDK declares it as a bare, undocumented,
+experimental `float | None` and names no unit for it anywhere, while sibling
+declarations use "cost" for premium-request counts, multipliers and
+AI-credit/nano-AIU units rather than money. Its unit therefore remains
+unknown — a constant per turn reads far more like a premium-request
+multiplier or a quota unit than a currency amount — so it must not be
+rendered as currency. The
 wire `Usage` model therefore carries **no** spend field at all (#439): no
 backend writes one, so keeping the field and its render was dead code one
 hand-built object away from reintroducing the fabricated figure. `run_usage`
