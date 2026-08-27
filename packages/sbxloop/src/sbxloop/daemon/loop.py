@@ -2358,8 +2358,23 @@ class DaemonLoop:
                 hint="posted, but no item is recorded as awaiting this PR",
             )
         else:
-            self.dstore.review_settled(waiting, gates=posted.gates_merge, verdict=posted.event)
-        verdict = "approved" if posted.event == "APPROVE" else "requested changes"
+            # The REQUESTED verdict, not the accepted one. GitHub downgrades
+            # either verdict to COMMENT when this identity is not an accepted
+            # reviewer (422), and `gates` already records that. What the gate
+            # falls back on when the review does not gate is *our* verdict —
+            # so storing "COMMENT" here made both of its fallbacks
+            # (`verdict == "REQUEST_CHANGES"` for a fix round, `== "APPROVE"`
+            # to land) permanently false, and the item sat in `reviewing`
+            # forever behind a debug-level "waiting on approval". Field:
+            # gh:424 on PR #480, whose review requested changes with 5
+            # comments and was never acted on.
+            self.dstore.review_settled(
+                waiting, gates=posted.gates_merge, verdict=posted.requested_event
+            )
+        # Also the requested one: a downgraded APPROVE is still an approval,
+        # and announcing it as "requested changes" tells the operator the
+        # opposite of what the review said.
+        verdict = "approved" if posted.requested_event == "APPROVE" else "requested changes"
         gate = "" if posted.gates_merge else " (as a comment — it does not gate the merge)"
         self._notify(
             f"🔎 review {verdict} on PR #{pr_number}{gate}: {posted.url}",
@@ -2367,7 +2382,8 @@ class DaemonLoop:
             item=item.item_id,
             run=run_id,
             pr=pr_number,
-            verdict=posted.event,
+            verdict=posted.requested_event,
+            posted_as=posted.event,
             gates_merge=posted.gates_merge,
         )
         assert isinstance(posted, PostedReview)

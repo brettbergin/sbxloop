@@ -1915,6 +1915,32 @@ class TestReviewGoesToThePr:
         assert outcome.gates_merge is False
         assert outcome.approved is False
 
+    def test_the_stored_verdict_is_the_one_we_asked_for(self, tmp_path: Path) -> None:
+        """GitHub downgrades either verdict to COMMENT when this identity is
+        not an accepted reviewer, and `gates` already records that. The
+        verdict column is what the gate falls back on *because* the review
+        does not gate — so storing the accepted event made both fallbacks
+        (`== "REQUEST_CHANGES"` for a fix round, `== "APPROVE"` to land)
+        permanently false on any repo that downgrades, which is every repo
+        the loop reviews its own PRs on.
+
+        Field: gh:424 sat in `reviewing` behind a debug-level "waiting on
+        approval" while its review had requested changes with 5 inline
+        comments on PR #480. Silent, and the one outcome this gate must
+        never produce.
+        """
+        h, _ = self._reviewed(tmp_path)
+        waiter = WorkItem(item_id="gh:1", source="github", source_key="1", title="W")
+        h.dstore.upsert_new(waiter, h.clock.t)
+        h.dstore.mark_reviewing("gh:1", h.clock.t)  # in the gate, not the queue
+        h.dstore.record_delivery("gh:1", 7, "sbxloop/r1", h.clock.t, url="https://x/pull/7")
+        h.dstore.review_in_flight("gh:1", "gh:391")
+        assert h.loop.tick().outcome == "done"
+        state = h.dstore.pr_state("gh:1")
+        assert state is not None
+        assert state.verdict == "REQUEST_CHANGES", "the requested verdict, not COMMENT"
+        assert not state.gates, "and the downgrade is recorded where it belongs"
+
     def test_an_ordinary_item_has_no_review_outcome(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.source.items = [inbox_item()]
