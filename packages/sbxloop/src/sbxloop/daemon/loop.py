@@ -991,17 +991,22 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         if result is not None and report.succeeded:
-            posted = self._post_review(item, run_id)
+            posted, is_review = self._post_review(item, run_id)
             # A review's findings go on the pull request, never into the
             # tracker: filing them as issues is the behaviour being replaced,
-            # and a reviewer with an issue-shaped outlet will use it.
-            filed = [] if posted is not None else self._collect_backlog(run_id, source)
+            # and a reviewer with an issue-shaped outlet will use it. That
+            # holds whether or not the post itself succeeded — a review item
+            # has no backlog to fall back to collecting (`is_review`, not
+            # `posted is not None`, which conflated "not a review" with "was
+            # a review but the post was lost").
+            filed = [] if is_review else self._collect_backlog(run_id, source)
             tool = self._collect_tool_findings(run_id, source)
             report = report._replace(
                 filed=tuple(filed),
                 tool_filed=tuple(tool.filed),
                 tool_noted=tuple(tool.unfiled),
                 review=_review_outcome(posted),
+                review_failed=is_review and posted is None,
             )
             self.dstore.finish_ledger(run_id, "done", now)
             if self._consecutive_failures:
@@ -2051,32 +2056,38 @@ class DaemonLoop:
                 continue
             self.dstore.touch_merge_check(item_id, now)
 
-    def _post_review(self, item: WorkItem, run_id: str) -> PostedReview | None:
+    def _post_review(self, item: WorkItem, run_id: str) -> tuple[PostedReview | None, bool]:
         """Post this run's review to the PR it reviewed, when it is one.
 
-        Returns None for every item that is not a review, which is what
-        keeps the ordinary backlog lane untouched. Best-effort: the run has
-        already succeeded, and a GitHub hiccup here must not turn that into
-        a failure — the review is visibly absent on the PR either way, which
+        Returns ``(posted, is_review)``. ``is_review`` is what lets the
+        caller tell "this item was never a review" (``is_review=False``)
+        apart from "this item was a review whose post did not happen"
+        (``is_review=True, posted=None``) — collapsing those into a single
+        ``posted is None`` used to route a lost review through the audit
+        lane's clean-bill wording, reporting "no findings" for exactly the
+        runs where a review was requested and never made it to the PR
+        (#469 field failure). Best-effort beyond that: the run has already
+        succeeded, and a GitHub hiccup here must not turn that into a
+        failure — the review is visibly absent on the PR either way, which
         is the honest signal.
         """
         target = self.dstore.review_target(item.item_id)
         if target is None:
-            return None
+            return None, False
         pr_number, origin_run_id = target
         github: Any = next((s for s in self.sources if s.name == "github"), None)
         if github is None or not hasattr(github, "post_review"):
             log.warning("review.no_github_source", item=item.item_id, pr=pr_number)
-            return None
+            return None, True
         try:
             posted = github.post_review(self.store.get_run(run_id), pr_number, origin_run_id)
         except Exception:
             log.warning(
                 "review.post_failed", item=item.item_id, run=run_id, pr=pr_number, exc_info=True
             )
-            return None
+            return None, True
         if posted is None:
-            return None
+            return None, True
         # `item` is the review's own work item; the item *waiting* on this PR
         # is a different one. Settling against the charter updated no row and
         # left the waiter marked "review in flight" for ever (field: gh:335
@@ -2103,7 +2114,7 @@ class DaemonLoop:
             gates_merge=posted.gates_merge,
         )
         assert isinstance(posted, PostedReview)
-        return posted
+        return posted, True
 
     def _collect_backlog(self, run_id: str, source: WorkSource) -> list[str]:
         """File the run's backlog items; returns their refs (``gh:<n>``)."""

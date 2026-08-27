@@ -1897,6 +1897,29 @@ class TestReviewGoesToThePr:
         assert h.loop.tick().outcome == "done"
         assert h.source.calls[-1][1].filed == ("inbox:finding-a",)
 
+    def test_a_lost_review_is_marked_failed_not_filed_nothing(self, tmp_path: Path) -> None:
+        """PR review comment (loop.py:1004): a review item whose post never
+        reaches the PR (here: the source's `post_review` returns None, as it
+        does for a missing/unparseable `.sbxloop/review.json`) must not be
+        indistinguishable from "this item was never a review" — both used to
+        collapse into `posted is None`, which routed the lost review through
+        the audit lane's "no findings" wording. `is_review` (not `posted is
+        not None`) is what still keeps the backlog lane untouched."""
+        h, _ = self._reviewed(tmp_path)
+        h.source.post_review = lambda run, pr_number, origin_run_id: None  # type: ignore[attr-defined]
+        h.loop._collect_backlog = lambda run_id, source: ["should:not:be:filed"]  # type: ignore[method-assign]
+        assert h.loop.tick().outcome == "done"
+        report = h.source.calls[-1][1]
+        assert report.filed == (), "a review must not fall back to filing backlog issues"
+        assert report.review is None
+        assert report.review_failed is True
+
+    def test_an_ordinary_item_never_reports_review_failed(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        assert h.loop.tick().outcome == "done"
+        assert h.source.calls[-1][1].review_failed is False
+
 
 class ReviewingSource(FakeSource):
     """A github-shaped source that files reviews and answers PR state."""
