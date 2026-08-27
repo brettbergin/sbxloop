@@ -730,6 +730,23 @@ class DaemonStore:
             )
             return [(str(row["run_id"]), str(row["item_id"])) for row in rows]
 
+    def finished_run_ids(self, run_ids: Sequence[str]) -> set[str]:
+        """Which of these runs already have a ledger `finished_at`. Used at
+        Discord watch reload to drop watches for runs that completed while
+        the daemon was down: the `run_finished` event that would have
+        pinged them has already fired, so reviving the entry would just
+        leave it waiting for an event that will never come again."""
+        if not run_ids:
+            return set()
+        with self._lock:
+            placeholders = ", ".join("?" for _ in run_ids)
+            rows = self._conn.execute(
+                f"SELECT run_id FROM daemon_runs WHERE run_id IN ({placeholders}) "  # nosec B608
+                "AND finished_at IS NOT NULL",
+                tuple(run_ids),
+            )
+            return {str(r["run_id"]) for r in rows}
+
     def finish_ledger(self, run_id: str, result: str, now: float) -> None:
         with self._lock:
             self._conn.execute(
@@ -1250,6 +1267,11 @@ class DaemonStore:
             return watches
 
     def clear_run_watch(self, run_id: str) -> None:
+        """Drop a run's watch row without returning it — used by the bridge's
+        `_evict_watch` when an entry is dropped for a reason other than a
+        normal finish (a `WATCHERS_CAP` trim, or reconciling a reload
+        against a run that already finished while the daemon was down),
+        where `take_run_watchers`'s return value would just be discarded."""
         with self._lock:
             self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
             self._conn.commit()

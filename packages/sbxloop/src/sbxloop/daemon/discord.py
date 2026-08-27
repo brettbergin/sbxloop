@@ -544,8 +544,15 @@ class DiscordBridge:
 
     def _reload_watches(self) -> None:
         """Repopulate `_watchers` from the store at startup, so a run started
-        before a restart still pings whoever asked. Never raises: a bad or
-        missing store leaves the bridge on its in-memory registry."""
+        before a restart still pings whoever asked. A watch whose run
+        already reached a terminal ledger state is dropped instead of
+        reloaded: `run_finished` for it already fired (or the daemon was
+        down when it should have), so reviving the entry would just leave a
+        phantom nothing will ever drain again — reconciled against
+        `daemon_runs.finished_at` via `finished_run_ids`, and the dropped
+        row is cleared with `_evict_watch` so it does not keep coming back
+        on every future restart. Never raises: a bad or missing store
+        leaves the bridge on its in-memory registry."""
         store = getattr(self, "dstore", None)
         if store is None:
             return
@@ -556,11 +563,24 @@ class DiscordBridge:
             return
         if not watches:
             return
+        try:
+            finished = store.finished_run_ids(list(watches))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("discord.watch_reconcile_failed", error=str(exc), exc_info=True)
+            finished = set()
+        for run_id in finished:
+            ids = watches.pop(run_id, [])
+            log.warning("discord.watch_orphaned", run=run_id, watchers=len(ids))
+            self._evict_watch(run_id)
+        if not watches:
+            return
         with self._watch_lock:
             for run_id, ids in watches.items():
                 self._watchers[run_id] = list(dict.fromkeys(ids))
             while len(self._watchers) > WATCHERS_CAP:
-                self._watchers.pop(next(iter(self._watchers)))
+                evicted = next(iter(self._watchers))
+                self._watchers.pop(evicted)
+                self._evict_watch(evicted)
         log.info("discord.watches_reloaded", runs=len(self._watchers))
 
     def on_watch(self, run_id: str, requester: str) -> str | None:
@@ -574,7 +594,15 @@ class DiscordBridge:
         (``_tool_handler`` builds ``by = f"{author} (via concierge)"``), but
         `_remember_requester` stores the id under the bare, untagged author
         string. Strip the tag back off before the lookup, or every real
-        watch fails to find an id and silently registers nothing."""
+        watch fails to find an id and silently registers nothing.
+
+        The in-memory append and the store persist happen under the same
+        `_watch_lock` `_take_watchers` uses to drain both registries — a
+        TOCTOU otherwise: with the persist outside the lock, a concurrent
+        drain for this run could pop the (still empty) in-memory entry and
+        delete zero store rows *before* this call's INSERT lands, orphaning
+        the row forever (nothing else ever deletes a row for a run that has
+        already finished)."""
         key = requester.removesuffix(VIA_CONCIERGE_SUFFIX)
         try:
             with self._watch_lock:
@@ -587,9 +615,11 @@ class DiscordBridge:
                 watchers = self._watchers.setdefault(run_id, [])
                 if user_id not in watchers:
                     watchers.append(user_id)
+                self._persist_watch(run_id, user_id)
                 while len(self._watchers) > WATCHERS_CAP:
-                    self._watchers.pop(next(iter(self._watchers)))
-            self._persist_watch(run_id, user_id)
+                    evicted = next(iter(self._watchers))
+                    self._watchers.pop(evicted)
+                    self._evict_watch(evicted)
             log.info("discord.watch_registered", run=run_id, by=requester)
             return None
         except Exception as exc:  # pragma: no cover - defensive
@@ -597,6 +627,9 @@ class DiscordBridge:
             return None
 
     def _persist_watch(self, run_id: str, user_id: str) -> None:
+        """Must be called with `_watch_lock` held (see `on_watch`), so the
+        memory mutation and the store write are one atomic step from
+        `_take_watchers`' point of view."""
         store = getattr(self, "dstore", None)
         if store is None:
             return
@@ -605,18 +638,37 @@ class DiscordBridge:
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("discord.watch_persist_failed", run=run_id, error=str(exc), exc_info=True)
 
+    def _evict_watch(self, run_id: str) -> None:
+        """Drop a run's persisted row when its in-memory entry is evicted
+        (cap trim in `on_watch`/`_reload_watches`) or reconciled away
+        (`_reload_watches` dropping an already-finished run). Without this
+        the store row outlives the eviction it is supposed to mirror and
+        `daemon_run_watches` grows without bound for runs that never reach
+        `_post_watch_notice`."""
+        store = getattr(self, "dstore", None)
+        if store is None:
+            return
+        try:
+            store.clear_run_watch(run_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("discord.watch_evict_failed", run=run_id, error=str(exc), exc_info=True)
+
     def _take_watchers(self, run_id: str) -> list[str]:
-        """Drain both registries for a run: the in-memory entry and the
-        persisted rows, unioned and de-duplicated, order preserved. Both are
-        cleared, so a second finish for the same run pings nobody."""
+        """Drain both registries for a run under `_watch_lock` — the same
+        lock `on_watch` holds across its own memory-append-plus-persist —
+        so the two operations cannot interleave. Unioned and de-duplicated,
+        order preserved. Both are cleared, so a second finish for the same
+        run pings nobody."""
         with self._watch_lock:
             watchers = list(self._watchers.pop(run_id, []))
-        store = getattr(self, "dstore", None)
-        if store is not None:
-            try:
-                watchers.extend(store.take_run_watchers(run_id))
-            except Exception as exc:  # pragma: no cover - defensive
-                log.warning("discord.watch_take_failed", run=run_id, error=str(exc), exc_info=True)
+            store = getattr(self, "dstore", None)
+            if store is not None:
+                try:
+                    watchers.extend(store.take_run_watchers(run_id))
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning(
+                        "discord.watch_take_failed", run=run_id, error=str(exc), exc_info=True
+                    )
         return list(dict.fromkeys(watchers))
 
     def _watch_notice(
@@ -647,8 +699,12 @@ class DiscordBridge:
         the persisted rows (a watch registered before a daemon restart), and
         is final — a second finish for the same run pings nobody. A run that
         never reaches this path at all (shutdown mid-run, a crash, a breaker
-        teardown) leaves its entry in `_watchers` — `WATCHERS_CAP` bounds that
-        instead of leaking it forever, evicting the oldest registrations first."""
+        teardown) leaves its entry in `_watchers` *and* its persisted row —
+        `WATCHERS_CAP` bounds both together (`_evict_watch` clears the row
+        whenever the in-memory entry is evicted), instead of leaking either
+        forever, evicting the oldest registrations first. A watch whose run
+        already finished while the daemon was down is a separate case,
+        reconciled at `_reload_watches` rather than here."""
         watchers = self._take_watchers(run_id)
         if not watchers:
             return
