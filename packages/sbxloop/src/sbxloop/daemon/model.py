@@ -54,6 +54,32 @@ class WorkItem(BaseModel):
     pending_report: PendingReport | None = None
 
 
+class ReviewOutcome(NamedTuple):
+    """What a review run actually posted to its pull request.
+
+    A review's deliverable is the review, not backlog issues: without this
+    the summary layer had only ``filed`` to report on, and a review files
+    none — so a ``REQUEST_CHANGES`` with eleven inline comments read as
+    "no findings" (#469).
+
+    ``requested_event`` is the verdict the reviewer asked for;
+    ``posted_event`` is what GitHub accepted, which is ``COMMENT`` when the
+    daemon identity is refused as a reviewer — and then ``gates_merge`` is
+    False and nothing on the PR blocks the merge.
+    """
+
+    pr_number: int
+    url: str
+    requested_event: str
+    posted_event: str
+    comments: int
+    gates_merge: bool
+
+    @property
+    def approved(self) -> bool:
+        return self.requested_event == "APPROVE"
+
+
 class RunReport(NamedTuple):
     """What the daemon tells the source about a finished run — mined from
     the run's persisted events, the same way the CLI finish summary is."""
@@ -77,6 +103,18 @@ class RunReport(NamedTuple):
     # tool_repo``) as refs, or merely noted by title in the closing comment.
     tool_filed: tuple[str, ...] = ()
     tool_noted: tuple[str, ...] = ()
+    # A review run's deliverable: the review it posted. None for every item
+    # that is not a review, so patch and audit reporting is unchanged.
+    review: ReviewOutcome | None = None
+    # True when this item WAS a review but the post never reached the PR —
+    # the review.json was missing or unparseable, no GitHub source was
+    # wired, or the POST itself raised (`loop._post_review` swallows that
+    # exception on purpose). Distinct from `review is None` on a non-review
+    # item: without this, a lost review fell back to the audit lane's
+    # "no findings" wording, telling the operator a PR was clean on exactly
+    # the runs where a review was requested and never made it (#469 field
+    # failure, loop.py:1004).
+    review_failed: bool = False
 
     @property
     def succeeded(self) -> bool:

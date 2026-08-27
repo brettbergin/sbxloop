@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -11,10 +11,21 @@ from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.gh.ops import GithubOps, IssueRef
 from sbxloop.gh.reporter import GithubReporterHook
 from sbxloop_worker.protocol import ErrorInfo, JobRequest, JobResult
+from tests.fakes.github_errors import worker_error
+
+
+class Fails(NamedTuple):
+    """Reply to this op with a recorded worker error shape (#226)."""
+
+    fixture: str
 
 
 class StubWorkerClient:
-    """Records github.op jobs and replies from a canned op->json map."""
+    """Records github.op jobs and replies from a canned op->json map.
+
+    A value is the response json, ``"FAIL"``, or a :class:`Fails` marker
+    naming a recorded worker error shape.
+    """
 
     def __init__(self, responses: dict[str, Any]) -> None:
         self.responses = responses
@@ -24,6 +35,13 @@ class StubWorkerClient:
         self.jobs.append(job)
         assert job.op is not None
         response = self.responses.get(job.op)
+        if isinstance(response, Fails):
+            kind, message, status = worker_error(response.fixture)
+            return JobResult(
+                job_id=job.job_id,
+                status="error",
+                error=ErrorInfo(type=kind, message=message, http_status=status),
+            )
         if response == "FAIL":
             return JobResult(
                 job_id=job.job_id,
@@ -269,3 +287,115 @@ class TestGithubReporterHook:
         _hook, ops, bus = self.make()
         bus.emit("agent.message", "r1", content="hi")
         assert ops.created == []
+
+
+class TestLanding:
+    """The primitives the daemon's landing stage merges a PR with.
+
+    All four go through ``raw.api``, so what these pin is the request shape
+    and — far more importantly — which GitHub answers come back as *data*
+    rather than as exceptions. A refusal misread as an error costs a retry
+    loop; an error misread as success merges nothing and says it did.
+    """
+
+    def test_ready_for_review_sends_the_mutation_and_reports_ready(self) -> None:
+        ops, client = make_ops(
+            {
+                "raw.api": {
+                    "data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}
+                }
+            }
+        )
+        assert ops.pr_ready_for_review("PR_node1") is True
+        params = client.jobs[0].params
+        assert params["method"] == "POST"
+        assert params["path"] == "/graphql"
+        assert params["body"]["variables"] == {"id": "PR_node1"}
+        assert "markPullRequestReadyForReview" in params["body"]["query"]
+
+    def test_ready_for_review_reads_the_body_not_the_status(self) -> None:
+        """GraphQL answers a failed mutation with 200 and an ``errors`` array.
+
+        Trusting the status here would report a still-draft PR as ready, and
+        a draft cannot be merged — the loop would then spend its whole merge
+        budget on a refusal it had caused itself.
+        """
+        ops, _ = make_ops({"raw.api": {"errors": [{"message": "Could not resolve to a node"}]}})
+        with pytest.raises(GithubOpsError, match="Could not resolve"):
+            ops.pr_ready_for_review("PR_bogus")
+
+    def test_ready_for_review_fails_closed_on_an_empty_answer(self) -> None:
+        """No error and no pull request is not an answer to act on."""
+        ops, _ = make_ops({"raw.api": {"data": {"markPullRequestReadyForReview": None}}})
+        with pytest.raises(GithubOpsError, match="no pull request"):
+            ops.pr_ready_for_review("PR_node1")
+
+    def test_ready_for_review_still_draft_is_not_ready(self) -> None:
+        ops, _ = make_ops(
+            {
+                "raw.api": {
+                    "data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": True}}}
+                }
+            }
+        )
+        assert ops.pr_ready_for_review("PR_node1") is False
+
+    def test_merge_sends_the_decided_sha(self) -> None:
+        """The sha the caller judged rides on the request, so a push that
+        landed since loses the race with a 409 instead of being merged over."""
+        ops, client = make_ops({"raw.api": {"merged": True, "sha": "cafe", "message": "ok"}})
+        outcome = ops.pr_merge("o/r", 42, method="squash", sha="beef")
+        assert (outcome.merged, outcome.sha) == (True, "cafe")
+        params = client.jobs[0].params
+        assert params["method"] == "PUT"
+        assert params["path"] == "/repos/o/r/pulls/42/merge"
+        assert params["body"] == {"merge_method": "squash", "sha": "beef"}
+
+    def test_merge_refusal_is_data_not_an_exception(self) -> None:
+        """405 is GitHub's blanket "not mergeable right now", and nothing the
+        loop can retry fixes it — so it must reach the caller as a verdict."""
+        ops, _ = make_ops({"raw.api": Fails("pr_not_mergeable_405")})
+        outcome = ops.pr_merge("o/r", 42, sha="beef")
+        assert (outcome.merged, outcome.blocked, outcome.stale) == (False, True, False)
+        assert "not mergeable" in outcome.reason
+
+    def test_merge_head_moved_is_stale_not_blocked(self) -> None:
+        """409 is a race, not a refusal: the next poll judges the new head."""
+        ops, _ = make_ops({"raw.api": Fails("pr_head_moved_409")})
+        outcome = ops.pr_merge("o/r", 42, sha="beef")
+        assert (outcome.merged, outcome.stale, outcome.blocked) == (False, True, False)
+
+    def test_merge_without_a_merged_flag_is_blocked(self) -> None:
+        """A 200 that does not claim a merge has not made one."""
+        ops, _ = make_ops({"raw.api": {"message": "nope"}})
+        outcome = ops.pr_merge("o/r", 42, sha="beef")
+        assert (outcome.merged, outcome.blocked) == (False, True)
+
+    def test_merge_other_failures_still_raise(self) -> None:
+        ops, _ = make_ops({"raw.api": "FAIL"})
+        with pytest.raises(GithubOpsError):
+            ops.pr_merge("o/r", 42, sha="beef")
+
+    def test_update_branch_sends_the_expected_head(self) -> None:
+        ops, client = make_ops({"raw.api": {"message": "Updating pull request branch."}})
+        assert ops.pr_update_branch("o/r", 42, expected_head_sha="beef") is True
+        params = client.jobs[0].params
+        assert params["path"] == "/repos/o/r/pulls/42/update-branch"
+        assert params["body"] == {"expected_head_sha": "beef"}
+
+    def test_update_branch_refusal_is_false_not_an_exception(self) -> None:
+        """422 covers "already current" and "your expected head moved". The
+        next poll re-reads the PR either way, so neither is worth raising."""
+        ops, _ = make_ops({"raw.api": Fails("update_branch_refused_422")})
+        assert ops.pr_update_branch("o/r", 42, expected_head_sha="beef") is False
+
+    def test_branch_delete_tolerates_an_absent_ref(self) -> None:
+        """The merge already happened; a branch a repo setting removed first
+        must not be reported as a failure of it."""
+        ops, _ = make_ops({"raw.api": Fails("ref_missing_404")})
+        ops.branch_delete("o/r", "sbxloop/r42")  # must not raise
+
+    def test_branch_delete_reraises_anything_else(self) -> None:
+        ops, _ = make_ops({"raw.api": "FAIL"})
+        with pytest.raises(GithubOpsError):
+            ops.branch_delete("o/r", "sbxloop/r42")

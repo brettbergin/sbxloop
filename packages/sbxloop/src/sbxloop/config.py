@@ -353,6 +353,11 @@ class Budgets(_ConfigModel):
 
 BacklogMode = Literal["off", "github", "inbox"]
 
+# How a landed PR is written onto the base branch. Squash is the default:
+# one autonomous PR becomes one commit, so the base branch's history reads
+# one line per issue rather than carrying every fix round separately.
+MergeMethod = Literal["squash", "merge", "rebase"]
+
 
 class DaemonConfig(_ConfigModel):
     """``sbxloop daemon`` — the always-on outer loop.
@@ -483,6 +488,27 @@ class DaemonConfig(_ConfigModel):
     backlog_auto_trigger: bool = False
     # Autonomous PRs arrive as drafts unless the operator says otherwise.
     deliver_draft: bool = True
+    # The last step out of the loop. With `auto_merge` on, a PR that clears
+    # the acceptance gate — green checks AND a satisfied review — is taken out
+    # of draft and merged by the daemon instead of being handed to a human.
+    # Off by default on purpose: merging is the one irreversible thing the
+    # loop does to a repository, and on a repo whose merges publish (sbxloop's
+    # own does) flipping this on means unattended releases.
+    #
+    # A PR the gate accepted for any *weaker* reason never merges: green CI
+    # with no reviewer available settles the way it always did. The bar for a
+    # merge is the full one.
+    auto_merge: bool = False
+    # How a landed PR is written onto the base branch. The repository's own
+    # merge-commit title/message settings still decide the wording.
+    merge_method: MergeMethod = "squash"
+    delete_branch_on_merge: bool = True
+    # Branch protection commonly requires a PR to be up to date with its base
+    # before merging, and `main` moves. Each update is one API call (not a
+    # run), but a base moving faster than CI finishes would update forever, so
+    # it is bounded; past it the PR is handed over. 0 disables updating, which
+    # leaves a behind PR to a human on such repositories.
+    merge_update_attempts: int = Field(default=3, ge=0)
     # Retention for runs/<run_id>/ on disk (workspace clone + harvested
     # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
     # rows are never removed. See sbxloop.gc for what is exempt.

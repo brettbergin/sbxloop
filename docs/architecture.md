@@ -167,7 +167,8 @@ task completion and rubber-stamped it (6/6 pass, 5/5 accept in the measured
 baseline) while diff-level defects — races, failure ordering, unguarded
 parses — leaked to the PR. Adversarial review lives in the daemon's
 post-delivery review lane, which sees the whole diff and drives bounded fix
-rounds on the delivered PR.
+rounds on the delivered PR — and, with `[daemon] auto_merge`, merges it (see
+[The acceptance gate, and landing](#the-acceptance-gate-and-landing)).
 
 Failures loop with budgets: verify failures re-BUILD with the failure
 transcript as feedback (`max_revisions_per_task`); exhausting revisions on
@@ -280,6 +281,55 @@ skip the daemon's `current` run and any item queued for resume, and the
 staleness sweep does not run at all while a run is executing. The persisted
 reason is surfaced next to the state in `sbxloop status` / `list_runs` output,
 on the `reason:` line of `sbxloop status <run>`, and in the TUI run header.
+
+## The acceptance gate, and landing
+
+A delivered PR is not done because it exists. `DaemonLoop._poll_one_review`
+advances one PR by exactly one step per tick, through gates ordered by what
+they cost — the PR's own fate first (a merge or an unmerged close outranks
+everything below), then the takeover guard, then CI (GitHub's compute, free),
+then the review, and only then the merge. Reviewing a red PR would spend a
+whole run on work that has to change anyway.
+
+The last gate is the **landing stage** (`_land`), reached only from the full
+bar: every check green *and* the review satisfied. With `[daemon] auto_merge`
+off it settles the item and stops, which is where the loop ended before. With
+it on:
+
+1. **Draft → ready.** REST cannot un-draft a pull request, so this one call is
+   GraphQL (`markPullRequestReadyForReview`) through the same `raw.api`
+   transport as everything else. GraphQL reports a failed mutation with a 200
+   status and an `errors` array, so the body is the verdict, not the status.
+   Un-drafting and merging are separate polls on purpose: GitHub reports a
+   draft's `mergeable_state` as `draft`, so the PR's real merge state only
+   becomes readable once it is out of draft.
+2. **Behind → update-branch.** Protection commonly requires a PR to be up to
+   date before merging, and the base moves. One API call, not a run — but
+   bounded (`merge_update_attempts`), because a base moving faster than CI
+   finishes would update for ever.
+3. **Conflicted → a fix round.** A re-delivery rebuilds the commit on the
+   current base, so a real conflict is genuinely fixable. It spends the
+   existing `review_rounds` budget because, unlike every other landing step,
+   it costs a whole run.
+4. **Merge**, sending the head sha the gate actually judged. A push that
+   landed since loses the race with a 409 rather than being merged over.
+
+Two answers come back as *data* rather than as exceptions, and the difference
+matters: **405** is GitHub's blanket "not mergeable right now" — a protection
+rule wanting an approval this identity cannot give, most often — which no
+retry fixes, so the item is handed over with the PR left open and out of
+draft; **409** is a race, so the next poll simply re-judges the new head.
+
+The interaction worth knowing is with the takeover guard. That guard fails an
+item whose branch head is not the one sbxloop delivered, because a fix round
+force-updates the branch and would otherwise replace a human's commits. An
+update-branch moves the head *by design*, and GitHub answers that request
+without the sha it will produce — so the daemon marks `landing` on the PR row,
+and while that is set one changed head is read as its own update commit rather
+than as a takeover. The request carries `expected_head_sha`, so a human who
+had pushed first makes the update fail instead of having their commit adopted;
+and the marker excuses exactly one move before the guard is back to its usual
+self.
 
 ## Daemon guardrails
 

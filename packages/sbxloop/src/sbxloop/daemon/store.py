@@ -123,7 +123,12 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     -- first poll after it. A later head that differs was pushed by someone
     -- else: the PR has been taken over, and a fix round force-updating it
     -- would silently replace their work (#412).
-    delivered_head TEXT
+    delivered_head TEXT,
+    -- The landing stage. `updates` counts update-branch calls spent keeping
+    -- the PR current with its base; `landing` marks one in flight, which is
+    -- what tells the takeover guard that the next head it sees is ours.
+    updates    INTEGER NOT NULL DEFAULT 0,
+    landing    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS daemon_audits (
@@ -211,6 +216,19 @@ _MIGRATIONS = (
         "delivered_head",
         "ALTER TABLE daemon_pr_state ADD COLUMN delivered_head TEXT",
     ),
+    # The landing stage: update-branch attempts spent, and whether one is in
+    # flight. Rows from before these columns read 0/0, which is where a PR
+    # that has never been landed belongs anyway.
+    (
+        "daemon_pr_state",
+        "updates",
+        "ALTER TABLE daemon_pr_state ADD COLUMN updates INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "daemon_pr_state",
+        "landing",
+        "ALTER TABLE daemon_pr_state ADD COLUMN landing INTEGER NOT NULL DEFAULT 0",
+    ),
 )
 
 
@@ -234,6 +252,14 @@ class PrState(NamedTuple):
     # The branch head as of our own last delivery (#412); None until the
     # first poll after a delivery observes it.
     delivered_head: str | None = None
+    # Update-branch attempts spent on this PR, bounded by
+    # `daemon.merge_update_attempts`.
+    updates: int = 0
+    # An update-branch the daemon asked for is in flight. GitHub answers that
+    # request without the sha it will produce, so the next poll has to read
+    # the branch to learn it — and while this is set, a head that moved is
+    # OUR commit, not a takeover.
+    landing: bool = False
 
     @property
     def review_in_flight(self) -> bool:
@@ -868,6 +894,13 @@ class DaemonStore:
         pushing to the same branch) must not reset the round count, which is
         the only thing bounding the loop. It does re-arm the merge watch —
         a fresh delivery means there is a PR to watch again.
+
+        It also clears ``delivered_head`` and ``landing`` together, for one
+        reason: the branch this row was tracking no longer exists as it was.
+        A landing marker that outlived the round it was set in would excuse
+        the *next* head move too, and the next head move might be a human's
+        — which is the whole thing #412's takeover guard exists to catch.
+        ``updates`` deliberately survives, like ``rounds``: it is a budget.
         """
         with self._lock:
             self._conn.execute(
@@ -875,7 +908,7 @@ class DaemonStore:
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
                 "pr_number = excluded.pr_number, branch = excluded.branch, "
                 "updated_at = excluded.updated_at, pr_url = excluded.pr_url, "
-                "settled = 0, merged_at = NULL, delivered_head = NULL",
+                "settled = 0, merged_at = NULL, delivered_head = NULL, landing = 0",
                 (item_id, pr_number, branch, now, url),
             )
             self._conn.commit()
@@ -900,6 +933,8 @@ class DaemonStore:
             settled=bool(row["settled"]),
             merged_at=row["merged_at"],
             delivered_head=row["delivered_head"],
+            updates=int(row["updates"]),
+            landing=bool(row["landing"]),
         )
 
     def merge_watch(self, now: float, min_interval_s: float) -> list[tuple[str, int, str]]:
@@ -937,6 +972,32 @@ class DaemonStore:
             self._conn.execute(
                 "UPDATE daemon_pr_state SET last_merge_check = ? WHERE item_id = ?",
                 (now, item_id),
+            )
+            self._conn.commit()
+
+    def bump_pr_update(self, item_id: str) -> int:
+        """Spend one update-branch attempt; returns the new total."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET updates = updates + 1 WHERE item_id = ?", (item_id,)
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT updates FROM daemon_pr_state WHERE item_id = ?", (item_id,)
+            ).fetchone()
+        return int(row["updates"]) if row is not None else 0
+
+    def set_landing(self, item_id: str, landing: bool) -> None:
+        """Mark (or clear) an update-branch in flight.
+
+        While set, a PR head that differs from ``delivered_head`` is the
+        daemon's own update commit rather than a takeover — the one thing
+        that tells those two apart.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pr_state SET landing = ? WHERE item_id = ?",
+                (1 if landing else 0, item_id),
             )
             self._conn.commit()
 

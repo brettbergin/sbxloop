@@ -249,6 +249,34 @@ def review_body(result: ReviewResult, *, origin_run_id: str) -> str:
     return "\n\n".join(parts)
 
 
+class PostedReview(NamedTuple):
+    """A posted review plus the facts about what was *asked* for.
+
+    ``SubmittedReview`` only knows what GitHub accepted; the requested
+    verdict and the inline-comment count live in the parsed review result.
+    Carrying them together here keeps the caller from re-deriving them
+    (#469: the run summary needs both to report a review honestly).
+    """
+
+    submitted: SubmittedReview
+    requested_event: ReviewEvent
+    comments: int
+    pr_number: int
+
+    @property
+    def url(self) -> str:
+        return self.submitted.url
+
+    @property
+    def event(self) -> ReviewEvent:
+        """What GitHub accepted — possibly a downgrade to ``COMMENT``."""
+        return self.submitted.event
+
+    @property
+    def gates_merge(self) -> bool:
+        return self.submitted.gates_merge
+
+
 def collect_review(
     run: RunRecord,
     *,
@@ -256,7 +284,7 @@ def collect_review(
     repo: str,
     pr_number: int,
     origin_run_id: str,
-) -> SubmittedReview | None:
+) -> PostedReview | None:
     """Post the run's review to ``pr_number``; None when it wrote none.
 
     Reads the mounted workspace directly, like the backlog lane — and for
@@ -304,4 +332,4 @@ def collect_review(
         comments=len(result.comments),
         gates_merge=submitted.gates_merge,
     )
-    return submitted
+    return PostedReview(submitted, result.event, len(result.comments), pr_number)

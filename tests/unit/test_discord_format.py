@@ -47,7 +47,7 @@ from sbxloop.daemon.discord_format import (
     summary_embed,
     summary_text,
 )
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
 from sbxloop.events import Event
 
 
@@ -1227,3 +1227,132 @@ class TestOldWorkerEventCompatibility:
             "bash", 1, "x" * 200000 + "\n" + "y\n" * 5000, success=False, max_lines=200
         )
         assert chunk is not None and len(chunk.text) <= DISCORD_MAX_MESSAGE
+
+
+class TestReviewReporting:
+    """#469: a review run files no backlog issues, so the audit wording made
+    a REQUEST_CHANGES with eleven inline comments read as "no findings"."""
+
+    item = WorkItem(item_id="gh:467", source="github", source_key="467", title="R", kind="audit")
+
+    def _report(self, review: ReviewOutcome) -> RunReport:
+        return RunReport("r1", "completed", "4/4 tasks done", review=review)
+
+    def test_request_changes_posted_as_non_gating_comment(self) -> None:
+        review = ReviewOutcome(
+            pr_number=463,
+            url="https://github.com/o/r/pull/463#pullrequestreview-1",
+            requested_event="REQUEST_CHANGES",
+            posted_event="COMMENT",
+            comments=11,
+            gates_merge=False,
+        )
+        report = self._report(review)
+        summary = findings_summary(report, repo="o/r", kind="audit")
+        assert summary == (
+            "review requested changes · 11 inline comment(s)"
+            " · <https://github.com/o/r/pull/463#pullrequestreview-1>"
+            " · ⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
+            " so nothing on the PR blocks the merge"
+        )
+        card = finish_embed(self.item, report, "completed", repo="o/r")
+        field = {n: v for n, v, _ in card.fields}["Review"]
+        assert field == (
+            "[requested changes · 11 inline comment(s)]"
+            "(https://github.com/o/r/pull/463#pullrequestreview-1)\n"
+            "⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
+            " so nothing on the PR blocks the merge"
+        )
+        # The whole point of the bug: never claim a clean PR here.
+        assert "no findings" not in summary
+        assert not any("no findings" in v for _, v, _ in card.fields)
+
+    def test_approve_with_zero_comments_reads_as_a_clean_review(self) -> None:
+        review = ReviewOutcome(
+            pr_number=470,
+            url="https://github.com/o/r/pull/470#pullrequestreview-9",
+            requested_event="APPROVE",
+            posted_event="APPROVE",
+            comments=0,
+            gates_merge=True,
+        )
+        report = self._report(review)
+        summary = findings_summary(report, repo="o/r", kind="audit")
+        assert summary == (
+            "review approved · no comments · <https://github.com/o/r/pull/470#pullrequestreview-9>"
+        )
+        assert "no findings" not in summary
+        card = finish_embed(self.item, report, "completed", repo="o/r")
+        assert {n: v for n, v, _ in card.fields}["Review"] == (
+            "[approved · no comments](https://github.com/o/r/pull/470#pullrequestreview-9)"
+        )
+
+    def test_audit_without_a_review_keeps_its_wording(self) -> None:
+        none = RunReport("r1", "completed", "x")
+        assert findings_summary(none, kind="audit") == "no findings"
+        card = finish_embed(self.item, none, "completed", repo="o/r")
+        assert card.fields == (("Filed", "no findings", True),)
+
+    def test_downgraded_approve_does_not_borrow_request_changes_wording(self) -> None:
+        """PR review comment (discord_format.py:1806): `_non_gating_note` was
+        written for `request_changes` and rendered for a downgraded `approve`
+        too, claiming an approval "does not gate the merge" — an approval
+        never gated the merge; what it actually loses is the ability to
+        satisfy a required-approval check."""
+        review = ReviewOutcome(
+            pr_number=470,
+            url="https://github.com/o/r/pull/470#pullrequestreview-9",
+            requested_event="APPROVE",
+            posted_event="COMMENT",
+            comments=0,
+            gates_merge=False,
+        )
+        report = self._report(review)
+        summary = findings_summary(report, repo="o/r", kind="audit")
+        assert summary == (
+            "review approved · no comments"
+            " · <https://github.com/o/r/pull/470#pullrequestreview-9>"
+            " · ⚠ posted as `COMMENT`, not `APPROVE` — it does not satisfy a"
+            " required-review gate; a human approval is still needed"
+        )
+        assert "so nothing on the PR blocks the merge" not in summary
+
+    def test_a_lost_review_does_not_read_as_no_findings(self) -> None:
+        """PR review comment (loop.py:1004): `posted is None` used to be
+        read as "this was not a review", collapsing four distinct failure
+        modes (missing/unparseable review.json, no GitHub source, a raised
+        POST) into the audit lane's clean-bill wording — exactly the runs
+        where the operator most needs to know the review never landed."""
+        report = RunReport("r1", "completed", "4/4 tasks done", review_failed=True)
+        summary = findings_summary(report, kind="audit")
+        assert summary == "⚠ review could not be posted to the pull request — see the daemon log"
+        assert "no findings" not in summary
+        card = finish_embed(self.item, report, "completed", repo="o/r")
+        assert {n: v for n, v, _ in card.fields}["Review"] == (
+            "⚠ review could not be posted to the pull request — see the daemon log"
+        )
+
+    def test_filed_lines_reports_the_review_for_the_text_only_watch_notice(self) -> None:
+        """PR review comment (discord_format.py:1839): `findings_summary`
+        learned about reviews but `filed_lines` had not — and it is not a
+        redundant duplicate, since `discord.py`'s watch notice (no embed
+        attached) renders only `filed_lines`."""
+        review = ReviewOutcome(
+            pr_number=463,
+            url="https://github.com/o/r/pull/463#pullrequestreview-1",
+            requested_event="REQUEST_CHANGES",
+            posted_event="COMMENT",
+            comments=11,
+            gates_merge=False,
+        )
+        report = self._report(review)
+        assert filed_lines(report, repo="o/r")[0] == (
+            "🔎 review requested changes · 11 inline comment(s)"
+            " · <https://github.com/o/r/pull/463#pullrequestreview-1>"
+            " · ⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
+            " so nothing on the PR blocks the merge"
+        )
+        lost = RunReport("r1", "completed", "x", review_failed=True)
+        assert filed_lines(lost) == [
+            "⚠ review could not be posted to the pull request — see the daemon log"
+        ]
