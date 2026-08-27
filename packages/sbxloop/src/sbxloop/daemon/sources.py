@@ -122,9 +122,16 @@ def _review_report_lines(review: ReviewOutcome) -> list[str]:
     comments = "no inline comments" if n == 0 else f"{n} inline comment(s)"
     lines = [f"Review {verdict} on PR #{review.pr_number} with {comments}: {review.url}"]
     if not review.gates_merge:
+        # What a downgrade costs differs by verdict, and saying the wrong one
+        # misleads whoever reads the issue. An approval never blocked the
+        # merge to begin with — what it loses is the ability to *satisfy* a
+        # required-review gate. Only `request_changes` loses its block.
         lines.append(
-            f"Posted as a non-gating {review.posted_event} — {review.requested_event} was "
-            "refused, so nothing on the PR blocks the merge."
+            f"Posted as {review.posted_event}, not {review.requested_event} — it does not "
+            "satisfy a required-review gate; a human approval is still needed."
+            if review.approved
+            else f"Posted as a non-gating {review.posted_event} — {review.requested_event} "
+            "was refused, so nothing on the PR blocks the merge."
         )
     return lines
 

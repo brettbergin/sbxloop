@@ -442,6 +442,28 @@ class TestGitHubSource:
         assert "Review approved on PR #9 with no inline comments" in body
         assert "no findings" not in body and "non-gating" not in body
 
+    def test_a_downgraded_approval_does_not_claim_the_merge_was_blocked(self) -> None:
+        """The same wording bug the Discord surface had (#470 review): an
+        approval that GitHub refused never blocked the merge, so saying
+        "nothing blocks the merge" reports a loss that never happened. What
+        it actually costs is the required-review gate it can no longer
+        satisfy — which is what a human reading the issue needs to know."""
+        ops = RecordingOps({"7": issue(7, "sbxloop:audit")})
+        item = self.make(ops).poll()[0]
+        outcome = ReviewOutcome(
+            pr_number=12,
+            url="https://x/pull/12#r3",
+            requested_event="APPROVE",
+            posted_event="COMMENT",
+            comments=0,
+            gates_merge=False,
+        )
+        self.make(ops).report_success(item, report(review=outcome, delivery=None))
+        body = "\n".join(b for _, b in ops.comments)
+        assert "nothing on the PR blocks the merge" not in body
+        assert "does not satisfy a required-review gate" in body
+        assert "a human approval is still needed" in body
+
     def test_claim_reverifies_then_swaps_labels_and_comments(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})
         item = self.make(ops).poll()[0]
