@@ -260,6 +260,57 @@ class TestBashisms:
             lint_verify_commands(["sh scripts/check.sh", "grep -c 'sh -c' notes.md"], ["go"]) == []
         )
 
+    def test_an_inert_sh_c_wrapper_is_unwrapped_not_rejected(self) -> None:
+        """Field failure (item gh:478, runs rv2y1a8ke and rq826h546): the
+        planner wrapped two checks as `sh -c 'exit 0'` and `sh -c 'git diff
+        --quiet && git diff --cached --quiet'`. Both were rejected as nested
+        shells, decompose was declared invalid twice, and the item was
+        abandoned — so PR #476 was never reviewed at all.
+
+        Neither could misbehave. A single-quoted payload with no `$` and no
+        backtick is handed through by the outer shell verbatim, so it runs
+        exactly as it would unwrapped. The rule's own remedy ("write the
+        pipeline directly") produces the same bytes.
+        """
+        for inert in (
+            "sh -c 'exit 0'",
+            "sh -c 'git diff --quiet && git diff --cached --quiet'",
+            "/bin/sh -c 'test -f README.md'",
+        ):
+            assert lint_verify_commands([inert], ["python"]) == [], inert
+
+    def test_the_wrapper_cannot_hide_its_payload_from_the_other_rules(self) -> None:
+        """Unwrapping, not waving through. Single-quoted spans are blanked
+        before the toolchain and mutating-command scans, so a wrapper
+        accepted whole would smuggle past exactly the checks that catch the
+        expensive mistakes — a bigger hole than the one this closes."""
+        (problem,) = lint_verify_commands(["sh -c 'pytest -q'"], ["python"])
+        assert "bare `pytest`" in problem
+        (mutating,) = lint_verify_commands(["sh -c 'apt-get install -y jq'"], ["python"])
+        assert "must not modify the environment" in mutating
+        (network,) = lint_verify_commands(["sh -c 'gh pr view 1'"], ["python"])
+        assert "judge the workspace, not the network" in network
+
+    def test_only_the_provably_identical_wrapper_is_unwrapped(self) -> None:
+        """Everything else can change what runs: `bash`/`dash`/`zsh` may not
+        be installed, `-l` rewrites the environment, and a double-quoted or
+        unquoted payload is expanded by the OUTER shell first — which is
+        r7ef26eht, the failure the rule was written for."""
+        for hazard in (
+            "bash -c 'make test'",
+            "sh -lc 'npm test'",
+            'sh -c "go test ./..."',
+            "sh -c 'awk \"{print $2}\" out.txt'",
+            "sh -c 'echo `date`'",
+        ):
+            assert lint_verify_commands([hazard], ["go"]), hazard
+
+    def test_a_gate_inside_an_inert_wrapper_still_counts_as_running_it(self) -> None:
+        """The gate check reads the command text, so it has to see through
+        the wrapper too — otherwise unwrapping trades one false rejection
+        for another."""
+        assert lint_verify_commands(["sh -c 'make check'"], ["python"], gate="make check") == []
+
     def test_bashism_words_as_data_are_not_flagged(self) -> None:
         """Command-like bashisms count only in command position, operator-like
         ones only outside quotes — a portable command that merely *mentions*

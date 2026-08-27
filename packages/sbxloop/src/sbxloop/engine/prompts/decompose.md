@@ -59,7 +59,11 @@ $outcome
   when the file lives one level down, and a test runner aimed at a
   directory holding no project can exit 0 having tested nothing. Write
   portable shell — `[ ]` not `[[ ]]`, `printf` for escape sequences, no
-  here-strings, never wrap a check in its own `sh -c "..."` — and prefer
+  here-strings, and never wrap a check in a shell of its own (no
+  `sh -c`, `bash -c`, `sh -lc`, in any quoting: the runner already provides
+  the shell, `bash` may not be installed, and a double-quoted wrapper has
+  its variable expansions consumed by the outer shell before the inner one
+  runs) — and prefer
   the project's test runner over shell pipelines: asserting on bytes,
   escape sequences, or exact whitespace is exact inside a test file and
   fragile as a `grep`/`od` one-liner.

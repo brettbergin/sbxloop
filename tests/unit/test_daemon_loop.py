@@ -95,7 +95,7 @@ class Harness:
         self.clock = Clock()
         self.outcomes: list[
             str
-        ] = []  # scripted per run: "completed"|"failed"|"raise"|"deliver_fail"
+        ] = []  # per run: "completed"|"failed"|"raise"|"deliver_fail"|"die_mid_phase"
         self.runs: list[tuple[str, bool]] = []
         self.run_configs: list[Config] = []  # the config each dispatch handed the runner
         self.source = FakeSource()
@@ -116,6 +116,12 @@ class Harness:
         kind = self.outcomes.pop(0) if self.outcomes else "completed"
         if kind == "raise":
             raise WorkerError("sandbox exploded")
+        if kind == "die_mid_phase":
+            # A run that died *inside* a phase: the row exists and is still
+            # non-terminal, which is what a rejected decompose leaves behind.
+            self.store.create_run(run_id, "outcome") if not resume else None
+            self.store.set_run_state(run_id, "decomposing")
+            raise WorkerError("decompose produced invalid output twice")
         state = "failed" if kind == "failed" else "completed"
         self.store.create_run(run_id, "outcome") if not resume else None
         self.store.set_run_state(run_id, state)
@@ -1703,6 +1709,33 @@ class TestOrphanRunReconciliation:
         assert events[-1].type == "run.reconciled"
         assert events[-1].data["previous_state"] == "running"
 
+    def test_a_run_that_dies_mid_phase_does_not_stay_in_flight(self, tmp_path: Path) -> None:
+        """The `runs` row is written only by the run loop, so a run that died
+        inside a phase used to be left `decomposing` until the stale sweep
+        timed it out — six hours in the field (runs rv2y1a8ke, rq826h546 of
+        item gh:478), during which `list_runs` and every active-run count
+        disagreed with reality.
+
+        Both settles close it now: the retry, whose item drops its run pin
+        and is dispatched fresh, and the abandon, whose item is terminal.
+        Neither can ever be resumed, so leaving the row open said something
+        untrue about the daemon.
+        """
+        h = Harness(tmp_path)
+        h.source.items = [inbox_item()]
+        h.outcomes = ["die_mid_phase", "die_mid_phase"]
+        assert h.loop.tick().outcome == "retry"
+        first = h.runs[0][0]
+        record = h.store.get_run(first)
+        assert record.state == "failed", "a requeued item is dispatched fresh, never resumed"
+        assert record.reason is not None and "decompose produced invalid output" in record.reason
+        assert "run.reconciled" in [e.type for _, e in h.store.events(first)]
+        h.clock.t += h.loop.config.daemon.retry_backoff_s + 1
+        assert h.loop.tick().outcome == "abandoned"
+        second = h.runs[1][0]
+        assert h.store.get_run(second).state == "failed"
+        assert h.store.non_terminal_runs() == [], "no phantom left for the sweep to find"
+
     def test_recover_reconciles_orphan_run_failed(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         for run_id, state in (("r_orph", "running"), ("r_dec", "decomposing")):
@@ -2259,6 +2292,38 @@ class TestAcceptanceGate:
         h.loop.tick()  # the gate resumes — and accepts on green, no re-file
         assert len(source.reviews) == 1
         assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+
+    def test_a_dead_charter_is_not_reported_as_having_no_reviewer(self, tmp_path: Path) -> None:
+        """Both settle on green CI, but they are not the same event, and the
+        acceptance line is the only place an operator sees which one it was.
+
+        Field case (item gh:478): the charter's decompose was rejected
+        twice, the item was abandoned, and PR #476 was then accepted as
+        "no reviewer" — telling whoever read it that this deployment has no
+        reviewer configured, when in fact its review had just broken. The
+        two need different responses, so they need different words.
+        """
+        h, _ = self._delivered(tmp_path)
+        h.loop.tick()
+        ref = h.dstore.pr_state("gh:1").review_ref or "gh:x"  # type: ignore[union-attr]
+        h.dstore.upsert_new(
+            WorkItem(item_id=ref, source="github", source_key="x", title="review"), h.clock.t
+        )
+        h.dstore.mark_failed(
+            ref, "decompose produced invalid output twice", h.clock.t, requeue=False
+        )
+        said: list[str] = []
+        original = h.loop._notify
+        h.loop._notify = lambda text, *a, **kw: (  # type: ignore[method-assign]
+            said.append(text),
+            original(text, *a, **kw),
+        )[-1]
+        h.loop.tick()  # clears the stale marker
+        h.loop.tick()  # accepts on green without re-filing
+        accepted = [t for t in said if "accepted" in t]
+        assert accepted, "the item must settle, not park"
+        assert "its review charter did not complete" in accepted[-1]
+        assert "no reviewer" not in accepted[-1]
 
     def test_the_gate_can_be_turned_off(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
