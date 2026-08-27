@@ -145,7 +145,6 @@ class TestPhasesAndEvents:
                 output_tokens=34,
                 cache_read_tokens=900,
                 cache_write_tokens=10,
-                cost=15.0,
             ),
             turns=3,
         )
@@ -154,7 +153,6 @@ class TestPhasesAndEvents:
         assert row["output_tokens"] == 34
         assert row["cache_read_tokens"] == 900
         assert row["cache_write_tokens"] == 10
-        assert row["cost"] == 15.0
         assert row["turns"] == 3
 
     def test_phase_usage_defaults_to_null(self, store: StateStore) -> None:
@@ -166,7 +164,6 @@ class TestPhasesAndEvents:
         row = store.phase_attempts("r1")[0]
         assert row["input_tokens"] is None
         assert row["output_tokens"] is None
-        assert row["cost"] is None
         assert row["turns"] is None
 
     def test_pre_usage_database_migrates_in_place(self, tmp_path: Path) -> None:

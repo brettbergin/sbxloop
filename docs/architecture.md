@@ -198,12 +198,15 @@ would invalidate the cache; the knob that did it is gone.
 
 The same run also settles what `AssistantUsageData.cost` is *not*: it reports
 the same constant (15.0) on every turn of every session, so it is not a
-per-turn delta and summing it fabricates a figure. `Usage.merged` therefore
-carries it last-wins rather than additively. Its unit is unknown — a constant
-per turn reads far more like a premium-request multiplier or a quota unit than
-a currency amount — so it must not be rendered as currency; `run_usage` and
-`usage_today` report "cost: not reported by the agent backend" until the unit
-is established.
+per-turn delta and summing it fabricates a figure. Its unit is unknown — a
+constant per turn reads far more like a premium-request multiplier or a quota
+unit than a currency amount — so it must not be rendered as currency. The
+wire `Usage` model therefore carries **no** spend field at all (#439): no
+backend writes one, so keeping the field and its render was dead code one
+hand-built object away from reintroducing the fabricated figure. `run_usage`
+and `usage_today` end their block with a fixed "spend: not reported by the
+agent backend" line, and any future backend figure must arrive with its unit
+established and be carried non-additively.
 
 One knob remains:
 

@@ -1065,7 +1065,7 @@ class TestBridge:
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
-            bus.emit("agent.usage", "r1", input_tokens=1200, output_tokens=80, cost=0.05)
+            bus.emit("agent.usage", "r1", input_tokens=1200, output_tokens=80)
             bus.emit(
                 "phase.end",
                 "r1",
@@ -1082,7 +1082,7 @@ class TestBridge:
             assert wait_for(lambda: any(s.startswith("📊 **run summary**") for s in thread.sent))
             # After the finish card, nothing else lands in the thread.
             assert thread.sent[-1].startswith("📊 **run summary**")
-            assert "1 turn(s)" in thread.sent[-1] and "$0.05" in thread.sent[-1]
+            assert "1 turn(s)" in thread.sent[-1] and "1,200 in / 80 out tokens" in thread.sent[-1]
             summary_kwargs = thread.sent_kwargs[-1]
             card = summary_kwargs["embed"]
             names = [f.name for f in card.fields]

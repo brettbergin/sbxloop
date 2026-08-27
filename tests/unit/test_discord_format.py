@@ -787,7 +787,7 @@ class TestRunSummary:
         for event in (
             tev(100.0, "run.start", outcome="fix the bug"),
             tev(101.0, "run.tasks", tasks=[{"id": "t1"}, {"id": "t2"}]),
-            tev(110.0, "agent.usage", input_tokens=1000, output_tokens=200, cost=0.10),
+            tev(110.0, "agent.usage", input_tokens=1000, output_tokens=200),
             tev(111.0, "agent.tool_start", tool="bash"),
             tev(112.0, "agent.tool_start", tool="bash"),
             tev(
@@ -798,7 +798,7 @@ class TestRunSummary:
                 status="failed",
                 message="verify command failed: `pytest -q` (exit 1)",
             ),
-            tev(140.0, "agent.usage", input_tokens=2000, output_tokens=300, cost=0.15),
+            tev(140.0, "agent.usage", input_tokens=2000, output_tokens=300),
             tev(150.0, "chat.message", message_id="m1", text="go faster"),
             tev(151.0, "chat.reply", message_id="m1", reply="ok", action="continue"),
             tev(160.0, "policy.deny", op="push"),
@@ -814,7 +814,6 @@ class TestRunSummary:
         assert stats.duration_s == 120.0
         assert stats.turns == 2 and stats.tool_calls == 2
         assert stats.input_tokens == 3000 and stats.output_tokens == 500
-        assert stats.cost == pytest.approx(0.25)
         assert stats.rework == [
             ("t2", "verify", "failed", "verify command failed: `pytest -q` (exit 1)")
         ]
@@ -825,8 +824,7 @@ class TestRunSummary:
     def test_summary_text_leads_with_the_headline_numbers(self) -> None:
         stats = self._folded()
         assert summary_text(stats, "completed") == (
-            "📊 **run summary** — 2m 00s · 2 turn(s) · 2 tool call(s) · "
-            "3,000 in / 500 out tokens · $0.25"
+            "📊 **run summary** — 2m 00s · 2 turn(s) · 2 tool call(s) · 3,000 in / 500 out tokens"
         )
         assert summary_text(None, "completed") == "📊 **run summary**"
 
@@ -840,7 +838,7 @@ class TestRunSummary:
         fields = {n: v for n, v, _ in card.fields}
         assert list(fields) == ["Stats", "Went well", "Needed work"]
         assert "turns 2 · tool calls 2" in fields["Stats"]
-        assert "tokens 3,000 in / 500 out · cost $0.25" in fields["Stats"]
+        assert "tokens 3,000 in / 500 out" in fields["Stats"]
         assert "steering 1 asked / 1 answered" in fields["Stats"]
         well = fields["Went well"]
         assert "delivered PR [#34](https://x/pull/34)" in well
@@ -884,7 +882,7 @@ class TestRunSummary:
         stats = RunStats()
         stats.observe(tev(100.0, "agent.usage"))
         assert stats.turns == 1
-        assert stats.input_tokens is None and stats.cost is None
+        assert stats.input_tokens is None
         assert summary_text(stats, "completed") == "📊 **run summary** — 0s · 1 turn(s)"
         card = summary_embed(stats, RunReport("r1", "completed", "x"), "completed")
         assert {n: v for n, v, _ in card.fields}["Stats"] == "turns 1"
