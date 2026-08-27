@@ -134,7 +134,7 @@ class PhaseRunner:
         # project-shape facts the verify-command lint keys on — a `uv.lock`
         # at the root flips the Python convention (#250). Host-side because
         # the lint runs at JSON acceptance, where a round trip into the VM
-        # per retry would spend more than the check is worth; the workspace
+        # per retry would cost more than the check is worth; the workspace
         # is mounted identically in the common case, and an unmounted run
         # still starts from this clone.
         self.workspace = workspace
@@ -326,12 +326,12 @@ class PhaseRunner:
     ) -> list[BatchCommandResult]:
         """Run mechanical shell commands as ONE worker job (#125).
 
-        Every job pays a fixed round-trip price (stage the job JSON, boot a
+        Every job pays a fixed round-trip cost (stage the job JSON, boot a
         cold interpreter under ``sbx exec``, fetch the result file) that
         dwarfs what verify/evidence commands actually do, so they ride
         together. Per-command semantics are preserved: each command still
         gets the per-job timeout, and the job budget covers the worst case
-        of all of them — matching what N sequential jobs paid before.
+        of all of them — matching what N sequential jobs cost before.
         """
         per_command = self.config.budgets.per_job_timeout_s
         job = JobRequest(
@@ -394,9 +394,9 @@ class PhaseRunner:
         graph as a whole to run the project's own gate.
 
         The builder cannot edit verify commands, so a bare `python -m
-        pytest` from the decomposer spends a revision cycle plus an in-VM
+        pytest` from the decomposer costs a revision cycle plus an in-VM
         workaround at verify time (field failure r12ygfd7t); rejecting at
-        JSON acceptance spends one retry with the rule quoted.
+        JSON acceptance costs one retry with the rule quoted.
 
         The gate is checked **across the graph, not per task**. A delivered
         PR (#389) failed `mdformat` and `security` — both plain `make check`

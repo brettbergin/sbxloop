@@ -272,7 +272,7 @@ class TestBashisms:
                     "test -f source/output",
                     "printf '%s' '[[literal]]'",
                     "echo '<<<'",
-                    'echo "spend is $x"',
+                    'echo "cost is $x"',
                     "grep -c local README.md",
                 ],
                 ["python", "go"],
@@ -320,8 +320,8 @@ class TestProjectGate:
     """A delivered PR (#389) failed `mdformat` and `security` — both plain
     `make check` targets — because the plan's verify commands were a subset
     of what the repository actually enforces. The run reported success and
-    the PR sat red. Rejecting that at JSON acceptance spends one retry; the
-    alternative spends a PR, a review round and a human noticing.
+    the PR sat red. Rejecting that at JSON acceptance costs one retry; the
+    alternative costs a PR, a review round and a human noticing.
     """
 
     def test_a_check_target_is_the_gate(self, tmp_path: Path) -> None:

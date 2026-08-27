@@ -251,7 +251,7 @@ class Concierge:
             elif isinstance(exc, WorkerError | SbxError) and not isinstance(
                 exc, WorkerTimeoutError
             ):
-                # A dead sandbox spends one hiccup: DaemonAgent drops it
+                # A dead sandbox costs one hiccup: DaemonAgent drops it
                 # (rate-limited) and the retry re-provisions — with a fresh
                 # session store, so the resume id is gone too.
                 if self.host.note_failure(exc):

@@ -34,8 +34,8 @@ T = TypeVar("T")
 SANDBOX_NAME_PREFIX = "sbxloop-daemon-github"
 # Ops issued from the daemon (not from a run) carry this run id in events.
 DAEMON_RUN_ID = "daemon"
-# A dead github sandbox spends one re-provision; a GitHub outage must not
-# spend one per failing call (each is a full microVM boot + worker install),
+# A dead github sandbox costs one re-provision; a GitHub outage must not
+# cost one per failing call (each is a full microVM boot + worker install),
 # so between re-provisions failures propagate to the caller, whose own
 # backoff (source poll, report best-effort) absorbs them.
 REPROVISION_MIN_INTERVAL_S = 300.0
@@ -100,7 +100,7 @@ class DaemonGithub:
 
     def call(self, fn: Callable[[GithubOps], T]) -> T:
         """Run ``fn(ops)``; on failure drop the sandbox (rate-limited, see
-        :meth:`note_failure`) and retry once, so a dead microVM spends one
+        :meth:`note_failure`) and retry once, so a dead microVM costs one
         hiccup, not the daemon."""
         try:
             return fn(self.ops())

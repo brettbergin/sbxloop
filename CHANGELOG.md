@@ -235,7 +235,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   147-turn run into `cost: 2205.0000` — a fabricated figure the concierge
   would repeat in Discord as fact. The host no longer lifts `cost` out of
   `agent.usage` events, `Usage.merged` carries it last-wins rather than
-  additively, and the concierge's spend line renders a figure only when it is strictly
+  additively, and `_cost_line` renders a figure only when it is strictly
   positive; `run_usage` and `usage_today` say "cost: not reported by the agent
   backend" instead. The field's *unit is unknown*: a value identical on every
   turn of every session is far more likely a premium-request multiplier or a

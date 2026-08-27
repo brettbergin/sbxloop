@@ -18,13 +18,14 @@ from sbxloop.daemon.concierge import _SPEND_NOT_REPORTED, _usage_from_event
 from sbxloop_worker.backends.copilot import usage_from_sdk_sample
 from sbxloop_worker.protocol import Usage
 
-CONSTANT_SPEND = 15.0
+CONSTANT_COST = 15.0
 TURNS = 10
 
 
 def _samples() -> list[dict[str, object]]:
     """Ten turn-shaped ``agent.usage`` payloads: distinct token counts, the
-    same constant spend figure, plus the ``agent`` key the host adds."""
+    same constant ``cost`` figure a pre-#439 event still carries, plus the
+    ``agent`` key the host adds."""
     return [
         {
             "agent": "executor",
@@ -33,16 +34,19 @@ def _samples() -> list[dict[str, object]]:
             "output_tokens": 100 + i,
             "cache_read_tokens": 18_000 + i * 900,
             "cache_write_tokens": 500,
-            "spend": CONSTANT_SPEND,
+            "cost": CONSTANT_COST,
         }
         for i in range(TURNS)
     ]
 
 
-class TestUsageHasNoSpendField:
-    def test_the_wire_model_rejects_a_spend_figure(self) -> None:
+class TestUsageRejectsTheRemovedField:
+    def test_the_wire_model_rejects_a_cost_figure(self) -> None:
+        """``cost`` was the field's real name; asserting on ``spend`` here
+        would only prove pydantic's ``extra="forbid"`` works, since ``spend``
+        was never a field either."""
         with pytest.raises(ValueError):
-            Usage(model="m", spend=CONSTANT_SPEND)
+            Usage(model="m", cost=CONSTANT_COST)
 
     def test_token_counters_are_still_summed(self) -> None:
         merged = Usage()
@@ -56,9 +60,12 @@ class TestUsageHasNoSpendField:
 
 
 class TestUsageFromEventDropsUnknownFields:
-    def test_a_spend_key_is_never_lifted_out_of_an_event(self) -> None:
+    def test_a_cost_key_is_never_lifted_out_of_an_event(self) -> None:
+        """A worker or event predating #439 may still emit ``cost``;
+        ``_usage_from_event`` must silently drop it rather than error, since
+        ``Usage`` no longer has anywhere for it to land."""
         usage = _usage_from_event(_samples()[0])
-        assert not hasattr(usage, "spend")
+        assert not hasattr(usage, "cost")
         assert usage.input_tokens == 20_000
 
 

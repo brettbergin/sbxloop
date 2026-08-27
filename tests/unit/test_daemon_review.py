@@ -85,7 +85,7 @@ class TestParseReview:
 
     def test_verdict_synonyms_are_accepted(self) -> None:
         """The agent writes this by hand; near-misses on the vocabulary
-        should not spend a review."""
+        should not cost a review."""
         for word in ("approve", "approved", "accept"):
             assert parse_review(review_json(verdict=word)).event == "APPROVE"  # type: ignore[union-attr]
         for word in ("request_changes", "request-changes", "reject", "revise"):
@@ -103,7 +103,7 @@ class TestParseReview:
         assert parse_review(json.dumps({"verdict": "approve"})) is None
         assert parse_review(review_json(summary="", comments=[])) is None
 
-    def test_one_bad_comment_does_not_sink_the_review(self) -> None:
+    def test_one_bad_comment_does_not_cost_the_review(self) -> None:
         result = parse_review(
             review_json(
                 comments=[

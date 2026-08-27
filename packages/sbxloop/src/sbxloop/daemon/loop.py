@@ -991,7 +991,7 @@ class DaemonLoop:
                 log.info("breaker.reset", after_failures=self._consecutive_failures)
             self._set_breaker(None, 0)
             # No review is filed here. The gates run cheapest-first: CI is
-            # GitHub's compute and is free, so it reports before a
+            # GitHub's compute and costs nothing, so it reports before a
             # review run is spent. Reviewing a red PR burns a whole run on
             # work that has to change anyway.
             if self._hold_for_review(item, run_id, report, now):
@@ -1325,7 +1325,7 @@ class DaemonLoop:
             pr_number, brief, failed = fix
             # A fix round is ONE task, seeded rather than decomposed: the
             # failures already are the acceptance criteria, and decomposing
-            # them spends a whole session to rediscover a structure we have.
+            # them costs a whole session to rediscover a structure we have.
             self.dstore.clear_fix(item.item_id)
             return engine.start(
                 brief,
@@ -1626,7 +1626,7 @@ class DaemonLoop:
             try:
                 self._poll_one_review(item, github, now)
             except Exception:
-                # A poll that cannot reach GitHub still spends the item a
+                # A poll that cannot reach GitHub still costs the item a
                 # round. Without that a persistent failure — a bad token, an
                 # API shape we read wrong, a repo that went private — parks
                 # the item in `reviewing` forever with nothing but a warning
@@ -1640,7 +1640,7 @@ class DaemonLoop:
     def _poll_one_review(self, item: WorkItem, github: Any, now: float) -> None:
         """Advance one delivered PR by exactly one step.
 
-        The gates are ordered by what they spend:
+        The gates are ordered by what they cost:
 
         ===============================  ===========================
         state                            action
@@ -1659,7 +1659,7 @@ class DaemonLoop:
         acceptance (waiting for an approval on a merged PR strands the item
         forever), and a human closing it unmerged is a rejection no review
         can override. Below that, CI first is the point: it is GitHub's
-        compute and is free, so a red PR never spends a review run on
+        compute and costs nothing, so a red PR never spends a review run on
         work that has to change anyway.
         """
         state = self.dstore.pr_state(item.item_id)

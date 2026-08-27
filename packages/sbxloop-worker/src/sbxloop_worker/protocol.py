@@ -206,7 +206,7 @@ class JobRequest(ProtocolModel):
 
     # kind == "shell.batch": shell command strings, each run via ``sh -c``
     # sequentially inside ONE worker process. Every job pays a fixed
-    # round-trip price (stage job JSON, exec a cold interpreter, fetch the
+    # round-trip cost (stage job JSON, exec a cold interpreter, fetch the
     # result) that dwarfs a mechanical command's real work, so verify and
     # evidence commands ride together instead of one job each.
     commands: list[str] | None = None

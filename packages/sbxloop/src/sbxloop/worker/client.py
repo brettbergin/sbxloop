@@ -201,7 +201,7 @@ class WorkerClient:
         manifest whose worker version matches this host, verified with the
         same entrypoint smoke check the ladder ends with. On success the
         whole ladder is skipped; any verification failure degrades to the
-        ladder below, so a stale template spends one probe, never a run.
+        ladder below, so a stale template costs one probe, never a run.
 
         Sandbox templates ship python3 but often lack python3-venv
         (Debian/Ubuntu split ensurepip out). The ladder:
@@ -433,7 +433,7 @@ class WorkerClient:
             )
             return False
         self.python = python
-        # Fail closed: anything but an explicit True spends one best-effort
+        # Fail closed: anything but an explicit True costs one best-effort
         # apt call, whereas trusting a malformed answer leaves the agent
         # without git for the whole run (#252).
         self._prebake_missing = [] if verdict.get("git") is True else [toolchains.GIT]

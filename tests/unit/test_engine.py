@@ -736,7 +736,7 @@ class TestTaskEgress:
     def test_rails_app_bundle_installs_without_a_declaration(self, harness: Harness) -> None:
         # #159: the motivating case for the declarable tier — "write a Rails
         # app" — now runs off the baseline. Declaring rubygems.org anyway
-        # stays valid and is free: seeded at provision time, so no
+        # stays valid and costs nothing: seeded at provision time, so no
         # grant-late call and no policy event.
         harness.script([taskgraph(task("t1", egress=GEMS_EGRESS)), *HAPPY_TASK])
         result = harness.engine().start("gem task, default policy")
@@ -747,7 +747,7 @@ class TestTaskEgress:
 
     def test_baseline_registry_needs_no_grant(self, harness: Harness) -> None:
         # #148: an npm build must not depend on the decomposer remembering
-        # to declare the registry — and declaring it anyway is free,
+        # to declare the registry — and declaring it anyway costs nothing,
         # because the sandbox was provisioned with it.
         harness.script([taskgraph(task("t1", egress=NPM_EGRESS)), *HAPPY_TASK])
         result = harness.engine().start("npm task, default policy")

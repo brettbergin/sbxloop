@@ -1926,7 +1926,7 @@ class TestAcceptanceGate:
     satisfied. Settling on "a PR exists" is how #389 was marked done with
     `mdformat` and `security` failing.
 
-    The gates run cheapest-first: CI is GitHub's compute and is free,
+    The gates run cheapest-first: CI is GitHub's compute and costs nothing,
     so it decides before a review run is spent — reviewing a red PR burns a
     whole run on work that has to change anyway.
     """
@@ -2045,7 +2045,7 @@ class TestAcceptanceGate:
         assert any(kind == "success" for kind, _ in source.calls)
 
     def test_red_checks_queue_a_fix_round_without_reviewing(self, tmp_path: Path) -> None:
-        """The saving that matters: a red PR spends a fix run, not a review
+        """The saving that matters: a red PR costs a fix run, not a review
         run followed by a fix run."""
         h, source = self._delivered(tmp_path)
         source.checks = ChecksVerdict("red", 2, (), ("mdformat",))
@@ -2185,7 +2185,7 @@ class TestAcceptanceGate:
 
     def test_a_poll_that_keeps_failing_hands_the_item_over(self, tmp_path: Path) -> None:
         """The one outcome an unattended daemon must never produce is a
-        silently parked item. A poll that cannot reach GitHub still spends a
+        silently parked item. A poll that cannot reach GitHub still costs a
         round, so a persistent failure ends the way any unaccepted PR does:
         handed to a human, out loud."""
         h, source = self._delivered(tmp_path, review_rounds=1)
@@ -2340,7 +2340,7 @@ class TestMergeWatch:
 
     def test_a_non_github_row_retires_without_a_read(self, tmp_path: Path) -> None:
         """Inbox work has no issue to settle: its row is retired silently,
-        spending zero GitHub reads."""
+        costing zero GitHub reads."""
         h, source = self._accepted(tmp_path)
         h.dstore.upsert_new(inbox_item(), h.clock.t)
         h.dstore.mark_done("inbox:a.md", h.clock.t)

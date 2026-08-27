@@ -54,7 +54,7 @@ class TestDrainSpend:
         assert empty.usage is None and empty.turns is None
 
     def test_retry_attempts_merge_into_one_bill(self) -> None:
-        """An invalid first reply spends real tokens; the drained spend must
+        """An invalid first reply costs real tokens; the drained spend must
         carry both attempts, not just the one that validated."""
         phases = runner(
             UsageAgent(

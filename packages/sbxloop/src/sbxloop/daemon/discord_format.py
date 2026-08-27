@@ -723,7 +723,7 @@ def _head(args: str) -> str:
 
 class RepetitionDetector:
     """Trailing-run detector for near-identical commands, fed one call at a
-    time so a burst of any length spends O(window) memory.
+    time so a burst of any length costs O(window) memory.
 
     A call extends the current run when it has the same tool and head word
     as the previous one. The run is *repetitive* once it holds ``window``
@@ -743,7 +743,7 @@ class RepetitionDetector:
         self._ratios: deque[float] = deque(maxlen=max(window - 1, 1))
 
     def add(self, tool: str, args: str) -> int:
-        from difflib import SequenceMatcher  # local: keep import price off the hot path
+        from difflib import SequenceMatcher  # local: keep import cost off the hot path
 
         head = (tool, _head(args))
         if head != self._head:

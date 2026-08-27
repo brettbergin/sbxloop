@@ -289,7 +289,7 @@ class SbxCLI:
 
         RESOURCES is documented as a comma-separated list (docker/docs
         data/sbx_cli, unchanged since the first sbx reference), so batching
-        n domains spends one CLI round-trip instead of n.
+        n domains costs one CLI round-trip instead of n.
         """
         if domain is None:
             return

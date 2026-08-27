@@ -214,7 +214,7 @@ def reviewing_harness(tmp_path: Path, **daemon: Any) -> Harness:
 
 class TestDeliveryReviews:
     """The loop evaluating the code it wrote — but only once the build has
-    reported. CI is GitHub's compute and is free; a review run spent
+    reported. CI is GitHub's compute and costs nothing; a review run spent
     on a red PR is spent on work that has to change anyway.
     """
 
@@ -234,7 +234,7 @@ class TestDeliveryReviews:
         assert any("review" in t and "#801" in t for t in front.seen)
 
     def test_a_red_pr_is_never_reviewed(self, tmp_path: Path) -> None:
-        """The saving: a red PR spends a fix round, not a review run and then
+        """The saving: a red PR costs a fix round, not a review run and then
         a fix round."""
         h = reviewing_harness(tmp_path)
         h.source.checks = ChecksVerdict("red", 1, (), ("lint",))  # type: ignore[attr-defined]

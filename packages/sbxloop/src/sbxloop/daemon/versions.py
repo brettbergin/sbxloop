@@ -200,7 +200,7 @@ class VersionProbe:
     daemon already uses for ``clock`` and ``store_factory``.
 
     Only *successful* lookups are memoised. Caching a failure would leave the
-    tool useless for five minutes after one blip, and the price of retrying is
+    tool useless for five minutes after one blip, and the cost of retrying is
     bounded by ``PYPI_TIMEOUT_S`` and the turn's own tool-call cap.
     """
 

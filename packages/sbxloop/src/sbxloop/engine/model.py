@@ -230,7 +230,7 @@ class RunResult(_Model):
 # anyone who set languages = ["rust"]. Provisioning is only a head start
 # besides: agents self-heal missing toolchains mid-run, so a Rust-configured
 # run that npm-installs a docs site still grows a node_modules. A name that
-# never occurs is free to carry, so the narrowing buys nothing either.
+# never occurs costs nothing to carry, so the narrowing buys nothing either.
 # Entries earn a place only if they are (i) conventionally
 # gitignored in their ecosystem and (ii) implausible as hand-written content
 # in any other. That rule deliberately keeps out the generic names —

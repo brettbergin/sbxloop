@@ -200,7 +200,7 @@ def test_every_template_opens_with_contract_header() -> None:
 
 
 def test_contract_header_never_reaches_the_model() -> None:
-    """The header is written for editors, not the agent: it must spend no
+    """The header is written for editors, not the agent: it must cost no
     tokens and must not be readable as instructions."""
     for name, context in RENDER_CONTEXTS.items():
         text = render(name, **context)

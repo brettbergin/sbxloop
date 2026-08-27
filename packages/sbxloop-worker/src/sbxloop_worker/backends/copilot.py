@@ -796,7 +796,7 @@ class CopilotBackend:
             # Resume is an optimisation, never a requirement: it saves a
             # revision from re-deriving what its own previous attempt
             # established. A session the SDK has expired, evicted, or never
-            # heard of must spend that saving and nothing more — falling
+            # heard of must cost that saving and nothing more — falling
             # through to a fresh session is exactly the behaviour before
             # resume existed, and the prompt still carries the previous
             # attempt's report either way.

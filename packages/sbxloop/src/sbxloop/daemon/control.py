@@ -284,7 +284,7 @@ class ControlClient:
         starts, which is deliberately after ``loop.recover()`` and so lasts
         as long as recovery does — over a minute on a daemon with orphaned
         runs to reconcile, which is exactly the state a restart creates. It
-        spend a good release a rollback (deploy of 0.7.23): the health check
+        cost a good release a rollback (deploy of 0.7.23): the health check
         submitted 56s before recovery finished, and the deploy read the
         refusal as "the daemon never came up" while the daemon was healthy.
         A daemon that never starts still fails, at the caller's deadline.
