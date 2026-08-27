@@ -459,9 +459,18 @@ class TestLandingRows:
         store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
         assert store.pr_state("gh:7").updates == 1  # type: ignore[union-attr]
 
+    @pytest.mark.skipif(
+        sqlite3.sqlite_version_info < (3, 35, 0),
+        reason="ALTER TABLE ... DROP COLUMN needs SQLite >= 3.35.0",
+    )
     def test_the_columns_are_added_to_a_db_that_predates_them(self, tmp_path: Path) -> None:
         """Additive migration, applied at open: an existing daemon upgrades in
-        place rather than losing its queue."""
+        place rather than losing its queue.
+
+        DROP COLUMN (SQLite >= 3.35.0) is only how this test *simulates* a
+        pre-migration database; the migration path under test does not use
+        it, so an older SQLite skips the simulation rather than failing the
+        suite over unrelated tooling."""
         path = tmp_path / "state.db"
         store = self._armed(tmp_path)
         store.close()
