@@ -34,7 +34,7 @@ from sbxloop.daemon.postmortem import postmortem_marker
 from sbxloop.daemon.review import REVIEW_INSTRUCTIONS, PostedReview, collect_review
 from sbxloop.engine.model import RunRecord
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import ChecksVerdict, GithubOps, MergeOutcome, SubmittedReview
+from sbxloop.gh.ops import ChecksVerdict, GithubOps, MergeOutcome
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
