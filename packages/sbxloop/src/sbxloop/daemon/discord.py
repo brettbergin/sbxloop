@@ -12,8 +12,8 @@ replying to it) talks to the **concierge** — the channel's agent
 (``sbxloop.daemon.concierge``). Its ``watch_run`` tool calls back into
 ``DiscordBridge.on_watch``, which remembers the asker's Discord id and
 @mentions them here when the run finishes; watches are persisted in
-``daemon_state`` and reloaded at startup, so a daemon restart mid-run
-still pings whoever asked. Routing rules live in
+``daemon_run_watches`` and reloaded at startup, so a daemon restart
+mid-run still pings whoever asked. Routing rules live in
 ``sbxloop.daemon.discord_routing``.
 
 Two rules make this safe to bolt onto the engine:
@@ -224,8 +224,9 @@ class DiscordBridge:
         # Run watches (#335). The concierge is transport-agnostic: it hands a
         # requester *display string* to `on_watch`, and the bridge turns it
         # back into a mentionable id through `_requester_ids`. The watches are
-        # persisted in `daemon_state` and reloaded here, so a daemon restart
-        # mid-run still pings whoever asked; `_requester_ids` stays in memory.
+        # persisted in `daemon_run_watches` and reloaded here, so a daemon
+        # restart mid-run still pings whoever asked; `_requester_ids` stays
+        # in memory.
         self._watch_lock = threading.Lock()
         self._watchers: dict[str, list[str]] = {}  # run_id -> discord user ids
         self._requester_ids: dict[str, str] = {}  # author display string -> user id

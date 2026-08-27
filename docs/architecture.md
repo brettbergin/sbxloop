@@ -118,9 +118,12 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   memory, resumed via `resume_session_id` — lives inside the VM.
   Its `watch_run` tool registers interest in a run so the asker is
   @mentioned in the control channel when that run finishes; the registry
-  (and the requester's mentionable Discord id) is **persisted in
-  `daemon_state` and reloaded at startup**, so a watch survives a daemon
-  restart.
+  is **persisted in `daemon_run_watches` and reloaded at startup** (the
+  requester's mentionable Discord id stays in-memory only), so a watch
+  survives a daemon restart — unless the run itself already finished
+  while the daemon was down, in which case the finish event that would
+  have fired the notice has already passed and reload drops the stale
+  watch instead of reviving it.
   `daemon_log` is served from a ring-buffer handler `configure_logging`
   installs in `sbxloop/log.py` — a `deque` with a `maxlen`, so a long-lived
   daemon's memory is bounded; the append is one atomic deque operation with

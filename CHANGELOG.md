@@ -63,10 +63,10 @@ All notable changes to sbxloop are documented here. The project adheres to
 ### Changed
 
 - **Run watches are persistent.** `watch_run` registrations are stored in
-  `daemon_state` (`run_id -> [requester ids]`) and reloaded when the daemon
-  starts, so a watch registered before a restart or upgrade still pings the
-  person who asked when the run finishes. The tool description, confirmation
-  text and docs no longer warn that a restart forgets watches.
+  `daemon_run_watches` (`run_id -> [requester ids]`) and reloaded when the
+  daemon starts, so a watch registered before a restart or upgrade still
+  pings the person who asked when the run finishes. The tool description,
+  confirmation text and docs no longer warn that a restart forgets watches.
 
 - **The per-task pipeline is three phases, not six: DECOMPOSE → BUILD →
   VERIFY.** PLAN and EXECUTE merged into one BUILD session that plans and
