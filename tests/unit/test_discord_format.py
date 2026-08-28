@@ -887,6 +887,20 @@ class TestRunSummary:
         card = summary_embed(stats, RunReport("r1", "completed", "x"), "completed")
         assert {n: v for n, v, _ in card.fields}["Stats"] == "turns 1"
 
+    def test_per_turn_cost_is_never_accumulated_or_rendered(self) -> None:
+        """The backend's per-turn ``cost`` is a constant of unknown unit, so
+        summing it invents a currency figure (#430). Nothing may read it and
+        no summary path may print a ``$`` number."""
+        stats = RunStats()
+        for _ in range(3):
+            stats.observe(tev(100.0, "agent.usage", cost=15.0, total_cost=15.0))
+        assert not any("cost" in name or "spend" in name for name in vars(stats))
+        text = summary_text(stats, "completed")
+        card = summary_embed(stats, RunReport("r1", "completed", "x"), "completed")
+        rendered = text + "\n".join(f"{n}{v}" for n, v, _ in card.fields)
+        assert "$" not in rendered
+        assert "45" not in rendered
+
 
 class TestFiledRefs:
     """Refs the daemon files (``gh:n``, ``owner/name#n``) rendered the way
@@ -1356,3 +1370,61 @@ class TestReviewReporting:
         assert filed_lines(lost) == [
             "⚠ review could not be posted to the pull request — see the daemon log"
         ]
+
+
+class TestNoFabricatedSpend:
+    """#430: the backend's per-turn ``cost`` is a constant of unknown unit
+    (15.0 on every turn of run rrhb28j7n), so summing it across a run and
+    printing it as ``$`` fabricates a spend figure. Nothing in the summary
+    may read it."""
+
+    TURNS = 147
+    COST = 15.0
+
+    def _stats(self) -> RunStats:
+        stats = RunStats()
+        stats.observe(tev(100.0, "run.start", outcome="fix the bug"))
+        for i in range(self.TURNS):
+            stats.observe(
+                tev(
+                    101.0 + i,
+                    "agent.usage",
+                    cost=self.COST,
+                    input_tokens=1000,
+                    output_tokens=200,
+                )
+            )
+        return stats
+
+    def test_no_cost_attribute_holds_the_sum(self) -> None:
+        stats = self._stats()
+        total = self.TURNS * self.COST
+        for name in ("cost", "total_cost", "spend", "cost_usd", "usd"):
+            assert not hasattr(stats, name)
+        for value in vars(stats).values():
+            assert value != total
+            assert value != self.COST
+
+    def test_summary_text_has_no_currency(self) -> None:
+        stats = self._stats()
+        for state in ("done", "completed", "failed"):
+            text = summary_text(stats, state)
+            assert "$" not in text
+            assert "2205" not in text
+
+    def test_summary_embed_has_no_currency(self) -> None:
+        card = summary_embed(self._stats(), RunReport("r1", "completed", "x"), "completed")
+        parts = [card.title or "", card.description or "", card.footer or ""]
+        for name, value, _inline in card.fields:
+            parts += [name, value]
+        blob = "\n".join(parts)
+        assert "$" not in blob
+        assert "2205" not in blob
+
+    def test_token_totals_still_accumulate(self) -> None:
+        stats = self._stats()
+        assert stats.turns == self.TURNS
+        assert stats.input_tokens == 1000 * self.TURNS
+        assert stats.output_tokens == 200 * self.TURNS
+        assert "147 turn(s)" in summary_text(stats, "done")
+        assert "147,000 in / 29,400 out tokens" in summary_text(stats, "done")
