@@ -164,6 +164,49 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A downgraded review no longer parks its item forever.** GitHub refuses
+  either verdict from an identity that is not an accepted reviewer and
+  posts it as a non-gating `COMMENT` (422). The daemon recorded *that* as
+  the item's verdict, but the verdict column exists precisely for the case
+  where the review does not gate — so both of the gate's fallbacks,
+  `verdict == "REQUEST_CHANGES"` (spend a fix round) and `== "APPROVE"`
+  (land it), were permanently false on any repo that downgrades, which is
+  every repo the loop reviews its own PRs on. The item sat in `reviewing`
+  behind a debug-level "waiting on approval": no fix round, no merge, no
+  notification. Field: `gh:424`, whose review requested changes with five
+  inline comments on PR #480 and was never acted on. The requested verdict
+  is stored now; `gates` already carried the downgrade. The same accepted-
+  vs-requested mix-up also announced a downgraded *approval* as "review
+  requested changes" — the opposite of what it said.
+
+- **An inert `sh -c '...'` no longer costs a work item.** The verify lint
+  rejected every nested shell, including single-quoted payloads with no `$`
+  in them, which the outer shell passes through verbatim — they run exactly
+  as they would unwrapped. Item `gh:478` was abandoned over two of them
+  (`sh -c 'exit 0'`, `sh -c 'git diff --quiet && git diff --cached --quiet'`), and PR #476 went unreviewed as a result. That form is now
+  *unwrapped and its payload linted*, so the wrapper still cannot hide a
+  bare `pytest` or an `apt-get` from the rules that matter, while every
+  shape that can actually misbehave — `bash -c` (may not be installed),
+  `sh -lc` (rewrites the environment), and any double-quoted or unquoted
+  payload (`$` eaten by the outer shell, field failure `r7ef26eht`) — is
+  rejected exactly as before. The decompose prompt's ban is reworded to
+  match: it read as forbidding only the double-quoted form.
+
+- **"No reviewer" no longer stands in for "the review broke".** A PR whose
+  review charter was filed and then died settles on green CI the same way a
+  deployment with no reviewer does, but the acceptance line called both "no
+  reviewer" — telling an operator their deployment has no reviewer when in
+  fact its review had just failed (field: `gh:478`'s charter, then PR #476
+  accepted). The gate now reports which of the two it was.
+
+- **A run that dies inside a phase is closed when it settles.** The `runs`
+  row is written only by the run loop, so a run killed mid-phase stayed
+  `decomposing` until the stale sweep timed it out — six hours in the field
+  (`rv2y1a8ke`, `rq826h546`), during which `list_runs` and every active-run
+  count disagreed with reality. Both settles close it now; neither the
+  retry (whose item drops its run pin) nor the abandon (whose item is
+  terminal) could ever have resumed it.
+
 - **The end-of-run summary card is back as the thread's last post.** The
   fix delivered for #420 (tool-call rendering) also deleted the summary
   card machinery shipped hours earlier — `RunStats`, `summary_text`,
