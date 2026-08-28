@@ -25,8 +25,7 @@ All notable changes to sbxloop are documented here. The project adheres to
     `main` — turning it on means unattended releases.
   - The bar is the *full* one. A PR the gate accepted for a weaker reason
     (green CI with no reviewer available) still settles the old way and is
-    never merged, and a PR someone else has pushed to still trips the
-    takeover guard untouched.
+    never merged.
   - `GithubOps` grew `pr_ready_for_review`, `pr_merge`, `pr_update_branch`
     and `branch_delete`, all through the existing `raw.api` transport — no
     new worker op. Un-drafting is the one GraphQL call in the codebase
@@ -39,12 +38,16 @@ All notable changes to sbxloop are documented here. The project adheres to
     open and out of draft, one click from done, rather than spending budget
     on a refusal no round can fix; `409` is a race, and the next poll
     re-judges the new head.
-  - `daemon_pr_state` gained `updates` and `landing` (additive migration,
-    applied at open). `landing` is what tells the daemon's own
-    update-branch commit apart from a human's push — without it the
-    takeover guard (#412) would hand off every PR that ever fell behind.
-    The update request carries `expected_head_sha`, so a human who pushed
-    first makes it fail rather than having their commit adopted.
+  - `daemon_pr_state` gained `updates` and `update_head` (additive
+    migration, applied at open). `update_head` records the head an
+    update-branch was requested at, so a poll can tell an update still in
+    flight from one that has landed instead of spending the budget asking
+    twice. The request carries `expected_head_sha`, so an update racing
+    another push fails rather than merging over it. A database created by an
+    earlier unreleased build of this work keeps its now-unused
+    `delivered_head` and `landing` columns — both are vestigial and harmless
+    (`landing` is `NOT NULL DEFAULT 0`, so inserts still work), and only a
+    freshly created database omits them.
 
 ### Removed
 
@@ -61,6 +64,20 @@ All notable changes to sbxloop are documented here. The project adheres to
   no longer written or read.
 
 ### Changed
+
+- **PR takeover detection is gone (#483).** The daemon no longer compares a
+  PR's head against the sha its delivering run recorded, no longer emits
+  `review.taken_over`, and no longer hands a PR to a human because commits
+  it did not deliver appeared on the branch. In practice the "stranger" was
+  sbxloop itself — a review run pushing fix-round commits onto the
+  delivering run's branch — and the guard stopped the loop short of the
+  merged PR it exists to produce. Review fix rounds now continue from the
+  PR's current head regardless of who pushed it, and the
+  "re-trigger the source issue to opt back in" escape hatch is removed with
+  it. Know the trade this makes: a fix-round delivery force-updates the PR
+  branch, so a human commit pushed onto a live sbxloop PR is now silently
+  overwritten by the next fix round — that is exactly what the guard was
+  catching, and nothing replaces it.
 
 - **`sbxloop watch` shows the same bounded excerpt of a failed tool call
   that Discord threads do.** The line-selection half of the excerpt policy

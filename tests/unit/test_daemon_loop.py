@@ -2099,27 +2099,21 @@ class TestAcceptanceGate:
         assert h.loop.tick().outcome == "reviewing"
         return h, source
 
-    def test_first_poll_baselines_the_delivered_head(self, tmp_path: Path) -> None:
+    def test_an_unexpected_head_still_gets_its_fix_round(self, tmp_path: Path) -> None:
+        """#483: the loop iterates on its own PR until it is merged. A head
+        the delivering run did not record is routine — sbxloop's own review
+        runs push fix-round commits onto that branch — so a moved head must
+        not stop the rounds."""
         h, source = self._delivered(tmp_path)
         source.head_sha = "ours0001"
         h.loop.tick()
-        assert h.dstore.pr_state("gh:1").delivered_head == "ours0001"  # type: ignore[union-attr]
-
-    def test_a_foreign_push_hands_the_pr_over(self, tmp_path: Path) -> None:
-        """#412: a fix round delivers by force-updating the branch, so a head
-        the daemon did not deliver means continuing would replace a human's
-        commits — whoever pushes last wins. Hand it over instead."""
-        h, source = self._delivered(tmp_path)
-        source.head_sha = "ours0001"
-        h.loop.tick()  # baselines
-        source.head_sha = "theirs002"
-        source.checks = ChecksVerdict("red", 2, (), ("lint",))  # would queue a fix round
+        source.head_sha = "someone002"
+        source.checks = ChecksVerdict("red", 2, (), ("lint",))
         h.loop.tick()
         item = h.dstore.get("gh:1")
-        assert item.state == "abandoned", "handed to a human, not retried"  # type: ignore[union-attr]
-        assert "taken over" in (item.last_error or "")  # type: ignore[union-attr]
+        assert item.state == "queued", "the fix round continues on the new head"  # type: ignore[union-attr]
         state = h.dstore.pr_state("gh:1")
-        assert state is not None and state.fix_brief is None, "no fix round was queued"
+        assert state is not None and state.fix_brief, "a fix round was queued"
 
     def test_a_review_is_not_refiled_after_its_charter_dies(self, tmp_path: Path) -> None:
         """#442: abandoning (or losing) the review charter must not silently
@@ -2661,39 +2655,17 @@ class TestLandingStage:
         assert source.merges == []
         assert len(h.runs) == before, "keeping a branch current must not cost an engine run"
         state = h.dstore.pr_state("gh:1")
-        assert state is not None and state.updates == 1 and state.landing
+        assert state is not None and state.updates == 1 and state.update_head == "ours0001"
 
-    def test_our_own_update_commit_is_not_read_as_a_takeover(self, tmp_path: Path) -> None:
-        """#412's guard fails the item on a head it did not deliver, and an
-        update-branch moves the head by design. Without the in-flight marker
-        every PR that ever fell behind would be handed off."""
+    def test_the_update_commit_is_merged_at_its_new_head(self, tmp_path: Path) -> None:
         h, source = self._accepted(tmp_path)
         source.mergeable_state = "behind"
         h.loop.tick()  # asks for the update
         source.head_sha = "updated1"  # its merge commit appears
         source.mergeable_state = "clean"
         h.loop.tick()
-        item = h.dstore.get("gh:1")
-        assert item.state == "done", "the update commit must not read as a takeover"  # type: ignore[union-attr]
-        state = h.dstore.pr_state("gh:1")
-        assert state is not None and not state.landing
+        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
         assert source.merges == [(9, "squash", "updated1")], "merged at the new head"
-
-    def test_a_foreign_push_during_a_landing_still_hands_over(self, tmp_path: Path) -> None:
-        """The marker only excuses ONE head move; once it is cleared the
-        guard is back to its old self."""
-        h, source = self._accepted(tmp_path)
-        source.mergeable_state = "behind"
-        h.loop.tick()  # asks for the update
-        source.head_sha = "updated1"
-        source.mergeable_state = "clean"
-        source.merge_outcome = MergeOutcome(False, "", "head moved", stale=True)
-        h.loop.tick()  # adopts the update commit, merge races and loses
-        source.head_sha = "theirs02"
-        h.loop.tick()
-        item = h.dstore.get("gh:1")
-        assert item.state == "abandoned"  # type: ignore[union-attr]
-        assert "taken over" in (item.last_error or "")  # type: ignore[union-attr]
 
     def test_only_one_update_is_in_flight_at_a_time(self, tmp_path: Path) -> None:
         h, source = self._accepted(tmp_path)
@@ -2701,6 +2673,18 @@ class TestLandingStage:
         h.loop.tick()
         h.loop.tick()  # head has not moved yet — do not ask again
         assert source.updates == [(9, "ours0001")]
+
+    def test_a_landed_update_stops_being_recorded_as_in_flight(self, tmp_path: Path) -> None:
+        """Once the head moves past the sha we asked at, the row should no
+        longer claim an update is outstanding."""
+        h, source = self._accepted(tmp_path, merge_update_attempts=3)
+        source.mergeable_state = "behind"
+        h.loop.tick()  # update 1
+        assert h.dstore.pr_state("gh:1").update_head == "ours0001"  # type: ignore[union-attr]
+        source.head_sha = "updated1"
+        h.loop.tick()  # still behind: asks again at the new head
+        assert h.dstore.pr_state("gh:1").update_head == "updated1"  # type: ignore[union-attr]
+        assert source.updates == [(9, "ours0001"), (9, "updated1")]
 
     def test_update_attempts_are_bounded_then_handed_over(self, tmp_path: Path) -> None:
         """A base moving faster than CI finishes would update for ever."""
@@ -2731,7 +2715,7 @@ class TestLandingStage:
         source.update_ok = False
         h.loop.tick()
         state = h.dstore.pr_state("gh:1")
-        assert state is not None and state.updates == 0 and not state.landing
+        assert state is not None and state.updates == 0 and state.update_head is None
         assert h.dstore.get("gh:1").state == "reviewing"  # type: ignore[union-attr]
 
     def test_a_blocked_merge_hands_over_with_the_pr_left_open(self, tmp_path: Path) -> None:
@@ -2770,17 +2754,15 @@ class TestLandingStage:
         h.loop.tick()
         assert h.dstore.get("gh:1").state == "abandoned"  # type: ignore[union-attr]
 
-    def test_a_fix_round_during_a_landing_re_arms_the_takeover_guard(self, tmp_path: Path) -> None:
+    def test_a_fix_round_during_a_landing_clears_the_update_marker(self, tmp_path: Path) -> None:
         """The base can move again — into a real conflict — while an
         update-branch is still in flight. The fix round that resolves it
-        rewrites the branch, so the marker set against the old one is moot.
-        If it survived the re-delivery it would excuse the NEXT head move
-        too, and that one could be a human's push.
-        """
+        rewrites the branch, so the head the marker recorded is moot; a
+        marker that outlived it would block the next update."""
         h, source = self._accepted(tmp_path)
         source.mergeable_state = "behind"
         h.loop.tick()  # asks for the update; the marker goes up
-        assert h.dstore.pr_state("gh:1").landing  # type: ignore[union-attr]
+        assert h.dstore.pr_state("gh:1").update_head == "ours0001"  # type: ignore[union-attr]
         # Before its commit appears, the base moves again and conflicts.
         source.mergeable, source.mergeable_state = False, "dirty"
         h.loop.tick()
@@ -2790,11 +2772,8 @@ class TestLandingStage:
         h.dstore.mark_reviewing("gh:1", h.clock.t)
         state = h.dstore.pr_state("gh:1")
         assert state is not None
-        assert not state.landing, "a marker that outlives its branch disarms the guard"
+        assert state.update_head is None, "a marker that outlives its branch is cleared"
         assert state.updates == 1, "the update budget is not refunded by a fix round"
-        # From here the guard is its old self: the next head the poll sees is
-        # baselined as the re-delivery's, and a later stranger's push is a
-        # takeover again — which is what TestAcceptanceGate already pins.
 
     def test_green_with_no_reviewer_is_never_merged(self, tmp_path: Path) -> None:
         """The bar for a merge is the full one. An acceptance that only ever

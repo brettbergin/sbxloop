@@ -377,17 +377,6 @@ class TestMergeWatchRows:
         state = store.pr_state("gh:7")
         assert state is not None and not state.settled and state.merged_at is None
 
-    def test_delivered_head_baselines_and_redelivery_clears_it(self, tmp_path: Path) -> None:
-        """#412: the takeover guard's baseline. A fresh delivery (a fix
-        round) moves the branch itself, so it must clear the old head or the
-        guard would read the daemon's own push as a takeover."""
-        store = self._armed(tmp_path)
-        assert store.pr_state("gh:7").delivered_head is None  # type: ignore[union-attr]
-        store.set_delivered_head("gh:7", "abc123")
-        assert store.pr_state("gh:7").delivered_head == "abc123"  # type: ignore[union-attr]
-        store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
-        assert store.pr_state("gh:7").delivered_head is None  # type: ignore[union-attr]
-
     def test_merge_watch_returns_only_done_unsettled_due_rows(self, tmp_path: Path) -> None:
         store = self._armed(tmp_path)
         assert store.merge_watch(1000.0, 300.0) == [("gh:7", 9, "https://x/pull/9")]
@@ -425,10 +414,9 @@ class TestMergeWatchRows:
 
 
 class TestLandingRows:
-    """The landing stage's bookkeeping. `landing` is the only thing that
-    tells the daemon's own update-branch commit apart from a human's push,
-    so it is the row that keeps #412's guard from firing on every PR that
-    ever falls behind."""
+    """The landing stage's bookkeeping: the update-branch budget and the head
+    an update was last requested at, which is what keeps a poll from asking
+    for the same update twice."""
 
     def _armed(self, tmp_path: Path) -> DaemonStore:
         store = DaemonStore(tmp_path / "state.db")
@@ -436,24 +424,24 @@ class TestLandingRows:
         store.record_delivery("gh:7", 9, "sbxloop/r1", 2.0, url="https://x/pull/9")
         return store
 
-    def test_a_fresh_row_has_spent_nothing_and_is_not_landing(self, tmp_path: Path) -> None:
+    def test_a_fresh_row_has_spent_nothing_and_has_no_update_head(self, tmp_path: Path) -> None:
         state = self._armed(tmp_path).pr_state("gh:7")
-        assert state is not None and state.updates == 0 and state.landing is False
+        assert state is not None and state.updates == 0 and state.update_head is None
 
-    def test_update_attempts_and_the_in_flight_marker_round_trip(self, tmp_path: Path) -> None:
+    def test_update_attempts_and_the_update_head_round_trip(self, tmp_path: Path) -> None:
         store = self._armed(tmp_path)
         assert store.bump_pr_update("gh:7") == 1
         assert store.bump_pr_update("gh:7") == 2
-        store.set_landing("gh:7", True)
+        store.set_update_head("gh:7", "abc123")
         state = store.pr_state("gh:7")
-        assert state is not None and state.updates == 2 and state.landing is True
-        store.set_landing("gh:7", False)
-        assert store.pr_state("gh:7").landing is False  # type: ignore[union-attr]
+        assert state is not None and state.updates == 2 and state.update_head == "abc123"
+        store.set_update_head("gh:7", None)
+        assert store.pr_state("gh:7").update_head is None  # type: ignore[union-attr]
 
     def test_update_attempts_survive_a_redelivery(self, tmp_path: Path) -> None:
-        """A fix round re-arms the merge watch and re-baselines the head, but
-        it must not refund the updates already spent — that is the only bound
-        on a base that moves faster than CI finishes."""
+        """A fix round re-arms the merge watch, but it must not refund the
+        updates already spent — that is the only bound on a base that moves
+        faster than CI finishes."""
         store = self._armed(tmp_path)
         store.bump_pr_update("gh:7")
         store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
@@ -476,25 +464,22 @@ class TestLandingRows:
         store.close()
         with sqlite3.connect(path) as conn:
             conn.execute("ALTER TABLE daemon_pr_state DROP COLUMN updates")
-            conn.execute("ALTER TABLE daemon_pr_state DROP COLUMN landing")
+            conn.execute("ALTER TABLE daemon_pr_state DROP COLUMN update_head")
             conn.commit()
         reopened = DaemonStore(path)
         state = reopened.pr_state("gh:7")
-        assert state is not None and state.updates == 0 and state.landing is False
+        assert state is not None and state.updates == 0 and state.update_head is None
         assert state.pr_number == 9, "the pre-existing row survived"
 
     def test_a_re_delivery_clears_the_marker_but_keeps_the_budget(self, tmp_path: Path) -> None:
         """A fix round rewrites the branch, so an update-branch that was in
-        flight against the old one is moot. Leaving the marker up would
-        excuse the next head move as ours — and the next one could be a
-        human's. The spend, like `rounds`, survives the round."""
+        flight against the old one is moot and its recorded head is stale.
+        The spend, like `rounds`, survives the round."""
         store = self._armed(tmp_path)
-        store.set_delivered_head("gh:7", "aaa")
         store.bump_pr_update("gh:7")
-        store.set_landing("gh:7", True)
+        store.set_update_head("gh:7", "aaa")
         store.record_delivery("gh:7", 9, "sbxloop/r1", 3.0, url="https://x/pull/9")
         state = store.pr_state("gh:7")
         assert state is not None
-        assert not state.landing, "a stale marker disarms the takeover guard"
-        assert state.delivered_head is None
+        assert state.update_head is None, "a stale marker would block the next update"
         assert state.updates == 1, "the update budget is not refunded by a fix round"

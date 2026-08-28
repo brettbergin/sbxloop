@@ -415,8 +415,7 @@ It is off by default, and deliberately:
 
 The bar is the full one. A PR the gate accepted for a *weaker* reason —
 green CI with no reviewer available to judge it — is never merged; it
-settles the way it always did. Neither is a PR someone else has pushed to:
-the takeover guard still hands those over untouched.
+settles the way it always did.
 
 When GitHub refuses the merge (a protection rule wanting an approval
 sbxloop's identity cannot give, a base that keeps moving out from under it),
