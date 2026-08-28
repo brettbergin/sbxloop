@@ -1404,6 +1404,10 @@ class RunStats:
         # are billed and timed by. Token fields stay None until a backend
         # actually reports them: "not reported" is not zero. No backend
         # reports a spend figure in a known unit, so none is tracked (#439).
+        # In particular the per-turn ``cost`` field on ``agent.usage`` is a
+        # constant of unknown unit (15.0 on every turn observed), so summing
+        # it across a run fabricates a currency total — it is deliberately
+        # never read, and no summary path prints a ``$`` figure (#430).
         self.turns = 0
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None

@@ -174,6 +174,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A downgraded review no longer parks its item forever.** GitHub refuses
+  either verdict from an identity that is not an accepted reviewer and
+  posts it as a non-gating `COMMENT` (422). The daemon recorded *that* as
+  the item's verdict, but the verdict column exists precisely for the case
+  where the review does not gate — so both of the gate's fallbacks,
+  `verdict == "REQUEST_CHANGES"` (spend a fix round) and `== "APPROVE"`
+  (land it), were permanently false on any repo that downgrades, which is
+  every repo the loop reviews its own PRs on. The item sat in `reviewing`
+  behind a debug-level "waiting on approval": no fix round, no merge, no
+  notification. Field: `gh:424`, whose review requested changes with five
+  inline comments on PR #480 and was never acted on. The requested verdict
+  is stored now; `gates` already carried the downgrade. The same accepted-
+  vs-requested mix-up also announced a downgraded *approval* as "review
+  requested changes" — the opposite of what it said.
+
 - **An inert `sh -c '...'` no longer costs a work item.** The verify lint
   rejected every nested shell, including single-quoted payloads with no `$`
   in them, which the outer shell passes through verbatim — they run exactly
