@@ -401,12 +401,19 @@ calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
   with any elision marked `… N lines elided …` counted from the event's
   `output_lines`. A failure gets the larger budget and prefers `error`
   (stderr); a success is quiet by default, because the batched line already
-  reports it. The caps are named constants — `TOOL_OUTPUT_LINES_DEFAULT` (0),
-  `TOOL_FAIL_OUTPUT_LINES_DEFAULT` (20), `TOOL_EXCERPT_LINE_CLIP` (300
-  chars/line), `TOOL_EXCERPT_MAX_CHARS` (1200) — with the two line budgets
-  configurable as `[discord] tool_output_lines` / `tool_fail_output_lines`.
-  The finished message is additionally clamped to `DISCORD_MAX_MESSAGE`, so no
-  input can overflow Discord's limit.
+  reports it. The line-selection half of that policy — the budgets, the
+  head+tail split, the per-line clip and the elision marker — lives in
+  `sbxloop.excerpt` so every renderer shares one copy: the caps are named
+  constants there, `TOOL_OUTPUT_LINES_DEFAULT` (0),
+  `TOOL_FAIL_OUTPUT_LINES_DEFAULT` (20) and `TOOL_EXCERPT_LINE_CLIP` (300
+  chars/line), with the two line budgets configurable as
+  `[discord] tool_output_lines` / `tool_fail_output_lines`. Discord's own
+  character caps stay in `discord_format`: the fenced body is clipped to
+  `TOOL_EXCERPT_MAX_CHARS` (1200) and the finished message to
+  `DISCORD_MAX_MESSAGE`, so no input can overflow Discord's limit. The
+  `sbxloop watch` TUI renders a failed tool call through the same shared
+  helper, so its excerpt has the same head+tail shape, per-line clip and
+  elision marker rather than a plain last-N-lines tail.
 - **Redaction at the render seam.** The worker already redacts an event's
   output before it leaves the sandbox; because this feature *publishes* more
   of what a command printed, every rendered command and every excerpt passes

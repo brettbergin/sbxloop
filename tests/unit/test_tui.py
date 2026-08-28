@@ -10,7 +10,8 @@ from rich.console import Console
 
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, render_event
 from sbxloop.events import HostEventTypes
-from sbxloop_worker.protocol import Event
+from sbxloop.excerpt import TOOL_EXCERPT_LINE_CLIP, TOOL_FAIL_OUTPUT_LINES_DEFAULT
+from sbxloop_worker.protocol import Event, EventTypes
 
 
 def make_event(type: str, **data: object) -> Event:
@@ -165,3 +166,38 @@ class TestDashboardChat:
         chat = ChatInput(lambda _: None)
         chat.feed(b"typing here")
         assert "typing here" in render_to_text(dashboard.renderable(chat.renderable()))
+
+
+class TestFailedToolExcerpt:
+    def render_fail(self, **data: object) -> str:
+        return render_to_text(
+            render_event(
+                make_event(
+                    EventTypes.AGENT_TOOL_END, tool="bash", success=False, exit_code=1, **data
+                )
+            )
+        )
+
+    def test_long_output_renders_head_tail_and_marker(self) -> None:
+        output = "\n".join(f"line{i}" for i in range(100))
+        text = self.render_fail(output=output)
+        assert "line0" in text
+        assert "line99" in text
+        assert "line50" not in text
+        assert f"… {100 - TOOL_FAIL_OUTPUT_LINES_DEFAULT} lines elided …" in text
+
+    def test_elided_count_uses_output_lines_field(self) -> None:
+        output = "\n".join(f"line{i}" for i in range(30))
+        text = self.render_fail(output=output, output_lines=500)
+        assert f"… {500 - TOOL_FAIL_OUTPUT_LINES_DEFAULT} lines elided …" in text
+
+    def test_long_line_is_clipped(self) -> None:
+        text = self.render_fail(error="x" * 2000)
+        assert "…" in text
+        assert "x" * (TOOL_EXCERPT_LINE_CLIP + 1) not in " ".join(text.split())
+
+    def test_short_output_renders_in_full_without_marker(self) -> None:
+        text = self.render_fail(output="boom\nbadness")
+        assert "boom" in text
+        assert "badness" in text
+        assert "lines elided" not in text

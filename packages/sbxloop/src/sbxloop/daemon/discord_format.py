@@ -43,6 +43,12 @@ from sbxloop.cli.tui import (
 from sbxloop.cli.tui import _one_line as _one_line_mid
 from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
 from sbxloop.events import Event, HostEventTypes
+from sbxloop.excerpt import (
+    TOOL_EXCERPT_LINE_CLIP,
+    TOOL_FAIL_OUTPUT_LINES_DEFAULT,
+    TOOL_OUTPUT_LINES_DEFAULT,
+    excerpt_output_lines,
+)
 from sbxloop.log import redact_text
 
 # Discord's hard cap per message; _clip never returns more than this even
@@ -60,22 +66,12 @@ EMBED_TOTAL_MAX = 6000
 EMBED_FOOTER_MAX = 2048
 
 # -- tool output excerpt budget -------------------------------------------------------------
-# What a completed tool call is allowed to publish back into the thread.
-# Deliberately asymmetric: a success is noise once you know it succeeded, a
-# failure is the thing the watcher opened the thread for. Every one of these
-# is an upper bound only -- the renderer additionally clamps the finished
-# message to DISCORD_MAX_MESSAGE, so no combination can overflow Discord.
-
-# Tail lines shown for a *successful* call. 0 (the default) means a success
-# renders no block of its own: its outcome and exit status already appear on
-# the batched ``$ bash …  ✓ 1.2s`` line, and giving every success a block
-# would break batching and flood the thread. Raise it to echo output.
-TOOL_OUTPUT_LINES_DEFAULT = 0
-# Total head+tail lines shown for a *failed* call: enough stderr to act on.
-TOOL_FAIL_OUTPUT_LINES_DEFAULT = 20
-# Per-line character clip inside an excerpt, so one 1MB line cannot eat the
-# whole budget before the total-chars cap is applied.
-TOOL_EXCERPT_LINE_CLIP = 300
+# The line-selection caps (TOOL_OUTPUT_LINES_DEFAULT,
+# TOOL_FAIL_OUTPUT_LINES_DEFAULT, TOOL_EXCERPT_LINE_CLIP) and the rationale
+# behind them live in :mod:`sbxloop.excerpt`, shared with every renderer.
+# Only the Discord-specific character caps are defined here; they are upper
+# bounds only -- the renderer additionally clamps the finished message to
+# DISCORD_MAX_MESSAGE, so no combination can overflow Discord.
 # Total characters of fenced body across all excerpt lines.
 TOOL_EXCERPT_MAX_CHARS = 1200
 
@@ -417,32 +413,6 @@ def _strip_bare_json(text: str) -> str:
 # -- tool batching --------------------------------------------------------------------------
 
 
-def _excerpt_lines(
-    lines: list[str], max_lines: int, total: int, line_clip: int, *, tail_only: bool = False
-) -> list[str]:
-    """Head+tail selection of at most ``max_lines`` lines with a middle
-    ``… N lines elided …`` marker; ``total`` is the true line count of the
-    original output (which may exceed what survived upstream clipping)."""
-    if max_lines <= 0:
-        return []
-    if len(lines) <= max_lines:
-        picked = list(lines)
-        cut = len(picked)
-    elif tail_only or max_lines == 1:
-        picked = lines[-max_lines:]
-        cut = 0
-    else:
-        head_n = max_lines // 2
-        tail_n = max_lines - head_n
-        picked = lines[:head_n] + lines[-tail_n:]
-        cut = head_n
-    omitted = max(0, total - len(picked))
-    out = [_clip(ln.rstrip(), line_clip).replace("```", "'''") for ln in picked]
-    if omitted > 0:
-        out = [*out[:cut], f"… {omitted} lines elided …", *out[cut:]]
-    return out
-
-
 def output_excerpt(
     tool: str,
     exit_code: int | None,
@@ -457,16 +427,16 @@ def output_excerpt(
     """The block a completed tool call gets to itself: an outcome header
     plus a bounded excerpt of its output.
 
-    A failure shows ``TOOL_FAIL_OUTPUT_LINES_DEFAULT`` head+tail lines (the
-    caller should pass the event's ``error``, falling back to ``output``, so
-    stderr is what appears); a success shows at most
-    ``TOOL_OUTPUT_LINES_DEFAULT`` tail lines and renders nothing at all when
-    that budget is 0 and there is nothing to say. Elision is marked with
-    ``… N lines elided …``, counted from ``output_lines`` (the event's true
-    line count) when the stored text was itself truncated.
+    Line selection -- how many lines a success and a failure get, the
+    per-line clip, and the ``… N lines elided …`` marker -- is
+    :func:`sbxloop.excerpt.excerpt_output_lines`; see that module for why
+    the budgets are what they are. The caller should pass the event's
+    ``error``, falling back to ``output``, so stderr is what appears on a
+    failure; a success renders nothing at all when its budget is 0 and
+    there is nothing to say.
 
-    Bounds: each line is clipped to ``line_clip``, the fenced body to
-    ``max_chars``, and the finished message to ``DISCORD_MAX_MESSAGE`` --
+    Discord-specific bounds on top of that: the fenced body is clipped to
+    ``max_chars`` and the finished message to ``DISCORD_MAX_MESSAGE`` --
     so no input, however pathological, can exceed Discord's limit.
 
     Redaction: upstream masks the event payload, and this renderer
@@ -479,9 +449,13 @@ def output_excerpt(
         max_lines = TOOL_FAIL_OUTPUT_LINES_DEFAULT if failed else TOOL_OUTPUT_LINES_DEFAULT
     exit_part = f" (exit {exit_code})" if exit_code is not None else ""
     head = f"✗ {code(tool)} failed{exit_part}" if failed else f"✓ {code(tool)}{exit_part}"
-    lines = [ln for ln in redact_text(str(detail or "")).strip().splitlines() if ln.strip()]
-    total = max(len(lines), int(output_lines or 0))
-    picked = _excerpt_lines(lines, int(max_lines), total, line_clip, tail_only=not failed)
+    picked = excerpt_output_lines(
+        detail,
+        max_lines=int(max_lines),
+        output_lines=output_lines,
+        line_clip=line_clip,
+        tail_only=not failed,
+    )
     if not picked:
         return block(head) if failed else None
     body = "\n".join(picked)

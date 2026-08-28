@@ -11,6 +11,12 @@ place at the bottom. Host lifecycle events stay compact one-liners.
 ``format_event`` remains the dense single-line form used by
 ``sbxloop logs``.
 
+A *failed* tool call additionally gets a bounded head+tail excerpt of its
+output beneath the command line, selected by :mod:`sbxloop.excerpt` — the
+same line-selection policy the Discord renderer uses, so both surfaces
+clip lines identically and mark what they dropped with
+``… N lines elided …`` counted from the event's ``output_lines``.
+
 The status region also hosts the interactive chat form (``ChatInput``):
 keystrokes are captured in cbreak mode (echo off — the Live region owns the
 screen) and the in-progress line is rendered inside the pinned panel, with
@@ -37,6 +43,7 @@ from rich.text import Text
 
 from sbxloop.cli.cmdfmt import COMMAND_DISPLAY_CLIP, format_command
 from sbxloop.events import Event, HostEventTypes, summarize_event
+from sbxloop.excerpt import TOOL_FAIL_OUTPUT_LINES_DEFAULT, excerpt_output_lines
 from sbxloop_worker.protocol import EventTypes
 
 # Live task states only; historical events replayed from a pre-BUILD run
@@ -76,9 +83,9 @@ RESOURCE_LEVEL_STYLES = {"ok": "dim", "warn": "yellow", "abort": "bold red"}
 
 AGENT_MESSAGE_CLIP = 4000
 # One-line clip for generic text (see _one_line); tool commands themselves
-# clip via cmdfmt.COMMAND_DISPLAY_CLIP. Output tail lines shown on tool failure.
+# clip via cmdfmt.COMMAND_DISPLAY_CLIP. Failed-tool output excerpts use the
+# shared budget and per-line clip from sbxloop.excerpt.
 TOOL_ARGS_LINE_CLIP = 160
-TOOL_FAIL_TAIL_LINES = 6
 
 
 def _stamp(event: Event) -> str:
@@ -166,14 +173,19 @@ def render_event(event: Event) -> RenderableType | None:
         # Failed executions carry the reason in `error` (the SDK omits
         # `output` on failure); prefer real output when both exist.
         tail = str(data.get("output") or "").strip() or error
-        if tail:
+        excerpt = (
+            excerpt_output_lines(
+                tail,
+                max_lines=TOOL_FAIL_OUTPUT_LINES_DEFAULT,
+                output_lines=data.get("output_lines"),
+            )
+            if tail
+            else []
+        )
+        if excerpt:
             return Group(
                 failure,
-                Text(
-                    "\n".join(tail.splitlines()[-TOOL_FAIL_TAIL_LINES:]),
-                    style="red dim",
-                    overflow="fold",
-                ),
+                Text("\n".join(excerpt), style="red dim", overflow="fold"),
             )
         return failure
 
