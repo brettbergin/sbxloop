@@ -291,9 +291,9 @@ on the `reason:` line of `sbxloop status <run>`, and in the TUI run header.
 A delivered PR is not done because it exists. `DaemonLoop._poll_one_review`
 advances one PR by exactly one step per tick, through gates ordered by what
 they cost — the PR's own fate first (a merge or an unmerged close outranks
-everything below), then the takeover guard, then CI (GitHub's compute, free),
-then the review, and only then the merge. Reviewing a red PR would spend a
-whole run on work that has to change anyway.
+everything below), then CI (GitHub's compute, free), then the review, and only
+then the merge. Reviewing a red PR would spend a whole run on work that has to
+change anyway.
 
 The last gate is the **landing stage** (`_land`), reached only from the full
 bar: every check green *and* the review satisfied. With `[daemon] auto_merge`
@@ -324,16 +324,14 @@ rule wanting an approval this identity cannot give, most often — which no
 retry fixes, so the item is handed over with the PR left open and out of
 draft; **409** is a race, so the next poll simply re-judges the new head.
 
-The interaction worth knowing is with the takeover guard. That guard fails an
-item whose branch head is not the one sbxloop delivered, because a fix round
-force-updates the branch and would otherwise replace a human's commits. An
-update-branch moves the head *by design*, and GitHub answers that request
-without the sha it will produce — so the daemon marks `landing` on the PR row,
-and while that is set one changed head is read as its own update commit rather
-than as a takeover. The request carries `expected_head_sha`, so a human who
-had pushed first makes the update fail instead of having their commit adopted;
-and the marker excuses exactly one move before the guard is back to its usual
-self.
+Fix rounds continue on whatever the PR's head is, whoever pushed it: the loop
+iterates on its own PR until it is merged, and its own review runs push
+fix-round commits onto that branch. The one piece of head bookkeeping left is
+the landing stage's: the head an update-branch was requested at is recorded so
+a later poll can tell an update still in flight (head unchanged) from one that
+has landed, rather than spending the budget asking twice. That request also
+carries `expected_head_sha`, so an update racing another push fails rather
+than merging over it.
 
 ## Daemon guardrails
 

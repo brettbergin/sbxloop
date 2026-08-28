@@ -131,16 +131,13 @@ CREATE TABLE IF NOT EXISTS daemon_pr_state (
     merged_at  REAL,
     settled    INTEGER NOT NULL DEFAULT 0,
     last_merge_check REAL NOT NULL DEFAULT 0,
-    -- The PR branch's head as of our own last delivery, observed on the
-    -- first poll after it. A later head that differs was pushed by someone
-    -- else: the PR has been taken over, and a fix round force-updating it
-    -- would silently replace their work (#412).
-    delivered_head TEXT,
-    -- The landing stage. `updates` counts update-branch calls spent keeping
-    -- the PR current with its base; `landing` marks one in flight, which is
-    -- what tells the takeover guard that the next head it sees is ours.
+    -- The landing stage: `updates` counts update-branch calls spent keeping
+    -- the PR current with its base; `update_head` is the head the branch sat
+    -- at when one was requested, so a poll can tell an update still in flight
+    -- (head unchanged) from one that has landed; it is cleared once the head
+    -- moves past it, so NULL means nothing was asked for.
     updates    INTEGER NOT NULL DEFAULT 0,
-    landing    INTEGER NOT NULL DEFAULT 0
+    update_head TEXT
 );
 
 CREATE TABLE IF NOT EXISTS daemon_audits (
@@ -221,16 +218,8 @@ _MIGRATIONS = (
         "last_merge_check",
         "ALTER TABLE daemon_pr_state ADD COLUMN last_merge_check REAL NOT NULL DEFAULT 0",
     ),
-    # The takeover guard (#412): rows from before the column re-baseline on
-    # their next poll, exactly like a fresh delivery.
-    (
-        "daemon_pr_state",
-        "delivered_head",
-        "ALTER TABLE daemon_pr_state ADD COLUMN delivered_head TEXT",
-    ),
-    # The landing stage: update-branch attempts spent, and whether one is in
-    # flight. Rows from before these columns read 0/0, which is where a PR
-    # that has never been landed belongs anyway.
+    # The landing stage: update-branch attempts spent. Rows from before this
+    # column read 0, which is where a PR that has never been landed belongs.
     (
         "daemon_pr_state",
         "updates",
@@ -238,8 +227,8 @@ _MIGRATIONS = (
     ),
     (
         "daemon_pr_state",
-        "landing",
-        "ALTER TABLE daemon_pr_state ADD COLUMN landing INTEGER NOT NULL DEFAULT 0",
+        "update_head",
+        "ALTER TABLE daemon_pr_state ADD COLUMN update_head TEXT",
     ),
 )
 
@@ -261,17 +250,13 @@ class PrState(NamedTuple):
     # and reported to the source.
     settled: bool = False
     merged_at: float | None = None
-    # The branch head as of our own last delivery (#412); None until the
-    # first poll after a delivery observes it.
-    delivered_head: str | None = None
     # Update-branch attempts spent on this PR, bounded by
     # `daemon.merge_update_attempts`.
     updates: int = 0
-    # An update-branch the daemon asked for is in flight. GitHub answers that
-    # request without the sha it will produce, so the next poll has to read
-    # the branch to learn it — and while this is set, a head that moved is
-    # OUR commit, not a takeover.
-    landing: bool = False
+    # The branch head when an update-branch was last requested. While the head
+    # still reads this, that update has not landed and asking again would burn
+    # the budget on a no-op.
+    update_head: str | None = None
 
     @property
     def review_in_flight(self) -> bool:
@@ -924,11 +909,6 @@ class DaemonStore:
         the only thing bounding the loop. It does re-arm the merge watch —
         a fresh delivery means there is a PR to watch again.
 
-        It also clears ``delivered_head`` and ``landing`` together, for one
-        reason: the branch this row was tracking no longer exists as it was.
-        A landing marker that outlived the round it was set in would excuse
-        the *next* head move too, and the next head move might be a human's
-        — which is the whole thing #412's takeover guard exists to catch.
         ``updates`` deliberately survives, like ``rounds``: it is a budget.
         """
         with self._lock:
@@ -937,7 +917,7 @@ class DaemonStore:
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
                 "pr_number = excluded.pr_number, branch = excluded.branch, "
                 "updated_at = excluded.updated_at, pr_url = excluded.pr_url, "
-                "settled = 0, merged_at = NULL, delivered_head = NULL, landing = 0",
+                "settled = 0, merged_at = NULL, update_head = NULL",
                 (item_id, pr_number, branch, now, url),
             )
             self._conn.commit()
@@ -961,9 +941,8 @@ class DaemonStore:
             pr_url=str(row["pr_url"] or ""),
             settled=bool(row["settled"]),
             merged_at=row["merged_at"],
-            delivered_head=row["delivered_head"],
             updates=int(row["updates"]),
-            landing=bool(row["landing"]),
+            update_head=row["update_head"],
         )
 
     def merge_watch(self, now: float, min_interval_s: float) -> list[tuple[str, int, str]]:
@@ -1016,27 +995,11 @@ class DaemonStore:
             ).fetchone()
         return int(row["updates"]) if row is not None else 0
 
-    def set_landing(self, item_id: str, landing: bool) -> None:
-        """Mark (or clear) an update-branch in flight.
-
-        While set, a PR head that differs from ``delivered_head`` is the
-        daemon's own update commit rather than a takeover — the one thing
-        that tells those two apart.
-        """
+    def set_update_head(self, item_id: str, sha: str | None) -> None:
+        """Record (or clear) the head an update-branch request was made at."""
         with self._lock:
             self._conn.execute(
-                "UPDATE daemon_pr_state SET landing = ? WHERE item_id = ?",
-                (1 if landing else 0, item_id),
-            )
-            self._conn.commit()
-
-    def set_delivered_head(self, item_id: str, sha: str) -> None:
-        """Record the PR branch head our own delivery produced, as observed
-        on the first poll after it. A later, different head means someone
-        else pushed — the takeover guard's baseline (#412)."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET delivered_head = ? WHERE item_id = ?",
+                "UPDATE daemon_pr_state SET update_head = ? WHERE item_id = ?",
                 (sha, item_id),
             )
             self._conn.commit()

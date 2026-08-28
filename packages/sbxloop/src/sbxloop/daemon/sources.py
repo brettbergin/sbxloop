@@ -321,8 +321,8 @@ class PrSnapshot(NamedTuple):
     merged: bool
     state: str  # open | closed
     # The branch head this poll saw; "" when it could not be read (and for
-    # merged/closed PRs, whose snapshot skips the read). Feeds the takeover
-    # guard (#412).
+    # merged/closed PRs, whose snapshot skips the read). Feeds the landing
+    # stage: the sha an update-branch/merge request is pinned to.
     head_sha: str = ""
     # What the landing stage needs, all of it already in the `pr_get` payload
     # the checks read costs anyway — no extra request.

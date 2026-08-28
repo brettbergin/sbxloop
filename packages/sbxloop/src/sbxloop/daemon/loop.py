@@ -1748,35 +1748,6 @@ class DaemonLoop:
         if snap.state == "closed":
             self._reject_closed(item, now, pr, state.pr_url)
             return
-        # The takeover guard (#412). The first poll after a delivery records
-        # the head that delivery produced; a later head that differs was
-        # pushed by someone else, and a fix round would force-update the
-        # branch over their work — whoever pushes last wins. Hand the PR to
-        # its human instead, out loud.
-        if snap.head_sha:
-            if not state.delivered_head:
-                self.dstore.set_delivered_head(item.item_id, snap.head_sha)
-                state = state._replace(delivered_head=snap.head_sha)
-            elif snap.head_sha != state.delivered_head:
-                if not state.landing:
-                    self._hand_off_taken_over(item, state, now, snap.head_sha)
-                    return
-                # An update-branch the landing stage asked for has landed.
-                # GitHub does not answer that request with the sha it will
-                # produce, so this poll is where we learn it — and because
-                # the request carried `expected_head_sha`, a human who had
-                # pushed first would have made it fail rather than let this
-                # adopt their commit as ours.
-                log.info(
-                    "review.update_branch_landed",
-                    item=item.item_id,
-                    pr=state.pr_number,
-                    was=state.delivered_head,
-                    now=snap.head_sha,
-                )
-                self.dstore.set_delivered_head(item.item_id, snap.head_sha)
-                self.dstore.set_landing(item.item_id, False)
-                state = state._replace(delivered_head=snap.head_sha, landing=False)
         checks, review_state = snap.checks, snap.review
         if checks.state == "pending":
             log.debug("review.waiting", item=item.item_id, pr=pr, on="checks")
@@ -1900,35 +1871,6 @@ class DaemonLoop:
             fate=fate,
         )
         return True
-
-    def _hand_off_taken_over(
-        self, item: WorkItem, state: PrState, now: float, head_sha: str
-    ) -> None:
-        """Someone else pushed to the PR's branch: stop competing for it.
-
-        A fix round delivers by force-updating the branch (the 422 handling
-        that keeps one PR per item), so continuing would silently replace
-        the human's commits (#412, field: PR #406). The item is handed over
-        with the PR left open; re-triggering the source issue opts back in.
-        """
-        self.dstore.mark_failed(
-            item.item_id,
-            f"PR #{state.pr_number} taken over: branch {state.branch} moved to "
-            f"{head_sha[:12]} (not our delivery)",
-            now,
-            requeue=False,
-        )
-        self._notify(
-            f"✋ {item.item_id}: PR #{state.pr_number} has commits the daemon did not "
-            f"deliver on `{state.branch}` — someone has taken it over. Automatic fix "
-            "rounds stopped; the PR is open and theirs. Re-trigger the source issue "
-            "to opt the loop back in.",
-            "review.taken_over",
-            level="error",
-            item=item.item_id,
-            pr=state.pr_number,
-            head=head_sha,
-        )
 
     def _poll_failed(self, item: WorkItem, now: float) -> None:
         """Charge a failed poll a round, and hand the item over at the cap."""
@@ -2059,7 +2001,7 @@ class DaemonLoop:
                 item, state, now, why="the PR conflicts with its base branch", failed=()
             )
             return
-        self._merge(item, state, now, detail=detail)
+        self._merge(item, state, now, head_sha=snap.head_sha, detail=detail)
 
     def _update_branch(self, item: WorkItem, state: PrState, snap: Any, now: float) -> None:
         """Bring a behind PR up to date with its base, once per poll.
@@ -2070,11 +2012,16 @@ class DaemonLoop:
         and the PR is handed over at the cap.
         """
         pr = state.pr_number
-        if state.landing:
-            # One already asked for; the takeover guard above adopts its
-            # commit when it appears.
-            log.debug("land.waiting", item=item.item_id, pr=pr, on="update-branch")
-            return
+        if state.update_head:
+            if snap.head_sha == state.update_head:
+                # The head has not moved since we asked, so either the update
+                # is still in flight or it produced no commit; either way,
+                # asking again would just spend budget on the same request.
+                log.debug("land.waiting", item=item.item_id, pr=pr, on="update-branch")
+                return
+            # The head moved past the sha we asked at: that update is done,
+            # so the row should stop claiming one is outstanding.
+            self.dstore.set_update_head(item.item_id, None)
         budget = self.config.daemon.merge_update_attempts
         if state.updates >= budget:
             self._hand_off_unmergeable(
@@ -2090,19 +2037,18 @@ class DaemonLoop:
             return
         source: Any = self._source_for(item)
         try:
-            accepted = source.pr_update_branch(pr, expected_head_sha=state.delivered_head or "")
+            accepted = source.pr_update_branch(pr, expected_head_sha=snap.head_sha or "")
         except Exception:
             log.warning("land.update_branch_failed", item=item.item_id, pr=pr, exc_info=True)
             self._poll_failed(item, now)
             return
         if not accepted:
             # GitHub refused the update — most often because the head moved
-            # under us. Nothing to record: the next poll re-reads the PR and
-            # the takeover guard decides what that head means.
+            # under us. Nothing to record: the next poll re-reads the PR.
             log.info("land.update_branch_refused", item=item.item_id, pr=pr)
             return
         spent = self.dstore.bump_pr_update(item.item_id)
-        self.dstore.set_landing(item.item_id, True)
+        self.dstore.set_update_head(item.item_id, snap.head_sha or None)
         self._notify(
             f"⬆ {item.item_id}: PR #{pr} was behind its base — updating the branch "
             f"({spent}/{budget}); its checks will re-run",
@@ -2113,23 +2059,22 @@ class DaemonLoop:
             budget=budget,
         )
 
-    def _merge(self, item: WorkItem, state: PrState, now: float, *, detail: str) -> None:
+    def _merge(
+        self, item: WorkItem, state: PrState, now: float, *, head_sha: str, detail: str
+    ) -> None:
         """Merge the PR, and settle the item on what GitHub answers."""
         daemon = self.config.daemon
         pr = state.pr_number
         source: Any = self._source_for(item)
         try:
-            outcome = source.pr_merge(
-                pr, method=daemon.merge_method, sha=state.delivered_head or ""
-            )
+            outcome = source.pr_merge(pr, method=daemon.merge_method, sha=head_sha or "")
         except Exception:
             log.warning("land.merge_failed", item=item.item_id, pr=pr, exc_info=True)
             self._poll_failed(item, now)
             return
         if outcome.stale:
             # The head moved between the poll that judged this PR and the
-            # merge. The next poll judges the new head; the takeover guard
-            # decides whether it is ours at all.
+            # merge. The next poll judges the new head.
             log.info("land.merge_stale", item=item.item_id, pr=pr, detail=outcome.reason)
             return
         if outcome.blocked:
