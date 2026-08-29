@@ -59,6 +59,7 @@ from sbxloop.errors import (
     WorkerTimeoutError,
 )
 from sbxloop.events import EventBus
+from sbxloop.ghids import issue_item_id, normalize_item_id
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger, log_buffer
 from sbxloop.worker.client import WorkerClient
@@ -526,7 +527,7 @@ class Concierge:
                 HostToolSpec(
                     name="item_detail",
                     description=(
-                        "One work item (ids look like gh:12): state, attempts, last error, "
+                        "One work item (ids look like gh:issue:12): state, attempts, last error, "
                         "who asked for it, its runs and the latest run's thread."
                     ),
                     parameters=_schema({"item_id": {"type": "string"}}, ["item_id"]),
@@ -799,6 +800,7 @@ class Concierge:
         lines = []
         for run in runs[:limit]:
             item_id = self.dstore.item_for_run(run.run_id)
+            item_id = normalize_item_id(item_id) if item_id else item_id
             item = self.dstore.get(item_id) if item_id else None
             title = _one_line(item.title if item else run.outcome, 80)
             lines.append(
@@ -819,6 +821,7 @@ class Concierge:
         tasks = self.store.get_tasks(run_id)
         report = self.loop.report_for(run_id)
         item_id = self.dstore.item_for_run(run_id)
+        item_id = normalize_item_id(item_id) if item_id else item_id
         item = self.dstore.get(item_id) if item_id else None
         thread = self.dstore.discord_thread(run_id)
         lines = [
@@ -855,7 +858,7 @@ class Concierge:
         return "\n".join(lines)
 
     def _tool_watch_run(self, args: dict[str, Any], by: str) -> str:
-        ident = str(args.get("run_id_or_item_id", "")).strip()
+        ident = normalize_item_id(str(args.get("run_id_or_item_id", "")).strip())
         if not ident:
             return "run_id_or_item_id is required"
         run = None
@@ -918,10 +921,10 @@ class Concierge:
         return head + "\n".join(lines)
 
     def _tool_item_detail(self, args: dict[str, Any], by: str) -> str:
-        item_id = str(args.get("item_id", "")).strip()
+        item_id = normalize_item_id(str(args.get("item_id", "")).strip())
         item = self.dstore.get(item_id) if item_id else None
         if item is None:
-            return f"no work item {item_id!r} (ids look like gh:12)"
+            return f"no work item {item_id!r} (ids look like gh:issue:12)"
         runs = self.dstore.runs_for_item(item_id)
         lines = [
             f"{item.item_id}: state {item.state} · attempts {item.attempts}",
@@ -1349,7 +1352,7 @@ class Concierge:
             was = str(data.get("state_reason") or "no reason recorded")
             return f'#{number} "{title}" is already closed ({was}) — nothing to do. {url}'
         labels = _label_names(data)
-        item = self.dstore.get(f"gh:{number}")
+        item = self.dstore.get(issue_item_id(int(number)))
         running = item is not None and item.state == "running"
         if daemon.in_progress_label in labels or running:
             run = f" (run `{item.run_id}`)" if item is not None and item.run_id else ""
@@ -1640,7 +1643,7 @@ def _status_detail(status: dict[str, Any]) -> str:
     current = status.get("current") or {}
     bits: list[str] = []
     if current.get("item_id"):
-        bits.append(f"current work item: {current['item_id']}")
+        bits.append(f"current work item: {normalize_item_id(str(current['item_id']))}")
     bits.append(f"consecutive failures: {status.get('consecutive_failures', 0)}")
     if status.get("stopping"):
         bits.append("the daemon is shutting down")

@@ -6,6 +6,28 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **GitHub work-item ids are typed: `gh:issue:1234`, `gh:pr:1234`** (#508).
+  The old `gh:1234` said nothing about what it pointed at, and a run carries
+  an issue number *and* a PR number side by side in chat, issue comments,
+  Discord threads and logs — readers had to guess. A new `sbxloop.ghids`
+  module owns the whole grammar (`format_gh_id`/`issue_item_id`/`pr_item_id`
+  to render, `parse_gh_id`/`try_parse_gh_id`/`normalize_item_id` to read) and
+  nothing else slices `gh:` strings by hand. Rendering is strict — every id
+  produced now carries its kind — and parsing is lenient: a bare `gh:<n>`
+  read from an old checkpoint, an old watch or typed by an operator is
+  accepted as the issue it always meant and normalised on the way in.
+  Adopted at every construction site (GitHub source discovery, the work item
+  model, the concierge's issue lookups), every lookup in the daemon store
+  (which also resolves legacy rows under either spelling, so no state
+  migration is required), the operator verbs (`items`, `queue`, `abandon`,
+  `retry`, `requeue` — both spellings in, typed out), the concierge tools
+  and their descriptions, Discord headline cards, thread names and control
+  replies, the GitHub comments and PR text a run writes back, and the
+  daemon's log/event fields. README, the architecture doc and the concierge
+  prompt lost their `gh:12`-style examples.
+
 ### Fixed
 
 - **The verify-suspect signal no longer collides distinct failures, over-reaches

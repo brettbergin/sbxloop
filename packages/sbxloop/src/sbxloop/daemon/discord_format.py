@@ -49,6 +49,7 @@ from sbxloop.excerpt import (
     TOOL_OUTPUT_LINES_DEFAULT,
     excerpt_output_lines,
 )
+from sbxloop.ghids import normalize_item_id
 from sbxloop.log import redact_text
 
 # Discord's hard cap per message; _clip never returns more than this even
@@ -1419,12 +1420,20 @@ def _origin(item: WorkItem) -> tuple[str, str]:
     return f"issue #{item.source_key}", "github"
 
 
+def _item_code(item: WorkItem) -> str:
+    """The item's canonical typed id, ready to paste back as a command."""
+    return code(normalize_item_id(item.item_id))
+
+
 def headline_text(item: WorkItem, run_id: str, state: str | None = None) -> str:
     """The headline's content= text (notification preview / embed fallback)."""
     origin, _ = _origin(item)
     origin = link(origin, item.url) if item.url else origin
     marker = STATE_MARKER.get(state or "", "▶")
-    return f"{marker} run {code(run_id)} — **{_one_line(item.title, 120)}** · {origin}"
+    return (
+        f"{marker} run {code(run_id)} — **{_one_line(item.title, 120)}** · "
+        f"{_item_code(item)} · {origin}"
+    )
 
 
 def headline_embed(
@@ -1441,6 +1450,7 @@ def headline_embed(
     origin, _kind = _origin(item)
     fields: list[tuple[str, str, bool]] = [
         ("Source", link(origin, item.url) if item.url else origin, True),
+        ("Item", _item_code(item), True),
         ("Run", code(run_id), True),
         ("State", state or "running", True),
     ]
@@ -1478,7 +1488,7 @@ def _cancel_note(item_id: str | None, report: RunReport) -> str:
         return note + " — re-queued; a fresh run starts on the next tick"
     note += f" — {code(f'sbxloop resume {report.run_id}')} continues the run"
     if item_id:
-        note += f"; `!sbx retry {item_id}` reruns it fresh"
+        note += f"; `!sbx retry {normalize_item_id(item_id)}` reruns it fresh"
     return note
 
 
@@ -1782,7 +1792,7 @@ def queue_lines(items: list[WorkItem], limit: int = 15) -> str:
     if not items:
         return "queue is empty."
     rows = [
-        f"• {code(i.item_id)} "
+        f"• {_item_code(i)} "
         + (link(_one_line(i.title, 80), i.url) if i.url else _one_line(i.title, 80))
         for i in items[:limit]
     ]
@@ -1808,7 +1818,7 @@ def items_lines(items: list[WorkItem], limit: int = 20) -> str:
         return "no work items."
     rows = []
     for i in items[:limit]:
-        row = f"{ITEM_STATE_MARKER.get(i.state, '•')} {code(i.item_id)} {i.state} · "
+        row = f"{ITEM_STATE_MARKER.get(i.state, '•')} {_item_code(i)} {i.state} · "
         row += link(_one_line(i.title, 60), i.url) if i.url else _one_line(i.title, 60)
         row += f" · attempts {i.attempts}"
         if i.run_id:

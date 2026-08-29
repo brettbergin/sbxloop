@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from sbxloop.daemon.discord_format import code, items_lines, queue_lines
+from sbxloop.ghids import normalize_item_id
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -199,14 +200,16 @@ def _dispatch(
 
 def _item_command(loop: Any, word: str, args: list[str], by: str | None) -> CommandReply:
     """``abandon|retry|requeue <item_id> [reason…]``. Item ids are the
-    daemon's own (``gh:12``, ``inbox:x.md``); the store rejects bad
+    daemon's own (``gh:issue:12``, ``inbox:x.md``); the legacy bare
+    ``gh:12`` spelling is normalised to the typed form before the lookup, so
+    both work and only the typed id is echoed back. The store rejects bad
     transitions with a message worth showing verbatim. A retry is
     attributed to the operator on the source."""
     if not args:
         return CommandReply(
             f"usage: {word} <item_id>" + (" [reason]" if word == "abandon" else ""), ok=False
         )
-    item_id = args[0]
+    item_id = normalize_item_id(args[0])
     try:
         if word == "abandon":
             item = loop.abandon_item(item_id, " ".join(args[1:]) or None)

@@ -69,10 +69,10 @@ class TestConfigure:
     def test_console_renders_event_and_fields(self, restore_logging: None) -> None:
         stream = io.StringIO()
         configure_logging("INFO", stream=stream)
-        get_logger("sbxloop.test").info("run.dispatch", item="gh:12", run="r1")
+        get_logger("sbxloop.test").info("run.dispatch", item="gh:issue:12", run="r1")
         line = stream.getvalue()
         assert "run.dispatch" in line
-        assert "item=gh:12" in line
+        assert "item=gh:issue:12" in line
         assert "run=r1" in line
         assert "[sbxloop.test]" in line
 
@@ -97,13 +97,13 @@ class TestConfigure:
     def test_json_renders_one_object_per_line(self, restore_logging: None) -> None:
         stream = io.StringIO()
         configure_logging("INFO", fmt="json", stream=stream)
-        get_logger("sbxloop.test").info("run.dispatch", item="gh:12")
+        get_logger("sbxloop.test").info("run.dispatch", item="gh:issue:12")
         get_logger("sbxloop.test").warning("run.failed", reason="boom")
         lines = stream.getvalue().strip().splitlines()
         assert len(lines) == 2
         first, second = (json.loads(line) for line in lines)
         assert first["event"] == "run.dispatch"
-        assert first["item"] == "gh:12"
+        assert first["item"] == "gh:issue:12"
         assert first["level"] == "info"
         assert second["level"] == "warning"
         assert "timestamp" in first
@@ -139,14 +139,14 @@ class TestRedaction:
             "api_key": "k",
             "authorization": "Bearer y",
             "tokens": 12,  # a count, not a credential
-            "item": "gh:1",
+            "item": "gh:issue:1",
         }
         out = redact_secrets(None, "info", event)
         assert out["github_token"] == REDACTED
         assert out["api_key"] == REDACTED
         assert out["authorization"] == REDACTED
         assert out["tokens"] == 12
-        assert out["item"] == "gh:1"
+        assert out["item"] == "gh:issue:1"
 
     def test_masks_end_to_end(self, restore_logging: None) -> None:
         stream = io.StringIO()
@@ -161,13 +161,33 @@ class TestContext:
         stream = io.StringIO()
         configure_logging("INFO", stream=stream)
         log = get_logger("sbxloop.test")
-        bind_run("r1", "gh:12", source="github")
+        bind_run("r1", "gh:issue:12", source="github")
         log.info("first")
         clear_run()
         log.info("second")
         first, second = stream.getvalue().strip().splitlines()
-        assert "run=r1" in first and "item=gh:12" in first and "source=github" in first
+        assert "run=r1" in first and "item=gh:issue:12" in first and "source=github" in first
         assert "run=r1" not in second
+
+    def test_bind_run_normalizes_legacy_item_id(self, restore_logging: None) -> None:
+        """#508: a legacy `gh:<n>` id read from an old checkpoint must be
+        logged in the typed form — the boundary canonicalises."""
+        stream = io.StringIO()
+        configure_logging("INFO", stream=stream)
+        bind_run("r1", "gh:12")
+        get_logger("sbxloop.test").info("run.dispatch")
+        clear_run()
+        line = stream.getvalue()
+        assert "item=gh:issue:12" in line
+        assert "item=gh:12 " not in line
+
+    def test_bind_run_leaves_non_github_item_ids_alone(self, restore_logging: None) -> None:
+        stream = io.StringIO()
+        configure_logging("INFO", stream=stream)
+        bind_run("r1", "inbox:todo.md")
+        get_logger("sbxloop.test").info("run.dispatch")
+        clear_run()
+        assert "item=inbox:todo.md" in stream.getvalue()
 
     def test_bind_run_does_not_cross_threads(self, restore_logging: None) -> None:
         import threading

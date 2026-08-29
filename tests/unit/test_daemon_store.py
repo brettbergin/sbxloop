@@ -30,31 +30,31 @@ class TestUpsert:
         store = DaemonStore(tmp_path / "state.db")
         assert store.upsert_new(item(), now=100.0) is True
         assert store.upsert_new(item(), now=101.0) is False
-        got = store.get("gh:7")
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "queued" and got.created_at == 100.0
 
     def test_finished_row_superseded_only_when_content_changed(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_done("gh:7", now=2.0)
+        store.mark_done("gh:issue:7", now=2.0)
         # identical re-discovery of a done item is NOT new work
         assert store.upsert_new(item(), now=3.0) is False
         # edited content is
         assert store.upsert_new(item(body="do MORE things"), now=4.0) is True
-        got = store.get("gh:7")
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "queued" and got.body == "do MORE things"
 
     def test_blocked_row_is_terminal_for_dedup(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_blocked("gh:7", "405", now=2.0)
+        store.mark_blocked("gh:issue:7", "405", now=2.0)
         assert store.upsert_new(item(), now=3.0) is False
         assert store.upsert_new(item(body="edited"), now=4.0) is True
 
     def test_running_row_never_superseded(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
         assert store.upsert_new(item(body="changed"), now=3.0) is False
 
     def test_requester_recorded_by_the_concierge_lands_on_the_item(self, tmp_path: Path) -> None:
@@ -64,16 +64,16 @@ class TestUpsert:
         store = DaemonStore(tmp_path / "state.db")
         store.note_requester("7", "1234567890", now=0.5)
         store.upsert_new(item(), now=1.0)
-        got = store.get("gh:7")
+        got = store.get("gh:issue:7")
         assert got is not None and got.requested_by == "1234567890"
         # An item the source already attributed keeps its own attribution.
         store.note_requester("8", "999", now=0.5)
         store.upsert_new(item("8", requested_by="111"), now=1.0)
-        assert store.get("gh:8").requested_by == "111"  # type: ignore[union-attr]
-        assert store.get("gh:7").requested_by == "1234567890"  # type: ignore[union-attr]
+        assert store.get("gh:issue:8").requested_by == "111"  # type: ignore[union-attr]
+        assert store.get("gh:issue:7").requested_by == "1234567890"  # type: ignore[union-attr]
         # Nothing recorded → nothing attributed.
         store.upsert_new(item("9"), now=1.0)
-        assert store.get("gh:9").requested_by is None  # type: ignore[union-attr]
+        assert store.get("gh:issue:9").requested_by is None  # type: ignore[union-attr]
 
 
 class TestQueueAndAttempts:
@@ -81,15 +81,15 @@ class TestQueueAndAttempts:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item("1"), now=10.0)
         store.upsert_new(item("2"), now=20.0)
-        assert store.next_queued(now=30.0, backoff_s=100.0).item_id == "gh:1"  # type: ignore[union-attr]
+        assert store.next_queued(now=30.0, backoff_s=100.0).item_id == "gh:issue:1"  # type: ignore[union-attr]
         # item 1 fails once at t=40 → eligible again at 40 + 1*100
-        store.mark_running("gh:1", "r1", now=35.0)
-        store.mark_failed("gh:1", "boom", now=40.0, requeue=True)
-        assert store.next_queued(now=50.0, backoff_s=100.0).item_id == "gh:2"  # type: ignore[union-attr]
-        store.mark_running("gh:2", "r2", now=55.0)
-        store.mark_done("gh:2", now=60.0)
+        store.mark_running("gh:issue:1", "r1", now=35.0)
+        store.mark_failed("gh:issue:1", "boom", now=40.0, requeue=True)
+        assert store.next_queued(now=50.0, backoff_s=100.0).item_id == "gh:issue:2"  # type: ignore[union-attr]
+        store.mark_running("gh:issue:2", "r2", now=55.0)
+        store.mark_done("gh:issue:2", now=60.0)
         assert store.next_queued(now=100.0, backoff_s=100.0) is None
-        assert store.next_queued(now=140.0, backoff_s=100.0).item_id == "gh:1"  # type: ignore[union-attr]
+        assert store.next_queued(now=140.0, backoff_s=100.0).item_id == "gh:issue:1"  # type: ignore[union-attr]
 
     def test_same_created_at_dispatches_in_insertion_order(self, tmp_path: Path) -> None:
         """A batch upserted with one `now` must still be FIFO: rowid breaks
@@ -112,14 +112,14 @@ class TestQueueAndAttempts:
     def test_attempt_counting_requeue_vs_failed(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        got = store.get("gh:7")
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        got = store.get("gh:issue:7")
         assert got is not None and got.attempts == 1 and got.run_id == "r1"
-        store.mark_failed("gh:7", "err1", now=3.0, requeue=True)
-        assert store.get("gh:7").state == "queued"  # type: ignore[union-attr]
-        store.mark_running("gh:7", "r2", now=4.0)
-        store.mark_failed("gh:7", "err2", now=5.0, requeue=False)
-        got = store.get("gh:7")
+        store.mark_failed("gh:issue:7", "err1", now=3.0, requeue=True)
+        assert store.get("gh:issue:7").state == "queued"  # type: ignore[union-attr]
+        store.mark_running("gh:issue:7", "r2", now=4.0)
+        store.mark_failed("gh:issue:7", "err2", now=5.0, requeue=False)
+        got = store.get("gh:issue:7")
         assert got is not None
         assert got.state == "failed" and got.attempts == 2 and got.last_error == "err2"
 
@@ -128,16 +128,16 @@ class TestQueueAndAttempts:
     ) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        store.mark_cancelled("gh:7", "cancelled by op", now=3.0)
-        got = store.get("gh:7")
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_cancelled("gh:issue:7", "cancelled by op", now=3.0)
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "cancelled" and got.last_error == "cancelled by op"
         assert store.next_queued(now=1e9, backoff_s=1) is None  # never auto-retried
         assert store.upsert_new(item(), now=4.0) is False  # re-discovery dedups like done
         with pytest.raises(ValueError, match="use retry"):
-            store.requeue("gh:7", now=5.0)  # requeue is for running/queued items
-        store.retry("gh:7", now=5.0, reason="re-queued by op")
-        got = store.get("gh:7")
+            store.requeue("gh:issue:7", now=5.0)  # requeue is for running/queued items
+        store.retry("gh:issue:7", now=5.0, reason="re-queued by op")
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "queued" and got.attempts == 0
         assert got.last_error == "re-queued by op"
         # Cancel keeps the run for `sbxloop resume`; a re-queue runs fresh, so
@@ -149,28 +149,28 @@ class TestQueueAndAttempts:
     def test_blocked_is_terminal_until_a_human_retries(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        store.mark_blocked("gh:7", "GitHub refused the merge", now=3.0)
-        got = store.get("gh:7")
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_blocked("gh:issue:7", "GitHub refused the merge", now=3.0)
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "blocked" and got.run_id == "r1"
         assert got.last_error == "GitHub refused the merge"
         assert got.pending_report == "blocked"  # the source is owed the label
         assert store.next_queued(now=1e9, backoff_s=1) is None
-        assert [i.item_id for i in store.items(["blocked"])] == ["gh:7"]
+        assert [i.item_id for i in store.items(["blocked"])] == ["gh:issue:7"]
         with pytest.raises(ValueError, match="use retry"):
-            store.requeue("gh:7", now=4.0)
-        got = store.retry("gh:7", now=5.0)
+            store.requeue("gh:issue:7", now=4.0)
+        got = store.retry("gh:issue:7", now=5.0)
         assert got.state == "queued" and got.attempts == 0 and got.run_id is None
         assert got.pending_report == "requeued"
 
     def test_running_items_and_unstarted_requeue(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_claimed("gh:7", now=1.5)
-        store.mark_running("gh:7", "r1", now=2.0)
-        assert [i.item_id for i in store.running_items()] == ["gh:7"]
-        store.mark_requeued_unstarted("gh:7", now=3.0)
-        got = store.get("gh:7")
+        store.mark_claimed("gh:issue:7", now=1.5)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        assert [i.item_id for i in store.running_items()] == ["gh:issue:7"]
+        store.mark_requeued_unstarted("gh:issue:7", now=3.0)
+        got = store.get("gh:issue:7")
         assert got is not None
         assert got.state == "queued" and got.claimed is True and got.run_id is None
 
@@ -180,40 +180,40 @@ class TestResumeAndBreaker:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item("1"), now=1.0)
         store.upsert_new(item("2"), now=2.0)
-        store.mark_claimed("gh:2", now=2.0)
-        store.mark_running("gh:2", "r2", now=3.0)  # attempts -> 1
-        store.mark_resume_pending("gh:2", now=4.0)
-        # gh:1 is older and has no backoff, but the interrupted run is
-        # in-flight work and goes first — regardless of gh:2's backoff.
+        store.mark_claimed("gh:issue:2", now=2.0)
+        store.mark_running("gh:issue:2", "r2", now=3.0)  # attempts -> 1
+        store.mark_resume_pending("gh:issue:2", now=4.0)
+        # gh:issue:1 is older and has no backoff, but the interrupted run is
+        # in-flight work and goes first — regardless of gh:issue:2's backoff.
         got = store.next_queued(now=4.0, backoff_s=900.0)
-        assert got is not None and got.item_id == "gh:2" and got.run_id == "r2"
+        assert got is not None and got.item_id == "gh:issue:2" and got.run_id == "r2"
 
     def test_mark_resuming_records_resume_and_keeps_attempts(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_claimed("gh:7", now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        store.mark_resume_pending("gh:7", now=3.0)
-        store.mark_resuming("gh:7", "r1", now=4.0)
-        got = store.get("gh:7")
+        store.mark_claimed("gh:issue:7", now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_resume_pending("gh:issue:7", now=3.0)
+        store.mark_resuming("gh:issue:7", "r1", now=4.0)
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "running" and got.attempts == 1
-        assert store.resumes_for_item("gh:7") == 1
+        assert store.resumes_for_item("gh:issue:7") == 1
         assert store.resumes_since(3.5) == 1 and store.resumes_since(4.5) == 0
         # The daily cap counts fresh starts AND resumes.
         assert store.runs_started_since(0) == 2
         with pytest.raises(KeyError):
-            store.mark_resuming("gh:7", "other-run", now=5.0)
+            store.mark_resuming("gh:issue:7", "other-run", now=5.0)
 
     def test_requeue_after_failure_unpins_the_run(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        store.mark_failed("gh:7", "boom", now=3.0, requeue=True)
-        got = store.get("gh:7")
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_failed("gh:issue:7", "boom", now=3.0, requeue=True)
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "queued" and got.run_id is None
-        store.mark_running("gh:7", "r2", now=4.0)
-        store.mark_failed("gh:7", "boom", now=5.0, requeue=False)
-        assert store.get("gh:7").run_id == "r2"  # type: ignore[union-attr]
+        store.mark_running("gh:issue:7", "r2", now=4.0)
+        store.mark_failed("gh:issue:7", "boom", now=5.0, requeue=False)
+        assert store.get("gh:issue:7").run_id == "r2"  # type: ignore[union-attr]
 
     def test_breaker_roundtrip(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -252,10 +252,10 @@ class TestLedgerAndThreads:
     def test_item_for_run_and_runs_for_item(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item("5"), now=1.0)
-        store.mark_running("gh:5", "r5", now=2.0)
-        assert store.item_for_run("r5") == "gh:5"
+        store.mark_running("gh:issue:5", "r5", now=2.0)
+        assert store.item_for_run("r5") == "gh:issue:5"
         assert store.item_for_run("r-unknown") is None
-        assert store.runs_for_item("gh:5") == ["r5"]
+        assert store.runs_for_item("gh:issue:5") == ["r5"]
 
     def test_discord_thread_map_roundtrip(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -273,9 +273,9 @@ class TestLedgerAndThreads:
         daemon_store = DaemonStore(db)
         engine_store.create_run("r1", "outcome")
         daemon_store.upsert_new(item(), now=1.0)
-        daemon_store.mark_running("gh:7", "r1", now=2.0)
+        daemon_store.mark_running("gh:issue:7", "r1", now=2.0)
         assert engine_store.get_run("r1").outcome == "outcome"
-        assert daemon_store.get("gh:7").run_id == "r1"  # type: ignore[union-attr]
+        assert daemon_store.get("gh:issue:7").run_id == "r1"  # type: ignore[union-attr]
         engine_store.close()
         daemon_store.close()
 
@@ -302,28 +302,28 @@ class TestOperatorControls:
     def test_abandon_keeps_run_id_and_records_reason(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        got = store.abandon("gh:7", "spiraling plan", now=3.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        got = store.abandon("gh:issue:7", "spiraling plan", now=3.0)
         assert got.state == "failed" and got.run_id == "r1"
         assert got.last_error == "spiraling plan"
         with pytest.raises(ValueError, match="already failed"):
-            store.abandon("gh:7", "again", now=4.0)
+            store.abandon("gh:issue:7", "again", now=4.0)
         with pytest.raises(KeyError):
-            store.abandon("gh:404", "x", now=4.0)
+            store.abandon("gh:issue:404", "x", now=4.0)
 
     def test_abandon_of_a_blocked_item_is_allowed(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_blocked("gh:7", "405", now=2.0)
-        got = store.abandon("gh:7", "not worth it", now=3.0)
+        store.mark_blocked("gh:issue:7", "405", now=2.0)
+        got = store.abandon("gh:issue:7", "not worth it", now=3.0)
         assert got.state == "failed" and got.pending_report == "abandoned"
 
     def test_retry_resets_attempts_and_unpins_run(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        store.mark_failed("gh:7", "boom", now=3.0, requeue=False)
-        got = store.retry("gh:7", now=4.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_failed("gh:issue:7", "boom", now=3.0, requeue=False)
+        got = store.retry("gh:issue:7", now=4.0)
         assert (got.state, got.attempts, got.run_id, got.last_error) == ("queued", 0, None, None)
         assert got.claimed is False  # untouched: whatever the source-side claim was stays
         # eligible immediately (no backoff): attempts are zero
@@ -332,33 +332,36 @@ class TestOperatorControls:
     def test_retry_refuses_running_and_done(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
         with pytest.raises(ValueError, match="abandon it first"):
-            store.retry("gh:7", now=3.0)
-        store.mark_done("gh:7", now=3.0)
+            store.retry("gh:issue:7", now=3.0)
+        store.mark_done("gh:issue:7", now=3.0)
         with pytest.raises(ValueError, match="is done"):
-            store.retry("gh:7", now=4.0)
+            store.retry("gh:issue:7", now=4.0)
 
     def test_requeue_keeps_attempts_but_clears_run(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        got = store.requeue("gh:7", now=3.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        got = store.requeue("gh:issue:7", now=3.0)
         assert (got.state, got.attempts, got.run_id) == ("queued", 1, None)
         assert store.running_items() == []
-        store.mark_failed("gh:7", "x", now=4.0, requeue=False)
+        store.mark_failed("gh:issue:7", "x", now=4.0, requeue=False)
         with pytest.raises(ValueError, match="use retry"):
-            store.requeue("gh:7", now=5.0)
+            store.requeue("gh:issue:7", now=5.0)
 
     def test_items_lists_all_or_filtered(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item("1"), now=1.0)
         store.upsert_new(item("2"), now=2.0)
-        store.mark_running("gh:2", "r2", now=3.0)
-        store.mark_failed("gh:2", "boom", now=4.0, requeue=False)
-        assert [i.item_id for i in store.items()] == ["gh:1", "gh:2"]
-        assert [i.item_id for i in store.items(["failed"])] == ["gh:2"]
-        assert [i.item_id for i in store.items(["queued", "failed"])] == ["gh:1", "gh:2"]
+        store.mark_running("gh:issue:2", "r2", now=3.0)
+        store.mark_failed("gh:issue:2", "boom", now=4.0, requeue=False)
+        assert [i.item_id for i in store.items()] == ["gh:issue:1", "gh:issue:2"]
+        assert [i.item_id for i in store.items(["failed"])] == ["gh:issue:2"]
+        assert [i.item_id for i in store.items(["queued", "failed"])] == [
+            "gh:issue:1",
+            "gh:issue:2",
+        ]
         assert store.items(["done"]) == []
 
     def test_transitions_are_conditional_against_a_concurrent_settle(self, tmp_path: Path) -> None:
@@ -370,17 +373,17 @@ class TestOperatorControls:
         store = DaemonStore(tmp_path / "state.db")
         other = DaemonStore(tmp_path / "state.db")  # the daemon's connection
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        stale = store.get("gh:7")
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        stale = store.get("gh:issue:7")
         assert stale is not None and stale.state == "running"  # what the CLI saw
-        other.mark_done("gh:7", now=3.0)  # the daemon settles it meanwhile
+        other.mark_done("gh:issue:7", now=3.0)  # the daemon settles it meanwhile
         with pytest.raises(ValueError, match="already done"):
-            store.abandon("gh:7", "stale", now=4.0)
+            store.abandon("gh:issue:7", "stale", now=4.0)
         with pytest.raises(ValueError, match="is done"):
-            store.requeue("gh:7", now=4.0)
+            store.requeue("gh:issue:7", now=4.0)
         with pytest.raises(ValueError, match="is done"):
-            store.retry("gh:7", now=4.0)
-        assert other.get("gh:7").state == "done"  # type: ignore[union-attr]
+            store.retry("gh:issue:7", now=4.0)
+        assert other.get("gh:issue:7").state == "done"  # type: ignore[union-attr]
         other.close()
 
     def test_abandon_and_retry_owe_the_source_a_report(self, tmp_path: Path) -> None:
@@ -389,34 +392,34 @@ class TestOperatorControls:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
         assert store.pending_reports() == []
-        assert store.abandon("gh:7", "nope", now=2.0).pending_report == "abandoned"
-        assert [i.item_id for i in store.pending_reports()] == ["gh:7"]
-        assert store.take_pending_report("gh:7") is True
-        assert store.take_pending_report("gh:7") is False  # paid: exactly once
+        assert store.abandon("gh:issue:7", "nope", now=2.0).pending_report == "abandoned"
+        assert [i.item_id for i in store.pending_reports()] == ["gh:issue:7"]
+        assert store.take_pending_report("gh:issue:7") is True
+        assert store.take_pending_report("gh:issue:7") is False  # paid: exactly once
         assert store.pending_reports() == []
-        assert store.retry("gh:7", now=3.0).pending_report == "requeued"
-        assert store.get("gh:7").updated_at == 3.0  # type: ignore[union-attr]
-        store.take_pending_report("gh:7")
+        assert store.retry("gh:issue:7", now=3.0).pending_report == "requeued"
+        assert store.get("gh:issue:7").updated_at == 3.0  # type: ignore[union-attr]
+        store.take_pending_report("gh:issue:7")
         # delivery is not an item change: the backoff clock does not move
-        assert store.get("gh:7").updated_at == 3.0  # type: ignore[union-attr]
+        assert store.get("gh:issue:7").updated_at == 3.0  # type: ignore[union-attr]
         # requeue (unpin) tells the source nothing
-        store.mark_running("gh:7", "r1", now=4.0)
-        assert store.requeue("gh:7", now=5.0).pending_report is None
+        store.mark_running("gh:issue:7", "r1", now=4.0)
+        assert store.requeue("gh:issue:7", now=5.0).pending_report is None
 
     def test_a_merged_run_owes_the_close_until_it_lands(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_running("gh:7", "r1", now=2.0)
-        store.mark_done("gh:7", now=3.0, pending_report="merged")
-        got = store.get("gh:7")
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_done("gh:issue:7", now=3.0, pending_report="merged")
+        got = store.get("gh:issue:7")
         assert got is not None and got.state == "done" and got.pending_report == "merged"
-        assert [i.item_id for i in store.pending_reports()] == ["gh:7"]
-        assert store.take_pending_report("gh:7") is True
-        assert store.get("gh:7").pending_report is None  # type: ignore[union-attr]
+        assert [i.item_id for i in store.pending_reports()] == ["gh:issue:7"]
+        assert store.take_pending_report("gh:issue:7") is True
+        assert store.get("gh:issue:7").pending_report is None  # type: ignore[union-attr]
         # plain mark_done owes nothing
         store.upsert_new(item("8"), now=1.0)
-        store.mark_done("gh:8", now=2.0)
-        assert store.get("gh:8").pending_report is None  # type: ignore[union-attr]
+        store.mark_done("gh:issue:8", now=2.0)
+        assert store.get("gh:issue:8").pending_report is None  # type: ignore[union-attr]
 
 
 class TestArchiveLegacy:
@@ -434,7 +437,7 @@ class TestArchiveLegacy:
                 );
                 CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE daemon_pr_state (item_id TEXT PRIMARY KEY);
-                INSERT INTO daemon_work_items VALUES ('gh:1','github','1','patch','x','done');
+                INSERT INTO daemon_work_items VALUES ('gh:issue:1','github','1','patch','x','done');
                 """
             )
         # WAL/SHM sidecars travel with the file.
@@ -452,7 +455,7 @@ class TestArchiveLegacy:
         assert not path.with_name("state.db-wal").exists()
         # A fresh store then opens clean, at the current schema.
         store = DaemonStore(path)
-        assert store.get("gh:1") is None
+        assert store.get("gh:issue:1") is None
         assert store.get_value("schema_version") == SCHEMA_VERSION
         # …and the archive is left alone on the next start.
         assert DaemonStore.archive_legacy(path) is None
@@ -485,3 +488,67 @@ class TestArchiveLegacy:
         with pytest.raises(DaemonError, match=r"pre-1\.0"):
             DaemonStore(path)
         assert path.exists()  # nothing was moved by the refusal
+
+
+class TestLegacyItemIds:
+    """A store written before the typed-id migration keeps resolving."""
+
+    @staticmethod
+    def _write_legacy_row(path: Path, item_id: str = "gh:1234") -> None:
+        """Insert a row exactly as the pre-migration daemon wrote it."""
+        store = DaemonStore(path)
+        store.close()
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
+            "attempts, claimed, run_id, last_error, created_at, updated_at) "
+            "VALUES (?, '1234', 'legacy', '', '', 'queued', 0, 0, NULL, NULL, 1.0, 1.0)",
+            (item_id,),
+        )
+        conn.execute(
+            "INSERT INTO daemon_runs (run_id, item_id, started_at) VALUES ('r9', ?, 1.0)",
+            (item_id,),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_legacy_row_resolves_under_both_forms(self, tmp_path: Path) -> None:
+        db = tmp_path / "state.db"
+        self._write_legacy_row(db)
+        store = DaemonStore(db)
+        for lookup in ("gh:1234", "gh:issue:1234"):
+            got = store.get(lookup)
+            assert got is not None, lookup
+            # loaded rows surface in the typed form regardless of storage
+            assert got.item_id == "gh:issue:1234"
+        assert [i.item_id for i in store.items()] == ["gh:issue:1234"]
+        assert [i.item_id for i in store.queued()] == ["gh:issue:1234"]
+
+    def test_legacy_row_transitions_under_the_typed_form(self, tmp_path: Path) -> None:
+        db = tmp_path / "state.db"
+        self._write_legacy_row(db)
+        store = DaemonStore(db)
+        store.mark_running("gh:issue:1234", "r1", now=2.0)
+        got = store.get("gh:1234")
+        assert got is not None and got.state == "running" and got.run_id == "r1"
+        assert store.abandon("gh:issue:1234", "nope", now=3.0).state == "failed"
+        assert store.take_pending_report("gh:1234") is True
+        assert store.retry("gh:1234", now=4.0).state == "queued"
+
+    def test_legacy_ledger_rows_resolve_and_normalise(self, tmp_path: Path) -> None:
+        db = tmp_path / "state.db"
+        self._write_legacy_row(db)
+        store = DaemonStore(db)
+        assert store.runs_for_item("gh:issue:1234") == ["r9"]
+        assert store.runs_for_item("gh:1234") == ["r9"]
+        assert store.item_for_run("r9") == "gh:issue:1234"
+        assert store.unsettled_runs() == [("r9", "gh:issue:1234")]
+
+    def test_new_rows_are_written_typed(self, tmp_path: Path) -> None:
+        db = tmp_path / "state.db"
+        store = DaemonStore(db)
+        # even an item constructed with the legacy spelling stores typed
+        store.upsert_new(item(), now=1.0)
+        with sqlite3.connect(db) as conn:
+            stored = [r[0] for r in conn.execute("SELECT item_id FROM daemon_work_items")]
+        assert stored == ["gh:issue:7"]

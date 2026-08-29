@@ -71,10 +71,13 @@ class TestFormat:
             assert format_for_discord(ev(t, x=1)) == []
 
     def test_headline_states(self) -> None:
-        item = WorkItem(item_id="gh:4", source_key="4", title="Fix login", url="https://x/4")
+        item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login", url="https://x/4")
         assert headline_text(item, "r1").startswith(
-            "▶ run `r1` — **Fix login** · [issue #4](https://x/4)"
+            "▶ run `r1` — **Fix login** · `gh:issue:4` · [issue #4](https://x/4)"
         )
+        legacy = WorkItem(item_id="gh:4", source_key="4", title="Fix login", url="https://x/4")
+        assert "`gh:issue:4`" in headline_text(legacy, "r1")
+        assert "gh:4 " not in headline_text(legacy, "r1")
         assert headline_text(item, "r1", "completed").startswith("✅")
         assert headline_text(item, "r1", "blocked").startswith("🚧")
 
@@ -576,8 +579,8 @@ class TestBridge:
             reply = ask("!sbx requeue inbox:a.md")
             assert "requeue failed:" in reply and "use retry" in reply
             assert "attempts reset" in ask("!sbx retry inbox:a.md")
-            reply = ask("!sbx abandon gh:404")
-            assert "abandon failed:" in reply and "gh:404" in reply
+            reply = ask("!sbx abandon gh:issue:404")
+            assert "abandon failed:" in reply and "gh:issue:404" in reply
             assert "`inbox:a.md` queued" in ask("!sbx items")
             item = floop.dstore.get("inbox:a.md")
             assert item is not None and item.state == "queued" and item.attempts == 0
@@ -589,9 +592,9 @@ class TestBridge:
         finish card); --retry re-queues instead; retry reruns a settled item
         under the author's name."""
         bridge, client, floop = make_bridge(tmp_path)
-        floop.dstore.upsert_new(WorkItem(item_id="gh:8", source_key="8", title="Eight"), 1.0)
-        floop.dstore.mark_running("gh:8", "r1", 1.0)
-        floop.dstore.mark_cancelled("gh:8", "cancelled by op", 2.0)
+        floop.dstore.upsert_new(WorkItem(item_id="gh:issue:8", source_key="8", title="Eight"), 1.0)
+        floop.dstore.mark_running("gh:issue:8", "r1", 1.0)
+        floop.dstore.mark_cancelled("gh:issue:8", "cancelled by op", 2.0)
         bridge.start()
         try:
             control = client.channels[42]
@@ -602,15 +605,15 @@ class TestBridge:
                 ("Discord user `brett`", False),
                 ("Discord user `brett`", True),
             ]
-            for cmd in ("!sbx retry gh:8", "!sbx retry"):
+            for cmd in ("!sbx retry gh:issue:8", "!sbx retry"):
                 n = len(control.sent)
                 bridge._handle_message(FakeMessage(cmd, control))
                 assert wait_for(lambda n=n: len(control.sent) > n), cmd
-            assert floop.retried == [("gh:8", "Discord user `brett`")]
+            assert floop.retried == [("gh:issue:8", "Discord user `brett`")]
             joined = "\n".join(control.sent)
             assert "settles as cancelled" in joined and "run again fresh" in joined
-            assert "`gh:8` re-queued" in joined and "usage: retry" in joined
-            item = floop.dstore.get("gh:8")
+            assert "`gh:issue:8` re-queued" in joined and "usage: retry" in joined
+            item = floop.dstore.get("gh:issue:8")
             assert item is not None and item.state == "queued"
             assert item.last_error == "re-queued by Discord user `brett`"
         finally:
@@ -785,15 +788,15 @@ class TestBridge:
             # the level rides as a marker; a notice with no run stays in the channel
             assert any(s.startswith("⚠ circuit breaker opened") for s in control.sent)
             # URLs are masked so notices do not unfurl; an item we ran points at its thread
-            item = WorkItem(item_id="gh:8", source_key="8", title="T")
+            item = WorkItem(item_id="gh:issue:8", source_key="8", title="T")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             tid = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
             bridge.daemon_notice(
                 DaemonNotice(
                     "run.done",
-                    "✅ gh:8 done (1/1 tasks done) · PR https://x/pull/9",
-                    item_id="gh:8",
+                    "✅ gh:issue:8 done (1/1 tasks done) · PR https://x/pull/9",
+                    item_id="gh:issue:8",
                     run_id="r1",
                     url="https://x/pull/9",
                 )
@@ -812,19 +815,23 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="gh:8", source_key="8", title="T")
+            item = WorkItem(item_id="gh:issue:8", source_key="8", title="T")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             tid = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
             bridge.daemon_notice(
-                DaemonNotice("run.resuming", "resuming r1 (attempt 2)", item_id="gh:8", run_id="r1")
+                DaemonNotice(
+                    "run.resuming", "resuming r1 (attempt 2)", item_id="gh:issue:8", run_id="r1"
+                )
             )
             thread = client.channels[tid]
             assert wait_for(lambda: any("resuming r1" in s for s in thread.sent))
             assert not any("resuming r1" in s for s in client.channels[42].sent)
             # a run the bridge never opened a thread for falls back to the channel
             bridge.daemon_notice(
-                DaemonNotice("run.resuming", "resuming r9 (attempt 2)", item_id="gh:9", run_id="r9")
+                DaemonNotice(
+                    "run.resuming", "resuming r9 (attempt 2)", item_id="gh:issue:9", run_id="r9"
+                )
             )
             assert wait_for(lambda: any("resuming r9" in s for s in client.channels[42].sent))
         finally:
@@ -998,7 +1005,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="gh:4", source_key="4", title="Fix", url="https://x/4")
+            item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix", url="https://x/4")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -1078,7 +1085,7 @@ class TestBridge:
 
         client.start = never_ready  # type: ignore[method-assign]
         bridge.start(connect_wait_s=0.1)
-        bridge.daemon_notice(DaemonNotice("item.queued", "queued something", item_id="gh:1"))
+        bridge.daemon_notice(DaemonNotice("item.queued", "queued something", item_id="gh:issue:1"))
         t0 = time.time()
         bridge.close(drain_wait_s=0.5)
         assert time.time() - t0 < 5

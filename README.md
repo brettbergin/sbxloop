@@ -373,6 +373,14 @@ running item's pinned run so its next dispatch starts over (attempts and
 backoff kept). The same controls are `!sbx items|abandon|retry|requeue` on
 Discord.
 
+`<item>` is a work item id. GitHub items are **typed** —
+`gh:issue:<number>` for the issue a run was claimed from, `gh:pr:<number>`
+for a pull request referenced as a work-item resource — and the untyped
+legacy form `gh:<number>` is still accepted everywhere as an alias for
+`gh:issue:<number>`, so old commands, checkpoints and watches keep working.
+Everything sbxloop prints uses the typed form. See
+[Work item ids](docs/architecture.md#work-item-ids) for the full grammar.
+
 **Workspace posture for unattended runs.** Point `[sandbox] workspace` at a
 **dedicated clone nobody edits** (`git clone <repo> ~/sbxloop-runner/src`),
 not the checkout you work in. Before each fresh run the daemon
@@ -475,8 +483,8 @@ and branch as links; verify failures, worker errors, denied permissions and
 refused egress called out; and a finished report card (the headline turns
 ✅/❌/⚠) with the final state, the task tally and the PR. How each item
 settled is a one-line notice in the control channel, pointing at the run's
-thread — `🎉 gh:9 merged (2/2 tasks done) · PR …`,
-`❌ gh:4 failed (…); 1 attempt(s) left`, `🚧 gh:7 blocked: … — a human needs to look` when an issue lands in `sbxloop:blocked`, `🛑 circuit breaker opened …` — with every URL masked so nothing sprouts a preview.
+thread — `🎉 gh:issue:9 merged (2/2 tasks done) · PR …`,
+`❌ gh:issue:4 failed (…); 1 attempt(s) left`, `🚧 gh:issue:7 blocked: … — a human needs to look` when an issue lands in `sbxloop:blocked`, `🛑 circuit breaker opened …` — with every URL masked so nothing sprouts a preview.
 Mentions are always disabled, so model output can never ping the
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines`,
 `tool_output_lines` (tail output lines echoed for a *successful* call,
@@ -497,7 +505,10 @@ the item as **cancelled** — attributed to you on the source, no automatic
 retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
 on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run
 instead, and `!sbx retry <item>` reruns any cancelled or abandoned item with
-its attempt budget reset. Those verbs work in a run's thread too, answered
+its attempt budget reset. Every `<item>` argument takes either the typed
+`gh:issue:<n>` / `gh:pr:<n>` form or the legacy bare `gh:<n>`
+([Work item ids](docs/architecture.md#work-item-ids)); replies always quote
+the typed form. Those verbs work in a run's thread too, answered
 where you typed them. Anyone who can post in the channel
 can steer — that is the boundary to set. The bot ignores messages from bots
 (itself included), so scripts drive the daemon with `sbxloop daemon ctl <verb>`

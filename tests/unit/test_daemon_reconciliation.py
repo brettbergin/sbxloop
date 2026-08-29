@@ -56,15 +56,15 @@ class TestAbruptTerminationRecovery:
     def test_orphan_run_of_settled_item_is_failed_on_next_start(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_kill", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_kill", now=2.0)
         h.store.create_run("r_kill", "x")
         h.store.set_run_state("r_kill", "building")
         h.store.append_event(Event.now("run.started", "r_kill"))
         before = [e.type for _, e in h.store.events("r_kill")]
         # The item was settled but the process died before the run row was
         # ever closed — exactly the #374 field shape.
-        h.dstore.mark_done("gh:1", 3.0)
+        h.dstore.mark_done("gh:issue:1", 3.0)
 
         fresh = _fresh_daemon(h)
         fresh.loop.recover()
@@ -80,12 +80,12 @@ class TestAbruptTerminationRecovery:
     def test_cancelled_item_run_is_cancelled_with_attribution(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_cancelled", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_cancelled", now=2.0)
         h.store.create_run("r_cancelled", "x")
         h.store.set_run_state("r_cancelled", "building")
         h.dstore.mark_cancelled(
-            "gh:1", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
+            "gh:issue:1", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
         )
 
         fresh = _fresh_daemon(h)
@@ -139,7 +139,7 @@ class TestCancelConsistency:
         assert record.reason is not None and "brett.bergin" in record.reason
         types = [e.type for _, e in h.store.events(run_id)]
         assert "run.cancelled" in types
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "cancelled"
         assert item.last_error is not None and "brett.bergin" in item.last_error
         # Nothing is left looking active.
@@ -153,7 +153,7 @@ class TestCancelConsistency:
         record = h.store.get_run(run_id)
         assert record.state in TERMINAL_RUN_STATES
         assert record.reason is not None and "brett.bergin" in record.reason
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         # Re-queued to run fresh — and crucially not pinned to a phantom run.
         assert item is not None and item.state == "queued"
         assert h.store.non_terminal_runs() == []
@@ -187,7 +187,7 @@ class TestCancelConsistency:
         record = h.store.get_run(h.runs[0][0])
         assert record.state == "cancelled"
         assert record.reason is not None and "brett.bergin" in record.reason
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "cancelled"
 
 
@@ -208,15 +208,15 @@ class TestLiveRunNotReconciled:
     def test_resume_pending_run_survives_recover(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_resume", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_resume", now=2.0)
         h.store.create_run("r_resume", "x")
         h.store.set_run_state("r_resume", "building")
 
         h.loop.recover()
 
         assert h.store.get_run("r_resume").state == "building"
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "queued" and item.run_id == "r_resume"
         assert [e.type for _, e in h.store.events("r_resume")] == []
 

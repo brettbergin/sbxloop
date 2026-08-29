@@ -5,6 +5,15 @@ mode allows the second connection) so ``sbxloop status``/``logs`` and the
 daemon's own bookkeeping share one file, but it owns its own connection and
 tables — the engine store stays untouched.
 
+Item ids are normalised rather than migrated. A row written before the
+typed-id migration carries a legacy ``gh:1234`` key; every lookup here goes
+through :func:`_id_match`, which matches both the typed and the legacy
+spelling of the same id, and every row loaded is normalised to the typed
+form by :class:`~sbxloop.daemon.model.WorkItem`. So a store written by the
+old daemon keeps resolving under either form, and rows written from now on
+are typed — no ALTER, no rewrite pass, no window where an in-flight item
+becomes unreachable.
+
 Schema version 2 (the 1.0 pipeline). The pre-1.0 daemon kept five more
 tables for the lanes that filed their own work — backlog fingerprints,
 post-mortems, review charters, per-item PR acceptance state, audit
@@ -26,6 +35,7 @@ from typing import NamedTuple
 
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.errors import DaemonError
+from sbxloop.ghids import GH_PREFIX, normalize_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -121,6 +131,26 @@ class DiscordThread(NamedTuple):
     thread_id: int
     headline_id: int | None
     status_id: int | None
+
+
+def _id_variants(item_id: str) -> tuple[str, str]:
+    """Both spellings of a GitHub item id (typed and legacy bare).
+
+    Non-GitHub ids (``inbox:x.md``) come back duplicated, so callers can
+    always bind exactly two parameters.
+    """
+    parsed = try_parse_gh_id(item_id)
+    if parsed is None:
+        return (item_id, item_id)
+    if parsed.kind == "issue":
+        return (parsed.item_id, f"{GH_PREFIX}{parsed.number}")
+    return (parsed.item_id, parsed.item_id)
+
+
+def _id_match(item_id: str) -> tuple[str, tuple[str, str]]:
+    """``("item_id IN (?, ?)", params)`` for a lookup that accepts either
+    spelling of the id."""
+    return ("item_id IN (?, ?)", _id_variants(item_id))
 
 
 def _row_to_item(row: sqlite3.Row) -> WorkItem:
@@ -282,7 +312,7 @@ class DaemonStore:
                 "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by) "
                 "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?)",
                 (
-                    item.item_id,
+                    normalize_item_id(item.item_id),
                     item.source_key,
                     item.title,
                     item.body,
@@ -308,9 +338,13 @@ class DaemonStore:
             self._conn.commit()
 
     def get(self, item_id: str) -> WorkItem | None:
+        """Look the item up under either spelling of its id: a row stored
+        with a legacy ``gh:1234`` key resolves for ``gh:issue:1234`` too."""
+        where, params = _id_match(item_id)
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM daemon_work_items WHERE item_id = ?", (item_id,)
+                f"SELECT * FROM daemon_work_items WHERE {where}",  # nosec B608
+                params,
             ).fetchone()
             return _row_to_item(row) if row else None
 
@@ -455,11 +489,13 @@ class DaemonStore:
         re-read and refuse with the state that is actually there."""
         assignments = ", ".join(f"{name} = ?" for name in fields)
         marks = ", ".join("?" for _ in allowed)
+        where, ids = _id_match(item_id)
+        item_id = normalize_item_id(item_id)
         with self._lock:
             cursor = self._conn.execute(
                 f"UPDATE daemon_work_items SET {assignments}, updated_at = ? "  # nosec B608
-                f"WHERE item_id = ? AND state IN ({marks})",
-                (*fields.values(), now, item_id, *allowed),
+                f"WHERE {where} AND state IN ({marks})",
+                (*fields.values(), now, *ids, *allowed),
             )
             self._conn.commit()
             if cursor.rowcount == 1:
@@ -494,11 +530,12 @@ class DaemonStore:
         none (or another thread already took it). Not ``_update``: this is
         not an item change and must not move ``updated_at``, the
         retry-backoff clock."""
+        where, ids = _id_match(item_id)
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE daemon_work_items SET pending_report = NULL "
-                "WHERE item_id = ? AND pending_report IS NOT NULL",
-                (item_id,),
+                "UPDATE daemon_work_items SET pending_report = NULL "  # nosec B608
+                f"WHERE {where} AND pending_report IS NOT NULL",
+                ids,
             )
             self._conn.commit()
             return cursor.rowcount == 1
@@ -516,11 +553,13 @@ class DaemonStore:
         """Move to running, count the attempt, and open the ledger row —
         all before the engine starts, so a crash still leaves the item→run
         link for recovery."""
+        where, ids = _id_match(item_id)
+        item_id = normalize_item_id(item_id)
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE daemon_work_items SET state = 'running', attempts = attempts + 1, "
-                "run_id = ?, updated_at = ? WHERE item_id = ?",
-                (run_id, now, item_id),
+                f"run_id = ?, updated_at = ? WHERE {where}",  # nosec B608
+                (run_id, now, *ids),
             )
             if cursor.rowcount != 1:
                 # An unknown item must not leave an orphan ledger row that the
@@ -546,11 +585,13 @@ class DaemonStore:
         its own ledger so the daily cap and the per-item resume budget see
         it. ``daemon_runs`` is keyed by run id, so a second segment of the
         same run cannot be a second row there."""
+        where, ids = _id_match(item_id)
+        item_id = normalize_item_id(item_id)
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE daemon_work_items SET state = 'running', updated_at = ? "
-                "WHERE item_id = ? AND run_id = ?",
-                (now, item_id, run_id),
+                "UPDATE daemon_work_items SET state = 'running', updated_at = ? "  # nosec B608
+                f"WHERE {where} AND run_id = ?",
+                (now, *ids, run_id),
             )
             if cursor.rowcount != 1:
                 self._conn.rollback()
@@ -602,11 +643,13 @@ class DaemonStore:
         # Column names come from this module's own keyword calls, never from
         # input; every value is a bound parameter.
         assignments = ", ".join(f"{name} = ?" for name in fields)
+        where, ids = _id_match(item_id)
+        item_id = normalize_item_id(item_id)
         with self._lock:
             self._conn.execute(
                 f"UPDATE daemon_work_items SET {assignments}, updated_at = ? "  # nosec B608
-                "WHERE item_id = ?",
-                (*fields.values(), now, item_id),
+                f"WHERE {where}",
+                (*fields.values(), now, *ids),
             )
             self._conn.commit()
         log.debug("store.update", item=item_id, **_loggable(fields))
@@ -637,9 +680,11 @@ class DaemonStore:
     def resumes_for_item(self, item_id: str) -> int:
         """Resumes across ALL of the item's runs: the budget bounds total
         effort per item, not per plan."""
+        where, ids = _id_match(item_id)
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_run_resumes WHERE item_id = ?", (item_id,)
+                f"SELECT COUNT(*) AS n FROM daemon_run_resumes WHERE {where}",  # nosec B608
+                ids,
             ).fetchone()
             return int(row["n"])
 
@@ -656,7 +701,7 @@ class DaemonStore:
                 "SELECT run_id, item_id FROM daemon_runs "
                 "WHERE finished_at IS NULL OR result = 'interrupted' ORDER BY started_at ASC"
             )
-            return [(str(row["run_id"]), str(row["item_id"])) for row in rows]
+            return [(str(row["run_id"]), normalize_item_id(str(row["item_id"]))) for row in rows]
 
     def finished_run_ids(self, run_ids: Sequence[str]) -> set[str]:
         """Which of these runs already have a ledger `finished_at`. Used at
@@ -686,12 +731,14 @@ class DaemonStore:
 
     def runs_for_item(self, item_id: str) -> list[str]:
         """Run ids the item has been dispatched under, oldest first."""
+        where, ids = _id_match(item_id)
         with self._lock:
             return [
                 str(r["run_id"])
                 for r in self._conn.execute(
-                    "SELECT run_id FROM daemon_runs WHERE item_id = ? ORDER BY started_at",
-                    (item_id,),
+                    f"SELECT run_id FROM daemon_runs WHERE {where} "  # nosec B608
+                    "ORDER BY started_at",
+                    ids,
                 )
             ]
 
@@ -724,7 +771,7 @@ class DaemonStore:
             row = self._conn.execute(
                 "SELECT item_id FROM daemon_runs WHERE run_id = ?", (run_id,)
             ).fetchone()
-            return None if row is None else str(row["item_id"])
+            return None if row is None else normalize_item_id(str(row["item_id"]))
 
     # -- circuit breaker ---------------------------------------------------------
 

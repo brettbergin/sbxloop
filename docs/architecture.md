@@ -404,6 +404,38 @@ recovery: the calendar-day run cap, the circuit breaker, the resume cap,
 pause and cancel, startup and staleness reconciliation, run-directory
 retention.
 
+### Work item ids
+
+Every work item carries a **source-qualified id**. GitHub resources use a
+**typed** grammar so a number is never ambiguous between the issue a run
+came from and the pull request it produced:
+
+```
+gh:issue:<number>    the GitHub issue a work item was claimed from (canonical)
+gh:pr:<number>       a pull request referenced as a work-item-adjacent resource
+gh:<number>          legacy alias, accepted on read, means gh:issue:<number>
+```
+
+One module, `sbxloop.ghids`, owns that grammar — `format_gh_id` /
+`issue_item_id` / `pr_item_id` render, `parse_gh_id` / `try_parse_gh_id` /
+`normalize_item_id` read — and nothing else slices `gh:` strings by hand.
+The rules are asymmetric on purpose:
+
+- **Rendering is strict.** Every id sbxloop newly produces is typed:
+  store rows, chronology and event payloads, daemon log lines, Discord
+  headline cards and thread names, concierge tool output, and the issue
+  comments and PR bodies a run writes back to GitHub.
+- **Parsing is lenient.** A bare `gh:<n>` typed by an operator, or read out
+  of a checkpoint, a store row or a watch registered before the migration,
+  is accepted and normalised to `gh:issue:<n>` at the boundary. No
+  migration of existing state is required: normalisation happens on read,
+  and lookups by either form resolve to the same item.
+
+Ids from other sources (e.g. `inbox:<file>.md`) pass through unchanged.
+Operator commands that take an `<item>` argument — `items`, `queue`,
+`abandon`, `retry`, `requeue`, on both `sbxloop daemon` and `!sbx` — accept
+either form and always *print* the typed one.
+
 The **run cap** is a wall-clock calendar-day gate: it counts the runs whose
 start time falls on the current day in `[daemon] run_cap_timezone` (any
 IANA zone, default `UTC`) and compares that against

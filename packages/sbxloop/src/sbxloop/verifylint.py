@@ -208,7 +208,7 @@ _NESTED_SHELL = re.compile(
 # `sh -c '...'` whose payload holds no `$` and no backtick is none of those:
 # the outer shell hands the single-quoted span through verbatim, so it runs
 # exactly as the payload would have run unwrapped. Rejecting that inert form
-# is what cost item gh:478 both of its decompose attempts — twice over a
+# is what cost item gh:issue:478 both of its decompose attempts — twice over a
 # `sh -c 'git diff --quiet && git diff --cached --quiet'` that would have
 # behaved identically either way — and PR #476 went unreviewed for it.
 _INERT_SHELL_WRAPPER = re.compile(r"^(?:/bin/|/usr/bin/)?sh\s+-c\s+'([^']*)'$")
