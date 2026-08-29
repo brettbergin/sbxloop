@@ -51,6 +51,12 @@
       "provenance": "synthetic",
       "observed": "not yet captured: re-delivering a run whose PR is already open (#223; deliver.py TODO(e2e))"
     },
+    "pr_missing_404": {
+      "message": "github op pr.update failed: GithubOpError: PATCH https://api.github.com/repos/o/r/pulls/31 -> HTTP 404: {\"message\":\"Not Found\"}",
+      "status": 404,
+      "provenance": "synthetic",
+      "observed": "not yet captured: updating a pull request number the daemon still remembers but GitHub no longer has (#488)"
+    },
     "pr_not_mergeable_405": {
       "message": "github op raw.api failed: GithubOpError: gh api PUT /repos/o/r/pulls/42/merge failed (rc=1): gh: Pull Request is not mergeable (HTTP 405)",
       "status": 405,

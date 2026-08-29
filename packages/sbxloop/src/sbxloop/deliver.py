@@ -58,6 +58,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from sbxloop import hostgit
 from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, exclusion_hit, scan_artifacts
 from sbxloop.errors import DeliveryError, GithubOpsError
@@ -161,13 +163,21 @@ def deliver_workspace(
     exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES,
     branch: str | None = None,
     closes: int | None = None,
+    pr_number: int | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
     ``branch`` overrides the per-run branch name so a fix round lands on the
     pull request it was fixing: the refs POST 422s on the existing branch and
-    force-updates it, and the PR create 422s on the existing head and reuses
-    the open PR (see the module notes).
+    force-updates it.
+
+    ``pr_number`` is the primary path for that fix round (#488): when the
+    caller already knows which PR this delivery belongs to, the PR is
+    updated in place (PATCH ``/pulls/{n}``) and no PR is ever blind-POSTed.
+    Only when ``pr_number`` is unknown — or the update fails because the PR
+    is gone or not updatable — does delivery fall back to ``pr_create``, and
+    with it the 422-collision/reuse detour for an already-open PR on the
+    same head.
 
     ``closes`` is the issue this delivery resolves; it becomes a
     ``Closes #N`` line in the PR body, so GitHub links issue and PR and
@@ -251,13 +261,50 @@ def deliver_workspace(
     _point_branch(ops, repo, branch, commit)
     log.info("deliver.branch_pushed", run=run_id, repo=repo, branch=branch, commit=commit[:12])
 
+    title = _title(outcome)
+    body = _body(run_id, outcome, plan, closes=closes)
+
+    if pr_number is not None:
+        updated = None
+        try:
+            updated = ops.pr_update(repo, pr_number, title=title, body=body)
+        except (GithubOpsError, ValidationError) as exc:
+            log.warning(
+                "deliver.pr_update_failed",
+                run=run_id,
+                repo=repo,
+                pr=pr_number,
+                error=str(exc),
+                hint="stored PR number is stale or not updatable; opening a PR instead",
+            )
+        if updated is not None:
+            # A PATCH succeeds on a *closed* PR and on a number that has
+            # drifted to an unrelated one, so a 200 is not evidence the
+            # remembered number still names this run's PR. Only an open PR
+            # whose head is the branch we just pushed is; anything else
+            # falls through to pr_create so the loop recovers itself (#488).
+            if updated.state == "open" and updated.head_ref == branch:
+                url = updated.url or f"https://github.com/{repo}/pull/{pr_number}"
+                log.info("deliver.pr_updated", run=run_id, repo=repo, pr=pr_number, url=url)
+                return PrRef(number=pr_number, url=url)
+            log.warning(
+                "deliver.pr_update_rejected",
+                run=run_id,
+                repo=repo,
+                pr=pr_number,
+                state=updated.state or "unknown",
+                head=updated.head_ref or "unknown",
+                branch=branch,
+                hint="updated PR is not an open PR for this branch; opening a PR instead",
+            )
+
     try:
         pr = ops.pr_create(
             repo,
             base=base,
             head=branch,
-            title=_title(outcome),
-            body=_body(run_id, outcome, plan, closes=closes),
+            title=title,
+            body=body,
             draft=draft,
         )
     except GithubOpsError as exc:

@@ -79,6 +79,29 @@ class TestGithubOpsFacade:
         assert url == "https://c/1"
         assert client.jobs[0].params["draft"] is True
 
+    def test_pr_update_dispatches_pr_update_op(self) -> None:
+        ops, client = make_ops(
+            {
+                "pr.update": {
+                    "number": 9,
+                    "url": "https://p/9",
+                    "state": "open",
+                    "head_ref": "dev",
+                }
+            }
+        )
+        pr = ops.pr_update("o/r", 9, title="T", body="B")
+        assert (pr.number, pr.url, pr.state, pr.head_ref) == (9, "https://p/9", "open", "dev")
+        job = client.jobs[0]
+        assert job.op == "pr.update"
+        assert job.params == {"repo": "o/r", "number": 9, "title": "T", "body": "B"}
+
+    def test_pr_update_tolerates_a_response_missing_url_and_state(self) -> None:
+        """A 200 without html_url must not raise past the caller's guards (#488)."""
+        ops, _ = make_ops({"pr.update": {"number": 9, "url": None, "state": None}})
+        pr = ops.pr_update("o/r", 9, body="B")
+        assert (pr.number, pr.url, pr.state, pr.head_ref) == (9, "", "", "")
+
     def test_contents_read(self) -> None:
         ops, _ = make_ops({"contents.read": {"content": "file body", "binary": False}})
         assert ops.contents_read("o/r", "README.md", ref="main") == "file body"

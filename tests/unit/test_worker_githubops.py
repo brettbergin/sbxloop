@@ -214,3 +214,47 @@ class TestRunnerErrorInfo:
         result = self._run(tmp_path, RuntimeError("boom"))
         assert result.error is not None
         assert result.error.http_status is None
+
+
+class RecordingTransport:
+    """Records (method, path, body) and answers with a fixed payload."""
+
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
+        self.calls.append((method, path, body))
+        result: JsonValue = self.answer
+        return result
+
+
+class TestPrUpdate:
+    def test_patches_only_supplied_fields(self) -> None:
+        t = RecordingTransport({"number": 7, "html_url": "https://p/7"})
+        out = execute_op(
+            "pr.update",
+            {"repo": "o/r", "number": 7, "title": "T", "body": "", "base": "main"},
+            t,
+        )
+        assert t.calls == [("PATCH", "/repos/o/r/pulls/7", {"title": "T", "base": "main"})]
+        assert out == {"number": 7, "url": "https://p/7", "state": None, "head_ref": None}
+
+    def test_falls_back_to_requested_number(self) -> None:
+        t = RecordingTransport({"html_url": "https://p/7"})
+        out = execute_op("pr.update", {"repo": "o/r", "number": 7, "body": "B"}, t)
+        assert out == {"number": 7, "url": "https://p/7", "state": None, "head_ref": None}
+
+    def test_surfaces_state_and_head_ref(self) -> None:
+        t = RecordingTransport(
+            {"number": 7, "html_url": "https://p/7", "state": "open", "head": {"ref": "b"}}
+        )
+        out = execute_op("pr.update", {"repo": "o/r", "number": 7, "body": "B"}, t)
+        assert out == {"number": 7, "url": "https://p/7", "state": "open", "head_ref": "b"}
+
+    def test_requires_repo_and_number(self) -> None:
+        with pytest.raises(GithubOpError):
+            execute_op("pr.update", {"repo": "o/r"}, RecordingTransport({}))
+
+    def test_registered_in_ops(self) -> None:
+        assert "pr.update" in githubops.OPS

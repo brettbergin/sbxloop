@@ -9,8 +9,13 @@ agent to rediscover that structure costs a whole session for nothing.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+
+import pytest
 
 from sbxloop.config import Config
+from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.review import FIX_TASK_TITLE, fix_brief, fix_tasks
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import RunResult
@@ -98,3 +103,79 @@ class TestSeededRunSkipsDecompose:
         engine = self._engine(tmp_path)
         engine.start("do the thing", run_id="rord00001")
         assert engine.store.get_tasks("rord00001") == []
+
+
+class TestFixConfigCarriesThePr:
+    """A fix round knows which PR it is updating (#488): the daemon's stored
+    PrState must reach delivery as config, not be rediscovered from a 422."""
+
+    def _loop_and_item(self, tmp_path: Path) -> tuple[Any, WorkItem]:
+        from sbxloop.daemon.loop import DaemonLoop
+        from sbxloop.daemon.store import DaemonStore
+
+        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        dstore = DaemonStore(config.state_dir / "state.db")
+        loop = DaemonLoop(
+            config,
+            store=StateStore(config.state_dir / "state.db"),
+            dstore=dstore,
+            sources=[],
+            runner=lambda item, cfg, run_id, bus, resume: RunResult(
+                run_id=run_id, state="completed"
+            ),
+        )
+        item = WorkItem(item_id="gh:1", source="github", source_key="1", title="t")
+        dstore.upsert_new(item, now=1.0)
+        dstore.record_delivery("gh:1", 42, "sbxloop/rabc", 1.0)
+        dstore.queue_fix("gh:1", fix_brief(42, "1 check failed", ("lint",)), 2.0)
+        return loop, item
+
+    def test_fix_config_carries_branch_and_pr_number(self, tmp_path: Path) -> None:
+        loop, item = self._loop_and_item(tmp_path)
+        out = loop._fix_config(item, loop.config)
+        assert out.sandbox.continue_branch == "sbxloop/rabc"
+        assert out.sandbox.continue_pr == 42
+
+    def test_no_pr_state_leaves_the_config_alone(self, tmp_path: Path) -> None:
+        loop, _item = self._loop_and_item(tmp_path)
+        other = WorkItem(item_id="gh:2", source="github", source_key="2", title="t")
+        out = loop._fix_config(other, loop.config)
+        assert out.sandbox.continue_pr is None and out.sandbox.continue_branch is None
+
+
+class TestEngineForwardsThePrNumber:
+    def test_deliver_gets_pr_number_from_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sbxloop.engine.engine as engine_mod
+        from sbxloop.gh.ops import PrRef
+
+        calls: list[dict[str, Any]] = []
+
+        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
+            calls.append(dict(kwargs))
+            return PrRef(number=42, url="https://x/pull/42")
+
+        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r", "deliver": True},
+                "sandbox": {"continue_branch": "sbxloop/rabc", "continue_pr": 42},
+            }
+        )
+        engine = LoopEngine(
+            config,
+            store=StateStore(tmp_path / "state" / "state.db"),
+            bus=EventBus(),
+            sbx=SbxCLI(binary=str(tmp_path / "no-such-sbx")),
+            install_workers=False,
+        )
+        source = tmp_path / "state" / "runs" / "r1" / "artifacts"
+        source.mkdir(parents=True)
+        (source / "a.txt").write_text("hi")
+        pair = SimpleNamespace(workspace=None, mounted=False)
+        engine._deliver("r1", "ship it", cast(Any, pair), cast(Any, object()))
+
+        assert calls and calls[0]["branch"] == "sbxloop/rabc"
+        assert calls[0]["pr_number"] == 42

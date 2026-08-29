@@ -107,6 +107,10 @@ class SandboxConfig(_ConfigModel):
     # lands red.
     gate_command: str | None = None
     continue_branch: str | None = None
+    # The pull request a fix round is updating. Carried from the daemon's
+    # stored PrState so delivery can PATCH that PR directly instead of
+    # blind-POSTing a new one and discovering the collision from a 422.
+    continue_pr: int | None = None
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
 

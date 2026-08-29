@@ -207,6 +207,39 @@ def _pr_create(t: Transport, p: dict[str, Any]) -> JsonValue:
     return {"number": data.get("number"), "url": data.get("html_url")}
 
 
+def _pr_update(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """Update an existing pull request in place.
+
+    Fix rounds already know the PR number, so delivery should PATCH it
+    rather than POST a new PR and recover the number from a 422 (#488).
+    Only fields with a truthy value are sent: an absent ``body`` must not
+    blank out the PR description. The flip side is that an empty string is
+    indistinguishable from "not supplied", so this op cannot blank a field
+    out — there is no way to clear a body through it.
+
+    ``state`` and ``head_ref`` come back alongside ``number``/``url``: a
+    PATCH also succeeds on a closed PR, or on a number that has drifted to
+    an unrelated PR, so the caller needs them to decide whether the PR it
+    just updated is really the one it meant (#488).
+    """
+    _require(p, "repo", "number")
+    number = p["number"]
+    body: dict[str, Any] = {}
+    for field in ("title", "body", "base", "state"):
+        if p.get(field):
+            body[field] = p[field]
+    data = t.request("PATCH", f"/repos/{p['repo']}/pulls/{number}", body)
+    assert isinstance(data, dict)
+    head = data.get("head")
+    head_ref = head.get("ref") if isinstance(head, dict) else None
+    return {
+        "number": data.get("number") or number,
+        "url": data.get("html_url"),
+        "state": data.get("state"),
+        "head_ref": head_ref,
+    }
+
+
 def _contents_read(t: Transport, p: dict[str, Any]) -> JsonValue:
     _require(p, "repo", "path")
     path = f"/repos/{p['repo']}/contents/{p['path']}"
@@ -361,6 +394,7 @@ OPS: dict[str, OpImpl] = {
     "issue.create": _issue_create,
     "issue.comment": _issue_comment,
     "pr.create": _pr_create,
+    "pr.update": _pr_update,
     "pr.comment": _issue_comment,  # PR comments go through the issues API
     "contents.read": _contents_read,
     "status.create": _status_create,

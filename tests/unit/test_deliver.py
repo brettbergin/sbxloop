@@ -12,7 +12,7 @@ import pytest
 from sbxloop import hostgit
 from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
 from sbxloop.errors import DeliveryError, GithubOpsError
-from sbxloop.gh.ops import PrRef
+from sbxloop.gh.ops import PrRef, PrUpdate
 from tests.fakes.github_errors import github_error
 
 
@@ -722,3 +722,162 @@ class TestRedeliveryCollisions:
                 outcome="x",
                 source_dir=make_workspace(tmp_path),
             )
+
+
+class TestDeliverWorkspaceKnownPrNumber:
+    """#488: a fix round that knows its PR number updates it in place."""
+
+    class UpdatingOps(StubOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.updates: list[tuple[str, int, dict[str, Any]]] = []
+
+        state = "open"
+        head_ref = ""
+        url: str | None = None
+
+        def pr_update(self, repo: str, number: int, **kwargs: Any) -> PrUpdate:
+            self.updates.append((repo, number, kwargs))
+            url = self.url if self.url is not None else f"https://github.com/{repo}/pull/{number}"
+            return PrUpdate(
+                number=number,
+                url=url,
+                state=self.state,
+                head_ref=self.head_ref,
+            )
+
+    def test_known_pr_number_updates_and_never_posts_a_pr(self, tmp_path: Path) -> None:
+        ops = self.UpdatingOps()
+        ops.head_ref = "sbxloop/r41"
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="fix it",
+            source_dir=make_workspace(tmp_path),
+            branch="sbxloop/r41",
+            pr_number=31,
+        )
+        assert pr == PrRef(number=31, url="https://github.com/o/r/pull/31")
+        assert ops.pr_kwargs == {}
+        assert not [c for c in ops.raw_calls if c[0] == "POST" and "/pulls" in c[1]]
+        (repo, number, kwargs) = ops.updates[0]
+        assert (repo, number) == ("o/r", 31)
+        assert kwargs["title"]
+        assert "hello.txt" in kwargs["body"]
+
+    def test_without_pr_number_still_creates(self, tmp_path: Path) -> None:
+        ops = self.UpdatingOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr == PrRef(number=7, url="https://github.com/o/r/pull/7")
+        assert ops.updates == []
+        assert ops.pr_kwargs["head"] == branch_name("r42")
+
+    def test_without_pr_number_still_reuses_on_collision(self, tmp_path: Path) -> None:
+        class CollidingOps(TestDeliverWorkspaceKnownPrNumber.UpdatingOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    return [{"number": 12, "html_url": "https://github.com/o/r/pull/12"}]
+                return super().raw(method, path, body)
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise github_error("pr_exists_422")
+
+        ops = CollidingOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr == PrRef(number=12, url="https://github.com/o/r/pull/12")
+        assert ops.updates == []
+
+    def test_closed_pr_is_rejected_and_a_fresh_pr_is_created(self, tmp_path: Path) -> None:
+        """A PATCH succeeds on a closed PR; a 200 alone must not be believed."""
+        ops = self.UpdatingOps()
+        ops.state = "closed"
+        ops.head_ref = "sbxloop/r41"
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            branch="sbxloop/r41",
+            pr_number=31,
+        )
+        assert pr == PrRef(number=7, url="https://github.com/o/r/pull/7")
+        assert ops.pr_kwargs["head"] == "sbxloop/r41"
+
+    def test_drifted_number_on_another_head_is_rejected(self, tmp_path: Path) -> None:
+        ops = self.UpdatingOps()
+        ops.state = "open"
+        ops.head_ref = "somebody/else"
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            branch="sbxloop/r41",
+            pr_number=31,
+        )
+        assert pr == PrRef(number=7, url="https://github.com/o/r/pull/7")
+
+    def test_update_without_html_url_still_returns_a_usable_ref(self, tmp_path: Path) -> None:
+        """A 200 missing html_url must not crash a completed run (#488)."""
+        ops = self.UpdatingOps()
+        ops.head_ref = "sbxloop/r41"
+        ops.url = ""
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            branch="sbxloop/r41",
+            pr_number=31,
+        )
+        assert pr == PrRef(number=31, url="https://github.com/o/r/pull/31")
+        assert ops.pr_kwargs == {}
+
+    def test_validation_error_from_update_falls_back_to_create(self, tmp_path: Path) -> None:
+        class BrokenOps(StubOps):
+            def pr_update(self, repo: str, number: int, **kwargs: Any) -> PrUpdate:
+                return PrUpdate.model_validate({"url": "https://x"})
+
+        ops = BrokenOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=31,
+        )
+        assert pr == PrRef(number=7, url="https://github.com/o/r/pull/7")
+
+    def test_failed_pr_update_falls_back_to_create(self, tmp_path: Path) -> None:
+        class GoneOps(StubOps):
+            def pr_update(self, repo: str, number: int, **kwargs: Any) -> PrUpdate:
+                raise github_error("pr_missing_404")
+
+        ops = GoneOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=31,
+        )
+        assert pr == PrRef(number=7, url="https://github.com/o/r/pull/7")
+        assert ops.pr_kwargs["head"] == branch_name("r42")

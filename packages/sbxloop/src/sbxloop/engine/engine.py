@@ -334,6 +334,10 @@ class LoopEngine:
                     source_dir=source,
                     base=github_cfg.deliver_base,
                     draft=github_cfg.deliver_draft,
+                    # Retrying a fix round's delivery: the rehydrated config
+                    # still names the branch and PR that round was fixing.
+                    branch=self.config.sandbox.continue_branch,
+                    pr_number=self.config.sandbox.continue_pr,
                     exclude=self.config.artifacts.exclude,
                     closes=github_cfg.deliver_closes,
                 )
@@ -860,6 +864,7 @@ class LoopEngine:
                 # A fix round lands on the pull request it was fixing, not a
                 # new one: same branch in, same branch out.
                 branch=self.config.sandbox.continue_branch,
+                pr_number=self.config.sandbox.continue_pr,
                 exclude=self.config.artifacts.exclude,
                 closes=gh.deliver_closes,
             )

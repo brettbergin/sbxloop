@@ -49,6 +49,20 @@ All notable changes to sbxloop are documented here. The project adheres to
     (`landing` is `NOT NULL DEFAULT 0`, so inserts still work), and only a
     freshly created database omits them.
 
+- **Fix-round deliveries update their pull request in place (#488).** A
+  delivery that already knows its PR number now PATCHes that PR's title and
+  body instead of POSTing a new one and recovering the number from the 422
+  collision, so a fix round no longer depends on GitHub refusing a duplicate.
+  `GithubOps` grew `pr_update` (new worker op `pr.update`), returning a
+  `PrUpdate` rather than a `PrRef`: GitHub answers 200 for a title/body edit
+  on a *closed* PR, and on a number that has drifted to an unrelated PR, so
+  the response's `state` and `head.ref` are surfaced and delivery accepts the
+  update only for an open PR whose head is the branch it just pushed —
+  anything else, including a failed PATCH or a malformed 200 (no `html_url`,
+  which would otherwise raise a `ValidationError` past `_deliver`'s
+  `SbxloopError` guard), falls through to creating a fresh PR so the loop
+  still recovers on its own.
+
 ### Removed
 
 - **`Usage` no longer carries a spend field, and no usage block renders a

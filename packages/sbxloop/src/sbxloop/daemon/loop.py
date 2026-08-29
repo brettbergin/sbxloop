@@ -1256,7 +1256,11 @@ class DaemonLoop:
         if state is None or not state.fix_brief or not state.branch:
             return config
         return config.model_copy(
-            update={"sandbox": config.sandbox.model_copy(update={"continue_branch": state.branch})}
+            update={
+                "sandbox": config.sandbox.model_copy(
+                    update={"continue_branch": state.branch, "continue_pr": state.pr_number}
+                )
+            }
         )
 
     def _item_config(self, item: WorkItem) -> Config:

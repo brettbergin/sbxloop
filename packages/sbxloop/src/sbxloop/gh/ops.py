@@ -11,7 +11,7 @@ import time
 from collections.abc import Sequence
 from typing import Any, Literal, NamedTuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from sbxloop.config import MergeMethod
 from sbxloop.errors import GithubOpsError
@@ -31,6 +31,23 @@ class IssueRef(BaseModel):
 class PrRef(BaseModel):
     number: int
     url: str
+
+
+# What a PR PATCH answered with. Deliberately laxer than PrRef: a PATCH
+# succeeds on a closed PR and on a number that has drifted to an unrelated
+# PR, so the caller has to inspect `state`/`head_ref` before trusting it —
+# and a 200 that omits `html_url` must not turn a completed run into a
+# crashed one, so `url` tolerates a missing value instead of raising (#488).
+class PrUpdate(BaseModel):
+    number: int
+    url: str = ""
+    state: str = ""
+    head_ref: str = ""
+
+    @field_validator("url", "state", "head_ref", mode="before")
+    @classmethod
+    def _blank_when_missing(cls, value: object) -> object:
+        return "" if value is None else value
 
 
 # What a review says about a PR. REQUEST_CHANGES/APPROVE are the ones that
@@ -285,6 +302,38 @@ class GithubOps:
                 },
             )
         )
+
+    def pr_update(
+        self,
+        repo: str,
+        number: int,
+        *,
+        title: str = "",
+        body: str = "",
+        base: str = "",
+        state: str = "",
+    ) -> PrUpdate:
+        """Update a PR we already know the number of (#488).
+
+        Empty fields are dropped rather than sent, so a caller refreshing
+        only the body cannot accidentally clear the title (and, as a
+        consequence, this method cannot blank a field out).
+
+        Returns a :class:`PrUpdate`, not a :class:`PrRef`: GitHub answers
+        200 for a title/body edit on a *closed* PR, so the caller must check
+        ``state``/``head_ref`` before believing the number it passed still
+        names the PR it meant.
+        """
+        params: dict[str, Any] = {"repo": repo, "number": number}
+        if title:
+            params["title"] = title
+        if body:
+            params["body"] = body
+        if base:
+            params["base"] = base
+        if state:
+            params["state"] = state
+        return PrUpdate.model_validate(self._op("pr.update", params))
 
     def pr_comment(self, repo: str, number: int, body: str) -> str:
         data = self._op("pr.comment", {"repo": repo, "number": number, "body": body})

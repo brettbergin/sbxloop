@@ -160,7 +160,7 @@ produced. Query history with
 ## GitHub ops
 
 `github.op` jobs execute in the github sandbox only (the sole holder of
-`GH_TOKEN`). Ops: `issue.create`, `issue.comment`, `pr.create`, `pr.comment`,
+`GH_TOKEN`). Ops: `issue.create`, `issue.comment`, `pr.create`, `pr.update`, `pr.comment`,
 `contents.read`, `status.create`, `repo.get`, `ref.get`, `search.issues`,
 `raw.api`, `blobs.create_many`. Transport inside the sandbox: `gh api` when gh
 is available, otherwise a pure-stdlib REST client — both produce identical
