@@ -64,7 +64,25 @@ class TestEnvExample:
     def test_example_documents_required_tokens(self) -> None:
         values = dotenv_values(REPO_ROOT / ".env.example")
         assert set(values) == {"COPILOT_GITHUB_TOKEN", "GH_TOKEN"}
+        # The optional credentials are documented, commented out.
+        text = (REPO_ROOT / ".env.example").read_text()
+        for name in ("GITHUB_TOKEN", "DISCORD_BOT_TOKEN", "GH_TOKEN_TWO", "token_env"):
+            assert name in text
         assert all(not v for v in values.values())  # placeholders ship empty
+
+    def test_example_documents_daemon_host_layout(self) -> None:
+        text = (REPO_ROOT / ".env.example").read_text()
+        assert "~/.config/sbxloop/secrets.env" in text
+        assert "0600" in text
+
+    def test_example_names_every_credential_env_var_the_code_reads(self) -> None:
+        from sbxloop.daemon.discord import TOKEN_ENV as DISCORD_TOKEN_ENV
+        from sbxloop.sbx.provision import GH_TOKEN_ENVS
+        from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
+
+        text = (REPO_ROOT / ".env.example").read_text()
+        for name in (COPILOT_TOKEN_ENV, DISCORD_TOKEN_ENV, *GH_TOKEN_ENVS):
+            assert name in text, f"{name} missing from .env.example"
 
     def test_example_commented_settings_are_valid_config(self, tmp_path: Path) -> None:
         # Every commented-out SBXLOOP_* line must round-trip through the
@@ -79,4 +97,4 @@ class TestEnvExample:
         assert env, "expected commented SBXLOOP_ examples"
         config = load_config(cwd=tmp_path, env=env)
         assert isinstance(config, Config)
-        assert config.github.repo == "owner/repo"
+        assert config.github.repo == "you/your-repo"

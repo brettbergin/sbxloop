@@ -6,6 +6,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`sbxloop.toml.example` at the repository root** (#527), covering every
+  section and key the config model knows — including both `[github]` forms
+  (the legacy single `repo` and the `[[github.repos]]` array with
+  `workspace`/`deliver_base`/`enabled`/`token_env`/`trigger_label`/`labels`)
+  — with the default and a one-line comment per key. The top-level keys are
+  live and every section ships commented out, so a fresh copy is exactly the
+  built-in defaults. It is now the single
+  source `sbxloop init` writes from (shipped as package data), and the new
+  `sbxloop init --stdout` prints it. `.env.example` was refreshed: the
+  `DISCORD_BOT_TOKEN` and `GITHUB_TOKEN` alias credentials, the per-repo
+  `token_env` pattern, the daemon-host `~/.config/sbxloop/secrets.env`
+  layout, and the single-repo `SBXLOOP_GITHUB__REPO` override marked legacy.
+  Tests pin the example against `sbxloop init` and the config model and
+  reject anything that looks like a real token, snowflake, host path or
+  non-placeholder repository.
+
 ### Changed
 
 - **Reverted #525** ("Remove Discord embeds from daemon bridge output in favour of plain markdown", #519): the plain-markdown bridge output read worse in the field than the embeds it replaced. Embeds, the `[discord]` keys #525 removed, and the previous rendering tests are back exactly as they were.

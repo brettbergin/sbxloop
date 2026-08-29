@@ -200,7 +200,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | `sbxloop logs RUN`                              | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                             |
 | `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                       |
 | `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                   |
-| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` (`--force` overwrites).                                                                                                                                                                                                 |
+| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints).                                                                                                                                                  |
 | `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                              |
 | `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                      |
 | `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                               |
@@ -996,8 +996,12 @@ back within the retention window — the finish summary prints it.
    working directory; real environment variables always win):
 
    ```bash
-   cp .env.example .env   # then fill in the token(s)
+   cp sbxloop.toml.example sbxloop.toml   # every key, commented, with its default
+   cp .env.example .env                   # then fill in the token(s)
    ```
+
+   `sbxloop.toml.example` is the file `sbxloop init` writes (`sbxloop init --stdout` prints it), and `.env.example` names every credential and
+   `SBXLOOP_*` override the code reads.
 
 3. **Optional** — configure the [GitHub integration](#github-integration)
    (adds the second PAT, `GH_TOKEN`).
@@ -1047,7 +1051,7 @@ Configuration resolves, in order, from `SBXLOOP_*` environment variables,
 `./sbxloop.toml`, `pyproject.toml [tool.sbxloop]`, and a user-level
 `~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) for settings
 that follow you rather than the checkout. `sbxloop init` writes a commented
-starter file; `sbxloop config show` prints every resolved value and where it
+starter file — the same `sbxloop.toml.example` committed at the repo root; `sbxloop config show` prints every resolved value and where it
 came from. The notable knobs:
 
 | Key                                                       | Default            | Meaning                                                                                                                                                                        |

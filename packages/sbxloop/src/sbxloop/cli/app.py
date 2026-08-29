@@ -10,6 +10,7 @@ import queue
 import sys
 import threading
 import time
+from importlib import resources
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, cast, get_args
 
@@ -1409,8 +1410,21 @@ def config_policy() -> None:
 @app.command()
 def init(
     force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
+    to_stdout: Annotated[
+        bool,
+        typer.Option("--stdout", help="Print the template instead of writing sbxloop.toml."),
+    ] = False,
 ) -> None:
-    """Write a commented sbxloop.toml with the default configuration."""
+    """Write a commented sbxloop.toml with the default configuration.
+
+    The template is `sbxloop.toml.example`, shipped as package data and
+    published at the repository root — one source of truth, so the example
+    file and this command cannot drift.
+    """
+    if to_stdout:
+        # bare TOML on stdout, nothing else — `sbxloop init --stdout > f.toml`
+        sys.stdout.write(DEFAULT_CONFIG_TOML)
+        return
     path = Path("sbxloop.toml")
     if path.exists() and not force:
         console.print("sbxloop.toml already exists (use --force to overwrite)")
@@ -2124,235 +2138,12 @@ def doctor(
     raise typer.Exit(0 if ok else 1)
 
 
-DEFAULT_CONFIG_TOML = """\
-# sbxloop configuration. Every key is optional; these are the defaults.
-# Precedence: SBXLOOP_* env vars > this file > pyproject [tool.sbxloop]
-# > ~/.config/sbxloop/sbxloop.toml (user-level defaults).
-
-# Copilot model for agent sessions ("auto" lets the SDK choose).
-model = "auto"
-# Optional sbx --app-name isolating sbxloop's sandboxes/policies/secrets.
-# Empty shares your normal sbx state (your login + balanced policy apply).
-# If set, that isolated state needs its own `sbx --app-name <name> login`
-# and `sbx --app-name <name> policy init balanced`.
-app_name = ""
-# Where run state (SQLite) and per-run workspaces live. Per-user by default
-# so status/logs see the same runs from any directory; a relative path
-# (e.g. ".sbxloop") scopes state to this project instead.
-state_dir = "~/.sbxloop"
-# Keep sandboxes around after a run (for debugging).
-keep_sandboxes = false
-# Keep the pair alive only when a run fails; inspect with `sbxloop shell <run>`.
-keep_on_failure = false
-# Worker transport: "stream" (default) or "poll".
-worker_transport = "stream"
-# Secret injection: "proxy" (sbx keychain proxy; recommended) or "plain-env".
-secret_strategy = "proxy"
-
-[sandbox]
-# Custom sandbox template reference (defaults to the sbx shell template).
-# `sbxloop bake` builds one with the worker preinstalled, cutting the
-# per-run install out of provisioning.
-# template = "sbxloop-baked:latest"
-# Where runs execute. Unset (the default) gives every run a fresh directory
-# under state_dir. Point it at an existing project to work on that code.
-# workspace = "path/to/checkout"
-# When `workspace` is a git checkout: "auto" (default) isolates each run in
-# a per-run clone on branch sbxloop/<run_id> — the checkout and its branches
-# are never touched, and a dirty tree refuses the run (uncommitted changes
-# would silently not travel). "clone" also isolates but runs from committed
-# HEAD even when dirty (and requires a git workspace). "in-place" mutates
-# the workspace directly (the pre-0.6 behavior).
-# workspace_isolation = "auto"
-# Extra network allow rules applied to both sandboxes.
-extra_allow_domains = []
-
-[policy]
-# Bounds for plan-declared egress. At PLAN time the agent may declare extra
-# domains a task needs during EXECUTE (each with a justification); they are
-# auto-granted to the agent sandbox just before EXECUTE only when they match
-# `allow` and no `deny` pattern, and every grant/refusal is logged as a run
-# event (`sbxloop logs RUN --type policy.`). Patterns: exact domains,
-# "*.example.com" (the domain and all subdomains), or "*" (everything).
-# Empty `allow` (the default) means plans may only use the always-reachable
-# baseline (the Copilot/GitHub hosts, the supported languages' package
-# registries, and apt mirrors) plus the well-known package registries plans
-# may declare without any configuration here. `deny` wins over both,
-# including the always-reachable baseline.
-# See `sbxloop config policy` for the effective per-phase policy.
-allow = []
-deny = []
-
-[github]
-# The GitHub integration. Unset (the default) disables GitHub entirely:
-# no github sandbox is provisioned, GH_TOKEN is not required, and a run
-# stops after its gate with the work in the workspace. Set `repo` to the
-# ONE repository sbxloop works with: every run that passes its gate opens a
-# pull request there and carries it through review, CI and merge (see
-# [landing]). GH_TOKEN needs contents:write + pull_requests:write on it.
-# `sbxloop run --repo owner/repo` overrides this per run.
-# repo = "you/your-repo"
-# deliver_base = "main"   # base branch; unset uses the repo's default
-# Create `repo` when it does not exist (probed up front, so a typo'd repo
-# fails the run before any work; needs a token allowed to create repos).
-# create_repo = false
-# create_public = false   # created repos are private unless flipped
-#
-# Several repositories: declare them as an array of tables instead of the
-# single `repo` above (the two forms are mutually exclusive — migrate by
-# moving `repo` and its delivery settings into one entry; a lone `[github]
-# repo` keeps working unchanged). The daemon polls every enabled entry for
-# the trigger label and routes each run — clone, branch, PR, review, CI,
-# merge, issue comments — to the repository its work item came from.
-# Everything here is PER REPOSITORY; the [daemon] guardrails (daily run
-# cap, per-item attempt cap, circuit breaker, one run at a time) stay
-# daemon-wide and are shared across all of them.
-# [[github.repos]]
-# repo = "you/one"
-# deliver_base = "main"        # base branch; unset uses the repo's default
-# [[github.repos]]
-# repo = "you/two"
-# enabled = false              # registered but not polled
-# token_env = "GH_TOKEN_TWO"   # unset uses the daemon-wide GH_TOKEN
-# trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
-# labels = ["team:core"]       # extra labels for issues/PRs in this repo
-
-[landing]
-# What happens after the tasks are built: the PR opens as a draft, the run
-# reviews its own diff, spends bounded fix rounds on what the review, CI or
-# the base branch object to, un-drafts and merges. Merging is not optional —
-# a run that cannot land its PR ends `blocked` with the PR left open for a
-# human. On a repo whose merges publish, every merged run is a release.
-# deliver_draft = true
-# max_review_rounds = 3      # times the review may request changes
-# max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
-# ci_poll_interval_s = 60
-# ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI"
-# ci_timeout_s = 3600        # per wait; exceeding it ends the run blocked
-# merge_method = "squash"    # squash | merge | rebase
-# delete_branch_on_merge = true
-# merge_update_attempts = 3  # update-branch calls when protection wants "up to date"
-
-[artifacts]
-# Path components excluded from artifact listings, harvest and delivery,
-# matched at any depth (a bare name each, no slashes). Setting this replaces
-# the default list below rather than adding to it. The default drops run/VCS
-# state plus regenerable dependency and build trees — dot-path artifacts like
-# .github/ or .gitignore are kept, and so are the ambiguous generic names
-# (bin, build, dist, out, lib, vendor), which you can add if you want them
-# dropped. Exclusions are counted and surfaced, never silent.
-exclude = [
-  ".git", ".sbxloop",
-  ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
-  ".venv", "venv", "__pycache__", "*.egg-info",   # Python (globs allowed)
-  "node_modules",                            # JavaScript / TypeScript
-  "target",                                  # Rust (cargo), Java (Maven)
-  ".gradle",                                 # Java (Gradle)
-  "obj",                                     # C# / .NET
-  ".bundle",                                 # Ruby (bundler)
-  "CMakeFiles",                              # C / C++
-]
-
-[budgets]
-# Sized for a small greenfield project. A large existing repo (thousands of
-# tests, a multi-package tree to orient in) wants a bigger wall clock and
-# tool cap — see contrib/presets/large-repo.toml.
-max_revisions_per_task = 2
-max_replans_per_task = 1
-max_tasks = 20
-max_wall_clock_s = 7200.0
-per_job_timeout_s = 1800.0
-max_tool_calls_per_phase = 40   # 0 = unbounded; past it the agent is told to wrap up
-
-[limits]
-# Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
-# the worker heartbeat and shown as a gauge in the TUI status panel.
-# Crossing disk_abort fails the current task with an explicit
-# "sandbox disk exhausted" error; mem_abort does the same for memory (off by
-# default: a parallel test run legitimately spikes memory for a heartbeat).
-disk_warn = 85.0
-disk_abort = 95.0
-mem_warn = 90.0
-mem_abort = 0.0
-
-[daemon]
-# `sbxloop daemon` — the always-on outer loop. Polls every configured,
-# enabled [github] repository for
-# issues carrying trigger_label; each one becomes ONE run that builds the
-# work, opens a draft PR, reviews and fixes it, waits for CI and merges it
-# (the landing knobs live under [landing]). The issue closes with
-# completed_label when the PR merges, gets failed_label when the run gave
-# up, blocked_label when GitHub would not let the loop finish. The daemon
-# never files work of its own; a label alone starts a run, so the guardrails
-# below are what stand between a mislabeled issue and your budget. All of
-# them are DAEMON-WIDE: with several repositories configured, the daily run
-# cap, the per-item attempt/resume caps, the consecutive-failure circuit
-# breaker and one-run-at-a-time are shared across every repository.
-# poll_interval_s = 60.0
-# trigger_label = "sbxloop:run"    # issue label that queues work
-# in_progress_label = "sbxloop:in-progress"
-# failed_label = "sbxloop:failed"
-# completed_label = "sbxloop:completed"  # applied when the PR merges
-# blocked_label = "sbxloop:blocked"      # the loop could not land the PR; a human looks
-# max_runs_per_day = 12           # calendar-day cap, persisted across restarts
-# run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
-# max_attempts_per_item = 2
-# max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
-# retry_backoff_s = 900.0          # times the attempt number
-# max_consecutive_failures = 3     # circuit breaker ...
-# breaker_cooldown_s = 3600.0      # ... and how long it stays open
-# shutdown_grace_s = 60.0          # keep below systemd TimeoutStopSec
-# Retention for .sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
-# swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
-# prune_runs_after_days = 14
-# Unattended workspace posture. Point [sandbox] workspace at a dedicated clone
-# nobody edits; before each run the daemon `git fetch`es it and fast-forwards
-# to origin (never merges/rebases), and daemon runs use `clone` isolation so a
-# dirty tree proceeds from HEAD with a warning instead of `auto`'s refusal.
-# workspace_isolation = "clone"    # clone | auto | in-place, for daemon runs
-# refresh_workspace = true
-# Daemon state lives OUTSIDE the workspace, at an absolute path. Unset:
-# $XDG_STATE_HOME/sbxloop/<runner-dir-name> (~/.local/state/...), unless the
-# top-level state_dir is set or a legacy ./.sbxloop/state.db already exists.
-# `sbxloop daemon items|abandon|retry|requeue` follow the same rule;
-# `sbxloop status`/`logs`/`gc` need SBXLOOP_STATE_DIR pointed there.
-# state_dir = "~/.local/state/sbxloop/my-project"
-
-[discord]
-# The daemon's human channel: a gateway bot posts each run's chronology
-# (agent messages, tool lines, issue/PR links) into a thread under a control
-# channel and relays replies typed in the thread to the running agent as
-# steering. Needs `pip install 'sbxloop[discord]'` and DISCORD_BOT_TOKEN in
-# the environment / .env (never here). Anyone who can post in the channel can
-# steer — restrict the channel. Unset channel_id = Discord off.
-# channel_id = 123456789012345678
-# command_prefix = "!sbx"          # !sbx status|pause|resume|cancel|queue
-# thread_per_run = true
-# chronology_level = "normal"      # quiet (lifecycle+links+chat) | normal (tool bursts
-#                                  # digested into one edited line) | verbose (every call)
-# max_message_chars = 1900
-# embeds = true                    # headline / finished / status as embed cards
-# status_line = true               # one per-run message edited as tasks progress
-# tool_batch_lines = 8             # verbose: consecutive tool calls per code block
-# tool_output_lines = 0            # tail output lines echoed for a successful call (0 = none)
-# tool_fail_output_lines = 20      # head+tail output lines echoed for a failed call
-
-[concierge]
-# The control channel's agent: @mention the bot (or reply to it) to ask
-# about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue
-# new work in plain language. Runs as a Copilot session in a long-lived
-# agent sandbox and reaches the daemon only through host tools; needs
-# COPILOT_GITHUB_TOKEN on the daemon host. Acts with the same authority as
-# !sbx. Effective only when [discord] is enabled.
-# enabled = true
-# model = ""                       # empty = the top-level model
-# timeout_s = 180                  # one message's wall-clock budget
-# max_tool_calls = 16
-# session_turns = 40               # rotate the resumed SDK session after N turns
-# github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
-# create_issues = true             # file (queued at once)/list/comment/label/close issues
-#                                  # (a close needs your yes)
-"""
+# The commented default configuration lives in one file — `sbxloop.toml.example`,
+# shipped as package data and published at the repository root — so `sbxloop
+# init` and the example a reader copies can never drift apart.
+DEFAULT_CONFIG_TOML = (
+    resources.files("sbxloop.data").joinpath("sbxloop.toml.example").read_text(encoding="utf-8")
+)
 
 
 def main() -> None:
