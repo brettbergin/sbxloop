@@ -14,7 +14,8 @@ Tiers (:func:`level_for`):
   tooling/resource warnings, permission denials, the tool-call cap,
   config drift.
 - INFO — lifecycle: ``run.*``, task and phase start/state/end, what the
-  structured phases decided (plan, critic verdict), sandbox provisioning,
+  pipeline decided (the review verdict, a fix round, CI's state, the
+  landing steps, merged/blocked), sandbox provisioning,
   worker job start/end/result, GitHub op start/end, policy denials, chat
   (steering) traffic, gc.
 - DEBUG — everything else: individual tool calls, agent messages and
@@ -50,7 +51,13 @@ INFO_TYPES: frozenset[str] = frozenset(
         HostEventTypes.RUN_STATE,
         HostEventTypes.RUN_ARTIFACTS,
         HostEventTypes.RUN_DELIVER,
-        HostEventTypes.RUN_REPORT,
+        HostEventTypes.REVIEW_VERDICT,
+        HostEventTypes.FIX_ROUND,
+        HostEventTypes.CI_STATUS,
+        HostEventTypes.LAND_UNDRAFT,
+        HostEventTypes.LAND_UPDATE,
+        HostEventTypes.RUN_MERGED,
+        HostEventTypes.RUN_BLOCKED,
         HostEventTypes.RUN_KEEP,
         HostEventTypes.RUN_END,
         HostEventTypes.TASK_START,

@@ -128,14 +128,22 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "user_guidance": "(none)",
         "user_message": "how is it going?",
     },
+    "review": {
+        "outcome": "o",
+        "pr_number": "12",
+        "round": "1",
+        "diff": "diff --git a/x b/x",
+        "tasks_summary": "- t1 [done] T",
+        "prior_rounds": "(first review of this pull request)",
+        "user_guidance": "(none)",
+        "project_gate": "- gate rule",
+    },
     "concierge": {
         "command_prefix": "!sbx",
         "repo": "owner/repo",
-        "inbox_dir": ".sbxloop/inbox",
         "model": "auto",
         "tool_notes": "- `sbx_control` — run a verb",
         "daemon_notes": "- poll interval 60s",
-        "backlog_label": "sbxloop:backlog",
         "trigger_label": "sbxloop:run",
     },
 }
@@ -147,21 +155,58 @@ def test_concierge_prompt_carries_contract() -> None:
     actions it did not perform (see the template header)."""
     text = render("concierge", **RENDER_CONTEXTS["concierge"])
     assert text.startswith("# You are the sbxloop concierge")
-    assert "`sbx_control`" in text and "`enqueue_work`" in text and "`create_issue`" in text
+    assert "`sbx_control`" in text and "`create_issue`" in text
+    assert "`enqueue_work`" not in text and "backlog" not in text and "inbox" not in text
     assert "thread" in text and "not here" in text
     assert "Never claim to have done something you did not do" in text
     assert "!sbx" in text  # the configured prefix reaches the model
-    # issues: created in triage, a run only after the person is asked
-    assert "`sbxloop:backlog`" in text and "`sbxloop:run`" in text
-    assert "ask the person whether to add" in text
-    assert "`label_issue_for_run` only after they explicitly say yes" in text
-    assert "`list_issues`" in text and "ask which, if any, should be worked" in text
+    # intake is one hop: the issue is filed with the trigger label and runs
+    assert "`sbxloop:run`" in text
+    assert "`create_issue`, **one call, no confirmation**" in text
+    assert "`label_issue_for_run`" in text and "`list_issues`" in text
+    assert "queue only what\n  the person names" in text
     # triage's other half: a reply is direct, a close never is
     assert "`comment_on_issue`" in text and "`close_issue`" in text
     assert "pass **their own words** as `confirmation`" in text
     assert "The one exception is\n  `close_issue`" in text
     # drift: the concierge reports versions, a human does the upgrading
     assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
+
+
+def test_review_prompt_carries_contract() -> None:
+    """REVIEW reads the PR adversarially through four named lenses, as a
+    read-only session, honours refutations from earlier rounds, and answers
+    in the verdict/severity vocabulary the engine validates (see the
+    template header)."""
+    text = render(
+        "review",
+        outcome="ship the feature",
+        pr_number="42",
+        round="2",
+        diff="diff --git a/app.py b/app.py\n+print('hi')",
+        tasks_summary="- t1 [done] Build",
+        prior_rounds="### Round 1 — request_changes",
+        user_guidance="- use uv",
+        project_gate="- One task's `verify_commands` MUST run `make check`",
+    )
+    assert text.startswith("# Review the pull request")
+    assert "pull request #42" in text and "round 2" in text
+    assert "diff --git a/app.py b/app.py" in text
+    assert "### Round 1 — request_changes" in text
+    assert "make check" in text and "use uv" in text
+    for lens in (
+        "Concurrency and locking",
+        "Failure ordering",
+        "Input validation",
+        "Cross-module interaction",
+    ):
+        assert lens in text, lens
+    assert "read-only" in text
+    assert "Do not modify" in text
+    assert "refuted" in text
+    assert "ONLY the fenced JSON block" in text
+    for word in ("approve", "request_changes", "blocking", "major", "minor", "nit"):
+        assert f"`{word}`" in text or f'"{word}"' in text, word
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:

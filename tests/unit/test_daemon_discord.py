@@ -13,7 +13,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.discord import DiscordBridge, _Pending, format_for_discord, headline_text
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.errors import DaemonError
 from sbxloop.events import Event, EventBus
@@ -71,14 +71,12 @@ class TestFormat:
             assert format_for_discord(ev(t, x=1)) == []
 
     def test_headline_states(self) -> None:
-        item = WorkItem(
-            item_id="gh:4", source="github", source_key="4", title="Fix login", url="https://x/4"
-        )
+        item = WorkItem(item_id="gh:4", source_key="4", title="Fix login", url="https://x/4")
         assert headline_text(item, "r1").startswith(
             "▶ run `r1` — **Fix login** · [issue #4](https://x/4)"
         )
         assert headline_text(item, "r1", "completed").startswith("✅")
-        assert headline_text(item, "r1", "delivery_failed").startswith("⚠")
+        assert headline_text(item, "r1", "blocked").startswith("🚧")
 
 
 # -- fake discord objects --------------------------------------------------------------
@@ -328,7 +326,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             control = client.channels[42]
@@ -351,16 +349,15 @@ class TestBridge:
                     "r1",
                     "completed",
                     "1/1 tasks done",
-                    delivery=(3, "https://x/pull/3"),
-                    filed=("gh:12",),
+                    pr=(3, "https://x/pull/3"),
                 ),
             )
             assert wait_for(
                 lambda: any(s.startswith("**finished: completed**") for s in thread.sent)
             )
-            # what the run filed rides on the finish text (no repo configured → plain #12)
+            # the PR rides on the finish text
             finish_text = next(s for s in thread.sent if s.startswith("**finished"))
-            assert "\n🔀 PR #3 <https://x/pull/3>\n🔎 filed #12" in finish_text
+            assert "\n🔀 PR #3 <https://x/pull/3>" in finish_text
             headline = control.messages[bridge.dstore.discord_thread("r1").headline_id]  # type: ignore[union-attr]
             assert wait_for(lambda: headline.content.startswith("✅"))
             # the finished card is an embed with the PR field
@@ -370,14 +367,14 @@ class TestBridge:
                 if t.startswith("**finished")
             ]
             assert finish_kwargs and finish_kwargs[0].get("embed") is not None
-            assert [f.name for f in finish_kwargs[0]["embed"].fields] == ["PR", "Filed"]
+            assert [f.name for f in finish_kwargs[0]["embed"].fields] == ["PR"]
         finally:
             bridge.close()
 
     def test_bus_subscriber_never_blocks(self, tmp_path: Path) -> None:
         bridge, _client, _ = make_bridge(tmp_path)
         # do NOT start the bridge: nothing drains the queue; emits must still return instantly
-        item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+        item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
         bus = EventBus()
         bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
         t0 = time.time()
@@ -389,7 +386,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bus = EventBus()
             bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
@@ -410,7 +407,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -429,7 +426,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -454,7 +451,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -473,7 +470,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -498,7 +495,7 @@ class TestBridge:
         bridge, client, floop = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -554,7 +551,7 @@ class TestBridge:
         transition answers with the store's reason instead of a traceback."""
         bridge, client, floop = make_bridge(tmp_path)
         floop.dstore.upsert_new(
-            WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A"), 1.0
+            WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A"), 1.0
         )
         floop.dstore.mark_running("inbox:a.md", "r1", 1.0)
         bridge.start()
@@ -592,9 +589,7 @@ class TestBridge:
         finish card); --retry re-queues instead; retry reruns a settled item
         under the author's name."""
         bridge, client, floop = make_bridge(tmp_path)
-        floop.dstore.upsert_new(
-            WorkItem(item_id="gh:8", source="github", source_key="8", title="Eight"), 1.0
-        )
+        floop.dstore.upsert_new(WorkItem(item_id="gh:8", source_key="8", title="Eight"), 1.0)
         floop.dstore.mark_running("gh:8", "r1", 1.0)
         floop.dstore.mark_cancelled("gh:8", "cancelled by op", 2.0)
         bridge.start()
@@ -629,7 +624,7 @@ class TestBridge:
         bridge.start()
         try:
             control = client.channels[42]
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bridge.run_started(item, "r1", engine, EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -767,7 +762,7 @@ class TestBridge:
             assert bridge._thread is not None and bridge._thread.is_alive()
             assert wait_for(lambda: bridge._degraded)
             # events keep flowing in from a run and must be consumed
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             for _ in range(200):
@@ -778,23 +773,60 @@ class TestBridge:
             bridge.close()
         assert bridge._thread is not None and not bridge._thread.is_alive()
 
-    def test_daemon_events_go_to_control_channel(self, tmp_path: Path) -> None:
+    def test_daemon_notices_go_to_control_channel(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            bridge.daemon_event("circuit breaker opened")
-            assert wait_for(lambda: "circuit breaker opened" in client.channels[42].sent)
+            bridge.daemon_notice(
+                DaemonNotice("breaker.opened", "circuit breaker opened", level="warning")
+            )
+            control = client.channels[42]
+            assert wait_for(lambda: any("circuit breaker opened" in s for s in control.sent))
+            # the level rides as a marker; a notice with no run stays in the channel
+            assert any(s.startswith("⚠ circuit breaker opened") for s in control.sent)
             # URLs are masked so notices do not unfurl; an item we ran points at its thread
-            item = WorkItem(item_id="gh:8", source="github", source_key="8", title="T")
+            item = WorkItem(item_id="gh:8", source_key="8", title="T")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             tid = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
-            bridge.daemon_event("✅ gh:8 done (1/1 tasks done) · PR https://x/pull/9")
-            assert wait_for(
-                lambda: any(
-                    "<https://x/pull/9>" in s and f"<#{tid}>" in s for s in client.channels[42].sent
+            bridge.daemon_notice(
+                DaemonNotice(
+                    "run.done",
+                    "✅ gh:8 done (1/1 tasks done) · PR https://x/pull/9",
+                    item_id="gh:8",
+                    run_id="r1",
+                    url="https://x/pull/9",
                 )
             )
+            assert wait_for(
+                lambda: any("<https://x/pull/9>" in s and f"<#{tid}>" in s for s in control.sent)
+            )
+            # ...and the same line landed in the run's thread, without the pointer
+            thread = client.channels[tid]
+            assert wait_for(lambda: any("<https://x/pull/9>" in s for s in thread.sent))
+            assert not any(f"<#{tid}>" in s for s in thread.sent)
+        finally:
+            bridge.close()
+
+    def test_non_terminal_run_notices_stay_in_the_thread(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="gh:8", source_key="8", title="T")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            tid = bridge.dstore.discord_thread("r1").thread_id  # type: ignore[union-attr]
+            bridge.daemon_notice(
+                DaemonNotice("run.resuming", "resuming r1 (attempt 2)", item_id="gh:8", run_id="r1")
+            )
+            thread = client.channels[tid]
+            assert wait_for(lambda: any("resuming r1" in s for s in thread.sent))
+            assert not any("resuming r1" in s for s in client.channels[42].sent)
+            # a run the bridge never opened a thread for falls back to the channel
+            bridge.daemon_notice(
+                DaemonNotice("run.resuming", "resuming r9 (attempt 2)", item_id="gh:9", run_id="r9")
+            )
+            assert wait_for(lambda: any("resuming r9" in s for s in client.channels[42].sent))
         finally:
             bridge.close()
 
@@ -803,7 +835,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path, chronology_level="verbose")
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -840,7 +872,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -892,7 +924,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path, command_prefix="!loop")
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -921,7 +953,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -966,9 +998,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(
-                item_id="gh:4", source="github", source_key="4", title="Fix", url="https://x/4"
-            )
+            item = WorkItem(item_id="gh:4", source_key="4", title="Fix", url="https://x/4")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -994,7 +1024,7 @@ class TestBridge:
         bridge.dstore.record_discord_thread("r1", 42, 4242, None)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             bus.emit("agent.message", "r1", content="resumed work", agent="executor")
@@ -1022,7 +1052,7 @@ class TestBridge:
 
         client.start = slow_start  # type: ignore[method-assign]
         bridge.start(connect_wait_s=0.2)
-        item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+        item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
         bus = EventBus()
         bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
         bus.emit("agent.message", "r1", content="all done quickly", agent="executor")
@@ -1048,7 +1078,7 @@ class TestBridge:
 
         client.start = never_ready  # type: ignore[method-assign]
         bridge.start(connect_wait_s=0.1)
-        bridge.daemon_event("queued something")
+        bridge.daemon_notice(DaemonNotice("item.queued", "queued something", item_id="gh:1"))
         t0 = time.time()
         bridge.close(drain_wait_s=0.5)
         assert time.time() - t0 < 5
@@ -1060,7 +1090,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bus = EventBus()
             bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -1077,7 +1107,7 @@ class TestBridge:
             bus.emit("task.state", "r1", task_id="t1", state="done", revisions=1)
             bridge.run_finished(
                 item,
-                RunReport("r1", "completed", "1/1 tasks done", delivery=(3, "https://x/pull/3")),
+                RunReport("r1", "completed", "1/1 tasks done", pr=(3, "https://x/pull/3")),
             )
             assert wait_for(lambda: any(s.startswith("📊 **run summary**") for s in thread.sent))
             # After the finish card, nothing else lands in the thread.
@@ -1103,7 +1133,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             engine = FakeEngine()
             bus = EventBus()
             bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
@@ -1148,7 +1178,7 @@ class TestBridge:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
             thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
@@ -1180,7 +1210,7 @@ class TestBridge:
 
         client.start = slow_start  # type: ignore[method-assign]
         bridge.start(connect_wait_s=0.2)
-        item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+        item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
         bus = EventBus()
         engine = FakeEngine()
         bridge.run_started(item, "r1", engine, bus)  # type: ignore[arg-type]
@@ -1259,7 +1289,7 @@ class TestRunWatches:
         )
         store = StateStore(tmp_path / "state" / "state.db")
         store.create_run("r1", "Ship it")
-        store.set_run_state("r1", "running")
+        store.set_run_state("r1", "building")
         turn(concierge, author=author)
         assert bridge._watchers == {"r1": ["555"]}
 
@@ -1273,7 +1303,7 @@ class TestRunWatches:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             control = client.channels[42]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -1285,7 +1315,7 @@ class TestRunWatches:
                     "r1",
                     "completed",
                     "1/1 tasks done",
-                    delivery=(3, "https://x/pull/3"),
+                    pr=(3, "https://x/pull/3"),
                 ),
             )
             assert wait_for(lambda: any(s.startswith("<@1> run `r1`") for s in control.sent))
@@ -1308,7 +1338,7 @@ class TestRunWatches:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             control = client.channels[42]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -1323,7 +1353,7 @@ class TestRunWatches:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             control = client.channels[42]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -1364,7 +1394,7 @@ class TestRunWatches:
         assert bridge._watchers == {"r1": ["1"]}
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             control = client.channels[42]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
@@ -1475,7 +1505,7 @@ class TestRunWatches:
         bridge._remember_requester("Discord user `brett`", "1")
         assert bridge.on_watch("r1", "Discord user `brett`") is None
         bridge.dstore.upsert_new(
-            WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A"), 1.0
+            WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A"), 1.0
         )
         bridge.dstore.mark_running("inbox:a.md", "r1", 1.0)
         bridge.dstore.finish_ledger("r1", "completed", 2.0)
@@ -1497,7 +1527,7 @@ class TestRunWatches:
         bridge, client, _ = make_bridge(tmp_path)
         bridge.start()
         try:
-            item = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A")
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
             bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
             control = client.channels[42]
             assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)

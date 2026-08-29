@@ -140,6 +140,33 @@ The job also sets `GH_TOKEN` explicitly on any step calling `gh`. The host's `se
 exports its own `GH_TOKEN`, and the `sbxloop` wrapper sources it with `set -a`; without the
 override, a host PAT would be the identity for Actions API calls.
 
+## 1.0 cutover
+
+The 1.0 pipeline (one run from issue to merged PR; no self-filed audits,
+post-mortems or backlog issues; landing under `[landing]`) changes what the
+daemon keeps on disk and which config keys exist. Because this pipeline
+deploys unattended, none of that may fail the restart:
+
+- **State.** A pre-1.0 `state.db` carries the old lanes' tables and item
+  kinds. On its first start the new daemon moves the whole file aside to
+  `state.db.pre-1.0` (plus `-wal`/`-shm`; a timestamp is appended if that
+  name is taken), logs `store.archived_legacy`, tells Discord, and starts
+  with empty tables. Engine run history goes with it — both stores share the
+  file. Nothing is migrated; renaming the file back restores the old world
+  for a 0.7.x rollback.
+- **Config.** The retired keys — `[daemon] inbox_dir, backlog*, audits, audit_dir, audit_label, backlog_label, delivered_label, postmortems*, review_deliveries, await_review, review_rounds, tool_repo, tracking_issue, close_on_success, auto_merge` and `[github] report, deliver` — still load, with a `config.retired_keys` warning at startup and
+  a `retired config keys` row in `sbxloop doctor`. `deliver_draft`,
+  `merge_method`, `delete_branch_on_merge` and `merge_update_attempts` are
+  carried into `[landing]` unless it sets them itself. They become hard
+  errors in 1.0.0, so edit the host's `sbxloop.toml` at leisure after the
+  first deploy: delete the retired keys and move `auto_merge = true`'s
+  intent — landing is always on now — by simply removing it.
+- **Issues and labels.** The old loop's `sbxloop:backlog` / `sbxloop:audit`
+  issues are closed by hand at cutover (`gh issue close --reason "not planned"`), those two labels and `sbxloop:delivered` deleted, and
+  `sbxloop:blocked` created. Any of the old loop's PRs still open
+  (`gh pr list --search "head:sbxloop/ is:open"`) are merged or closed by
+  hand — their items went with the archived state.
+
 ## Operating it
 
 ```bash

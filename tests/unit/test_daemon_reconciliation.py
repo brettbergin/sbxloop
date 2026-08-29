@@ -33,7 +33,7 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult
 from sbxloop.errors import RunCancelledError
 from sbxloop.events import Event, EventBus
-from tests.unit.test_daemon_loop import Harness, inbox_item
+from tests.unit.test_daemon_loop import Harness, gh_item
 
 
 def _fresh_daemon(h: Harness) -> Harness:
@@ -55,16 +55,16 @@ class TestAbruptTerminationRecovery:
 
     def test_orphan_run_of_settled_item_is_failed_on_next_start(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
-        h.dstore.upsert_new(inbox_item(), now=1.0)
-        h.dstore.mark_claimed("inbox:a.md", now=1.0)
-        h.dstore.mark_running("inbox:a.md", "r_kill", now=2.0)
+        h.dstore.upsert_new(gh_item(), now=1.0)
+        h.dstore.mark_claimed("gh:1", now=1.0)
+        h.dstore.mark_running("gh:1", "r_kill", now=2.0)
         h.store.create_run("r_kill", "x")
-        h.store.set_run_state("r_kill", "running")
+        h.store.set_run_state("r_kill", "building")
         h.store.append_event(Event.now("run.started", "r_kill"))
         before = [e.type for _, e in h.store.events("r_kill")]
         # The item was settled but the process died before the run row was
         # ever closed — exactly the #374 field shape.
-        h.dstore.mark_done("inbox:a.md", 3.0)
+        h.dstore.mark_done("gh:1", 3.0)
 
         fresh = _fresh_daemon(h)
         fresh.loop.recover()
@@ -79,13 +79,13 @@ class TestAbruptTerminationRecovery:
 
     def test_cancelled_item_run_is_cancelled_with_attribution(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
-        h.dstore.upsert_new(inbox_item(), now=1.0)
-        h.dstore.mark_claimed("inbox:a.md", now=1.0)
-        h.dstore.mark_running("inbox:a.md", "r_cancelled", now=2.0)
+        h.dstore.upsert_new(gh_item(), now=1.0)
+        h.dstore.mark_claimed("gh:1", now=1.0)
+        h.dstore.mark_running("gh:1", "r_cancelled", now=2.0)
         h.store.create_run("r_cancelled", "x")
-        h.store.set_run_state("r_cancelled", "running")
+        h.store.set_run_state("r_cancelled", "building")
         h.dstore.mark_cancelled(
-            "inbox:a.md", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
+            "gh:1", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
         )
 
         fresh = _fresh_daemon(h)
@@ -97,7 +97,7 @@ class TestAbruptTerminationRecovery:
         assert "work item cancelled" in record.reason and "brett.bergin" in record.reason
         events = [e for _, e in fresh.store.events("r_cancelled")]
         assert [e.type for e in events] == ["run.reconciled"]
-        assert events[-1].data["previous_state"] == "running"
+        assert events[-1].data["previous_state"] == "building"
 
 
 class TestCancelConsistency:
@@ -114,13 +114,13 @@ class TestCancelConsistency:
         ) -> RunResult:
             h.runs.append((run_id, resume))
             h.store.create_run(run_id, "x")
-            h.store.set_run_state(run_id, "running")
+            h.store.set_run_state(run_id, "building")
             started.set()
             assert cancelled.wait(5)
             raise RunCancelledError(f"run {run_id} interrupted")
 
         h.loop._runner = runner
-        h.source.items = [inbox_item()]
+        h.source.items = [gh_item()]
         thread = threading.Thread(target=h.loop.tick)
         thread.start()
         assert started.wait(5)
@@ -139,7 +139,7 @@ class TestCancelConsistency:
         assert record.reason is not None and "brett.bergin" in record.reason
         types = [e.type for _, e in h.store.events(run_id)]
         assert "run.cancelled" in types
-        item = h.dstore.get("inbox:a.md")
+        item = h.dstore.get("gh:1")
         assert item is not None and item.state == "cancelled"
         assert item.last_error is not None and "brett.bergin" in item.last_error
         # Nothing is left looking active.
@@ -153,7 +153,7 @@ class TestCancelConsistency:
         record = h.store.get_run(run_id)
         assert record.state in TERMINAL_RUN_STATES
         assert record.reason is not None and "brett.bergin" in record.reason
-        item = h.dstore.get("inbox:a.md")
+        item = h.dstore.get("gh:1")
         # Re-queued to run fresh — and crucially not pinned to a phantom run.
         assert item is not None and item.state == "queued"
         assert h.store.non_terminal_runs() == []
@@ -169,13 +169,13 @@ class TestCancelConsistency:
         ) -> RunResult:
             h.runs.append((run_id, resume))
             h.store.create_run(run_id, "x")
-            h.store.set_run_state(run_id, "running")
+            h.store.set_run_state(run_id, "building")
             started.set()
             assert cancelled.wait(5)
             raise RunCancelledError("boundary")
 
         h.loop._runner = runner
-        h.source.items = [inbox_item()]
+        h.source.items = [gh_item()]
         thread = threading.Thread(target=h.loop.tick)
         thread.start()
         assert started.wait(5)
@@ -187,7 +187,7 @@ class TestCancelConsistency:
         record = h.store.get_run(h.runs[0][0])
         assert record.state == "cancelled"
         assert record.reason is not None and "brett.bergin" in record.reason
-        item = h.dstore.get("inbox:a.md")
+        item = h.dstore.get("gh:1")
         assert item is not None and item.state == "cancelled"
 
 
@@ -197,26 +197,26 @@ class TestLiveRunNotReconciled:
     def test_in_flight_run_survives_recover(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.store.create_run("r_live", "x")
-        h.store.set_run_state("r_live", "running")
-        h.loop._current = RunHandle(inbox_item("live.md"), "r_live", cast(Any, None), EventBus())
+        h.store.set_run_state("r_live", "building")
+        h.loop._current = RunHandle(gh_item("2"), "r_live", cast(Any, None), EventBus())
 
         h.loop.recover()
 
-        assert h.store.get_run("r_live").state == "running"
+        assert h.store.get_run("r_live").state == "building"
         assert [e.type for _, e in h.store.events("r_live")] == []
 
     def test_resume_pending_run_survives_recover(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
-        h.dstore.upsert_new(inbox_item(), now=1.0)
-        h.dstore.mark_claimed("inbox:a.md", now=1.0)
-        h.dstore.mark_running("inbox:a.md", "r_resume", now=2.0)
+        h.dstore.upsert_new(gh_item(), now=1.0)
+        h.dstore.mark_claimed("gh:1", now=1.0)
+        h.dstore.mark_running("gh:1", "r_resume", now=2.0)
         h.store.create_run("r_resume", "x")
-        h.store.set_run_state("r_resume", "running")
+        h.store.set_run_state("r_resume", "building")
 
         h.loop.recover()
 
-        assert h.store.get_run("r_resume").state == "running"
-        item = h.dstore.get("inbox:a.md")
+        assert h.store.get_run("r_resume").state == "building"
+        item = h.dstore.get("gh:1")
         assert item is not None and item.state == "queued" and item.run_id == "r_resume"
         assert [e.type for _, e in h.store.events("r_resume")] == []
 
@@ -226,7 +226,7 @@ class TestStatusAndListAgree:
 
     def test_idle_daemon_reports_no_active_runs_after_recover(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
-        for run_id, state in (("r_orph", "running"), ("r_dec", "decomposing")):
+        for run_id, state in (("r_orph", "building"), ("r_dec", "decomposing")):
             h.store.create_run(run_id, "x")
             h.store.set_run_state(run_id, state)
         h.store.create_run("r_done", "x")
@@ -242,12 +242,12 @@ class TestStatusAndListAgree:
 
     def test_live_run_is_the_only_active_run_after_recover(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
-        for run_id, state in (("r_orph", "running"), ("r_dec", "decomposing")):
+        for run_id, state in (("r_orph", "building"), ("r_dec", "decomposing")):
             h.store.create_run(run_id, "x")
             h.store.set_run_state(run_id, state)
         h.store.create_run("r_live", "x")
-        h.store.set_run_state("r_live", "running")
-        h.loop._current = RunHandle(inbox_item("live.md"), "r_live", cast(Any, None), EventBus())
+        h.store.set_run_state("r_live", "building")
+        h.loop._current = RunHandle(gh_item("2"), "r_live", cast(Any, None), EventBus())
 
         h.loop.recover()
 

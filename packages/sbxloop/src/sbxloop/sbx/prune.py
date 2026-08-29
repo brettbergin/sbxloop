@@ -19,6 +19,7 @@ import time
 
 from pydantic import BaseModel, ConfigDict
 
+from sbxloop.engine.model import TERMINAL_RUN_STATES
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, StateError
 from sbxloop.ids import is_run_id
@@ -26,10 +27,10 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxInfo, SandboxRole
 from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV, COPILOT_TOKEN_HOST
 
-# A run in one of these states has already had (or never needed) its
-# teardown: any of its sandboxes still present are leaked. "failed" is safe
-# to include even though it is resumable — resume re-provisions a fresh pair.
-TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+# A run in a terminal state has already had (or never needed) its teardown:
+# any of its sandboxes still present are leaked. The resumable terminal
+# states ("failed", "blocked", "cancelled") are safe to include — resume
+# re-provisions a fresh pair.
 
 # Age a run must be inactive before its sandboxes count as orphaned. Guards
 # against racing a run that another terminal just started or is mid-phase.

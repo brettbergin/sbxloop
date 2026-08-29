@@ -24,8 +24,69 @@ class TestRuns:
     def test_create_get_update(self, store: StateStore) -> None:
         record = store.create_run("r1", "do things", "{}")
         assert record.state == "created"
-        store.set_run_state("r1", "running")
-        assert store.get_run("r1").state == "running"
+        store.set_run_state("r1", "building")
+        assert store.get_run("r1").state == "building"
+
+    def test_stage_tracks_non_terminal_states_and_survives_terminal_ones(
+        self, store: StateStore
+    ) -> None:
+        """`stage` is where a resume re-enters: every non-terminal state
+        writes it, a terminal state leaves it, so a failed/blocked run still
+        knows the stage it stopped in."""
+        store.create_run("r1", "x")
+        assert store.get_run("r1").stage is None
+        for state in ("provisioning", "decomposing", "building", "gating", "delivering"):
+            store.set_run_state("r1", state)  # type: ignore[arg-type]
+            assert store.get_run("r1").stage == state
+        store.set_run_state("r1", "awaiting_ci")
+        store.set_run_state("r1", "blocked")
+        run = store.get_run("r1")
+        assert (run.state, run.stage) == ("blocked", "awaiting_ci")
+        store.set_run_state("r1", "landing")
+        store.set_run_state("r1", "merged")
+        run = store.get_run("r1")
+        assert (run.state, run.stage) == ("merged", "landing")
+
+    def test_reason_round_trips_and_clears(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        assert store.get_run("r1").reason is None
+        store.set_run_reason("r1", "ci fix rounds exhausted")
+        assert store.get_run("r1").reason == "ci fix rounds exhausted"
+        store.set_run_reason("r1", None)
+        assert store.get_run("r1").reason is None
+        with pytest.raises(StateError, match="unknown run"):
+            store.set_run_reason("ghost", "x")
+
+    def test_legacy_run_states_read_as_building(self, store: StateStore) -> None:
+        """A pre-pipeline database holds runs in `running` / `finalizing`;
+        both meant "the task graph is being worked", which `building` now
+        names, so they read back remapped from get_run and list_runs alike
+        and the run still lists and resumes."""
+        store.create_run("r1", "x")
+        store.create_run("r2", "y")
+        store._conn.execute("UPDATE runs SET state = 'running' WHERE run_id = 'r1'")
+        store._conn.execute("UPDATE runs SET state = 'finalizing' WHERE run_id = 'r2'")
+        store._conn.commit()
+        assert store.get_run("r1").state == "building"
+        assert store.get_run("r2").state == "building"
+        assert {r.run_id: r.state for r in store.list_runs()} == {
+            "r1": "building",
+            "r2": "building",
+        }
+        # nothing else is remapped
+        store.set_run_state("r1", "gating")
+        assert store.get_run("r1").state == "gating"
+
+    def test_touch_run_refreshes_updated_at_only(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        store.set_run_state("r1", "awaiting_ci")
+        before = store.get_run("r1")
+        store._conn.execute("UPDATE runs SET updated_at = 1.0 WHERE run_id = 'r1'")
+        store._conn.commit()
+        store.touch_run("r1")
+        after = store.get_run("r1")
+        assert after.updated_at > 1.0
+        assert (after.state, after.stage) == (before.state, before.stage)
 
     def test_duplicate_run_rejected(self, store: StateStore) -> None:
         store.create_run("r1", "x")
@@ -68,41 +129,20 @@ class TestTasks:
         assert loaded.last_feedback == "try harder"
         assert loaded.session_id == "s-1"
 
-    def test_legacy_states_remap_on_read(self, store: StateStore) -> None:
-        """Rows persisted by the six-phase pipeline remap onto the live
-        vocabulary before pydantic sees them, so mid-flight runs resume
-        across the upgrade: planning never committed work (fresh BUILD);
-        scrutinizing has a committed report (idempotent VERIFY re-entry);
-        validating re-derives its verify evidence the same way."""
+    def test_append_task_orders_after_the_saved_graph(self, store: StateStore) -> None:
+        """A fix round is appended behind every graph task, and a second
+        one behind the first — `save_tasks` numbers from zero and would
+        collide with the graph already saved."""
         store.create_run("r1", "x")
-        store.save_tasks("r1", [TaskSpec(id=t, title=t.upper()) for t in ("t1", "t2", "t3", "t4")])
-        for task_id, legacy in (
-            ("t1", "planning"),
-            ("t2", "scrutinizing"),
-            ("t3", "validating"),
-            ("t4", "done"),
-        ):
-            store._conn.execute(
-                "UPDATE tasks SET state = ? WHERE run_id = 'r1' AND task_id = ?",
-                (legacy, task_id),
-            )
-        store._conn.commit()
-        states = {t.spec.id: t.state for t in store.get_tasks("r1")}
-        assert states == {
-            "t1": "executing",
-            "t2": "verifying",
-            "t3": "verifying",
-            "t4": "done",
-        }
-
-    def test_legacy_plan_json_is_ignored_not_fatal(self, store: StateStore) -> None:
-        """A pre-upgrade row's plan_json column may hold anything; reading
-        the task must not parse it (the column stays, unread)."""
-        store.create_run("r1", "x")
-        store.save_tasks("r1", [TaskSpec(id="t1", title="A")])
-        store._conn.execute("UPDATE tasks SET plan_json = '{not even json' WHERE run_id = 'r1'")
-        store._conn.commit()
-        assert store.get_tasks("r1")[0].spec.id == "t1"
+        store.save_tasks("r1", [TaskSpec(id="t1", title="A"), TaskSpec(id="t2", title="B")])
+        fix1 = store.append_task("r1", TaskSpec(id="fix-1", title="Fix"))
+        assert fix1.state == "pending" and fix1.spec.id == "fix-1"
+        store.append_task("r1", TaskSpec(id="fix-2", title="Fix again"))
+        assert [t.spec.id for t in store.get_tasks("r1")] == ["t1", "t2", "fix-1", "fix-2"]
+        # the appended task is updatable like any other
+        fix1.state = "done"
+        store.update_task("r1", fix1)
+        assert [t.state for t in store.get_tasks("r1")] == ["pending", "pending", "done", "pending"]
 
     def test_update_unknown_task(self, store: StateStore) -> None:
         store.create_run("r1", "x")
@@ -352,9 +392,12 @@ class TestReconciliation:
     def test_non_terminal_runs_filters_and_orders(self, store: StateStore) -> None:
         for run_id, state in (
             ("r_done", "completed"),
+            ("r_merged", "merged"),
+            ("r_blocked", "blocked"),
             ("r_failed", "failed"),
             ("r_cancelled", "cancelled"),
-            ("r_run", "running"),
+            ("r_run", "building"),
+            ("r_ci", "awaiting_ci"),
             ("r_dec", "decomposing"),
         ):
             store.create_run(run_id, run_id)
@@ -362,13 +405,13 @@ class TestReconciliation:
         store.create_run("r_created", "left as created")
 
         records = store.non_terminal_runs()
-        assert {r.run_id for r in records} == {"r_run", "r_dec", "r_created"}
+        assert {r.run_id for r in records} == {"r_run", "r_ci", "r_dec", "r_created"}
         stamps = [r.updated_at for r in records]
         assert stamps == sorted(stamps)
 
     def test_reconcile_run_writes_state_and_reason(self, store: StateStore) -> None:
         store.create_run("r_run", "o")
-        store.set_run_state("r_run", "running")
+        store.set_run_state("r_run", "building")
 
         store.reconcile_run("r_run", "cancelled", "work item cancelled")
 
@@ -380,13 +423,13 @@ class TestReconciliation:
     def test_reconcile_run_rejects_non_terminal_and_unknown(self, store: StateStore) -> None:
         store.create_run("r_run", "o")
         with pytest.raises(StateError):
-            store.reconcile_run("r_run", "running", "nope")
+            store.reconcile_run("r_run", "building", "nope")
         with pytest.raises(StateError):
             store.reconcile_run("missing", "failed", "nope")
 
     def test_reconcile_does_not_touch_events(self, store: StateStore) -> None:
         store.create_run("r_run", "o")
-        store.set_run_state("r_run", "running")
+        store.set_run_state("r_run", "building")
         store.append_event(Event(ts=1.0, run_id="r_run", type="run.start", data={"i": 1}))
         before = list(store.events("r_run"))
 
@@ -410,20 +453,139 @@ class TestReconciliation:
         )
         conn.execute(
             "INSERT INTO runs (run_id, outcome, state, created_at, updated_at)"
-            " VALUES ('old', 'legacy', 'running', 1.0, 2.0)"
+            " VALUES ('old', 'legacy', 'building', 1.0, 2.0)"
         )
         conn.commit()
         conn.close()
 
         store = StateStore(db)
         record = store.get_run("old")
-        assert record.state == "running"
+        assert record.state == "building"
         assert record.reason is None
+        assert record.stage is None and record.pr_number is None
+        assert record.review_rounds == 0 and record.update_head is None
         store.reconcile_run("old", "failed", "orphaned: daemon restarted")
         assert store.get_run("old").reason == "orphaned: daemon restarted"
         store.close()
 
         assert StateStore(db).get_run("old").state == "failed"
+
+
+class TestPipelineColumns:
+    """The pull request and the round budgets live on the runs row so a
+    resumed run picks the pipeline up exactly where it stopped."""
+
+    def test_set_run_pr_round_trips_and_moves_the_head(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        run = store.get_run("r1")
+        assert (run.pr_number, run.pr_url, run.branch, run.head_sha, run.pr_node_id) == (
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        store.set_run_pr(
+            "r1",
+            number=9,
+            url="https://x/pull/9",
+            branch="sbxloop/r1",
+            head_sha="aaa",
+            node_id="PR_node9",
+        )
+        run = store.get_run("r1")
+        assert (run.pr_number, run.pr_url, run.branch, run.head_sha, run.pr_node_id) == (
+            9,
+            "https://x/pull/9",
+            "sbxloop/r1",
+            "aaa",
+            "PR_node9",
+        )
+        # A re-delivery moves the head; a missing node id keeps the old one.
+        store.set_run_pr(
+            "r1", number=9, url="https://x/pull/9", branch="sbxloop/r1", head_sha="bbb"
+        )
+        run = store.get_run("r1")
+        assert run.head_sha == "bbb" and run.pr_node_id == "PR_node9"
+        assert store.list_runs()[0].pr_number == 9
+
+    def test_set_run_pr_clears_the_update_marker(self, store: StateStore) -> None:
+        """An update-branch marker that outlived the head it was requested
+        at would park the landing stage forever."""
+        store.create_run("r1", "x")
+        store.set_update_head("r1", "aaa")
+        assert store.get_run("r1").update_head == "aaa"
+        store.set_run_pr("r1", number=9, url="u", branch="b", head_sha="ccc")
+        assert store.get_run("r1").update_head is None
+        store.set_update_head("r1", None)
+        assert store.get_run("r1").update_head is None
+
+    def test_set_run_head_and_verdict(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        store.set_run_head("r1", "ddd")
+        store.set_run_verdict("r1", "request_changes")
+        run = store.get_run("r1")
+        assert run.head_sha == "ddd" and run.last_verdict == "request_changes"
+
+    def test_bump_run_counter_is_whitelisted_and_returns_the_count(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        assert store.bump_run_counter("r1", "review_rounds") == 1
+        assert store.bump_run_counter("r1", "review_rounds") == 2
+        assert store.bump_run_counter("r1", "ci_rounds") == 1
+        assert store.bump_run_counter("r1", "update_attempts") == 1
+        run = store.get_run("r1")
+        assert (run.review_rounds, run.ci_rounds, run.update_attempts) == (2, 1, 1)
+        with pytest.raises(StateError, match="not a run counter"):
+            store.bump_run_counter("r1", "state")
+        with pytest.raises(StateError, match="not a run counter"):
+            store.bump_run_counter("r1", "review_rounds; DROP TABLE runs")
+        assert store.get_run("r1").review_rounds == 2
+
+    @pytest.mark.parametrize(
+        "method",
+        ["set_run_pr", "set_run_head", "set_run_verdict", "set_update_head", "bump_run_counter"],
+    )
+    def test_unknown_run_is_refused(self, store: StateStore, method: str) -> None:
+        calls = {
+            "set_run_pr": lambda: store.set_run_pr(
+                "ghost", number=1, url="u", branch="b", head_sha="h"
+            ),
+            "set_run_head": lambda: store.set_run_head("ghost", "h"),
+            "set_run_verdict": lambda: store.set_run_verdict("ghost", "approve"),
+            "set_update_head": lambda: store.set_update_head("ghost", "h"),
+            "bump_run_counter": lambda: store.bump_run_counter("ghost", "ci_rounds"),
+        }
+        with pytest.raises(StateError, match="unknown run"):
+            calls[method]()
+
+    def test_pre_pipeline_database_migrates_in_place(self, tmp_path: Path) -> None:
+        """A state.db from before the pipeline columns opens cleanly, gains
+        them with their defaults, and its old rows stay readable."""
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
+            " state TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}',"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL,"
+            " workspace TEXT, mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT,"
+            " user_guidance TEXT NOT NULL DEFAULT '[]', reason TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO runs (run_id, outcome, state, created_at, updated_at)"
+            " VALUES ('old', 'legacy', 'completed', 1.0, 2.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = StateStore(db)
+        run = store.get_run("old")
+        assert run.stage is None and run.pr_number is None and run.head_sha is None
+        assert (run.review_rounds, run.ci_rounds, run.update_attempts) == (0, 0, 0)
+        assert run.update_head is None and run.last_verdict is None
+        store.set_run_pr("old", number=1, url="u", branch="b", head_sha="h")
+        assert store.bump_run_counter("old", "ci_rounds") == 1
+        # reopening does not re-apply the ALTERs
+        assert StateStore(db).get_run("old").pr_number == 1
 
 
 class TestWriterSerialization:

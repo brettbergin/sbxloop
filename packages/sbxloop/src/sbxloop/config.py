@@ -32,10 +32,12 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     ValidationError,
     field_validator,
     model_validator,
 )
+from pydantic.functional_validators import ModelWrapValidatorHandler
 
 from sbxloop.errors import ConfigError
 from sbxloop.log import LogFormat, LogLevel, get_logger
@@ -90,11 +92,12 @@ class SandboxConfig(_ConfigModel):
     # updates that same branch, so the pull request already open on it is
     # updated rather than a second one opened.
     #
-    # Set per run by the daemon for a fix round; never configured by hand.
-    # An absent branch fails provisioning on purpose — a round that fell
-    # back to the default branch would deliver a tree that never contained
-    # the PR's work, and force-updating the branch with it destroys that
-    # work. A failed provision is recoverable; that is not.
+    # Set by the engine when a run is resumed after its workspace clone was
+    # pruned — the PR branch is the durable copy of the work; never
+    # configured by hand. An absent branch fails provisioning on purpose:
+    # a resume that fell back to the default branch would deliver a tree
+    # that never contained the PR's work, and force-updating the branch with
+    # it destroys that work. A failed provision is recoverable; that is not.
     # The one command that runs everything this project holds itself to.
     # Unset: detected from what the project declares (a `check`/`ci` target in
     # a makefile, justfile or Taskfile; an npm script; tox.ini; noxfile.py) —
@@ -172,26 +175,22 @@ class PolicyConfig(_ConfigModel):
 class GithubConfig(_ConfigModel):
     """The GitHub integration. ``repo`` is the gate: unset (the default)
     disables GitHub entirely — no github sandbox is provisioned, no GH_TOKEN
-    is required, and repo-facing features (progress reporting, delivery)
-    refuse to run. Setting it makes ``repo`` the one repository sbxloop is
-    allowed to work with; behavior toggles like ``report`` act on it."""
+    is required, and the run ends ``completed`` after its gate with nothing
+    delivered. Setting it makes ``repo`` the one repository sbxloop works
+    with: every run that passes its gate opens a pull request there and
+    carries it through review, CI and merge (see ``[landing]``)."""
 
     repo: str | None = None
-    report: bool = False
-    # Publish a completed run's artifacts as a PR to `repo`.
-    deliver: bool = False
     deliver_base: str | None = None  # base branch; None → the repo's default
-    deliver_draft: bool = False
     # Create `repo` when it does not exist (probed right after provisioning,
     # so a missing repo fails the run before any work). Opt-in so a typo'd
     # repo errors instead of silently delivering into a fresh repository;
     # needs a token that may create repositories for the owner.
     create_repo: bool = False
     create_public: bool = False  # created repositories are private by default
-    # Issue in `repo` this delivery resolves; rendered as "Closes #N" in the
-    # PR body so GitHub links issue and PR and closes the issue on merge
-    # even when the daemon is not running. Set per-run by the daemon for
-    # issue-sourced patch items; inbox work has no issue and leaves it unset.
+    # Issue in `repo` this run resolves; rendered as "Closes #N" in the PR
+    # body so GitHub links issue and PR and closes the issue on merge even
+    # when the daemon is not running. Set per run by the daemon.
     deliver_closes: int | None = Field(default=None, ge=1)
 
     @field_validator("repo")
@@ -351,44 +350,124 @@ class Budgets(_ConfigModel):
     max_parallel_tasks: int = Field(default=1, ge=1)
 
 
-BacklogMode = Literal["off", "github", "inbox"]
-
 # How a landed PR is written onto the base branch. Squash is the default:
 # one autonomous PR becomes one commit, so the base branch's history reads
 # one line per issue rather than carrying every fix round separately.
 MergeMethod = Literal["squash", "merge", "rebase"]
 
 
+class LandingConfig(_ConfigModel):
+    """What happens to a run's work after its tasks are built: the pull
+    request, the loop's own review of it, the fix rounds, the CI wait and
+    the merge — all stages of the same run (see ``engine.model.RunState``).
+    Effective only with ``[github] repo`` set; without a repository a run
+    stops ``completed`` after its gate.
+
+    The PR opens as a draft and is taken out of draft only once the review
+    approves and CI is green, so a watching human sees "draft" mean
+    "sbxloop is still working on this". Merging is not optional: a run that
+    cannot land its PR ends ``blocked`` with the PR left open for a human,
+    never ``done`` with an unmerged PR. On a repository whose merges publish
+    (sbxloop's own does), every merged run is therefore an unattended
+    release.
+
+    Two round budgets bound the fix loop. ``max_review_rounds`` is how many
+    times the review may request changes before the run gives up;
+    ``max_ci_rounds`` covers the mechanical failures — a red project gate
+    before delivery, red CI, a conflict with the base, a human requesting
+    changes on the PR. Each round is a fix task (BUILD + VERIFY) followed
+    by a re-delivery onto the same branch, so a round costs real turns; a
+    run past either budget ends ``failed`` with the PR still a draft.
+
+    CI is polled every ``ci_poll_interval_s`` for at most ``ci_timeout_s``
+    per wait; the wait is not charged to ``[budgets] max_wall_clock_s``,
+    which bounds agent work. ``ci_settle_s`` is how long "no check runs
+    yet" must persist before it counts as "this repository has no CI":
+    Actions registers its check runs a few seconds after a push, and
+    merging in that gap would merge before CI started.
+
+    Branch protection commonly requires a PR to be up to date before
+    merging, and the base moves; ``merge_update_attempts`` bounds the
+    update-branch calls (each is one API call, not a run) before the PR is
+    handed over ``blocked``. 0 disables updating.
+    """
+
+    deliver_draft: bool = True
+    max_review_rounds: int = Field(default=3, ge=0)
+    max_ci_rounds: int = Field(default=2, ge=0)
+    ci_poll_interval_s: float = Field(default=60.0, gt=0)
+    ci_settle_s: float = Field(default=90.0, ge=0)
+    ci_timeout_s: float = Field(default=3600.0, gt=0)
+    merge_method: MergeMethod = "squash"
+    delete_branch_on_merge: bool = True
+    merge_update_attempts: int = Field(default=3, ge=0)
+    # The reviewer is shown the PR's diff inline; past this many characters
+    # the diff is clipped and the reviewer reads the rest from the tree.
+    review_diff_max_chars: int = Field(default=150_000, ge=10_000)
+
+
+# `[daemon]` keys retired by the 1.0 pipeline: the self-filing lanes
+# (backlog, audits, post-mortems, tool findings, tracking issues), the review
+# lane and its gates, the inbox source, and the landing knobs that moved to
+# `[landing]`. A config carrying one still loads — with a warning naming it
+# and, for the moved keys, its value carried over — because the daemon host
+# is deployed unattended and a hard failure there would roll the release
+# back before anyone could edit the file. The tolerance goes away in 1.0,
+# when these become the unknown keys they now are.
+RETIRED_DAEMON_KEYS: frozenset[str] = frozenset(
+    {
+        "inbox_dir",
+        "backlog",
+        "backlog_max_per_run",
+        "backlog_auto_trigger",
+        "backlog_label",
+        "audits",
+        "audit_dir",
+        "audit_label",
+        "delivered_label",
+        "postmortems",
+        "postmortems_per_day",
+        "review_deliveries",
+        "await_review",
+        "review_rounds",
+        "tool_repo",
+        "tracking_issue",
+        "close_on_success",
+        "auto_merge",
+    }
+)
+RETIRED_GITHUB_KEYS: frozenset[str] = frozenset({"report", "deliver"})
+# Keys whose value carries over into `[landing]` (unless `[landing]` sets
+# them itself): from `[daemon]` and `[github]` respectively.
+HOISTED_DAEMON_KEYS: tuple[str, ...] = (
+    "deliver_draft",
+    "merge_method",
+    "delete_branch_on_merge",
+    "merge_update_attempts",
+)
+HOISTED_GITHUB_KEYS: tuple[str, ...] = ("deliver_draft",)
+
+
 class DaemonConfig(_ConfigModel):
     """``sbxloop daemon`` — the always-on outer loop.
 
-    The daemon discovers work (GitHub issues carrying ``trigger_label`` in
-    the configured repo, and ``.md`` files in ``inbox_dir``), runs each item
-    as a full inner-loop run, and reports back to the source. It is fully
-    autonomous — a label or a file alone starts a run — so the spend
+    The daemon discovers work — GitHub issues carrying ``trigger_label`` in
+    the configured repo — claims each one, runs it as one full engine run
+    (task graph, gate, pull request, review, fix rounds, CI, merge; see
+    ``[landing]``) and reports the outcome back on the issue: closed with
+    ``completed_label`` when the PR merged, ``failed_label`` when the run
+    gave up, ``blocked_label`` when GitHub would not let the loop finish
+    and a human has to look. The daemon never files work of its own; only
+    a human labelling an issue (directly, or through the Discord concierge)
+    starts a run.
+
+    It is fully autonomous — a label alone starts a run — so the spend
     guardrails here are the only thing standing between a mislabeled issue
     and an empty Copilot budget: a calendar-day run cap, a per-item retry
-    cap, and a consecutive-failure circuit breaker.
-
-    The run cap (``max_runs_per_day``) is a wall-clock daily gate: it
-    counts the runs *started* during the current calendar day in
-    ``run_cap_timezone`` (default ``UTC``) and resets at 00:00 in that
-    zone.
-
-    ``backlog`` lets the inner agent file follow-up work it discovers
-    (written to ``.sbxloop/backlog/*.md`` in the run workspace) into either
-    source. Agent-filed items land in triage (the ``backlog_label`` / the
-    inbox ``triage/`` dir) and never run until a human promotes them, unless
-    ``backlog_auto_trigger`` is set — a self-feeding queue is the failure
-    mode that flag guards.
-
-    A delivered patch item settles its source issue on *merge*, not on
-    acceptance: at acceptance the issue gets the summary comment plus
-    ``delivered_label`` and stays open; when the PR merges the daemon
-    closes it and swaps in ``completed_label``, and a PR closed without
-    merging marks the item failed instead. ``close_on_success`` used to
-    close at acceptance and is now a deprecated no-op; ``tracking_issue``
-    still governs the per-run tracking issue.
+    cap, and a consecutive-failure circuit breaker. The run cap
+    (``max_runs_per_day``) is a wall-clock daily gate: it counts the runs
+    *started* during the current calendar day in ``run_cap_timezone``
+    (default ``UTC``) and resets at 00:00 in that zone.
 
     Unattended runs need a different workspace posture from a one-shot
     ``sbxloop run`` (#255). ``workspace_isolation`` replaces the
@@ -406,7 +485,6 @@ class DaemonConfig(_ConfigModel):
     :func:`sbxloop.daemon.paths.resolve_state_dir`.
     """
 
-    inbox_dir: str = ".sbxloop/inbox"  # "" disables the inbox source
     workspace_isolation: WorkspaceIsolation = "clone"
     refresh_workspace: bool = True
     state_dir: Path | None = None
@@ -415,58 +493,12 @@ class DaemonConfig(_ConfigModel):
     trigger_label: str = "sbxloop:run"
     in_progress_label: str = "sbxloop:in-progress"
     failed_label: str = "sbxloop:failed"
-    backlog_label: str = "sbxloop:backlog"
-    delivered_label: str = "sbxloop:delivered"
-    # Applied when the work actually lands: at merge for patch items, at
-    # close for audits. The durable "sbxloop did this" mark on the issue.
+    # Applied when the work actually lands — the PR merged. The durable
+    # "sbxloop did this" mark on the issue.
     completed_label: str = "sbxloop:completed"
-    # Discovery lane: an issue carrying this label is a charter — the run
-    # investigates and files findings as backlog issues, never a PR.
-    audit_label: str = "sbxloop:audit"
-    # When a patch item is abandoned (or delivers nothing), file a post-mortem
-    # charter carrying the plan, verify transcripts and failure events, so the
-    # discovery lane turns the daemon's own failures into evidenced findings.
-    # Never for audit items (no recursion); capped per calendar day.
-    postmortems: bool = True
-    postmortems_per_day: int = 3
-    # Scheduled area audits: charters versioned in the target repo under
-    # ``audit_dir`` (front-matter `every: 7d`), opened as audit issues when
-    # due. Off by default — a repo opts in by carrying charters AND the
-    # operator flipping this on.
-    audits: bool = False
-    audit_dir: Path = Path(".github/sbxloop/audits")
-    # After a run delivers a PR, open a review audit of that PR — the loop
-    # evaluating the code it just wrote (defects, missing edge cases, scope
-    # drift) and filing findings for a human to promote.
-    review_deliveries: bool = True
-    # Hold a delivered item open until its PR is green and its review is
-    # satisfied, instead of settling it the moment a PR exists. That
-    # settling is how PR #389 was marked done with `mdformat` and
-    # `security` failing.
-    #
-    # The gates run cheapest-first: CI is GitHub's compute and costs nothing,
-    # so it decides before a review run is spent — reviewing a red PR wastes
-    # a whole run on work that has to change anyway.
-    #
-    # `review_rounds` bounds how many fix rounds one PR may spend before it
-    # is handed to a human. A round is a real run (fix, then re-review), so
-    # this is a spend control, not a poll counter; total spend stays bounded
-    # by `max_runs_per_day` above, which those runs count against like any
-    # other. There is deliberately no separate per-day review cap: a second
-    # global counter for one lane starves other work for the wrong reason —
-    # a stubborn PR eating today's reviews says nothing about whether the
-    # next delivery deserves one.
-    await_review: bool = True
-    review_rounds: int = 3
-    # Where findings ABOUT THE TOOL (sbxloop's planner, prompts, lint,
-    # delivery) go — the tool's own tracker, never the project's. Unset:
-    # such findings are only noted in the closing comment.
-    tool_repo: str | None = None
-    # Deprecated: patch items now settle their source issue when the PR
-    # merges (close + `completed_label`), never at acceptance, so this flag
-    # no longer closes anything. Kept so existing configs still load.
-    close_on_success: bool = True
-    tracking_issue: bool = True
+    # The run cleared its own bar but GitHub would not finish the PR; it is
+    # left open, out of the loop's hands, for a human.
+    blocked_label: str = "sbxloop:blocked"
     max_runs_per_day: int = 12
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
@@ -483,32 +515,6 @@ class DaemonConfig(_ConfigModel):
     # only at task-phase boundaries and interrupted runs are resumable, so
     # this is a courtesy wait, not a correctness requirement.
     shutdown_grace_s: float = 60.0
-    backlog: BacklogMode = "off"
-    backlog_max_per_run: int = 5
-    backlog_auto_trigger: bool = False
-    # Autonomous PRs arrive as drafts unless the operator says otherwise.
-    deliver_draft: bool = True
-    # The last step out of the loop. With `auto_merge` on, a PR that clears
-    # the acceptance gate — green checks AND a satisfied review — is taken out
-    # of draft and merged by the daemon instead of being handed to a human.
-    # Off by default on purpose: merging is the one irreversible thing the
-    # loop does to a repository, and on a repo whose merges publish (sbxloop's
-    # own does) flipping this on means unattended releases.
-    #
-    # A PR the gate accepted for any *weaker* reason never merges: green CI
-    # with no reviewer available settles the way it always did. The bar for a
-    # merge is the full one.
-    auto_merge: bool = False
-    # How a landed PR is written onto the base branch. The repository's own
-    # merge-commit title/message settings still decide the wording.
-    merge_method: MergeMethod = "squash"
-    delete_branch_on_merge: bool = True
-    # Branch protection commonly requires a PR to be up to date with its base
-    # before merging, and `main` moves. Each update is one API call (not a
-    # run), but a base moving faster than CI finishes would update forever, so
-    # it is bounded; past it the PR is handed over. 0 disables updating, which
-    # leaves a behind PR to a human on such repositories.
-    merge_update_attempts: int = Field(default=3, ge=0)
     # Retention for runs/<run_id>/ on disk (workspace clone + harvested
     # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
     # rows are never removed. See sbxloop.gc for what is exempt.
@@ -544,10 +550,8 @@ class DaemonConfig(_ConfigModel):
             self.trigger_label,
             self.in_progress_label,
             self.failed_label,
-            self.backlog_label,
-            self.delivered_label,
             self.completed_label,
-            self.audit_label,
+            self.blocked_label,
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")
@@ -559,9 +563,6 @@ class DaemonConfig(_ConfigModel):
             "max_runs_per_day",
             "max_attempts_per_item",
             "max_consecutive_failures",
-            "backlog_max_per_run",
-            "postmortems_per_day",
-            "review_rounds",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"daemon.{name} must be >= 1")
@@ -572,8 +573,6 @@ class DaemonConfig(_ConfigModel):
                 "daemon.run_cap_timezone must be a valid IANA timezone, "
                 f"got {self.run_cap_timezone!r}"
             ) from None
-        if self.tool_repo is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", self.tool_repo):
-            raise ValueError(f"daemon.tool_repo must be owner/name, got {self.tool_repo!r}")
         return self
 
 
@@ -645,10 +644,10 @@ class ConciergeConfig(_ConfigModel):
     # Expose the read-only GitHub tool (PR/issue/diff/file reads through
     # the daemon's github-ops sandbox) when GitHub is configured.
     github_tools: bool = True
-    # Let the concierge write to issues in the configured repo: file them
-    # (backlog label), list them, comment on them, label one for a run, and
-    # close one. Every act that starts a run or closes an issue happens only
-    # after the person explicitly says so.
+    # Let the concierge write to issues in the configured repo: file one for
+    # a run (it is queued the moment it is filed), list them, comment on
+    # them, label an existing one for a run, and close one. Closing is the
+    # one act that waits for the person's explicit say-so.
     create_issues: bool = True
 
 
@@ -717,9 +716,57 @@ class Config(_ConfigModel):
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
     limits: Limits = Field(default_factory=Limits)
+    landing: LandingConfig = Field(default_factory=LandingConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
+
+    # Dotted names of retired keys the loaded config carried (see
+    # RETIRED_DAEMON_KEYS); `doctor` reports them so they get removed.
+    _retired_keys: tuple[str, ...] = PrivateAttr(default=())
+
+    @property
+    def retired_keys(self) -> tuple[str, ...]:
+        return self._retired_keys
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _tolerate_retired(cls, data: Any, handler: ModelWrapValidatorHandler[Config]) -> Config:
+        """Drop the keys the 1.0 pipeline retired, carrying the landing knobs
+        over into ``[landing]``, and remember what was dropped."""
+        retired: list[str] = []
+        if isinstance(data, dict):
+            data = dict(data)
+            landing = data.get("landing")
+            landing = dict(landing) if isinstance(landing, dict) else {}
+            for section, retired_keys, hoisted in (
+                ("daemon", RETIRED_DAEMON_KEYS, HOISTED_DAEMON_KEYS),
+                ("github", RETIRED_GITHUB_KEYS, HOISTED_GITHUB_KEYS),
+            ):
+                block = data.get(section)
+                if not isinstance(block, dict):
+                    continue
+                block = dict(block)
+                for key in hoisted:
+                    if key in block:
+                        landing.setdefault(key, block.pop(key))
+                        retired.append(f"{section}.{key}")
+                for key in sorted(block):
+                    if key in retired_keys:
+                        block.pop(key)
+                        retired.append(f"{section}.{key}")
+                data[section] = block
+            if landing:
+                data["landing"] = landing
+        config = handler(data)
+        if retired:
+            config._retired_keys = tuple(retired)
+            log.warning(
+                "config.retired_keys",
+                keys=retired,
+                hint="remove them from sbxloop.toml; landing knobs now live under [landing]",
+            )
+        return config
 
     @field_validator("state_dir", mode="after")
     @classmethod

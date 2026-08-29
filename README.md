@@ -9,19 +9,20 @@
 
 sbxloop turns a large outcome ("migrate this service to async", "add coverage
 to every untested module") into a supervised agentic loop: it **decomposes**
-the outcome into a task graph, then for each task
-**builds → verifies**, with
-revision/replan budgets, checkpointing, resume, artifact harvesting, and
-optional delivery of the results as a GitHub pull request.
+the outcome into a task graph, **builds → verifies** each task under
+revision/replan budgets, and — with a GitHub repository configured — carries
+the work the rest of the way itself: a draft pull request, its own
+adversarial review of the diff, bounded fix rounds, CI, and the merge.
+Checkpointing, resume and artifact harvesting throughout.
 
 ## The primitive: a sandbox pair
 
 Every run gets an isolated microVM agent sandbox — plus, when the GitHub integration is configured, a second github-ops sandbox, so no single environment ever holds both credentials:
 
-| Sandbox                | Credential                                                               | Purpose                                                                                                                                             |
-| ---------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM.      |
-| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: issues write, contents read, …)            | Performs user-facing GitHub operations (issues, PRs, statuses) against the one configured repository. Only provisioned when `[github] repo` is set. |
+| Sandbox                | Credential                                                                       | Purpose                                                                                                                                                                   |
+| ---------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission)         | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM.                            |
+| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: contents write, pull requests write, issues write) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set. |
 
 Both sandboxes run under sbx's **balanced network policy** (default-deny
 egress plus a curated allowlist), and tokens are injected through sbx's secret
@@ -91,10 +92,14 @@ print(result.state, result.run_id)
 ## How a run works
 
 ```
-outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
+outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency order:
               BUILD ─▶ VERIFY ─▶ done
                 ▲        │fail (≤ revisions: same session resumes;
                 └────────┘        exhausted: fresh session, one replan)
+
+        ──▶ GATE ─▶ DELIVER (draft PR) ─▶ REVIEW ─▶ CI ─▶ LAND ─▶ merged
+              ▲                            │changes requested / red / conflict
+              └──────── FIX (one task) ◀───┘  (≤ max_review_rounds / max_ci_rounds)
 ```
 
 - **Decompose** — produces the task DAG, and with it every task's
@@ -107,30 +112,74 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task:
 - **Verify** — mechanical: the task's `verify_commands` must exit 0, run from
   the workspace root. No LLM. The full command transcript is persisted with
   the attempt, so a resumed run judges with the real evidence.
+- **Gate** — the project's own check (`[sandbox] gate_command`, or the
+  detected `make check` / `just ci` / `npm run check` / tox / nox) over the
+  whole tree, mechanical. A later task can break what an earlier one proved,
+  so this is the last look at the tree exactly as it will be delivered. A run
+  with no `[github] repo` ends **`completed`** here, its work in the
+  workspace.
+- **Deliver** — the tree becomes one commit on `sbxloop/<run>` and a draft
+  pull request. Every later round re-delivers onto the same branch, so one
+  run is one PR.
+- **Review** — a fresh read-only session reads the PR's whole diff
+  adversarially (concurrency, failure ordering, trust-boundary parsing,
+  cross-module invariants, scope) and returns a verdict with line-anchored
+  findings. The verdict is the run's own and is authoritative; it is also
+  posted to the PR for the record. There is no per-task critic: the old
+  per-task review stages judged task completion and rubber-stamped it while
+  diff-level defects leaked to the PR; one adversarial pass over the
+  assembled diff is the critic that earns its turns.
+- **Fix** — one seeded task (`fix-N`), built and verified like any other
+  under the same revision/replan budgets, then back through the gate. Every
+  round sees the earlier rounds' findings and the fixer's per-finding
+  `addressed` / `refuted: <why>` list, and the next review may not re-raise
+  a refuted finding without a rebuttal — the memory that stops a run arguing
+  with itself.
+- **CI** — the delivered head's check runs are polled; red fetches the
+  failing jobs' logs into the next fix brief. "No check runs yet" only
+  counts as "no CI" once it has persisted for `ci_settle_s`.
+- **Land** — un-draft, update the branch if protection wants it current,
+  merge with the head the review actually judged (a push that landed since
+  loses the race rather than being merged over).
 
-There is no in-run critic: the per-task review stages audited task
-completion and rubber-stamped it while diff-level defects leaked to the PR.
-Adversarial review lives in the daemon's post-delivery review lane, which
-sees the whole diff and drives bounded fix rounds on the delivered PR.
+**Budgets, not vibes.** Revisions, replans, task count and wall clock are
+bounded by `[budgets]` (defaults: 2 revisions and 1 replan per task, 20
+tasks, 2 h wall clock, 30 min per job); the fix loop by `[landing]` —
+`max_review_rounds` (default 3) for verdicts that request changes,
+`max_ci_rounds` (default 2) for the mechanical failures: a red gate, red CI,
+a base conflict, a human requesting changes on the PR. Exhausting a task's
+budget fails the *task*; its dependents are skipped and the run finishes
+`failed` before anything is delivered. One deliberate exception: when
+revisions are exhausted by *verify-command* failures, the task spends a
+replan first when budget remains — the builder cannot edit verify commands,
+so only a fresh session's fresh approach can unstick work that disagrees
+with where a check looks. Time spent waiting on GitHub is not charged to
+`max_wall_clock_s`; `[landing] ci_timeout_s` bounds each wait instead.
 
-**Budgets, not vibes.** Revisions, replans, task count, and wall clock are all
-bounded (`[budgets]` in config; defaults: 2 revisions and 1 replan per task,
-20 tasks, 2 h wall clock, 15 min per job). Budget exhaustion fails the *task*;
-its dependents are skipped and the run continues, finishing `failed` if any
-task failed. One deliberate exception: when revisions are exhausted by
-*verify-command* failures, the task spends a replan first when budget
-remains — the builder cannot edit verify commands, so only a fresh session's
-fresh approach can unstick work that disagrees with where a check looks.
+**How a run ends.** `merged` — the PR landed; the work is on the base
+branch. `completed` — no repository was configured; the work passed the
+gate and sits in the workspace. `failed` — a task or a round budget ran out
+(any PR is still a draft, and nothing re-picks it). `blocked` — the run
+cleared its own bar but GitHub would not let it finish: a protection rule
+wanting an approval this identity cannot give, CI that never reported within
+`ci_timeout_s`, an update-branch budget spent. Nothing another round would
+change, so the PR is left open and out of draft for a human. (`cancelled` is
+the fifth, and yours.)
 
 **Checkpointing and resume.** State is committed to SQLite after every
-transition. `sbxloop resume <run>` re-provisions a fresh sandbox pair and
-continues from the last committed transition — under the **run's persisted
-config**, not whatever is on disk at resume time. The workspace is pinned from
-the state DB (a mismatch refuses to resume), and any difference from the
-current on-disk config is surfaced as a `run.config_drift` event. The one
-exception: the debug toggles (`keep_sandboxes` / `keep_on_failure`) stay
-resume-time choices, so a crashing run can be resumed with keep flipped on in
-config or env.
+transition, and every stage is a run state — `building`, `gating`,
+`delivering`, `reviewing`, `fixing`, `awaiting_ci`, `landing` — with the last
+one entered kept on the run. `sbxloop resume <run>` re-provisions a fresh
+sandbox pair and re-enters *there*: a crash during a CI wait costs a re-poll,
+not a rebuild; a re-delivery is idempotent (the branch is force-moved, the
+open PR reused); a `blocked` run resumes at `landing` once a human has dealt
+with the cause. The run continues under its **persisted config**, not
+whatever is on disk at resume time: the workspace is pinned from the state
+DB (a mismatch refuses to resume), and any difference from the current
+on-disk config is surfaced as a `run.config_drift` event. The one exception:
+the debug toggles (`keep_sandboxes` / `keep_on_failure`) stay resume-time
+choices, so a crashing run can be resumed with keep flipped on in config or
+env.
 
 **Guardrails.** The worker heartbeat samples in-VM disk and memory
 (`[limits]`; defaults warn at 85 % disk / 90 % memory and abort the task at
@@ -139,25 +188,25 @@ letting in-VM tooling fail confusingly on a full disk.
 
 ## CLI reference
 
-| Command                               | What it does                                                                                                                                                                                                                                          |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop run "OUTCOME"`               | Start a run. Options: `--repo`, `--report`, `--deliver`, `--deliver-base`, `--deliver-draft`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`.                                                                                         |
-| `sbxloop daemon`                      | The always-on outer loop: poll labeled issues + an inbox dir, run each item, report back, mirror to Discord. Options: `--repo`, `--inbox`, `--backlog`, `--discord-channel`, `--once`, `--dry-run`.                                                   |
-| `sbxloop daemon ctl CMD`              | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as Discord's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                    |
-| `sbxloop resume RUN`                  | Re-provision sandboxes and continue a checkpointed run under its persisted config.                                                                                                                                                                    |
-| `sbxloop deliver RUN`                 | Deliver (or re-deliver) a completed run's artifacts as a PR from a github-ops sandbox alone — the retry path when end-of-run delivery failed. Options: `--repo`, `--deliver-base`, `--deliver-draft`, `--create-repo`, `--create-public`, `--report`. |
-| `sbxloop cancel RUN`                  | Cancel an in-flight run.                                                                                                                                                                                                                              |
-| `sbxloop status [RUN]`                | List runs, or show one run's task/phase detail.                                                                                                                                                                                                       |
-| `sbxloop logs RUN`                    | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                  |
-| `sbxloop artifacts RUN`               | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                            |
-| `sbxloop shell RUN`                   | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                        |
-| `sbxloop init`                        | Write a commented starter `sbxloop.toml` (`--force` overwrites).                                                                                                                                                                                      |
-| `sbxloop bake`                        | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                   |
-| `sbxloop doctor [--deep]`             | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                           |
-| `sbxloop sandbox ls\|rm\|prune`       | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                    |
-| `sbxloop gc`                          | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                       |
-| `sbxloop secrets list\|clean\|rotate` | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                              |
-| `sbxloop config show\|policy`         | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                             |
+| Command                                         | What it does                                                                                                                                                                                                                                                     |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                   |
+| `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to Discord. Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`. |
+| `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                              |
+| `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as Discord's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                               |
+| `sbxloop resume RUN`                            | Re-provision sandboxes and continue a checkpointed run under its persisted config — at the task graph, or at the pipeline stage it stopped in (the retry path for a failed delivery or a `blocked` landing).                                                     |
+| `sbxloop cancel RUN`                            | Cancel an in-flight run.                                                                                                                                                                                                                                         |
+| `sbxloop status [RUN]`                          | List runs, or show one run's task/phase detail.                                                                                                                                                                                                                  |
+| `sbxloop logs RUN`                              | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                             |
+| `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                       |
+| `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                   |
+| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` (`--force` overwrites).                                                                                                                                                                                                 |
+| `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                              |
+| `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                      |
+| `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                               |
+| `sbxloop gc`                                    | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                  |
+| `sbxloop secrets list\|clean\|rotate`           | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                         |
+| `sbxloop config show\|policy`                   | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                                        |
 
 ## Network egress: least privilege, by plan
 
@@ -241,95 +290,88 @@ copied. If the agent commits inside the VM it needs `git config user.name` /
 
 ## The daemon: an always-on outer loop
 
-`sbxloop daemon` wraps the run loop in a persistent process that discovers
-work, runs each item as a full inner-loop run, reports back to wherever the
-work came from, and keeps going. Two work sources, usable together:
+`sbxloop daemon` is deliberately small. It polls the one configured
+repository (`--repo` / `[github] repo` — the repo being worked on) for open
+issues carrying the trigger label (`sbxloop:run`), claims each one, runs it
+as **one** engine run — task graph, gate, draft PR, review, fix rounds, CI,
+merge — and settles the outcome on the issue. One labeled issue is one run
+is one pull request. There is no other work source, and the daemon **never
+files work of its own**: only a human labelling an issue — directly, or by
+asking the Discord concierge, which files the issue *with* the label —
+starts a run.
 
-- **GitHub issues** in the target repo (`--repo` / `[github] repo` — the
-  repo being worked on) carrying the trigger label (`sbxloop:run` by
-  default). The daemon claims the issue (label swap + comment), runs it with
-  reporting and delivery forced on (PRs arrive as **drafts** by default),
-  and on success comments the summary + PR link and adds
-  `sbxloop:delivered`. The issue settles when the PR **merges**: the daemon
-  watches the delivered PR, and on merge closes the issue and swaps in
-  `sbxloop:completed` (the PR body also carries `Closes #N`, so GitHub
-  links the pair and closes the issue even when the daemon is down). A PR
-  closed without merging marks the item failed and leaves the issue open.
-  Run failures retry with backoff, then land in `sbxloop:failed` with
-  re-trigger instructions. `tracking_issue = false` in `[daemon]` skips the
-  per-run tracking issue (the summary comment on the source issue carries
-  the same info).
-- **Inbox files**: drop a `.md` (first `# heading` = title) into
-  `<inbox>/pending/`; it moves through `running/` to `done/` or `failed/`
-  with a `<name>.result.md` beside it.
+The labels are the state machine, and every transition is visible on the
+issue:
 
-It is **fully autonomous** — a label or a file alone starts a run — so the
-spend guardrails in `[daemon]` are the safety net: a calendar-day run cap
-(`max_runs_per_day`, default 12 — the name and default are unchanged) that
-counts the runs *started* since 00:00 in `[daemon] run_cap_timezone` (any
-IANA zone, default `UTC`) and resets at that boundary, so a run started just
-before midnight does not free a slot early (earlier releases aged each run
-out individually a fixed period after it started rather than at the day
-boundary); a per-item attempt cap, a per-item resume cap, and a consecutive-failure
-circuit breaker (persisted, so a restart cannot reset it). Treat the
-trigger label as "execute arbitrary instructions with GH_TOKEN's repo scope"
-and restrict who can apply it. Inner agents can file follow-up work they
-discover (`--backlog github|inbox`) — those land in **triage** (the
-`sbxloop:backlog` label / `inbox/triage/`) and never run until a human
-promotes them, unless `backlog_auto_trigger` is set.
+- **Claim.** `sbxloop:run` → `sbxloop:in-progress`, plus a claim comment.
+  The comment is the lock: GitHub has no compare-and-swap on labels, but a
+  comment is created exactly once and ordered, so two daemons watching one
+  repository cannot both take an issue. A `Run <id> started.` comment
+  follows once the run is dispatched.
+- **`merged`** — the PR landed. The daemon comments the PR link, swaps
+  `in-progress` for **`sbxloop:completed`** and closes the issue
+  (`state_reason: completed`). The PR body also carries `Closes #N`, so
+  GitHub links the pair and closes the issue even when the daemon is down.
+- **`failed`** — the run gave up: a task or a round budget ran out, or it
+  errored. The daemon comments the reason and retries with backoff while
+  the item has attempts left (`max_attempts_per_item`, default 2;
+  `retry_backoff_s` × the attempt number), then abandons it:
+  `in-progress` → **`sbxloop:failed`**, with re-trigger instructions
+  (remove `failed`, re-add `run`). Any PR stays a draft.
+- **`blocked`** — the run cleared its own bar and GitHub would not let it
+  finish: a protection rule wanting an approval the loop's identity cannot
+  give, CI that never reported, an update-branch budget spent. The PR is
+  left **open and out of draft** — one click from done — the issue stays
+  open with **`sbxloop:blocked`** and a comment saying why, and the item
+  neither retries nor counts toward the breaker, because nothing another
+  attempt would change. Merge or fix by hand and close the issue, or
+  `!sbx retry <item>` once the cause is dealt with.
+- **cancelled** — `!sbx cancel` settles the item as cancelled, attributed
+  to whoever asked, with no automatic retry; the run stays resumable.
 
-**The discovery lane.** An issue carrying `sbxloop:audit` (`[daemon] audit_label`) is a *charter*, not a change: the run investigates — "review
-`daemon/loop.py` for guardrail holes", "post-mortem run rXXXX" — and its
-deliverable is findings, each written as one file under `.sbxloop/backlog/`
-with **Evidence** (file:line), **Repro**, **Proposal**, **Size** and
-**Kind**, which the daemon files as `sbxloop:backlog` issues (so
-`--backlog github` is required for the lane to produce anything). Audits
-never deliver a PR, close on completion with a `Filed: #…` comment, and an
-audit that finds nothing real says so. Promoting a finding is a label swap
-(`sbxloop:backlog` → `sbxloop:run`) — a human decision, so the loop's
-precision is visible before anyone hands it the keys.
-When a patch item is abandoned (or completes without delivering) the daemon
-files a **post-mortem** as an audit charter — the plan, the last verify
-transcript, the failure events, all in the issue body, because the auditor
-works in a fresh clone and cannot read the daemon's state — so the loop's own
-failures become findings too (`[daemon] postmortems`, capped per calendar day
-in `run_cap_timezone`, never for audit items).
-And with `[daemon] audits = true`, **charters versioned in the repository**
-(`.github/sbxloop/audits/<name>.md`, front-matter `every: 7d`) are opened as
-`audit: <name>` issues on schedule — reviewed like code, visible as issues,
-deduplicated against GitHub itself so a fresh state dir cannot double-file.
-sbxloop's own repo carries four (verify-lint vs. prompts, daemon guardrails,
-e2e markers, test flakes); every finding they produce is one more
-`sbxloop:backlog` issue for a human to promote or close.
+Everything else the daemon does is a guardrail or a recovery. It is
+**fully autonomous** — a label alone starts a run *and merges the result* —
+so treat the trigger label as "execute arbitrary instructions with
+`GH_TOKEN`'s repo scope" and restrict who can apply it. The `[daemon]`
+guardrails are the safety net:
 
-Two more things close the loop. Every PR the daemon delivers gets a
-**review audit** (`[daemon] review_deliveries`): a fresh run reads the source
-issue and the diff as a skeptical maintainer and files defects, missing
-tests and scope drift as backlog issues — sbxloop evaluating the code
-sbxloop wrote. And findings *about the tool itself* — the decomposer wrote a
-bad verify command, a prompt misled the agent, delivery mishandled a case —
-are never dumped on the project's tracker: the audit contract routes them
-to `.sbxloop/backlog/tool/`, and `[daemon] tool_repo = "brettbergin/sbxloop"`
-files them upstream (unset: they are noted in the closing comment only).
+- a **calendar-day run cap** (`max_runs_per_day`, default 12) counting the
+  runs *started* since 00:00 in `run_cap_timezone` (any IANA zone, default
+  `UTC`) and resetting at that boundary, so a run started just before
+  midnight does not free a slot early;
+- the **per-item attempt cap** with backoff (above), and a **per-item
+  resume cap** (`max_resumes_per_item`, default 2): an interrupted run
+  (SIGTERM, crash) is resumed on the next start — through the same
+  guardrails as any dispatch — and past the cap the interruption counts as
+  a failed attempt instead;
+- a **circuit breaker** (`max_consecutive_failures`, default 3, then
+  `breaker_cooldown_s`, default 1 h) that is persisted, so a restart cannot
+  reset it;
+- **pause and cancel**, from Discord or `sbxloop daemon ctl` (below);
+- **reconciliation**: on start, and every tick while nothing is executing,
+  runs the store still shows in flight with no process behind them are
+  closed with a recorded reason (`run_stale_after_s`, default 6 h; `0`
+  disables the staleness sweep), so `sbxloop status` and `!sbx status`
+  agree about what is active;
+- **retention**: run directories past `prune_runs_after_days` are swept on
+  start and daily (see [Sandbox hygiene](#sandbox-hygiene)).
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
-daemon owns, so the host still never holds the PAT. Runs are one at a time;
-an interrupted run (SIGTERM, crash) is resumed on the next start — through
-the same guardrails as any dispatch, and at most `max_resumes_per_item` times
-before it counts as a failed attempt. Ship it as a systemd user service with
+daemon owns, so the host still never holds the PAT. Runs are one at a time.
+Ship it as a systemd user service with
 [`contrib/systemd/`](contrib/systemd/).
 
 Individual items are steerable from another shell without stopping the
 daemon: `sbxloop daemon items` lists them (state, attempts, pinned run, last
 error); `sbxloop daemon abandon <item> [--reason …]` gives one up (a live
-daemon cancels its in-flight run and tells the issue/inbox file — the report
-is owed on the row and paid by the next tick or the next daemon start, once);
-`sbxloop daemon retry <item>` re-queues an abandoned or cancelled item with attempts
-reset and a **fresh build session** — not a resume of the approach that
-failed; and
-`sbxloop daemon requeue <item>` drops a running item's pinned run so its
-next dispatch starts over (attempts and backoff kept). The same controls are
-`!sbx items|abandon|retry|requeue` on Discord.
+daemon cancels its in-flight run and tells the issue — the report is owed
+on the row and paid by the next tick or the next daemon start, once);
+`sbxloop daemon retry <item>` re-queues an abandoned, blocked or cancelled
+item with attempts reset and a **fresh build session** — not a resume of
+the approach that failed; and `sbxloop daemon requeue <item>` drops a
+running item's pinned run so its next dispatch starts over (attempts and
+backoff kept). The same controls are `!sbx items|abandon|retry|requeue` on
+Discord.
 
 **Workspace posture for unattended runs.** Point `[sandbox] workspace` at a
 **dedicated clone nobody edits** (`git clone <repo> ~/sbxloop-runner/src`),
@@ -365,81 +407,60 @@ breaker open, backing off, capped) whenever that changes; `DEBUG` adds every
 tool call, `sbx` invocation and poll. See
 [docs/architecture.md → Logging](docs/architecture.md#logging).
 
-#### Working a design tracker
+#### The `[daemon]` keys
 
-A source issue always settles on **merge**, not on delivery: at acceptance
-the daemon comments the run summary and PR link, removes
-`sbxloop:in-progress`, and adds `sbxloop:delivered`; when the PR merges it
-closes the issue (`state_reason: completed`) and swaps `sbxloop:delivered`
-for `sbxloop:completed`. Who does the merging is
-[`auto_merge`](#merging-without-a-human-auto_merge)'s call — by default, a
-human. A PR closed without merging marks the item failed
-(`sbxloop:failed`) and leaves the issue open for the human to re-trigger or
-close. (`close_on_success`, which used to close the issue at acceptance, is
-now a deprecated no-op.) For a tracker whose issues are design discussions
-rather than a queue of chores:
-
-- `[daemon] tracking_issue` (default `true`) — with `false` no per-run
-  tracking issue is opened; the summary comment on the source issue is the
-  record, so the design thread stays in one place.
+This is the whole list — the landing knobs live under
+[`[landing]`](#github-integration):
 
 ```toml
 [daemon]
-deliver_draft = true          # PRs arrive as drafts for review
-tracking_issue = false        # the summary comment is the record
-workspace_isolation = "clone" # never touch the runner's checkout
-refresh_workspace = true      # fast-forward it before each fresh run
+poll_interval_s = 60.0
+trigger_label = "sbxloop:run"             # the label that queues work
+in_progress_label = "sbxloop:in-progress"
+completed_label = "sbxloop:completed"     # the PR merged; the issue closes
+failed_label = "sbxloop:failed"           # the run gave up; re-trigger by hand
+blocked_label = "sbxloop:blocked"         # GitHub would not let the loop land the PR
+max_runs_per_day = 12                     # calendar-day cap, persisted across restarts
+run_cap_timezone = "UTC"                  # day boundary for the cap (resets at 00:00 there)
+max_attempts_per_item = 2
+max_resumes_per_item = 2                  # interrupted runs resumed at most this often per item
+retry_backoff_s = 900.0                   # times the attempt number
+max_consecutive_failures = 3              # circuit breaker ...
+breaker_cooldown_s = 3600.0               # ... and how long it stays open
+shutdown_grace_s = 60.0                   # keep below systemd TimeoutStopSec
+prune_runs_after_days = 14                # run-directory retention; 0 disables
+run_stale_after_s = 21600                 # staleness reconciliation; 0 disables
+workspace_isolation = "clone"             # clone | auto | in-place, for daemon runs
+refresh_workspace = true
+# state_dir = "~/.local/state/sbxloop/my-project"
+log_level = "INFO"
+log_format = "console"
 ```
 
-#### Merging without a human: `auto_merge`
+#### Upgrading a pre-1.0 daemon
 
-By default the loop stops one step short of done. It delivers the PR, files
-a review of it, runs bounded fix rounds against red checks and requested
-changes — and then hands a green, approved, still-draft PR to a person to
-merge.
-
-`[daemon] auto_merge` closes that gap. A PR that clears the **full**
-acceptance bar — every check green *and* the review satisfied — is taken out
-of draft (a GraphQL `markPullRequestReadyForReview`; REST cannot un-draft),
-brought up to date with its base if protection requires that, and merged.
-The merge then settles the source issue through the path that already
-existed: closed, `sbxloop:completed`.
-
-It is off by default, and deliberately:
-
-> Merging is the only irreversible thing sbxloop does to a repository. On a
-> repo whose merges publish — this one releases to PyPI and redeploys the
-> daemon host on every merge to `main` — turning it on means unattended
-> releases. That is the existing pipeline working as designed, with nobody
-> in front of it.
-
-The bar is the full one. A PR the gate accepted for a *weaker* reason —
-green CI with no reviewer available to judge it — is never merged; it
-settles the way it always did.
-
-When GitHub refuses the merge (a protection rule wanting an approval
-sbxloop's identity cannot give, a base that keeps moving out from under it),
-the item is handed to a human with the PR **open and out of draft** — one
-click from done — rather than spending its budget on a refusal no round can
-fix.
-
-```toml
-[daemon]
-auto_merge = true             # merge the PR once it is green and approved
-merge_method = "squash"       # squash | merge | rebase
-delete_branch_on_merge = true
-merge_update_attempts = 3     # keep it current with a moving base; 0 disables
-```
-
-Watch it happen in the log: `land.undrafted` → `land.update_branch` →
-`item.merged`, or `land.blocked` when it stopped and why.
+The 1.0 pipeline retired the daemon's other lanes — the agent backlog,
+post-mortems, scheduled audit charters, the review lane, the inbox source,
+the per-run tracking issue — and with them their `[daemon]` keys and
+`[github] report` / `deliver`; the landing knobs (`deliver_draft`,
+`merge_method`, `delete_branch_on_merge`, `merge_update_attempts`) moved to
+`[landing]`. A config still carrying a retired key **loads**, with a
+`config.retired_keys` warning at startup and a `retired config keys` row in
+`sbxloop doctor`, and a moved key's value is carried into `[landing]` unless
+that section sets it — the daemon host deploys unattended, and a hard
+failure there would roll the release back before anyone could edit the file.
+They become errors in 1.0.0, so delete them at leisure (`auto_merge = true`
+simply goes: landing is always on). A pre-1.0 `state.db` is moved aside to
+`state.db.pre-1.0` on first start rather than migrated, and the old lanes'
+issues and labels are closed by hand;
+[docs/deploy.md → 1.0 cutover](docs/deploy.md#10-cutover) has the steps.
 
 ### Discord: chronology out, steering in
 
 With `pip install 'sbxloop[discord]'`, `DISCORD_BOT_TOKEN` in the
 environment, and `[discord] channel_id` set, a gateway bot posts a headline
-card per run in the control channel (source, run id, branch, tracking
-issue, PR, task tally — colour follows the state) and streams that run's
+card per run in the control channel (source issue, run id, branch, PR,
+task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
 code-fence boundaries instead of clipped — their **narration only**, never the
@@ -454,17 +475,11 @@ code blocks instead; one **status line edited in place** as tasks
 progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
 and branch as links; verify failures, worker errors, denied permissions and
 refused egress called out; and a finished report card (the headline turns
-✅/❌/⚠) that also names what the run filed — an audit's findings, linked
-(`Filed`, `Upstream` for findings routed to `[daemon] tool_repo`, or
-`no findings`). A review run reports its review instead — its deliverable is
-never a filed issue, so the card and notice name the verdict, the inline
-comment count and a link to the posted review (`review requested changes · 11 inline comment(s)`), plus an explicit warning when GitHub refused the
-requested event and the review went up as a non-gating `COMMENT` that blocks
-nothing. `no findings` is audit-lane wording only and never appears for a
-review. Audit-lane notices in the control channel follow the same
-shape — `🔎 audit #701 filed for charter flakes · audit: flakes`,
-`🔎 review #801 filed for PR #9 · gh:4`, `🔎 post-mortem #901 filed for gh:4 · abandoned: …`, `✅ gh:9 done (2/2 tasks done) · filed #50` — with every
-issue number a link. Mentions are always disabled, so model output can never ping the
+✅/❌/⚠) with the final state, the task tally and the PR. How each item
+settled is a one-line notice in the control channel, pointing at the run's
+thread — `🎉 gh:9 merged (2/2 tasks done) · PR …`,
+`❌ gh:4 failed (…); 1 attempt(s) left`, `🚧 gh:7 blocked: … — a human needs to look` when an issue lands in `sbxloop:blocked`, `🛑 circuit breaker opened …` — with every URL masked so nothing sprouts a preview.
+Mentions are always disabled, so model output can never ping the
 channel. `[discord] embeds`, `status_line`, `tool_batch_lines`,
 `tool_output_lines` (tail output lines echoed for a *successful* call,
 default `0` = none) and `tool_fail_output_lines` (head+tail lines echoed for a
@@ -502,12 +517,14 @@ agent, which knows how to operate sbxloop and what it is building. Ask
 "pause after this one", or "also please add retries to the fetch client"
 — it runs the same `!sbx` verbs through the same dispatcher, reads the
 run store (runs, tasks, chronology, reports), fetches PR/issue/diff/file
-details through the github-ops sandbox, queues new work as an inbox
-item with a self-contained title and body, and files issues in the
-configured repo from a described feature or bug — created with the
-`sbxloop:backlog` label (triage), after which it **asks you** whether to
-add `sbxloop:run` and labels only on your yes; "what's in the backlog?"
-lists the open `sbxloop:backlog` issues and asks which, if any, to work.
+details through the github-ops sandbox, and turns a described feature or
+bug into work in **one hop**: `create_issue` files the issue in the
+configured repo with a self-contained title and body *and* the
+`sbxloop:run` label, and the daemon claims it on its next poll. There is
+no triage lane in between — which is why the concierge writes a body a
+fresh clone can act on, and why the channel is the access boundary.
+"What's open?" lists the repository's open issues and which are queued or
+running.
 Ask what a run cost and it reports that run's input/output tokens per
 agent persona and totalled; "how much have we spent today?" totals the
 current calendar day in `run_cap_timezone` — the same day the run cap
@@ -537,7 +554,7 @@ chat can wedge the daemon. The result is clipped to
 Say "tell me when r7… is done" (a run id or a work item id) and `watch_run`
 registers your interest: it confirms, and when that run lands the daemon
 posts in the control channel @mentioning you with the outcome — final
-state, task summary, tracking issue, PR, delivery error, anything filed.
+state, task summary, PR, and the reason when it failed or was blocked.
 Watching a run that has already finished answers with the outcome
 immediately instead of registering. Watches are **persisted** in the daemon state: they are
 reloaded at startup, so a watch registered before a daemon restart still
@@ -596,7 +613,7 @@ tool caches, `target` (cargo/Maven), `.gradle`, `obj` (.NET), `.bundle`,
 `CMakeFiles`. Entries may use glob patterns, matched against whole path
 components (`*.egg-info` catches pip's project-named metadata directory).
 They are large, reproducible from the manifests that *are* delivered, and
-nobody wants them in a `--deliver` PR diff. The ambiguous generic names —
+nobody wants them in a delivery PR diff. The ambiguous generic names —
 `bin`, `build`, `dist`, `out`, `lib`, `vendor` — are **not** excluded, since
 each is build output in one ecosystem and checked-in content in another; add
 them to `[artifacts] exclude` if your project wants them dropped. Whatever is
@@ -610,7 +627,7 @@ sbxloop has **no** GitHub capability until you name the one repository it
 may work with — either per run on the command line:
 
 ```console
-$ sbxloop run "build the thing" --repo you/your-repo --deliver
+$ sbxloop run "build the thing" --repo you/your-repo
 ```
 
 or persistently in `sbxloop.toml`:
@@ -618,22 +635,25 @@ or persistently in `sbxloop.toml`:
 ```toml
 [github]
 repo = "you/your-repo"   # the ONE repo sbxloop may act on
-report = false           # post run progress as a tracking issue (or `--report`)
-deliver = false          # PR the run's artifacts to the repo (or `--deliver`)
-deliver_base = ""        # base branch for delivery PRs (or `--deliver-base`)
-deliver_draft = false    # open delivery PRs as drafts (or `--deliver-draft`)
+deliver_base = ""        # base branch for the PR; unset uses the repo's default (or `--deliver-base`)
 create_repo = false      # create the repo if missing (or `--create-repo`)
 create_public = false    # created repos are private unless flipped (or `--create-public`)
 ```
 
-CLI flags win over the toml, so `--repo` can also redirect a configured setup
-at a different repository for one run.
+`repo` is the gate, and there is no separate switch behind it: unset, no
+github sandbox is provisioned, `GH_TOKEN` is not needed, and a run ends
+`completed` after its gate with the work in the workspace. Set, **every run
+that passes its gate opens a pull request there and carries it through
+review, CI and the merge** — delivery is not an optional step at the end of
+a run, it is the second half of one. CLI flags win over the toml, so
+`--repo` can also redirect a configured setup at a different repository for
+one run.
 
 The repository is probed right after provisioning, so a missing or typo'd
 `--repo` fails the run up front instead of after the work is done. For a
 fresh project, add `--create-repo` and sbxloop creates it (private by
 default, `--create-public` to flip) with an initial commit, then delivers
-the artifacts as a normal reviewable PR — creation is opt-in precisely so a
+the work as a normal reviewable PR — creation is opt-in precisely so a
 typo'd repo name errors instead of silently landing in a brand-new
 repository. Creating repos needs a token allowed to do so for that owner;
 the per-repo minimal token suffices for everything else. An
@@ -641,25 +661,63 @@ existing-but-empty repository (no commits yet) is also handled: delivery
 bootstraps the initial commit itself.
 
 With `repo` set, runs provision the github-ops sandbox and require a second
-PAT, `GH_TOKEN`, with the repository permissions you want sbxloop to act with
-— used *only* by that sandbox. Without it, no github sandbox exists,
-`GH_TOKEN` is not needed, and repo-facing features refuse to run.
+PAT, `GH_TOKEN`, used *only* by that sandbox. It needs `contents:write` (the
+branch, the merge) and `pull_requests:write` (the PR, the review, un-drafting,
+update-branch) on the repository; the daemon also needs `issues:write` to
+claim and settle issues. Without it, no github sandbox exists and
+repo-facing features refuse to run.
 
-- **`--report`** opens a tracking issue at run start, comments as tasks
-  finish, and posts the final summary before teardown. A resumed run re-finds
-  its existing issue instead of opening a duplicate.
-- **`--deliver`** publishes a completed run's artifacts as a pull request:
-  one atomic commit via the git data API, branch `sbxloop/<run>`, through the
-  github-ops sandbox (`GH_TOKEN` only). Needs `contents:write` +
-  `pull_requests:write` on the repo. Delivery runs after the run has already
-  succeeded; delivery failures are reported loudly (`run.deliver` event) but
-  never fail a completed run. When one does fail, `sbxloop deliver <run>`
-  retries it later without re-running the work: it provisions only the
-  github-ops sandbox, reuses the run's persisted config (`--repo` and the
-  other options override its `[github]` section, so a run that never named a
-  repo can still be delivered), force-moves the same `sbxloop/<run>` branch
-  and reuses an already-open PR, and `--report` refreshes the tracking issue
-  with the PR link.
+**Delivery** is one atomic commit via the git data API on branch
+`sbxloop/<run>`, opened as a draft pull request, with the harvested tree
+filtered by `[artifacts] exclude`. Every fix round re-delivers onto the same
+branch — force-moved, the open PR reused — so one run is one PR, and
+`sbxloop resume <run>` at `delivering` is the retry path when a delivery
+failed. The PR stays a draft until the review approves and CI is green, so a
+watching human reads "draft" as "sbxloop is still working on this".
+
+**The review is the run's own.** A fresh read-only session reads the diff
+and returns a verdict; the run acts on that verdict whatever GitHub does
+with it. It is also posted to the PR for the record — as `APPROVE` /
+`REQUEST_CHANGES` when the repository accepts the loop's identity as a
+reviewer, and as a plain `COMMENT` review when it does not (GitHub refuses a
+PR author's approval of its own PR, among other rules). A `COMMENT` gates
+nothing on GitHub's side, which is fine: the gate is in the run. A *human's*
+standing `REQUEST_CHANGES` on the PR is honoured — it costs a fix round on
+the CI budget — and a human merging the PR themselves is the acceptance,
+while a human closing it unmerged fails the run.
+
+**Branch protection.** "Require branches to be up to date" is handled: the
+landing stage calls update-branch (bounded by `merge_update_attempts`, each
+one API call) and re-judges the new head. A rule the loop cannot satisfy —
+most often a required approval its identity cannot give — comes back as a
+405 on merge, which no retry fixes, so the run ends `blocked` with the PR
+open and out of draft for a human. A 409 is a race with a push that landed
+since; the next poll re-judges.
+
+The post-build stages are configured under `[landing]`, effective only with
+a repository:
+
+```toml
+[landing]
+deliver_draft = true            # the PR opens as a draft; un-drafted once review and CI pass
+max_review_rounds = 3           # how many times the review may request changes
+max_ci_rounds = 2               # rounds for the mechanical failures: red gate, red CI, conflict, human objection
+ci_poll_interval_s = 60         # how often the delivered head's check runs are polled
+ci_settle_s = 90                # "no check runs yet" must persist this long to mean "this repo has no CI"
+ci_timeout_s = 3600             # per wait, not charged to max_wall_clock_s; exceeding it ends the run blocked
+merge_method = "squash"         # squash | merge | rebase
+delete_branch_on_merge = true
+merge_update_attempts = 3       # update-branch calls when protection wants "up to date"; 0 disables
+review_diff_max_chars = 150000  # the diff shown inline to the reviewer; past it, the reviewer reads the tree
+```
+
+Landing is not optional and has no off switch: a run with a repository
+either merges, ends `failed` with its PR still a draft, or hands a `blocked`
+PR to a human. On a repository whose merges publish — sbxloop's own releases
+to PyPI and redeploys the daemon host on every merge to `main` — every
+merged run is therefore an unattended release. That is the existing pipeline
+working as designed, with nobody in front of it; the round budgets and the
+daemon's guardrails are what you are trusting instead.
 
 ## Debugging failed runs
 
@@ -787,7 +845,7 @@ sbxloop sandbox prune --force    # actually remove the orphan candidates
 ```
 
 A sandbox counts as an orphan candidate when its run is terminal
-(completed/failed/cancelled), unknown to this working copy's state DB, or
+(merged/completed/failed/blocked/cancelled), unknown to this working copy's state DB, or
 non-terminal but silent past `--min-age` (default 1 hour — the persisted event
 stream, heartbeats included, is the liveness signal). Sandboxes deliberately
 kept for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor` reports the current orphan-candidate count.
@@ -804,7 +862,7 @@ sbxloop gc                       # remove those past the retention window
 sbxloop gc --older-than 3        # a tighter window for this sweep only
 ```
 
-Only terminal runs (completed/failed/cancelled) past the window go, and never
+Only terminal runs (merged/completed/failed/blocked/cancelled) past the window go, and never
 one whose sandboxes were kept or whose delivery failed — that directory is the
 only copy of the work until it is fetched or redelivered. The SQLite rows stay
 (they are the audit trail); each removal is recorded as a `daemon.gc` event on
@@ -879,48 +937,52 @@ that follow you rather than the checkout. `sbxloop init` writes a commented
 starter file; `sbxloop config show` prints every resolved value and where it
 came from. The notable knobs:
 
-| Key                                    | Default            | Meaning                                                                                                 |
-| -------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
-| `model`                                | `auto`             | Copilot model id (`--model` overrides per run).                                                         |
-| `state_dir`                            | `.sbxloop`         | Runs, workspaces, artifacts, SQLite state, event logs.                                                  |
-| `keep_sandboxes` / `keep_on_failure`   | `false`            | Sandbox retention for debugging (see above).                                                            |
-| `secret_strategy`                      | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                         |
-| `[sandbox] template`                   | unset              | Baked template ref from `sbxloop bake`.                                                                 |
-| `[sandbox] workspace`                  | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                 |
-| `[sandbox] workspace_isolation`        | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                 |
-| `[sandbox] extra_allow_domains`        | `[]`               | Static egress allows applied to every run.                                                              |
-| `[sandbox] languages`                  | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                              |
-| `[policy] allow` / `deny`              | `[]`               | Bounds for task-declared egress.                                                                        |
-| `[github] repo` / `report` / `deliver` | unset / `false`    | The GitHub integration gate and toggles.                                                                |
-| `[artifacts] exclude`                  | see below          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it). |
-| `[budgets]`                            | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`. |
-| `[limits]`                             | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                         |
+| Key                                                       | Default            | Meaning                                                                                                                                                                        |
+| --------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`                                                   | `auto`             | Copilot model id (`--model` overrides per run).                                                                                                                                |
+| `state_dir`                                               | `~/.sbxloop`       | Runs, workspaces, artifacts, SQLite state, event logs.                                                                                                                         |
+| `keep_sandboxes` / `keep_on_failure`                      | `false`            | Sandbox retention for debugging (see above).                                                                                                                                   |
+| `secret_strategy`                                         | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                                                                                                |
+| `[sandbox] template`                                      | unset              | Baked template ref from `sbxloop bake`.                                                                                                                                        |
+| `[sandbox] workspace`                                     | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                                                                                        |
+| `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                        |
+| `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                               |
+| `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                     |
+| `[sandbox] languages`                                     | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                                                                                                     |
+| `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                               |
+| `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public` beside it.                               |
+| `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`. |
+| `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                        |
+| `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                            |
+| `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                |
+| `[daemon] trigger_label` … `blocked_label`                | `sbxloop:run` …    | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`.                                                                    |
+| `[daemon] max_runs_per_day`                               | `12`               | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there.                                                                   |
+| `[daemon] run_cap_timezone`                               | `UTC`              | IANA timezone defining the run cap's day boundary.                                                                                                                             |
+| `[daemon] max_attempts_per_item` / `max_resumes_per_item` | `2` / `2`          | Per-item retry and resume caps; `retry_backoff_s`, `max_consecutive_failures`, `breaker_cooldown_s` beside them.                                                               |
+| `[daemon] run_stale_after_s`                              | `21600`            | With no run executing, non-terminal runs idle this long are reconciled to a terminal state (`0` disables).                                                                     |
+| `[daemon] prune_runs_after_days`                          | `14`               | Run-directory retention, swept on start and daily (`0` disables).                                                                                                              |
+| `[daemon] workspace_isolation`                            | `clone`            | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).                                                                               |
+| `[daemon] refresh_workspace`                              | `true`             | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                                                                                                |
+| `[daemon] state_dir`                                      | unset              | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above).                                                                          |
 
-test failure.
-exhausted" error instead of letting an in-VM OOM surface as an inexplicable
-memory transiently) fails the task with an explicit "sandbox memory
-a warning; `mem_abort` (off by default, because a parallel test run spikes
-Memory pressure is instead made visible through `[limits]`: `mem_warn` emits
-memory flags, so the microVM is whatever size sbx gives every sandbox.
 sbxloop does not size the sandbox: `sbx create` is called without CPU or
-
-pytest run's first traceback and its failure summary both survive.
-critic keeps the first 2 KB and the last 4 KB of each command, so a long
-a starting point (4 h wall clock, tool cap 80). Verify output handed to the
-clock. [`contrib/presets/large-repo.toml`](contrib/presets/large-repo.toml) is
-minutes of test time, and 20 tasks × 3 attempts × verify presses on the wall
-packages to orient in — wants more headroom: one verify pass alone can be
-small greenfield project. A large existing repo — thousands of tests, several
-The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
+memory flags, so the microVM is whatever size sbx gives every sandbox.
+Memory pressure is instead made visible through `[limits]`: `mem_warn` emits
+a warning; `mem_abort` (off by default, because a parallel test run spikes
+memory transiently) fails the task with an explicit "sandbox memory
+exhausted" error instead of letting an in-VM OOM surface as an inexplicable
+test failure.
 
 ### Sizing budgets for a larger repository
 
-| `[daemon] workspace_isolation` | `clone` | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning). |
-| `[daemon] refresh_workspace` | `true` | `git fetch` + fast-forward the workspace checkout before each fresh daemon run. |
-| `[daemon] state_dir` | unset | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above). |
-| `[daemon] max_runs_per_day` | `12` | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there. |
-| `[daemon] run_cap_timezone` | `UTC` | IANA timezone defining the run cap's day boundary (also used by the per-day review and post-mortem caps). |
-| `[daemon] run_stale_after_s` | `21600` | With no run executing, non-terminal runs idle this long are reconciled to a terminal state (`0` disables). |
+The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
+small greenfield project. A large existing repo — thousands of tests, several
+packages to orient in — wants more headroom: one verify pass alone can be
+minutes of test time, and 20 tasks × 3 attempts × verify presses on the wall
+clock. [`contrib/presets/large-repo.toml`](contrib/presets/large-repo.toml) is
+a starting point (4 h wall clock, tool cap 80). Verify output handed back to
+the builder keeps the first 2 KB and the last 4 KB of each command, so a long
+pytest run's first traceback and its failure summary both survive.
 
 ## Repository layout
 
@@ -944,7 +1006,7 @@ The real-sbx end-to-end suite runs in CI via a manually dispatched workflow.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume
+- [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume, landing, the daemon
 - [Worker protocol](docs/worker-protocol.md) — the host↔worker contract: job kinds, events, transports
 - [Deploying the daemon](docs/deploy.md) — merge to `main` releases, then deploys itself to the daemon host: drain, upgrade, restart, health check, roll back
 - [Spike: agent-session backend](docs/spikes/46-agent-session-backend.md) — feasibility study for proxy-held secrets via sbx native sessions (issue #46)

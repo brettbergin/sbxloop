@@ -35,7 +35,7 @@ from sbxloop.engine.model import RunResult
 from sbxloop.engine.store import StateStore
 from sbxloop.events import EventBus
 from tests.unit.test_daemon_discord import FakeLoop
-from tests.unit.test_daemon_loop import FakeSource, inbox_item
+from tests.unit.test_daemon_loop import FakeSource, gh_item
 
 runner = CliRunner()
 
@@ -72,9 +72,7 @@ class TestDispatch:
         """#246: whoever asked is what the source hears — Discord passes its
         author, ctl its OS user; the dispatcher must not drop it."""
         floop = FakeLoop(_dstore(tmp_path))
-        floop.dstore.upsert_new(
-            WorkItem(item_id="gh:8", source="github", source_key="8", title="Eight"), 1.0
-        )
+        floop.dstore.upsert_new(WorkItem(item_id="gh:8", source_key="8", title="Eight"), 1.0)
         floop.dstore.mark_running("gh:8", "r1", 1.0)
         floop.dstore.mark_cancelled("gh:8", "cancelled by op", 2.0)
         assert dispatch(floop, "cancel", by="ops").ok
@@ -86,19 +84,17 @@ class TestDispatch:
 
     def test_item_verbs_report_the_stores_reason(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))
-        floop.dstore.upsert_new(
-            WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="Do A"), 1.0
-        )
-        floop.dstore.mark_running("inbox:a.md", "r1", 1.0)
+        floop.dstore.upsert_new(WorkItem(item_id="gh:9", source_key="9", title="Do A"), 1.0)
+        floop.dstore.mark_running("gh:9", "r1", 1.0)
         reply = dispatch(floop, "abandon")
         assert not reply.ok and reply.known and reply.text.startswith("usage: abandon")
-        reply = dispatch(floop, "retry inbox:a.md")
+        reply = dispatch(floop, "retry gh:9")
         assert not reply.ok and "retry failed:" in reply.text and "abandon it first" in reply.text
-        reply = dispatch(floop, "abandon inbox:a.md plan spiraled")
+        reply = dispatch(floop, "abandon gh:9 plan spiraled")
         assert reply.ok and "abandoned" in reply.text and "`r1`" in reply.text
-        reply = dispatch(floop, "requeue inbox:a.md")
+        reply = dispatch(floop, "requeue gh:9")
         assert not reply.ok and "requeue failed:" in reply.text
-        assert "attempts reset" in dispatch(floop, "retry inbox:a.md").text
+        assert "attempts reset" in dispatch(floop, "retry gh:9").text
         assert not dispatch(floop, "abandon gh:404").ok
 
     def test_verbs_are_case_insensitive_and_take_no_extra_args(self, tmp_path: Path) -> None:
@@ -350,7 +346,7 @@ class TestControlQueue:
         config = Config.model_validate({"state_dir": str(tmp_path / "state")})
         store = StateStore(config.state_dir / "state.db")
         dstore = DaemonStore(config.state_dir / "state.db")
-        source = FakeSource([inbox_item()])
+        source = FakeSource([gh_item()])
         released = threading.Event()
         cancelled = threading.Event()
 
@@ -365,7 +361,7 @@ class TestControlQueue:
             store.set_run_state(run_id, "cancelled")
             return RunResult(run_id=run_id, state="cancelled")
 
-        loop = DaemonLoop(config, store=store, dstore=dstore, sources=[source], runner=run)
+        loop = DaemonLoop(config, store=store, dstore=dstore, source=source, runner=run)
         server = ControlServer(loop, config.state_dir, poll_s=0.02)
         server.start()
         ticker = threading.Thread(target=loop.tick, daemon=True)
@@ -434,19 +430,25 @@ class TestDaemonCtlCommand:
         # An `abandon` served while recover() is still settling the item it
         # snapshotted would be overwritten by recovery's own verdict, so
         # requests stay refused-as-stale until recovery is done.
+        from sbxloop.daemon.github import DaemonGithub
+        from sbxloop.daemon.sources import GitHubIssueSource
+
         order: list[str] = []
         monkeypatch.setattr(DaemonLoop, "recover", lambda self: order.append("recover"))
         monkeypatch.setattr(ControlServer, "start", lambda self: order.append("ctl.start"))
-        (workdir / "inbox" / "pending").mkdir(parents=True)
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        # No sandbox, no GitHub: the poll finds nothing and the tick idles.
+        monkeypatch.setattr(DaemonGithub, "remove_stale", lambda self: None)
+        monkeypatch.setattr(GitHubIssueSource, "poll", lambda self: [])
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
         assert order == ["recover", "ctl.start"]
+        assert "tick:" in result.output and "no_work" in result.output
 
     def test_daemon_group_still_runs_the_loop_bare(self, workdir: Path) -> None:
         # `daemon` became a group so `ctl` could hang off it; the bare
-        # invocation must keep its old behaviour (exit 2 without sources).
-        result = runner.invoke(app, ["daemon", "--inbox", ""])
-        assert result.exit_code == 2 and "daemon.no_work_sources" in result.output
+        # invocation must keep its old behaviour (exit 2 without a repository).
+        result = runner.invoke(app, ["daemon"])
+        assert result.exit_code == 2 and "daemon.no_repository" in result.output
 
 
 class TestCommandAudit:

@@ -394,6 +394,56 @@ def changes_since(repo_path: Path, base: str) -> list[WorkspaceChange]:
     return [changes[path] for path in sorted(changes)]
 
 
+def diff_text(repo_path: Path, remote_base_sha: str | None) -> str | None:
+    """The run's changes as a unified diff for a reviewer, or None when the
+    checkout has no base to measure against.
+
+    Tracked paths come from ``git diff <base>`` (working tree included,
+    committed or not — the agent may do either) and untracked-but-not-
+    ignored files are appended as ``--no-index`` diffs against ``/dev/null``
+    so a new file the agent never ``git add``-ed is still reviewed. A
+    ``--stat`` header opens the text. Unclipped: the caller decides how
+    much of it a prompt may carry.
+    """
+    base = resolve_diff_base(repo_path, remote_base_sha)
+    git = find_git()
+    if base is None or git is None:
+        return None
+    try:
+        with Repo(repo_path) as repo:
+            stat = repo.git.diff("--stat", "--no-color", base)
+            body = repo.git.diff("--no-color", base)
+            untracked = [
+                path
+                for path in repo.git.ls_files("--others", "--exclude-standard", "-z").split("\0")
+                if path
+            ]
+    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError) as exc:
+        raise DeliveryError(f"git diff failed in {repo_path}: {exc}") from exc
+    parts = [stat.strip(), body]
+    for path in untracked:
+        # `--no-index` exits 1 whenever the files differ, which they always
+        # do against /dev/null; the output is the diff either way.
+        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
+            [
+                git,
+                "-C",
+                str(repo_path),
+                "diff",
+                "--no-color",
+                "--no-index",
+                "--",
+                "/dev/null",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        parts.append(proc.stdout or f"diff --git a/{path} b/{path}\n(new file, unreadable)\n")
+    return "\n".join(part for part in parts if part)
+
+
 def _pairs(listing: str) -> list[tuple[str, str]]:
     fields = listing.split("\0")
     return [(fields[i], fields[i + 1]) for i in range(0, len(fields) - 1, 2) if fields[i]]

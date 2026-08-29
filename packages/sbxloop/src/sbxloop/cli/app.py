@@ -344,19 +344,19 @@ def _print_artifacts_summary(result: RunResult, config: Config) -> None:
 def _print_github_summary(result: RunResult, config: Config) -> None:
     """What the run did on GitHub, mined from its persisted event stream.
 
-    The run.deliver/run.report lines scroll away with the transcript; the
-    repo, tracking issue, and delivery PR are the outputs the user actually
-    came for, so the finish summary restates them (#67-adjacent: outcomes
-    must be surfaced, never left implicit in scrollback).
+    The run.deliver/review/merge lines scroll away with the transcript; the
+    repo, the PR and how it ended are the outputs the user actually came
+    for, so the finish summary restates them (#67-adjacent: outcomes must be
+    surfaced, never left implicit in scrollback).
     """
     created = False
     repo: str | None = None
-    issue_line: str | None = None
-    deliver_line: str | None = None
+    lines: list[str] = []
     try:
-        events = list(_store(config).events(result.run_id, type_prefix="run."))
+        events = list(_store(config).events(result.run_id, type_prefix="r"))
     except SbxloopError:
         return
+    rounds = 0
     for _seq, event in events:
         data = event.data
         if event.type == HostEventTypes.RUN_DELIVER:
@@ -364,20 +364,26 @@ def _print_github_summary(result: RunResult, config: Config) -> None:
             if data.get("created"):
                 created = True
             elif data.get("error"):
-                deliver_line = f"delivery [bold red]failed[/]: {data['error']}"
+                lines.append(f"delivery [bold red]failed[/]: {data['error']}")
             elif data.get("url"):
-                deliver_line = f"delivered: PR [bold]#{data.get('pr')}[/]  {data['url']}"
-        elif event.type == HostEventTypes.RUN_REPORT:
-            repo = str(data.get("repo") or repo or "")
-            issue_line = f"tracking issue: [bold]#{data.get('issue')}[/]  {data.get('url')}"
-    if not repo:
+                rounds = int(data.get("round") or 1)
+                lines = [f"PR [bold]#{data.get('pr')}[/]  {data['url']} (delivery {rounds})"]
+        elif event.type == HostEventTypes.REVIEW_VERDICT:
+            lines.append(
+                f"review round {data.get('round')}: [bold]{data.get('verdict')}[/] "
+                f"({data.get('blocking', 0)} blocking finding(s))"
+            )
+        elif event.type == HostEventTypes.RUN_MERGED:
+            who = "by a human" if data.get("by_human") else "by sbxloop"
+            lines.append(f"[bold green]merged[/] {who}: {str(data.get('sha') or '')[:12]}")
+        elif event.type == HostEventTypes.RUN_BLOCKED:
+            lines.append(f"[bold yellow]blocked[/]: {data.get('why')}")
+    if not repo and not result.pr_url:
         return
     suffix = " [dim](created this run)[/]" if created else ""
-    console.print(f"\ngithub: [bold]{repo}[/]{suffix}")
-    if issue_line:
-        console.print(f"  {issue_line}")
-    if deliver_line:
-        console.print(f"  {deliver_line}")
+    console.print(f"\ngithub: [bold]{repo or config.github.repo}[/]{suffix}")
+    for line in lines:
+        console.print(f"  {line}")
 
 
 def _print_workspace_clone_summary(result: RunResult, config: Config) -> None:
@@ -417,8 +423,10 @@ def _print_retention_note(config: Config) -> None:
 
 
 def _finish(result: RunResult, config: Config) -> None:
-    style = "green" if result.succeeded else "red"
+    style = "green" if result.succeeded else ("yellow" if result.state == "blocked" else "red")
     console.print(f"\nrun [bold cyan]{result.run_id}[/] finished: [bold {style}]{result.state}[/]")
+    if result.reason:
+        console.print(f"  reason: {result.reason}")
     for task in result.tasks:
         console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
     _print_github_summary(result, config)
@@ -438,37 +446,16 @@ def run(
         str | None,
         typer.Option(
             "--repo",
-            help='GitHub repository ("owner/name") for --report/--deliver, '
-            "overriding [github].repo from sbxloop.toml.",
-        ),
-    ] = None,
-    report: Annotated[
-        bool | None,
-        typer.Option(
-            "--report/--no-report",
-            help="Post run progress to the GitHub repository (--repo or [github].repo).",
-        ),
-    ] = None,
-    deliver: Annotated[
-        bool | None,
-        typer.Option(
-            "--deliver/--no-deliver",
-            help="Publish the completed run's artifacts as a PR to the GitHub "
-            "repository (--repo or [github].repo).",
+            help='GitHub repository ("owner/name") the run delivers to and merges into, '
+            "overriding [github].repo from sbxloop.toml. Without one the run stops "
+            "after its gate with the work in the workspace.",
         ),
     ] = None,
     deliver_base: Annotated[
         str | None,
         typer.Option(
             "--deliver-base",
-            help="Base branch for the delivery PR (default: the repo's default branch).",
-        ),
-    ] = None,
-    deliver_draft: Annotated[
-        bool | None,
-        typer.Option(
-            "--deliver-draft/--no-deliver-draft",
-            help="Open the delivery PR as a draft.",
+            help="Base branch for the pull request (default: the repo's default branch).",
         ),
     ] = None,
     create_repo: Annotated[
@@ -512,7 +499,11 @@ def run(
         ),
     ] = True,
 ) -> None:
-    """Run an agentic loop for OUTCOME in a fresh sandbox pair."""
+    """Run an agentic loop for OUTCOME in a fresh sandbox pair.
+
+    With a GitHub repository configured the run carries its work all the
+    way: a draft pull request, its own review, fix rounds, CI, and the merge.
+    """
     config = _config_with_overrides(
         model=model,
         keep_sandboxes=keep_sandboxes,
@@ -522,10 +513,7 @@ def run(
         key: value
         for key, value in (
             ("repo", repo),
-            ("report", report),
-            ("deliver", deliver),
             ("deliver_base", deliver_base),
-            ("deliver_draft", deliver_draft),
             ("create_repo", create_repo),
             ("create_public", create_public),
         )
@@ -540,18 +528,10 @@ def run(
             console.print(f"[bold red]invalid GitHub option:[/] {exc.errors()[0]['msg']}")
             raise typer.Exit(2) from exc
         config = config.model_copy(update={"github": github})
-    wanted = [
-        feature
-        for feature, enabled in (
-            ("progress reporting (--report)", config.github.report),
-            ("PR delivery (--deliver)", config.github.deliver),
-        )
-        if enabled
-    ]
-    if wanted and not config.github.enabled:
+    if (deliver_base or create_repo or create_public) and not config.github.enabled:
         console.print(
-            f"[bold red]GitHub integration is not configured.[/] {', '.join(wanted)} "
-            "needs a repository: pass [cyan]--repo owner/repo[/] or set "
+            "[bold red]GitHub integration is not configured.[/] Those options need a "
+            "repository: pass [cyan]--repo owner/repo[/] or set "
             '[cyan]\\[github] repo = "owner/repo"[/] in sbxloop.toml '
             "(see `sbxloop init`), then re-run."
         )
@@ -584,75 +564,6 @@ def resume(
         raise typer.Exit(2) from exc
     # engine.config is the run's rehydrated config, which is what drove the run.
     _finish(result, engine.config)
-
-
-@app.command()
-def deliver(
-    run_id: Annotated[str, typer.Argument(help="Completed run id to deliver.")],
-    repo: Annotated[
-        str | None,
-        typer.Option(
-            "--repo",
-            help='GitHub repository ("owner/name"), overriding the run\'s [github].repo.',
-        ),
-    ] = None,
-    deliver_base: Annotated[
-        str | None,
-        typer.Option("--deliver-base", help="Base branch for the PR (default: repo default)."),
-    ] = None,
-    deliver_draft: Annotated[
-        bool | None,
-        typer.Option("--deliver-draft/--no-deliver-draft", help="Open the PR as a draft."),
-    ] = None,
-    create_repo: Annotated[
-        bool | None,
-        typer.Option(
-            "--create-repo/--no-create-repo",
-            help="Create the repository if it does not exist (see `sbxloop run --help`).",
-        ),
-    ] = None,
-    create_public: Annotated[
-        bool | None,
-        typer.Option("--create-public/--no-create-public"),
-    ] = None,
-    report: Annotated[
-        bool | None,
-        typer.Option(
-            "--report/--no-report",
-            help="Also refresh the run's tracking issue with the PR link "
-            "(default: the run's [github].report).",
-        ),
-    ] = None,
-) -> None:
-    """Deliver (or re-deliver) a completed run's artifacts as a PR.
-
-    The retry path for a run whose end-of-run delivery failed: provisions a
-    github-ops sandbox only, reuses the run's persisted config (options here
-    override its [github] section), and re-delivers the same branch/PR.
-    """
-    config = load_config()
-    overrides = {
-        key: value
-        for key, value in (
-            ("repo", repo),
-            ("deliver_base", deliver_base),
-            ("deliver_draft", deliver_draft),
-            ("create_repo", create_repo),
-            ("create_public", create_public),
-        )
-        if value is not None
-    }
-    engine = LoopEngine(config)
-    engine.bus.subscribe(plain_printer(console))
-    try:
-        pr = engine.deliver(run_id, github_overrides=overrides, report=report)
-    except ValidationError as exc:
-        console.print(f"[bold red]invalid GitHub option:[/] {exc.errors()[0]['msg']}")
-        raise typer.Exit(2) from exc
-    except SbxloopError as exc:
-        console.print(f"[bold red]delivery failed:[/] {exc}")
-        raise typer.Exit(2) from exc
-    console.print(f"run [bold cyan]{run_id}[/] delivered: PR [bold]#{pr.number}[/]  {pr.url}")
 
 
 @app.command()
@@ -1397,14 +1308,6 @@ def daemon(
         str | None,
         typer.Option("--repo", help='GitHub repository ("owner/name") to poll for labeled issues.'),
     ] = None,
-    inbox: Annotated[
-        str | None,
-        typer.Option("--inbox", help='Inbox directory of .md work files ("" disables).'),
-    ] = None,
-    backlog: Annotated[
-        str | None,
-        typer.Option("--backlog", help="Where agent-filed follow-up work goes: github|inbox|off."),
-    ] = None,
     max_runs_per_day: Annotated[
         int | None,
         int | None,
@@ -1438,8 +1341,8 @@ def daemon(
         typer.Option("--log-format", help="Daemon log rendering: console|json."),
     ] = None,
 ) -> None:
-    """Run the always-on outer loop: discover work (labeled GitHub issues,
-    inbox files), run each item through the inner loop, report back, and
+    """Run the always-on outer loop: claim labeled GitHub issues, run each
+    one through to a merged pull request, report back on the issue, and
     mirror the chronology to Discord. Subcommands inspect and steer
     individual work items; `sbxloop daemon ctl CMD` talks to the running
     daemon instead."""
@@ -1452,8 +1355,9 @@ def daemon(
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.logsink import event_log_subscriber
     from sbxloop.daemon.loop import DaemonLoop
+    from sbxloop.daemon.model import DaemonNotice
     from sbxloop.daemon.paths import resolve_state_dir
-    from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels, InboxSource, WorkSource
+    from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels
 
     log = get_logger("sbxloop.daemon")
     started_at = time.monotonic()
@@ -1468,8 +1372,6 @@ def daemon(
     daemon_overrides = {
         k: v
         for k, v in (
-            ("inbox_dir", inbox),
-            ("backlog", backlog),
             ("max_runs_per_day", max_runs_per_day),
             ("poll_interval_s", poll_interval),
             ("log_level", log_level),
@@ -1498,62 +1400,44 @@ def daemon(
         raise typer.Exit(2) from exc
     configure_logging(config.daemon.log_level, fmt=config.daemon.log_format)
 
-    github_active = config.github.enabled
-    inbox_active = bool(config.daemon.inbox_dir)
-    if not github_active and not inbox_active:
+    if not config.github.enabled:
         log.error(
-            "daemon.no_work_sources",
-            hint="set --repo owner/name (or [github] repo) to poll issues, and/or an "
-            "inbox directory (--inbox DIR / [daemon] inbox_dir)",
+            "daemon.no_repository",
+            hint="set --repo owner/name (or [github] repo): the daemon's work is the "
+            "labeled issues of one repository",
         )
         raise typer.Exit(2)
-    if config.daemon.backlog == "github" and not github_active:
-        log.error("daemon.backlog_needs_github", hint="--backlog github needs --repo owner/name")
-        raise typer.Exit(2)
-    if github_active and config.daemon.backlog != "github":
-        # The audit lane is always on when issues are a source; its
-        # findings only have somewhere to go with backlog = "github".
+    assert config.github.repo is not None
+    if config.retired_keys:
         log.warning(
-            "daemon.audit_findings_unfiled",
-            audit_label=config.daemon.audit_label,
-            backlog=config.daemon.backlog,
-            hint="audit runs complete but file nothing without --backlog github",
+            "daemon.retired_config_keys",
+            keys=list(config.retired_keys),
+            hint="these keys are ignored (landing knobs were carried into [landing]); "
+            "remove them from sbxloop.toml — they become errors in 1.0",
         )
 
+    db_path = config.state_dir / "state.db"
+    # A pre-1.0 state database carries the old daemon lanes' tables and item
+    # kinds; it is moved aside rather than migrated, before the engine store
+    # opens the file (both stores share it).
+    archived = DaemonStore.archive_legacy(db_path)
     store = _store(config)
-    dstore = DaemonStore(config.state_dir / "state.db")
+    dstore = DaemonStore(db_path)
     sbx = SbxCLI(app_name=config.app_name or None)
     bus = EventBus()
     bus.subscribe(event_log_subscriber)
-    sources: list[WorkSource] = []
-    github: DaemonGithub | None = None
-    inbox_source: InboxSource | None = None
-    if inbox_active:
-        inbox_source = InboxSource(Path(config.daemon.inbox_dir))
-        sources.append(inbox_source)
-    if github_active:
-        assert config.github.repo is not None
-        github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
-        github.remove_stale()
-        labels = GitHubLabels(
-            config.daemon.trigger_label,
-            config.daemon.in_progress_label,
-            config.daemon.failed_label,
-            config.daemon.backlog_label,
-            delivered=config.daemon.delivered_label,
-            audit=config.daemon.audit_label,
-            completed=config.daemon.completed_label,
-        )
-        sources.append(
-            GitHubIssueSource(
-                github.ops,
-                config.github.repo,
-                labels,
-                on_failure=github.note_failure,
-                close_on_success=config.daemon.close_on_success,
-                tool_repo=config.daemon.tool_repo,
-            )
-        )
+    github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
+    github.remove_stale()
+    labels = GitHubLabels(
+        config.daemon.trigger_label,
+        config.daemon.in_progress_label,
+        config.daemon.failed_label,
+        config.daemon.completed_label,
+        config.daemon.blocked_label,
+    )
+    source = GitHubIssueSource(
+        github.ops, config.github.repo, labels, on_failure=github.note_failure
+    )
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: where its state went (with the anchored default,
@@ -1565,10 +1449,9 @@ def daemon(
         pid=os.getpid(),
         state_dir=str(config.state_dir),
         state_dir_reason=state_choice.reason,
-        sources=[s.name for s in sources],
+        archived_state=str(archived) if archived else None,
         repo=config.github.repo,
-        trigger_label=config.daemon.trigger_label if github_active else None,
-        inbox_dir=config.daemon.inbox_dir or None,
+        trigger_label=config.daemon.trigger_label,
         poll_interval_s=config.daemon.poll_interval_s,
         max_runs_per_day=config.daemon.max_runs_per_day,
         max_attempts_per_item=config.daemon.max_attempts_per_item,
@@ -1578,10 +1461,10 @@ def daemon(
         breaker_cooldown_s=config.daemon.breaker_cooldown_s,
         workspace_isolation=config.daemon.workspace_isolation,
         refresh_workspace=config.daemon.refresh_workspace,
-        backlog=config.daemon.backlog,
-        audits=config.daemon.audits,
-        postmortems=config.daemon.postmortems,
-        review_deliveries=config.daemon.review_deliveries,
+        landing="on",
+        max_review_rounds=config.landing.max_review_rounds,
+        max_ci_rounds=config.landing.max_ci_rounds,
+        merge_method=config.landing.merge_method,
         discord=("on" if config.discord.enabled else "off"),
         discord_channel=config.discord.channel_id if config.discord.enabled else None,
         concierge=("on" if config.discord.enabled and config.concierge.enabled else "off"),
@@ -1594,33 +1477,29 @@ def daemon(
     if dry_run:
         code = 0
         try:
-            for source in sources:
-                found = 0
-                for item in source.poll():
-                    found += 1
-                    # The listing IS this command's output: stdout, so it
-                    # pipes and greps; the log keeps the structured record.
-                    console.print(
-                        f"[cyan]{item.item_id}[/]  {item.title}"
-                        + (f"  {item.url}" if item.url else "")
-                    )
-                    log.debug(
-                        "daemon.dry_run_candidate",
-                        source=source.name,
-                        item=item.item_id,
-                        title=item.title,
-                        url=item.url or None,
-                    )
-                log.info("daemon.dry_run_polled", source=source.name, candidates=found)
+            found = 0
+            for item in source.poll():
+                found += 1
+                # The listing IS this command's output: stdout, so it
+                # pipes and greps; the log keeps the structured record.
+                console.print(
+                    f"[cyan]{item.item_id}[/]  {item.title}" + (f"  {item.url}" if item.url else "")
+                )
+                log.debug(
+                    "daemon.dry_run_candidate",
+                    item=item.item_id,
+                    title=item.title,
+                    url=item.url or None,
+                )
+            log.info("daemon.dry_run_polled", candidates=found)
         except SbxloopError as exc:
             log.error("daemon.poll_failed", error=str(exc), exc_info=True)
             code = 1
         finally:
-            if github is not None:
-                github.close()
+            github.close()
         raise typer.Exit(code)
 
-    loop = DaemonLoop(config, store=store, dstore=dstore, sources=sources, sbx=sbx)
+    loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx)
     # One probe, shared: the startup drift check below warms its PyPI memo, so
     # the concierge's first `version_status` answers without a network call.
     versions = VersionProbe(sbx=sbx)
@@ -1634,6 +1513,14 @@ def daemon(
             log.error("discord.bridge_failed", error=str(exc), exc_info=True)
             raise typer.Exit(2) from exc
         loop.frontend = bridge
+        if archived is not None:
+            bridge.daemon_notice(
+                DaemonNotice(
+                    kind="daemon.state_archived",
+                    text=f"pre-1.0 daemon state moved aside to {archived}; starting fresh",
+                    level="warning",
+                )
+            )
         if config.concierge.enabled and not once:
             # The control channel's agent: its own event bus (the log sink
             # sees its turns like any agent session) and a long-lived agent
@@ -1647,7 +1534,6 @@ def daemon(
                 loop=loop,
                 dstore=dstore,
                 store_factory=lambda: _store(config),
-                inbox=inbox_source,
                 github=github,
                 host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
                 bus=concierge_bus,
@@ -1663,7 +1549,18 @@ def daemon(
         # background (never on the startup path) and narrate it only when
         # behind — nobody has to remember to ask. `sbx_control`'s concierge
         # tool `version_status` answers the same question on demand.
-        start_drift_check(versions, bridge.daemon_event if bridge is not None else None)
+        start_drift_check(
+            versions,
+            (
+                (
+                    lambda text: bridge.daemon_notice(
+                        DaemonNotice(kind="daemon.version_drift", text=text, level="warning")
+                    )
+                )
+                if bridge is not None
+                else None
+            ),
+        )
 
     ctl = ControlServer(loop, config.state_dir)
     cleanup_registry.install_handlers()
@@ -1709,9 +1606,8 @@ def daemon(
             # the next daemon process (conversation memory lives in it).
             log.debug("daemon.shutdown", step="concierge")
             concierge.close()
-        if github is not None:
-            log.debug("daemon.shutdown", step="github sandbox")
-            github.close()
+        log.debug("daemon.shutdown", step="github sandbox")
+        github.close()
         dstore.close()
         log.info(
             "daemon.stopped",
@@ -1737,7 +1633,7 @@ def _daemon_store() -> DaemonStore:
 
 _ITEM_CONTROL_NOTE = (
     "[dim]a live daemon notices the change within a second: an in-flight run for "
-    "this item is cancelled and the source (issue / inbox file) is told on its next "
+    "this item is cancelled and the issue is told on its next "
     "tick; with no daemon running, the next daemon start reports it and closes the "
     "dead run. The item's next dispatch, if any, starts a fresh run.[/]"
 )
@@ -1783,7 +1679,7 @@ def daemon_items(
 
 @daemon_app.command("abandon")
 def daemon_abandon(
-    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12).")],
     reason: Annotated[str | None, typer.Option("--reason", help="Recorded as last error.")] = None,
 ) -> None:
     """Give up on a queued or running item; its run will not be resumed."""
@@ -1792,15 +1688,15 @@ def daemon_abandon(
 
 @daemon_app.command("retry")
 def daemon_retry(
-    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12).")],
 ) -> None:
-    """Re-queue an abandoned/cancelled item with attempts reset and a fresh plan (not a resume)."""
+    """Re-queue a failed/blocked/cancelled item: attempts reset, fresh run (not a resume)."""
     _item_control("retry", item_id, None)
 
 
 @daemon_app.command("requeue")
 def daemon_requeue(
-    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12, inbox:x.md).")],
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12).")],
 ) -> None:
     """Unpin a running item from its run so the next dispatch starts fresh (attempts kept)."""
     _item_control("requeue", item_id, None)
@@ -2080,23 +1976,34 @@ deny = []
 
 [github]
 # The GitHub integration. Unset (the default) disables GitHub entirely:
-# no github sandbox is provisioned, GH_TOKEN is not required, and
-# repo-facing features refuse to run. Set `repo` to the ONE repository
-# sbxloop may work with; the toggles below act on it. Everything here can
-# also be set per run (`sbxloop run --repo owner/repo --deliver ...`), and
-# the flags win over this file.
+# no github sandbox is provisioned, GH_TOKEN is not required, and a run
+# stops after its gate with the work in the workspace. Set `repo` to the
+# ONE repository sbxloop works with: every run that passes its gate opens a
+# pull request there and carries it through review, CI and merge (see
+# [landing]). GH_TOKEN needs contents:write + pull_requests:write on it.
+# `sbxloop run --repo owner/repo` overrides this per run.
 # repo = "you/your-repo"
-# Post run progress (issues/comments) to the configured repo.
-# report = false
-# Open a PR with the run's artifacts when a run completes (or `--deliver`).
-# GH_TOKEN needs contents:write + pull_requests:write on the repo.
-# deliver = false
 # deliver_base = "main"   # base branch; unset uses the repo's default
-# deliver_draft = false
 # Create `repo` when it does not exist (probed up front, so a typo'd repo
 # fails the run before any work; needs a token allowed to create repos).
 # create_repo = false
 # create_public = false   # created repos are private unless flipped
+
+[landing]
+# What happens after the tasks are built: the PR opens as a draft, the run
+# reviews its own diff, spends bounded fix rounds on what the review, CI or
+# the base branch object to, un-drafts and merges. Merging is not optional —
+# a run that cannot land its PR ends `blocked` with the PR left open for a
+# human. On a repo whose merges publish, every merged run is a release.
+# deliver_draft = true
+# max_review_rounds = 3      # times the review may request changes
+# max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
+# ci_poll_interval_s = 60
+# ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI"
+# ci_timeout_s = 3600        # per wait; exceeding it ends the run blocked
+# merge_method = "squash"    # squash | merge | rebase
+# delete_branch_on_merge = true
+# merge_update_attempts = 3  # update-branch calls when protection wants "up to date"
 
 [artifacts]
 # Path components excluded from artifact listings, harvest and delivery,
@@ -2141,31 +2048,20 @@ mem_warn = 90.0
 mem_abort = 0.0
 
 [daemon]
-# `sbxloop daemon` — the always-on outer loop. Discovers work and runs each
-# item as a full inner-loop run, fully autonomously: a labeled issue in the
-# [github] repo or a .md file in the inbox starts a run on its own, so the
-# guardrails below are what stand between a mislabeled issue and your budget.
-# inbox_dir = ".sbxloop/inbox"     # "" disables the inbox source
+# `sbxloop daemon` — the always-on outer loop. Polls the [github] repo for
+# issues carrying trigger_label; each one becomes ONE run that builds the
+# work, opens a draft PR, reviews and fixes it, waits for CI and merges it
+# (the landing knobs live under [landing]). The issue closes with
+# completed_label when the PR merges, gets failed_label when the run gave
+# up, blocked_label when GitHub would not let the loop finish. The daemon
+# never files work of its own; a label alone starts a run, so the guardrails
+# below are what stand between a mislabeled issue and your budget.
 # poll_interval_s = 60.0
 # trigger_label = "sbxloop:run"    # issue label that queues work
 # in_progress_label = "sbxloop:in-progress"
 # failed_label = "sbxloop:failed"
-# backlog_label = "sbxloop:backlog"
-# delivered_label = "sbxloop:delivered"
-# completed_label = "sbxloop:completed"  # applied when the work lands (PR merged / audit closed)
-# audit_label = "sbxloop:audit"    # discovery lane: investigate, file findings, no PR
-# postmortems = true             # file a post-mortem audit when a patch item fails
-# postmortems_per_day = 3
-# audits = false                 # open .github/sbxloop/audits/*.md charters on schedule
-# review_deliveries = true       # audit each PR the loop delivers (defects → backlog)
-# tool_repo = "brettbergin/sbxloop"  # findings ABOUT sbxloop go here, never to the project
-# audit_dir = ".github/sbxloop/audits"
-# A delivered patch item settles its source issue when the PR MERGES: at
-# acceptance the issue gets the summary + delivered_label and stays open;
-# on merge the daemon closes it and swaps in completed_label. A PR closed
-# without merging marks the item failed instead.
-# close_on_success = true         # deprecated no-op: issues now close on merge, not acceptance
-# tracking_issue = true           # false skips the per-run tracking issue
+# completed_label = "sbxloop:completed"  # applied when the PR merges
+# blocked_label = "sbxloop:blocked"      # the loop could not land the PR; a human looks
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # max_attempts_per_item = 2
@@ -2174,25 +2070,6 @@ mem_abort = 0.0
 # max_consecutive_failures = 3     # circuit breaker ...
 # breaker_cooldown_s = 3600.0      # ... and how long it stays open
 # shutdown_grace_s = 60.0          # keep below systemd TimeoutStopSec
-# Agent-filed follow-up work (.sbxloop/backlog/*.md in the run workspace):
-# "github" files issues with backlog_label, "inbox" writes to inbox/triage/,
-# "off" ignores it. Filed items wait for a human unless auto-trigger is on.
-# backlog = "off"
-# backlog_max_per_run = 5
-# backlog_auto_trigger = false
-# deliver_draft = true             # autonomous PRs arrive as drafts
-# The last step out of the loop. With auto_merge on, a PR that clears the full
-# acceptance bar — green checks AND a satisfied review — is taken out of draft
-# and merged by the daemon. Off by default: merging is the one irreversible
-# thing the loop does to a repo, and on a repo whose merges publish a release
-# this means unattended releases. A PR accepted for any weaker reason (green
-# CI with no reviewer available) is still handed to a human.
-# auto_merge = false
-# merge_method = "squash"          # squash | merge | rebase
-# delete_branch_on_merge = true
-# Branch protection often requires a PR to be up to date before merging, and
-# the base moves. Each update is one API call, not a run; 0 disables updating.
-# merge_update_attempts = 3
 # Retention for .sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
 # swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
 # prune_runs_after_days = 14
@@ -2241,7 +2118,8 @@ mem_abort = 0.0
 # max_tool_calls = 16
 # session_turns = 40               # rotate the resumed SDK session after N turns
 # github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
-# create_issues = true             # file/list/comment/label/close issues (a close needs your yes)
+# create_issues = true             # file (queued at once)/list/comment/label/close issues
+#                                  # (a close needs your yes)
 """
 
 

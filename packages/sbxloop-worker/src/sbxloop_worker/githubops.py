@@ -26,10 +26,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from typing import Any, Protocol
+from http.client import HTTPMessage
+from typing import IO, Any, Protocol
 
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
+USER_AGENT = "sbxloop-worker"
 
 JsonValue = dict[str, Any] | list[Any]
 
@@ -76,6 +78,11 @@ def parse_gh_http_status(stderr: str) -> int | None:
 class Transport(Protocol):
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue: ...
 
+    def request_text(self, method: str, path: str) -> str:
+        """Like :meth:`request`, for endpoints that answer with a text body
+        (Actions job logs) rather than JSON."""
+        ...
+
 
 class GhCliTransport:
     """Executes REST calls through ``gh api``."""
@@ -83,7 +90,7 @@ class GhCliTransport:
     def __init__(self, gh: str = "gh") -> None:
         self.gh = gh
 
-    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
+    def _run(self, method: str, path: str, body: dict[str, Any] | None = None) -> str:
         argv = [
             self.gh,
             "api",
@@ -106,10 +113,44 @@ class GhCliTransport:
                 f"gh api {method} {path} failed (rc={proc.returncode}): {stderr}",
                 http_status=parse_gh_http_status(stderr),
             )
-        if not proc.stdout.strip():
+        return proc.stdout
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
+        stdout = self._run(method, path, body)
+        if not stdout.strip():
             return {}
-        parsed: JsonValue = json.loads(proc.stdout)
+        parsed: JsonValue = json.loads(stdout)
         return parsed
+
+    def request_text(self, method: str, path: str) -> str:
+        # gh follows the logs endpoint's redirect to blob storage itself and
+        # prints the body verbatim, so nothing beyond "don't parse it" differs.
+        return self._run(method, path)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Turn every redirect into an HTTPError so the caller sees the 302.
+
+    The Actions logs endpoint answers 302 to a *signed* blob-storage URL.
+    urllib's default handler would replay the original headers there —
+    bearer token included — and the storage host rejects a request carrying
+    both its signature and an Authorization header (and would be handed the
+    token either way). The caller follows the hop itself, unauthenticated.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
 
 class RestTransport:
@@ -155,6 +196,61 @@ class RestTransport:
             return {}
         parsed: JsonValue = json.loads(raw)
         return parsed
+
+    def request_text(self, method: str, path: str) -> str:
+        url = path if path.startswith("http") else f"{API_ROOT}{path}"
+        if not url.startswith("https://"):
+            raise GithubOpError(f"refusing non-HTTPS GitHub API URL: {url}")
+        opener = urllib.request.build_opener(_NoRedirect)
+        request = urllib.request.Request(
+            url,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": API_VERSION,
+                "User-Agent": USER_AGENT,
+            },
+        )
+        body, location = self._open_text(opener, request)
+        if location is None:
+            return body
+        # The hop to storage: the URL carries its own signature, so the only
+        # header it gets is a User-Agent. Same https rule — that signature is
+        # a credential too, if a short-lived one.
+        if not location.startswith("https://"):
+            raise GithubOpError(f"refusing non-HTTPS redirect target: {location}")
+        follow = urllib.request.Request(location, method="GET", headers={"User-Agent": USER_AGENT})
+        body, location = self._open_text(opener, follow)
+        if location is not None:
+            raise GithubOpError(f"{method} {url}: storage redirected again, to {location}")
+        return body
+
+    @staticmethod
+    def _open_text(
+        opener: urllib.request.OpenerDirector, request: urllib.request.Request
+    ) -> tuple[str, str | None]:
+        """``(body, None)`` for a response, ``("", location)`` for a redirect.
+
+        Job logs are whatever the build printed, so the body is decoded with
+        replacement: a stray byte must not turn "here is your failure" into
+        a decode error.
+        """
+        method, url = request.get_method(), request.full_url
+        try:
+            with opener.open(request, timeout=120) as response:  # nosec B310 - https enforced by caller
+                return response.read().decode("utf-8", errors="replace"), None
+        except urllib.error.HTTPError as exc:
+            if exc.code in _REDIRECT_CODES:
+                location = exc.headers.get("Location")
+                if location:
+                    return "", str(location)
+            detail = exc.read().decode(errors="replace")[:2000]
+            raise GithubOpError(
+                f"{method} {url} -> HTTP {exc.code}: {detail}", http_status=exc.code
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise GithubOpError(f"{method} {url} failed: {exc.reason}") from exc
 
 
 def select_transport() -> Transport:
@@ -308,6 +404,82 @@ def _raw_api(t: Transport, p: dict[str, Any]) -> JsonValue:
     return t.request(str(p["method"]).upper(), str(p["path"]), p.get("body"))
 
 
+# Check-run conclusions that are not failures — the same set the host's
+# ``fold_check_runs`` uses to decide a PR is red (the worker cannot import
+# sbxloop, so the set is repeated here; keep the two aligned). ``neutral``
+# and ``skipped`` are not red builds; everything else, including conclusions
+# GitHub adds later, fails closed.
+PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+
+# Per-check excerpt budget, and how much of it goes to the head of the log.
+# The tail is where a failing job says *why* (the assertion, the traceback,
+# the non-zero exit); the head names what was being run. Both matter to a
+# fix agent, the middle rarely does.
+DEFAULT_LOG_CHARS = 6000
+LOG_HEAD_CHARS = 1500
+
+
+def _clip_head_tail(text: str, head: int, tail: int) -> str:
+    """Keep the first ``head`` and last ``tail`` characters, marking the cut."""
+    if len(text) <= head + tail:
+        return text
+    dropped = len(text) - head - tail
+    return f"{text[:head]}\n...(clipped {dropped} chars)...\n{text[len(text) - tail :]}"
+
+
+def _check_output_excerpt(run: dict[str, Any]) -> str:
+    """What a non-Actions check (or one whose logs cannot be read) said."""
+    output = run.get("output") or {}
+    if not isinstance(output, dict):
+        return ""
+    parts = [str(output.get(key) or "").strip() for key in ("title", "summary", "text")]
+    return "\n\n".join(part for part in parts if part)
+
+
+def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """The failing check runs on a commit, each with the text that explains it.
+
+    A fix round needs more than the name of a red check: it needs the
+    assertion or the compiler error. For GitHub Actions the check-run id is
+    the job id, so the job's log is fetched; other checks (and Actions jobs
+    whose logs are gone — expired, or a token without ``actions:read``)
+    fall back to what the check itself reported. Each excerpt is clipped
+    head+tail to ``max_chars`` so a chatty build cannot flood the brief.
+    """
+    _require(p, "repo", "sha")
+    repo, sha = p["repo"], p["sha"]
+    max_chars = int(p.get("max_chars") or DEFAULT_LOG_CHARS)
+    head = min(LOG_HEAD_CHARS, max_chars)
+    tail = max_chars - head
+    data = t.request("GET", f"/repos/{repo}/commits/{sha}/check-runs")
+    runs = data.get("check_runs") if isinstance(data, dict) else None
+    checks: list[dict[str, Any]] = []
+    for run in runs if isinstance(runs, list) else []:
+        if not isinstance(run, dict):
+            continue
+        conclusion = run.get("conclusion")
+        if conclusion is None or str(conclusion).lower() in PASSING_CONCLUSIONS:
+            continue
+        excerpt = ""
+        if (run.get("app") or {}).get("slug") == "github-actions" and run.get("id") is not None:
+            try:
+                excerpt = t.request_text("GET", f"/repos/{repo}/actions/jobs/{run['id']}/logs")
+            except GithubOpError as exc:
+                reason = f"HTTP {exc.http_status}" if exc.http_status else str(exc)[:200]
+                excerpt = f"(logs unavailable: {reason})\n{_check_output_excerpt(run)}"
+        if not excerpt.strip():
+            excerpt = _check_output_excerpt(run)
+        checks.append(
+            {
+                "name": str(run.get("name") or "check"),
+                "conclusion": str(conclusion),
+                "details_url": str(run.get("details_url") or ""),
+                "excerpt": _clip_head_tail(excerpt, head, tail),
+            }
+        )
+    return {"checks": checks}
+
+
 # One progress event per this many blobs keeps a multi-hundred-file delivery
 # visibly alive without flooding the event stream.
 BLOB_PROGRESS_EVERY = 10
@@ -368,6 +540,7 @@ OPS: dict[str, OpImpl] = {
     "ref.get": _ref_get,
     "search.issues": _search_issues,
     "raw.api": _raw_api,
+    "checks.failed_logs": _checks_failed_logs,
 }
 
 # Ops that stream progress while they run (they receive a progress callback in

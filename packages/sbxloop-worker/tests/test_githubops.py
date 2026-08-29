@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import email.message
 import io
 import json
 import stat
+import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -24,11 +26,21 @@ from sbxloop_worker.githubops import (
 
 
 class RecordingTransport:
-    """In-memory transport recording requests and returning canned data."""
+    """In-memory transport recording requests and returning canned data.
 
-    def __init__(self, responses: dict[str, Any] | None = None) -> None:
+    ``texts`` answers ``request_text`` by path prefix with a string, or
+    raises the :class:`GithubOpError` stored there.
+    """
+
+    def __init__(
+        self,
+        responses: dict[str, Any] | None = None,
+        texts: dict[str, str | GithubOpError] | None = None,
+    ) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.text_calls: list[tuple[str, str]] = []
         self.responses = responses or {}
+        self.texts = texts or {}
 
     def request(
         self, method: str, path: str, body: dict[str, Any] | None = None
@@ -38,6 +50,15 @@ class RecordingTransport:
             if path.startswith(prefix):
                 return response  # type: ignore[no-any-return]
         return {}
+
+    def request_text(self, method: str, path: str) -> str:
+        self.text_calls.append((method, path))
+        for prefix, text in self.texts.items():
+            if path.startswith(prefix):
+                if isinstance(text, GithubOpError):
+                    raise text
+                return text
+        return ""
 
 
 class TestOpRegistry:
@@ -138,6 +159,144 @@ class TestOpRegistry:
     def test_unknown_op_lists_progress_ops(self) -> None:
         with pytest.raises(GithubOpError, match=r"blobs\.create_many"):
             execute_op("teleport.repo", {}, RecordingTransport())
+
+
+def check_run(
+    name: str,
+    conclusion: str | None,
+    *,
+    run_id: int = 1,
+    app: str = "github-actions",
+    output: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": name,
+        "conclusion": conclusion,
+        "details_url": f"https://ci/{name}",
+        "app": {"slug": app},
+        "output": output or {},
+    }
+
+
+def check_runs(*runs: dict[str, Any]) -> dict[str, Any]:
+    return {"/repos/o/r/commits/abc/check-runs": {"check_runs": list(runs)}}
+
+
+class TestChecksFailedLogs:
+    """``checks.failed_logs``: the text behind each red check, clipped."""
+
+    def test_actions_job_logs_fetched_and_clipped_head_tail(self) -> None:
+        log = "H" * 2000 + "M" * 3000 + "T" * 2000
+        t = RecordingTransport(
+            check_runs(check_run("unit", "failure", run_id=77)),
+            texts={"/repos/o/r/actions/jobs/77/logs": log},
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc", "max_chars": 4000}, t)
+        assert isinstance(out, dict)
+        assert t.calls == [("GET", "/repos/o/r/commits/abc/check-runs", None)]
+        assert t.text_calls == [("GET", "/repos/o/r/actions/jobs/77/logs")]
+        (check,) = out["checks"]
+        assert (check["name"], check["conclusion"]) == ("unit", "failure")
+        assert check["details_url"] == "https://ci/unit"
+        excerpt = check["excerpt"]
+        # 1500 head + 2500 tail; the 3000 in between are cut and counted.
+        assert excerpt.startswith("H" * 1500 + "\n...(clipped 3000 chars)...\n")
+        assert excerpt.endswith("T" * 2000)
+        assert excerpt.count("M") == 500
+        assert len(excerpt) == 4000 + len("\n...(clipped 3000 chars)...\n")
+
+    def test_short_log_is_not_clipped(self) -> None:
+        t = RecordingTransport(
+            check_runs(check_run("unit", "failure", run_id=77)),
+            texts={"/repos/o/r/actions/jobs/77/logs": "short log\n"},
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert out["checks"][0]["excerpt"] == "short log\n"
+
+    def test_non_actions_check_uses_its_output(self) -> None:
+        t = RecordingTransport(
+            check_runs(
+                check_run(
+                    "lint",
+                    "failure",
+                    app="some-bot",
+                    output={"title": "3 problems", "summary": "", "text": "a.py:1: E501"},
+                )
+            )
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert t.text_calls == []
+        assert out["checks"][0]["excerpt"] == "3 problems\n\na.py:1: E501"
+
+    def test_logs_error_falls_back_to_output_with_a_note(self) -> None:
+        t = RecordingTransport(
+            check_runs(
+                check_run(
+                    "unit",
+                    "timed_out",
+                    run_id=5,
+                    output={"title": "Job timed out", "summary": "after 6h"},
+                )
+            ),
+            texts={"/repos/o/r/actions/jobs/5/logs": GithubOpError("gone", http_status=410)},
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        (check,) = out["checks"]
+        assert check["conclusion"] == "timed_out"
+        lines = check["excerpt"].splitlines()
+        assert lines[0] == "(logs unavailable: HTTP 410)"
+        assert "Job timed out" in check["excerpt"]
+        assert "after 6h" in check["excerpt"]
+
+    def test_logs_error_without_status_quotes_the_message(self) -> None:
+        t = RecordingTransport(
+            check_runs(check_run("unit", "failure", run_id=5)),
+            texts={"/repos/o/r/actions/jobs/5/logs": GithubOpError("proxy refused")},
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert out["checks"][0]["excerpt"].startswith("(logs unavailable: proxy refused)")
+
+    def test_only_failing_conclusions_are_listed(self) -> None:
+        t = RecordingTransport(
+            check_runs(
+                check_run("ok", "success", run_id=1),
+                check_run("Neutral", "NEUTRAL", run_id=2),
+                check_run("skipped", "skipped", run_id=3),
+                check_run("pending", None, run_id=4),
+                check_run("cancelled", "cancelled", run_id=5),
+                check_run("failed", "failure", run_id=6),
+            ),
+            texts={"/repos/o/r/actions/jobs/": "log"},
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert [c["name"] for c in out["checks"]] == ["cancelled", "failed"]
+        assert [p for _, p in t.text_calls] == [
+            "/repos/o/r/actions/jobs/5/logs",
+            "/repos/o/r/actions/jobs/6/logs",
+        ]
+
+    def test_no_failures_is_an_empty_list(self) -> None:
+        t = RecordingTransport(check_runs(check_run("ok", "success")))
+        assert execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t) == {"checks": []}
+        assert execute_op(
+            "checks.failed_logs", {"repo": "o/r", "sha": "abc"}, RecordingTransport()
+        ) == {"checks": []}
+
+    def test_requires_repo_and_sha(self) -> None:
+        with pytest.raises(GithubOpError, match="missing required params: sha"):
+            execute_op("checks.failed_logs", {"repo": "o/r"}, RecordingTransport())
+
+    def test_clip_head_tail_marker(self) -> None:
+        assert githubops._clip_head_tail("abcdef", 2, 2) == "ab\n...(clipped 2 chars)...\nef"
+        assert githubops._clip_head_tail("abcd", 2, 2) == "abcd"
+        # A zero tail must not slice back to the whole string.
+        assert githubops._clip_head_tail("abcdef", 2, 0) == "ab\n...(clipped 4 chars)...\n"
 
 
 class SequencedBlobTransport:
@@ -258,6 +417,129 @@ class TestGhCliTransport:
         transport = GhCliTransport(gh=str(script))
         with pytest.raises(GithubOpError, match="rc=1"):
             transport.request("GET", "/repos/o/r")
+
+    def test_request_text_returns_stdout_verbatim(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[list[str]] = []
+
+        def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="line 1\n{not json\n", stderr="")
+
+        monkeypatch.setattr(githubops.subprocess, "run", fake_run)
+        out = GhCliTransport(gh="gh").request_text("GET", "/repos/o/r/actions/jobs/7/logs")
+        assert out == "line 1\n{not json\n"
+        assert seen == [
+            [
+                "gh",
+                "api",
+                "-X",
+                "GET",
+                "-H",
+                f"X-GitHub-Api-Version: {githubops.API_VERSION}",
+                "/repos/o/r/actions/jobs/7/logs",
+            ]
+        ]
+
+    def test_request_text_failure_carries_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="gh: Gone (HTTP 410)")
+
+        monkeypatch.setattr(githubops.subprocess, "run", fake_run)
+        with pytest.raises(GithubOpError, match="rc=1") as info:
+            GhCliTransport(gh="gh").request_text("GET", "/repos/o/r/actions/jobs/7/logs")
+        assert info.value.http_status == 410
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+class RedirectingOpener:
+    """Stands in for ``build_opener(...)``: records every request's headers,
+    answers the first with a 302 to ``location`` and the rest with ``body``."""
+
+    def __init__(self, location: str, body: bytes = b"log body") -> None:
+        self.location = location
+        self.body = body
+        self.requests: list[tuple[str, dict[str, str]]] = []
+
+    def open(self, request: Any, timeout: float = 0) -> Any:
+        headers = {k.lower(): v for k, v in request.header_items()}
+        self.requests.append((request.full_url, headers))
+        if len(self.requests) == 1:
+            hdrs = email.message.Message()
+            hdrs["Location"] = self.location
+            raise urllib.error.HTTPError(request.full_url, 302, "Found", hdrs, io.BytesIO(b""))
+        return FakeResponse(self.body)
+
+
+class TestRestTransportText:
+    def test_redirect_is_followed_without_the_bearer_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The logs endpoint 302s to a signed storage URL. The token must not
+        travel there — the signature is the credential, and the storage host
+        rejects a request carrying both."""
+        opener = RedirectingOpener("https://blob.example/signed?sig=abc", b"log \xff line\n")
+        monkeypatch.setattr(githubops.urllib.request, "build_opener", lambda *handlers: opener)
+        out = RestTransport(token="tok123").request_text("GET", "/repos/o/r/actions/jobs/7/logs")
+        assert out == "log � line\n"
+        assert len(opener.requests) == 2
+        first_url, first_headers = opener.requests[0]
+        assert first_url == "https://api.github.com/repos/o/r/actions/jobs/7/logs"
+        assert first_headers["authorization"] == "Bearer tok123"
+        second_url, second_headers = opener.requests[1]
+        assert second_url == "https://blob.example/signed?sig=abc"
+        assert "authorization" not in second_headers
+        assert second_headers == {"user-agent": githubops.USER_AGENT}
+
+    def test_redirect_handler_is_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[Any] = []
+
+        def fake_build_opener(*handlers: Any) -> RedirectingOpener:
+            seen.extend(handlers)
+            return RedirectingOpener("https://blob.example/x")
+
+        monkeypatch.setattr(githubops.urllib.request, "build_opener", fake_build_opener)
+        RestTransport(token="tok").request_text("GET", "/repos/o/r/actions/jobs/7/logs")
+        assert seen == [githubops._NoRedirect]
+        # and the handler really does refuse to follow
+        assert githubops._NoRedirect().redirect_request(None, None, 302, "", None, "x") is None  # type: ignore[arg-type]
+
+    def test_redirect_to_plain_http_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        opener = RedirectingOpener("http://blob.example/signed")
+        monkeypatch.setattr(githubops.urllib.request, "build_opener", lambda *handlers: opener)
+        with pytest.raises(GithubOpError, match="non-HTTPS redirect"):
+            RestTransport(token="tok").request_text("GET", "/repos/o/r/actions/jobs/7/logs")
+        assert len(opener.requests) == 1
+
+    def test_direct_body_without_redirect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class DirectOpener:
+            def open(self, request: Any, timeout: float = 0) -> Any:
+                return FakeResponse(b"plain body")
+
+        monkeypatch.setattr(githubops.urllib.request, "build_opener", lambda *h: DirectOpener())
+        assert RestTransport(token="tok").request_text("GET", "/repos/o/r/x") == "plain body"
+
+    def test_http_error_mapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class FailingOpener:
+            def open(self, request: Any, timeout: float = 0) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url, 404, "not found", None, io.BytesIO(b"nope")
+                )
+
+        monkeypatch.setattr(githubops.urllib.request, "build_opener", lambda *h: FailingOpener())
+        with pytest.raises(GithubOpError, match="HTTP 404") as info:
+            RestTransport(token="tok").request_text("GET", "/repos/o/r/actions/jobs/7/logs")
+        assert info.value.http_status == 404
+
+    def test_non_https_refused(self) -> None:
+        with pytest.raises(GithubOpError, match="non-HTTPS"):
+            RestTransport(token="tok").request_text("GET", "http://api.github.com/x")
 
 
 class TestRestTransport:

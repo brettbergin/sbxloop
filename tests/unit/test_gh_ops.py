@@ -1,4 +1,4 @@
-"""Host GithubOps facade + GithubReporterHook tests (stubbed WorkerClient)."""
+"""Host GithubOps facade tests (stubbed WorkerClient)."""
 
 from __future__ import annotations
 
@@ -7,9 +7,7 @@ from typing import Any, NamedTuple
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.events import EventBus, HostEventTypes
-from sbxloop.gh.ops import GithubOps, IssueRef
-from sbxloop.gh.reporter import GithubReporterHook
+from sbxloop.gh.ops import FailedCheck, GithubOps, IssueRef
 from sbxloop_worker.protocol import ErrorInfo, JobRequest, JobResult
 from tests.fakes.github_errors import worker_error
 
@@ -182,111 +180,158 @@ class TestGithubOpsFacade:
             ops.blobs_create_many("o/r", [{"path": "a.txt", "content_b64": "YQ=="}])
 
 
-class RecordingOps:
-    """GithubOps stand-in recording reporter interactions."""
+class TestChecksFailedLogs:
+    def test_maps_entries_and_doubles_the_timeout(self) -> None:
+        ops, client = make_ops(
+            {
+                "checks.failed_logs": {
+                    "checks": [
+                        {
+                            "name": "unit",
+                            "conclusion": "failure",
+                            "details_url": "https://ci/unit",
+                            "excerpt": "FAILED test_x\n",
+                        },
+                        {
+                            "name": "lint",
+                            "conclusion": "cancelled",
+                            "details_url": "",
+                            "excerpt": "",
+                        },
+                    ]
+                }
+            }
+        )
+        assert ops.checks_failed_logs("o/r", "abc", max_chars=1234) == [
+            FailedCheck("unit", "failure", "FAILED test_x\n", "https://ci/unit"),
+            FailedCheck("lint", "cancelled", "", ""),
+        ]
+        job = client.jobs[0]
+        assert job.op == "checks.failed_logs"
+        assert job.params == {"repo": "o/r", "sha": "abc", "max_chars": 1234}
+        # One log download per red check, from blob storage: slow.
+        assert job.timeout_s == ops.timeout_s * 2
 
-    def __init__(self, existing_issues: list[dict[str, Any]] | None = None) -> None:
-        self.created: list[tuple[str, str]] = []
-        self.comments: list[tuple[int, str]] = []
-        self.searches: list[str] = []
-        self.raw_calls: list[tuple[str, str, dict[str, Any] | None]] = []
-        self.existing_issues = existing_issues or []
+    def test_default_budget_and_empty_list(self) -> None:
+        ops, client = make_ops({"checks.failed_logs": {"checks": []}})
+        assert ops.checks_failed_logs("o/r", "abc") == []
+        assert client.jobs[0].params["max_chars"] == 6000
 
-    def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> IssueRef:
-        self.created.append((repo, title))
-        return IssueRef(number=42, url="https://x/42")
+    def test_malformed_results_raise(self) -> None:
+        ops, _ = make_ops({"checks.failed_logs": {"nope": 1}})
+        with pytest.raises(GithubOpsError, match="no check list"):
+            ops.checks_failed_logs("o/r", "abc")
+        ops, _ = make_ops({"checks.failed_logs": {"checks": [{"name": "unit"}]}})
+        with pytest.raises(GithubOpsError, match="malformed entry"):
+            ops.checks_failed_logs("o/r", "abc")
+        ops, _ = make_ops({"checks.failed_logs": {"checks": ["unit"]}})
+        with pytest.raises(GithubOpsError, match="malformed entry"):
+            ops.checks_failed_logs("o/r", "abc")
 
-    def issue_comment(self, repo: str, number: int, body: str) -> str:
-        self.comments.append((number, body))
-        return "https://c"
-
-    def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
-        self.searches.append(query)
-        return self.existing_issues
-
-    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        self.raw_calls.append((method, path, body))
-        return {}
+    def test_worker_failure_raises(self) -> None:
+        ops, _ = make_ops({"checks.failed_logs": "FAIL"})
+        with pytest.raises(GithubOpsError, match="HTTP 403"):
+            ops.checks_failed_logs("o/r", "abc")
 
 
-class TestGithubReporterHook:
-    """Run start/end are explicit open_run/close_run calls (the engine emits
-    the bus lifecycle events outside the hook's attach window — #58); only
-    task progress arrives via the bus."""
+class PathStubClient(StubWorkerClient):
+    """``raw.api`` replies keyed by request path, for methods that make
+    more than one raw call."""
 
-    def make(
-        self, existing_issues: list[dict[str, Any]] | None = None
-    ) -> tuple[GithubReporterHook, RecordingOps, EventBus]:
-        ops = RecordingOps(existing_issues)
-        hook = GithubReporterHook(ops, "o/r")  # type: ignore[arg-type]
-        bus = EventBus()
-        bus.attach_hook(hook)
-        return hook, ops, bus
+    def submit(self, job: JobRequest) -> JobResult:
+        self.jobs.append(job)
+        assert job.op == "raw.api"
+        return JobResult(
+            job_id=job.job_id, status="ok", output_json=self.responses.get(job.params["path"])
+        )
 
-    def test_full_run_reporting(self) -> None:
-        hook, ops, bus = self.make()
-        hook.open_run("r1", "do the thing")
-        bus.emit(HostEventTypes.TASK_END, "r1", task_id="t1", title="first", state="done")
-        bus.emit(HostEventTypes.TASK_END, "r1", task_id="t2", title="second", state="failed")
-        hook.close_run("r1", "completed")
 
-        assert ops.created == [("o/r", "sbxloop run r1")]
-        assert len(ops.comments) == 3
-        assert "✅ `t1`" in ops.comments[0][1]
-        assert "❌ `t2`" in ops.comments[1][1]
-        final = ops.comments[2][1]
-        assert "finished: **completed**" in final
-        assert "`t1` first" in final
-        # a completed run closes its tracking issue
-        assert ops.raw_calls == [
-            ("PATCH", "/repos/o/r/issues/42", {"state": "closed", "state_reason": "completed"})
+def review(login: str, state: str, body: str = "") -> dict[str, Any]:
+    return {"user": {"login": login}, "state": state, "body": body}
+
+
+def inline(login: str, body: str, path: str = "", line: int | None = None) -> dict[str, Any]:
+    return {"user": {"login": login}, "body": body, "path": path, "line": line}
+
+
+def make_feedback_ops(
+    reviews: list[dict[str, Any]], comments: list[dict[str, Any]]
+) -> tuple[GithubOps, PathStubClient]:
+    client = PathStubClient(
+        {"/repos/o/r/pulls/7/reviews": reviews, "/repos/o/r/pulls/7/comments": comments}
+    )
+    return GithubOps(client, "r1"), client  # type: ignore[arg-type]
+
+
+class TestPrReviewFeedback:
+    def test_renders_standing_objections_and_inline_comments(self) -> None:
+        ops, client = make_feedback_ops(
+            [
+                review("alice", "CHANGES_REQUESTED", "Please handle the empty case."),
+                review("bob", "COMMENTED", "drive-by"),
+            ],
+            [
+                inline("alice", "off by one", path="src/x.py", line=12),
+                inline("alice", "rename this", path="src/y.py"),
+                inline("carol", "no anchor"),
+                inline("carol", "   "),
+            ],
+        )
+        out = ops.pr_review_feedback("o/r", 7)
+        assert out == (
+            "Please handle the empty case.\n\n"
+            "- `src/x.py:12`: off by one\n\n"
+            "- `src/y.py`: rename this\n\n"
+            "- no anchor"
+        )
+        assert [j.params["path"] for j in client.jobs] == [
+            "/repos/o/r/pulls/7/reviews",
+            "/repos/o/r/pulls/7/comments",
         ]
 
-    def test_failed_run_leaves_the_issue_open(self) -> None:
-        hook, ops, _bus = self.make()
-        hook.open_run("r1", "do the thing")
-        hook.close_run("r1", "failed")
-        assert any("finished: **failed**" in body for _n, body in ops.comments)
-        assert ops.raw_calls == []
-
-    def test_resume_reuses_existing_tracking_issue(self) -> None:
-        hook, ops, _bus = self.make(
-            existing_issues=[{"number": 7, "title": "sbxloop run r1", "html_url": "https://x/7"}]
+    def test_latest_verdict_per_reviewer_wins(self) -> None:
+        """A CHANGES_REQUESTED a later APPROVE cleared no longer stands."""
+        ops, _ = make_feedback_ops(
+            [
+                review("alice", "CHANGES_REQUESTED", "fix it"),
+                review("alice", "APPROVED", "thanks"),
+                review("bob", "APPROVED"),
+                review("bob", "CHANGES_REQUESTED", "wait, no"),
+            ],
+            [],
         )
-        hook.open_run("r1", "again")
-        assert ops.created == []  # found, not duplicated
-        assert hook.issue is not None and hook.issue.number == 7
+        assert ops.pr_review_feedback("o/r", 7) == "wait, no"
 
-    def test_task_events_without_open_run_are_ignored(self) -> None:
-        hook, ops, bus = self.make()
-        bus.emit(HostEventTypes.TASK_END, "r1", task_id="t1", state="done")
-        hook.close_run("r1", "failed")
-        assert ops.created == []
-        assert ops.comments == []
+    def test_excludes_the_loops_own_identity(self) -> None:
+        ops, _ = make_feedback_ops(
+            [
+                review("sbxloop-bot", "CHANGES_REQUESTED", "my own review"),
+                review("alice", "CHANGES_REQUESTED", "a human objection"),
+            ],
+            [
+                inline("sbxloop-bot", "my own inline", path="a.py", line=1),
+                inline("alice", "human inline", path="b.py", line=2),
+            ],
+        )
+        out = ops.pr_review_feedback("o/r", 7, exclude_login="sbxloop-bot")
+        assert out == "a human objection\n\n- `b.py:2`: human inline"
 
-    def test_reporting_failure_is_swallowed(self) -> None:
-        class ExplodingOps(RecordingOps):
-            def issue_create(self, *a: Any, **k: Any) -> IssueRef:
-                raise RuntimeError("github down")
+    def test_clips(self) -> None:
+        ops, _ = make_feedback_ops([review("alice", "CHANGES_REQUESTED", "x" * 100)], [])
+        assert ops.pr_review_feedback("o/r", 7, clip=10) == "x" * 10
 
-        hook = GithubReporterHook(ExplodingOps(), "o/r")  # type: ignore[arg-type]
-        hook.open_run("r1", "x")  # must not raise
-        assert hook.issue is None
-        hook.close_run("r1", "completed")  # must not raise either
+    def test_nothing_standing_is_empty(self) -> None:
+        ops, _ = make_feedback_ops([review("alice", "APPROVED", "lgtm")], [])
+        assert ops.pr_review_feedback("o/r", 7) == ""
+        ops, _ = make_feedback_ops([], [])
+        assert ops.pr_review_feedback("o/r", 7) == ""
 
-    def test_close_run_failure_is_swallowed(self) -> None:
-        class ExplodingComment(RecordingOps):
-            def issue_comment(self, *a: Any, **k: Any) -> str:
-                raise RuntimeError("github down")
-
-        hook = GithubReporterHook(ExplodingComment(), "o/r")  # type: ignore[arg-type]
-        hook.open_run("r1", "x")
-        hook.close_run("r1", "completed")  # must not raise
-
-    def test_unrelated_events_ignored(self) -> None:
-        _hook, ops, bus = self.make()
-        bus.emit("agent.message", "r1", content="hi")
-        assert ops.created == []
+    def test_tolerates_malformed_payloads(self) -> None:
+        client = PathStubClient(
+            {"/repos/o/r/pulls/7/reviews": {"message": "nope"}, "/repos/o/r/pulls/7/comments": [1]}
+        )
+        ops = GithubOps(client, "r1")  # type: ignore[arg-type]
+        assert ops.pr_review_feedback("o/r", 7) == ""
 
 
 class TestLanding:

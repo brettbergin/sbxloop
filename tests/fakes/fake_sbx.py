@@ -281,6 +281,12 @@ def cmd_exec(root: Path, args: list[str]) -> int:
         return fake_pkill(fs, rewritten[1:])
     home = fs / "home/agent"
     home.mkdir(parents=True, exist_ok=True)
+    # The worker runs under `sh -lc`, so this home's ~/.profile is the one
+    # place a test can shape the guest's environment (a `gh` shim on PATH,
+    # say) after the login profile has rebuilt PATH.
+    profile = os.environ.get("SBX_FAKE_PROFILE")
+    if profile:
+        (home / ".profile").write_text(profile)
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["SBX_FAKE_FS"] = str(fs)

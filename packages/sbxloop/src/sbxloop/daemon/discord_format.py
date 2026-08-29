@@ -30,7 +30,6 @@ import json
 import re
 import socket
 from collections import deque
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,7 +40,8 @@ from sbxloop.cli.tui import (
     TOOL_ARGS_LINE_CLIP,
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
-from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.engine.model import PIPELINE_STAGES
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.excerpt import (
     TOOL_EXCERPT_LINE_CLIP,
@@ -82,12 +82,28 @@ COLOR_WARN = 0xE67E22
 COLOR_DIM = 0x95A5A6
 
 # The daemon-side view of "how did the run end".
-STATE_MARKER = {"completed": "✅", "failed": "❌", "delivery_failed": "⚠", "cancelled": "⏹"}
+STATE_MARKER = {
+    "merged": "🎉",
+    "completed": "✅",
+    "failed": "❌",
+    "blocked": "🚧",
+    "cancelled": "⏹",
+}
 STATE_COLOR = {
+    "merged": COLOR_OK,
     "completed": COLOR_OK,
     "failed": COLOR_FAIL,
-    "delivery_failed": COLOR_WARN,
+    "blocked": COLOR_WARN,
     "cancelled": COLOR_DIM,
+}
+# How a post-build stage reads in the chronology when the run enters it.
+STAGE_MARKER = {
+    "gating": "🚦",
+    "delivering": "🔀",
+    "reviewing": "🔍",
+    "fixing": "🛠",
+    "awaiting_ci": "⏳",
+    "landing": "🚀",
 }
 
 _FENCE_RE = re.compile(r"^\s*(```|~~~)\s*([\w+#.-]*)")
@@ -1109,8 +1125,6 @@ def format_for_discord(
         ]
     if t == HostEventTypes.RUN_TASKS:
         return [block(part) for part in split_markdown(roster_text(data), max_chars)]
-    if t == HostEventTypes.RUN_REPORT:
-        return [line(f"📋 tracking issue {link(f'#{data.get("issue")}', data.get('url'))}")]
     if t == HostEventTypes.RUN_DELIVER:
         if data.get("created"):
             repo = str(data.get("repo") or "")
@@ -1119,8 +1133,57 @@ def format_for_discord(
             return [line(f"⚠ **delivery failed:** {_one_line(data['error'], 300)}", flush=True)]
         if data.get("url"):
             label = f"#{data.get('pr')}" + (f" · {data['repo']}" if data.get("repo") else "")
-            return [line(f"🔀 PR {link(label, data['url'])}", flush=True)]
+            round_no = data.get("round")
+            tail = f" (round {round_no})" if isinstance(round_no, int) and round_no > 1 else ""
+            return [line(f"🔀 PR {link(label, data['url'])}{tail}", flush=True)]
         return []
+    if t == HostEventTypes.REVIEW_VERDICT:
+        verdict = "approved" if data.get("verdict") == "approve" else "requested changes"
+        n = data.get("findings") or 0
+        text = f"🔍 review round {data.get('round')}: **{verdict}** · {n} finding(s)"
+        if data.get("url"):
+            text += f" · {link('review', data['url'])}"
+        return [line(text, flush=True)]
+    if t == HostEventTypes.FIX_ROUND:
+        why = _one_line(data.get("why") or "", 200)
+        return [
+            line(
+                f"🛠 fix round {data.get('round')} ({data.get('kind')}, budget "
+                f"{data.get('budget')}) — {why}",
+                flush=True,
+            )
+        ]
+    if t == HostEventTypes.CI_STATUS:
+        state = str(data.get("state") or "")
+        if state == "red":
+            failed = ", ".join(str(f) for f in _list(data, "failed")) or "checks"
+            return [line(f"❌ CI red — {_one_line(failed, 200)}", flush=True)]
+        if state == "green":
+            return [line(f"✅ CI green · {data.get('total', 0)} check(s)", flush=True)]
+        return []
+    if t == HostEventTypes.LAND_UNDRAFT:
+        return [line(f"🚀 PR #{data.get('pr')} taken out of draft")]
+    if t == HostEventTypes.LAND_UPDATE:
+        return [
+            line(f"🚀 PR #{data.get('pr')} updated from its base (attempt {data.get('attempt')})")
+        ]
+    if t == HostEventTypes.RUN_MERGED:
+        label = f"#{data.get('pr')}"
+        who = " (by a human)" if data.get("by_human") else ""
+        return [line(f"🎉 **merged** PR {link(label, data.get('url'))}{who}", flush=True)]
+    if t == HostEventTypes.RUN_BLOCKED:
+        why = _one_line(data.get("why") or "", 300)
+        label = f"#{data.get('pr')}"
+        return [
+            line(
+                f"🚧 **blocked:** {why} · PR {link(label, data.get('url'))} "
+                "— a human needs to look",
+                flush=True,
+            )
+        ]
+    if t == HostEventTypes.RUN_STATE and data.get("state") in PIPELINE_STAGES:
+        stage = str(data["state"])
+        return [line(f"{STAGE_MARKER.get(stage, '▶')} **{stage.replace('_', ' ')}**")]
     if t == "sandbox.workspace_clone":
         text = f"🌿 branch {code(data.get('branch'))} · clone of {code(data.get('source'))}"
         if data.get("reused"):
@@ -1263,10 +1326,7 @@ def roster_text(data: dict[str, Any]) -> str:
 
 def _origin(item: WorkItem) -> tuple[str, str]:
     """(label, kind) for where a work item came from."""
-    if item.source == "github":
-        prefix = "audit" if item.kind == "audit" else "issue"
-        return f"{prefix} #{item.source_key}", "github"
-    return f"inbox {code(item.source_key)}", "inbox"
+    return f"issue #{item.source_key}", "github"
 
 
 def headline_text(item: WorkItem, run_id: str, state: str | None = None) -> str:
@@ -1283,9 +1343,9 @@ def headline_embed(
     state: str | None = None,
     *,
     branch: str | None = None,
-    tracking: tuple[int, str] | None = None,
     pr: tuple[int, str] | None = None,
     summary: str | None = None,
+    requested_by: str | None = None,
     hostname: str | None = None,
 ) -> EmbedSpec:
     origin, _kind = _origin(item)
@@ -1296,12 +1356,14 @@ def headline_embed(
     ]
     if branch:
         fields.append(("Branch", code(branch), True))
-    if tracking:
-        fields.append(("Tracking issue", link(f"#{tracking[0]}", tracking[1]), True))
     if pr:
         fields.append(("PR", link(f"#{pr[0]}", pr[1]), True))
     if summary:
         fields.append(("Tasks", summary, True))
+    if requested_by:
+        # A plain mention renders as the name; the send path disables
+        # pings, so nobody is notified by the card itself.
+        fields.append(("Requested by", f"<@{requested_by}>", True))
     host = hostname if hostname is not None else socket.gethostname()
     return EmbedSpec(
         title=_one_line(item.title, 200),
@@ -1341,32 +1403,12 @@ def finish_embed(
     fields: list[tuple[str, str, bool]] = []
     if report.cancelled_by:
         fields.append(("Cancelled", _cancel_note(item.item_id, report), False))
-    if report.tracking_issue:
-        fields.append(
-            ("Tracking issue", link(f"#{report.tracking_issue[0]}", report.tracking_issue[1]), True)
-        )
-    if report.delivery:
-        fields.append(("PR", link(f"#{report.delivery[0]}", report.delivery[1]), True))
-    # What the run filed is an audit's deliverable (and a patch run's side
-    # findings): show it where the PR is shown. A review never files (loop.py
-    # `_settle` sets `filed=()` whenever `is_review`, whether or not the post
-    # itself succeeded), so this is one chain deciding the "Filed"/"Review"
-    # field rather than a separate check a reader has to prove impossible.
-    if report.review is not None:
-        # A review's deliverable is the review, not filed issues (#469).
-        fields.append(("Review", _review_field(report.review), False))
-    elif report.review_failed:
-        fields.append(("Review", f"⚠ {_review_failed_text()}", False))
-    elif report.filed:
-        fields.append(("Filed", refs_text(report.filed, repo), True))
-    elif item.kind == "audit":
-        fields.append(("Filed", "no findings", True))
-    if report.tool_filed:
-        fields.append(("Upstream", refs_text(report.tool_filed, repo), True))
-    if report.tool_noted:
-        fields.append(("Noted", _noted_note(len(report.tool_noted)), False))
-    if report.delivery_error:
-        fields.append(("Delivery", f"⚠ {_one_line(report.delivery_error, 600)}", False))
+    if report.pr:
+        fields.append(("PR", link(f"#{report.pr[0]}", report.pr[1]), True))
+    if report.rounds:
+        fields.append(("Fix rounds", str(report.rounds), True))
+    if report.reason and state != "merged":
+        fields.append(("Reason", _one_line(report.reason, 600), False))
     if unanswered:
         fields.append(
             ("Steering", f"⚠ {unanswered} message(s) were not answered before the run ended", False)
@@ -1535,10 +1577,9 @@ def _stat_rows(stats: RunStats) -> list[str]:
 
 def _went_well(stats: RunStats, report: RunReport) -> list[str]:
     out: list[str] = []
-    if report.delivery:
-        out.append(f"delivered PR {link(f'#{report.delivery[0]}', report.delivery[1])}")
-    if report.filed:
-        out.append(f"filed {len(report.filed)} finding(s)")
+    if report.pr:
+        verb = "merged" if report.state == "merged" else "delivered"
+        out.append(f"{verb} PR {link(f'#{report.pr[0]}', report.pr[1])}")
     done, total = stats.task_counts()
     if total and done == total:
         out.append(f"all {total} task(s) completed")
@@ -1566,8 +1607,10 @@ def _needed_work(stats: RunStats, report: RunReport, unanswered: int) -> list[st
     failed = sum(1 for s in stats.states.values() if s == "failed")
     if failed:
         out.append(f"{failed} task(s) failed")
-    if report.delivery_error:
-        out.append(f"delivery failed — {_one_line(report.delivery_error, 160)}")
+    if report.rounds:
+        out.append(f"{report.rounds} fix round(s) spent")
+    if report.reason and report.state != "merged":
+        out.append(f"{report.state} — {_one_line(report.reason, 160)}")
     if unanswered:
         out.append(f"{unanswered} steering message(s) went unanswered")
     if stats.steers_failed:
@@ -1650,7 +1693,6 @@ def queue_lines(items: list[WorkItem], limit: int = 15) -> str:
         return "queue is empty."
     rows = [
         f"• {code(i.item_id)} "
-        + ("🔎 audit · " if i.kind == "audit" else "")
         + (link(_one_line(i.title, 80), i.url) if i.url else _one_line(i.title, 80))
         for i in items[:limit]
     ]
@@ -1663,8 +1705,9 @@ ITEM_STATE_MARKER = {
     "queued": "⏳",
     "running": "▶",
     "done": "✅",
-    "abandoned": "❌",
     "failed": "❌",
+    "blocked": "🚧",
+    "cancelled": "⏹",
 }
 
 
@@ -1676,8 +1719,6 @@ def items_lines(items: list[WorkItem], limit: int = 20) -> str:
     rows = []
     for i in items[:limit]:
         row = f"{ITEM_STATE_MARKER.get(i.state, '•')} {code(i.item_id)} {i.state} · "
-        if i.kind == "audit":
-            row += "🔎 audit · "
         row += link(_one_line(i.title, 60), i.url) if i.url else _one_line(i.title, 60)
         row += f" · attempts {i.attempts}"
         if i.run_id:
@@ -1690,195 +1731,23 @@ def items_lines(items: list[WorkItem], limit: int = 20) -> str:
     return "\n".join(rows)
 
 
-def daemon_notice(text: str, *, thread_id: int | None = None) -> str:
-    """A control-channel notice: URLs masked, optional pointer to the run's thread."""
-    out = mask_urls(str(text))
+NOTICE_LEVEL_MARKER = {"warning": "⚠ ", "error": "🛑 "}
+
+
+def daemon_notice(notice: DaemonNotice | str, *, thread_id: int | None = None) -> str:
+    """A control-channel notice: URLs masked, a level marker for anything
+    above info, optional pointer to the run's thread."""
+    if isinstance(notice, DaemonNotice):
+        prefix = NOTICE_LEVEL_MARKER.get(notice.level, "")
+        text = notice.text
+        if prefix and not text.startswith(tuple(NOTICE_LEVEL_MARKER.values())):
+            text = prefix + text
+    else:
+        text = str(notice)
+    out = mask_urls(text)
     if thread_id:
         out += f" · <#{thread_id}>"
     return out
-
-
-# -- filed refs (audits, reviews, post-mortems, backlog) -----------------------------
-
-_GH_REF_RE = re.compile(r"^gh:(\d+)$")
-_UPSTREAM_REF_RE = re.compile(r"^([\w.-]+/[\w.-]+)#(\d+)$")
-
-
-def issue_url(ref: str, repo: str | None = None) -> str | None:
-    """The GitHub URL behind a filed ref: ``gh:12`` needs ``repo``; an
-    upstream ``owner/name#5`` ref carries its own; anything else has none."""
-    if (m := _GH_REF_RE.match(ref)) and repo:
-        return f"https://github.com/{repo}/issues/{m.group(1)}"
-    if m := _UPSTREAM_REF_RE.match(ref):
-        return f"https://github.com/{m.group(1)}/issues/{m.group(2)}"
-    return None
-
-
-def _ref_label(ref: str) -> str | None:
-    if m := _GH_REF_RE.match(ref):
-        return f"#{m.group(1)}"
-    if _UPSTREAM_REF_RE.match(ref):
-        return ref
-    return None
-
-
-def ref_link(ref: str, repo: str | None = None) -> str:
-    """A filed ref as Discord text: a masked link when the URL is known,
-    ``#12`` when the repo is not, inline code for anything else."""
-    label = _ref_label(ref)
-    if label is None:
-        return code(ref)
-    return link(label, issue_url(ref, repo))
-
-
-def _ref_plain(ref: str, repo: str | None = None) -> str:
-    """``#12 <url>`` — the no-unfurl form for text fallbacks."""
-    label = _ref_label(ref)
-    if label is None:
-        return code(ref)
-    url = issue_url(ref, repo)
-    return f"{label} {nolink(url)}" if url else label
-
-
-def refs_text(refs: Sequence[str], repo: str | None = None, *, limit: int = 6) -> str:
-    """Filed refs as a comma list (a list inside one field, not fields)."""
-    shown = [ref_link(r, repo) for r in refs[:limit]]
-    if len(refs) > limit:
-        shown.append(f"… +{len(refs) - limit}")
-    return ", ".join(shown)
-
-
-def _noted_note(n: int) -> str:
-    return (
-        f"{n} finding(s) about sbxloop noted, not filed — "
-        "set `[daemon] tool_repo` to route them upstream"
-    )
-
-
-def filed_notice(
-    kind: str, ref: str, *, repo: str | None = None, target: str = "", detail: str = ""
-) -> str:
-    """Control-channel notice for a charter the daemon opened: ``🔎 audit
-    [#701](…) filed for charter `x` · audit: x``."""
-    text = f"🔎 {kind} {ref_link(ref, repo)} filed"
-    if target:
-        text += f" for {target}"
-    if detail:
-        text += f" · {_one_line(detail, 80)}"
-    return text
-
-
-def _review_verdict(review: ReviewOutcome) -> str:
-    return "approved" if review.approved else "requested changes"
-
-
-def _review_comments(n: int) -> str:
-    return "no comments" if n == 0 else f"{n} inline comment(s)"
-
-
-def _non_gating_note(review: ReviewOutcome) -> str:
-    """What a downgraded review costs the operator — which differs by verdict.
-
-    `gh/ops.py:pr_review_create` downgrades either verdict to `COMMENT` when
-    the daemon identity is refused as a reviewer. For `request_changes` that
-    means nothing on the PR blocks the merge, which is the useful warning.
-    But an approval never blocked the merge in the first place; a downgraded
-    approve instead loses the ability to *satisfy* a required-approval gate,
-    which is a different fact and the one worth telling the operator. Before
-    this branch, an approval downgrade rendered as "posted as a non-gating
-    COMMENT — APPROVE was refused, so nothing on the PR blocks the merge",
-    which is only ever true of `request_changes`.
-    """
-    if review.approved:
-        return (
-            f"⚠ posted as {code(review.posted_event)}, not {code(review.requested_event)} — "
-            "it does not satisfy a required-review gate; a human approval is still needed"
-        )
-    return (
-        f"⚠ posted as a non-gating {code(review.posted_event)} — "
-        f"{code(review.requested_event)} was refused, so nothing on the PR blocks the merge"
-    )
-
-
-def _review_failed_text() -> str:
-    """A review was requested but never reached the PR: `.sbxloop/review.json`
-    was missing or unparseable, no GitHub source was wired, or the POST
-    itself raised. Distinct from "no findings" — that wording is only for a
-    review that either was never attempted or genuinely found nothing."""
-    return "review could not be posted to the pull request — see the daemon log"
-
-
-def review_summary(review: ReviewOutcome) -> str:
-    """The ``·``-joinable tail describing a posted review."""
-    parts = [f"review {_review_verdict(review)}", _review_comments(review.comments)]
-    if review.url:
-        parts.append(nolink(review.url))
-    if not review.gates_merge:
-        parts.append(_non_gating_note(review))
-    return " · ".join(parts)
-
-
-def _review_field(review: ReviewOutcome) -> str:
-    head = f"{_review_verdict(review)} · {_review_comments(review.comments)}"
-    text = link(head, review.url) if review.url else head
-    if not review.gates_merge:
-        text += f"\n{_non_gating_note(review)}"
-    return text
-
-
-def findings_summary(report: RunReport, *, repo: str | None = None, kind: str = "patch") -> str:
-    """The ``·``-joinable tail saying what a run filed; empty when a patch
-    run filed nothing, ``no findings`` when an audit did. A review run
-    reports its review instead — its deliverable is never a filed issue."""
-    parts = []
-    if report.review is not None:
-        parts.append(review_summary(report.review))
-    elif report.review_failed:
-        parts.append(f"⚠ {_review_failed_text()}")
-    if report.filed:
-        parts.append(f"filed {refs_text(report.filed, repo)}")
-    if report.tool_filed:
-        parts.append(f"upstream {refs_text(report.tool_filed, repo)}")
-    if report.tool_noted:
-        parts.append(
-            f"noted {len(report.tool_noted)} finding(s) about sbxloop — "
-            "set `[daemon] tool_repo` to file them upstream"
-        )
-    # `report.review is not None` and `report.review_failed` each already
-    # appended a part above, so `parts` is non-empty whenever either is set —
-    # a review (posted or lost) never falls through to "no findings".
-    if not parts and kind == "audit":
-        return "no findings"
-    return " · ".join(parts)
-
-
-def filed_lines(report: RunReport, *, repo: str | None = None) -> list[str]:
-    """Finish-text fallback lines, in the ``🔀 PR #34 <url>`` style.
-
-    Not a redundant duplicate of :func:`findings_summary`: this is what
-    ``discord.py``'s plain-text watch notice renders (no embed attached
-    there), so a review's verdict has to reach the operator through this
-    list too, not only through :func:`_review_field` on the embed.
-    """
-    out = []
-    if report.review is not None:
-        out.append("🔎 " + review_summary(report.review))
-    elif report.review_failed:
-        out.append(f"⚠ {_review_failed_text()}")
-    if report.filed:
-        out.append("🔎 filed " + ", ".join(_ref_plain(r, repo) for r in report.filed))
-    if report.tool_filed:
-        out.append("🔎 filed upstream " + ", ".join(_ref_plain(r, repo) for r in report.tool_filed))
-    if report.tool_noted:
-        out.append(f"⚠ {_noted_note(len(report.tool_noted))}")
-    return out
-
-
-def charter_skipped_notice(problem: str, audit_dir: object) -> str:
-    return (
-        f"⚠ audit charter skipped: {_one_line(problem, 200)}"
-        f" · fix or remove it under {code(audit_dir)}"
-    )
 
 
 __all__ = [
@@ -1897,18 +1766,13 @@ __all__ = [
     "StatusLine",
     "ToolBatcher",
     "block",
-    "charter_skipped_notice",
     "code",
     "daemon_notice",
-    "filed_lines",
-    "filed_notice",
-    "findings_summary",
     "finish_embed",
     "finish_text",
     "format_for_discord",
     "headline_embed",
     "headline_text",
-    "issue_url",
     "items_lines",
     "line",
     "link",
@@ -1916,8 +1780,6 @@ __all__ = [
     "nolink",
     "output_excerpt",
     "queue_lines",
-    "ref_link",
-    "refs_text",
     "roster_text",
     "split_markdown",
     "status_embed",

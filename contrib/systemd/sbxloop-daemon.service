@@ -1,5 +1,5 @@
 [Unit]
-Description=sbxloop daemon — autonomous outer loop over labeled issues and inbox files
+Description=sbxloop daemon — one run per labeled issue, from build to merged PR
 Documentation=https://github.com/brettbergin/sbxloop
 After=network-online.target sbx-sandboxd.service
 Wants=network-online.target
@@ -13,7 +13,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # The project directory: sbxloop.toml, .env (COPILOT_GITHUB_TOKEN, GH_TOKEN,
-# DISCORD_BOT_TOKEN) and the inbox live here; run state goes to
+# DISCORD_BOT_TOKEN) live here; run state goes to
 # ~/.local/state/sbxloop/<this dir's name>/ unless [daemon] state_dir says
 # otherwise. Tokens are loaded from .env by sbxloop itself, so no
 # EnvironmentFile is needed.

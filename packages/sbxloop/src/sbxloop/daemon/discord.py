@@ -59,7 +59,6 @@ from sbxloop.daemon.discord_format import (
     _one_line,
     code,
     daemon_notice,
-    filed_lines,
     finish_embed,
     finish_text,
     format_for_discord,
@@ -71,7 +70,7 @@ from sbxloop.daemon.discord_format import (
     summary_text,
 )
 from sbxloop.daemon.discord_routing import route_message
-from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.daemon.model import TERMINAL_NOTICE_KINDS, DaemonNotice, RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.errors import DaemonError
@@ -248,8 +247,6 @@ class DiscordBridge:
         self._facts: dict[str, dict[str, Any]] = {}
         # Counters behind the end-of-run summary card, the thread's last post.
         self._runstats: dict[str, RunStats] = {}
-        # item_id -> run_id for the last run of an item (notice -> thread pointer).
-        self._item_runs: dict[str, str] = {}
 
     # -- lifecycle ------------------------------------------------------------------
 
@@ -387,8 +384,8 @@ class DiscordBridge:
 
     # -- Frontend protocol (called from daemon threads) --------------------------
 
-    def daemon_event(self, text: str) -> None:
-        self._enqueue("__daemon__", text)
+    def daemon_notice(self, notice: DaemonNotice) -> None:
+        self._enqueue("__daemon__", notice)
 
     def run_started(self, item: WorkItem, run_id: str, engine: LoopEngine, bus: EventBus) -> None:
         with self._lock:
@@ -396,9 +393,16 @@ class DiscordBridge:
             self._active_item = item
             self._items[run_id] = item
             self._engine = engine
-            self._item_runs[item.item_id] = run_id
             # Non-blocking subscriber: just enqueue; the pump renders + sends.
             self._unsubscribe = bus.subscribe(lambda ev: self._events.put((run_id, ev)))
+        if item.requested_by:
+            # Whoever asked for the work through the concierge is pinged with
+            # the outcome without having to ask for a watch.
+            with self._watch_lock:
+                watchers = self._watchers.setdefault(run_id, [])
+                if item.requested_by not in watchers:
+                    watchers.append(item.requested_by)
+                self._persist_watch(run_id, item.requested_by)
         self._enqueue(run_id, None)  # sentinel: ensure thread + headline
 
     def run_finished(self, item: WorkItem, report: RunReport) -> None:
@@ -411,11 +415,7 @@ class DiscordBridge:
             self._engine = None
         if unsubscribe is not None:
             unsubscribe()
-        state = (
-            "delivery_failed"
-            if report.delivery_error and report.state == "completed"
-            else report.state
-        )
+        state = report.state
         # Which steers went unanswered is decided by the pump in ``_finish``,
         # AFTER it has drained the events queued ahead of this marker: a
         # ``chat.reply`` already on the queue still resolves its steer.
@@ -678,15 +678,11 @@ class DiscordBridge:
         lines = [f"{mentions} run `{run_id}` finished: **{state}**"]
         if report.task_summary:
             lines.append(f"tasks: {_one_line(report.task_summary, 200)}")
-        if report.tracking_issue:
-            lines.append(
-                f"📋 tracking issue #{report.tracking_issue[0]} <{report.tracking_issue[1]}>"
-            )
-        if report.delivery:
-            lines.append(f"🔀 PR #{report.delivery[0]} <{report.delivery[1]}>")
-        if report.delivery_error:
-            lines.append(f"⚠ delivery failed: {_one_line(report.delivery_error, 200)}")
-        lines.extend(filed_lines(report, repo=self.config.github.repo))
+        if report.pr:
+            marker = "🎉 merged" if state == "merged" else "🔀"
+            lines.append(f"{marker} PR #{report.pr[0]} <{report.pr[1]}>")
+        if report.reason and state != "merged":
+            lines.append(f"⚠ {_one_line(report.reason, 200)}")
         if thread is not None:
             lines.append(f"chronology: <#{thread.thread_id}>")
         return _clip("\n".join(lines), self.discord.max_message_chars)
@@ -879,7 +875,12 @@ class DiscordBridge:
                         self._drained.set()
                     continue
                 if run_id == "__daemon__":
-                    await self._daemon_notice(str(payload))
+                    notice = (
+                        payload
+                        if isinstance(payload, DaemonNotice)
+                        else DaemonNotice("daemon.started", str(payload))
+                    )
+                    await self._daemon_notice(notice)
                     continue
                 if payload is None:
                     await self._ensure_thread(run_id)
@@ -1012,9 +1013,6 @@ class DiscordBridge:
         if event.type == "sandbox.workspace_clone" and d.get("branch"):
             facts["branch"] = str(d["branch"])
             changed = True
-        elif event.type == HostEventTypes.RUN_REPORT and d.get("issue"):
-            facts["tracking"] = (int(d["issue"]), str(d.get("url") or ""))
-            changed = True
         elif event.type == HostEventTypes.RUN_DELIVER and d.get("pr") and d.get("url"):
             facts["pr"] = (int(d["pr"]), str(d["url"]))
             changed = True
@@ -1128,16 +1126,36 @@ class DiscordBridge:
             )
         await send_group()
 
-    async def _daemon_notice(self, text: str) -> None:
-        # Point the notice at the run's thread when it names an item we ran.
+    async def _daemon_notice(self, notice: DaemonNotice) -> None:
+        """Route a notice: a run-scoped one goes into that run's thread when
+        the bridge opened one; a terminal one is mirrored to the control
+        channel with a pointer to the thread, so a human not reading the
+        thread still sees how the run ended. Everything else is a
+        control-channel line."""
         thread_id: int | None = None
-        for item_id, run_id in list(self._item_runs.items()):
-            if item_id in text:
-                known = self.dstore.discord_thread(run_id)
-                if known is not None and self.discord.thread_per_run:
-                    thread_id = known.thread_id
-                break
-        await self._send_channel(daemon_notice(text, thread_id=thread_id))
+        if notice.run_id and self.discord.thread_per_run:
+            known = self.dstore.discord_thread(notice.run_id)
+            if known is not None:
+                thread_id = known.thread_id
+        text = daemon_notice(notice)
+        if thread_id is not None:
+            try:
+                thread = await self._thread_channel(thread_id)
+                if thread is not None:
+                    await self._send(thread, text)
+            except Exception:
+                log.warning("discord.notice_thread_failed", run=notice.run_id, exc_info=True)
+            if notice.kind not in TERMINAL_NOTICE_KINDS:
+                return
+        await self._send_channel(daemon_notice(notice, thread_id=thread_id))
+
+    async def _thread_channel(self, thread_id: int) -> Any:
+        """The thread object for a persisted thread id, or None."""
+        client = self.client
+        thread = client.get_channel(thread_id) if client is not None else None
+        if thread is None and client is not None:
+            thread = await client.fetch_channel(thread_id)
+        return thread
 
     async def _finish(self, payload: tuple[Any, ...]) -> None:
         _, item, state, report = payload
@@ -1159,15 +1177,12 @@ class DiscordBridge:
             status.finish(state)
             await self._edit_status(run_id, force=True)
         text = finish_text(state, report)
-        if report.tracking_issue:
-            text += f"\n📋 tracking issue #{report.tracking_issue[0]} <{report.tracking_issue[1]}>"
-        if report.delivery:
-            text += f"\n🔀 PR #{report.delivery[0]} <{report.delivery[1]}>"
+        if report.pr:
+            marker = "🎉 merged" if state == "merged" else "🔀"
+            text += f"\n{marker} PR #{report.pr[0]} <{report.pr[1]}>"
+        if report.reason and state != "merged":
+            text += f"\n⚠ {_one_line(report.reason, 300)}"
         repo = self.config.github.repo
-        for extra in filed_lines(report, repo=repo):
-            text += f"\n{extra}"
-        if report.delivery_error:
-            text += f"\n⚠ delivery failed: {_one_line(report.delivery_error, 300)}"
         if unanswered:
             text += (
                 f"\n⚠ {len(unanswered)} steering message(s) were not answered before the run ended"
@@ -1190,10 +1205,8 @@ class DiscordBridge:
                 embed=summary_embed(stats, report, state, len(unanswered)),
             )
         facts = self._facts.setdefault(run_id, {})
-        if report.tracking_issue:
-            facts["tracking"] = report.tracking_issue
-        if report.delivery:
-            facts["pr"] = report.delivery
+        if report.pr:
+            facts["pr"] = report.pr
         facts["summary"] = report.task_summary
         await self._refresh_headline(run_id, item=item, state=state)
         await self._post_watch_notice(run_id, state, report)
@@ -1551,8 +1564,8 @@ class DiscordBridge:
                 run_id,
                 state,
                 branch=facts.get("branch"),
-                tracking=facts.get("tracking"),
                 pr=facts.get("pr"),
+                requested_by=item.requested_by,
                 summary=facts.get("summary"),
             ),
         )

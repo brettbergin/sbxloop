@@ -162,10 +162,27 @@ class HostEventTypes:
     RUN_STATE = "run.state"
     RUN_CONFIG_DRIFT = "run.config_drift"
     RUN_ARTIFACTS = "run.artifacts"
+    # The pull request, opened or updated (`pr`, `url`, `branch`, `head_sha`,
+    # `round`); `error` instead when delivery failed.
     RUN_DELIVER = "run.deliver"
-    RUN_REPORT = "run.report"
     RUN_KEEP = "run.keep"
     RUN_END = "run.end"
+    # The pipeline after the task graph. `run.state` already marks every
+    # stage entry (the state *is* the stage); these carry what a stage
+    # decided. `review.verdict`: our own critic's call on the PR (`round`,
+    # `verdict`, `findings`, `blocking`, `url`, `summary`). `fix.round`: a
+    # fix task appended (`round`, `kind`, `task_id`, `why`, `budget`).
+    # `ci.status`: the folded check-run state, emitted on change only
+    # (`round`, `state`, `total`, `pending`, `failed`, `head_sha`,
+    # `waited_s`). `land.*`: the landing steps GitHub was asked for.
+    # `run.merged` / `run.blocked`: how the pipeline ended.
+    REVIEW_VERDICT = "review.verdict"
+    FIX_ROUND = "fix.round"
+    CI_STATUS = "ci.status"
+    LAND_UNDRAFT = "land.undraft"
+    LAND_UPDATE = "land.update"
+    RUN_MERGED = "run.merged"
+    RUN_BLOCKED = "run.blocked"
     # A non-terminal run closed out by daemon startup/staleness reconciliation.
     RUN_RECONCILED = "run.reconciled"
     # The task roster as the run will work it (also re-announced on resume,

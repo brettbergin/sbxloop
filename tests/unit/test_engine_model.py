@@ -8,10 +8,15 @@ from pydantic import ValidationError
 from sbxloop.engine.model import (
     DEFAULT_ARTIFACT_EXCLUDES,
     GITIGNORED,
+    PIPELINE_STAGES,
+    RESUMABLE_RUN_STATES,
+    TERMINAL_RUN_STATES,
     EgressSpec,
     RunRecord,
+    RunResult,
     SteerVerdict,
     TaskGraph,
+    TaskRecord,
     TaskSpec,
     artifact_files,
     artifacts_dir,
@@ -419,3 +424,73 @@ class TestSteerVerdict:
     def test_unknown_action_rejected(self) -> None:
         with pytest.raises(ValidationError):
             SteerVerdict(reply="ok", action="abort_everything", guidance="g")
+
+
+class TestRunStates:
+    """One run carries its work to a merged PR: the pipeline stages are
+    run states, every one resumable, and the terminal set is what liveness
+    and reporting key on."""
+
+    def test_pipeline_stages_are_ordered_and_resumable(self) -> None:
+        assert PIPELINE_STAGES == (
+            "gating",
+            "delivering",
+            "reviewing",
+            "fixing",
+            "awaiting_ci",
+            "landing",
+        )
+        assert set(PIPELINE_STAGES) <= RESUMABLE_RUN_STATES
+        assert not set(PIPELINE_STAGES) & TERMINAL_RUN_STATES
+
+    def test_terminal_states(self) -> None:
+        assert {"merged", "completed", "failed", "blocked", "cancelled"} == TERMINAL_RUN_STATES
+        # A finished run is finished; a stopped one may be picked up again.
+        assert {"merged", "completed"}.isdisjoint(RESUMABLE_RUN_STATES)
+        assert {"failed", "blocked", "cancelled"} <= RESUMABLE_RUN_STATES
+        assert {"created", "provisioning", "decomposing", "building"} <= RESUMABLE_RUN_STATES
+
+    def test_legacy_state_names_are_gone(self) -> None:
+        for legacy in ("running", "finalizing"):
+            assert legacy not in RESUMABLE_RUN_STATES
+            assert legacy not in TERMINAL_RUN_STATES
+            with pytest.raises(ValidationError):
+                RunRecord(run_id="r", outcome="o", state=legacy, created_at=1.0, updated_at=1.0)  # type: ignore[arg-type]
+
+    def test_run_record_pipeline_defaults(self) -> None:
+        run = RunRecord(run_id="r1", outcome="x", state="created", created_at=1.0, updated_at=1.0)
+        assert run.stage is None and run.reason is None
+        assert (run.pr_number, run.pr_url, run.pr_node_id, run.branch, run.head_sha) == (
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (run.review_rounds, run.ci_rounds, run.update_attempts) == (0, 0, 0)
+        assert run.update_head is None and run.last_verdict is None
+
+
+class TestRunResult:
+    @pytest.mark.parametrize("state", ["merged", "completed"])
+    def test_succeeded_states(self, state: str) -> None:
+        result = RunResult(run_id="r1", state=state)  # type: ignore[arg-type]
+        assert result.succeeded
+        assert result.pr_number is None and result.pr_url is None and result.reason is None
+
+    @pytest.mark.parametrize("state", ["failed", "blocked", "cancelled", "landing", "created"])
+    def test_unfinished_and_stopped_states_did_not_succeed(self, state: str) -> None:
+        assert not RunResult(run_id="r1", state=state).succeeded  # type: ignore[arg-type]
+
+    def test_carries_the_pr_and_the_reason(self) -> None:
+        result = RunResult(
+            run_id="r1",
+            state="blocked",
+            tasks=[TaskRecord(spec=TaskSpec(id="t1", title="T"), state="done")],
+            pr_number=9,
+            pr_url="https://x/pull/9",
+            reason="its draft status could not be cleared",
+        )
+        assert result.pr_number == 9
+        assert result.reason == "its draft status could not be cleared"
+        assert [t.state for t in result.tasks] == ["done"]

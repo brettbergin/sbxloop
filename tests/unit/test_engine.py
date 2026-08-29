@@ -1,17 +1,24 @@
 """End-to-end LoopEngine tests: fake sbx + real worker + scripted echo backend.
 
-Every agent phase (decompose, build, steer) consumes the next scripted echo
-response in order, so a whole run is scripted as a list — one BUILD entry per
-task attempt. Shell jobs (the mechanical verify commands) run for real inside
+Every agent phase (decompose, build, review, steer) consumes the next
+scripted echo response in order, so a whole run is scripted as a list — one
+BUILD entry per task attempt, one REVIEW entry per review round. Shell jobs
+(the mechanical verify commands and the project gate) run for real inside
 the fake sandbox fs and consume no script entries: a failing verify is
 scripted by giving the task a failing command, and a revision loop by a
 command that only passes once a later BUILD writes the file it looks for.
+
+GitHub is a :class:`tests.fakes.fake_github.FakeGithub` handed in through
+the engine's ``github_ops`` seam: delivery, the posted review, CI and the
+merge all go through it, so a run with ``[github] repo`` set is scripted
+all the way to ``merged`` without a network.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -20,15 +27,27 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import (
-    DEFAULT_ARTIFACT_EXCLUDES,
+    PIPELINE_STAGES,
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
 )
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import BudgetExceededError, StateError, WorkerError
+from sbxloop.errors import BudgetExceededError, GithubOpsError, StateError, WorkerError
 from sbxloop.events import Event, EventBus, HostEventTypes
+from sbxloop.gh.ops import FailedCheck, GithubOps
 from sbxloop.sbx.cli import SbxCLI
 from tests.conftest import FakeSbx
+from tests.fakes.fake_github import (
+    BLOCKED_405,
+    GREEN,
+    MERGED,
+    NO_CHECKS,
+    PENDING,
+    RED,
+    STALE_409,
+    FakeGithub,
+    human_review,
+)
 
 # -- scripted responses ------------------------------------------------------
 
@@ -59,12 +78,34 @@ def task(
 # BUILD plans and executes in one session and reports in prose (expect=text),
 # so one scripted entry covers one whole task attempt.
 BUILD = {"text": "work complete, files changed"}
+# A delivery needs something to deliver: the pipeline tests' builder writes
+# a file (the workspace is a plain directory, so delivery snapshots it).
+FILES_BUILD = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
 
 HAPPY_TASK = [BUILD]
 
 # Budgets that make the first verify failure terminal: no revisions, no
 # replans — the shortest scriptable path to a failed task.
 NO_RETRY_BUDGETS = {"max_revisions_per_task": 0, "max_replans_per_task": 0}
+
+FINDING = {
+    "path": "hello.txt",
+    "line": 1,
+    "body": "hello.txt must greet with hello, not hi",
+    "severity": "major",
+}
+
+
+def review(verdict: str, summary: str, *findings: dict[str, Any]) -> dict[str, Any]:
+    return {"json": {"verdict": verdict, "summary": summary, "findings": list(findings)}}
+
+
+REVIEW_OK = review("approve", "looked for the four failure modes and found none")
+REVIEW_RC = review("request_changes", "one real problem", FINDING)
+
+# CI-wait knobs that keep the tests fast: poll at once, trust "no check
+# runs" immediately.
+FAST_LANDING = {"ci_poll_interval_s": 0.01, "ci_settle_s": 0}
 
 
 class Harness:
@@ -90,7 +131,18 @@ class Harness:
         state = self.script_path.with_suffix(".json.state")
         state.unlink(missing_ok=True)
 
-    def engine(self, *, install_workers: bool = False, **config_overrides: Any) -> LoopEngine:
+    def consumed(self) -> int:
+        """How many scripted entries the workers have used so far."""
+        state = self.script_path.with_suffix(".json.state")
+        return int(state.read_text()) if state.is_file() else 0
+
+    def engine(
+        self,
+        *,
+        install_workers: bool = False,
+        ops: GithubOps | None = None,
+        **config_overrides: Any,
+    ) -> LoopEngine:
         # Resource guardrails default OFF in the harness: the real worker
         # samples the host filesystem here, so default thresholds would make
         # tests depend on how full the developer's disk is.
@@ -114,10 +166,21 @@ class Harness:
             sbx=SbxCLI(binary=str(self.fake_sbx.binary)),
             worker_python=sys.executable,
             install_workers=install_workers,
+            github_ops=(lambda client, run_id: ops) if ops is not None else None,
+        )
+
+    def pipeline(self, fake: FakeGithub, **config_overrides: Any) -> LoopEngine:
+        """An engine that delivers to the fake's repository and lands there."""
+        landing = FAST_LANDING | config_overrides.pop("landing", {})
+        return self.engine(
+            ops=fake, github={"repo": fake.repo}, landing=landing, **config_overrides
         )
 
     def event_types(self) -> list[str]:
         return [e.type for e in self.events]
+
+    def run_states(self) -> list[str]:
+        return [e.data["state"] for e in self.events if e.type == HostEventTypes.RUN_STATE]
 
     def sandboxes_left(self) -> list[str]:
         boxes = self.fake_sbx.state / "sandboxes"
@@ -140,8 +203,10 @@ class TestHappyPath:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         result = harness.engine().start("build the feature")
 
+        # No repository: the run stops after its gate, `completed`.
         assert result.state == "completed"
         assert result.succeeded
+        assert result.pr_number is None
         assert [t.state for t in result.tasks] == ["done"]
         assert result.tasks[0].session_id is not None
 
@@ -149,6 +214,13 @@ class TestHappyPath:
         assert HostEventTypes.RUN_START in types
         assert HostEventTypes.TASK_END in types
         assert HostEventTypes.RUN_END in types
+        assert harness.run_states() == [
+            "provisioning",
+            "decomposing",
+            "building",
+            "gating",
+            "completed",
+        ]
         # sandboxes cleaned up
         assert harness.sandboxes_left() == []
 
@@ -243,19 +315,21 @@ class TestHappyPath:
     def test_default_run_is_github_less(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No [github].repo → only the agent sandbox exists, GH_TOKEN unneeded."""
+        """No [github].repo → only the agent sandbox exists, GH_TOKEN unneeded,
+        and the run ends `completed` (nothing to deliver to)."""
         monkeypatch.delenv("GH_TOKEN", raising=False)
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         result = harness.engine().start("no github anywhere")
-        assert result.succeeded
+        assert result.state == "completed"
         created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
         assert all(name.endswith("-agent") for name in created), created
+        assert HostEventTypes.RUN_DELIVER not in harness.event_types()
 
     def test_configured_github_provisions_ops_sandbox(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-        result = harness.engine(github={"repo": "owner/repo"}).start("with github")
-        assert result.succeeded
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(FakeGithub()).start("with github")
+        assert result.state == "merged"
         created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
         assert any(name.endswith("-github") for name in created), created
 
@@ -286,8 +360,10 @@ class TestHappyPath:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         engine = harness.engine()
         result = engine.start("record phases")
-        phases = [row["phase"] for row in engine.store.phase_attempts(result.run_id)]
-        assert phases == ["decompose", "build", "verify"]
+        rows = engine.store.phase_attempts(result.run_id)
+        assert [row["phase"] for row in rows] == ["decompose", "build", "verify", "gate"]
+        # A project that declares no gate records the skip, not a pass.
+        assert rows[-1]["status"] == "skipped"
 
     def test_phase_attempts_carry_usage(self, harness: Harness) -> None:
         """Every agent phase row bills its session's tokens and turns; the
@@ -361,6 +437,7 @@ class TestReviseAndVerify:
         harness.script([taskgraph(task("t1", verify=["false"])), *([BUILD] * 6)])
         result = harness.engine().start("verify never passes")
         assert result.state == "failed"
+        assert result.reason == "a task failed or was skipped"
         assert result.tasks[0].state == "failed"
         assert result.tasks[0].replans == 1
         assert result.tasks[0].revisions == 3
@@ -406,6 +483,8 @@ class TestReplanAndSkip:
         assert by_id["t2"].state == "skipped"
         end_states = [e.data["state"] for e in harness.events if e.type == HostEventTypes.TASK_END]
         assert end_states == ["failed", "skipped"]
+        # A failed graph never reaches the gate, let alone a delivery.
+        assert "gating" not in harness.run_states()
 
 
 class TestBudgetsAndCancel:
@@ -417,7 +496,9 @@ class TestBudgetsAndCancel:
         with pytest.raises(BudgetExceededError, match="max_wall_clock_s"):
             engine.start("too slow")
         run_id = engine.store.list_runs()[0].run_id
-        assert engine.store.get_run(run_id).state == "failed"
+        run = engine.store.get_run(run_id)
+        assert run.state == "failed"
+        assert run.reason == "exceeded max_wall_clock_s=5"
         assert harness.sandboxes_left() == []  # pair context cleaned up
 
     def test_too_many_tasks_rejected(self, harness: Harness) -> None:
@@ -438,7 +519,7 @@ class TestBudgetsAndCancel:
         assert "cancelled" in RESUMABLE_RUN_STATES
         assert "cancelled" in TERMINAL_RUN_STATES
 
-    @pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
+    @pytest.mark.parametrize("state", sorted(TERMINAL_RUN_STATES))
     def test_cancel_refuses_terminal_runs(self, harness: Harness, state: str) -> None:
         # Rewriting a finished run to cancelled would corrupt history.
         engine = harness.engine()
@@ -460,7 +541,7 @@ class TestBudgetsAndCancel:
         with pytest.raises(StateError, match="interrupted"):
             engine.start("interrupt me")
         run_id = engine.store.list_runs()[0].run_id
-        assert engine.store.get_run(run_id).state == "running"
+        assert engine.store.get_run(run_id).state == "building"
         assert harness.sandboxes_left() == []  # pair context cleaned up
 
 
@@ -474,7 +555,8 @@ class TestResume:
 
         run_id = engine.store.list_runs()[0].run_id
         run = engine.store.get_run(run_id)
-        assert run.state == "running"  # persisted mid-flight
+        assert run.state == "building"  # persisted mid-flight
+        assert run.stage == "building"
         tasks = engine.store.get_tasks(run_id)
         assert tasks[0].state == "executing"
 
@@ -491,42 +573,13 @@ class TestResume:
         # "uncommitted phases re-run" resume semantic
         assert phases.count("build") == 1
 
-    def test_resume_remaps_legacy_task_states(self, harness: Harness) -> None:
-        # A run checkpointed by the six-phase pipeline resumes across the
-        # upgrade: the store remaps its persisted states onto the live
-        # vocabulary (planning -> executing: no committed work, BUILD starts
-        # fresh; scrutinizing/validating -> verifying: the work was done, so
-        # idempotent mechanical VERIFY is the cheaper re-entry).
-        harness.script([taskgraph(task("t1"), task("t2"), task("t3")), {"fail": "boom"}])
+    @pytest.mark.parametrize("state", ["completed", "merged"])
+    def test_resume_finished_run_refused(self, harness: Harness, state: str) -> None:
         engine = harness.engine()
-        with pytest.raises(WorkerError, match="boom"):
-            engine.start("pre-upgrade run")
-        run_id = engine.store.list_runs()[0].run_id
-        for task_id, legacy in (("t1", "planning"), ("t2", "scrutinizing"), ("t3", "validating")):
-            engine.store._conn.execute(
-                "UPDATE tasks SET state = ? WHERE run_id = ? AND task_id = ?",
-                (legacy, run_id, task_id),
-            )
-        engine.store._conn.commit()
-        assert [t.state for t in engine.store.get_tasks(run_id)] == [
-            "executing",
-            "verifying",
-            "verifying",
-        ]
-
-        # t1 re-enters BUILD (one script entry); t2/t3 re-run their verify
-        # commands mechanically and pass without consuming any.
-        harness.script([*HAPPY_TASK])
-        result = harness.engine().resume(run_id)
-        assert result.state == "completed"
-        assert [t.state for t in result.tasks] == ["done", "done", "done"]
-
-    def test_resume_completed_run_refused(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-        engine = harness.engine()
-        result = engine.start("finish it")
+        engine.store.create_run("rdone", "x", engine.config.model_dump_json())
+        engine.store.set_run_state("rdone", state)  # type: ignore[arg-type]
         with pytest.raises(StateError, match="only unfinished runs"):
-            engine.resume(result.run_id)
+            engine.resume("rdone")
 
     def _crashed_run(
         self,
@@ -860,6 +913,25 @@ class TestKeepOnFailure:
         assert engine.store.get_run(result.run_id).kept_reason is None
         assert "run.keep" not in harness.event_types()
 
+    def test_merged_run_still_cleans_up(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(FakeGithub(), keep_on_failure=True)
+        result = engine.start("all fine, shipped")
+        assert result.state == "merged"
+        assert harness.sandboxes_left() == []
+        assert "run.keep" not in harness.event_types()
+
+    def test_blocked_run_keeps_pair(self, harness: Harness) -> None:
+        """Blocked is not success: the evidence is kept like a failure's."""
+        fake = FakeGithub()
+        fake.merge_outcomes = [BLOCKED_405]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, keep_on_failure=True)
+        result = engine.start("blocked at the door")
+        assert result.state == "blocked"
+        assert len(result.kept_sandboxes) == 2
+        assert engine.store.get_run(result.run_id).kept_reason == "debug"
+
     def test_keep_sandboxes_marks_manual(self, harness: Harness) -> None:
         # `sandbox prune` must understand manually kept pairs as well.
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
@@ -930,6 +1002,25 @@ class TestWorkspaceExecution:
             "files": 2,
             "mounted": False,
         }
+
+    def test_unmounted_run_delivers_the_harvest(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Delivery reads the harvest, refreshed right before it — the
+        fix round's writes must be in the PR, not just the first build's."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        fake = FakeGithub()
+        fix = {"text": "fixed", "files": {"hello.txt": "hello\n"}}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, fix, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt in harvest mode")
+        assert result.state == "merged"
+        assert not result.mounted
+        delivered = [json.loads(json.dumps(b)) for b in fake.blob_batches]
+        assert [[e["path"] for e in batch] for batch in delivered] == [
+            ["hello.txt"],
+            ["hello.txt"],
+        ]
+        assert delivered[0][0]["content_b64"] != delivered[1][0]["content_b64"]
 
     def test_mounted_run_reports_artifacts_event(self, harness: Harness) -> None:
         build = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
@@ -1015,8 +1106,8 @@ class TestWorkspaceExecution:
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """With harvest_mode='final', mid-run copies are skipped; only the
-        authoritative sweep at finalize runs.  The result is still complete
-        and artifacts are delivered — just with fewer sbx exec tar calls."""
+        authoritative sweep at the end runs.  The result is still complete
+        and artifacts are on the host — just with fewer sbx exec tar calls."""
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
         build = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
         harness.script([taskgraph(task("t1"), task("t2", deps=["t1"])), build, build])
@@ -1027,287 +1118,10 @@ class TestWorkspaceExecution:
         harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
         assert (harvested / "hello.txt").read_text() == "hi\n"
 
-        # Per-task mode would run tar once per task + once at finalize.
-        # Final mode runs tar only at finalize (1 call).
+        # Per-task mode would run tar once per task + once at the end.
+        # Final mode runs tar only at the end (1 call).
         tar_calls = [inv for inv in harness.fake_sbx.invocations("exec") if "tar" in inv]
         assert len(tar_calls) == 1
-
-
-class TestDeliverHook:
-    """The engine's finalize hook; the git-data flow itself is covered in
-    test_deliver.py. deliver_workspace is patched — no GitHub, no network."""
-
-    def deliver_engine(self, harness: Harness, **overrides: Any) -> LoopEngine:
-        return harness.engine(github={"repo": "o/r", "deliver": True}, **overrides)
-
-    def test_completed_run_delivers_and_emits_pr(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.gh.ops import PrRef
-
-        calls: list[dict[str, Any]] = []
-
-        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
-            calls.append({"repo": repo, **kwargs})
-            return PrRef(number=3, url="https://github.com/o/r/pull/3")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        build = {"text": "done", "files": {"hello.txt": "hi"}}
-        harness.script([taskgraph(task("t1")), build])
-        result = self.deliver_engine(harness).start("ship it")
-
-        assert result.state == "completed"
-        assert len(calls) == 1
-        assert calls[0]["repo"] == "o/r"
-        assert calls[0]["run_id"] == result.run_id
-        assert calls[0]["outcome"] == "ship it"
-        assert calls[0]["source_dir"] == result.workspace
-        # config default threaded through
-        assert calls[0]["exclude"] == list(DEFAULT_ARTIFACT_EXCLUDES)
-        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
-        assert [e.data for e in deliver_events] == [
-            {"repo": "o/r", "pr": 3, "url": "https://github.com/o/r/pull/3"}
-        ]
-
-    def test_delivery_failure_is_loud_but_nonfatal(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.errors import DeliveryError
-
-        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
-            raise DeliveryError("boom")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-        result = self.deliver_engine(harness).start("ship it")
-
-        assert result.state == "completed"  # the run itself still succeeded
-        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
-        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
-
-    def test_delivery_infra_error_never_fails_a_completed_run(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """WorkerError/SbxError from the op jobs (not just DeliveryError)
-        must stay inside _deliver: the run already succeeded (#59)."""
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.errors import SbxError, WorkerTimeoutError
-
-        for exc in (
-            WorkerError("worker for job j1 produced no result file"),
-            WorkerTimeoutError("job j1 exceeded 120s"),
-            SbxError("sbx command failed: cp", stderr="daemon exploded"),
-        ):
-
-            def fake_deliver(*args: Any, _exc: Exception = exc, **kwargs: Any) -> Any:
-                raise _exc
-
-            monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-            monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-            harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-            harness.events.clear()
-            result = self.deliver_engine(harness).start(f"ship {type(exc).__name__}")
-
-            assert result.state == "completed", type(exc).__name__
-            deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
-            assert len(deliver_events) == 1
-            assert str(exc) in deliver_events[0].data["error"]
-
-    def test_failed_run_never_delivers(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import sbxloop.engine.engine as engine_mod
-
-        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
-            raise AssertionError("must not deliver a failed run")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        # the build reports success but verify never passes
-        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
-        result = self.deliver_engine(harness, budgets=NO_RETRY_BUDGETS).start("doomed")
-        assert result.state == "failed"
-        assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
-
-    def test_no_repo_configured_never_delivers(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import sbxloop.engine.engine as engine_mod
-
-        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
-            raise AssertionError("must not deliver without a configured repo")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-        result = harness.engine().start("plain run")
-        assert result.state == "completed"
-        assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
-
-
-class TestDeliverCommand:
-    """`sbxloop deliver <run>` — LoopEngine.deliver: the retry path for a
-    completed run whose end-of-run delivery failed (#223). Runs on a
-    github-only sandbox; deliver_workspace/ensure_repository are patched."""
-
-    def completed_run(self, harness: Harness, **config_overrides: Any) -> str:
-        build = {"text": "done", "files": {"hello.txt": "hi"}}
-        harness.script([taskgraph(task("t1")), build])
-        result = harness.engine(**config_overrides).start("ship it")
-        assert result.state == "completed"
-        harness.events.clear()
-        return result.run_id
-
-    def patch_delivery(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.gh.ops import PrRef
-
-        calls: list[dict[str, Any]] = []
-
-        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
-            calls.append({"repo": repo, **kwargs})
-            return PrRef(number=5, url="https://github.com/o/r/pull/5")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        return calls
-
-    def test_delivers_completed_run_from_github_only_sandbox(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The run itself was github-less (no repo → no delivery); the repo
-        # arrives as an override, the way `deliver --repo` passes it.
-        run_id = self.completed_run(harness)
-        calls = self.patch_delivery(monkeypatch)
-        creates_before = len(harness.fake_sbx.invocations("create"))
-
-        pr = harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
-
-        assert pr.number == 5
-        assert len(calls) == 1
-        assert calls[0]["repo"] == "o/r"
-        assert calls[0]["run_id"] == run_id
-        assert calls[0]["outcome"] == "ship it"
-        assert calls[0]["source_dir"].is_dir()
-        # exactly one sandbox — the run's github name — created and torn down
-        creates = harness.fake_sbx.invocations("create")[creates_before:]
-        assert len(creates) == 1
-        assert any(f"sbxloop-{run_id}-github" in arg for arg in creates[0])
-        assert harness.sandboxes_left() == []
-        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
-        assert [e.data for e in deliver_events] == [
-            {"repo": "o/r", "pr": 5, "url": "https://github.com/o/r/pull/5"}
-        ]
-        # persisted under the run, so `logs` and the finish summary see it
-        store = StateStore(harness.state_dir / "state.db")
-        assert [e.type for _s, e in store.events(run_id, type_prefix="run.deliver")] == [
-            HostEventTypes.RUN_DELIVER
-        ]
-
-    def test_uses_persisted_repo_when_no_override(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        run_id = self.completed_run(harness, github={"repo": "persisted/repo"})
-        calls = self.patch_delivery(monkeypatch)
-        harness.engine().deliver(run_id)
-        assert calls[0]["repo"] == "persisted/repo"
-
-    def test_refuses_run_without_repo(self, harness: Harness) -> None:
-        run_id = self.completed_run(harness)
-        with pytest.raises(StateError, match="no delivery repository"):
-            harness.engine().deliver(run_id)
-        assert harness.sandboxes_left() == []
-
-    def test_refuses_unfinished_run(self, harness: Harness) -> None:
-        engine = harness.engine()
-        engine.store.create_run("r-open", "x", engine.config.model_dump_json())
-        with pytest.raises(StateError, match="only completed runs"):
-            engine.deliver("r-open", github_overrides={"repo": "o/r"})
-
-    def test_failure_emits_error_event_raises_and_tears_down(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.errors import DeliveryError
-
-        run_id = self.completed_run(harness)
-
-        def fake_deliver(*args: Any, **kwargs: Any) -> Any:
-            raise DeliveryError("boom")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        with pytest.raises(DeliveryError, match="boom"):
-            harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
-        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
-        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "boom"}]
-        assert harness.sandboxes_left() == []
-
-    def test_provisioning_failure_emits_error_event_and_raises(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A retry that dies before the sandbox is up (missing token, sbx
-        create/policy error, worker install) is still a failed delivery
-        attempt: `logs` must record it, not just the traceback."""
-        from sbxloop.engine.engine import LoopEngine
-        from sbxloop.errors import ProvisionError
-
-        run_id = self.completed_run(harness)
-
-        def fail(self: Any, *args: Any, **kwargs: Any) -> Any:
-            raise ProvisionError("no github token")
-
-        monkeypatch.setattr(LoopEngine, "_provision_github_only", fail)
-        with pytest.raises(ProvisionError, match="no github token"):
-            harness.engine().deliver(run_id, github_overrides={"repo": "o/r"})
-        deliver_events = [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER]
-        assert [e.data for e in deliver_events] == [{"repo": "o/r", "error": "no github token"}]
-
-    def test_report_refreshes_tracking_issue(
-        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.gh.ops import IssueRef
-
-        run_id = self.completed_run(harness)
-        self.patch_delivery(monkeypatch)
-
-        class RecordingOps:
-            instances: ClassVar[list[Any]] = []
-
-            def __init__(self, client: Any, run_id: str, **kwargs: Any) -> None:
-                self.comments: list[str] = []
-                self.raw_calls: list[tuple[str, str]] = []
-                type(self).instances.append(self)
-
-            def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
-                return [{"title": f"sbxloop run {run_id}", "number": 9, "html_url": "https://x/9"}]
-
-            def issue_create(self, *a: Any, **k: Any) -> IssueRef:
-                raise AssertionError("existing issue must be reused")
-
-            def issue_comment(self, repo: str, number: int, body: str) -> str:
-                self.comments.append(body)
-                return "https://c"
-
-            def raw(self, method: str, path: str, body: Any = None) -> Any:
-                self.raw_calls.append((method, path))
-                return {}
-
-        monkeypatch.setattr(engine_mod, "GithubOps", RecordingOps)
-        harness.engine().deliver(run_id, github_overrides={"repo": "o/r"}, report=True)
-
-        (ops,) = RecordingOps.instances
-        assert ops.comments == [f"Run `{run_id}` delivered: PR #5 https://github.com/o/r/pull/5"]
-        assert ("PATCH", "/repos/o/r/issues/9") in ops.raw_calls
-        report_events = [e for e in harness.events if e.type == HostEventTypes.RUN_REPORT]
-        assert [e.data for e in report_events] == [
-            {"repo": "o/r", "issue": 9, "url": "https://x/9"}
-        ]
 
 
 class TestPrebakedTemplate:
@@ -1360,14 +1174,14 @@ class TestPrebakedTemplate:
         """With [github].repo the pair installs concurrently (#127); both
         sandboxes verify their baked worker and each emits its own event."""
         self.seed_template(harness)
-        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-        result = harness.engine(
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(
+            FakeGithub(),
             install_workers=True,
             sandbox={"template": self.REF},
-            github={"repo": "owner/repo"},
         ).start("use the baked template with github")
 
-        assert result.state == "completed"
+        assert result.state == "merged"
         joined = [" ".join(c) for c in harness.fake_sbx.invocations("exec")]
         assert not [j for j in joined if "-m venv" in j or "pip install" in j or "apt-get" in j]
         prebaked = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_PREBAKED]
@@ -1435,70 +1249,682 @@ class TestResourceGuardrail:
         assert rows, "sandbox.resources events were not persisted"
 
 
-class TestGithubReporting:
-    """Wiring for --report: the engine must open the tracking issue after
-    the github sandbox exists, mirror task ends, and post the summary while
-    the sandbox is still alive (#58). GithubOps is patched at the engine
-    module — no GitHub, no network."""
+class Clock:
+    """A manual clock for the engine's wall-clock and CI-settle arithmetic."""
 
-    class RecordingOps:
-        instances: ClassVar[list[TestGithubReporting.RecordingOps]] = []
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
 
-        def __init__(self, client: Any, run_id: str, **kwargs: Any) -> None:
-            self.run_id = run_id
-            self.created: list[str] = []
-            self.comments: list[str] = []
-            type(self).instances.append(self)
+    def __call__(self) -> float:
+        return self.t
 
-        def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
-            return []
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
 
-        def issue_create(self, repo: str, title: str, body: str = "", labels: Any = None) -> Any:
-            from sbxloop.gh.ops import IssueRef
 
-            self.created.append(title)
-            return IssueRef(number=11, url="https://x/11")
+class TestPipeline:
+    """GATE → DELIVER → REVIEW ⇄ FIX → CI → LAND, scripted end to end against
+    a FakeGithub through the engine's ``github_ops`` seam."""
 
-        def issue_comment(self, repo: str, number: int, body: str) -> str:
-            self.comments.append(body)
-            return "https://c"
+    def _events(self, harness: Harness, type: str) -> list[Event]:
+        return [e for e in harness.events if e.type == type]
 
-    @pytest.fixture(autouse=True)
-    def _patch_ops(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import sbxloop.engine.engine as engine_mod
+    def test_issue_to_merge(self, harness: Harness) -> None:
+        """The whole pipeline once: a draft PR, a review that asks for a
+        change, one fix round re-delivered onto the same branch, an
+        approval, green CI, un-draft, merge, branch gone."""
+        fake = FakeGithub(draft=True)
+        fake.checks = [GREEN]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
 
-        self.RecordingOps.instances = []
-        monkeypatch.setattr(engine_mod, "GithubOps", self.RecordingOps)
+        assert result.state == "merged"
+        assert result.succeeded
+        assert result.reason is None
+        assert result.pr_number == 7
+        assert result.pr_url == "https://github.com/o/r/pull/7"
+        assert [(t.spec.id, t.state) for t in result.tasks] == [("t1", "done"), ("fix-1", "done")]
+        fix = result.tasks[1].spec
+        assert FINDING["body"] in fix.description
+        assert "`hello.txt:1` [major]" in fix.description
+        assert fix.verify_commands == ["true"]
 
-    def test_report_opens_comments_and_summarizes(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-        result = harness.engine(github={"repo": "o/r", "report": True}).start("do it")
+        # The review verdict is ours; it is posted for the record.
+        assert [event for event, _, _ in fake.reviews] == ["REQUEST_CHANGES", "APPROVE"]
+        _, body, comments = fake.reviews[0]
+        assert "one real problem" in body and f"run `{result.run_id}`" in body
+        assert [(c.path, c.line) for c in comments] == [("hello.txt", 1)]
+        # Delivered as a draft, un-drafted once, merged at the round-2 head,
+        # branch tidied away.
+        assert fake.pr_kwargs["draft"] is True
+        assert fake.pr_kwargs["head"] == f"sbxloop/{result.run_id}"
+        assert fake.ready_calls == ["PR_node7"]
+        assert fake.merges == [(7, "squash", "commit2")]
+        assert fake.deleted_branches == [f"sbxloop/{result.run_id}"]
+        assert fake.pr["merged"] is True
 
-        assert result.state == "completed"
-        assert len(self.RecordingOps.instances) == 1
-        ops = self.RecordingOps.instances[0]
-        assert ops.created == [f"sbxloop run {result.run_id}"]
-        # one comment per task end + the final summary
-        assert len(ops.comments) == 2
-        assert "✅ `t1`" in ops.comments[0]
-        assert "finished: **completed**" in ops.comments[1]
+        assert harness.run_states() == [
+            "provisioning",
+            "decomposing",
+            "building",
+            "gating",
+            "delivering",
+            "reviewing",
+            "fixing",
+            "gating",
+            "delivering",
+            "reviewing",
+            "awaiting_ci",
+            "landing",
+            "merged",
+        ]
+        deliveries = self._events(harness, HostEventTypes.RUN_DELIVER)
+        assert [(e.data["round"], e.data["head_sha"], e.data["pr"]) for e in deliveries] == [
+            (1, "commit1", 7),
+            (2, "commit2", 7),
+        ]
+        verdicts = self._events(harness, HostEventTypes.REVIEW_VERDICT)
+        assert [(e.data["round"], e.data["verdict"], e.data["blocking"]) for e in verdicts] == [
+            (1, "request_changes", 1),
+            (2, "approve", 0),
+        ]
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "review"
+        assert fix_round.data["task_id"] == "fix-1"
+        assert fix_round.data["budget"] == "1/3"
+        (merged,) = self._events(harness, HostEventTypes.RUN_MERGED)
+        assert merged.data["sha"] == "merge0001" and merged.data["by_human"] is False
+        (end,) = self._events(harness, HostEventTypes.RUN_END)
+        assert end.data["state"] == "merged" and end.data["pr"] == 7
 
-    def test_failed_run_summary_reports_failed(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
-        result = harness.engine(
-            github={"repo": "o/r", "report": True}, budgets=NO_RETRY_BUDGETS
-        ).start("doomed")
+        run = engine.store.get_run(result.run_id)
+        assert run.state == "merged"
+        assert run.stage == "landing"
+        assert run.review_rounds == 1
+        assert run.ci_rounds == 0
+        assert run.pr_number == 7
+        assert run.pr_node_id == "PR_node7"
+        assert run.branch == f"sbxloop/{result.run_id}"
+        assert run.head_sha == "commit2"
+        assert run.last_verdict == "approve"
+        phases = [(row["phase"], row["status"]) for row in engine.store.phase_attempts(run.run_id)]
+        assert phases == [
+            ("decompose", "ok"),
+            ("build", "ok"),
+            ("verify", "ok"),
+            ("gate", "skipped"),
+            ("review", "request_changes"),
+            ("build", "ok"),
+            ("verify", "ok"),
+            ("gate", "skipped"),
+            ("review", "approve"),
+        ]
 
+    def test_review_rounds_carry_history_and_refutations(self, harness: Harness) -> None:
+        """Round 2 sees round 1's findings and the fixer's response; a
+        verdict built only on a refuted finding is sent back once."""
+        fake = FakeGithub()
+        refute = {"text": "Left as is.\n\nrefuted: hello.txt:1 — the greeting is specified as hi"}
+        harness.script(
+            [taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, refute, REVIEW_RC, REVIEW_OK]
+        )
+        engine = harness.pipeline(fake, keep_sandboxes=True)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        assert [event for event, _, _ in fake.reviews] == ["REQUEST_CHANGES", "APPROVE"]
+        reviews = [
+            j
+            for j in harness.agent_jobs(result.run_id)
+            if (j.get("prompt") or "").startswith("# Review the pull request")
+        ]
+        assert len(reviews) == 3  # round 1, round 2, round 2's retry
+        (first,) = [j for j in reviews if "(first review of this pull request)" in j["prompt"]]
+        assert "### Round" not in first["prompt"]
+        second = [j["prompt"] for j in reviews if "### Round 1 — request_changes" in j["prompt"]]
+        assert len(second) == 2
+        assert all("the greeting is specified as hi" in p for p in second)
+        (retry,) = [p for p in second if "already refuted" in p]
+        assert "hello.txt:1" in retry
+        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "review"]
+        assert [r["attempt"] for r in rows] == [1, 2]
+
+    def test_delivery_opens_one_draft_pr_and_refreshes_it(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("ship hello")
+        assert result.state == "merged"
+        assert fake.pr_kwargs == {
+            "repo": "o/r",
+            "base": "main",
+            "head": f"sbxloop/{result.run_id}",
+            "title": "sbxloop: ship hello",
+            "body": fake.pr_kwargs["body"],
+            "draft": True,
+        }
+        assert "hello.txt" in fake.pr_kwargs["body"]
+        commits = [p for m, p, _ in fake.raw_calls if m == "POST" and p.endswith("/git/commits")]
+        assert len(commits) == 2
+        patches = [p for m, p, _ in fake.raw_calls if m == "PATCH"]
+        assert patches == [f"/repos/o/r/git/refs/heads/sbxloop/{result.run_id}"]
+
+    def test_the_review_still_counts_when_github_refuses_the_post(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_once["pr_review_create"] = GithubOpsError("reviews closed", http_status=422)
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("ship hello")
+        assert result.state == "merged"
+        (verdict,) = self._events(harness, HostEventTypes.REVIEW_VERDICT)
+        assert verdict.data["verdict"] == "approve" and verdict.data["url"] == ""
+
+    def test_review_exhaustion_fails_with_the_pr_left_a_draft(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_RC])
+        engine = harness.pipeline(fake, landing={"max_review_rounds": 1})
+        result = engine.start("never good enough")
         assert result.state == "failed"
-        ops = self.RecordingOps.instances[0]
-        assert "❌ `t1`" in ops.comments[0]
-        assert "finished: **failed**" in ops.comments[-1]
+        assert result.reason is not None
+        assert "review fix rounds exhausted (1 allowed by [landing] review_rounds)" in result.reason
+        assert result.pr_number == 7
+        assert fake.pr["draft"] is True
+        assert fake.merges == [] and fake.ready_calls == []
+        assert [t.spec.id for t in result.tasks] == ["t1", "fix-1"]
+        run = engine.store.get_run(result.run_id)
+        assert run.review_rounds == 2 and run.stage == "reviewing"
+        assert run.reason == result.reason
 
-    def test_report_disabled_touches_nothing(self, harness: Harness) -> None:
-        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
-        result = harness.engine(github={"repo": "o/r"}).start("quiet")
-        assert result.state == "completed"
-        assert self.RecordingOps.instances == []
+    def test_gate_red_spends_a_ci_round_before_delivering(self, harness: Harness) -> None:
+        """A later task breaks what an earlier one proved: the gate over the
+        whole tree catches it before GitHub does, on the CI budget."""
+        gate = "grep -q green state.txt"
+        fake = FakeGithub()
+        harness.script(
+            [
+                taskgraph(task("t1", verify=[gate]), task("t2", deps=["t1"])),
+                {"text": "t1", "files": {"state.txt": "green\n", "hello.txt": "hi\n"}},
+                {"text": "t2 broke it", "files": {"state.txt": "red\n"}},
+                {"text": "fixed", "files": {"state.txt": "green\n"}},
+                REVIEW_OK,
+            ]
+        )
+        engine = harness.pipeline(fake, sandbox={"gate_command": gate})
+        result = engine.start("keep the gate green")
+        assert result.state == "merged"
+        assert [(t.spec.id, t.state) for t in result.tasks] == [
+            ("t1", "done"),
+            ("t2", "done"),
+            ("fix-1", "done"),
+        ]
+        fix = result.tasks[2].spec
+        assert fix.description.startswith("The work in this tree is not yet acceptable")
+        assert f"#### `{gate}` (failure)" in fix.description
+        assert fix.verify_commands == [gate, "true"]
+        assert fix.acceptance_criteria[0] == "the project gate passes"
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "gate" and fix_round.data["pr"] is None
+        gates = [
+            (e.data["status"], e.data["attempt"])
+            for e in self._events(harness, HostEventTypes.PHASE_END)
+            if e.data["phase"] == "gate"
+        ]
+        assert gates[0] == ("failed", 1)
+        run = engine.store.get_run(result.run_id)
+        assert run.ci_rounds == 1 and run.review_rounds == 0
+        assert harness.run_states()[3:5] == ["gating", "fixing"]
+        # The tree that was delivered is green: the fix task's own verify
+        # ran the gate (it is in its verify commands) and passed.
+        assert (result.workspace / "state.txt").read_text() == "green\n"  # type: ignore[operator]
+
+    def test_the_gate_is_re_run_after_a_gate_fix_round(self, harness: Harness) -> None:
+        gate = "grep -q green state.txt"
+        fake = FakeGithub()
+        harness.script(
+            [
+                taskgraph(task("t1", verify=[gate]), task("t2", deps=["t1"])),
+                {"text": "t1", "files": {"state.txt": "green\n", "hello.txt": "hi\n"}},
+                {"text": "t2 broke it", "files": {"state.txt": "red\n"}},
+                {"text": "fixed", "files": {"state.txt": "green\n"}},
+                REVIEW_OK,
+            ]
+        )
+        engine = harness.pipeline(fake, sandbox={"gate_command": gate})
+        result = engine.start("keep the gate green")
+        assert result.state == "merged"
+        gates = [
+            (e.data["status"], e.data["attempt"])
+            for e in self._events(harness, HostEventTypes.PHASE_END)
+            if e.data["phase"] == "gate"
+        ]
+        assert gates == [("failed", 1), ("ok", 2)]
+        assert harness.run_states()[3:7] == ["gating", "fixing", "gating", "delivering"]
+
+    def test_ci_red_fix_round_carries_the_log_excerpt(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.checks = [RED, GREEN]
+        fake.failed_logs = [
+            FailedCheck("lint", "failure", "E501 hello.txt:1 too long", "https://x")
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("pass CI")
+        assert result.state == "merged"
+        fix = result.tasks[1].spec
+        assert "E501 hello.txt:1 too long" in fix.description
+        assert "#### `lint` (failure)" in fix.description
+        assert "the `lint` check passes" in fix.acceptance_criteria
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "ci"
+        assert fix_round.data["why"] == "1 of 1 check(s) failed: ci"
+        statuses = [e.data["state"] for e in self._events(harness, HostEventTypes.CI_STATUS)]
+        assert statuses == ["red", "green"]
+        run = engine.store.get_run(result.run_id)
+        assert run.ci_rounds == 1 and run.review_rounds == 0
+        assert fake.merges == [(7, "squash", "commit2")]
+
+    def test_ci_red_past_the_budget_fails(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.checks = [RED]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake, landing={"max_ci_rounds": 0}).start("pass CI")
+        assert result.state == "failed"
+        assert result.reason is not None
+        assert "ci fix rounds exhausted (0 allowed by [landing] ci_rounds)" in result.reason
+        assert fake.merges == []
+        assert [t.spec.id for t in result.tasks] == ["t1"]
+
+    def test_ci_that_never_reports_blocks(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.checks = [PENDING]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"ci_timeout_s": 0.05})
+        result = engine.start("wait for CI")
+        assert result.state == "blocked"
+        assert result.reason is not None
+        assert "ci_timeout_s=0.05" in result.reason
+        assert fake.merges == []
+        run = engine.store.get_run(result.run_id)
+        assert run.state == "blocked" and run.stage == "awaiting_ci"
+
+    def test_no_check_runs_is_trusted_only_after_the_settle_window(self, harness: Harness) -> None:
+        """Actions registers check runs seconds after a push: "no checks
+        yet" must not merge before CI has started."""
+        clock = Clock()
+
+        class SlowCi(FakeGithub):
+            def pr_checks(self, repo: str, sha: str) -> Any:
+                clock.advance(30.0)
+                return super().pr_checks(repo, sha)
+
+        fake = SlowCi()
+        fake.checks = [NO_CHECKS]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"ci_settle_s": 100.0})
+        engine.clock = clock
+        result = engine.start("no CI here")
+        assert result.state == "merged"
+        # delivered at t; polled at +30, +60, +90 (waiting), +120 (settled);
+        # then landing reads the checks once more
+        assert len(fake.checks_calls) == 5
+        (status,) = self._events(harness, HostEventTypes.CI_STATUS)
+        assert status.data["total"] == 0 and status.data["state"] == "green"
+
+    def test_a_long_ci_wait_is_not_charged_to_the_wall_clock(self, harness: Harness) -> None:
+        clock = Clock()
+
+        class SleepingEvent(threading.Event):
+            def wait(self, timeout: float | None = None) -> bool:
+                clock.advance(100.0)
+                return True
+
+        fake = FakeGithub()
+        fake.checks = [PENDING, PENDING, GREEN]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, budgets={"max_wall_clock_s": 10.0})
+        engine.clock = clock
+        engine._wake = SleepingEvent()
+        result = engine.start("slow CI")
+        assert result.state == "merged"
+        # two CI polls that found checks pending, plus the un-draft settle
+        # read before the merge: 300s of waiting against a 10s budget
+        assert engine._waited_s == 300.0
+
+    def test_landing_405_blocks_and_a_resume_finishes(self, harness: Harness) -> None:
+        """A protection rule no round can satisfy hands the PR to a human;
+        once they have acted, the run resumes at landing — no decompose, no
+        build, no review re-run."""
+        fake = FakeGithub()
+        fake.merge_outcomes = [BLOCKED_405]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("land it")
+        assert result.state == "blocked"
+        assert result.reason == BLOCKED_405.reason
+        assert not result.succeeded
+        (blocked,) = self._events(harness, HostEventTypes.RUN_BLOCKED)
+        assert blocked.data["pr"] == 7 and blocked.data["why"] == BLOCKED_405.reason
+        run = engine.store.get_run(result.run_id)
+        assert run.state == "blocked" and run.stage == "landing"
+        assert run.reason == BLOCKED_405.reason
+        assert fake.deleted_branches == []
+        assert "blocked" in RESUMABLE_RUN_STATES
+
+        fake.merge_outcomes = [MERGED]
+        harness.script([])
+        resumed = harness.pipeline(fake).resume(result.run_id)
+        assert resumed.state == "merged"
+        assert resumed.reason is None
+        assert resumed.pr_number == 7
+        assert harness.consumed() == 0, "a resume at landing must not re-run any agent phase"
+        assert fake.merges == [(7, "squash", "commit1"), (7, "squash", "commit1")]
+        run = engine.store.get_run(result.run_id)
+        assert run.state == "merged" and run.reason is None
+
+    def test_landing_409_re_judges_then_merges(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.merge_outcomes = [STALE_409, MERGED]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged"
+        assert len(fake.merges) == 2
+
+    def test_a_pr_stuck_behind_its_base_is_bounded_then_blocked(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "behind"
+        fake.update_ok = False
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"merge_update_attempts": 2})
+        result = engine.start("land it")
+        assert result.state == "blocked"
+        assert result.reason is not None
+        assert "still behind its base after 2 update(s)" in result.reason
+        assert fake.updates == [(7, "commit1"), (7, "commit1")]
+        updates = self._events(harness, HostEventTypes.LAND_UPDATE)
+        assert [(e.data["attempt"], e.data["accepted"]) for e in updates] == [
+            (1, False),
+            (2, False),
+        ]
+        run = engine.store.get_run(result.run_id)
+        assert run.update_attempts == 2 and run.update_head is None
+
+    def test_a_conflict_spends_a_fix_round(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable"] = False
+        fake.pr["mergeable_state"] = "dirty"
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+
+        def rebased(event: Event) -> None:
+            # The fix round's re-delivery rebuilds the commit on the base.
+            if event.type == HostEventTypes.FIX_ROUND:
+                fake.pr["mergeable"] = True
+                fake.pr["mergeable_state"] = "clean"
+
+        engine.bus.subscribe(rebased)
+        result = engine.start("land it")
+        assert result.state == "merged"
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "conflict"
+        assert "conflicts with its base branch" in result.tasks[1].spec.description
+        assert engine.store.get_run(result.run_id).ci_rounds == 1
+
+    def test_a_humans_objection_spends_a_fix_round_with_their_words(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "please say hello")]
+        fake.feedback = "please say hello\n\n- `hello.txt:1`: hi is too casual"
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+
+        def satisfied(event: Event) -> None:
+            if event.type == HostEventTypes.FIX_ROUND:
+                fake.reviews_payload = [human_review("alice", "APPROVED", "thanks")]
+
+        engine.bus.subscribe(satisfied)
+        result = engine.start("land it")
+        assert result.state == "merged"
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "human"
+        brief = result.tasks[1].spec.description
+        assert "Review comments a human left on the PR" in brief
+        assert "hi is too casual" in brief
+        # The loop read its own login to tell alice's review from its own.
+        assert ("GET", "/user", None) in fake.raw_calls
+
+    def test_the_loops_own_review_never_objects_to_itself(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("sbxloop-bot", "CHANGES_REQUESTED", "round 1")]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged"
+        assert self._events(harness, HostEventTypes.FIX_ROUND) == []
+
+    def test_a_pr_closed_by_a_human_fails_the_run(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.pr["state"] = "closed"
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "failed"
+        assert result.reason == "the pull request was closed without being merged"
+        assert fake.merges == []
+
+    def test_a_pr_merged_by_a_human_lands_without_a_merge_call(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.pr["merged"] = True
+        fake.pr["merge_commit_sha"] = "human123"
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged"
+        assert fake.merges == []
+        (merged,) = self._events(harness, HostEventTypes.RUN_MERGED)
+        assert merged.data["sha"] == "human123" and merged.data["by_human"] is True
+
+    def test_failed_graph_never_delivers(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        result = harness.pipeline(fake, budgets=NO_RETRY_BUDGETS).start("doomed")
+        assert result.state == "failed"
+        assert result.pr_number is None
+        assert fake.pr_created is False
+        assert self._events(harness, HostEventTypes.RUN_DELIVER) == []
+
+    def test_a_missing_repository_fails_before_any_work(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.repo_lookup = lambda repo: None  # type: ignore[method-assign]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        from sbxloop.errors import DeliveryError
+
+        with pytest.raises(DeliveryError, match="does not exist"):
+            harness.pipeline(fake).start("nowhere to go")
+        assert harness.consumed() == 0
+
+    # -- chat during the pipeline -------------------------------------------
+
+    STEER_CONTINUE: ClassVar[dict[str, Any]] = {
+        "json": {"reply": "still waiting on CI", "action": "continue"}
+    }
+    STEER_TASK: ClassVar[dict[str, Any]] = {
+        "json": {
+            "reply": "restarting the fix",
+            "action": "steer_task",
+            "guidance": "greet in French",
+        }
+    }
+
+    def test_a_chat_message_cuts_a_ci_wait_short(self, harness: Harness) -> None:
+        """A poll interval must never delay an answer: the message wakes the
+        wait, and the reply lands at the next tick — before the run ends."""
+        fake = FakeGithub()
+        fake.checks = [PENDING, PENDING, GREEN]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, self.STEER_CONTINUE])
+        # not a draft: no un-draft settle wait muddies the arithmetic below
+        engine = harness.pipeline(fake, landing={"ci_poll_interval_s": 3.0, "deliver_draft": False})
+        posted: list[str] = []
+
+        def ask_during_the_wait(event: Event) -> None:
+            if event.type == HostEventTypes.CI_STATUS and not posted:
+                posted.append("armed")
+                threading.Timer(0.2, lambda: engine.post_user_message("how is CI?")).start()
+
+        engine.bus.subscribe(ask_during_the_wait)
+        result = engine.start("wait for CI")
+        assert result.state == "merged"
+        # two full intervals would be 6s of waiting; the first was cut short
+        assert engine._waited_s < 5.0, engine._waited_s
+        types = harness.event_types()
+        assert types.index("chat.reply") < types.index(HostEventTypes.RUN_END)
+        reply = next(e for e in harness.events if e.type == "chat.reply")
+        assert reply.data["reply"] == "still waiting on CI"
+        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "steer")
+        assert steer["task_id"] is None
+
+    def test_steer_task_on_a_fix_task_restarts_its_build(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                FILES_BUILD,
+                REVIEW_RC,
+                BUILD,  # fix-1, first attempt
+                self.STEER_TASK,
+                {"text": "bonjour", "files": {"hello.txt": "bonjour\n"}},  # restarted
+                REVIEW_OK,
+            ]
+        )
+        engine = harness.pipeline(fake, keep_sandboxes=True)
+        posted: list[str] = []
+
+        def steer_after_the_fix_build(event: Event) -> None:
+            if (
+                event.type == HostEventTypes.PHASE_END
+                and event.data.get("phase") == "build"
+                and event.data.get("task_id") == "fix-1"
+                and not posted
+            ):
+                posted.append(engine.post_user_message("do it in French"))
+
+        engine.bus.subscribe(steer_after_the_fix_build)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        fix = result.tasks[1]
+        assert fix.state == "done" and fix.revisions == 0 and fix.replans == 0
+        action = next(e for e in harness.events if e.type == "chat.action")
+        assert action.data["action"] == "steer_task" and action.data["task_id"] == "fix-1"
+        builds = [
+            r
+            for r in engine.store.phase_attempts(result.run_id)
+            if r["phase"] == "build" and r["task_id"] == "fix-1"
+        ]
+        assert len(builds) == 2
+        prompts = [
+            j["prompt"]
+            for j in harness.agent_jobs(result.run_id)
+            if "user steering (must be honored): greet in French" in (j.get("prompt") or "")
+        ]
+        assert len(prompts) == 1
+        assert (result.workspace / "hello.txt").read_text() == "bonjour\n"  # type: ignore[operator]
+
+    # -- resume at every post-delivery stage ----------------------------------
+
+    def _interrupted(
+        self, harness: Harness, fake: FakeGithub, script: list[dict[str, Any]], exc: type[Exception]
+    ) -> tuple[LoopEngine, str]:
+        harness.script(script)
+        engine = harness.pipeline(fake)
+        with pytest.raises(exc):
+            engine.start("resume me")
+        return engine, engine.store.list_runs()[0].run_id
+
+    def test_resume_at_delivering_re_delivers(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_once["blobs_create_many"] = GithubOpsError("blob store down", http_status=502)
+        engine, run_id = self._interrupted(
+            harness, fake, [taskgraph(task("t1")), FILES_BUILD], GithubOpsError
+        )
+        run = engine.store.get_run(run_id)
+        assert run.state == "delivering" and run.stage == "delivering"
+        assert run.pr_number is None
+        harness.script([REVIEW_OK])
+        result = harness.pipeline(fake).resume(run_id)
+        assert result.state == "merged"
+        assert fake.pr_created and result.pr_number == 7
+        # decompose/build never re-ran: the resume consumed only the review
+        assert harness.consumed() == 1
+        assert harness.run_states()[-6:] == [
+            "provisioning",
+            "delivering",
+            "reviewing",
+            "awaiting_ci",
+            "landing",
+            "merged",
+        ]
+
+    def test_resume_at_reviewing_reviews_without_re_delivering(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        engine, run_id = self._interrupted(
+            harness,
+            fake,
+            [taskgraph(task("t1")), FILES_BUILD, {"fail": "reviewer exploded"}],
+            WorkerError,
+        )
+        run = engine.store.get_run(run_id)
+        assert run.state == "reviewing" and run.pr_number == 7
+        harness.script([REVIEW_OK])
+        result = harness.pipeline(fake).resume(run_id)
+        assert result.state == "merged"
+        commits = [p for m, p, _ in fake.raw_calls if m == "POST" and p.endswith("/git/commits")]
+        assert len(commits) == 1, "the PR already carried the work; no re-delivery"
+        assert fake.merges == [(7, "squash", "commit1")]
+
+    def test_resume_at_fixing_finishes_the_fix_task(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        engine, run_id = self._interrupted(
+            harness,
+            fake,
+            [taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, {"fail": "fixer exploded"}],
+            WorkerError,
+        )
+        run = engine.store.get_run(run_id)
+        assert run.state == "fixing" and run.review_rounds == 1
+        assert [(t.spec.id, t.state) for t in engine.store.get_tasks(run_id)] == [
+            ("t1", "done"),
+            ("fix-1", "executing"),
+        ]
+        harness.script([BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).resume(run_id)
+        assert result.state == "merged"
+        assert [(t.spec.id, t.state) for t in result.tasks] == [("t1", "done"), ("fix-1", "done")]
+        assert engine.store.get_run(run_id).review_rounds == 1, "a resume spends no round"
+        assert fake.merges == [(7, "squash", "commit2")]
+
+    def test_resume_at_awaiting_ci_re_polls(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_once["pr_checks"] = GithubOpsError("github down", http_status=502)
+        engine, run_id = self._interrupted(
+            harness, fake, [taskgraph(task("t1")), FILES_BUILD, REVIEW_OK], GithubOpsError
+        )
+        run = engine.store.get_run(run_id)
+        assert run.state == "awaiting_ci" and run.head_sha == "commit1"
+        harness.script([])
+        result = harness.pipeline(fake).resume(run_id)
+        assert result.state == "merged"
+        assert harness.consumed() == 0
+        reviews = [r for r in engine.store.phase_attempts(run_id) if r["phase"] == "review"]
+        assert len(reviews) == 1
+
+    def test_resume_at_landing_lands(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_once["pr_merge"] = GithubOpsError("github down", http_status=502)
+        engine, run_id = self._interrupted(
+            harness, fake, [taskgraph(task("t1")), FILES_BUILD, REVIEW_OK], GithubOpsError
+        )
+        assert engine.store.get_run(run_id).state == "landing"
+        harness.script([])
+        result = harness.pipeline(fake).resume(run_id)
+        assert result.state == "merged"
+        assert harness.consumed() == 0
+        assert len(fake.merges) == 2
+
+    def test_every_pipeline_stage_is_resumable(self) -> None:
+        assert set(PIPELINE_STAGES) <= RESUMABLE_RUN_STATES
 
 
 class TestInteractiveChat:
@@ -1625,6 +2051,26 @@ class TestInteractiveChat:
         messages = [e for e in harness.events if e.type == "chat.message"]
         assert [m.data["message_id"] for m in messages] == [first, second]
         assert engine.store.get_run_guidance(result.run_id) == ["use postgres everywhere"]
+
+    def test_a_message_after_the_last_task_is_answered_before_the_gate(
+        self, harness: Harness
+    ) -> None:
+        """A message arriving during the last build has no task boundary
+        left to land on; it is answered between the graph and the gate."""
+        harness.script([taskgraph(task("t1")), BUILD, self.STEER_CONTINUE])
+        engine = harness.engine()
+
+        def ask_late(event: Event) -> None:
+            if event.type == HostEventTypes.TASK_END:
+                engine.post_user_message("are we done?")
+
+        engine.bus.subscribe(ask_late)
+        result = engine.start("build the feature")
+        assert result.state == "completed"
+        types = harness.event_types()
+        assert types.index("chat.reply") < types.index(HostEventTypes.RUN_END)
+        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "steer")
+        assert steer["task_id"] is None
 
     def test_resume_replays_persisted_guidance_into_prompts(self, harness: Harness) -> None:
         from sbxloop.engine.phases import PhaseRunner
