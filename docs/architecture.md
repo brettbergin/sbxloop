@@ -29,7 +29,7 @@ model, and the run lifecycle.
 Two distributions ship from this repo in lockstep versions:
 
 - **`sbxloop`** — everything above the line: the host orchestrator.
-- **`sbxloop-worker`** — the in-sandbox runtime. The host package embeds the
+- **`sbxloop-worker`** — the in-sandbox runtime. The host package vendors the
   worker wheel (`sbxloop/_vendor/`) at build time so sandboxes can be
   provisioned with no dependency on PyPI availability of sbxloop itself.
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
@@ -490,7 +490,7 @@ The rules are asymmetric on purpose:
 
 - **Rendering is strict.** Every id sbxloop newly produces is typed:
   store rows, chronology and event payloads, daemon log lines, Discord
-  headline cards and thread names, concierge tool output, and the issue
+  headlines and thread names, concierge tool output, and the issue
   comments and PR bodies a run writes back to GitHub.
 - **Parsing is lenient.** A bare `gh:<n>` typed by an operator, or read out
   of a checkpoint, a store row or a watch registered before the migration,
@@ -534,6 +534,14 @@ the PR and why. `run.state` fires on every stage entry — the state *is* the
 stage. These carry no information the agent's reply did not — they exist so
 a surface can show the decision without showing the agent's JSON, which is
 what the Discord bridge does.
+
+Everything the bridge posts — the run headline, the finish verdict, the run
+summary, the live status message edited in place, daemon notices, concierge
+tool notes and steering status notes — is **plain Discord markdown**. There
+is no rich-card rendering path: state and stage markers (`STATE_MARKER`,
+`STAGE_MARKER`) carry the at-a-glance signal, and every message is clamped
+to `DISCORD_MAX_MESSAGE`, split with `split_markdown` when long, redacted
+through `redact_text`, and sent with mentions disabled.
 
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
 

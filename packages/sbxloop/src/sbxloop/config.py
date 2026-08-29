@@ -729,11 +729,10 @@ class DiscordConfig(_ConfigModel):
     chronology_level: ChronologyLevel = "normal"
     # Discord's hard cap is 2000; leave headroom for wrappers.
     max_message_chars: int = Field(default=1900, ge=200, le=2000)
-    # Rich output: embed cards for the run headline, finished report and
-    # `!sbx status`; a per-run status message edited in place as tasks
-    # progress; at the verbose level, consecutive tool calls batched into
-    # one code block of at most tool_batch_lines.
-    embeds: bool = True
+    # Rich output: the run headline, finished report and `!sbx status` are
+    # plain markdown (#519); a per-run status message edited in place as
+    # tasks progress; at the verbose level, consecutive tool calls batched
+    # into one code block of at most tool_batch_lines.
     status_line: bool = True
     tool_batch_lines: int = Field(default=8, ge=1, le=40)
     # How much of a completed tool call's output is echoed into the thread:

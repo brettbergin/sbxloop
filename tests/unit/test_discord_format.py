@@ -7,15 +7,9 @@ from typing import Any
 import pytest
 
 from sbxloop.daemon.discord_format import (
-    COLOR_FAIL,
-    COLOR_OK,
-    COLOR_RUNNING,
-    COLOR_WARN,
     DISCORD_MAX_MESSAGE,
-    EMBED_TOTAL_MAX,
     TOOL_FAIL_OUTPUT_LINES_DEFAULT,
     TOOL_OUTPUT_LINES_DEFAULT,
-    EmbedSpec,
     RunStats,
     StatusLine,
     SteerProgress,
@@ -24,10 +18,9 @@ from sbxloop.daemon.discord_format import (
     _clip,
     _fence_state,
     daemon_notice,
-    finish_embed,
+    finish_body_text,
     finish_text,
     format_for_discord,
-    headline_embed,
     headline_text,
     items_lines,
     mask_urls,
@@ -36,9 +29,9 @@ from sbxloop.daemon.discord_format import (
     repetitive_streak,
     roster_text,
     split_markdown,
-    status_embed,
+    status_text,
     strip_json_payload,
-    summary_embed,
+    summary_body_text,
     summary_text,
 )
 from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
@@ -602,36 +595,13 @@ class TestSteerProgress:
 
 
 class TestEmbeds:
-    def test_clamped_respects_limits(self) -> None:
-        spec = EmbedSpec(
-            title="t" * 300,
-            description="d" * 5000,
-            fields=tuple((f"n{i}", "v" * 2000, True) for i in range(30)),
-            footer="f" * 3000,
-        ).clamped()
-        assert len(spec.title or "") == 256
-        assert len(spec.fields) <= 25 and all(len(v) <= 1024 for _, v, _ in spec.fields)
-        assert len(spec.footer or "") == 2048
-        total = (
-            len(spec.title or "")
-            + len(spec.description or "")
-            + len(spec.footer or "")
-            + sum(len(n) + len(v) for n, v, _ in spec.fields)
-        )
-        assert total <= EMBED_TOTAL_MAX
-
-    def test_headline_card_by_state(self) -> None:
+    def test_headline_text_by_state(self) -> None:
         item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login", url="https://x/4")
-        running = headline_embed(item, "r1", hostname="db")
-        assert running.title == "Fix login" and running.url == "https://x/4"
-        assert running.color == COLOR_RUNNING and running.footer == "sbxloop · db"
-        assert {n: v for n, v, _ in running.fields} == {
-            "Source": "[issue #4](https://x/4)",
-            "Item": "`gh:issue:4`",
-            "Run": "`r1`",
-            "State": "running",
-        }
-        done = headline_embed(
+        running = headline_text(item, "r1", hostname="db")
+        assert running.startswith("▶ run `r1` — **Fix login**")
+        assert "[issue #4](https://x/4)" in running and "`gh:issue:4`" in running
+        assert "sbxloop · db" in running
+        done = headline_text(
             item,
             "r1",
             "completed",
@@ -641,55 +611,39 @@ class TestEmbeds:
             requested_by="4242",
             hostname="db",
         )
-        names = [n for n, _, _ in done.fields]
-        assert names == [
-            "Source",
-            "Item",
-            "Run",
-            "State",
-            "Branch",
-            "PR",
-            "Tasks",
-            "Requested by",
-        ]
-        assert done.color == COLOR_OK
-        assert {n: v for n, v, _ in done.fields}["Requested by"] == "<@4242>"
-        assert headline_embed(item, "r1", "merged", hostname="db").color == COLOR_OK
-        assert headline_embed(item, "r1", "failed", hostname="db").color == COLOR_FAIL
-        assert headline_embed(item, "r1", "blocked", hostname="db").color == COLOR_WARN
+        assert done.startswith("✅")
+        assert "branch `sbxloop/r1`" in done and "PR [#34](https://x/pull/34)" in done
+        assert "3/3 tasks done" in done and "requested by <@4242>" in done
+        assert headline_text(item, "r1", "failed", hostname="db").startswith("❌")
+        assert headline_text(item, "r1", "blocked", hostname="db").startswith("🚧")
         assert headline_text(item, "r2", "merged").startswith("🎉 run `r2` — **Fix login**")
         assert "`gh:issue:4`" in headline_text(item, "r2", "merged")
 
     def test_typed_ids_on_cards_and_listings(self) -> None:
         """Legacy `gh:<n>` items still render, but always in the typed form."""
         legacy = WorkItem(item_id="gh:4", source_key="4", title="Fix login", url="https://x/4")
-        card = headline_embed(legacy, "r1", hostname="db")
-        assert {n: v for n, v, _ in card.fields}["Item"] == "`gh:issue:4`"
         assert "`gh:issue:4`" in headline_text(legacy, "r1")
         assert "`gh:issue:4`" in queue_lines([legacy])
         assert "`gh:issue:4`" in items_lines([legacy])
         report = RunReport("r1", "cancelled", "1/3 tasks done", cancelled_by="ops")
-        cancelled = finish_embed(legacy, report, "cancelled")
-        note = {n: v for n, v, _ in cancelled.fields}["Cancelled"]
-        assert "!sbx retry gh:issue:4" in note
+        assert "!sbx retry gh:issue:4" in finish_body_text(legacy, report, "cancelled")
 
-    def test_finish_card_and_text(self) -> None:
+    def test_finish_text_and_body(self) -> None:
         item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login")
         report = RunReport("r1", "merged", "3/3 tasks done", pr=(34, "https://x/pull/34"), rounds=2)
         assert finish_text("merged", report) == "**finished: merged** — 3/3 tasks done"
-        card = finish_embed(item, report, "merged", unanswered=1)
-        assert card.title == "🎉 finished: merged" and card.description == "3/3 tasks done"
-        assert [n for n, _, _ in card.fields] == ["PR", "Fix rounds", "Steering"]
-        assert card.color == COLOR_OK
-        blocked = finish_embed(
+        body = finish_body_text(item, report, "merged", unanswered=1)
+        assert body.startswith("🎉 **finished: merged** — 3/3 tasks done")
+        assert "PR [#34](https://x/pull/34)" in body and "fix rounds: 2" in body
+        assert "were not answered" in body
+        blocked = finish_body_text(
             item,
             RunReport("r1", "blocked", "x", pr=(34, "https://x/pull/34"), reason="405 refused"),
             "blocked",
         )
-        assert blocked.color == COLOR_WARN
-        assert {n: v for n, v, _ in blocked.fields}["Reason"] == "405 refused"
-        # A merged run's reason (none) is not a field.
-        assert "Reason" not in {n for n, _, _ in card.fields}
+        assert blocked.startswith("🚧") and "reason: 405 refused" in blocked
+        # A merged run's reason (none) is not rendered.
+        assert "reason:" not in body
 
     def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
         """#246: a cancel is not a failure; the card must name the requester
@@ -698,16 +652,14 @@ class TestEmbeds:
         report = RunReport("r1", "cancelled", "1/3 tasks done", cancelled_by="Discord user `b`")
         text = finish_text("cancelled", report)
         assert "cancelled by Discord user `b`" in text and "`sbxloop resume r1`" in text
-        card = finish_embed(item, report, "cancelled")
-        assert card.title == "⏹ finished: cancelled"
-        assert card.fields[0][0] == "Cancelled"
-        assert "`sbxloop resume r1`" in card.fields[0][1]
-        assert "!sbx retry gh:issue:8" in card.fields[0][1]
-        requeued = finish_embed(item, report._replace(requeued=True), "cancelled")
-        assert "re-queued" in requeued.fields[0][1] and "resume" not in requeued.fields[0][1]
+        body = finish_body_text(item, report, "cancelled")
+        assert body.startswith("⏹ **finished: cancelled**")
+        assert "`sbxloop resume r1`" in body and "!sbx retry gh:issue:8" in body
+        requeued = finish_body_text(item, report._replace(requeued=True), "cancelled")
+        assert "re-queued" in requeued and "resume" not in requeued
 
-    def test_status_card_and_queue(self) -> None:
-        card = status_embed(
+    def test_status_text_and_queue(self) -> None:
+        text = status_text(
             {
                 "current": {"run_id": "r1", "title": "Fix"},
                 "queued": 2,
@@ -718,16 +670,13 @@ class TestEmbeds:
                 "paused": True,
             }
         )
-        assert {n: v for n, v, _ in card.fields} == {
-            "Current": "`r1` — Fix",
-            "Queued": "2",
-            "Runs today (UTC)": "1/12 · resets 00:00 UTC",
-            "Breaker": "closed",
-            "Paused": "yes",
-        }
-        assert card.color == COLOR_WARN
-        idle = status_embed({"current": None, "breaker_open": True})
-        assert idle.fields[0][1] == "idle" and idle.color == COLOR_FAIL
+        assert text.startswith("⏸")
+        assert "Current: `r1` — Fix" in text
+        assert "Queued: 2" in text
+        assert "1/12" in text and "resets 00:00 UTC" in text
+        assert "Breaker: closed" in text and "Paused: yes" in text
+        idle = status_text({"current": None, "breaker_open": True})
+        assert idle.startswith("🛑") and "Current: idle" in idle
         assert queue_lines([]) == "queue is empty."
         items = [
             WorkItem(
@@ -860,38 +809,32 @@ class TestRunSummary:
         )
         assert summary_text(None, "completed") == "📊 **run summary**"
 
-    def test_summary_card_stats_and_both_ledgers(self) -> None:
+    def test_summary_body_stats_and_both_ledgers(self) -> None:
         stats = self._folded()
         report = RunReport("r1", "merged", "2/2 tasks done", pr=(34, "https://x/pull/34"))
-        card = summary_embed(stats, report, "merged")
-        assert card.title == "📊 run summary" and card.color == COLOR_OK
-        assert card.description == "**merged** — 2/2 tasks done in 2m 00s"
-        assert card.footer == "run r1"
-        fields = {n: v for n, v, _ in card.fields}
-        assert list(fields) == ["Stats", "Went well", "Needed work"]
-        assert "turns 2 · tool calls 2" in fields["Stats"]
-        assert "tokens 3,000 in / 500 out" in fields["Stats"]
-        assert "steering 1 asked / 1 answered" in fields["Stats"]
-        well = fields["Went well"]
-        assert "merged PR [#34](https://x/pull/34)" in well
-        assert "all 2 task(s) completed" in well
-        assert "answered all 1 steering message(s)" in well
-        work = fields["Needed work"]
-        assert "• `t2` verify: **failed** — verify command failed: `pytest -q` (exit 1)" in work
-        assert "• 1 policy denial(s)" in work
+        text = summary_body_text(stats, report, "merged")
+        assert text.startswith("📊 **run summary**")
+        assert "**merged** — 2/2 tasks done in 2m 00s" in text
+        assert "_run r1_" in text
+        assert "turns 2 · tool calls 2" in text
+        assert "tokens 3,000 in / 500 out" in text
+        assert "steering 1 asked / 1 answered" in text
+        assert "merged PR [#34](https://x/pull/34)" in text
+        assert "all 2 task(s) completed" in text
+        assert "answered all 1 steering message(s)" in text
+        assert "• `t2` verify: **failed** — verify command failed: `pytest -q` (exit 1)" in text
+        assert "• 1 policy denial(s)" in text
 
-    def test_summary_card_degrades_without_stats(self) -> None:
+    def test_summary_body_degrades_without_stats(self) -> None:
         """A run the pump never saw events for still gets a summary; unknown
         numbers are omitted rather than shown as zero."""
         report = RunReport("r1", "failed", "no tasks ran")
-        card = summary_embed(None, report, "failed")
-        assert card.color == COLOR_FAIL and card.description == "**failed** — no tasks ran"
-        fields = {n: v for n, v, _ in card.fields}
-        assert "Stats" not in fields
-        assert fields["Went well"] == "nothing stood out"
-        assert fields["Needed work"] == "no setbacks observed"
+        text = summary_body_text(None, report, "failed")
+        assert "**failed** — no tasks ran" in text
+        assert "turns" not in text
+        assert "nothing stood out" in text and "no setbacks observed" in text
 
-    def test_summary_card_flags_setbacks_and_resume(self) -> None:
+    def test_summary_body_flags_setbacks_and_resume(self) -> None:
         stats = RunStats()
         stats.observe(tev(100.0, "run.start", resumed=True))
         stats.observe(tev(101.0, "agent.tool_cap", cap=40))
@@ -899,16 +842,13 @@ class TestRunSummary:
         stats.observe(tev(103.0, "chat.reply", message_id="m1", error="worker died"))
         stats.observe(tev(104.0, "task.state", task_id="t1", state="failed"))
         report = RunReport("r1", "failed", "0/1 tasks done", reason="409 conflict", rounds=1)
-        card = summary_embed(stats, report, "failed", unanswered=1)
-        assert "_stats cover the run since the daemon last picked it up_" in (
-            card.description or ""
-        )
-        work = {n: v for n, v, _ in card.fields}["Needed work"]
-        assert "1 task(s) failed" in work
-        assert "failed — 409 conflict" in work and "1 fix round(s) spent" in work
-        assert "1 steering message(s) went unanswered" in work
-        assert "1 steer(s) errored" in work
-        assert "hit the per-phase tool-call ceiling" in work
+        text = summary_body_text(stats, report, "failed", unanswered=1)
+        assert "_stats cover the run since the daemon last picked it up_" in text
+        assert "1 task(s) failed" in text
+        assert "failed — 409 conflict" in text and "1 fix round(s) spent" in text
+        assert "1 steering message(s) went unanswered" in text
+        assert "1 steer(s) errored" in text
+        assert "hit the per-phase tool-call ceiling" in text
 
     def test_usage_never_reported_is_not_zero(self) -> None:
         stats = RunStats()
@@ -916,8 +856,7 @@ class TestRunSummary:
         assert stats.turns == 1
         assert stats.input_tokens is None
         assert summary_text(stats, "completed") == "📊 **run summary** — 0s · 1 turn(s)"
-        card = summary_embed(stats, RunReport("r1", "completed", "x"), "completed")
-        assert {n: v for n, v, _ in card.fields}["Stats"] == "turns 1"
+        assert "turns 1" in summary_body_text(stats, RunReport("r1", "completed", "x"), "completed")
 
     def test_per_turn_cost_is_never_accumulated_or_rendered(self) -> None:
         """The backend's per-turn ``cost`` is a constant of unknown unit, so
@@ -928,31 +867,18 @@ class TestRunSummary:
             stats.observe(tev(100.0, "agent.usage", cost=15.0, total_cost=15.0))
         assert not any("cost" in name or "spend" in name for name in vars(stats))
         text = summary_text(stats, "completed")
-        card = summary_embed(stats, RunReport("r1", "completed", "x"), "completed")
-        rendered = text + "\n".join(f"{n}{v}" for n, v, _ in card.fields)
+        rendered = text + summary_body_text(stats, RunReport("r1", "completed", "x"), "completed")
         assert "$" not in rendered
         assert "45" not in rendered
 
 
-def test_embed_converter_roundtrip() -> None:
+def test_allowed_mentions_are_disabled() -> None:
     pytest.importorskip("discord")
-    from sbxloop.daemon.discord import _allowed_mentions_none, _to_embed
+    from sbxloop.daemon.discord import _allowed_mentions_none
 
-    spec = EmbedSpec(
-        title="T",
-        description="D",
-        url="https://x",
-        color=COLOR_OK,
-        fields=(("a", "b", True),),
-        footer="f",
-    )
-    embed = _to_embed(spec)
-    assert embed is not None
-    assert embed.title == "T" and embed.description == "D" and embed.url == "https://x"
-    assert embed.colour.value == COLOR_OK
-    assert [(f.name, f.value, f.inline) for f in embed.fields] == [("a", "b", True)]
-    assert embed.footer.text == "f"
-    assert _allowed_mentions_none() is not None
+    mentions = _allowed_mentions_none()
+    assert mentions is not None
+    assert not mentions.everyone and not mentions.roles and not mentions.users
 
 
 class TestOutputExcerpt:
@@ -1250,12 +1176,8 @@ class TestNoFabricatedSpend:
             assert "$" not in text
             assert "2205" not in text
 
-    def test_summary_embed_has_no_currency(self) -> None:
-        card = summary_embed(self._stats(), RunReport("r1", "completed", "x"), "completed")
-        parts = [card.title or "", card.description or "", card.footer or ""]
-        for name, value, _inline in card.fields:
-            parts += [name, value]
-        blob = "\n".join(parts)
+    def test_summary_body_has_no_currency(self) -> None:
+        blob = summary_body_text(self._stats(), RunReport("r1", "completed", "x"), "completed")
         assert "$" not in blob
         assert "2205" not in blob
 
@@ -1351,3 +1273,102 @@ class TestSteerProgressStages:
         p.observe(ev("run.state", state="building"))
         p.observe(ev("task.end", task_id="fix-1", state="done"))
         assert p.render() == "⏳ steer queued; answered at the next checkpoint"
+
+
+class TestPlainRenderers:
+    """The plain-markdown renderers for the headline, finish and status."""
+
+    def _item(self) -> WorkItem:
+        return WorkItem(
+            item_id="gh:issue:4",
+            source_key="4",
+            title="Fix login",
+            url="https://github.com/o/r/issues/4",
+        )
+
+    def test_status_text_carries_every_field_and_a_marker(self) -> None:
+        text = status_text(
+            {
+                "current": {"run_id": "r1", "title": "Fix"},
+                "queued": 2,
+                "runs_today": 1,
+                "max_runs_per_day": 12,
+                "run_cap_timezone": "UTC",
+                "breaker_open": False,
+                "paused": True,
+            }
+        )
+        assert text.startswith("⏸ **sbxloop daemon**")
+        assert "Current: `r1` — Fix" in text
+        assert "Queued: 2" in text
+        assert "Runs today (UTC): 1/12 · resets 00:00 UTC" in text
+        assert "Breaker: closed" in text
+        assert "Paused: yes" in text
+        assert len(text) <= DISCORD_MAX_MESSAGE
+
+    def test_status_text_markers_replace_the_colours(self) -> None:
+        assert status_text({"current": None, "breaker_open": True}).startswith("🛑")
+        assert status_text({"current": None}).startswith("✅")
+        assert "Current: idle" in status_text({"current": None})
+
+    def test_status_text_clamps_a_huge_title(self) -> None:
+        text = status_text({"current": {"run_id": "r1", "title": "x" * 40_000}})
+        assert len(text) <= DISCORD_MAX_MESSAGE
+
+    def test_headline_text_carries_the_card_facts(self) -> None:
+        text = headline_text(
+            self._item(),
+            "r2",
+            "merged",
+            branch="feat/x",
+            pr=(7, "https://x/pull/7"),
+            summary="3/3 tasks",
+            requested_by="99",
+            hostname="box",
+        )
+        assert text.startswith("🎉 run `r2` — **Fix login**")
+        assert "`gh:issue:4`" in text
+        assert "[issue #4](https://github.com/o/r/issues/4)" in text
+        assert "branch `feat/x`" in text
+        assert "PR [#7](https://x/pull/7)" in text
+        assert "requested by <@99>" in text
+        assert "sbxloop · box" in text
+        assert len(text) <= DISCORD_MAX_MESSAGE
+
+    def test_finish_body_text_carries_the_card_fields(self) -> None:
+        report = RunReport(
+            "r1",
+            "failed",
+            "1/3 tasks done",
+            pr=(3, "https://x/pull/3"),
+            rounds=2,
+            reason="verify failed",
+        )
+        text = finish_body_text(self._item(), report, "failed", unanswered=1)
+        assert text.startswith("❌ **finished: failed** — 1/3 tasks done")
+        assert "PR [#3](https://x/pull/3)" in text
+        assert "fix rounds: 2" in text
+        assert "reason: verify failed" in text
+        assert "were not answered" in text
+        assert "run `r1` · Fix login" in text
+        assert len(text) <= DISCORD_MAX_MESSAGE
+
+    def test_finish_body_text_says_how_to_resume_a_cancel(self) -> None:
+        report = RunReport("r1", "cancelled", "0/3 tasks done", cancelled_by="Discord user `b`")
+        text = finish_body_text(self._item(), report, "cancelled")
+        assert text.startswith("⏹ **finished: cancelled**")
+        assert "`sbxloop resume r1`" in text
+        assert "!sbx retry gh:issue:4" in text
+
+    def test_summary_body_text_carries_stats_and_verdicts(self) -> None:
+        stats = RunStats()
+        stats.turns = 3
+        stats.tool_calls = 5
+        report = RunReport("r1", "completed", "3/3 tasks done")
+        text = summary_body_text(stats, report, "completed")
+        assert text.startswith("📊 **run summary**")
+        assert "**completed** — 3/3 tasks done" in text
+        assert "turns 3" in text and "tool calls 5" in text
+        assert "**Went well**" in text and "**Needed work**" in text
+        assert "_run r1_" in text
+        assert len(text) <= DISCORD_MAX_MESSAGE

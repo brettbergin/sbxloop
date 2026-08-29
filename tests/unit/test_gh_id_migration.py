@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from sbxloop.daemon.control import dispatch, plain
-from sbxloop.daemon.discord_format import headline_embed, headline_text, items_lines, queue_lines
+from sbxloop.daemon.discord_format import headline_text, items_lines, queue_lines
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.log import bind_run, clear_run, configure_logging, get_logger
 from tests.unit.test_daemon_discord import FakeLoop
@@ -79,8 +79,6 @@ class TestLegacyStateFixture:
         store = DaemonStore(legacy_store(tmp_path))
         item = store.get(LEGACY_ID)
         assert item is not None and item.item_id == TYPED_ID
-        card = headline_embed(item, "r9", hostname="db")
-        assert {n: v for n, v, _ in card.fields}["Item"] == f"`{TYPED_ID}`"
         for text in (headline_text(item, "r9"), queue_lines([item]), items_lines([item])):
             assert TYPED_ID in text and not BARE.search(text)
 
