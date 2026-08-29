@@ -122,7 +122,18 @@ __all__ = [
 ]
 
 _TOOL_EVENTS = ("agent.tool_start", "agent.tool_end")
-_STATUS_EVENTS = ("task.start", "task.state", "task.end", "phase.end", "run.end", "run.state")
+_STATUS_EVENTS = (
+    "task.start",
+    "task.state",
+    "task.end",
+    "phase.end",
+    "run.end",
+    "run.state",
+    "fix.round",
+    "ci.status",
+    "land.undraft",
+    "land.update",
+)
 # A tool burst ends at a phase/task boundary even when that event renders
 # nothing at the normal level — the next phase's calls start a fresh line.
 _BURST_BOUNDARY = ("phase.end", "task.start", "task.end", "run.end")

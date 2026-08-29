@@ -14,8 +14,8 @@ model, and the run lifecycle.
 │                            (state machine, budgets, checkpoints)  │
 ├──────────────────────────┬────────────────────────────────────────┤
 │ Worker transport         │ GitHub ops facade                      │
-│ WorkerClient             │ GithubOps + GithubReporterHook         │
-│ (stream / poll)          │ (typed github.op jobs)                 │
+│ WorkerClient             │ GithubOps (typed github.op jobs) +     │
+│ (stream / poll)          │ engine.landing / engine.review         │
 ├──────────────────────────┴────────────────────────────────────────┤
 │ Sandbox layer              SbxCLI → Sandbox → Provisioner → Pair  │
 ├───────────────────────────────────────────────────────────────────┤
@@ -73,15 +73,15 @@ then needs its own `sbx --app-name <name> login` and policy init. The `plain-env
 written to `~/.sbxloop/env.sh` in-VM) exists for hosts where the experimental
 `set-custom` proxying is unavailable, and is documented as weaker.
 
-Beyond the static baseline, egress is **plan-declared and grant-late**: the
-PLAN phase may declare extra domains a task needs during EXECUTE (each with a
-justification), validated against operator bounds (`[policy] allow` /
-`[policy] deny` in sbxloop.toml — out-of-bounds requests fail plan
-validation) and applied via `sbx policy allow network <domain> --sandbox <agent>` only at EXECUTE entry. Every grant and refusal is emitted as a
+Beyond the static baseline, egress is **task-declared and grant-late**: the
+DECOMPOSE phase may declare extra domains a task needs during BUILD (each with
+a justification), validated against operator bounds (`[policy] allow` /
+`[policy] deny` in sbxloop.toml — out-of-bounds requests fail graph
+validation) and applied via `sbx policy allow network <domain> --sandbox <agent>` only at BUILD entry. Every grant and refusal is emitted as a
 `policy.allow` / `policy.deny` run event, so the persisted event log doubles
 as an egress audit trail (`sbxloop logs RUN --type policy.`); `sbxloop config policy` renders the effective per-phase policy. sbx 0.35 has no
 revocation primitive, so grants persist for the sandbox's lifetime
-(SCRUTINIZE/VERIFY inherit them) but never outlive a run — sandboxes are
+(VERIFY, the gate and the review inherit them) but never outlive a run — sandboxes are
 removed at run end and `resume` provisions fresh ones.
 
 Cleanup is guaranteed by `SandboxPair` (context manager) plus a process-wide
@@ -189,7 +189,12 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   refuses the loop's identity as a reviewer of its own PR).
 - **FIX** — one seeded task (`fix-N`), built and verified like any other
   under the same revision/replan budgets, whose exam is the union of the
-  decomposer's verify commands plus the gate. Then back to GATE. Every
+  decomposer's verify commands plus the gate. Then back to GATE. A
+  `conflict` round first merges the current base into the run's clone
+  (`hostgit.merge_from_base`), so the conflict is real in the fixer's
+  working tree — delivery overlays files onto the current base tree and
+  would otherwise overwrite the conflicting hunks with the run's version —
+  and the conflicted paths ride in the brief. Every
   round sees the earlier rounds' findings and the fixer's per-finding
   `addressed` / `refuted: <why>` list, and the next review is told not to
   re-raise a refuted finding without a rebuttal (`RefutedGuard` sends such

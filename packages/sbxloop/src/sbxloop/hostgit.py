@@ -18,6 +18,7 @@ behind that probe.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -553,6 +554,92 @@ def refresh_from_origin(repo_path: Path) -> RefreshResult:
         raise ProvisionError(f"cannot refresh {repo_path}: {exc}") from exc
     except GitCommandError as exc:
         raise ProvisionError(f"refreshing {repo_path} failed: {_describe(exc)}") from exc
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """What :func:`merge_from_base` did to a run's clone.
+
+    ``merged`` is True when the base is now contained in the branch (a clean
+    merge, or nothing to merge); ``conflicts`` are the paths left carrying
+    conflict markers for the fixer to resolve when it is not.
+    """
+
+    merged: bool
+    conflicts: tuple[str, ...]
+    message: str
+
+
+# Identity for the commits the host makes in a run clone. Nothing about
+# them is published: delivery squashes the working tree through the Git Data
+# API, so these only exist to give git a committer.
+_HOST_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "sbxloop",
+    "GIT_AUTHOR_EMAIL": "sbxloop@localhost",
+    "GIT_COMMITTER_NAME": "sbxloop",
+    "GIT_COMMITTER_EMAIL": "sbxloop@localhost",
+}
+
+
+def merge_from_base(repo_path: Path, base_branch: str, *, remote: str = "origin") -> MergeResult:
+    """Bring the current base branch into a run's clone before a fix round.
+
+    A pull request that conflicts with its base cannot be fixed by editing
+    the run's files alone: delivery overlays the working tree onto the
+    *current* base tree, so the conflicting hunks would simply be overwritten
+    with the run's version. Merging ``<remote>/<base>`` into the clone first
+    makes the conflict concrete — the fixer sees the markers in its working
+    tree, resolves them, and the next delivery diffs against a base the
+    branch now contains.
+
+    Uncommitted work is checkpointed as a commit first (git refuses to merge
+    over local edits, and the agent may or may not have committed); local
+    commits are invisible to delivery, which squashes the tree. A merge that
+    conflicts is left in progress on purpose, with the conflicted paths
+    reported, so the fixer finishes it (``git add -A && git commit``). Fetch
+    failures raise :class:`ProvisionError`.
+    """
+    try:
+        with Repo(repo_path) as repo, repo.git.custom_environment(**_HOST_GIT_ENV):
+            if remote not in {r.name for r in repo.remotes}:
+                return MergeResult(False, (), f"{repo_path}: no {remote} remote")
+            try:
+                repo.remote(remote).fetch(base_branch)
+            except GitCommandError as exc:
+                raise ProvisionError(
+                    f"git fetch {remote} {base_branch} failed in {repo_path}: {_describe(exc)}"
+                ) from exc
+            ref = f"{remote}/{base_branch}"
+            target = repo.commit(ref)
+            if repo.git.status("--porcelain").strip():
+                repo.git.add("-A")
+                repo.git.commit("-m", f"sbxloop: checkpoint before merging {ref}", "--no-verify")
+            if repo.is_ancestor(target, repo.head.commit):
+                return MergeResult(True, (), f"{repo_path}: already contains {ref}")
+            try:
+                repo.git.merge("--no-edit", ref)
+            except GitCommandError as exc:
+                conflicts = tuple(
+                    path
+                    for path in repo.git.diff("--name-only", "--diff-filter=U").split("\n")
+                    if path
+                )
+                if not conflicts:
+                    # Not a content conflict — leave the tree as it was.
+                    with contextlib.suppress(GitCommandError):
+                        repo.git.merge("--abort")
+                    raise ProvisionError(
+                        f"merging {ref} into {repo_path} failed: {_describe(exc)}"
+                    ) from exc
+                return MergeResult(
+                    False,
+                    conflicts,
+                    f"{repo_path}: merging {ref} left {len(conflicts)} conflicted file(s) "
+                    "for the fixer to resolve",
+                )
+            return MergeResult(True, (), f"{repo_path}: merged {ref} ({target.hexsha[:12]})")
+    except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
+        raise ProvisionError(f"cannot merge into {repo_path}: {exc}") from exc
 
 
 def _describe(exc: Exception) -> str:

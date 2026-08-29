@@ -231,6 +231,7 @@ def fix_brief(
     findings: Sequence[ReviewFinding] = (),
     failed_checks: Sequence[FailedCheck] = (),
     objections: str = "",
+    conflicts: Sequence[str] = (),
 ) -> str:
     """What one fix round is for, concretely.
 
@@ -269,6 +270,14 @@ def fix_brief(
             "Review comments a human left on the PR, quoted verbatim:\n\n"
             + objections
             + "\n\nAddress each one — with a change, or with a reasoned explanation."
+        )
+    if conflicts:
+        parts.append(
+            "The base branch was merged into this tree and left conflict markers in:\n"
+            + "\n".join(f"- `{path}`" for path in conflicts)
+            + "\n\nResolve every marker so the file is correct against the *current* "
+            "base, then complete the merge with `git add -A && git commit --no-edit` "
+            "before you finish — the delivery diffs against the merged base."
         )
     parts.append(
         "End your summary with one line per finding or objection above, in the form "
