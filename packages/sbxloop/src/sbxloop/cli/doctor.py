@@ -163,6 +163,65 @@ def repo_checks(
     return rows
 
 
+@dataclass
+class WorkspaceOriginMismatch:
+    """An enabled repo whose effective workspace belongs to another repo."""
+
+    repo: str
+    path: Path
+    origin_repo: str
+
+    @property
+    def message(self) -> str:
+        return (
+            f"workspace {self.path} is a checkout of {self.origin_repo}, not {self.repo} — "
+            f"runs for {self.repo} would be built from another repository's tree; "
+            f"move [sandbox] workspace into the matching [[github.repos]] entry, or set "
+            f'workspace = "..." on the {self.repo} entry'
+        )
+
+
+def workspace_origin_mismatches(config: Config) -> list[WorkspaceOriginMismatch]:
+    """Every enabled repo whose workspace origin names a different repository.
+
+    The workspace checked is the resolved one
+    (:meth:`Config.workspace_for_repo`) and, where resolution declined to
+    hand one back, the raw configured ``[sandbox] workspace``: declining is
+    what keeps a run out of the wrong tree, but the operator still has a
+    misconfiguration to fix and must be told about it here rather than at
+    dispatch.
+    """
+    from sbxloop import hostgit
+
+    mismatches: list[WorkspaceOriginMismatch] = []
+    for entry in config.github.enabled_repos():
+        path = config.workspace_for_repo(entry.repo)
+        if path is None:
+            if entry.workspace is not None:
+                path = entry.workspace.expanduser()
+            elif config.sandbox.workspace is not None:
+                path = config.sandbox.workspace.expanduser()
+            else:
+                continue
+        origin = hostgit.normalise_repo_url(hostgit.origin_url(path))
+        if origin is None:
+            # Not a git checkout, or an origin we cannot read as owner/name:
+            # nothing to contradict, so nothing to fail on here.
+            continue
+        expected = hostgit.normalise_repo_url(entry.repo)
+        if expected is not None and origin != expected:
+            mismatches.append(WorkspaceOriginMismatch(entry.repo, path, origin))
+    return mismatches
+
+
+def workspace_origin_checks(config: Config) -> list[Check]:
+    """One hard-failing :class:`Check` per origin mismatch."""
+    return [
+        Check(f"workspace for {m.repo}", False, m.message)
+        for m in workspace_origin_mismatches(config)
+    ]
+
+
 REQUIRED_REPO_PERMISSIONS = ("issues", "contents", "pull_requests")
 
 
@@ -447,6 +506,9 @@ def collect_checks(
         # probe fail must not hide the verdict for the others.
         report("checking configured repositories")
         checks.extend(repo_checks(config, env, probe=probe_repo))
+        # A workspace that is a checkout of another repository would build a
+        # repo's runs from the wrong tree (#526): refuse before dispatch.
+        checks.extend(workspace_origin_checks(config))
     else:
         checks.append(
             Check(

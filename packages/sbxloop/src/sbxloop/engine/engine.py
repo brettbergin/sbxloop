@@ -292,7 +292,7 @@ class LoopEngine:
         if repo is not None and self.config.github.find_repo(repo) is None:
             known = ", ".join(r.repo for r in self.config.github.repo_list()) or "none"
             raise StateError(f"repository {repo!r} is not configured (configured: {known})")
-        github = self.config.github.for_repo(repo)
+        github = self.config.github.for_repo(repo, workspace=self.config.workspace_for_repo(repo))
         self.config = self.config.model_copy(update={"github": github})
 
     def resume(self, run_id: str) -> RunResult:
@@ -431,10 +431,15 @@ class LoopEngine:
         engine was built with disagree, with both values."""
         stored_flat = _flatten(stored.model_dump(mode="json"))
         current_flat = _flatten(current.model_dump(mode="json"))
+        # `github.enabled_repo_count` is bookkeeping recorded when a run's
+        # config was narrowed to its repository, not an operator setting: it
+        # differs from the live config by construction and says nothing about
+        # drift.
+        ignore = {"github.enabled_repo_count"}
         return [
             f"{key} (run: {stored_flat.get(key)!r}, current: {current_flat.get(key)!r})"
             for key in sorted(stored_flat.keys() | current_flat.keys())
-            if stored_flat.get(key) != current_flat.get(key)
+            if key not in ignore and stored_flat.get(key) != current_flat.get(key)
         ]
 
     # -- run driver --------------------------------------------------------
