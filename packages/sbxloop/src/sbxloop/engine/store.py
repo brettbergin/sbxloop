@@ -580,9 +580,10 @@ class StateStore:
     def last_event_ts(self, run_id: str) -> float | None:
         """Timestamp of the run's most recent persisted event, if any.
 
-        Every bus event (heartbeats included) is persisted, so this is the
-        best liveness signal available for a run whose recorded state says
-        non-terminal but whose process may be long dead.
+        Every bus event except streaming deltas (heartbeats included) is
+        persisted, so this is the best liveness signal available for a run
+        whose recorded state says non-terminal but whose process may be
+        long dead.
         """
         row = self._conn.execute(
             "SELECT MAX(ts) AS ts FROM events WHERE run_id = ?", (run_id,)

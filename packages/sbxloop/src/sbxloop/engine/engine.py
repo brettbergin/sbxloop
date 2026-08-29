@@ -1138,14 +1138,36 @@ class LoopEngine:
         )
         posted_url = ""
         posted_event = ""
+        comments = verdict.comments()
         try:
-            submitted = ops.pr_review_create(
-                repo,
-                run.pr_number,
-                verdict.event,
-                review_body(verdict, run_id=run_id, round=round_no),
-                verdict.comments(),
-            )
+            try:
+                submitted = ops.pr_review_create(
+                    repo,
+                    run.pr_number,
+                    verdict.event,
+                    review_body(verdict, run_id=run_id, round=round_no),
+                    comments,
+                )
+            except GithubOpsError:
+                if not comments:
+                    raise
+                # A finding anchored to a line outside the diff makes GitHub
+                # refuse the whole review (422), in both the requested event
+                # and the COMMENT fallback. The findings matter more than
+                # their anchors: post them in the body instead.
+                log.warning(
+                    "review.post_inline_refused",
+                    run=run_id,
+                    pr=run.pr_number,
+                    comments=len(comments),
+                    hint="re-posting the review with its findings in the body",
+                )
+                submitted = ops.pr_review_create(
+                    repo,
+                    run.pr_number,
+                    verdict.event,
+                    review_body(verdict, run_id=run_id, round=round_no, anchored=False),
+                )
             posted_url, posted_event = submitted.url, submitted.event
         except GithubOpsError:
             # The record is a courtesy to whoever reads the PR; the verdict

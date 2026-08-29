@@ -2217,3 +2217,25 @@ class TestInteractiveChat:
         assert applied == "steer_run"
         assert engine.store.get_run_guidance("r1chat") == ["switch approach"]
         assert phases.user_guidance == ["switch approach"]
+
+
+class TestReviewPostFallback:
+    """Field run rx8amxxvm (#130 → PR #503): the reviewer approved with two
+    nits anchored to lines outside the diff, GitHub 422'd the APPROVE and its
+    COMMENT fallback alike, and nothing reached the PR. The findings matter
+    more than their anchors."""
+
+    def test_a_review_refused_for_its_anchors_is_reposted_in_the_body(
+        self, harness: Harness
+    ) -> None:
+        nit = {"path": "hello.txt", "line": 1, "body": "stale docstring", "severity": "nit"}
+        fake = FakeGithub(draft=True)
+        fake.refuse_inline_comments = True
+        harness.script([taskgraph(task("t1")), FILES_BUILD, review("approve", "fine", nit)])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        assert [event for event, _, _ in fake.reviews] == ["APPROVE"]
+        _, body, comments = fake.reviews[0]
+        assert comments == []
+        assert "Findings:" in body and "`hello.txt:1` [nit] stale docstring" in body
+        assert "fine" in body

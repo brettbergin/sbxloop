@@ -268,3 +268,23 @@ class TestFixTask:
     def test_is_fix_task(self) -> None:
         assert is_fix_task("fix-1") and is_fix_task("fix-12")
         assert not is_fix_task("t1") and not is_fix_task("prefix-1")
+
+
+def test_review_body_unanchored_lists_every_finding() -> None:
+    from sbxloop.engine.review import ReviewFinding, ReviewVerdict, review_body
+
+    verdict = ReviewVerdict(
+        verdict="approve",
+        summary="fine",
+        findings=[
+            ReviewFinding(path="a.py", line=3, body="anchored nit", severity="nit"),
+            ReviewFinding(path="b.py", body="unanchored", severity="minor"),
+        ],
+    )
+    body = review_body(verdict, run_id="r1", round=2, anchored=False)
+    assert body.startswith("fine")
+    assert "Findings:\n- `a.py:3` [nit] anchored nit\n- `b.py` [minor] unanchored" in body
+    assert body.endswith("<sub>sbxloop review round 2 of run `r1`</sub>")
+    # the anchored shape lists only what has no inline comment
+    anchored = review_body(verdict, run_id="r1", round=2)
+    assert "anchored nit" not in anchored and "unanchored" in anchored
