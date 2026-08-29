@@ -24,6 +24,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import (
@@ -32,7 +33,13 @@ from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
 )
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import BudgetExceededError, GithubOpsError, StateError, WorkerError
+from sbxloop.errors import (
+    BudgetExceededError,
+    GithubOpsError,
+    ProvisionError,
+    StateError,
+    WorkerError,
+)
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gh.ops import FailedCheck, GithubOps
 from sbxloop.sbx.cli import SbxCLI
@@ -1666,6 +1673,103 @@ class TestPipeline:
         assert fix_round.data["kind"] == "conflict"
         assert "conflicts with its base branch" in result.tasks[1].spec.description
         assert engine.store.get_run(result.run_id).ci_rounds == 1
+
+    def test_conflict_fix_round_merges_the_base_into_the_clone(self, harness: Harness) -> None:
+        """A conflicting PR cannot be fixed on the run's files alone (delivery
+        overlays the tree onto the *current* base), so the round first merges
+        origin/<base> into the clone and briefs the fixer on the markers."""
+        fake = FakeGithub()
+        fake.pr["mergeable"] = False
+        fake.pr["mergeable_state"] = "dirty"
+        merges: list[tuple[Path, str]] = []
+
+        def merge_from_base(
+            repo_path: Path, base_branch: str, *, remote: str = "origin"
+        ) -> hostgit.MergeResult:
+            merges.append((repo_path, base_branch))
+            return hostgit.MergeResult(False, ("docs/x.md",), "merged origin/main: 1 conflict")
+
+        harness.monkeypatch.setattr(hostgit, "merge_from_base", merge_from_base)
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+
+        def resolved(event: Event) -> None:
+            if event.type == HostEventTypes.FIX_ROUND:
+                fake.pr["mergeable"] = True
+                fake.pr["mergeable_state"] = "clean"
+
+        engine.bus.subscribe(resolved)
+        result = engine.start("land it")
+
+        assert result.state == "merged"
+        assert result.mounted and result.workspace is not None
+        # The run's own clone, against the repository's default branch
+        # (FakeGithub's repo_get says main; no [github] deliver_base is set).
+        assert merges == [(result.workspace, "main")]
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "conflict"
+        assert fix_round.data["task_id"] == "fix-1"
+        assert "conflicts with its base branch" in fix_round.data["why"]
+        assert "merged origin/main: 1 conflict" in fix_round.data["why"]
+        fix = result.tasks[1].spec
+        assert fix.id == "fix-1"
+        assert "merged origin/main: 1 conflict" in fix.description
+        assert "left conflict markers in:" in fix.description
+        assert "- `docs/x.md`" in fix.description
+        assert "git add -A && git commit --no-edit" in fix.description
+
+    def test_a_failed_base_merge_still_spends_the_conflict_round(self, harness: Harness) -> None:
+        """A fetch/merge failure is logged, not fatal: the round runs on the
+        tree as it is, and the brief carries no conflict section."""
+        fake = FakeGithub()
+        fake.pr["mergeable"] = False
+        fake.pr["mergeable_state"] = "dirty"
+
+        def merge_from_base(
+            repo_path: Path, base_branch: str, *, remote: str = "origin"
+        ) -> hostgit.MergeResult:
+            raise ProvisionError("git fetch origin main failed: no route to host")
+
+        harness.monkeypatch.setattr(hostgit, "merge_from_base", merge_from_base)
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+
+        def resolved(event: Event) -> None:
+            if event.type == HostEventTypes.FIX_ROUND:
+                fake.pr["mergeable"] = True
+                fake.pr["mergeable_state"] = "clean"
+
+        engine.bus.subscribe(resolved)
+        result = engine.start("land it")
+
+        assert result.state == "merged"
+        assert [(t.spec.id, t.state) for t in result.tasks] == [("t1", "done"), ("fix-1", "done")]
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "conflict"
+        assert "no route to host" not in fix_round.data["why"]
+        fix = result.tasks[1].spec
+        assert "conflicts with its base branch" in fix.description
+        assert "conflict markers in" not in fix.description
+        assert "git add -A" not in fix.description
+
+    def test_the_review_diffs_against_the_current_base(self, harness: Harness) -> None:
+        """The reviewer's diff is taken against the base branch's tip as
+        GitHub has it now (ref_lookup heads/<base>), not the commit the
+        clone was cut from — after a conflict round merged the base in, the
+        latter would show the base's own movement as the run's changes."""
+        fake = FakeGithub()
+        bases: list[str | None] = []
+
+        def diff_text(repo_path: Path, remote_base_sha: str | None) -> str | None:
+            bases.append(remote_base_sha)
+            return "diff --git a/hello.txt b/hello.txt\n+hi\n"
+
+        harness.monkeypatch.setattr(hostgit, "diff_text", diff_text)
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+
+        assert result.state == "merged"
+        assert bases == ["base123"], "FakeGithub.ref_lookup answers base123 for heads/main"
 
     def test_a_humans_objection_spends_a_fix_round_with_their_words(self, harness: Harness) -> None:
         fake = FakeGithub()

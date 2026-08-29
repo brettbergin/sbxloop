@@ -673,3 +673,194 @@ class TestCloneExistingBranch:
         with pytest.raises(ProvisionError):
             hostgit.clone_existing_branch(checkout, target, "sbxloop/nope")
         assert not target.exists() or not any(target.iterdir())
+
+
+def make_run_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """A run clone whose ``origin`` is a bare upstream that can move on.
+
+    ``clone_for_run`` re-points the clone's origin at the *source's* origin,
+    so cutting the clone from a checkout of the bare repo leaves the clone
+    fetching from the bare repo — the shape merge_from_base runs against.
+    """
+    upstream, checkout = make_upstream_and_clone(tmp_path)
+    clone = tmp_path / "run"
+    hostgit.clone_for_run(checkout, clone, "sbxloop/r1")
+    assert hostgit.origin_url(clone) == str(upstream)
+    return upstream, clone
+
+
+def push_upstream_edit(
+    tmp_path: Path, upstream: Path, rel: str, content: str, name: str = "editor"
+) -> str:
+    """Advance origin/main with an edit to an existing file, from another clone."""
+    other = tmp_path / name
+    git("clone", "-q", str(upstream), str(other), cwd=tmp_path)
+    (other / rel).write_text(content)
+    git("commit", "-q", "-am", f"{name} edits {rel}", cwd=other)
+    git("push", "-q", "origin", "main", cwd=other)
+    return rev(other)
+
+
+def commit_all(cwd: Path, message: str) -> str:
+    git("add", "-A", cwd=cwd)
+    git("commit", "-q", "-m", message, cwd=cwd)
+    return rev(cwd)
+
+
+class TestMergeFromBase:
+    """Before a conflict fix round the current base is merged into the run's
+    clone, so the conflict is real in the fixer's working tree rather than
+    something delivery silently overwrites."""
+
+    def test_clean_merge_brings_the_new_base_commit_in(self, tmp_path: Path) -> None:
+        upstream, clone = make_run_clone(tmp_path)
+        (clone / "work.txt").write_text("the run's work\n")
+        commit_all(clone, "run work")
+        new_sha = push_upstream_commit(tmp_path, upstream)
+
+        result = hostgit.merge_from_base(clone, "main")
+
+        assert result.merged is True
+        assert result.conflicts == ()
+        assert "origin/main" in result.message
+        with Repo(clone) as repo:
+            assert repo.is_ancestor(repo.commit(new_sha), repo.head.commit)
+            assert repo.active_branch.name == "sbxloop/r1"
+            assert not repo.is_dirty(untracked_files=True)
+        # Both sides' files are present: the run's work and the base's.
+        assert (clone / "work.txt").read_text() == "the run's work\n"
+        assert (clone / "pusher.txt").read_text() == "more\n"
+        assert not (clone / ".git" / "MERGE_HEAD").exists()
+
+    def test_uncommitted_work_is_checkpointed_first(self, tmp_path: Path) -> None:
+        """git refuses to merge over local edits, and the agent may not have
+        committed: the tree is committed as-is (host identity) and the merge
+        then proceeds cleanly."""
+        upstream, clone = make_run_clone(tmp_path)
+        (clone / "wip.txt").write_text("not yet committed\n")
+        (clone / "hello.txt").write_text("edited but not committed\n")
+        new_sha = push_upstream_commit(tmp_path, upstream)
+
+        result = hostgit.merge_from_base(clone, "main")
+
+        assert result.merged is True
+        with Repo(clone) as repo:
+            checkpoints = [
+                c for c in repo.iter_commits() if c.message.startswith("sbxloop: checkpoint")
+            ]
+            assert len(checkpoints) == 1
+            (checkpoint,) = checkpoints
+            assert (checkpoint.author.name, checkpoint.author.email) == (
+                "sbxloop",
+                "sbxloop@localhost",
+            )
+            assert (checkpoint.committer.name, checkpoint.committer.email) == (
+                "sbxloop",
+                "sbxloop@localhost",
+            )
+            assert set(checkpoint.stats.files) == {"wip.txt", "hello.txt"}
+            assert repo.is_ancestor(checkpoint, repo.head.commit)
+            assert repo.is_ancestor(repo.commit(new_sha), repo.head.commit)
+            assert not repo.is_dirty(untracked_files=True)
+        # Nothing of the agent's work was lost in the checkpoint.
+        assert (clone / "wip.txt").read_text() == "not yet committed\n"
+        assert (clone / "hello.txt").read_text() == "edited but not committed\n"
+        assert (clone / "pusher.txt").exists()
+
+    def test_conflict_is_left_in_progress_with_the_paths(self, tmp_path: Path) -> None:
+        """Both sides edit the same line: the merge stays in progress, the
+        markers are in the file, and the conflicted paths are reported for
+        the fixer's brief."""
+        upstream, clone = make_run_clone(tmp_path)
+        (clone / "hello.txt").write_text("the run's line\n")
+        before = commit_all(clone, "run edit")
+        push_upstream_edit(tmp_path, upstream, "hello.txt", "upstream's line\n")
+
+        result = hostgit.merge_from_base(clone, "main")
+
+        assert result.merged is False
+        assert result.conflicts == ("hello.txt",)
+        assert "1 conflicted file" in result.message and "origin/main" in result.message
+        text = (clone / "hello.txt").read_text()
+        assert "<<<<<<<" in text and "=======" in text and ">>>>>>>" in text
+        assert "the run's line" in text and "upstream's line" in text
+        assert (clone / ".git" / "MERGE_HEAD").is_file()
+        assert rev(clone) == before, "no merge commit until the fixer resolves it"
+
+    def test_the_fixers_finish_completes_the_merge(self, tmp_path: Path) -> None:
+        """The brief tells the fixer `git add -A && git commit --no-edit`;
+        after that the base is contained and a second merge is a no-op."""
+        upstream, clone = make_run_clone(tmp_path)
+        (clone / "hello.txt").write_text("the run's line\n")
+        commit_all(clone, "run edit")
+        new_sha = push_upstream_edit(tmp_path, upstream, "hello.txt", "upstream's line\n")
+        assert hostgit.merge_from_base(clone, "main").merged is False
+
+        (clone / "hello.txt").write_text("the run's line\nupstream's line\n")
+        git("add", "-A", cwd=clone)
+        git("commit", "--no-edit", cwd=clone)
+
+        assert not (clone / ".git" / "MERGE_HEAD").exists()
+        again = hostgit.merge_from_base(clone, "main")
+        assert again.merged is True and again.conflicts == ()
+        assert "already contains origin/main" in again.message
+        with Repo(clone) as repo:
+            assert repo.is_ancestor(repo.commit(new_sha), repo.head.commit)
+
+    def test_base_already_contained_makes_no_commit(self, tmp_path: Path) -> None:
+        _, clone = make_run_clone(tmp_path)
+        (clone / "work.txt").write_text("the run's work\n")
+        before = commit_all(clone, "run work")
+
+        result = hostgit.merge_from_base(clone, "main")
+
+        assert result.merged is True
+        assert result.conflicts == ()
+        assert "already contains origin/main" in result.message
+        assert rev(clone) == before
+        assert not (clone / ".git" / "MERGE_HEAD").exists()
+
+    def test_no_origin_remote_reports_rather_than_raising(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path)
+        before = rev(repo)
+        result = hostgit.merge_from_base(repo, "main")
+        assert result.merged is False
+        assert result.conflicts == ()
+        assert "no origin remote" in result.message
+        assert rev(repo) == before
+
+    def test_fetch_failure_raises_provision_error(self, tmp_path: Path) -> None:
+        _, clone = make_run_clone(tmp_path)
+        git("remote", "set-url", "origin", str(tmp_path / "gone.git"), cwd=clone)
+        before = rev(clone)
+        with pytest.raises(ProvisionError, match="git fetch origin main failed"):
+            hostgit.merge_from_base(clone, "main")
+        assert rev(clone) == before
+
+    def test_non_content_merge_failure_aborts_and_raises(self, tmp_path: Path) -> None:
+        """A merge git refuses outright (here: unrelated histories) has no
+        conflicted paths to hand the fixer; the tree is left as it was."""
+        _, clone = make_run_clone(tmp_path)
+        before = rev(clone)
+        # Different content, so the stranger's root commit can never collide
+        # with the seed's (same tree + message + identity in the same second
+        # would be the same SHA, and the histories would then be related).
+        stranger = tmp_path / "stranger"
+        stranger.mkdir()
+        git("init", "-b", "main", cwd=stranger)
+        (stranger / "stranger.txt").write_text("nothing in common\n")
+        commit_all(stranger, "a stranger's root")
+        stranger_bare = tmp_path / "stranger.git"
+        git("clone", "--bare", "-q", str(stranger), str(stranger_bare), cwd=tmp_path)
+        git("remote", "set-url", "origin", str(stranger_bare), cwd=clone)
+
+        with pytest.raises(ProvisionError, match="merging origin/main into"):
+            hostgit.merge_from_base(clone, "main")
+
+        assert rev(clone) == before
+        assert not (clone / ".git" / "MERGE_HEAD").exists()
+        assert not hostgit.is_dirty(clone)
+
+    def test_not_a_repo_raises_provision_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ProvisionError, match="cannot merge into"):
+            hostgit.merge_from_base(tmp_path / "nope", "main")

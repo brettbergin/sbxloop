@@ -916,6 +916,15 @@ class StatusLine:
         self.current: str | None = None
         self.phase: str | None = None
         self.finished: str | None = None
+        # The post-build pipeline: which stage the run is in, which review
+        # round it is on, the fix round in progress (round, kind, budget),
+        # what CI last said, and the landing step under way.
+        self.stage: str | None = None
+        self.review_round = 0
+        self.fix: tuple[int, str, str] | None = None
+        self.ci: str | None = None
+        self.ci_pending = 0
+        self.landing: str | None = None
         self._dirty = False
 
     @property
@@ -948,12 +957,39 @@ class StatusLine:
             if self.current == tid:
                 self.current, self.phase = None, None
             self._dirty = True
-        elif t in ("run.end", "run.state") and d.get("state") in (
-            "completed",
-            "failed",
-            "cancelled",
-        ):
+        elif t in ("run.end", "run.state") and d.get("state") in STATE_MARKER:
             self.finished = str(d["state"])
+            self._dirty = True
+        elif t == "run.state" and d.get("state") in PIPELINE_STAGES:
+            self.stage = str(d["state"])
+            if self.stage == "reviewing":
+                self.review_round += 1
+            if self.stage != "fixing":
+                self.fix = None
+            if self.stage != "awaiting_ci":
+                self.ci, self.ci_pending = None, 0
+            if self.stage != "landing":
+                self.landing = None
+            self._dirty = True
+        elif t == "run.state" and d.get("state") == "building":
+            self.stage = None
+            self._dirty = True
+        elif t == HostEventTypes.FIX_ROUND:
+            self.fix = (
+                int(d.get("round") or 0),
+                str(d.get("kind") or ""),
+                str(d.get("budget") or ""),
+            )
+            self._dirty = True
+        elif t == HostEventTypes.CI_STATUS:
+            self.ci = str(d.get("state") or "")
+            self.ci_pending = len(_list(d, "pending"))
+            self._dirty = True
+        elif t == HostEventTypes.LAND_UNDRAFT:
+            self.landing = "out of draft"
+            self._dirty = True
+        elif t == HostEventTypes.LAND_UPDATE:
+            self.landing = f"updating from base (attempt {d.get('attempt')})"
             self._dirty = True
 
     def finish(self, state: str) -> None:
@@ -977,20 +1013,50 @@ class StatusLine:
             marker = STATE_MARKER.get(self.finished, "🏁")
             head = f"{marker} finished · {counts['done']}/{total} tasks done"
             return head + (f" · {totals}" if totals else "")
-        if self.current and self.current in self.roster:
+        if self.stage:
+            head = self._stage_line()
+        elif self.current and self.current in self.roster:
             idx = ids.index(self.current) + 1
             title = _one_line(self.roster[self.current], 80)
-            head = f"⏳ task {idx}/{total} · **{title}**"
-            if self.phase:
-                head += f" · {self.phase}"
-            rev = self.revisions.get(self.current, 0)
-            if rev:
-                head += f" · rev {rev}"
+            head = f"⏳ task {idx}/{total} · **{title}**" + self._task_tail()
         elif total:
             head = f"⏳ {total} task(s) planned"
         else:
             head = "⏳ decomposing"
         return head + (f"\n{totals}" if totals else "")
+
+    def _task_tail(self) -> str:
+        tail = f" · {self.phase}" if self.phase else ""
+        rev = self.revisions.get(self.current or "", 0)
+        return tail + (f" · rev {rev}" if rev else "")
+
+    def _stage_line(self) -> str:
+        """Where a run is once its task graph is built."""
+        stage = self.stage
+        if stage == "gating":
+            return "🚦 gate · running the project's own check"
+        if stage == "delivering":
+            return "🔀 delivering · the pull request"
+        if stage == "reviewing":
+            return f"🔍 review round {self.review_round or 1}"
+        if stage == "fixing":
+            if self.fix:
+                round_no, kind, budget = self.fix
+                head = f"🛠 fix round {round_no} ({kind}"
+                head += f", budget {budget})" if budget else ")"
+            else:
+                head = "🛠 fix round"
+            return head + self._task_tail()
+        if stage == "awaiting_ci":
+            if self.ci == "red":
+                return "❌ CI red"
+            if self.ci == "green":
+                return "✅ CI green"
+            pending = f" · {self.ci_pending} pending" if self.ci_pending else ""
+            return f"⏳ CI{pending}"
+        if stage == "landing":
+            return f"🚀 landing · {self.landing or 'merging'}"
+        return f"⏳ {stage}"
 
 
 # Task states are the engine's phase boundaries; a queued steer is answered
@@ -1001,6 +1067,17 @@ _STATE_PHASE = {
     "verifying": "verify",
 }
 _PHASE_STATES = frozenset(_STATE_PHASE)
+# What the run is doing in each post-build stage, for the steer note.
+_STAGE_DOING = {
+    "gating": "running the project's gate",
+    "delivering": "delivering the pull request",
+    "reviewing": "reviewing its own pull request",
+    "fixing": "in a fix round",
+    "awaiting_ci": "waiting on CI",
+    "landing": "landing the pull request",
+}
+# Stages where the engine is polling GitHub rather than running an agent job.
+_WAIT_STAGES = frozenset({"awaiting_ci", "landing"})
 
 
 class SteerProgress:
@@ -1019,6 +1096,7 @@ class SteerProgress:
         self.task_id: str | None = None
         self.title: str | None = None
         self.phase: str | None = None
+        self.stage: str | None = None
         self.tool_calls = 0
         self.capped = False
         self._dirty = False
@@ -1059,6 +1137,12 @@ class SteerProgress:
             if d.get("cap"):
                 self.cap = int(d["cap"])
             self._dirty = True
+        elif t == "run.state" and d.get("state") in PIPELINE_STAGES:
+            self.stage = str(d["state"])
+            self._dirty = True
+        elif t == "run.state" and d.get("state") == "building":
+            self.stage = None
+            self._dirty = True
 
     def render(self, *, state: str = "queued") -> str:
         """``state`` is ``queued`` (waiting for a checkpoint), ``answering``
@@ -1085,6 +1169,12 @@ class SteerProgress:
             tail = " — ceiling reached)" if self.capped else " so far)"
             noun = "tool call" if self.tool_calls == 1 and not self.cap else "tool calls"
             where += f" ({calls} {noun}{tail}"
+        if not where and self.stage in _WAIT_STAGES:
+            # Between polls the engine sleeps on an event a message sets, so
+            # the answer comes within moments rather than at a checkpoint.
+            return f"⏳ steer queued — the run is {_STAGE_DOING[self.stage]}; answered now"
+        if not where and self.stage:
+            where = f" — the run is {_STAGE_DOING.get(self.stage, self.stage)}"
         return f"⏳ steer queued{where}; answered at the next checkpoint"
 
 

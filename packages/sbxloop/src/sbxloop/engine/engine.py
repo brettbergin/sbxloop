@@ -1189,8 +1189,17 @@ class LoopEngine:
         workspace = p.pair.workspace
         if workspace is None or not p.pair.mounted:
             return None
+        # Diff against the *current* base commit, not the one the clone was
+        # cut from: after a conflict round merged the base in, the latter
+        # would show the whole base branch's movement as the run's changes.
+        base_sha: str | None = None
+        if p.ops is not None and p.repo is not None:
+            try:
+                base_sha = p.ops.ref_lookup(p.repo, f"heads/{self._base_branch(p)}")
+            except SbxloopError:
+                log.warning("review.base_lookup_failed", run=p.run_id, exc_info=True)
         try:
-            return hostgit.diff_text(workspace, None)
+            return hostgit.diff_text(workspace, base_sha)
         except SbxloopError:
             log.warning("review.diff_failed", run=p.run_id, exc_info=True)
             return None
@@ -1257,6 +1266,12 @@ class LoopEngine:
         gate = phases.project_gate()
         if gate:
             verify_commands.append(gate)
+        conflicts: tuple[str, ...] = ()
+        if kind == "conflict":
+            merged = self._merge_base_into_clone(p)
+            if merged is not None:
+                conflicts = merged.conflicts
+                why = f"{why}; {merged.message}"
         spec = fix_task(
             round=round_no,
             pr_number=run.pr_number,
@@ -1268,6 +1283,7 @@ class LoopEngine:
                 findings=findings,
                 failed_checks=failed_checks,
                 objections=objections,
+                conflicts=conflicts,
             ),
             verify_commands=verify_commands,
             failed_checks=failed_checks,
@@ -1286,6 +1302,39 @@ class LoopEngine:
         )
         self._announce_roster(run_id, self.store.get_tasks(run_id))
         return self._drive_fix_task(p, task)
+
+    def _base_branch(self, p: Pipeline) -> str:
+        """The branch the PR targets: configured, else the repository's default."""
+        base = self.config.github.deliver_base
+        if base:
+            return base
+        if p.ops is not None and p.repo is not None:
+            return str(p.ops.repo_get(p.repo).get("default_branch") or "main")
+        return "main"
+
+    def _merge_base_into_clone(self, p: Pipeline) -> hostgit.MergeResult | None:
+        """Before a conflict fix round: bring the current base into the run's
+        clone so the conflict is real in the fixer's working tree (see
+        :func:`hostgit.merge_from_base`). None when the run has no mounted
+        clone to merge into; a fetch/merge failure is logged and the round
+        proceeds on the tree as it is."""
+        workspace = p.pair.workspace
+        if workspace is None or not p.pair.mounted or p.ops is None:
+            return None
+        base = self._base_branch(p)
+        try:
+            result = hostgit.merge_from_base(workspace, base)
+        except SbxloopError:
+            log.warning("fix.merge_base_failed", run=p.run_id, base=base, exc_info=True)
+            return None
+        log.info(
+            "fix.merged_base",
+            run=p.run_id,
+            base=base,
+            merged=result.merged,
+            conflicts=list(result.conflicts),
+        )
+        return result
 
     def _resume_fix(self, p: Pipeline) -> str | None:
         """A run resumed mid fix round: finish the fix task still in flight

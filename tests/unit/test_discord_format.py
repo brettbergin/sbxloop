@@ -1240,3 +1240,88 @@ class TestNoFabricatedSpend:
         assert stats.output_tokens == 200 * self.TURNS
         assert "147 turn(s)" in summary_text(stats, "done")
         assert "147,000 in / 29,400 out tokens" in summary_text(stats, "done")
+
+
+class TestStatusLineStages:
+    """After the task graph the status line follows the pipeline, not the
+    (finished) task roster: a watcher reads *which stage* the run is in."""
+
+    def _built(self) -> StatusLine:
+        s = StatusLine()
+        s.observe(ev("task.state", task_id="t1", title="Add tests", state="pending", revisions=0))
+        s.observe(ev("task.start", task_id="t1", title="Add tests"))
+        s.observe(ev("task.end", task_id="t1", title="Add tests", state="done"))
+        return s
+
+    def test_stage_progression(self) -> None:
+        s = self._built()
+        assert s.render() == "⏳ 1 task(s) planned\n✅ 1 done"
+        s.observe(ev("run.state", state="gating"))
+        assert s.render() == "🚦 gate · running the project's own check\n✅ 1 done"
+        s.observe(ev("run.state", state="delivering"))
+        assert s.render().startswith("🔀 delivering")
+        s.observe(ev("run.state", state="reviewing"))
+        assert s.render().startswith("🔍 review round 1")
+        s.observe(ev("run.state", state="fixing"))
+        s.observe(ev("fix.round", round=1, kind="review", task_id="fix-1", budget="1/3"))
+        s.observe(ev("task.state", task_id="fix-1", title="Make it acceptable", state="pending"))
+        s.observe(ev("task.start", task_id="fix-1", title="Make it acceptable"))
+        s.observe(ev("phase.end", task_id="fix-1", phase="build", status="ok", message="x"))
+        assert s.render().startswith("🛠 fix round 1 (review, budget 1/3) · build")
+        s.observe(ev("task.end", task_id="fix-1", state="done"))
+        s.observe(ev("run.state", state="gating"))
+        s.observe(ev("run.state", state="delivering"))
+        s.observe(ev("run.state", state="reviewing"))
+        assert s.render().startswith("🔍 review round 2")
+        s.observe(ev("run.state", state="awaiting_ci"))
+        assert s.render().startswith("⏳ CI\n")
+        s.observe(ev("ci.status", state="pending", pending=["lint", "test"], failed=[]))
+        assert s.render().startswith("⏳ CI · 2 pending")
+        s.observe(ev("ci.status", state="green", pending=[], failed=[], total=2))
+        assert s.render().startswith("✅ CI green")
+        s.observe(ev("run.state", state="landing"))
+        assert s.render().startswith("🚀 landing · merging")
+        s.observe(ev("land.undraft", pr=9))
+        assert s.render().startswith("🚀 landing · out of draft")
+        s.observe(ev("land.update", pr=9, attempt=1, accepted=True))
+        assert "updating from base (attempt 1)" in s.render()
+        s.observe(ev("run.state", state="merged"))
+        assert s.render().startswith("🎉 finished · 2/2 tasks done")
+
+    def test_ci_red_and_blocked(self) -> None:
+        s = self._built()
+        s.observe(ev("run.state", state="awaiting_ci"))
+        s.observe(ev("ci.status", state="red", pending=[], failed=["test"]))
+        assert s.render().startswith("❌ CI red")
+        s.observe(ev("run.state", state="blocked"))
+        assert s.render().startswith("🚧 finished")
+
+    def test_stage_events_mark_dirty(self) -> None:
+        s = self._built()
+        s.render()
+        s.observe(ev("run.state", state="reviewing"))
+        assert s.dirty
+
+
+class TestSteerProgressStages:
+    def test_wait_stages_answer_at_once(self) -> None:
+        p = SteerProgress()
+        p.observe(ev("run.state", state="awaiting_ci"))
+        assert p.render() == "⏳ steer queued — the run is waiting on CI; answered now"
+        p.observe(ev("run.state", state="landing"))
+        assert "landing the pull request; answered now" in p.render()
+
+    def test_agent_stages_wait_for_a_checkpoint(self) -> None:
+        p = SteerProgress()
+        p.observe(ev("run.state", state="reviewing"))
+        assert p.render() == (
+            "⏳ steer queued — the run is reviewing its own pull request; "
+            "answered at the next checkpoint"
+        )
+        # a fix task in flight is reported like any task, not as a stage
+        p.observe(ev("run.state", state="fixing"))
+        p.observe(ev("task.start", task_id="fix-1", title="Make it acceptable"))
+        assert "agent is on `fix-1`" in p.render()
+        p.observe(ev("run.state", state="building"))
+        p.observe(ev("task.end", task_id="fix-1", state="done"))
+        assert p.render() == "⏳ steer queued; answered at the next checkpoint"

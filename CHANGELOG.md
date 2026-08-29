@@ -8,6 +8,25 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **The run thread follows the pipeline.** The per-run status line now says
+  which stage the run is in once its tasks are built — `🚦 gate`,
+  `🔀 delivering`, `🔍 review round 2`, `🛠 fix round 1 (review, budget 1/3) · build`, `⏳ CI · 2 pending` / `❌ CI red` / `✅ CI green`,
+  `🚀 landing · out of draft` — instead of "1 task(s) planned" for the
+  whole second half of the run, and ends `🎉` / `🚧` for `merged` /
+  `blocked`. The note under a queued steer says the same ("the run is
+  waiting on CI; answered now" — a message wakes a GitHub wait at once).
+
+- **A conflict fix round starts from the merged base.** Before a
+  `conflict` round the engine merges `origin/<base>` into the run's clone
+  (`hostgit.merge_from_base`): uncommitted work is checkpointed, a clean
+  merge just lands, and a conflicting one is left in progress with the
+  conflicted paths quoted in the fix brief for the fixer to resolve and
+  commit. Before this, delivery overlaid the run's files onto the current
+  base tree, so the conflicting hunks were silently overwritten with the
+  run's version. The review diff is likewise taken against the *current*
+  base commit, so a round after such a merge reviews the run's changes
+  and not the base branch's movement.
+
 - **One run, from issue to merged pull request.** The engine now carries a
   run past its task graph: GATE (the project's own gate over the whole
   tree) → DELIVER (a draft PR) → REVIEW (the run's own adversarial pass
@@ -28,11 +47,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   human; one that runs out of rounds ends `failed` with the PR still a
   draft. Waiting on GitHub is not charged to `max_wall_clock_s`, and a
   Discord message or a cancel wakes a wait at once.
+
 - **Findings carry forward inside the run.** Every review round sees the
   earlier rounds' findings and the fixer's per-finding `addressed` /
   `refuted: <why>` list; a verdict that only re-raises refuted findings is
   sent back once with the history quoted. This, plus the round budgets, is
   what stops a run arguing with itself.
+
 - **The daemon files nothing.** Gone: the agent backlog lane
   (`.sbxloop/backlog/*.md` → `sbxloop:backlog` issues), post-mortem
   issues, scheduled audit charters (`.github/sbxloop/audits/`), tool
@@ -45,6 +66,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   concierge tool are gone with it. The daemon settles each run's outcome
   on the issue: `merged` → closed with `sbxloop:completed`, `failed` →
   `sbxloop:failed`, `blocked` → the new `sbxloop:blocked`.
+
 - **Config cutover, tolerated.** `[daemon]` lost `inbox_dir`, `backlog`,
   `backlog_max_per_run`, `backlog_auto_trigger`, `backlog_label`,
   `audits`, `audit_dir`, `audit_label`, `delivered_label`, `postmortems`,
@@ -59,10 +81,12 @@ All notable changes to sbxloop are documented here. The project adheres to
   failing — the daemon host deploys unattended and a hard failure there
   would roll the release back before anyone could edit the file. They
   become errors in 1.0.0.
+
 - **State cutover.** The daemon's tables changed shape (no PR-state,
   review, audit, post-mortem or backlog tables; one item kind). A pre-1.0
   `state.db` is moved aside to `state.db.pre-1.0` on first start rather
   than migrated (docs/deploy.md, "1.0 cutover").
+
 - **Removed with the above:** `sbxloop deliver` (resume at `delivering` is
   the retry path), `sbxloop run --report/--deliver/--deliver-draft`, the
   `GithubReporterHook` tracking issue, `sbxloop daemon --inbox/--backlog`,
