@@ -96,7 +96,7 @@ class TestClassification:
 
     def test_stale_non_terminal_run_is_orphan(self, store: StateStore) -> None:
         store.create_run("rabc12345", "x")
-        store.set_run_state("rabc12345", "running")
+        store.set_run_state("rabc12345", "building")
         now = store.get_run("rabc12345").updated_at
         (verdict,) = classify_sandboxes(
             [info("sbxloop-rabc12345-agent")], store, min_age_s=HOUR, now=now + 2 * HOUR
@@ -110,7 +110,7 @@ class TestClassification:
         from sbxloop_worker.protocol import Event
 
         store.create_run("rabc12345", "x")
-        store.set_run_state("rabc12345", "running")
+        store.set_run_state("rabc12345", "building")
         now = store.get_run("rabc12345").updated_at + 2 * HOUR
         store.append_event(Event(ts=now - 60, run_id="rabc12345", type="worker.heartbeat", data={}))
         (verdict,) = classify_sandboxes(

@@ -20,18 +20,18 @@ from sbxloop.engine.model import (
     RunState,
     TaskRecord,
     TaskSpec,
-    TaskState,
 )
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
 
-# Task states written by the six-phase pipeline (pre-BUILD), remapped at
-# read time so mid-flight runs resume across the upgrade. See get_tasks.
-_LEGACY_TASK_STATES: dict[str, TaskState] = {
-    "planning": "executing",
-    "scrutinizing": "verifying",
-    "validating": "verifying",
-}
+# Per-run counters the pipeline spends; the only columns `bump_run_counter`
+# may touch, so a caller cannot increment an arbitrary column by name.
+RUN_COUNTERS: frozenset[str] = frozenset({"review_rounds", "ci_rounds", "update_attempts"})
+
+# Run states written before the pipeline existed, remapped at read time so a
+# pre-1.0 state database still lists and resumes: both were "the task graph
+# is being worked", which `building` now names.
+_LEGACY_RUN_STATES: dict[str, RunState] = {"running": "building", "finalizing": "building"}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -45,7 +45,18 @@ CREATE TABLE IF NOT EXISTS runs (
     mounted    INTEGER NOT NULL DEFAULT 0,
     kept_reason TEXT,
     user_guidance TEXT NOT NULL DEFAULT '[]',
-    reason     TEXT
+    reason     TEXT,
+    stage      TEXT,
+    pr_number  INTEGER,
+    pr_url     TEXT,
+    pr_node_id TEXT,
+    branch     TEXT,
+    head_sha   TEXT,
+    review_rounds INTEGER NOT NULL DEFAULT 0,
+    ci_rounds  INTEGER NOT NULL DEFAULT 0,
+    update_attempts INTEGER NOT NULL DEFAULT 0,
+    update_head TEXT,
+    last_verdict TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -53,7 +64,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     order_idx  INTEGER NOT NULL,
     state      TEXT NOT NULL,
     spec_json  TEXT NOT NULL,
-    plan_json  TEXT,
     revisions  INTEGER NOT NULL DEFAULT 0,
     replans    INTEGER NOT NULL DEFAULT 0,
     last_feedback TEXT NOT NULL DEFAULT '',
@@ -99,6 +109,23 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "user_guidance",
             "ALTER TABLE runs ADD COLUMN user_guidance TEXT NOT NULL DEFAULT '[]'",
         ),
+        ("stage", "ALTER TABLE runs ADD COLUMN stage TEXT"),
+        ("pr_number", "ALTER TABLE runs ADD COLUMN pr_number INTEGER"),
+        ("pr_url", "ALTER TABLE runs ADD COLUMN pr_url TEXT"),
+        ("pr_node_id", "ALTER TABLE runs ADD COLUMN pr_node_id TEXT"),
+        ("branch", "ALTER TABLE runs ADD COLUMN branch TEXT"),
+        ("head_sha", "ALTER TABLE runs ADD COLUMN head_sha TEXT"),
+        (
+            "review_rounds",
+            "ALTER TABLE runs ADD COLUMN review_rounds INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("ci_rounds", "ALTER TABLE runs ADD COLUMN ci_rounds INTEGER NOT NULL DEFAULT 0"),
+        (
+            "update_attempts",
+            "ALTER TABLE runs ADD COLUMN update_attempts INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("update_head", "ALTER TABLE runs ADD COLUMN update_head TEXT"),
+        ("last_verdict", "ALTER TABLE runs ADD COLUMN last_verdict TEXT"),
     ),
     "phase_attempts": (
         ("input_tokens", "ALTER TABLE phase_attempts ADD COLUMN input_tokens INTEGER"),
@@ -160,14 +187,117 @@ class StateStore:
             )
 
     def set_run_state(self, run_id: str, state: RunState) -> None:
+        """Move the run to ``state``. A non-terminal state is also recorded
+        as the run's ``stage``; a terminal one leaves ``stage`` alone, so a
+        failed or blocked run still knows where a resume should re-enter."""
+        with self._lock:
+            if state in TERMINAL_RUN_STATES:
+                cursor = self._conn.execute(
+                    "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+                    (state, time.time(), run_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE runs SET state = ?, stage = ?, updated_at = ? WHERE run_id = ?",
+                    (state, state, time.time(), run_id),
+                )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+
+    def set_run_reason(self, run_id: str, reason: str | None) -> None:
+        """Record why a run stopped where it did (a budget, a refusal)."""
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
-                (state, time.time(), run_id),
+                "UPDATE runs SET reason = ?, updated_at = ? WHERE run_id = ?",
+                (reason, time.time(), run_id),
             )
             if cursor.rowcount == 0:
                 raise StateError(f"unknown run {run_id}")
             self._conn.commit()
+
+    def touch_run(self, run_id: str) -> None:
+        """Refresh ``updated_at`` without changing anything else — the
+        liveness signal for a run idling on a CI wait, where no job runs and
+        so no event is persisted."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE runs SET updated_at = ? WHERE run_id = ?", (time.time(), run_id)
+            )
+            self._conn.commit()
+
+    def set_run_pr(
+        self,
+        run_id: str,
+        *,
+        number: int,
+        url: str,
+        branch: str,
+        head_sha: str | None,
+        node_id: str | None = None,
+    ) -> None:
+        """Record the delivered pull request. Called on every delivery: the
+        number/url/branch are stable across rounds, ``head_sha`` moves, and a
+        re-delivery clears ``update_head`` (an update marker outliving the
+        head it was requested at would park the landing stage forever)."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET pr_number = ?, pr_url = ?, branch = ?, head_sha = ?,"
+                " pr_node_id = COALESCE(?, pr_node_id), update_head = NULL, updated_at = ?"
+                " WHERE run_id = ?",
+                (number, url, branch, head_sha, node_id, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+
+    def set_run_head(self, run_id: str, head_sha: str) -> None:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET head_sha = ?, updated_at = ? WHERE run_id = ?",
+                (head_sha, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+
+    def set_run_verdict(self, run_id: str, verdict: str) -> None:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET last_verdict = ?, updated_at = ? WHERE run_id = ?",
+                (verdict, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+
+    def set_update_head(self, run_id: str, head_sha: str | None) -> None:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET update_head = ?, updated_at = ? WHERE run_id = ?",
+                (head_sha, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+
+    def bump_run_counter(self, run_id: str, counter: str) -> int:
+        """Spend one unit of a per-run budget; returns the new count."""
+        if counter not in RUN_COUNTERS:
+            raise StateError(f"not a run counter: {counter!r}")
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE runs SET {counter} = {counter} + 1, updated_at = ? WHERE run_id = ?",  # nosec B608 — column name is whitelisted above
+                (time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+            row = self._conn.execute(
+                f"SELECT {counter} AS n FROM runs WHERE run_id = ?",  # nosec B608
+                (run_id,),
+            ).fetchone()
+            return int(row["n"])
 
     def set_run_workspace(self, run_id: str, workspace: Path, mounted: bool) -> None:
         with self._lock:
@@ -223,18 +353,29 @@ class StateStore:
         return RunRecord(
             run_id=row["run_id"],
             outcome=row["outcome"],
-            state=row["state"],
+            state=_LEGACY_RUN_STATES.get(row["state"], row["state"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             workspace=Path(row["workspace"]) if row["workspace"] else None,
             mounted=bool(row["mounted"]),
             kept_reason=row["kept_reason"],
-            reason=row["reason"] if "reason" in set(row.keys()) else None,
+            reason=row["reason"],
+            stage=row["stage"],
+            pr_number=row["pr_number"],
+            pr_url=row["pr_url"],
+            pr_node_id=row["pr_node_id"],
+            branch=row["branch"],
+            head_sha=row["head_sha"],
+            review_rounds=int(row["review_rounds"] or 0),
+            ci_rounds=int(row["ci_rounds"] or 0),
+            update_attempts=int(row["update_attempts"] or 0),
+            update_head=row["update_head"],
+            last_verdict=row["last_verdict"],
         )
 
     def non_terminal_runs(self) -> list[RunRecord]:
-        """Runs still recorded as in flight (created/provisioning/decomposing/
-        running/finalizing), oldest-updated first.
+        """Runs still recorded as in flight (anything not in
+        ``TERMINAL_RUN_STATES``), oldest-updated first.
 
         Callers must exclude the run genuinely executing in-process before
         reconciling anything returned here.
@@ -293,6 +434,22 @@ class StateStore:
                 )
             self._conn.commit()
 
+    def append_task(self, run_id: str, spec: TaskSpec) -> TaskRecord:
+        """Add one task after every existing one (a fix round). ``save_tasks``
+        numbers from zero and would collide with the graph already saved."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(order_idx), -1) + 1 AS next FROM tasks WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            self._conn.execute(
+                "INSERT INTO tasks (run_id, task_id, order_idx, state, spec_json)"
+                " VALUES (?, ?, ?, 'pending', ?)",
+                (run_id, spec.id, int(row["next"]), spec.model_dump_json()),
+            )
+            self._conn.commit()
+        return TaskRecord(spec=spec)
+
     def update_task(self, run_id: str, task: TaskRecord) -> None:
         with self._lock:
             cursor = self._conn.execute(
@@ -318,19 +475,10 @@ class StateStore:
         ).fetchall()
         records: list[TaskRecord] = []
         for row in rows:
-            # Rows persisted by the six-phase pipeline are remapped onto the
-            # live vocabulary before pydantic sees them, extending the old
-            # resume-rewind precedent: `planning` never committed work, so
-            # BUILD starts fresh; `scrutinizing` is only set after the
-            # execute report committed, so idempotent mechanical VERIFY is
-            # the cheaper re-entry (a failure re-enters BUILD normally);
-            # `validating` re-derives its verify evidence the same way.
-            # plan_json is ignored — the column stays, unread and unwritten.
-            state: TaskState = _LEGACY_TASK_STATES.get(row["state"], row["state"])
             records.append(
                 TaskRecord(
                     spec=TaskSpec.model_validate_json(row["spec_json"]),
-                    state=state,
+                    state=row["state"],
                     revisions=row["revisions"],
                     replans=row["replans"],
                     last_feedback=row["last_feedback"],

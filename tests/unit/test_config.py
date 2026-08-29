@@ -118,7 +118,6 @@ def test_workspace_isolation_default_and_validation(tmp_path: Path) -> None:
 def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     config = load_config(cwd=tmp_path, env={})
     assert config.daemon.trigger_label == "sbxloop:run"
-    assert config.daemon.backlog == "off"
     assert config.daemon.max_runs_per_day == 12
     # #255: unattended posture — clone isolation, fetch refresh, no state
     # dir pin (resolved by daemon.paths at startup).
@@ -130,14 +129,12 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
         cwd=tmp_path,
         env={
             "SBXLOOP_DAEMON__MAX_RUNS_PER_DAY": "3",
-            "SBXLOOP_DAEMON__BACKLOG": "github",
             "SBXLOOP_DAEMON__WORKSPACE_ISOLATION": "in-place",
             "SBXLOOP_DAEMON__STATE_DIR": "/var/lib/sbxloop",
             "SBXLOOP_DISCORD__CHANNEL_ID": "123456789",
         },
     )
     assert over.daemon.max_runs_per_day == 3
-    assert over.daemon.backlog == "github"
     assert over.daemon.workspace_isolation == "in-place"
     assert over.daemon.state_dir == Path("/var/lib/sbxloop")
     assert over.discord.enabled is True and over.discord.channel_id == 123456789
@@ -154,43 +151,34 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text("[concierge]\ntimeout_s = 5\n")
     with pytest.raises(ConfigError):
         load_config(cwd=tmp_path, env={})
-    assert config.daemon.close_on_success is True and config.daemon.tracking_issue is True
-    assert config.daemon.delivered_label == "sbxloop:delivered"
     assert config.daemon.completed_label == "sbxloop:completed"
+    assert config.daemon.blocked_label == "sbxloop:blocked"
     assert config.github.deliver_closes is None
     (tmp_path / "sbxloop.toml").write_text(
         '[daemon]\ntrigger_label = "x"\nin_progress_label = "x"\n'
     )
     with pytest.raises(ConfigError, match="distinct"):
         load_config(cwd=tmp_path, env={})
-    # delivered_label takes part in the lifecycle-label distinctness check
-    (tmp_path / "sbxloop.toml").write_text('[daemon]\ndelivered_label = "sbxloop:failed"\n')
+    # blocked_label takes part in the lifecycle-label distinctness check
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\nblocked_label = "sbxloop:failed"\n')
     with pytest.raises(ConfigError, match="distinct"):
         load_config(cwd=tmp_path, env={})
     # completed_label does too, case-insensitively
-    (tmp_path / "sbxloop.toml").write_text('[daemon]\ncompleted_label = "SBXLOOP:DELIVERED"\n')
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\ncompleted_label = "SBXLOOP:BLOCKED"\n')
     with pytest.raises(ConfigError, match="case-insensitively"):
+        load_config(cwd=tmp_path, env={})
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\nblocked_label = " "\n')
+    with pytest.raises(ConfigError, match="non-empty"):
         load_config(cwd=tmp_path, env={})
     # deliver_closes must be a positive issue number
     (tmp_path / "sbxloop.toml").write_text('[github]\nrepo = "o/r"\ndeliver_closes = 0\n')
     with pytest.raises(ConfigError):
-        load_config(cwd=tmp_path, env={})
-    # tool_repo must be owner/name
-    (tmp_path / "sbxloop.toml").write_text('[daemon]\ntool_repo = "not a repo"\n')
-    with pytest.raises(ConfigError, match="owner/name"):
-        load_config(cwd=tmp_path, env={})
-    # so does the discovery lane's audit_label
-    (tmp_path / "sbxloop.toml").write_text('[daemon]\naudit_label = "sbxloop:run"\n')
-    with pytest.raises(ConfigError, match="distinct"):
         load_config(cwd=tmp_path, env={})
     # GitHub labels are case-insensitive: differing only by case is a collision
     (tmp_path / "sbxloop.toml").write_text(
         '[daemon]\ntrigger_label = "sbxloop:run"\nfailed_label = "SBXLOOP:RUN"\n'
     )
     with pytest.raises(ConfigError, match="case-insensitively"):
-        load_config(cwd=tmp_path, env={})
-    (tmp_path / "sbxloop.toml").write_text('[daemon]\nbacklog = "yolo"\n')
-    with pytest.raises(ConfigError):
         load_config(cwd=tmp_path, env={})
     (tmp_path / "sbxloop.toml").write_text("[daemon]\nmax_runs_per_day = 0\n")
     with pytest.raises(ConfigError, match="max_runs_per_day"):
@@ -217,6 +205,12 @@ def test_unknown_key_is_config_error(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text("no_such_option = 1\n")
     with pytest.raises(ConfigError, match="invalid sbxloop configuration"):
         load_config(cwd=tmp_path, env={})
+    # Retired keys are tolerated (below); any other unknown key in those
+    # sections is still a hard error.
+    for section in ("daemon", "github", "landing"):
+        (tmp_path / "sbxloop.toml").write_text(f"[{section}]\nno_such_option = 1\n")
+        with pytest.raises(ConfigError, match="invalid sbxloop configuration"):
+            load_config(cwd=tmp_path, env={})
 
 
 def test_github_repo_must_be_owner_name(tmp_path: Path) -> None:
@@ -228,7 +222,9 @@ def test_github_disabled_by_default(tmp_path: Path) -> None:
     config = load_config(cwd=tmp_path, env={})
     assert config.github.repo is None
     assert not config.github.enabled
-    assert not config.github.report
+    assert not hasattr(config.github, "report")
+    assert not hasattr(config.github, "deliver")
+    assert not hasattr(config.github, "deliver_draft")
 
 
 def test_invalid_toml_is_config_error(tmp_path: Path) -> None:
@@ -248,20 +244,156 @@ def test_env_string_fallback(tmp_path: Path) -> None:
     assert config.model == "claude-sonnet"
 
 
-def test_deliver_config_layers(tmp_path: Path) -> None:
-    (tmp_path / "sbxloop.toml").write_text(
-        '[github]\nrepo = "file/repo"\ndeliver = true\ndeliver_draft = true\n'
-    )
+def test_github_delivery_layers(tmp_path: Path) -> None:
+    (tmp_path / "sbxloop.toml").write_text('[github]\nrepo = "file/repo"\ncreate_repo = true\n')
     config = load_config(cwd=tmp_path, env={})
     assert config.github.repo == "file/repo"
-    assert config.github.deliver is True
-    assert config.github.deliver_draft is True
+    assert config.github.create_repo is True
     assert config.github.deliver_base is None
+    assert config.landing.deliver_draft is True
 
     config = load_config(cwd=tmp_path, env={"SBXLOOP_GITHUB__DELIVER_BASE": "develop"})
     assert config.github.deliver_base == "develop"
 
-    assert Config().github.deliver is False  # delivery is opt-in
+
+class TestLandingSection:
+    """[landing]: what happens to a run's work after its tasks are built.
+    Merging is not optional and every knob has a bounded default."""
+
+    def test_defaults(self, tmp_path: Path) -> None:
+        landing = load_config(cwd=tmp_path, env={}).landing
+        assert landing.deliver_draft is True
+        assert landing.max_review_rounds == 3
+        assert landing.max_ci_rounds == 2
+        assert landing.ci_poll_interval_s == 60.0
+        assert landing.ci_settle_s == 90.0
+        assert landing.ci_timeout_s == 3600.0
+        assert landing.merge_method == "squash"
+        assert landing.delete_branch_on_merge is True
+        assert landing.merge_update_attempts == 3
+        assert landing.review_diff_max_chars == 150_000
+        assert Config().retired_keys == ()
+
+    def test_layers_and_validation(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[landing]\nmax_review_rounds = 1\nci_settle_s = 0\ndeliver_draft = false\n"
+        )
+        config = load_config(
+            cwd=tmp_path,
+            env={
+                "SBXLOOP_LANDING__MERGE_METHOD": "rebase",
+                "SBXLOOP_LANDING__MERGE_UPDATE_ATTEMPTS": "0",
+                "SBXLOOP_LANDING__CI_POLL_INTERVAL_S": "5",
+            },
+        )
+        assert config.landing.max_review_rounds == 1
+        assert config.landing.ci_settle_s == 0.0
+        assert config.landing.deliver_draft is False
+        assert config.landing.merge_method == "rebase"
+        # 0 is a real setting, not a mistake: it disables branch updating.
+        assert config.landing.merge_update_attempts == 0
+        assert config.landing.ci_poll_interval_s == 5.0
+        for bad in (
+            {"SBXLOOP_LANDING__MERGE_METHOD": "yolo"},
+            {"SBXLOOP_LANDING__MERGE_UPDATE_ATTEMPTS": "-1"},
+            {"SBXLOOP_LANDING__MAX_REVIEW_ROUNDS": "-1"},
+            {"SBXLOOP_LANDING__CI_POLL_INTERVAL_S": "0"},
+            {"SBXLOOP_LANDING__CI_TIMEOUT_S": "0"},
+            {"SBXLOOP_LANDING__REVIEW_DIFF_MAX_CHARS": "100"},
+        ):
+            with pytest.raises(ConfigError):
+                load_config(cwd=tmp_path, env=bad)
+
+
+class TestRetiredKeys:
+    """The 1.0 pipeline retired the daemon's self-filing lanes and moved the
+    landing knobs under [landing]. A config still carrying them loads with a
+    warning (the daemon host is unattended), the moved values carry over,
+    and `retired_keys` names them for `doctor`."""
+
+    def test_daemon_landing_knobs_are_hoisted(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[daemon]\nauto_merge = true\nmerge_method = "rebase"\n'
+            "delete_branch_on_merge = false\nmerge_update_attempts = 1\n"
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert config.landing.merge_method == "rebase"
+        assert config.landing.delete_branch_on_merge is False
+        assert config.landing.merge_update_attempts == 1
+        assert set(config.retired_keys) == {
+            "daemon.auto_merge",
+            "daemon.merge_method",
+            "daemon.delete_branch_on_merge",
+            "daemon.merge_update_attempts",
+        }
+        assert not hasattr(config.daemon, "auto_merge")
+
+    def test_github_deliver_keys_are_tolerated_and_deliver_draft_hoisted(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[github]\nrepo = "o/r"\ndeliver = true\nreport = true\ndeliver_draft = false\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert config.github.repo == "o/r"
+        assert config.landing.deliver_draft is False
+        assert set(config.retired_keys) == {
+            "github.deliver",
+            "github.report",
+            "github.deliver_draft",
+        }
+
+    def test_an_explicit_landing_value_wins_over_a_hoisted_one(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[daemon]\nmerge_method = "rebase"\n[landing]\nmerge_method = "merge"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert config.landing.merge_method == "merge"
+        assert config.retired_keys == ("daemon.merge_method",)
+
+    def test_retired_lane_keys_are_dropped_with_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[daemon]\nbacklog = "github"\nreview_deliveries = true\n'
+            "close_on_success = false\ntracking_issue = true\n"
+            'audit_label = "sbxloop:audit"\ntool_repo = "o/tool"\ninbox_dir = "in"\n'
+        )
+        with caplog.at_level("WARNING"):
+            config = load_config(cwd=tmp_path, env={})
+        assert set(config.retired_keys) == {
+            "daemon.backlog",
+            "daemon.review_deliveries",
+            "daemon.close_on_success",
+            "daemon.tracking_issue",
+            "daemon.audit_label",
+            "daemon.tool_repo",
+            "daemon.inbox_dir",
+        }
+        assert config.daemon.trigger_label == "sbxloop:run"
+        assert any("config.retired_keys" in r.getMessage() for r in caplog.records)
+
+    def test_retired_keys_arrive_from_the_environment_too(self, tmp_path: Path) -> None:
+        config = load_config(
+            cwd=tmp_path,
+            env={"SBXLOOP_DAEMON__AUTO_MERGE": "true", "SBXLOOP_DAEMON__MERGE_METHOD": "merge"},
+        )
+        assert config.landing.merge_method == "merge"
+        assert set(config.retired_keys) == {"daemon.auto_merge", "daemon.merge_method"}
+
+    def test_a_hoisted_value_is_still_validated(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[daemon]\nmerge_method = "yolo"\n')
+        with pytest.raises(ConfigError):
+            load_config(cwd=tmp_path, env={})
+
+    def test_retired_keys_survive_a_round_trip_through_json(self, tmp_path: Path) -> None:
+        """Persisted run configs (and resume's rehydration) carry the clean
+        shape: nothing retired leaks back in."""
+        (tmp_path / "sbxloop.toml").write_text('[daemon]\nmerge_method = "rebase"\n')
+        config = load_config(cwd=tmp_path, env={})
+        again = Config.model_validate_json(config.model_dump_json())
+        assert again.landing.merge_method == "rebase"
+        assert again.retired_keys == ()
 
 
 def test_policy_defaults_empty(tmp_path: Path) -> None:
@@ -478,30 +610,10 @@ def test_run_stale_after_s_default_override_and_validation(tmp_path: Path) -> No
         load_config(cwd=tmp_path, env={})
 
 
-def test_auto_merge_defaults_off_and_is_operator_set(tmp_path: Path) -> None:
-    """Merging is the one irreversible thing the loop does to a repository,
-    and on a repo whose merges publish a release it means unattended
-    releases — so it never arrives switched on."""
+def test_merging_is_not_optional(tmp_path: Path) -> None:
+    """The old `auto_merge` opt-in is gone: a run that reaches landing merges
+    its own PR or ends blocked, never `done` with an unmerged PR."""
     config = load_config(cwd=tmp_path, env={})
-    assert config.daemon.auto_merge is False
-    assert config.daemon.merge_method == "squash"
-    assert config.daemon.delete_branch_on_merge is True
-    assert config.daemon.merge_update_attempts == 3
-    over = load_config(
-        cwd=tmp_path,
-        env={
-            "SBXLOOP_DAEMON__AUTO_MERGE": "true",
-            "SBXLOOP_DAEMON__MERGE_METHOD": "rebase",
-            "SBXLOOP_DAEMON__DELETE_BRANCH_ON_MERGE": "false",
-            "SBXLOOP_DAEMON__MERGE_UPDATE_ATTEMPTS": "0",
-        },
-    )
-    assert over.daemon.auto_merge is True
-    assert over.daemon.merge_method == "rebase"
-    assert over.daemon.delete_branch_on_merge is False
-    # 0 is a real setting, not a mistake: it disables branch updating.
-    assert over.daemon.merge_update_attempts == 0
-    with pytest.raises(ConfigError):
-        load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__MERGE_METHOD": "yolo"})
-    with pytest.raises(ConfigError):
-        load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__MERGE_UPDATE_ATTEMPTS": "-1"})
+    assert not hasattr(config.daemon, "auto_merge")
+    assert not hasattr(config.landing, "auto_merge")
+    assert config.landing.merge_method == "squash"

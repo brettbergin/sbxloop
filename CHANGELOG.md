@@ -6,10 +6,76 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **One run, from issue to merged pull request.** The engine now carries a
+  run past its task graph: GATE (the project's own gate over the whole
+  tree) → DELIVER (a draft PR) → REVIEW (the run's own adversarial pass
+  over the PR's diff, a fresh read-only session; its verdict is
+  authoritative and is also posted to the PR) → FIX rounds (one seeded
+  `fix-N` task each, built and verified like any other, re-delivered onto
+  the same branch, back through the gate) → CI (red fetches the failing
+  jobs' logs into the next fix brief) → LAND (un-draft, update-branch,
+  merge with the judged head). Run states grew `gating`, `delivering`,
+  `reviewing`, `fixing`, `awaiting_ci`, `landing`, `merged` and `blocked`
+  (`running` is now `building`; `finalizing` is gone); `runs.stage` keeps
+  the last stage entered so `resume` re-enters there — a crash during a CI
+  wait costs a re-poll, not a rebuild. The knobs live in a new `[landing]`
+  section (`max_review_rounds`, `max_ci_rounds`, `ci_poll_interval_s`,
+  `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`,
+  `merge_update_attempts`, `deliver_draft`). Merging is not optional any
+  more: a run that cannot land its PR ends `blocked` with the PR open for a
+  human; one that runs out of rounds ends `failed` with the PR still a
+  draft. Waiting on GitHub is not charged to `max_wall_clock_s`, and a
+  Discord message or a cancel wakes a wait at once.
+- **Findings carry forward inside the run.** Every review round sees the
+  earlier rounds' findings and the fixer's per-finding `addressed` /
+  `refuted: <why>` list; a verdict that only re-raises refuted findings is
+  sent back once with the history quoted. This, plus the round budgets, is
+  what stops a run arguing with itself.
+- **The daemon files nothing.** Gone: the agent backlog lane
+  (`.sbxloop/backlog/*.md` → `sbxloop:backlog` issues), post-mortem
+  issues, scheduled audit charters (`.github/sbxloop/audits/`), tool
+  findings routed to `tool_repo`, the per-run tracking issue, and the
+  review lane's charter issues that re-entered the queue as `audit` work
+  items. In the field the loop had filed the same finding on consecutive
+  days under different issue numbers while only 17 of 225 issues ever
+  reached `sbxloop:completed`. A work item is now exactly one labeled
+  GitHub issue → one run; the inbox source and its `enqueue_work`
+  concierge tool are gone with it. The daemon settles each run's outcome
+  on the issue: `merged` → closed with `sbxloop:completed`, `failed` →
+  `sbxloop:failed`, `blocked` → the new `sbxloop:blocked`.
+- **Config cutover, tolerated.** `[daemon]` lost `inbox_dir`, `backlog`,
+  `backlog_max_per_run`, `backlog_auto_trigger`, `backlog_label`,
+  `audits`, `audit_dir`, `audit_label`, `delivered_label`, `postmortems`,
+  `postmortems_per_day`, `review_deliveries`, `await_review`,
+  `review_rounds`, `tool_repo`, `tracking_issue`, `close_on_success`,
+  `auto_merge` (landing is always on) and gained `blocked_label`;
+  `[github]` lost `report` and `deliver` (a repository means deliver). The
+  moved knobs (`deliver_draft`, `merge_method`, `delete_branch_on_merge`,
+  `merge_update_attempts`) are carried into `[landing]` when found in
+  their old place. A config still carrying any of these loads with a
+  `config.retired_keys` warning and a `sbxloop doctor` row rather than
+  failing — the daemon host deploys unattended and a hard failure there
+  would roll the release back before anyone could edit the file. They
+  become errors in 1.0.0.
+- **State cutover.** The daemon's tables changed shape (no PR-state,
+  review, audit, post-mortem or backlog tables; one item kind). A pre-1.0
+  `state.db` is moved aside to `state.db.pre-1.0` on first start rather
+  than migrated (docs/deploy.md, "1.0 cutover").
+- **Removed with the above:** `sbxloop deliver` (resume at `delivering` is
+  the retry path), `sbxloop run --report/--deliver/--deliver-draft`, the
+  `GithubReporterHook` tracking issue, `sbxloop daemon --inbox/--backlog`,
+  the `run.report` event, `LoopEngine.deliver()`. New worker op
+  `checks.failed_logs` (Actions job logs for failed check runs; the REST
+  transport does not forward the bearer token on the redirect to blob
+  storage) and `GithubOps.checks_failed_logs` / `pr_review_feedback`.
+
 ### Added
 
 - **The loop can land its own pull request (`[daemon] auto_merge`, default
-  off).** A delivered PR that clears the full acceptance bar — every check
+  off).** *(Superseded above before release: landing is now unconditional
+  and configured under `[landing]`.)* A delivered PR that clears the full acceptance bar — every check
   green *and* the review satisfied — is taken out of draft, brought up to
   date with its base if protection requires that, and merged; the source
   issue then settles through the merge path that already existed (closed,

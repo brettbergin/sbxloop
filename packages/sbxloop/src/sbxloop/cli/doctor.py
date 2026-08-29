@@ -375,6 +375,22 @@ def collect_checks(
     except OSError as exc:
         checks.append(Check("state dir", False, f"not writable: {exc}"))
 
+    # Retired config keys (the 1.0 pipeline dropped the self-filing lanes and
+    # moved the landing knobs). They load with a warning today so an
+    # unattended deploy cannot fail on them; they become errors in 1.0.
+    if config.retired_keys:
+        checks.append(
+            Check(
+                "retired config keys",
+                False,
+                "still in the config, ignored: "
+                + ", ".join(config.retired_keys)
+                + " — landing knobs were carried into [landing]; remove them before 1.0, "
+                "when they become errors (docs/deploy.md, '1.0 cutover')",
+                hard=False,
+            )
+        )
+
     legacy = _legacy_state_dir(config.state_dir, sources)
     if legacy is not None:
         checks.append(

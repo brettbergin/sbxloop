@@ -351,6 +351,71 @@ class TestResolveDiffBase:
         assert hostgit.resolve_diff_base(plain, None) is None
 
 
+class TestDiffText:
+    """The reviewer's view of the run's changes: tracked edits (committed or
+    not), deletions, and untracked files it never `git add`-ed."""
+
+    def test_includes_tracked_modifications_and_untracked_files(self, tmp_path: Path) -> None:
+        _, clone = make_clone(tmp_path)
+        (clone / "hello.txt").write_text("changed\n")
+        (clone / "old.txt").unlink()
+        (clone / "new.txt").write_text("brand new\n")
+
+        text = hostgit.diff_text(clone, None)
+
+        assert text is not None
+        # --stat header opens the text
+        assert text.splitlines()[0].strip().startswith("hello.txt")
+        assert "-hi\n+changed" in text
+        assert "diff --git a/old.txt b/old.txt" in text and "-old" in text
+        assert "diff --git a/new.txt b/new.txt" in text
+        assert "+brand new" in text
+        assert "\x1b[" not in text  # --no-color
+
+    def test_committed_work_counts_the_same(self, tmp_path: Path) -> None:
+        _, clone = make_clone(tmp_path)
+        (clone / "hello.txt").write_text("committed change\n")
+        git("commit", "-am", "edit", cwd=clone)
+        text = hostgit.diff_text(clone, None)
+        assert text is not None and "+committed change" in text
+
+    def test_ignored_untracked_files_are_left_out(self, tmp_path: Path) -> None:
+        source = make_repo(tmp_path)
+        (source / ".gitignore").write_text("*.log\n")
+        git("add", ".", cwd=source)
+        git("commit", "-m", "ignore", cwd=source)
+        clone = tmp_path / "clone"
+        hostgit.clone_for_run(source, clone, "sbxloop/r1")
+        (clone / "debug.log").write_text("noise\n")
+        (clone / "kept.txt").write_text("x\n")
+        text = hostgit.diff_text(clone, None)
+        assert text is not None
+        assert "kept.txt" in text and "debug.log" not in text
+
+    def test_prefers_the_remote_base_when_known(self, tmp_path: Path) -> None:
+        source, clone = make_clone(tmp_path)
+        remote_tip = rev(source, "HEAD~1")
+        # Against HEAD~1 the second commit's files (old.txt, the script) are
+        # part of the diff; against the clone pin they are not.
+        against_tip = hostgit.diff_text(clone, remote_tip)
+        against_pin = hostgit.diff_text(clone, None)
+        assert against_tip is not None and "old.txt" in against_tip
+        assert against_pin == ""
+
+    def test_no_base_is_none(self, tmp_path: Path) -> None:
+        """A repo the agent git-init-ed itself has nothing to diff against;
+        the reviewer then reads the tree."""
+        assert hostgit.diff_text(make_repo(tmp_path), None) is None
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        assert hostgit.diff_text(plain, None) is None
+
+    def test_no_git_binary_is_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, clone = make_clone(tmp_path)
+        monkeypatch.setattr(hostgit, "find_git", lambda: None)
+        assert hostgit.diff_text(clone, None) is None
+
+
 def make_upstream_and_clone(tmp_path: Path) -> tuple[Path, Path]:
     """A bare 'origin' plus a checkout cloned from it — the daemon's
     dedicated-clone layout — so refresh has a real remote to fetch from."""

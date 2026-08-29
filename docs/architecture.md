@@ -108,9 +108,10 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   agent (`daemon/concierge.py`), a Copilot session with the agent token
   and **no built-in tools**: everything it can do is a *host tool*
   (`JobRequest.host_tools`) — daemon control through `control.dispatch`,
-  run/item lookups over the stores, `InboxSource.enqueue`, GitHub reads and
-  issue triage (file, list, comment, label for a run, close) through the ops
-  box, and `daemon_log` over the process's own recent log lines — relayed as
+  run/item lookups over the stores, GitHub reads and issue triage (file —
+  queued the moment it is filed — list, comment, label for a run, close)
+  through the ops box, and `daemon_log` over the process's own recent log
+  lines — relayed as
   `agent.tool_request` events and answered
   by the host's `HostToolBroker` with a response file (`sbx cp`) the worker
   polls for. It is **kept across daemon restarts** when the installed worker
@@ -142,12 +143,18 @@ every failure degrades to "could not reach PyPI" rather than raising.
 
 ## The loop
 
+One run carries an outcome all the way to a merged pull request:
+
 ```
 outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
              BUILD ─▶ VERIFY ─▶ done
                ▲        │fail (≤ max_revisions: same session resumes)
                └────────┘
                ▲ (revisions exhausted by verify: fresh session, one replan)
+
+        ─▶ GATE ─▶ DELIVER (draft PR) ─▶ REVIEW ─▶ CI ─▶ LAND ─▶ merged
+             ▲                            │request_changes / red / conflict
+             └──────── FIX (one task) ◀───┘  (≤ max_review_rounds / max_ci_rounds)
 ```
 
 - **DECOMPOSE** — one agent session turns the outcome into a validated task
@@ -165,23 +172,61 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   the one thrown away.
 - **VERIFY** — mechanical: the task's decomposer-authored `verify_commands`
   must all exit 0. No LLM.
+- **GATE** — the project's own gate (`[sandbox] gate_command`, or the
+  detected `make check` / `just ci` / `npm run check` / tox / nox) over the
+  whole tree, mechanical. The decomposer must put the gate in *some* task's
+  exam, but a later task can break what an earlier one proved; this is the
+  last check on the tree exactly as it will be delivered. A run with no
+  `[github] repo` ends `completed` here, its work in the workspace.
+- **DELIVER** — the tree becomes one commit on `sbxloop/<run>` and a draft
+  PR (see [Delivery](#delivery)); every later round re-delivers onto the
+  same branch, so one run is one PR.
+- **REVIEW** — a fresh read-only session reads the PR's whole diff
+  adversarially (concurrency, failure ordering, trust-boundary parsing,
+  cross-module invariants, scope) and returns a verdict with line-anchored
+  findings. The verdict is the run's own and is authoritative; it is also
+  posted to the PR for the record (as a `COMMENT` review when GitHub
+  refuses the loop's identity as a reviewer of its own PR).
+- **FIX** — one seeded task (`fix-N`), built and verified like any other
+  under the same revision/replan budgets, whose exam is the union of the
+  decomposer's verify commands plus the gate. Then back to GATE. Every
+  round sees the earlier rounds' findings and the fixer's per-finding
+  `addressed` / `refuted: <why>` list, and the next review is told not to
+  re-raise a refuted finding without a rebuttal (`RefutedGuard` sends such
+  a verdict back once) — the memory the old loop never had.
+- **CI** — poll the delivered head's check runs; red fetches the failing
+  jobs' logs into a fix brief. "No check runs yet" is trusted as "no CI"
+  only after `ci_settle_s`.
+- **LAND** — see below.
 
-There is no in-run critic. The former SCRUTINIZE/VALIDATE stages audited
-task completion and rubber-stamped it (6/6 pass, 5/5 accept in the measured
-baseline) while diff-level defects — races, failure ordering, unguarded
-parses — leaked to the PR. Adversarial review lives in the daemon's
-post-delivery review lane, which sees the whole diff and drives bounded fix
-rounds on the delivered PR — and, with `[daemon] auto_merge`, merges it (see
-[The acceptance gate, and landing](#the-acceptance-gate-and-landing)).
+Two round budgets bound the fix loop: `[landing] max_review_rounds` for
+verdicts that request changes, `max_ci_rounds` for the mechanical failures
+(a red gate, red CI, a base conflict, a human requesting changes on the PR).
+Past either the run ends `failed` with the PR still a draft — nothing
+re-picks it unless a human re-labels the issue. There is no per-task
+critic: the former SCRUTINIZE/VALIDATE stages audited task completion and
+rubber-stamped it (6/6 pass, 5/5 accept in the measured baseline) while
+diff-level defects leaked to the PR; one adversarial pass over the
+assembled diff is the critic that earns its turns.
 
 Failures loop with budgets: verify failures re-BUILD with the failure
 transcript as feedback (`max_revisions_per_task`); exhausting revisions on
 verify failures spends a replan (`max_replans_per_task`) and restarts with a
 fresh session. Exhaustion fails the task, skips its dependents, and finishes
-the run `failed`. A wall-clock budget bounds the whole run.
+the run `failed` before anything is delivered. `[budgets] max_wall_clock_s`
+bounds the agent's work; time spent waiting on GitHub (CI, landing) is not
+charged to it and is bounded separately by `[landing] ci_timeout_s`.
 
 Structured JSON phases are validated against pydantic models with one retry
 that feeds the validation error back to the agent.
+
+Every stage is a run state — `building`, `gating`, `delivering`,
+`reviewing`, `fixing`, `awaiting_ci`, `landing` — and the last one entered
+is kept in `runs.stage`, so a run that ends `failed` or `blocked` still
+knows where a resume re-enters. The sandbox pair stays alive across the
+waits (a fix round needs the agent sandbox, a poll the github one; an idle
+microVM is cheap); a chat message or a cancel wakes a wait at once rather
+than at the next poll interval.
 
 ### What a run costs
 
@@ -253,9 +298,12 @@ persisting — a crash and a `kill -9` look identical to the store — and
    change budgets/toggles or relocate the workspace. Any difference from
    the current on-disk config is reported as a `run.config_drift` event,
 2. re-provisions a fresh sandbox pair,
-3. reloads task records (plans included),
-4. continues from the last committed transition. A phase whose result was
-   never committed re-runs from its start; nothing is replayed.
+3. reloads task records,
+4. continues from the last committed transition — the task graph if the run
+   never delivered, else the pipeline stage in `runs.stage` (a re-delivery
+   is idempotent: the branch is force-moved and the open PR reused; a
+   review that never committed its verdict runs again). A phase whose
+   result was never committed re-runs from its start; nothing is replayed.
 
 ### Run reconciliation
 
@@ -265,8 +313,8 @@ process (or a cancelled work item) used to leave runs stuck in `running` or
 was active (#374). Two sweeps keep them honest, and both only ever *append*
 chronology (a `run.reconciled` event) — historical events are never mutated:
 
-- **Startup reconciliation** closes every non-terminal run (`created`,
-  `provisioning`, `decomposing`, `running`, `finalizing`) that is neither the
+- **Startup reconciliation** closes every non-terminal run (anything not in
+  `merged`/`completed`/`failed`/`blocked`/`cancelled`) that is neither the
   run executing in this process nor one pinned for resume.
 - **The staleness safety net** runs every tick — including while paused — and
   closes any non-terminal run whose last activity (chronology, falling back to
@@ -286,19 +334,15 @@ staleness sweep does not run at all while a run is executing. The persisted
 reason is surfaced next to the state in `sbxloop status` / `list_runs` output,
 on the `reason:` line of `sbxloop status <run>`, and in the TUI run header.
 
-## The acceptance gate, and landing
+## Landing
 
-A delivered PR is not done because it exists. `DaemonLoop._poll_one_review`
-advances one PR by exactly one step per tick, through gates ordered by what
-they cost — the PR's own fate first (a merge or an unmerged close outranks
-everything below), then CI (GitHub's compute, free), then the review, and only
-then the merge. Reviewing a red PR would spend a whole run on work that has to
-change anyway.
-
-The last gate is the **landing stage** (`_land`), reached only from the full
-bar: every check green *and* the review satisfied. With `[daemon] auto_merge`
-off it settles the item and stops, which is where the loop ended before. With
-it on:
+A delivered PR is not done because it exists, and merging is not optional:
+`engine/landing.py` drives the PR to a decision, polling in the order of
+what each gate costs — the PR's own fate first (a human merging it is the
+acceptance; a human closing it unmerged fails the run), then un-drafting,
+then a human's standing `CHANGES_REQUESTED` (the loop's own reviews are
+excluded from that fold — our verdict lives in the run), then CI, then
+mergeability, and only then the merge:
 
 1. **Draft → ready.** REST cannot un-draft a pull request, so this one call is
    GraphQL (`markPullRequestReadyForReview`) through the same `raw.api`
@@ -309,41 +353,52 @@ it on:
    becomes readable once it is out of draft.
 2. **Behind → update-branch.** Protection commonly requires a PR to be up to
    date before merging, and the base moves. One API call, not a run — but
-   bounded (`merge_update_attempts`), because a base moving faster than CI
-   finishes would update for ever.
-3. **Conflicted → a fix round.** A re-delivery rebuilds the commit on the
-   current base, so a real conflict is genuinely fixable. It spends the
-   existing `review_rounds` budget because, unlike every other landing step,
-   it costs a whole run.
-4. **Merge**, sending the head sha the gate actually judged. A push that
+   bounded (`[landing] merge_update_attempts`), because a base moving faster
+   than CI finishes would update for ever. The head an update was requested
+   at is recorded so a later poll can tell an update still in flight (head
+   unchanged) from one that has landed, rather than spending the budget
+   asking twice; the request carries `expected_head_sha`, so an update
+   racing another push fails rather than merging over it.
+3. **Conflicted, red, or objected to → a fix round**, on the CI budget. A
+   re-delivery rebuilds the commit on the current base, so a real conflict
+   is genuinely fixable.
+4. **Merge**, sending the head sha the loop actually judged. A push that
    landed since loses the race with a 409 rather than being merged over.
 
 Two answers come back as *data* rather than as exceptions, and the difference
 matters: **405** is GitHub's blanket "not mergeable right now" — a protection
 rule wanting an approval this identity cannot give, most often — which no
-retry fixes, so the item is handed over with the PR left open and out of
-draft; **409** is a race, so the next poll simply re-judges the new head.
+retry fixes, so the run ends `blocked` with the PR left open and out of
+draft for a human (and resumes at `landing` once they have acted); **409** is
+a race, so the next poll simply re-judges the new head. A draft that will
+not clear, CI that never reports within `ci_timeout_s`, and an update budget
+spent are `blocked` for the same reason: nothing another round would change.
 
-Fix rounds continue on whatever the PR's head is, whoever pushed it: the loop
-iterates on its own PR until it is merged, and its own review runs push
-fix-round commits onto that branch. The one piece of head bookkeeping left is
-the landing stage's: the head an update-branch was requested at is recorded so
-a later poll can tell an update still in flight (head unchanged) from one that
-has landed, rather than spending the budget asking twice. That request also
-carries `expected_head_sha`, so an update racing another push fails rather
-than merging over it.
+## The daemon
 
-## Daemon guardrails
+`sbxloop daemon` is deliberately small: it claims issues carrying
+`sbxloop:run` in the one configured repository (a label swap plus a claim
+comment as the optimistic lock), runs each as **one** engine run, and
+reports the outcome on the issue — closed with `sbxloop:completed` when the
+PR merged (the PR body's `Closes #N` closes it even if the daemon is down),
+`sbxloop:failed` when the run gave up (after the per-item attempt cap and
+its backoff), `sbxloop:blocked` when GitHub would not let the loop finish.
+It never files work of its own: only a human labelling an issue — directly,
+or by asking the Discord concierge, which files the issue *with* the label —
+starts a run. Everything else the daemon does is a guardrail or a
+recovery: the calendar-day run cap, the circuit breaker, the resume cap,
+pause and cancel, startup and staleness reconciliation, run-directory
+retention.
 
-The daemon's **run cap** is a wall-clock calendar-day gate: it counts the runs whose start time falls on the current day in
-`[daemon] run_cap_timezone` (any IANA zone, default `UTC`) and compares that
-against `[daemon] max_runs_per_day` (default 12, key name unchanged). The
-count resets at 00:00 in that zone, so a run started at 23:59 still occupies
-a slot for the remaining minute and frees it only at the boundary; the same
-day window backs the per-day review and post-mortem caps. This gate is
-distinct from the per-item attempt cap, the per-item resume cap and the
-persisted consecutive-failure circuit breaker, which are unaffected by the
-day boundary. Operator strings name both the day and the zone
+The **run cap** is a wall-clock calendar-day gate: it counts the runs whose
+start time falls on the current day in `[daemon] run_cap_timezone` (any
+IANA zone, default `UTC`) and compares that against
+`[daemon] max_runs_per_day` (default 12). The count resets at 00:00 in that
+zone, so a run started at 23:59 still occupies a slot for the remaining
+minute and frees it only at the boundary. This gate is distinct from the
+per-item attempt cap, the per-item resume cap and the persisted
+consecutive-failure circuit breaker, which are unaffected by the day
+boundary. Operator strings name both the day and the zone
 (`runs today (UTC): 7/10, resets at 00:00 UTC`).
 
 ## Events
@@ -352,17 +407,20 @@ Everything observable is an `Event` (versioned JSONL envelope, shared model
 in `sbxloop_worker.protocol`). Workers emit `worker.*`, `agent.*`, `gh.*`;
 the host adds `run.*`, `task.*`, `phase.*`, `sandbox.*`. All events flow
 through the host `EventBus` (synchronous, subscriber-exception-isolated) and
-are persisted to SQLite — the CLI TUI, `logs --follow`, and hooks like
-`GithubReporterHook` are all just bus subscribers.
+are persisted to SQLite — the CLI TUI, `logs --follow`, the daemon's log
+sink and the Discord bridge are all just bus subscribers.
 
-The phases that ask their agent for JSON (decompose, plan, scrutinize,
-validate) also emit what they *decided*, parsed: `run.tasks` (the roster,
-re-announced on resume with each task's persisted state), `phase.plan` (the
-steps, expected artifacts, verify commands and egress grants a task will be
-executed against) and `phase.verdict` (a critic's call, its issues and the
-feedback the executor is about to be told). These carry no information the
-agent's reply did not — they exist so a surface can show the decision without
-showing the agent's JSON, which is what the Discord bridge does.
+The stages that decide something also emit what they *decided*, parsed:
+`run.tasks` (the roster, re-announced on resume and after a fix task is
+appended), `review.verdict` (the round, the verdict, how many findings and
+how many block, the posted review's url), `fix.round` (the round, its kind
+— `review`, `gate`, `ci`, `conflict`, `human` — the task appended and the
+budget it spent), `ci.status` (the folded check-run state, emitted on change
+only), `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
+the PR and why. `run.state` fires on every stage entry — the state *is* the
+stage. These carry no information the agent's reply did not — they exist so
+a surface can show the decision without showing the agent's JSON, which is
+what the Discord bridge does.
 
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
 
@@ -453,9 +511,9 @@ subscribed to every run's bus under the logger `sbxloop.run`
   `sandbox.tooling_warning`, `sandbox.resources_warning`,
   `agent.permission_denied`, `agent.tool_cap`, `run.config_drift`.
 - `INFO` — lifecycle: `run.*`, task and phase start/state/end, what the
-  structured phases decided (`phase.plan`, `phase.verdict`), sandbox
-  provisioning, worker job start/end/result, GitHub op start/end, policy
-  denials, chat (steering) traffic, gc.
+  pipeline decided (`review.verdict`, `fix.round`, `ci.status`, `land.*`),
+  sandbox provisioning, worker job start/end/result, GitHub op start/end,
+  policy denials, chat (steering) traffic, gc.
 - `DEBUG` — everything else: individual tool calls, agent messages and
   deltas, usage, heartbeats, stdout, resource samples, policy allows.
 

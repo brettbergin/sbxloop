@@ -12,15 +12,37 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 RunState = Literal[
+    # the task graph
     "created",
     "provisioning",
     "decomposing",
-    "running",
-    "finalizing",
+    "building",
+    # the pipeline: one run carries its work all the way to a merged PR
+    "gating",
+    "delivering",
+    "reviewing",
+    "fixing",
+    "awaiting_ci",
+    "landing",
+    # terminal
+    "merged",
     "completed",
     "failed",
+    "blocked",
     "cancelled",
 ]
+
+# The post-build stages in order. `runs.stage` records the last non-terminal
+# state a run entered, so `resume` re-enters the pipeline where it stopped
+# rather than at the task graph.
+PIPELINE_STAGES: tuple[str, ...] = (
+    "gating",
+    "delivering",
+    "reviewing",
+    "fixing",
+    "awaiting_ci",
+    "landing",
+)
 
 TaskState = Literal[
     "pending",
@@ -32,16 +54,36 @@ TaskState = Literal[
 ]
 
 TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
-TERMINAL_RUN_STATES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+# `merged` is the end of a run that delivered to a repository; `completed`
+# the end of one with no repository to deliver to (a local `sbxloop run`
+# stops after the gate). `blocked` means the run cleared its own bar but
+# GitHub would not finish the PR — a protection rule, a draft that would not
+# clear, CI that never reported — so a human has to look; it is terminal for
+# liveness and resumable once the cause is fixed. `failed` and `cancelled`
+# are terminal for reporting (nothing is in flight, so `list_runs` must not
+# show them as active) yet an operator may still `sbxloop resume` them.
+TERMINAL_RUN_STATES: frozenset[str] = frozenset(
+    {"merged", "completed", "failed", "blocked", "cancelled"}
+)
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
-    # 'cancelled' is terminal for reporting/liveness purposes (nothing is in
-    # flight, so `list_runs` must not show it as active) yet an operator may
-    # still `sbxloop resume` a run they cancelled mid-flight — the same
-    # terminal+resumable combination 'failed' already has.
-    {"created", "provisioning", "decomposing", "running", "finalizing", "failed", "cancelled"}
+    {
+        "created",
+        "provisioning",
+        "decomposing",
+        "building",
+        *PIPELINE_STAGES,
+        "failed",
+        "blocked",
+        "cancelled",
+    }
 )
 
-Phase = Literal["decompose", "build", "verify"]
+Phase = Literal["decompose", "build", "verify", "gate", "review", "steer"]
+
+# What a fix round is for. `review` rounds are charged to the review budget;
+# everything else — a red gate, red CI, a base conflict, a human objecting on
+# the PR — to the CI budget, because those are the rounds red CI would cost.
+FixKind = Literal["review", "gate", "ci", "conflict", "human"]
 
 
 class _Model(BaseModel):
@@ -191,9 +233,28 @@ class RunRecord(_Model):
     # excludes kept runs unless asked to include them.
     kept_reason: str | None = None
     # Why this run reached its terminal state: reconciliation of an
-    # orphaned run, or cancellation attribution. None for runs still in
-    # flight or terminated through the ordinary in-process path.
+    # orphaned run, cancellation attribution, an exhausted budget, or what
+    # GitHub refused. None for runs still in flight or that ended merged.
     reason: str | None = None
+    # Pipeline bookkeeping. `stage` is the last non-terminal state the run
+    # entered — a terminal state overwrites `state` but leaves this, so a
+    # resume of a failed/blocked run knows where to re-enter. The PR fields
+    # are set at the first delivery; `head_sha` moves with every re-delivery
+    # and is what CI checks and the merge are judged against. The round
+    # counters are the budgets spent (see `[landing]`); `update_head` is the
+    # head an update-branch was requested at, so a later poll can tell an
+    # update still in flight from one that landed.
+    stage: str | None = None
+    pr_number: int | None = None
+    pr_url: str | None = None
+    pr_node_id: str | None = None
+    branch: str | None = None
+    head_sha: str | None = None
+    review_rounds: int = 0
+    ci_rounds: int = 0
+    update_attempts: int = 0
+    update_head: str | None = None
+    last_verdict: str | None = None
 
 
 class RunResult(_Model):
@@ -207,10 +268,15 @@ class RunResult(_Model):
     # Sandbox names deliberately left alive (keep_sandboxes/keep_on_failure),
     # so callers can point the user at `sbxloop shell`.
     kept_sandboxes: list[str] = Field(default_factory=list)
+    # The delivered pull request, when the run got that far, and why the run
+    # stopped short of `merged` when it did.
+    pr_number: int | None = None
+    pr_url: str | None = None
+    reason: str | None = None
 
     @property
     def succeeded(self) -> bool:
-        return self.state == "completed"
+        return self.state in ("merged", "completed")
 
 
 # Path components excluded from artifact listings, harvest and delivery by

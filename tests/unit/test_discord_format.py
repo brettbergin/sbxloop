@@ -23,22 +23,15 @@ from sbxloop.daemon.discord_format import (
     ToolDigest,
     _clip,
     _fence_state,
-    charter_skipped_notice,
     daemon_notice,
-    filed_lines,
-    filed_notice,
-    findings_summary,
     finish_embed,
     finish_text,
     format_for_discord,
     headline_embed,
     headline_text,
-    issue_url,
     mask_urls,
     output_excerpt,
     queue_lines,
-    ref_link,
-    refs_text,
     repetitive_streak,
     roster_text,
     split_markdown,
@@ -47,7 +40,7 @@ from sbxloop.daemon.discord_format import (
     summary_embed,
     summary_text,
 )
-from sbxloop.daemon.model import ReviewOutcome, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
 from sbxloop.events import Event
 
 
@@ -228,9 +221,7 @@ class TestFormat:
         assert format_for_discord(ev("agent.tool_end", tool="bash", success=False)) == []
 
     def test_link_carriers(self) -> None:
-        assert texts(
-            format_for_discord(ev("run.report", repo="o/r", issue=3, url="https://x/3"))
-        ) == ["📋 tracking issue [#3](https://x/3)"]
+        assert format_for_discord(ev("run.report", repo="o/r", issue=3, url="https://x/3")) == []
         pr = format_for_discord(ev("run.deliver", repo="o/r", pr=9, url="https://x/pull/9"))
         assert texts(pr) == ["🔀 PR [#9 · o/r](https://x/pull/9)"] and pr[0].flush
         assert texts(format_for_discord(ev("run.deliver", repo="o/r", error="409 empty"))) == [
@@ -629,9 +620,7 @@ class TestEmbeds:
         assert total <= EMBED_TOTAL_MAX
 
     def test_headline_card_by_state(self) -> None:
-        item = WorkItem(
-            item_id="gh:4", source="github", source_key="4", title="Fix login", url="https://x/4"
-        )
+        item = WorkItem(item_id="gh:4", source_key="4", title="Fix login", url="https://x/4")
         running = headline_embed(item, "r1", hostname="db")
         assert running.title == "Fix login" and running.url == "https://x/4"
         assert running.color == COLOR_RUNNING and running.footer == "sbxloop · db"
@@ -645,69 +634,42 @@ class TestEmbeds:
             "r1",
             "completed",
             branch="sbxloop/r1",
-            tracking=(12, "https://x/12"),
             pr=(34, "https://x/pull/34"),
             summary="3/3 tasks done",
+            requested_by="4242",
             hostname="db",
         )
         names = [n for n, _, _ in done.fields]
-        assert names == ["Source", "Run", "State", "Branch", "Tracking issue", "PR", "Tasks"]
+        assert names == ["Source", "Run", "State", "Branch", "PR", "Tasks", "Requested by"]
         assert done.color == COLOR_OK
+        assert {n: v for n, v, _ in done.fields}["Requested by"] == "<@4242>"
+        assert headline_embed(item, "r1", "merged", hostname="db").color == COLOR_OK
         assert headline_embed(item, "r1", "failed", hostname="db").color == COLOR_FAIL
-        assert headline_embed(item, "r1", "delivery_failed", hostname="db").color == COLOR_WARN
-        inbox = WorkItem(item_id="inbox:a.md", source="inbox", source_key="a.md", title="A")
-        assert headline_text(inbox, "r2") == "▶ run `r2` — **A** · inbox `a.md`"
+        assert headline_embed(item, "r1", "blocked", hostname="db").color == COLOR_WARN
+        assert headline_text(item, "r2", "merged").startswith("🎉 run `r2` — **Fix login**")
 
     def test_finish_card_and_text(self) -> None:
-        item = WorkItem(item_id="gh:4", source="github", source_key="4", title="Fix login")
-        report = RunReport(
-            "r1",
-            "completed",
-            "3/3 tasks done",
-            tracking_issue=(12, "https://x/12"),
-            delivery=(34, "https://x/pull/34"),
+        item = WorkItem(item_id="gh:4", source_key="4", title="Fix login")
+        report = RunReport("r1", "merged", "3/3 tasks done", pr=(34, "https://x/pull/34"), rounds=2)
+        assert finish_text("merged", report) == "**finished: merged** — 3/3 tasks done"
+        card = finish_embed(item, report, "merged", unanswered=1)
+        assert card.title == "🎉 finished: merged" and card.description == "3/3 tasks done"
+        assert [n for n, _, _ in card.fields] == ["PR", "Fix rounds", "Steering"]
+        assert card.color == COLOR_OK
+        blocked = finish_embed(
+            item,
+            RunReport("r1", "blocked", "x", pr=(34, "https://x/pull/34"), reason="405 refused"),
+            "blocked",
         )
-        assert finish_text("completed", report) == "**finished: completed** — 3/3 tasks done"
-        card = finish_embed(item, report, "completed", unanswered=1)
-        assert card.title == "✅ finished: completed" and card.description == "3/3 tasks done"
-        assert [n for n, _, _ in card.fields] == ["Tracking issue", "PR", "Steering"]
-        failed = finish_embed(
-            item, RunReport("r1", "completed", "x", delivery_error="409"), "delivery_failed"
-        )
-        assert failed.color == COLOR_WARN and failed.fields[0][1].startswith("⚠ 409")
-
-    def test_finish_card_shows_what_the_run_filed(self) -> None:
-        """An audit's deliverable is its findings: they belong on the card
-        next to the PR, linked, with upstream/noted ones told apart."""
-        audit = WorkItem(item_id="gh:9", source="github", source_key="9", title="A", kind="audit")
-        report = RunReport(
-            "r1",
-            "completed",
-            "2/2 tasks done",
-            filed=("gh:12", "gh:13"),
-            tool_filed=("brettbergin/sbxloop#5",),
-            tool_noted=("X",),
-        )
-        card = finish_embed(audit, report, "completed", repo="o/r")
-        assert {n: v for n, v, _ in card.fields} == {
-            "Filed": "[#12](https://github.com/o/r/issues/12), [#13](https://github.com/o/r/issues/13)",
-            "Upstream": "[brettbergin/sbxloop#5](https://github.com/brettbergin/sbxloop/issues/5)",
-            "Noted": (
-                "1 finding(s) about sbxloop noted, not filed — "
-                "set `[daemon] tool_repo` to route them upstream"
-            ),
-        }
-        empty = finish_embed(audit, RunReport("r1", "completed", "x"), "completed", repo="o/r")
-        assert empty.fields == (("Filed", "no findings", True),)
-        patch = WorkItem(item_id="gh:4", source="github", source_key="4", title="P")
-        assert finish_embed(patch, RunReport("r1", "completed", "x"), "completed").fields == ()
-        # No repo known (bridge without a github section): plain #n, never a broken link.
-        assert finish_embed(patch, report, "completed").fields[0][1] == "#12, #13"
+        assert blocked.color == COLOR_WARN
+        assert {n: v for n, v, _ in blocked.fields}["Reason"] == "405 refused"
+        # A merged run's reason (none) is not a field.
+        assert "Reason" not in {n for n, _, _ in card.fields}
 
     def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
         """#246: a cancel is not a failure; the card must name the requester
         and tell the human the run is resumable (or already re-queued)."""
-        item = WorkItem(item_id="gh:8", source="github", source_key="8", title="Demo")
+        item = WorkItem(item_id="gh:8", source_key="8", title="Demo")
         report = RunReport("r1", "cancelled", "1/3 tasks done", cancelled_by="Discord user `b`")
         text = finish_text("cancelled", report)
         assert "cancelled by Discord user `b`" in text and "`sbxloop resume r1`" in text
@@ -745,7 +707,6 @@ class TestEmbeds:
         items = [
             WorkItem(
                 item_id=f"gh:{i}",
-                source="github",
                 source_key=str(i),
                 title=f"T{i}",
                 url=f"https://x/{i}",
@@ -756,15 +717,6 @@ class TestEmbeds:
             queue_lines(items, limit=2)
             == "• `gh:0` [T0](https://x/0)\n• `gh:1` [T1](https://x/1)\n… and 1 more"
         )
-        audit = WorkItem(
-            item_id="gh:9",
-            source="github",
-            source_key="9",
-            title="A",
-            url="https://x/9",
-            kind="audit",
-        )
-        assert queue_lines([audit]) == "• `gh:9` 🔎 audit · [A](https://x/9)"
 
     def test_daemon_notice_masks_urls(self) -> None:
         assert mask_urls("PR https://x/pull/9 done") == "PR <https://x/pull/9> done"
@@ -775,6 +727,60 @@ class TestEmbeds:
         assert daemon_notice("✅ gh:8 done · PR https://x/pull/9", thread_id=77) == (
             "✅ gh:8 done · PR <https://x/pull/9> · <#77>"
         )
+        notice = DaemonNotice("run.done", "🎉 gh:8 merged · PR https://x/pull/9", run_id="r1")
+        assert (
+            daemon_notice(notice, thread_id=77) == "🎉 gh:8 merged · PR <https://x/pull/9> · <#77>"
+        )
+        warn = DaemonNotice("run.failed", "gh:8 failed", level="warning")
+        assert daemon_notice(warn) == "⚠ gh:8 failed"
+        error = DaemonNotice("run.blocked", "🚧 gh:8 blocked", level="error")
+        assert daemon_notice(error) == "🛑 🚧 gh:8 blocked"
+
+    def test_pipeline_events_render_one_line_each(self) -> None:
+        assert texts(format_for_discord(ev("run.state", state="reviewing"))) == ["🔍 **reviewing**"]
+        assert texts(format_for_discord(ev("run.state", state="awaiting_ci"))) == [
+            "⏳ **awaiting ci**"
+        ]
+        assert format_for_discord(ev("run.state", state="building")) == []
+        verdict = format_for_discord(
+            ev("review.verdict", round=2, verdict="request_changes", findings=3, url="https://r")
+        )
+        assert texts(verdict) == [
+            "🔍 review round 2: **requested changes** · 3 finding(s) · [review](https://r)"
+        ]
+        assert verdict[0].flush
+        assert texts(
+            format_for_discord(ev("review.verdict", round=3, verdict="approve", findings=0))
+        ) == ["🔍 review round 3: **approved** · 0 finding(s)"]
+        assert texts(
+            format_for_discord(
+                ev("fix.round", round=1, kind="ci", budget="1/2", why="mdformat, security failed")
+            )
+        ) == ["🛠 fix round 1 (ci, budget 1/2) — mdformat, security failed"]
+        assert texts(
+            format_for_discord(ev("ci.status", state="red", failed=["lint", "test (3.13)"]))
+        ) == ["❌ CI red — lint, test (3.13)"]
+        assert texts(format_for_discord(ev("ci.status", state="green", total=7))) == [
+            "✅ CI green · 7 check(s)"
+        ]
+        assert format_for_discord(ev("ci.status", state="pending")) == []
+        assert texts(format_for_discord(ev("land.undraft", pr=9))) == [
+            "🚀 PR #9 taken out of draft"
+        ]
+        assert texts(format_for_discord(ev("land.update", pr=9, attempt=1))) == [
+            "🚀 PR #9 updated from its base (attempt 1)"
+        ]
+        merged = format_for_discord(ev("run.merged", pr=9, url="https://x/pull/9"))
+        assert texts(merged) == ["🎉 **merged** PR [#9](https://x/pull/9)"] and merged[0].flush
+        assert texts(
+            format_for_discord(ev("run.merged", pr=9, url="https://x/pull/9", by_human=True))
+        ) == ["🎉 **merged** PR [#9](https://x/pull/9) (by a human)"]
+        assert texts(
+            format_for_discord(ev("run.blocked", pr=9, url="https://x/pull/9", why="405"))
+        ) == ["🚧 **blocked:** 405 · PR [#9](https://x/pull/9) — a human needs to look"]
+        assert texts(
+            format_for_discord(ev("run.deliver", repo="o/r", pr=9, url="https://x/pull/9", round=2))
+        ) == ["🔀 PR [#9 · o/r](https://x/pull/9) (round 2)"]
 
 
 def tev(ts: float, type: str, **data: Any) -> Event:
@@ -830,10 +836,10 @@ class TestRunSummary:
 
     def test_summary_card_stats_and_both_ledgers(self) -> None:
         stats = self._folded()
-        report = RunReport("r1", "completed", "2/2 tasks done", delivery=(34, "https://x/pull/34"))
-        card = summary_embed(stats, report, "completed")
+        report = RunReport("r1", "merged", "2/2 tasks done", pr=(34, "https://x/pull/34"))
+        card = summary_embed(stats, report, "merged")
         assert card.title == "📊 run summary" and card.color == COLOR_OK
-        assert card.description == "**completed** — 2/2 tasks done in 2m 00s"
+        assert card.description == "**merged** — 2/2 tasks done in 2m 00s"
         assert card.footer == "run r1"
         fields = {n: v for n, v, _ in card.fields}
         assert list(fields) == ["Stats", "Went well", "Needed work"]
@@ -841,7 +847,7 @@ class TestRunSummary:
         assert "tokens 3,000 in / 500 out" in fields["Stats"]
         assert "steering 1 asked / 1 answered" in fields["Stats"]
         well = fields["Went well"]
-        assert "delivered PR [#34](https://x/pull/34)" in well
+        assert "merged PR [#34](https://x/pull/34)" in well
         assert "all 2 task(s) completed" in well
         assert "answered all 1 steering message(s)" in well
         work = fields["Needed work"]
@@ -866,14 +872,14 @@ class TestRunSummary:
         stats.observe(tev(102.0, "chat.message", message_id="m1", text="x"))
         stats.observe(tev(103.0, "chat.reply", message_id="m1", error="worker died"))
         stats.observe(tev(104.0, "task.state", task_id="t1", state="failed"))
-        report = RunReport("r1", "failed", "0/1 tasks done", delivery_error="409 conflict")
+        report = RunReport("r1", "failed", "0/1 tasks done", reason="409 conflict", rounds=1)
         card = summary_embed(stats, report, "failed", unanswered=1)
         assert "_stats cover the run since the daemon last picked it up_" in (
             card.description or ""
         )
         work = {n: v for n, v, _ in card.fields}["Needed work"]
         assert "1 task(s) failed" in work
-        assert "delivery failed — 409 conflict" in work
+        assert "failed — 409 conflict" in work and "1 fix round(s) spent" in work
         assert "1 steering message(s) went unanswered" in work
         assert "1 steer(s) errored" in work
         assert "hit the per-phase tool-call ceiling" in work
@@ -900,71 +906,6 @@ class TestRunSummary:
         rendered = text + "\n".join(f"{n}{v}" for n, v, _ in card.fields)
         assert "$" not in rendered
         assert "45" not in rendered
-
-
-class TestFiledRefs:
-    """Refs the daemon files (``gh:n``, ``owner/name#n``) rendered the way
-    every other link in the bridge is: masked, or plain when no URL is known."""
-
-    def test_ref_link_and_refs_text(self) -> None:
-        assert issue_url("gh:12", "o/r") == "https://github.com/o/r/issues/12"
-        assert issue_url("gh:12") is None
-        assert issue_url("o/x#5") == "https://github.com/o/x/issues/5"
-        assert issue_url("gh:existing", "o/r") is None
-        assert ref_link("gh:12", "o/r") == "[#12](https://github.com/o/r/issues/12)"
-        assert ref_link("gh:12") == "#12"
-        assert ref_link("o/x#5") == "[o/x#5](https://github.com/o/x/issues/5)"
-        assert ref_link("inbox:foo.md") == "`inbox:foo.md`"
-        assert ref_link("gh:existing") == "`gh:existing`"
-        assert refs_text(["gh:1", "gh:2"], "o/r") == (
-            "[#1](https://github.com/o/r/issues/1), [#2](https://github.com/o/r/issues/2)"
-        )
-        assert refs_text([f"gh:{i}" for i in range(8)], limit=6) == "#0, #1, #2, #3, #4, #5, … +2"
-
-    def test_filed_notice(self) -> None:
-        assert filed_notice(
-            "audit", "gh:701", repo="o/r", target="charter `flakes`", detail="audit: flakes"
-        ) == (
-            "🔎 audit [#701](https://github.com/o/r/issues/701) filed for charter `flakes`"
-            " · audit: flakes"
-        )
-        assert filed_notice("post-mortem", "gh:901", target="gh:4", detail="abandoned: boom") == (
-            "🔎 post-mortem #901 filed for gh:4 · abandoned: boom"
-        )
-        assert filed_notice("review", "gh:801") == "🔎 review #801 filed"
-
-    def test_findings_summary_and_filed_lines(self) -> None:
-        none = RunReport("r1", "completed", "x")
-        assert findings_summary(none) == ""
-        assert findings_summary(none, kind="audit") == "no findings"
-        assert filed_lines(none) == []
-        report = RunReport(
-            "r1", "completed", "x", filed=("gh:12",), tool_filed=("o/x#5",), tool_noted=("A", "B")
-        )
-        assert findings_summary(report, repo="o/r") == (
-            "filed [#12](https://github.com/o/r/issues/12)"
-            " · upstream [o/x#5](https://github.com/o/x/issues/5)"
-            " · noted 2 finding(s) about sbxloop — set `[daemon] tool_repo` to file them upstream"
-        )
-        assert filed_lines(report, repo="o/r") == [
-            "🔎 filed #12 <https://github.com/o/r/issues/12>",
-            "🔎 filed upstream o/x#5 <https://github.com/o/x/issues/5>",
-            "⚠ 2 finding(s) about sbxloop noted, not filed — "
-            "set `[daemon] tool_repo` to route them upstream",
-        ]
-        assert filed_lines(report._replace(tool_filed=(), tool_noted=())) == ["🔎 filed #12"]
-        # Masked links survive the control-channel URL masking.
-        assert daemon_notice(findings_summary(report, repo="o/r")) == findings_summary(
-            report, repo="o/r"
-        )
-
-    def test_charter_skipped_notice(self) -> None:
-        assert charter_skipped_notice(
-            "a/bad.md: charter body is empty", ".github/sbxloop/audits"
-        ) == (
-            "⚠ audit charter skipped: a/bad.md: charter body is empty"
-            " · fix or remove it under `.github/sbxloop/audits`"
-        )
 
 
 def test_embed_converter_roundtrip() -> None:
@@ -1241,135 +1182,6 @@ class TestOldWorkerEventCompatibility:
             "bash", 1, "x" * 200000 + "\n" + "y\n" * 5000, success=False, max_lines=200
         )
         assert chunk is not None and len(chunk.text) <= DISCORD_MAX_MESSAGE
-
-
-class TestReviewReporting:
-    """#469: a review run files no backlog issues, so the audit wording made
-    a REQUEST_CHANGES with eleven inline comments read as "no findings"."""
-
-    item = WorkItem(item_id="gh:467", source="github", source_key="467", title="R", kind="audit")
-
-    def _report(self, review: ReviewOutcome) -> RunReport:
-        return RunReport("r1", "completed", "4/4 tasks done", review=review)
-
-    def test_request_changes_posted_as_non_gating_comment(self) -> None:
-        review = ReviewOutcome(
-            pr_number=463,
-            url="https://github.com/o/r/pull/463#pullrequestreview-1",
-            requested_event="REQUEST_CHANGES",
-            posted_event="COMMENT",
-            comments=11,
-            gates_merge=False,
-        )
-        report = self._report(review)
-        summary = findings_summary(report, repo="o/r", kind="audit")
-        assert summary == (
-            "review requested changes · 11 inline comment(s)"
-            " · <https://github.com/o/r/pull/463#pullrequestreview-1>"
-            " · ⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
-            " so nothing on the PR blocks the merge"
-        )
-        card = finish_embed(self.item, report, "completed", repo="o/r")
-        field = {n: v for n, v, _ in card.fields}["Review"]
-        assert field == (
-            "[requested changes · 11 inline comment(s)]"
-            "(https://github.com/o/r/pull/463#pullrequestreview-1)\n"
-            "⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
-            " so nothing on the PR blocks the merge"
-        )
-        # The whole point of the bug: never claim a clean PR here.
-        assert "no findings" not in summary
-        assert not any("no findings" in v for _, v, _ in card.fields)
-
-    def test_approve_with_zero_comments_reads_as_a_clean_review(self) -> None:
-        review = ReviewOutcome(
-            pr_number=470,
-            url="https://github.com/o/r/pull/470#pullrequestreview-9",
-            requested_event="APPROVE",
-            posted_event="APPROVE",
-            comments=0,
-            gates_merge=True,
-        )
-        report = self._report(review)
-        summary = findings_summary(report, repo="o/r", kind="audit")
-        assert summary == (
-            "review approved · no comments · <https://github.com/o/r/pull/470#pullrequestreview-9>"
-        )
-        assert "no findings" not in summary
-        card = finish_embed(self.item, report, "completed", repo="o/r")
-        assert {n: v for n, v, _ in card.fields}["Review"] == (
-            "[approved · no comments](https://github.com/o/r/pull/470#pullrequestreview-9)"
-        )
-
-    def test_audit_without_a_review_keeps_its_wording(self) -> None:
-        none = RunReport("r1", "completed", "x")
-        assert findings_summary(none, kind="audit") == "no findings"
-        card = finish_embed(self.item, none, "completed", repo="o/r")
-        assert card.fields == (("Filed", "no findings", True),)
-
-    def test_downgraded_approve_does_not_borrow_request_changes_wording(self) -> None:
-        """PR review comment (discord_format.py:1806): `_non_gating_note` was
-        written for `request_changes` and rendered for a downgraded `approve`
-        too, claiming an approval "does not gate the merge" — an approval
-        never gated the merge; what it actually loses is the ability to
-        satisfy a required-approval check."""
-        review = ReviewOutcome(
-            pr_number=470,
-            url="https://github.com/o/r/pull/470#pullrequestreview-9",
-            requested_event="APPROVE",
-            posted_event="COMMENT",
-            comments=0,
-            gates_merge=False,
-        )
-        report = self._report(review)
-        summary = findings_summary(report, repo="o/r", kind="audit")
-        assert summary == (
-            "review approved · no comments"
-            " · <https://github.com/o/r/pull/470#pullrequestreview-9>"
-            " · ⚠ posted as `COMMENT`, not `APPROVE` — it does not satisfy a"
-            " required-review gate; a human approval is still needed"
-        )
-        assert "so nothing on the PR blocks the merge" not in summary
-
-    def test_a_lost_review_does_not_read_as_no_findings(self) -> None:
-        """PR review comment (loop.py:1004): `posted is None` used to be
-        read as "this was not a review", collapsing four distinct failure
-        modes (missing/unparseable review.json, no GitHub source, a raised
-        POST) into the audit lane's clean-bill wording — exactly the runs
-        where the operator most needs to know the review never landed."""
-        report = RunReport("r1", "completed", "4/4 tasks done", review_failed=True)
-        summary = findings_summary(report, kind="audit")
-        assert summary == "⚠ review could not be posted to the pull request — see the daemon log"
-        assert "no findings" not in summary
-        card = finish_embed(self.item, report, "completed", repo="o/r")
-        assert {n: v for n, v, _ in card.fields}["Review"] == (
-            "⚠ review could not be posted to the pull request — see the daemon log"
-        )
-
-    def test_filed_lines_reports_the_review_for_the_text_only_watch_notice(self) -> None:
-        """PR review comment (discord_format.py:1839): `findings_summary`
-        learned about reviews but `filed_lines` had not — and it is not a
-        redundant duplicate, since `discord.py`'s watch notice (no embed
-        attached) renders only `filed_lines`."""
-        review = ReviewOutcome(
-            pr_number=463,
-            url="https://github.com/o/r/pull/463#pullrequestreview-1",
-            requested_event="REQUEST_CHANGES",
-            posted_event="COMMENT",
-            comments=11,
-            gates_merge=False,
-        )
-        report = self._report(review)
-        assert filed_lines(report, repo="o/r")[0] == (
-            "🔎 review requested changes · 11 inline comment(s)"
-            " · <https://github.com/o/r/pull/463#pullrequestreview-1>"
-            " · ⚠ posted as a non-gating `COMMENT` — `REQUEST_CHANGES` was refused,"
-            " so nothing on the PR blocks the merge"
-        )
-        lost = RunReport("r1", "completed", "x", review_failed=True)
-        assert filed_lines(lost) == [
-            "⚠ review could not be posted to the pull request — see the daemon log"
-        ]
 
 
 class TestNoFabricatedSpend:

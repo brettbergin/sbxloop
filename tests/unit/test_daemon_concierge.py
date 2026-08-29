@@ -27,7 +27,6 @@ from sbxloop.daemon.concierge import (
     ConciergeReply,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
-from sbxloop.daemon.sources import InboxSource
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TaskSpec
 from sbxloop.engine.store import StateStore
@@ -195,7 +194,6 @@ def make(
     scripts: list[Script],
     *,
     github: FakeGithub | None = None,
-    inbox: bool = True,
     config: dict[str, Any] | None = None,
     versions: Any = None,
     on_watch: Callable[[str, str], str | None] | None = None,
@@ -203,7 +201,6 @@ def make(
     raw: dict[str, Any] = {
         "state_dir": str(tmp_path / "state"),
         "discord": {"channel_id": 42},
-        "daemon": {"inbox_dir": str(tmp_path / "inbox")},
     }
     if github is not None:
         raw["github"] = {"repo": "owner/repo"}
@@ -221,7 +218,6 @@ def make(
         loop=loop,  # type: ignore[arg-type]
         dstore=dstore,
         store_factory=lambda: StateStore(cfg.state_dir / "state.db"),
-        inbox=InboxSource(tmp_path / "inbox") if inbox else None,
         github=github,  # type: ignore[arg-type]
         host=host,
         bus=EventBus(),
@@ -233,9 +229,12 @@ def make(
 
 
 def turn(
-    concierge: Concierge, text: str = "hello", author: str = "Discord user `brett`"
+    concierge: Concierge,
+    text: str = "hello",
+    author: str = "Discord user `brett`",
+    author_id: str | None = None,
 ) -> ConciergeReply:
-    return concierge.submit_turn(text, author=author).result(timeout=10)
+    return concierge.submit_turn(text, author=author, author_id=author_id).result(timeout=10)
 
 
 class TestJobShape:
@@ -257,7 +256,6 @@ class TestJobShape:
             "watch_run",
             "run_events",
             "item_detail",
-            "enqueue_work",
             "version_status",
             "run_usage",
             "usage_today",
@@ -353,43 +351,6 @@ class TestTools:
         assert resp.ok  # the tool ran; the daemon just did not accept the verb
         assert resp.text.startswith("(command not accepted)")
 
-    def test_enqueue_work_writes_a_pending_inbox_item(self, tmp_path: Path) -> None:
-        concierge, client, *_ = make(
-            tmp_path,
-            [
-                {
-                    "calls": [
-                        ("enqueue_work", {"title": "Add retries to fetch", "body": "Wrap fetch()…"})
-                    ]
-                }
-            ],
-        )
-        turn(concierge, "also please add retries", author="Discord user `ana`")
-        (resp,) = client.responses
-        assert resp.ok and resp.text.startswith("queued inbox:add-retries-to-fetch-")
-        (path,) = (tmp_path / "inbox" / "pending").glob("*.md")
-        text = path.read_text()
-        assert text.startswith("# Add retries to fetch\n\nWrap fetch()…")
-        assert "Requested by Discord user `ana` (via concierge) via the concierge" in text
-        # ...and the daemon's inbox source will poll it (after the settle window).
-        source = InboxSource(tmp_path / "inbox", clock=lambda: time.time() + 10)
-        assert [i.title for i in source.poll()] == ["Add retries to fetch"]
-
-    def test_enqueue_without_inbox_is_an_error_text(self, tmp_path: Path) -> None:
-        concierge, client, *_ = make(
-            tmp_path, [{"calls": [("enqueue_work", {"title": "t", "body": "b"})]}], inbox=False
-        )
-        turn(concierge)
-        assert "no inbox source" in client.responses[0].text
-
-    def test_enqueue_mentions_paused_daemon(self, tmp_path: Path) -> None:
-        concierge, client, _, loop, _ = make(
-            tmp_path, [{"calls": [("enqueue_work", {"title": "t", "body": "b"})]}]
-        )
-        loop.paused = True
-        turn(concierge)
-        assert "PAUSED" in client.responses[0].text
-
     def _seed_run(self, tmp_path: Path, dstore: DaemonStore, loop: LoopWithRuns) -> StateStore:
         store = StateStore(tmp_path / "state" / "state.db")
         store.create_run("r1abcdefg", "Ship the widget")
@@ -406,12 +367,12 @@ class TestTools:
             )
         store.append_event(Event.now("task.end", "r1abcdefg", task="t1", state="done"))
         store.append_run_guidance("r1abcdefg", "prefer small commits")
-        item = WorkItem(item_id="inbox:w.md", source="inbox", source_key="w.md", title="Widget")
+        item = WorkItem(item_id="inbox:w.md", source_key="w.md", title="Widget")
         dstore.upsert_new(item, 1.0)
         dstore.mark_running("inbox:w.md", "r1abcdefg", 2.0)
         dstore.record_discord_thread("r1abcdefg", 42, 4242, None)
         loop.reports["r1abcdefg"] = RunReport(
-            "r1abcdefg", "completed", "2/2 tasks done", delivery=(7, "https://gh/pr/7")
+            "r1abcdefg", "completed", "2/2 tasks done", pr=(7, "https://gh/pr/7")
         )
         return store
 
@@ -582,7 +543,7 @@ class TestTools:
         assert events.text.startswith("(4 events; showing last 2)") or "msg 2" in events.text
         assert "msg 2" in events.text and "msg 0" not in events.text
         assert missing.text.startswith("no run 'nope'")
-        assert "inbox:w.md: patch from inbox · state running" in item.text
+        assert "inbox:w.md: state running" in item.text
         assert "runs: r1abcdefg" in item.text and "<#4242>" in item.text
 
     def test_github_get_reads_through_the_ops_sandbox(self, tmp_path: Path) -> None:
@@ -642,7 +603,7 @@ class TestTools:
         assert bad.text == "pr needs number"
         assert github.paths[0] == "/repos/owner/repo/pulls/7"
 
-    def test_list_issues_defaults_to_the_backlog_and_flags_queued_ones(
+    def test_list_issues_lists_everything_open_and_flags_daemon_states(
         self, tmp_path: Path
     ) -> None:
         github = FakeGithub(
@@ -651,7 +612,7 @@ class TestTools:
                     {
                         "number": 7,
                         "title": "Retry the fetch client",
-                        "labels": [{"name": "sbxloop:backlog"}],
+                        "labels": [{"name": "bug"}],
                         "created_at": "2026-08-01T00:00:00Z",
                         "user": {"login": "ana"},
                         "comments": 2,
@@ -660,11 +621,20 @@ class TestTools:
                     {
                         "number": 9,
                         "title": "Already going",
-                        "labels": [{"name": "sbxloop:backlog"}, {"name": "sbxloop:run"}],
+                        "labels": [{"name": "sbxloop:run"}],
                         "created_at": "bogus",
                         "user": {"login": "bo"},
                         "comments": 0,
                         "html_url": "https://gh/i/9",
+                    },
+                    {
+                        "number": 11,
+                        "title": "Stuck",
+                        "labels": [{"name": "sbxloop:blocked"}],
+                        "created_at": "bogus",
+                        "user": {"login": "bo"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/11",
                     },
                     {"number": 10, "title": "a PR", "pull_request": {}, "labels": []},
                 ]
@@ -676,29 +646,30 @@ class TestTools:
                 {
                     "calls": [
                         ("list_issues", {}),
-                        ("list_issues", {"all": True, "limit": 5}),
+                        ("list_issues", {"limit": 5}),
                         ("list_issues", {"label": "bug"}),
                     ]
                 }
             ],
             github=github,
         )
-        turn(concierge, "what's in the backlog?")
-        backlog, everything, bugs = client.responses
-        assert backlog.text.startswith("2 open issue(s) in owner/repo with `sbxloop:backlog`")
-        assert "- #7 Retry the fetch client · [sbxloop:backlog]" in backlog.text
-        assert "by ana · 2 comments · https://gh/i/7" in backlog.text
-        assert "#9 Already going" in backlog.text and "QUEUED for a run" in backlog.text
-        assert "#10" not in backlog.text  # pull requests are not issues
-        assert "ask the person which, if any, should be worked" in backlog.text
-        assert "labels=sbxloop%3Abacklog" in github.paths[0]
-        assert "labels=" not in github.paths[1] and "per_page=5" in github.paths[1]
+        turn(concierge, "what's open?")
+        everything, capped, bugs = client.responses
+        assert everything.text.startswith("3 open issue(s) in owner/repo (newest activity first")
+        assert "- #7 Retry the fetch client · [bug]" in everything.text
+        assert "by ana · 2 comments · https://gh/i/7" in everything.text
+        assert "#9 Already going" in everything.text and "QUEUED for a run" in everything.text
+        assert "#11 Stuck" in everything.text and "BLOCKED — needs a human" in everything.text
+        assert "#10" not in everything.text  # pull requests are not issues
+        assert "label_issue_for_run" in everything.text and "create_issue" in everything.text
+        assert "labels=" not in github.paths[0]
+        assert "per_page=5" in github.paths[1]
         assert "labels=bug" in github.paths[2]
-        assert everything.ok and bugs.ok
+        assert capped.ok and bugs.ok
 
-    def test_create_issue_files_in_triage_and_labels_only_on_request(self, tmp_path: Path) -> None:
+    def test_create_issue_files_and_queues_in_one_hop(self, tmp_path: Path) -> None:
         github = FakeGithub()
-        concierge, client, *_ = make(
+        concierge, client, _, _, dstore = make(
             tmp_path,
             [
                 {
@@ -709,26 +680,56 @@ class TestTools:
                         ),
                         ("create_issue", {"title": "", "body": "x"}),
                     ],
-                    "text": "Filed #41. Should I label it sbxloop:run?",
+                    "text": "Filed and queued #41; a run thread will appear here.",
                 },
-                {"calls": [("label_issue_for_run", {"number": 41})], "text": "done"},
+                {"calls": [("label_issue_for_run", {"number": 12})], "text": "done"},
             ],
             github=github,
         )
-        turn(concierge, "file an issue: add retries to fetch", author="Discord user `ana`")
+        turn(concierge, "add retries to fetch", author="Discord user `ana`", author_id="777")
         created, bad = client.responses
-        assert created.ok and created.text.startswith("created issue #41 https://gh/i/41")
-        assert "`sbxloop:backlog`" in created.text and "ask the person" in created.text
+        assert created.ok and created.text.startswith(
+            "created and queued issue #41 https://gh/i/41"
+        )
+        assert "`sbxloop:run`" in created.text and "run thread will appear" in created.text
+        assert "ask the person" not in created.text
         assert bad.text == "both title and body are required"
         (repo, title, body, labels) = github.created[0]
         assert repo == "owner/repo" and title == "Add retries to fetch"
-        assert labels == ["sbxloop:backlog"]
+        assert labels == ["sbxloop:run"]
         assert body.startswith("Wrap fetch().\n\n---\nFiled by Discord user `ana` (via concierge)")
-        assert not any("/labels" in p for p in github.paths)  # not labelled for a run yet
-        turn(concierge, "yes", author="Discord user `ana`")
+        assert "777" not in body  # the requester never reaches the public issue
+        assert not any("/labels" in p for p in github.paths)  # already queued: no label call
+        # ...but the daemon's store knows who asked, so the work item will.
+        dstore.upsert_new(WorkItem(item_id="gh:41", source_key="41", title="Add retries"), 1.0)
+        assert dstore.get("gh:41").requested_by == "777"  # type: ignore[union-attr]
+        # An issue that already exists is queued with label_issue_for_run.
+        turn(concierge, "run #12 too", author="Discord user `ana`")
         (labelled,) = client.responses[2:]
-        assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #41")
-        assert github.paths[-1] == "/repos/owner/repo/issues/41/labels"
+        assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #12")
+        assert github.paths[-1] == "/repos/owner/repo/issues/12/labels"
+
+    def test_create_issue_without_an_author_id_records_no_requester(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [{"calls": [("create_issue", {"title": "T", "body": "B"})]}],
+            github=github,
+        )
+        turn(concierge, "do T")
+        assert client.responses[0].ok
+        dstore.upsert_new(WorkItem(item_id="gh:41", source_key="41", title="T"), 1.0)
+        assert dstore.get("gh:41").requested_by is None  # type: ignore[union-attr]
+
+    def test_create_issue_mentions_a_paused_daemon(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [{"calls": [("create_issue", {"title": "t", "body": "b"})]}],
+            github=FakeGithub(),
+        )
+        loop.paused = True
+        turn(concierge)
+        assert "PAUSED" in client.responses[0].text
 
     def test_version_status_reports_drift(self, tmp_path: Path) -> None:
         versions = FakeVersions("sbxloop 0.7.12 installed · 0.7.15 on PyPI · BEHIND")
@@ -1057,7 +1058,7 @@ class TestTools:
                 ],
                 github=github,
             )
-            item = WorkItem(item_id="gh:12", source="github", source_key="12", title="T")
+            item = WorkItem(item_id="gh:12", source_key="12", title="T")
             dstore.upsert_new(item, 1.0)
             if claimed:
                 dstore.mark_claimed("gh:12", 2.0)
@@ -1444,7 +1445,7 @@ class TestWatchRun:
         )
         store = StateStore(tmp_path / "state" / "state.db")
         store.create_run("r7abcdefg", "Ship it")
-        store.set_run_state("r7abcdefg", "running")
+        store.set_run_state("r7abcdefg", "building")
         turn(concierge, author="alice")
         text = client.responses[0].text
         assert seen == [("r7abcdefg", "alice (via concierge)")]
@@ -1465,7 +1466,7 @@ class TestWatchRun:
             "r8abcdefg",
             "completed",
             "2/2 tasks done",
-            delivery=(9, "https://github.com/owner/repo/pull/9"),
+            pr=(9, "https://github.com/owner/repo/pull/9"),
         )
         turn(concierge, author="alice")
         text = client.responses[0].text
@@ -1485,8 +1486,8 @@ class TestWatchRun:
         for run_id in ("r1abcdefg", "r2abcdefg"):
             store.create_run(run_id, "Ship it")
         store.set_run_state("r1abcdefg", "failed")
-        store.set_run_state("r2abcdefg", "running")
-        item = WorkItem(item_id="inbox:w.md", source="inbox", source_key="w.md", title="Widget")
+        store.set_run_state("r2abcdefg", "building")
+        item = WorkItem(item_id="inbox:w.md", source_key="w.md", title="Widget")
         dstore.upsert_new(item, 1.0)
         dstore.mark_running("inbox:w.md", "r1abcdefg", 2.0)
         dstore.mark_running("inbox:w.md", "r2abcdefg", 3.0)
@@ -1511,7 +1512,7 @@ class TestWatchRun:
         )
         store = StateStore(tmp_path / "state" / "state.db")
         store.create_run("r9abcdefg", "Ship it")
-        store.set_run_state("r9abcdefg", "running")
+        store.set_run_state("r9abcdefg", "building")
         turn(concierge)
         assert "not available on this transport" in client.responses[0].text
 

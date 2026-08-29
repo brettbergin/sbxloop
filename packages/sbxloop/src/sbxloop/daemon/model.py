@@ -1,4 +1,5 @@
-"""Daemon data models: the work item and what a finished run reports."""
+"""Daemon data models: the work item, what a finished run reports, and the
+notices the loop narrates to a human channel."""
 
 from __future__ import annotations
 
@@ -8,39 +9,35 @@ from pydantic import BaseModel, ConfigDict
 
 from sbxloop.engine.model import RunState
 
-ItemSource = Literal["github", "inbox"]
-# What a run of the item is FOR. ``patch``: change the tree, deliver a PR.
-# ``audit``: investigate and file findings as backlog issues — no delivery,
-# the tree is disposable, the issues are the output (the discovery lane).
-ItemKind = Literal["patch", "audit"]
 # ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
 # it is terminal for the daemon (no retry, no breaker count) while the run
-# itself stays resumable from the CLI.
-# ``reviewing`` is delivered-but-not-accepted: the run succeeded and opened a
-# PR, and the item stays in flight until that PR is green and its review is
-# satisfied. It is NOT terminal — settling on "a PR exists" is how a red one
-# (#389: mdformat and security failing) got marked done.
-ItemState = Literal["queued", "running", "reviewing", "done", "failed", "abandoned", "cancelled"]
-# An operator decision the source has not been told about yet: the row-only
-# CLI (another process) cannot report, so the loop owes and delivers it.
-PendingReport = Literal["abandoned", "requeued"]
+# itself stays resumable from the CLI. ``blocked`` is the run having cleared
+# its own bar and GitHub refusing to finish the PR — terminal for the daemon
+# (a human has to look), retryable by hand. ``failed`` covers both the
+# attempt budget running out and an operator abandoning the item.
+ItemState = Literal["queued", "running", "done", "failed", "blocked", "cancelled"]
+# A decision the source has not been told about yet. ``abandoned`` /
+# ``requeued`` are operator decisions from another process (the row-only
+# CLI cannot report); ``merged`` / ``blocked`` are the run's own outcome,
+# owed until the issue close / label actually landed on GitHub.
+PendingReport = Literal["abandoned", "requeued", "merged", "blocked"]
 
 
 class WorkItem(BaseModel):
     """One unit of discovered work and its dispatch bookkeeping.
 
-    ``item_id`` is stable across polls (``gh:<issue#>`` / ``inbox:<name>``)
-    so repeated discovery of the same source object dedups on it. ``claimed``
-    records that the source-side claim (label swap / file rename) already
-    happened — a crash between claim and run start must not re-claim.
+    ``item_id`` is stable across polls (``gh:<issue#>``) so repeated
+    discovery of the same issue dedups on it. ``claimed`` records that the
+    source-side claim (label swap) already happened — a crash between claim
+    and run start must not re-claim. ``requested_by`` is the Discord user
+    who asked for the work through the concierge, when known, so the run's
+    finish can ping them.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     item_id: str
-    source: ItemSource
     source_key: str
-    kind: ItemKind = "patch"
     title: str
     body: str = ""
     url: str = ""
@@ -52,44 +49,23 @@ class WorkItem(BaseModel):
     created_at: float = 0.0
     updated_at: float = 0.0
     pending_report: PendingReport | None = None
-
-
-class ReviewOutcome(NamedTuple):
-    """What a review run actually posted to its pull request.
-
-    A review's deliverable is the review, not backlog issues: without this
-    the summary layer had only ``filed`` to report on, and a review files
-    none — so a ``REQUEST_CHANGES`` with eleven inline comments read as
-    "no findings" (#469).
-
-    ``requested_event`` is the verdict the reviewer asked for;
-    ``posted_event`` is what GitHub accepted, which is ``COMMENT`` when the
-    daemon identity is refused as a reviewer — and then ``gates_merge`` is
-    False and nothing on the PR blocks the merge.
-    """
-
-    pr_number: int
-    url: str
-    requested_event: str
-    posted_event: str
-    comments: int
-    gates_merge: bool
-
-    @property
-    def approved(self) -> bool:
-        return self.requested_event == "APPROVE"
+    requested_by: str | None = None
 
 
 class RunReport(NamedTuple):
-    """What the daemon tells the source about a finished run — mined from
-    the run's persisted events, the same way the CLI finish summary is."""
+    """What the daemon tells the source and the humans about a finished
+    run — read from the engine's run record, which carries the PR."""
 
     run_id: str
     state: RunState
     task_summary: str
-    tracking_issue: tuple[int, str] | None = None
-    delivery: tuple[int, str] | None = None
-    delivery_error: str | None = None
+    # The pull request the run delivered: (number, url).
+    pr: tuple[int, str] | None = None
+    branch: str | None = None
+    # Fix rounds spent (review + CI/gate/conflict/human).
+    rounds: int = 0
+    # Why the run stopped short of merged, when it did.
+    reason: str | None = None
     workspace: str | None = None
     # Who asked for the cancel (``state`` is then ``cancelled`` from the
     # daemon's point of view even though the persisted run is still
@@ -97,41 +73,20 @@ class RunReport(NamedTuple):
     cancelled_by: str | None = None
     # ``!sbx cancel --retry``: the item went straight back to the queue.
     requeued: bool = False
-    # Backlog issues the run filed (``gh:<n>`` refs) — an audit's deliverable.
-    filed: tuple[str, ...] = ()
-    # Findings addressed to sbxloop itself: filed upstream (``[daemon]
-    # tool_repo``) as refs, or merely noted by title in the closing comment.
-    tool_filed: tuple[str, ...] = ()
-    tool_noted: tuple[str, ...] = ()
-    # A review run's deliverable: the review it posted. None for every item
-    # that is not a review, so patch and audit reporting is unchanged.
-    review: ReviewOutcome | None = None
-    # True when this item WAS a review but the post never reached the PR —
-    # the review.json was missing or unparseable, no GitHub source was
-    # wired, or the POST itself raised (`loop._post_review` swallows that
-    # exception on purpose). Distinct from `review is None` on a non-review
-    # item: without this, a lost review fell back to the audit lane's
-    # "no findings" wording, telling the operator a PR was clean on exactly
-    # the runs where a review was requested and never made it (#469 field
-    # failure, loop.py:1004).
-    review_failed: bool = False
 
     @property
     def succeeded(self) -> bool:
-        return self.state == "completed" and self.delivery_error is None
+        return self.state == "merged"
 
 
 TickOutcome = Literal[
     "done",
     "retry",
-    "abandoned",
-    "delivery_failed",
+    "failed",
+    "blocked",
     "interrupted",
     "cancelled",
     "requeued",
-    # The run finished and its PR is open; the item is now waiting on that
-    # PR's checks and review rather than being done.
-    "reviewing",
 ]
 IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work"]
 
@@ -151,3 +106,73 @@ class TickResult(NamedTuple):
         if self.idle_kind is None:
             return None
         return f"{self.idle_kind} ({self.idle_detail})" if self.idle_detail else self.idle_kind
+
+
+# What the loop narrates. Daemon-scoped kinds belong in the control channel;
+# run-scoped kinds carry a ``run_id`` and belong in that run's thread, the
+# terminal ones mirrored to the channel so a human who is not reading the
+# thread still sees how it ended.
+NoticeKind = Literal[
+    "daemon.started",
+    "daemon.stopped",
+    "daemon.daily_cap",
+    "daemon.gc",
+    "daemon.state_archived",
+    "daemon.version_drift",
+    "breaker.opened",
+    "breaker.half_open",
+    "source.poll_recovered",
+    "workspace.refreshed",
+    "workspace.refresh_failed",
+    "item.queued",
+    "item.claim_failed",
+    "item.abandoned",
+    "item.requeued",
+    "item.abandon_cancelling",
+    "item.requeue_cancelling",
+    "item.requeue_unpinned",
+    "run.resuming",
+    "run.resume_budget_exhausted",
+    "run.done",
+    "run.failed",
+    "run.abandoned",
+    "run.blocked",
+    "run.cancelled",
+    "run.requeued",
+    "recovery.requeued",
+    "recovery.settling",
+    "recovery.resume_pending",
+    "recovery.run_reconciled",
+    "recovery.offline_abandon",
+    "recovery.offline_requeue",
+    "recovery.stale_sandbox_removed",
+]
+
+# Kinds a frontend should mirror to the control channel even when the
+# notice has a run thread: the run's fate, which a human not reading the
+# thread still needs to see.
+TERMINAL_NOTICE_KINDS: frozenset[str] = frozenset(
+    {
+        "run.done",
+        "run.failed",
+        "run.abandoned",
+        "run.blocked",
+        "run.cancelled",
+        "run.requeued",
+        "item.abandoned",
+    }
+)
+
+NoticeLevel = Literal["info", "warning", "error"]
+
+
+class DaemonNotice(NamedTuple):
+    """One thing the loop wants a human to know, addressed well enough for
+    a frontend to route it (to a run's thread, or the control channel)."""
+
+    kind: NoticeKind
+    text: str
+    item_id: str | None = None
+    run_id: str | None = None
+    url: str | None = None
+    level: NoticeLevel = "info"

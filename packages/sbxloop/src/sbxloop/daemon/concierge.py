@@ -23,8 +23,8 @@ Threading: turns run one at a time on the concierge's own worker thread
 (``submit_turn`` returns a Future; ``pending`` says how many are queued
 behind the running one). Tool handlers run on the WorkerClient's host-tool
 pool while the session is blocked; they are serialised by
-``_tool_lock`` — the daemon loop, the daemon store and the inbox have
-their own locks, and the concierge keeps a private read-only
+``_tool_lock`` — the daemon loop and the daemon store have their own
+locks, and the concierge keeps a private read-only
 :class:`~sbxloop.engine.store.StateStore` connection so it never shares the
 engine thread's.
 """
@@ -37,7 +37,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, get_args
 from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
@@ -46,6 +46,7 @@ from sbxloop.daemon.control import dispatch, plain
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.daemon.versions import VersionProbe
+from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
@@ -73,8 +74,7 @@ from sbxloop_worker.protocol import (
 if TYPE_CHECKING:
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.loop import DaemonLoop
-    from sbxloop.daemon.model import WorkItem
-    from sbxloop.daemon.sources import InboxSource
+    from sbxloop.daemon.model import RunReport, WorkItem
     from sbxloop.gh.ops import GithubOps
 
 log = get_logger(__name__)
@@ -87,10 +87,10 @@ CONCIERGE_RUN_ID = "concierge"
 STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
 
-_RUN_STATES = ["pending", "running", "completed", "failed", "cancelled"]
+_RUN_STATES = list(get_args(RunState))
 #: Run states that mean the run is over — nothing more will happen to it, so a
 #: watch on one of these is answered immediately instead of registered.
-_FINISHED_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+_FINISHED_RUN_STATES = TERMINAL_RUN_STATES
 #: Levels ``daemon_log`` accepts, coarsest last — the filter is at-or-above.
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 # GitHub's ``state_reason`` for a close. ``completed`` means the thing was
@@ -138,7 +138,6 @@ class Concierge:
         loop: DaemonLoop,
         dstore: DaemonStore,
         store_factory: Callable[[], StateStore],
-        inbox: InboxSource | None,
         github: DaemonGithub | None,
         host: SessionHost,
         bus: EventBus,
@@ -151,8 +150,11 @@ class Concierge:
         self.dstore = dstore
         self._store_factory = store_factory
         self._store: StateStore | None = None
-        self.inbox = inbox
         self.github = github if config.concierge.github_tools else None
+        # The Discord user id of whoever is speaking in the current turn, so
+        # an issue they ask for records them as its requester. Turns run one
+        # at a time on the executor, so one slot is enough.
+        self._turn_author_id: str | None = None
         self.host = host
         self.bus = bus
         self.clock = clock
@@ -201,9 +203,12 @@ class Concierge:
         text: str,
         *,
         author: str,
+        author_id: str | None = None,
         on_tool: ToolCallback | None = None,
     ) -> Future[ConciergeReply]:
-        """Queue one message; the Future resolves with the reply."""
+        """Queue one message; the Future resolves with the reply.
+        ``author_id`` is the transport's mentionable id for the speaker,
+        recorded as the requester of any issue this turn files."""
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("concierge is closed")
@@ -212,7 +217,11 @@ class Concierge:
         def run() -> ConciergeReply:
             with self._state_lock:
                 self._pending -= 1
-            return self._run_turn(text, author=author, on_tool=on_tool)
+            self._turn_author_id = author_id
+            try:
+                return self._run_turn(text, author=author, on_tool=on_tool)
+            finally:
+                self._turn_author_id = None
 
         return self._executor.submit(run)
 
@@ -357,7 +366,9 @@ class Concierge:
             f"runs per calendar day in {daemon.run_cap_timezone} (the count resets at "
             f"00:00 {daemon.run_cap_timezone}); "
             "a consecutive-failure breaker pauses dispatch",
-            f"backlog mode: {daemon.backlog}",
+            "every run carries its issue to a merged pull request (review, fix rounds, "
+            f"CI and the merge are stages of the run); a run that cannot land ends "
+            f"`blocked` with the `{daemon.blocked_label}` label for a human",
             "Discord: one thread per run"
             if self.config.discord.thread_per_run
             else "Discord: runs post in the control channel",
@@ -366,9 +377,7 @@ class Concierge:
             "concierge",
             command_prefix=self.config.discord.command_prefix,
             repo=self.config.github.repo or "(no GitHub repository configured)",
-            inbox_dir=self.config.daemon.inbox_dir or "(no inbox configured)",
             model=self.config.concierge.model or self.config.model,
-            backlog_label=self.config.daemon.backlog_label,
             trigger_label=self.config.daemon.trigger_label,
             tool_notes=bullet_list(
                 [f"`{t.spec.name}` — {t.spec.description}" for t in self._tools.values()]
@@ -470,9 +479,9 @@ class Concierge:
                 HostToolSpec(
                     name="run_detail",
                     description=(
-                        "Everything known about one run: outcome, state, tasks, tracking "
-                        "issue / PR / delivery error, standing guidance, its work item and "
-                        "the Discord thread where it can be steered."
+                        "Everything known about one run: outcome, state, tasks, its pull "
+                        "request, fix rounds spent, why it stopped, standing guidance, its "
+                        "work item and the Discord thread where it can be steered."
                     ),
                     parameters=_schema({"run_id": {"type": "string"}}, ["run_id"]),
                 ),
@@ -517,31 +526,12 @@ class Concierge:
                 HostToolSpec(
                     name="item_detail",
                     description=(
-                        "One work item (ids look like gh:12 or inbox:name.md): source, kind, "
-                        "state, attempts, last error, its runs and the latest run's thread."
+                        "One work item (ids look like gh:12): state, attempts, last error, "
+                        "who asked for it, its runs and the latest run's thread."
                     ),
                     parameters=_schema({"item_id": {"type": "string"}}, ["item_id"]),
                 ),
                 self._tool_item_detail,
-            ),
-            HostTool(
-                HostToolSpec(
-                    name="enqueue_work",
-                    description=(
-                        "Queue NEW work for the daemon as an inbox item. Write a "
-                        "self-contained title and body (what to build/change, acceptance "
-                        "criteria, constraints) — the run's agents see only this text. The "
-                        "daemon picks it up on its next poll."
-                    ),
-                    parameters=_schema(
-                        {
-                            "title": {"type": "string", "maxLength": 120},
-                            "body": {"type": "string"},
-                        },
-                        ["title", "body"],
-                    ),
-                ),
-                self._tool_enqueue_work,
             ),
             HostTool(
                 HostToolSpec(
@@ -666,18 +656,19 @@ class Concierge:
             and self.config.github.repo
             and self.config.concierge.create_issues
         ):
-            backlog = self.config.daemon.backlog_label
             trigger = self.config.daemon.trigger_label
             tools.append(
                 HostTool(
                     HostToolSpec(
                         name="create_issue",
                         description=(
-                            f"File a NEW issue in {self.config.github.repo} describing a "
-                            "feature or bug the person asked for. Write a clear title and a "
-                            f"self-contained body. The issue gets the `{backlog}` label "
-                            f"(triage); it does NOT run until the `{trigger}` label is added "
-                            "— after creating it, ask the person whether to add that label."
+                            f"File a NEW issue in {self.config.github.repo} for a feature or "
+                            "bug the person asked for, and queue it: the issue is created "
+                            f"with the `{trigger}` label, the daemon claims it on its next "
+                            "poll and runs it through to a merged pull request, and a run "
+                            "thread appears in this channel. One call, no confirmation. "
+                            "Write a crisp issue: a specific title, a paragraph of context "
+                            "(what and why), acceptance criteria as a checklist."
                         ),
                         parameters=_schema(
                             {
@@ -695,12 +686,11 @@ class Concierge:
                     HostToolSpec(
                         name="list_issues",
                         description=(
-                            f"Open issues in {self.config.github.repo}: by default the ones "
-                            f"carrying the `{backlog}` label (the triage backlog — work that "
-                            "is waiting for someone to say run it); all=true lists every open "
-                            "issue; label narrows to one label. Each line: number, title, "
-                            "labels, age, author, comments, url. After listing the backlog, "
-                            "ask the person whether any of them should be worked."
+                            f"Open issues in {self.config.github.repo}, newest activity "
+                            "first, each flagged QUEUED / RUNNING / FAILED / BLOCKED from the "
+                            "daemon's labels; label narrows to one label. Each line: number, "
+                            "title, labels, age, author, comments, url. Queue only what the "
+                            "person names, with label_issue_for_run."
                         ),
                         parameters=_schema(
                             {
@@ -718,9 +708,9 @@ class Concierge:
                     HostToolSpec(
                         name="label_issue_for_run",
                         description=(
-                            f"Add the `{trigger}` label to an issue so the daemon claims and "
-                            "runs it on its next poll. Only after the person explicitly said "
-                            "yes to running it."
+                            f"Add the `{trigger}` label to an issue that ALREADY EXISTS so "
+                            "the daemon claims and runs it on its next poll (a new request "
+                            "goes through create_issue, which queues it itself)."
                         ),
                         parameters=_schema(
                             {"number": {"type": "integer", "minimum": 1}}, ["number"]
@@ -842,22 +832,16 @@ class Concierge:
                 f"  - {task.spec.id} [{task.state}] {_one_line(task.spec.title, 100)}"
                 f" (revisions {task.revisions}, replans {task.replans})"
             )
-        if report.tracking_issue:
-            lines.append(f"tracking issue: #{report.tracking_issue[0]} {report.tracking_issue[1]}")
-        if report.delivery:
-            lines.append(f"delivered PR: #{report.delivery[0]} {report.delivery[1]}")
-        if report.delivery_error:
-            lines.append(f"delivery error: {_one_line(report.delivery_error, 300)}")
-        if report.filed:
-            lines.append(f"filed backlog: {', '.join(report.filed)}")
+        lines.extend(_report_lines(report))
         guidance = self.store.get_run_guidance(run_id)
         if guidance:
             lines.append("standing guidance:")
             lines.extend(f"  - {_one_line(g, 200)}" for g in guidance)
         if item is not None:
             lines.append(
-                f"work item: {item.item_id} [{item.state}] {item.kind} · attempts {item.attempts}"
+                f"work item: {item.item_id} [{item.state}] · attempts {item.attempts}"
                 + (f" · last error: {_one_line(item.last_error, 200)}" if item.last_error else "")
+                + (f" · requested by <@{item.requested_by}>" if item.requested_by else "")
                 + (f" · {item.url}" if item.url else "")
             )
         live = self.loop.current
@@ -900,17 +884,8 @@ class Concierge:
                 f"run {run_id} already finished: state={run.state}",
                 f"outcome: {_one_line(run.outcome, 400)}",
                 f"tasks: {report.task_summary}",
+                *_report_lines(report),
             ]
-            if report.tracking_issue:
-                lines.append(
-                    f"tracking issue: #{report.tracking_issue[0]} {report.tracking_issue[1]}"
-                )
-            if report.delivery:
-                lines.append(f"delivered PR: #{report.delivery[0]} {report.delivery[1]}")
-            if report.delivery_error:
-                lines.append(f"delivery error: {_one_line(report.delivery_error, 300)}")
-            if report.filed:
-                lines.append(f"filed backlog: {', '.join(report.filed)}")
             return "\n".join(lines)
         if self._on_watch is None:
             return (
@@ -946,15 +921,16 @@ class Concierge:
         item_id = str(args.get("item_id", "")).strip()
         item = self.dstore.get(item_id) if item_id else None
         if item is None:
-            return f"no work item {item_id!r} (ids look like gh:12 or inbox:name.md)"
+            return f"no work item {item_id!r} (ids look like gh:12)"
         runs = self.dstore.runs_for_item(item_id)
         lines = [
-            f"{item.item_id}: {item.kind} from {item.source} · state {item.state} · "
-            f"attempts {item.attempts}",
+            f"{item.item_id}: state {item.state} · attempts {item.attempts}",
             f"title: {_one_line(item.title, 200)}",
         ]
         if item.url:
             lines.append(f"url: {item.url}")
+        if item.requested_by:
+            lines.append(f"requested by: <@{item.requested_by}>")
         if item.last_error:
             lines.append(f"last error: {_one_line(item.last_error, 300)}")
         if item.body:
@@ -965,29 +941,6 @@ class Concierge:
             if thread is not None:
                 lines.append(f"latest run's Discord thread: <#{thread.thread_id}>")
         return "\n".join(lines)
-
-    def _tool_enqueue_work(self, args: dict[str, Any], by: str) -> str:
-        if self.inbox is None:
-            return (
-                "cannot enqueue: this daemon has no inbox source (set [daemon] inbox_dir or "
-                "start it with --inbox)"
-            )
-        title = _one_line(str(args.get("title", "")).strip(), 120)
-        body = str(args.get("body", "")).strip()
-        if not title or not body:
-            return "both title and body are required"
-        item_id = self.inbox.enqueue(title, body, by=by)
-        status = self.loop.status()
-        note = ""
-        if status.get("paused"):
-            note = " The daemon is PAUSED — nothing runs until `resume`."
-        elif status.get("breaker_open"):
-            note = " The breaker is OPEN — nothing runs until it resets."
-        return (
-            f"queued {item_id} — the daemon picks it up on its next poll "
-            f"(every {self.config.daemon.poll_interval_s:g}s) and runs it after anything "
-            f"already queued.{note}"
-        )
 
     def _tool_version_status(self, args: dict[str, Any], by: str) -> str:
         """Installed versus latest. The PyPI half is best effort by
@@ -1228,20 +1181,31 @@ class Concierge:
         body = str(args.get("body", "")).strip()
         if not title or not body:
             return "both title and body are required"
-        backlog = self.config.daemon.backlog_label
         trigger = self.config.daemon.trigger_label
         full_body = f"{body}\n\n---\nFiled by {by} via the sbxloop concierge\n"
         try:
             ref = self.github.call(
-                lambda ops: ops.issue_create(repo, title, full_body, labels=[backlog])
+                lambda ops: ops.issue_create(repo, title, full_body, labels=[trigger])
             )
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"creating the issue failed: {_one_line(str(exc), 300)}"
+        if self._turn_author_id:
+            # Recorded here, not in the public issue body: the work item the
+            # daemon builds from this issue inherits it, and the run's finish
+            # pings the requester.
+            self.dstore.note_requester(str(ref.number), self._turn_author_id, self.clock())
         log.info("concierge.issue_created", number=ref.number, by=by, title=title[:80])
+        status = self.loop.status()
+        note = ""
+        if status.get("paused"):
+            note = " The daemon is PAUSED — nothing runs until `resume`."
+        elif status.get("breaker_open"):
+            note = " The breaker is OPEN — nothing runs until it resets."
         return (
-            f"created issue #{ref.number} {ref.url} with the `{backlog}` label. It will NOT "
-            f"run until it carries `{trigger}` — ask the person whether to add it, and call "
-            f"label_issue_for_run({ref.number}) only if they say yes."
+            f"created and queued issue #{ref.number} {ref.url} with the `{trigger}` label — "
+            f"the daemon claims it within {self.config.daemon.poll_interval_s:g}s and runs it "
+            "after anything already queued; a run thread will appear here and the person "
+            f"will be pinged when it merges or needs a human.{note}"
         )
 
     def _tool_list_issues(self, args: dict[str, Any], by: str) -> str:
@@ -1250,8 +1214,6 @@ class Concierge:
         daemon = self.config.daemon
         limit = _int_arg(args, "limit", 20, 1, 50)
         label = str(args.get("label") or "").strip()
-        if not label and not args.get("all"):
-            label = daemon.backlog_label
         query = f"state=open&per_page={limit}&sort=updated&direction=desc"
         if label:
             query += f"&labels={quote(label, safe='')}"
@@ -1278,7 +1240,9 @@ class Concierge:
             if daemon.in_progress_label in labels:
                 flags.append("RUNNING")
             if daemon.failed_label in labels:
-                flags.append("failed before")
+                flags.append("FAILED before")
+            if daemon.blocked_label in labels:
+                flags.append("BLOCKED — needs a human")
             created = _iso_age(str(issue.get("created_at") or ""), now)
             user = (issue.get("user") or {}).get("login", "?")
             lines.append(
@@ -1288,8 +1252,9 @@ class Concierge:
                 + (f" · {' / '.join(flags)}" if flags else "")
             )
         lines.append(
-            f"Issues without `{daemon.trigger_label}` are not queued: ask the person which, "
-            "if any, should be worked, and label_issue_for_run those they name."
+            f"Issues without `{daemon.trigger_label}` are not queued: label_issue_for_run "
+            "queues one that exists (only the ones the person names); create_issue files "
+            "and queues a new one."
         )
         return "\n".join(lines)
 
@@ -1496,7 +1461,7 @@ def _work_item_note(item: WorkItem | None) -> str:
     **already-claimed** one skips that check entirely (``loop.py``: ``if not
     item.claimed``) and can still start a whole run on the issue that was
     just closed — which is worth saying out loud."""
-    if item is None or item.state not in ("queued", "failed"):
+    if item is None or item.state not in ("queued", "failed", "blocked"):
         return ""
     if not item.claimed:
         return (
@@ -1509,6 +1474,19 @@ def _work_item_note(item: WorkItem | None) -> str:
         "closing the issue does NOT stop it — a run can still start. Say so, and use "
         f"`sbx_control` with `abandon {item.item_id} issue closed` if it should be dropped"
     )
+
+
+def _report_lines(report: RunReport) -> list[str]:
+    """The PR, the rounds and the reason a run stopped, as tool text."""
+    lines: list[str] = []
+    if report.pr:
+        verb = "merged" if report.state == "merged" else "delivered"
+        lines.append(f"{verb} PR: #{report.pr[0]} {report.pr[1]}")
+    if report.rounds:
+        lines.append(f"fix rounds spent: {report.rounds}")
+    if report.reason and report.state != "merged":
+        lines.append(f"{report.state}: {_one_line(report.reason, 300)}")
+    return lines
 
 
 def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> int:

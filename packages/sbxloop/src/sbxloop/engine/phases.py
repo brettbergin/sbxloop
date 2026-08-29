@@ -16,12 +16,12 @@ Session strategy per phase (a deliberate design decision):
   inspect the workspace to answer the user accurately but must not
   "helpfully" edit anything — direction changes flow back through the
   engine as build restarts or standing guidance, never as direct edits.
-
-There is no in-run critic. The per-task SCRUTINIZE/VALIDATE stages audited
-task completion and rubber-stamped it (6/6 pass, 5/5 accept in the measured
-baseline) while diff-level defects leaked to the PR; the adversarial review
-now lives in the daemon's post-delivery review lane, which sees the whole
-diff and can drive bounded fix rounds.
+- REVIEW runs once per delivery as a fresh read-only session over the
+  PR's whole diff. There is no per-task critic: the old SCRUTINIZE/VALIDATE
+  stages audited task completion and rubber-stamped it (6/6 pass, 5/5
+  accept in the measured baseline) while diff-level defects leaked to the
+  PR. One adversarial pass over the assembled diff, driving bounded fix
+  rounds, is the critic that earns its turns (see ``engine.review``).
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from pydantic import BaseModel
 from sbxloop.config import Config
 from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
 from sbxloop.engine.prompts import bullet_list, render
+from sbxloop.engine.review import RefutedGuard, ReviewVerdict
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
@@ -65,7 +66,12 @@ AGENT_NAMES = {
     "decompose": "decomposer",
     "build": "builder",
     "steer": "steering",
+    "review": "reviewer",
 }
+# The review prompt carries the PR's diff inline; past this it is clipped
+# head+tail (the reviewer still has the tree). Overridden by
+# `[landing] review_diff_max_chars`.
+REVIEW_DIFF_HEAD_CLIP = 100_000
 
 log = get_logger(__name__)
 
@@ -249,7 +255,6 @@ class PhaseRunner:
         *,
         permission_mode: Literal["auto", "read_only"] = "auto",
         check: Callable[[ModelT], None] | None = None,
-        preamble: str = "",
     ) -> tuple[ModelT, JobResult]:
         """Run a JSON-expecting agent job; one retry with what went wrong.
 
@@ -261,15 +266,9 @@ class PhaseRunner:
         that used to kill whole runs on one chatty reply). Anything else
         raises immediately.
 
-        ``preamble`` is injected into the template's ``$retry_context`` slot
-        on every attempt (validation feedback appends to it, never replaces
-        it) — used by the degraded-critic guard to confront a re-run critic
-        with its predecessor's tooling failures.
-
-        Returns the validated model together with the raw JobResult, whose
-        session-health tally the critic phases inspect.
+        Returns the validated model together with the raw JobResult.
         """
-        retry_context = preamble
+        retry_context = ""
         last_error: Exception | None = None
         for _ in range(2):
             prompt = render(prompt_name, retry_context=retry_context, **context)
@@ -290,7 +289,7 @@ class PhaseRunner:
                     prompt=prompt_name,
                     reason="reply contained no JSON",
                 )
-                retry_context = preamble + (
+                retry_context = (
                     "\n## Previous attempt was invalid\n\n"
                     "Your previous response contained no parseable JSON. Respond "
                     "with ONLY one fenced ```json block in the format above — no "
@@ -311,7 +310,7 @@ class PhaseRunner:
                     reason="output failed validation",
                     error=str(exc)[:300],
                 )
-                retry_context = preamble + (
+                retry_context = (
                     "\n## Previous attempt was invalid\n\n"
                     "Your previous response failed validation with:\n\n"
                     f"```\n{exc}\n```\n\nFix the structure and respond again."
@@ -485,21 +484,83 @@ class PhaseRunner:
             resume_session_id=resume_session_id,
         )
 
+    def review(
+        self,
+        *,
+        diff: str | None,
+        pr_number: int,
+        round: int,
+        tasks: Sequence[TaskRecord],
+        history: str,
+        refuted: set[str],
+    ) -> ReviewVerdict:
+        """Review the delivered PR: a fresh read-only session over its diff.
+
+        ``history`` is the rendered earlier rounds and ``refuted`` the
+        anchors of findings the fixer refuted in them — the reviewer is
+        told about both, and :class:`RefutedGuard` sends back, once, a
+        verdict that only re-raises refuted findings.
+        """
+        limit = self.config.landing.review_diff_max_chars
+        diff_shown = clip_head_tail(
+            diff, head=min(REVIEW_DIFF_HEAD_CLIP, limit * 2 // 3), tail=limit // 3
+        )
+        board = bullet_list(
+            [
+                f"{t.spec.id} [{t.state}] {t.spec.title}"
+                + (
+                    "\n  acceptance: " + "; ".join(t.spec.acceptance_criteria)
+                    if t.spec.acceptance_criteria
+                    else ""
+                )
+                for t in tasks
+            ],
+            empty="(no tasks recorded)",
+        )
+        verdict, _ = self._agent_json(
+            ReviewVerdict,
+            "review",
+            {
+                "outcome": self.outcome,
+                "pr_number": str(pr_number),
+                "round": str(round),
+                "diff": diff_shown
+                or "(no diff text available — review the tree in the working directory)",
+                "tasks_summary": board,
+                "prior_rounds": history,
+                "user_guidance": self._guidance(),
+                "project_gate": gate_rule(self.project_gate()),
+            },
+            permission_mode="read_only",
+            check=RefutedGuard(refuted).check,
+        )
+        return verdict
+
     def steer(
-        self, message: str, *, tasks: Sequence[TaskRecord], task: TaskRecord | None
+        self,
+        message: str,
+        *,
+        tasks: Sequence[TaskRecord],
+        task: TaskRecord | None,
+        stage: str | None = None,
     ) -> SteerVerdict:
         """Answer one interactive chat message and rule on its course change.
 
         ``task`` is the task the engine is currently driving (None between
-        tasks); ``tasks`` is the whole board, so the agent can speak to
-        overall progress.
+        tasks, and throughout the post-build stages); ``tasks`` is the whole
+        board, so the agent can speak to overall progress; ``stage`` names
+        where the run is when no task is active ("awaiting CI on PR #12").
         """
         board = bullet_list(
             [f"{t.spec.id} [{t.state}] {t.spec.title}" for t in tasks],
             empty="(the outcome has not been decomposed into tasks yet)",
         )
         if task is None:
-            current = "(no task is active right now — the run is between tasks)"
+            current = (
+                f"(no task is active right now — the run is {stage})"
+                if stage
+                else "(no task is active right now — the run is between tasks)"
+            )
         else:
             current = (
                 f"Task {task.spec.id}: {task.spec.title} (state: {task.state}, "

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -83,14 +84,16 @@ class TestPolicy:
         assert v.size_bytes >= 1024
         assert "older than 14d" in v.reason
 
-    @pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
+    @pytest.mark.parametrize("state", ["completed", "merged", "failed", "blocked", "cancelled"])
     def test_every_terminal_state_qualifies(
         self, store: StateStore, state_dir: Path, state: str
     ) -> None:
         seed_run(store, state_dir, "raaaaaaa2", state=state)
         assert verdict_for(store, state_dir, "raaaaaaa2").prunable
 
-    @pytest.mark.parametrize("state", ["created", "provisioning", "running", "finalizing"])
+    @pytest.mark.parametrize(
+        "state", ["created", "provisioning", "building", "delivering", "awaiting_ci", "landing"]
+    )
     def test_in_flight_runs_are_never_pruned(
         self, store: StateStore, state_dir: Path, state: str
     ) -> None:
@@ -158,7 +161,7 @@ class TestPrune:
     ) -> None:
         old = seed_run(store, state_dir, "rbbbbbbb1")
         young = seed_run(store, state_dir, "rbbbbbbb2", age_days=1)
-        live = seed_run(store, state_dir, "rbbbbbbb3", state="running")
+        live = seed_run(store, state_dir, "rbbbbbbb3", state="building")
         result = prune_run_dirs(store, state_dir, older_than_s=RETENTION, now=NOW, actor="daemon")
         assert result.pruned == ["rbbbbbbb1"]
         assert result.failed == []
@@ -347,6 +350,23 @@ class TestResumeGuard:
         assert len(calls) == 2
 
 
+class _NoWork:
+    """A WorkSource that never has anything: the sweep is what is under test."""
+
+    name = "none"
+
+    def poll(self) -> list[Any]:
+        return []
+
+    def claim(self, item: Any) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("report_"):
+            return lambda *a, **k: True
+        raise AttributeError(name)
+
+
 class TestDaemonSweep:
     def make_loop(self, state_dir: Path, store: StateStore, **daemon: object) -> DaemonLoop:
         config = Config.model_validate({"state_dir": str(state_dir), "daemon": daemon})
@@ -354,7 +374,7 @@ class TestDaemonSweep:
             config,
             store=store,
             dstore=DaemonStore(state_dir / "state.db"),
-            sources=[],
+            source=cast(Any, _NoWork()),
             clock=lambda: NOW,
         )
 
@@ -383,11 +403,11 @@ class TestDaemonSweep:
 
     def test_sweep_notifies_frontend_with_counts(self, store: StateStore, state_dir: Path) -> None:
         seed_run(store, state_dir, "rddddddd5")
-        seen: list[str] = []
+        seen: list[Any] = []
 
         class Front:
-            def daemon_event(self, text: str) -> None:
-                seen.append(text)
+            def daemon_notice(self, notice: Any) -> None:
+                seen.append(notice)
 
             def run_started(self, *a: object) -> None: ...
             def run_finished(self, *a: object) -> None: ...
@@ -395,8 +415,8 @@ class TestDaemonSweep:
         loop = self.make_loop(state_dir, store)
         loop.frontend = Front()
         loop.tick()
-        line = next(t for t in seen if t.startswith("daemon.gc"))
-        assert "pruned 1 run dir(s)" in line and "freed" in line
+        notice = next(n for n in seen if n.kind == "daemon.gc")
+        assert "pruned 1 run dir(s)" in notice.text and "freed" in notice.text
 
     def test_sweep_failure_does_not_take_daemon_down(
         self, store: StateStore, state_dir: Path, monkeypatch: pytest.MonkeyPatch

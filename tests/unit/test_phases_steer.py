@@ -67,6 +67,25 @@ class TestSteer:
         assert "no task is active" in prompt
         assert "not been decomposed" in prompt
 
+    def test_stage_names_where_the_run_is_when_no_task_is_active(self) -> None:
+        """Throughout the post-build stages there is no current task; the
+        engine says where the run is instead (a CI wait on a PR, say)."""
+        agent = StubAgent({"reply": "ok", "action": "continue", "guidance": ""})
+        phases = runner(agent)
+        phases.steer("status?", tasks=[record("done")], task=None, stage="awaiting CI on PR #12")
+        prompt = agent.jobs[0].prompt or ""
+        assert "no task is active right now — the run is awaiting CI on PR #12" in prompt
+        assert "between tasks" not in prompt
+        assert "t1 [done] Build it" in prompt
+
+    def test_stage_is_ignored_while_a_task_is_active(self) -> None:
+        agent = StubAgent({"reply": "ok", "action": "continue", "guidance": ""})
+        phases = runner(agent)
+        phases.steer("status?", tasks=[record()], task=record(), stage="gating")
+        prompt = agent.jobs[0].prompt or ""
+        assert "Task t1: Build it (state: executing" in prompt
+        assert "the run is gating" not in prompt
+
     def test_guidance_injected_into_build_prompts(self) -> None:
         agent = StubAgent(None)
         phases = runner(agent)

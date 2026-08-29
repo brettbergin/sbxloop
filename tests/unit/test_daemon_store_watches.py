@@ -69,8 +69,8 @@ def test_finished_run_ids_reports_only_runs_with_a_ledger_close(tmp_path: Path) 
     all (never started, or started by a different process) is not
     reported as finished, only one `finish_ledger` actually closed."""
     s = store(tmp_path)
-    s.upsert_new(WorkItem(item_id="i1", source="inbox", source_key="a.md", title="A"), 1.0)
-    s.upsert_new(WorkItem(item_id="i2", source="inbox", source_key="b.md", title="B"), 1.0)
+    s.upsert_new(WorkItem(item_id="i1", source_key="a.md", title="A"), 1.0)
+    s.upsert_new(WorkItem(item_id="i2", source_key="b.md", title="B"), 1.0)
     s.mark_running("i1", "r1", 1.0)
     s.mark_running("i2", "r2", 1.0)
     s.finish_ledger("r1", "completed", 2.0)

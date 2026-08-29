@@ -8,14 +8,14 @@ from pathlib import Path
 import pytest
 
 from sbxloop.daemon.model import WorkItem
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import LEGACY_SUFFIX, SCHEMA_VERSION, DaemonStore
 from sbxloop.engine.store import StateStore
+from sbxloop.errors import DaemonError
 
 
 def item(key: str = "7", **overrides: object) -> WorkItem:
     fields: dict[str, object] = {
         "item_id": f"gh:{key}",
-        "source": "github",
         "source_key": key,
         "title": f"issue {key}",
         "body": "do the thing",
@@ -44,11 +44,36 @@ class TestUpsert:
         got = store.get("gh:7")
         assert got is not None and got.state == "queued" and got.body == "do MORE things"
 
+    def test_blocked_row_is_terminal_for_dedup(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_blocked("gh:7", "405", now=2.0)
+        assert store.upsert_new(item(), now=3.0) is False
+        assert store.upsert_new(item(body="edited"), now=4.0) is True
+
     def test_running_row_never_superseded(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
         store.mark_running("gh:7", "r1", now=2.0)
         assert store.upsert_new(item(body="changed"), now=3.0) is False
+
+    def test_requester_recorded_by_the_concierge_lands_on_the_item(self, tmp_path: Path) -> None:
+        """The concierge files the issue and knows who asked; discovery
+        builds the item later from GitHub, which does not — the store
+        joins the two, and the id never appears in the public issue."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.note_requester("7", "1234567890", now=0.5)
+        store.upsert_new(item(), now=1.0)
+        got = store.get("gh:7")
+        assert got is not None and got.requested_by == "1234567890"
+        # An item the source already attributed keeps its own attribution.
+        store.note_requester("8", "999", now=0.5)
+        store.upsert_new(item("8", requested_by="111"), now=1.0)
+        assert store.get("gh:8").requested_by == "111"  # type: ignore[union-attr]
+        assert store.get("gh:7").requested_by == "1234567890"  # type: ignore[union-attr]
+        # Nothing recorded → nothing attributed.
+        store.upsert_new(item("9"), now=1.0)
+        assert store.get("gh:9").requested_by is None  # type: ignore[union-attr]
 
 
 class TestQueueAndAttempts:
@@ -84,7 +109,7 @@ class TestQueueAndAttempts:
             store.mark_running("gh:nope", "r_orphan", now=1.0)
         assert store.runs_started_since(0) == 0
 
-    def test_attempt_counting_requeue_vs_abandon(self, tmp_path: Path) -> None:
+    def test_attempt_counting_requeue_vs_failed(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
         store.mark_running("gh:7", "r1", now=2.0)
@@ -96,7 +121,7 @@ class TestQueueAndAttempts:
         store.mark_failed("gh:7", "err2", now=5.0, requeue=False)
         got = store.get("gh:7")
         assert got is not None
-        assert got.state == "abandoned" and got.attempts == 2 and got.last_error == "err2"
+        assert got.state == "failed" and got.attempts == 2 and got.last_error == "err2"
 
     def test_cancelled_is_terminal_and_retry_resets_the_attempt_budget(
         self, tmp_path: Path
@@ -120,6 +145,23 @@ class TestQueueAndAttempts:
         assert got.run_id is None
         # A human's re-queue is eligible right away, no failure backoff.
         assert store.next_queued(now=5.0, backoff_s=900) is not None
+
+    def test_blocked_is_terminal_until_a_human_retries(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_blocked("gh:7", "GitHub refused the merge", now=3.0)
+        got = store.get("gh:7")
+        assert got is not None and got.state == "blocked" and got.run_id == "r1"
+        assert got.last_error == "GitHub refused the merge"
+        assert got.pending_report == "blocked"  # the source is owed the label
+        assert store.next_queued(now=1e9, backoff_s=1) is None
+        assert [i.item_id for i in store.items(["blocked"])] == ["gh:7"]
+        with pytest.raises(ValueError, match="use retry"):
+            store.requeue("gh:7", now=4.0)
+        got = store.retry("gh:7", now=5.0)
+        assert got.state == "queued" and got.attempts == 0 and got.run_id is None
+        assert got.pending_report == "requeued"
 
     def test_running_items_and_unstarted_requeue(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -173,18 +215,6 @@ class TestResumeAndBreaker:
         store.mark_failed("gh:7", "boom", now=5.0, requeue=False)
         assert store.get("gh:7").run_id == "r2"  # type: ignore[union-attr]
 
-    def test_item_kind_roundtrips_and_defaults_to_patch(self, tmp_path: Path) -> None:
-        store = DaemonStore(tmp_path / "state.db")
-        store.upsert_new(
-            WorkItem(item_id="gh:9", source="github", source_key="9", kind="audit", title="A"),
-            now=1.0,
-        )
-        store.upsert_new(
-            WorkItem(item_id="gh:1", source="github", source_key="1", title="P"), now=1.0
-        )
-        assert store.get("gh:9").kind == "audit"  # type: ignore[union-attr]
-        assert store.get("gh:1").kind == "patch"  # type: ignore[union-attr]
-
     def test_breaker_roundtrip(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         assert store.breaker() == (None, 0)
@@ -204,9 +234,10 @@ class TestResumeAndBreaker:
         store.set_breaker(1.0, 2)
         store.set_value("k", "v")
         assert store.breaker() == (1.0, 2) and store.get_value("k") == "v"
+        assert store.get_value("schema_version") == SCHEMA_VERSION
 
 
-class TestLedgerBacklogThreads:
+class TestLedgerAndThreads:
     def test_rolling_window(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         # runs at t=1000, t=50000, t=90000; a 24h window ending at 90000
@@ -218,18 +249,13 @@ class TestLedgerBacklogThreads:
         assert store.runs_started_since(0) == 3
         store.finish_ledger("r0", "done", now=1500.0)
 
-    def test_item_for_run(self, tmp_path: Path) -> None:
+    def test_item_for_run_and_runs_for_item(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item("5"), now=1.0)
         store.mark_running("gh:5", "r5", now=2.0)
         assert store.item_for_run("r5") == "gh:5"
         assert store.item_for_run("r-unknown") is None
-
-    def test_backlog_fingerprint_dedup(self, tmp_path: Path) -> None:
-        store = DaemonStore(tmp_path / "state.db")
-        assert store.backlog_seen("abc") is False
-        store.backlog_record("abc", "r1", "gh:9", now=1.0)
-        assert store.backlog_seen("abc") is True
+        assert store.runs_for_item("gh:5") == ["r5"]
 
     def test_discord_thread_map_roundtrip(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -253,6 +279,22 @@ class TestLedgerBacklogThreads:
         engine_store.close()
         daemon_store.close()
 
+    def test_no_lane_tables_exist(self, tmp_path: Path) -> None:
+        """The self-filing lanes are gone with their bookkeeping."""
+        store = DaemonStore(tmp_path / "state.db")
+        tables = {
+            str(r[0])
+            for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert tables >= {"daemon_work_items", "daemon_runs", "daemon_requesters"}
+        assert not tables & {
+            "daemon_backlog_filed",
+            "daemon_postmortems",
+            "daemon_reviews",
+            "daemon_pr_state",
+            "daemon_audits",
+        }
+
 
 class TestOperatorControls:
     """#229: abandon / retry / requeue transitions and what they clear."""
@@ -262,12 +304,19 @@ class TestOperatorControls:
         store.upsert_new(item(), now=1.0)
         store.mark_running("gh:7", "r1", now=2.0)
         got = store.abandon("gh:7", "spiraling plan", now=3.0)
-        assert got.state == "abandoned" and got.run_id == "r1"
+        assert got.state == "failed" and got.run_id == "r1"
         assert got.last_error == "spiraling plan"
-        with pytest.raises(ValueError, match="already abandoned"):
+        with pytest.raises(ValueError, match="already failed"):
             store.abandon("gh:7", "again", now=4.0)
         with pytest.raises(KeyError):
             store.abandon("gh:404", "x", now=4.0)
+
+    def test_abandon_of_a_blocked_item_is_allowed(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_blocked("gh:7", "405", now=2.0)
+        got = store.abandon("gh:7", "not worth it", now=3.0)
+        assert got.state == "failed" and got.pending_report == "abandoned"
 
     def test_retry_resets_attempts_and_unpins_run(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -308,8 +357,8 @@ class TestOperatorControls:
         store.mark_running("gh:2", "r2", now=3.0)
         store.mark_failed("gh:2", "boom", now=4.0, requeue=False)
         assert [i.item_id for i in store.items()] == ["gh:1", "gh:2"]
-        assert [i.item_id for i in store.items(["abandoned"])] == ["gh:2"]
-        assert [i.item_id for i in store.items(["queued", "abandoned"])] == ["gh:1", "gh:2"]
+        assert [i.item_id for i in store.items(["failed"])] == ["gh:2"]
+        assert [i.item_id for i in store.items(["queued", "failed"])] == ["gh:1", "gh:2"]
         assert store.items(["done"]) == []
 
     def test_transitions_are_conditional_against_a_concurrent_settle(self, tmp_path: Path) -> None:
@@ -354,132 +403,85 @@ class TestOperatorControls:
         store.mark_running("gh:7", "r1", now=4.0)
         assert store.requeue("gh:7", now=5.0).pending_report is None
 
-
-class TestMergeWatchRows:
-    """The merge watch's bookkeeping: which rows are due, and what settles
-    them. The rows are the restart story — no memory is involved."""
-
-    def _armed(self, tmp_path: Path) -> DaemonStore:
+    def test_a_merged_run_owes_the_close_until_it_lands(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
-        store.mark_done("gh:7", now=2.0)
-        store.record_delivery("gh:7", 9, "sbxloop/r1", 2.0, url="https://x/pull/9")
-        return store
-
-    def test_record_delivery_stores_the_url_and_rearms_the_watch(self, tmp_path: Path) -> None:
-        store = self._armed(tmp_path)
-        state = store.pr_state("gh:7")
-        assert state is not None and state.pr_url == "https://x/pull/9"
-        assert not state.settled and state.merged_at is None
-        store.settle_merge("gh:7", 3.0, merged_at=3.0)
-        # A re-delivery (fix round) means there is a PR to watch again.
-        store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
-        state = store.pr_state("gh:7")
-        assert state is not None and not state.settled and state.merged_at is None
-
-    def test_merge_watch_returns_only_done_unsettled_due_rows(self, tmp_path: Path) -> None:
-        store = self._armed(tmp_path)
-        assert store.merge_watch(1000.0, 300.0) == [("gh:7", 9, "https://x/pull/9")]
-        # Throttled: a fresh check pushes it past the interval.
-        store.touch_merge_check("gh:7", 1000.0)
-        assert store.merge_watch(1200.0, 300.0) == []
-        assert store.merge_watch(1301.0, 300.0) != []
-        # Settled rows never come back.
-        store.settle_merge("gh:7", 1400.0, merged_at=1400.0)
-        assert store.merge_watch(9999.0, 300.0) == []
-        state = store.pr_state("gh:7")
-        assert state is not None and state.settled and state.merged_at == 1400.0
-
-    def test_merge_watch_skips_items_not_done(self, tmp_path: Path) -> None:
-        """A reviewing item is the acceptance gate's to advance, and a
-        failed one has been handed to a human — neither costs a read."""
-        store = DaemonStore(tmp_path / "state.db")
-        store.upsert_new(item(), now=1.0)
-        store.record_delivery("gh:7", 9, "b", 1.0, url="u")
-        store.mark_reviewing("gh:7", now=2.0)
-        assert store.merge_watch(1000.0, 300.0) == []
-        store.mark_failed("gh:7", "boom", 3.0, requeue=False)
-        assert store.merge_watch(1000.0, 300.0) == []
-        store.set_state("gh:7", "done", 4.0)
-        assert store.merge_watch(1000.0, 300.0) == [("gh:7", 9, "u")]
-
-    def test_pre_migration_rows_are_swept_retroactively(self, tmp_path: Path) -> None:
-        """settled defaults to 0, so rows from before the columns existed —
-        accepted items whose PRs merged with nobody watching — come due on
-        the first tick after the upgrade. Opening the store twice also
-        proves the migrations are idempotent."""
-        self._armed(tmp_path)
-        again = DaemonStore(tmp_path / "state.db")
-        assert again.merge_watch(1000.0, 300.0) == [("gh:7", 9, "https://x/pull/9")]
+        store.mark_running("gh:7", "r1", now=2.0)
+        store.mark_done("gh:7", now=3.0, pending_report="merged")
+        got = store.get("gh:7")
+        assert got is not None and got.state == "done" and got.pending_report == "merged"
+        assert [i.item_id for i in store.pending_reports()] == ["gh:7"]
+        assert store.take_pending_report("gh:7") is True
+        assert store.get("gh:7").pending_report is None  # type: ignore[union-attr]
+        # plain mark_done owes nothing
+        store.upsert_new(item("8"), now=1.0)
+        store.mark_done("gh:8", now=2.0)
+        assert store.get("gh:8").pending_report is None  # type: ignore[union-attr]
 
 
-class TestLandingRows:
-    """The landing stage's bookkeeping: the update-branch budget and the head
-    an update was last requested at, which is what keeps a poll from asking
-    for the same update twice."""
+class TestArchiveLegacy:
+    """The 1.0 cutover: a pre-1.0 daemon state.db is moved aside, not
+    migrated — automatically, because the daemon host deploys unattended."""
 
-    def _armed(self, tmp_path: Path) -> DaemonStore:
-        store = DaemonStore(tmp_path / "state.db")
-        store.upsert_new(item(), now=1.0)
-        store.record_delivery("gh:7", 9, "sbxloop/r1", 2.0, url="https://x/pull/9")
-        return store
-
-    def test_a_fresh_row_has_spent_nothing_and_has_no_update_head(self, tmp_path: Path) -> None:
-        state = self._armed(tmp_path).pr_state("gh:7")
-        assert state is not None and state.updates == 0 and state.update_head is None
-
-    def test_update_attempts_and_the_update_head_round_trip(self, tmp_path: Path) -> None:
-        store = self._armed(tmp_path)
-        assert store.bump_pr_update("gh:7") == 1
-        assert store.bump_pr_update("gh:7") == 2
-        store.set_update_head("gh:7", "abc123")
-        state = store.pr_state("gh:7")
-        assert state is not None and state.updates == 2 and state.update_head == "abc123"
-        store.set_update_head("gh:7", None)
-        assert store.pr_state("gh:7").update_head is None  # type: ignore[union-attr]
-
-    def test_update_attempts_survive_a_redelivery(self, tmp_path: Path) -> None:
-        """A fix round re-arms the merge watch, but it must not refund the
-        updates already spent — that is the only bound on a base that moves
-        faster than CI finishes."""
-        store = self._armed(tmp_path)
-        store.bump_pr_update("gh:7")
-        store.record_delivery("gh:7", 9, "sbxloop/r2", 4.0, url="https://x/pull/9")
-        assert store.pr_state("gh:7").updates == 1  # type: ignore[union-attr]
-
-    @pytest.mark.skipif(
-        sqlite3.sqlite_version_info < (3, 35, 0),
-        reason="ALTER TABLE ... DROP COLUMN needs SQLite >= 3.35.0",
-    )
-    def test_the_columns_are_added_to_a_db_that_predates_them(self, tmp_path: Path) -> None:
-        """Additive migration, applied at open: an existing daemon upgrades in
-        place rather than losing its queue.
-
-        DROP COLUMN (SQLite >= 3.35.0) is only how this test *simulates* a
-        pre-migration database; the migration path under test does not use
-        it, so an older SQLite skips the simulation rather than failing the
-        suite over unrelated tooling."""
-        path = tmp_path / "state.db"
-        store = self._armed(tmp_path)
-        store.close()
+    @staticmethod
+    def _legacy(path: Path) -> None:
         with sqlite3.connect(path) as conn:
-            conn.execute("ALTER TABLE daemon_pr_state DROP COLUMN updates")
-            conn.execute("ALTER TABLE daemon_pr_state DROP COLUMN update_head")
-            conn.commit()
-        reopened = DaemonStore(path)
-        state = reopened.pr_state("gh:7")
-        assert state is not None and state.updates == 0 and state.update_head is None
-        assert state.pr_number == 9, "the pre-existing row survived"
+            conn.executescript(
+                """
+                CREATE TABLE daemon_work_items (
+                    item_id TEXT PRIMARY KEY, source TEXT, source_key TEXT, kind TEXT,
+                    title TEXT, state TEXT
+                );
+                CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE daemon_pr_state (item_id TEXT PRIMARY KEY);
+                INSERT INTO daemon_work_items VALUES ('gh:1','github','1','patch','x','done');
+                """
+            )
+        # WAL/SHM sidecars travel with the file.
+        path.with_name(path.name + "-wal").write_bytes(b"")
+        path.with_name(path.name + "-shm").write_bytes(b"")
 
-    def test_a_re_delivery_clears_the_marker_but_keeps_the_budget(self, tmp_path: Path) -> None:
-        """A fix round rewrites the branch, so an update-branch that was in
-        flight against the old one is moot and its recorded head is stale.
-        The spend, like `rounds`, survives the round."""
-        store = self._armed(tmp_path)
-        store.bump_pr_update("gh:7")
-        store.set_update_head("gh:7", "aaa")
-        store.record_delivery("gh:7", 9, "sbxloop/r1", 3.0, url="https://x/pull/9")
-        state = store.pr_state("gh:7")
-        assert state is not None
-        assert state.update_head is None, "a stale marker would block the next update"
-        assert state.updates == 1, "the update budget is not refunded by a fix round"
+    def test_legacy_file_is_renamed_with_its_sidecars(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        self._legacy(path)
+        archived = DaemonStore.archive_legacy(path, clock=lambda: 1234.0)
+        assert archived == tmp_path / f"state.db{LEGACY_SUFFIX}"
+        assert archived.exists() and not path.exists()
+        assert (tmp_path / f"state.db{LEGACY_SUFFIX}-wal").exists()
+        assert (tmp_path / f"state.db{LEGACY_SUFFIX}-shm").exists()
+        assert not path.with_name("state.db-wal").exists()
+        # A fresh store then opens clean, at the current schema.
+        store = DaemonStore(path)
+        assert store.get("gh:1") is None
+        assert store.get_value("schema_version") == SCHEMA_VERSION
+        # …and the archive is left alone on the next start.
+        assert DaemonStore.archive_legacy(path) is None
+
+    def test_a_second_archive_does_not_clobber_the_first(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        self._legacy(path)
+        first = DaemonStore.archive_legacy(path, clock=lambda: 1234.0)
+        self._legacy(path)
+        second = DaemonStore.archive_legacy(path, clock=lambda: 5678.0)
+        assert first is not None and second is not None and first != second
+        assert second.name == f"state.db{LEGACY_SUFFIX}.5678"
+        assert first.exists() and second.exists()
+
+    def test_engine_only_and_current_files_are_untouched(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        assert DaemonStore.archive_legacy(path) is None  # no file
+        StateStore(path).create_run("r1", "o")  # a CLI host's engine-only db
+        assert DaemonStore.archive_legacy(path) is None
+        assert path.exists()
+        DaemonStore(path)  # now at schema 2
+        assert DaemonStore.archive_legacy(path) is None
+        assert StateStore(path).get_run("r1").outcome == "o"
+
+    def test_opening_a_legacy_file_directly_is_refused_clearly(self, tmp_path: Path) -> None:
+        """`sbxloop daemon items` before the daemon's first 1.0 start must
+        say what to do, not fail on a missing column."""
+        path = tmp_path / "state.db"
+        self._legacy(path)
+        with pytest.raises(DaemonError, match=r"pre-1\.0"):
+            DaemonStore(path)
+        assert path.exists()  # nothing was moved by the refusal

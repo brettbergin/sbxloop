@@ -112,6 +112,20 @@ class ChecksVerdict(NamedTuple):
         return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
 
 
+class FailedCheck(NamedTuple):
+    """One red check run, with the text that explains it.
+
+    ``excerpt`` is the job log (head+tail clipped) for a GitHub Actions
+    check, or the check's own title/summary/text for anything else — what a
+    fix round reads to learn *why* the build is red, not just that it is.
+    """
+
+    name: str
+    conclusion: str
+    excerpt: str
+    url: str
+
+
 # Check-run conclusions that are not failures. ``neutral`` and ``skipped``
 # are deliberately included: a skipped job is not a red build, and treating
 # it as one would wedge the fix loop against something no commit can change.
@@ -314,6 +328,91 @@ class GithubOps:
         """``APPROVED`` / ``CHANGES_REQUESTED`` / ``NONE`` — each reviewer's
         latest verdict only. ``login`` narrows it to one reviewer."""
         return fold_reviews(self.raw("GET", f"/repos/{repo}/pulls/{number}/reviews"), login=login)
+
+    def checks_failed_logs(
+        self, repo: str, sha: str, *, max_chars: int = 6000
+    ) -> list[FailedCheck]:
+        """The red check runs on ``sha``, each with its log or output excerpt.
+
+        A dedicated worker op rather than ``raw.api``: the Actions logs
+        endpoint answers a text body behind a redirect, which the JSON
+        transport cannot carry. The job gets twice the usual timeout — one
+        log download per failing check, from blob storage, is slow.
+        """
+        data = self._op(
+            "checks.failed_logs",
+            {"repo": repo, "sha": sha, "max_chars": max_chars},
+            timeout_s=self.timeout_s * 2,
+        )
+        checks = data.get("checks") if isinstance(data, dict) else None
+        if not isinstance(checks, list):
+            raise GithubOpsError(f"checks.failed_logs returned no check list: {data!r}")
+        failed: list[FailedCheck] = []
+        for entry in checks:
+            if not isinstance(entry, dict) or not all(
+                isinstance(entry.get(key), str)
+                for key in ("name", "conclusion", "details_url", "excerpt")
+            ):
+                raise GithubOpsError(f"checks.failed_logs returned a malformed entry: {entry!r}")
+            failed.append(
+                FailedCheck(
+                    name=entry["name"],
+                    conclusion=entry["conclusion"],
+                    excerpt=entry["excerpt"],
+                    url=entry["details_url"],
+                )
+            )
+        return failed
+
+    def pr_review_feedback(
+        self, repo: str, number: int, *, exclude_login: str | None = None, clip: int = 6000
+    ) -> str:
+        """The objections standing on a PR, as one markdown block a fix
+        round can act on; ``""`` when nothing stands.
+
+        Latest verdict per reviewer only, matching how :func:`fold_reviews`
+        judges the PR — a CHANGES_REQUESTED that a later APPROVE cleared is
+        not an objection any more. Inline review comments are quoted with
+        their ``path:line`` anchors so the fix agent can find the lines.
+        ``exclude_login`` drops one identity's reviews and comments: the
+        loop's own review is already known to the caller that posted it.
+        """
+
+        def login_of(entry: dict[str, Any]) -> str:
+            return str((entry.get("user") or {}).get("login") or "")
+
+        reviews = self.raw("GET", f"/repos/{repo}/pulls/{number}/reviews")
+        latest: dict[str, dict[str, Any]] = {}
+        for review in reviews if isinstance(reviews, list) else []:
+            if not isinstance(review, dict):
+                continue
+            login = login_of(review)
+            if exclude_login is not None and login == exclude_login:
+                continue
+            state = str(review.get("state") or "").upper()
+            if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                latest[login] = review
+        parts: list[str] = []
+        for review in latest.values():
+            if str(review.get("state") or "").upper() != "CHANGES_REQUESTED":
+                continue
+            body = str(review.get("body") or "").strip()
+            if body:
+                parts.append(body)
+        comments = self.raw("GET", f"/repos/{repo}/pulls/{number}/comments")
+        for comment in comments if isinstance(comments, list) else []:
+            if not isinstance(comment, dict):
+                continue
+            if exclude_login is not None and login_of(comment) == exclude_login:
+                continue
+            body = str(comment.get("body") or "").strip()
+            if not body:
+                continue
+            path = str(comment.get("path") or "")
+            line = comment.get("line") or comment.get("original_line")
+            anchor = f"`{path}:{line}`: " if path and line else f"`{path}`: " if path else ""
+            parts.append(f"- {anchor}{body}")
+        return "\n\n".join(parts)[:clip]
 
     def pr_review_create(
         self,

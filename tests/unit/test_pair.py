@@ -207,9 +207,25 @@ def test_tui_run_sigterm_removes_both_sandboxes(fake_sbx: FakeSbx, tmp_path: Pat
     script = workdir / "echo-script.json"
     # decompose blocks in the worker long enough for SIGTERM to land mid-run
     script.write_text(json.dumps([{"text": "never used", "sleep_s": 60}]))
+    # A configured repo means the run probes it (repo.get) right after
+    # provisioning, through the github worker — which under the fake sbx
+    # runs `gh api` on this host. A gh shim answers the probe so the run
+    # reaches decompose instead of dying on a 401.
+    # The worker runs under `sh -lc` in the fake sandbox's own HOME, whose
+    # login profile rebuilds PATH (macOS path_helper appends the inherited
+    # entries *after* the system ones), so the shim is prepended from that
+    # home's ~/.profile — the fake writes SBX_FAKE_PROFILE there — where it
+    # wins whatever the system PATH says.
+    bin_dir = workdir / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text('#!/bin/sh\nprintf \'{"default_branch":"main","full_name":"owner/repo"}\'\n')
+    gh.chmod(0o755)
     env = os.environ.copy()  # PATH already carries the fake sbx shim
     env.update(
         {
+            "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+            "SBX_FAKE_PROFILE": f'export PATH="{bin_dir}:$PATH"\n',
             "SBXLOOP_WORKER_BACKEND": "echo",
             "SBXLOOP_ECHO_SCRIPT": str(script),
             "COPILOT_GITHUB_TOKEN": "tok",
@@ -245,7 +261,7 @@ def test_tui_run_sigterm_removes_both_sandboxes(fake_sbx: FakeSbx, tmp_path: Pat
                 break
             time.sleep(0.2)
         assert proc.poll() is None, f"run exited early:\n{log_path.read_text()}"
-        assert state in ("decomposing", "running"), state
+        assert state in ("decomposing", "building"), state
         sandboxes = fake_sbx.state / "sandboxes"
         live = sorted(p.name for p in sandboxes.iterdir())
         assert len(live) == 2, live

@@ -1,30 +1,42 @@
-"""DaemonStore: work items, the run ledger, backlog dedup, Discord threads.
+"""DaemonStore: work items, the run ledger, requesters, Discord threads.
 
 Lives in the same ``state.db`` as the engine's :class:`StateStore` (WAL
 mode allows the second connection) so ``sbxloop status``/``logs`` and the
 daemon's own bookkeeping share one file, but it owns its own connection and
-tables — the engine store stays untouched. Same schema discipline:
-``CREATE TABLE IF NOT EXISTS`` on every open, additive-only changes.
+tables — the engine store stays untouched.
+
+Schema version 2 (the 1.0 pipeline). The pre-1.0 daemon kept five more
+tables for the lanes that filed their own work — backlog fingerprints,
+post-mortems, review charters, per-item PR acceptance state, audit
+schedules — none of which exist any more: the PR's fate is now the engine
+run's own (``runs.pr_number`` …). A ``state.db`` from that era is not
+migrated; :meth:`DaemonStore.archive_legacy` moves it aside and the daemon
+starts clean. That archive takes the engine's run history with it, which is
+the deliberate "fresh state" of the cutover.
 """
 
 from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-from sbxloop.daemon.model import ItemState, WorkItem
+from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
+from sbxloop.errors import DaemonError
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 
+SCHEMA_VERSION = "2"
+LEGACY_SUFFIX = ".pre-1.0"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS daemon_work_items (
     item_id     TEXT PRIMARY KEY,
-    source      TEXT NOT NULL,
-    source_key  TEXT NOT NULL,
+    source_key  TEXT NOT NULL UNIQUE,
     title       TEXT NOT NULL,
     body        TEXT NOT NULL DEFAULT '',
     url         TEXT NOT NULL DEFAULT '',
@@ -36,8 +48,7 @@ CREATE TABLE IF NOT EXISTS daemon_work_items (
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
     pending_report TEXT,
-    kind        TEXT NOT NULL DEFAULT 'patch',
-    UNIQUE(source, source_key)
+    requested_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);
 
@@ -76,74 +87,14 @@ CREATE TABLE IF NOT EXISTS daemon_run_watches (
 );
 CREATE INDEX IF NOT EXISTS idx_daemon_run_watches_run ON daemon_run_watches(run_id);
 
-CREATE TABLE IF NOT EXISTS daemon_backlog_filed (
-    fingerprint TEXT PRIMARY KEY,
-    run_id      TEXT NOT NULL,
-    filed_as    TEXT NOT NULL,
-    filed_at    REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS daemon_postmortems (
-    run_id     TEXT PRIMARY KEY,
-    item_id    TEXT NOT NULL,
-    filed_as   TEXT NOT NULL,
-    filed_at   REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS daemon_reviews (
-    run_id     TEXT PRIMARY KEY,
-    pr_number  INTEGER NOT NULL,
-    filed_as   TEXT NOT NULL,
-    filed_at   REAL NOT NULL,
-    gates      INTEGER NOT NULL DEFAULT 0,
-    rounds     INTEGER NOT NULL DEFAULT 0
-);
-
--- The acceptance state of one item's delivered PR. Keyed on the item, not
--- on a run: the PR belongs to the work item, and every fix round is a new
--- run against the same PR.
-CREATE TABLE IF NOT EXISTS daemon_pr_state (
-    item_id    TEXT PRIMARY KEY,
-    pr_number  INTEGER NOT NULL,
-    branch     TEXT NOT NULL DEFAULT '',
-    rounds     INTEGER NOT NULL DEFAULT 0,
-    -- Whether the review that was actually posted can hold the merge; a
-    -- COMMENT cannot, and waiting for an approval nobody can give strands
-    -- the item forever.
-    gates      INTEGER NOT NULL DEFAULT 0,
-    reviewed   INTEGER NOT NULL DEFAULT 0,
-    -- The event our own review asked for (APPROVE / REQUEST_CHANGES). When
-    -- the review could only be posted as a COMMENT, GitHub records no
-    -- verdict at all, so this is the only place the answer survives.
-    verdict    TEXT,
-    -- The review charter in flight, or NULL when none is.
-    review_ref TEXT,
-    -- What the next fix round is for; NULL when no round is queued.
-    fix_brief  TEXT,
-    updated_at REAL NOT NULL DEFAULT 0,
-    -- Where the PR lives, so post-acceptance notices need not re-mine the
-    -- run's event stream for it.
-    pr_url     TEXT NOT NULL DEFAULT '',
-    -- The merge watch: acceptance is not the end of the story — the source
-    -- issue settles (close + completed label) only when the PR merges.
-    -- `settled` is 0 until the merge (or an unmerged close) has been seen
-    -- AND reported to the source, so a restart resumes the watch.
-    merged_at  REAL,
-    settled    INTEGER NOT NULL DEFAULT 0,
-    last_merge_check REAL NOT NULL DEFAULT 0,
-    -- The landing stage: `updates` counts update-branch calls spent keeping
-    -- the PR current with its base; `update_head` is the head the branch sat
-    -- at when one was requested, so a poll can tell an update still in flight
-    -- (head unchanged) from one that has landed; it is cleared once the head
-    -- moves past it, so NULL means nothing was asked for.
-    updates    INTEGER NOT NULL DEFAULT 0,
-    update_head TEXT
-);
-
-CREATE TABLE IF NOT EXISTS daemon_audits (
-    name       TEXT PRIMARY KEY,
-    filed_as   TEXT NOT NULL,
-    filed_at   REAL NOT NULL
+-- Who asked for an issue through the concierge, keyed by the issue number
+-- it filed, so the work item that discovery later builds from that issue
+-- carries the requester — recorded here rather than in the public issue
+-- body, which would expose a Discord user id.
+CREATE TABLE IF NOT EXISTS daemon_requesters (
+    source_key   TEXT PRIMARY KEY,
+    requester_id TEXT NOT NULL,
+    created_at   REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS daemon_discord_threads (
@@ -160,107 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_discord_threads_thread
     ON daemon_discord_threads(thread_id);
 """
 
-# Columns added after a table first shipped; applied idempotently at open
-# (same pattern as engine/store.py's runs migrations).
-_MIGRATIONS = (
-    (
-        "daemon_discord_threads",
-        "status_id",
-        "ALTER TABLE daemon_discord_threads ADD COLUMN status_id INTEGER",
-    ),
-    # #229: an operator decision (abandon / retry) the source has not heard yet.
-    (
-        "daemon_work_items",
-        "pending_report",
-        "ALTER TABLE daemon_work_items ADD COLUMN pending_report TEXT",
-    ),
-    # Discovery lane: audit items investigate and file issues, patch items
-    # deliver PRs. Rows from before the column are patches.
-    (
-        "daemon_work_items",
-        "kind",
-        "ALTER TABLE daemon_work_items ADD COLUMN kind TEXT NOT NULL DEFAULT 'patch'",
-    ),
-    # The acceptance gate: whether the posted review can actually hold the
-    # merge (a COMMENT cannot), and how many polls have found the PR still
-    # unsatisfied.
-    (
-        "daemon_reviews",
-        "gates",
-        "ALTER TABLE daemon_reviews ADD COLUMN gates INTEGER NOT NULL DEFAULT 0",
-    ),
-    (
-        "daemon_reviews",
-        "rounds",
-        "ALTER TABLE daemon_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0",
-    ),
-    ("daemon_pr_state", "verdict", "ALTER TABLE daemon_pr_state ADD COLUMN verdict TEXT"),
-    # The merge watch. `settled` defaults to 0 so rows from before the
-    # column — accepted items whose PRs merged with no one watching — are
-    # swept retroactively at the next tick.
-    (
-        "daemon_pr_state",
-        "pr_url",
-        "ALTER TABLE daemon_pr_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''",
-    ),
-    (
-        "daemon_pr_state",
-        "merged_at",
-        "ALTER TABLE daemon_pr_state ADD COLUMN merged_at REAL",
-    ),
-    (
-        "daemon_pr_state",
-        "settled",
-        "ALTER TABLE daemon_pr_state ADD COLUMN settled INTEGER NOT NULL DEFAULT 0",
-    ),
-    (
-        "daemon_pr_state",
-        "last_merge_check",
-        "ALTER TABLE daemon_pr_state ADD COLUMN last_merge_check REAL NOT NULL DEFAULT 0",
-    ),
-    # The landing stage: update-branch attempts spent. Rows from before this
-    # column read 0, which is where a PR that has never been landed belongs.
-    (
-        "daemon_pr_state",
-        "updates",
-        "ALTER TABLE daemon_pr_state ADD COLUMN updates INTEGER NOT NULL DEFAULT 0",
-    ),
-    (
-        "daemon_pr_state",
-        "update_head",
-        "ALTER TABLE daemon_pr_state ADD COLUMN update_head TEXT",
-    ),
-)
-
-
-class PrState(NamedTuple):
-    """Where one item's delivered PR stands on its way to being accepted."""
-
-    pr_number: int
-    branch: str
-    rounds: int
-    gates: bool
-    reviewed: int
-    review_ref: str | None
-    fix_brief: str | None
-    # What our own review asked for, when one has been posted.
-    verdict: str | None = None
-    pr_url: str = ""
-    # The merge watch: set once the merge (or unmerged close) has been seen
-    # and reported to the source.
-    settled: bool = False
-    merged_at: float | None = None
-    # Update-branch attempts spent on this PR, bounded by
-    # `daemon.merge_update_attempts`.
-    updates: int = 0
-    # The branch head when an update-branch was last requested. While the head
-    # still reads this, that update has not landed and asking again would burn
-    # the budget on a no-op.
-    update_head: str | None = None
-
-    @property
-    def review_in_flight(self) -> bool:
-        return self.review_ref is not None
+TERMINAL_ITEM_STATES: frozenset[str] = frozenset({"done", "failed", "blocked", "cancelled"})
 
 
 class DiscordThread(NamedTuple):
@@ -275,9 +126,7 @@ class DiscordThread(NamedTuple):
 def _row_to_item(row: sqlite3.Row) -> WorkItem:
     return WorkItem(
         item_id=row["item_id"],
-        source=row["source"],
         source_key=row["source_key"],
-        kind=row["kind"] or "patch",
         title=row["title"],
         body=row["body"],
         url=row["url"],
@@ -289,6 +138,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         pending_report=row["pending_report"],
+        requested_by=row["requested_by"],
     )
 
 
@@ -302,7 +152,58 @@ def _loggable(fields: dict[str, object]) -> dict[str, object]:
     return out
 
 
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}  # nosec B608
+
+
 class DaemonStore:
+    @classmethod
+    def archive_legacy(cls, path: Path, *, clock: Callable[[], float] = time.time) -> Path | None:
+        """Move a pre-1.0 ``state.db`` (and its ``-wal``/``-shm``) aside.
+
+        Returns the archive path, or None when there was nothing to do: no
+        file, a database the daemon never touched (an engine-only store from
+        ``sbxloop run`` on a CLI host is left alone), or one already at the
+        current schema. Called before either store opens the file — the
+        daemon host is deployed unattended, so the cutover has to be
+        something the daemon does for itself on its first start.
+        """
+        if not path.is_file():
+            return None
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            tables = _tables(conn)
+            if "daemon_work_items" not in tables:
+                return None
+            if "daemon_state" in tables:
+                row = conn.execute(
+                    "SELECT value FROM daemon_state WHERE key = 'schema_version'"
+                ).fetchone()
+                if row is not None and str(row[0]) == SCHEMA_VERSION:
+                    return None
+        finally:
+            conn.close()
+        target = path.with_name(f"{path.name}{LEGACY_SUFFIX}")
+        if target.exists():
+            target = path.with_name(f"{path.name}{LEGACY_SUFFIX}.{int(clock())}")
+        for suffix in ("", "-wal", "-shm"):
+            src = path.with_name(path.name + suffix)
+            if src.exists():
+                src.rename(target.with_name(target.name + suffix))
+        log.warning(
+            "store.archived_legacy",
+            db=str(path),
+            archived_to=str(target),
+            hint="pre-1.0 daemon state is not migrated; the daemon starts with a fresh store",
+        )
+        return target
+
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,14 +213,23 @@ class DaemonStore:
         # The engine commits per event on the same file while a run is in
         # flight; wait for it instead of failing on SQLITE_BUSY.
         self._conn.execute("PRAGMA busy_timeout=5000")
+        if "daemon_work_items" in _tables(self._conn) and "kind" in _columns(
+            self._conn, "daemon_work_items"
+        ):
+            # Opened by a CLI command before the daemon's first start did
+            # the archive; say so rather than fail on a missing column.
+            self._conn.close()
+            raise DaemonError(
+                f"{path} is a pre-1.0 daemon state database; start `sbxloop daemon` once "
+                f"to archive it (to {path.name}{LEGACY_SUFFIX}) and begin a fresh store"
+            )
         self._conn.executescript(_SCHEMA)
-        for table, column, ddl in _MIGRATIONS:
-            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
-            if column not in existing:
-                self._conn.execute(ddl)
-                log.info("store.migrated", db=str(path), table=table, column=column)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('schema_version', ?)",
+            (SCHEMA_VERSION,),
+        )
         self._conn.commit()
-        log.debug("store.opened", db=str(path))
+        log.debug("store.opened", db=str(path), schema=SCHEMA_VERSION)
         # One connection shared by the daemon, bridge and CLI threads:
         # sqlite3 rejects concurrent use of a connection from two threads
         # ("bad parameter or other API misuse"), so EVERY statement — reads
@@ -334,18 +244,18 @@ class DaemonStore:
     def upsert_new(self, item: WorkItem, now: float) -> bool:
         """Record a discovered item; True if it was not already known.
 
-        A finished (done/abandoned) row with the same source key is
-        superseded when the content changed — an operator re-dropping an
-        edited inbox file, or re-triggering an issue, is a new work item.
+        A finished row with the same issue is superseded when the content
+        changed — re-triggering an edited issue is a new work item. The
+        requester the concierge recorded for the issue, if any, is copied
+        onto the item.
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT item_id, state, title, body FROM daemon_work_items "
-                "WHERE source = ? AND source_key = ?",
-                (item.source, item.source_key),
+                "SELECT item_id, state, title, body FROM daemon_work_items WHERE source_key = ?",
+                (item.source_key,),
             ).fetchone()
             if row is not None:
-                terminal = row["state"] in ("done", "abandoned", "cancelled")
+                terminal = row["state"] in TERMINAL_ITEM_STATES
                 changed = (row["title"], row["body"]) != (item.title, item.body)
                 if not (terminal and changed):
                     return False
@@ -358,24 +268,44 @@ class DaemonStore:
                 self._conn.execute(
                     "DELETE FROM daemon_work_items WHERE item_id = ?", (row["item_id"],)
                 )
+            requester = self._conn.execute(
+                "SELECT requester_id FROM daemon_requesters WHERE source_key = ?",
+                (item.source_key,),
+            ).fetchone()
+            requested_by = (
+                item.requested_by
+                if item.requested_by
+                else (str(requester["requester_id"]) if requester is not None else None)
+            )
             self._conn.execute(
-                "INSERT INTO daemon_work_items (item_id, source, source_key, kind, title, body, "
-                "url, state, attempts, claimed, run_id, last_error, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?)",
+                "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
+                "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?)",
                 (
                     item.item_id,
-                    item.source,
                     item.source_key,
-                    item.kind,
                     item.title,
                     item.body,
                     item.url,
                     now,
                     now,
+                    requested_by,
                 ),
             )
             self._conn.commit()
             return True
+
+    def note_requester(self, source_key: str, requester_id: str, now: float) -> None:
+        """Remember who asked for the issue ``source_key`` (the concierge's
+        write path), so the work item discovery builds from it carries the
+        requester and the run's finish can ping them."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO daemon_requesters (source_key, requester_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (source_key, requester_id, now),
+            )
+            self._conn.commit()
 
     def get(self, item_id: str) -> WorkItem | None:
         with self._lock:
@@ -448,44 +378,43 @@ class DaemonStore:
     # -- operator controls (#229) ------------------------------------------------
 
     def abandon(self, item_id: str, reason: str, now: float) -> WorkItem:
-        """Operator abandon: queued/running → abandoned. ``run_id`` is kept
-        so the ledger and ``sbxloop logs`` still tie the item to the run
-        that made the operator give up on it; the loop treats
-        "abandoned while pinned to my run" as its cue to cancel that run.
-        The source is owed a report (``pending_report``): whoever delivers
-        it — the loop's settle path, recovery, or the tick sweep after a
-        row-only CLI abandon — clears the debt."""
+        """Operator abandon: queued/running/blocked → failed. ``run_id`` is
+        kept so the ledger and ``sbxloop logs`` still tie the item to the run
+        that made the operator give up on it; the loop treats "abandoned
+        while pinned to my run" as its cue to cancel that run. The source is
+        owed a report (``pending_report``): whoever delivers it — the loop's
+        settle path, recovery, or the tick sweep after a row-only CLI
+        abandon — clears the debt."""
         return self._transition(
             item_id,
             now,
-            ("queued", "running", "failed"),
+            ("queued", "running", "blocked"),
             lambda item: f"{item_id} is already {item.state}",
-            state="abandoned",
+            state="failed",
             last_error=reason[:2000],
             pending_report="abandoned",
         )
 
     def retry(self, item_id: str, now: float, reason: str | None = None) -> WorkItem:
-        """Operator retry: an abandoned, cancelled or backoff-waiting item
-        goes back to the queue as if freshly discovered. The attempt budget
-        and retry backoff exist to bound *autonomous* churn, so a human
-        decision starts both over — attempts reset, eligible on the next
-        tick (the daily run cap still applies) — and the run is unpinned so
-        the next dispatch plans from scratch instead of resuming the plan
-        that failed (#228: recovery would have resumed a doomed plan; #254).
-        The source-side claim is kept: re-claiming would fail (the inbox
-        file / trigger label moved when it was first claimed). ``reason``
-        (e.g. "re-queued by X") is kept as ``last_error`` for the audit
-        trail in ``items``; without one the old error is cleared. The source
-        is owed a ``requeued`` report (GitHub: re-claim, drop the failed
-        label; inbox: move the file back out of failed/)."""
+        """Operator retry: a failed, blocked, cancelled or backoff-waiting
+        item goes back to the queue as if freshly discovered. The attempt
+        budget and retry backoff exist to bound *autonomous* churn, so a
+        human decision starts both over — attempts reset, eligible on the
+        next tick (the daily run cap still applies) — and the run is
+        unpinned so the next dispatch plans from scratch instead of
+        resuming the plan that failed (#228, #254). The source-side claim is
+        kept: re-claiming would fail (the trigger label moved when it was
+        first claimed). ``reason`` (e.g. "re-queued by X") is kept as
+        ``last_error`` for the audit trail in ``items``; without one the old
+        error is cleared. The source is owed a ``requeued`` report
+        (re-claim, drop the failed/blocked label)."""
         return self._transition(
             item_id,
             now,
-            ("abandoned", "cancelled", "queued"),
+            ("failed", "blocked", "cancelled", "queued"),
             lambda item: (
-                f"{item_id} is {item.state}; only abandoned, cancelled or queued items can be "
-                "retried" + (" (abandon it first)" if item.state == "running" else "")
+                f"{item_id} is {item.state}; only failed, blocked, cancelled or queued items "
+                "can be retried" + (" (abandon it first)" if item.state == "running" else "")
             ),
             state="queued",
             attempts=0,
@@ -505,7 +434,7 @@ class DaemonStore:
             ("running", "queued"),
             lambda item: (
                 f"{item_id} is {item.state}; only running or queued items can be requeued"
-                + (" (use retry)" if item.state in ("abandoned", "cancelled") else "")
+                + (" (use retry)" if item.state in ("failed", "blocked", "cancelled") else "")
             ),
             state="queued",
             run_id=None,
@@ -548,8 +477,9 @@ class DaemonStore:
             raise ValueError(refuse(current))
 
     def pending_reports(self) -> list[WorkItem]:
-        """Items whose operator decision (abandon / retry) the source has
-        not been told about yet, oldest decision first."""
+        """Items whose decision the source has not been told about yet
+        (an operator's abandon / retry, or a run's merged / blocked outcome
+        whose report did not land), oldest decision first."""
         with self._lock:
             return [
                 _row_to_item(row)
@@ -631,15 +561,28 @@ class DaemonStore:
             )
             self._conn.commit()
 
-    def mark_done(self, item_id: str, now: float) -> None:
-        self._update(item_id, now, state="done", last_error=None)
+    def mark_done(
+        self, item_id: str, now: float, *, pending_report: PendingReport | None = None
+    ) -> None:
+        """The run merged its PR. ``pending_report="merged"`` records the
+        issue close as a debt the tick pays (and retries) — a GitHub hiccup
+        on the close must not leave the issue open with no one to close it."""
+        self._update(item_id, now, state="done", last_error=None, pending_report=pending_report)
+
+    def mark_blocked(self, item_id: str, reason: str, now: float) -> None:
+        """The run cleared its own bar but GitHub would not finish the PR;
+        a human has to look. Terminal for the daemon, ``retry``-able by
+        hand; the source is owed the blocked report."""
+        self._update(
+            item_id, now, state="blocked", last_error=reason[:2000], pending_report="blocked"
+        )
 
     def mark_failed(self, item_id: str, error: str, now: float, *, requeue: bool) -> None:
         # A requeued item must not keep its run pinned: queued + run_id
-        # means "resume this run", and a failed run is dispatched fresh. An
-        # abandoned item keeps it for forensics.
+        # means "resume this run", and a failed run is dispatched fresh. A
+        # failed item keeps it for forensics.
         fields: dict[str, object] = {
-            "state": "queued" if requeue else "abandoned",
+            "state": "queued" if requeue else "failed",
             "last_error": error[:2000],
         }
         if requeue:
@@ -648,7 +591,7 @@ class DaemonStore:
 
     def mark_cancelled(self, item_id: str, reason: str, now: float) -> None:
         """Operator cancel: terminal for the daemon, unlike ``mark_failed``
-        which either re-queues (with backoff) or abandons."""
+        which either re-queues (with backoff) or fails."""
         self._update(item_id, now, state="cancelled", last_error=reason[:2000])
 
     def mark_requeued_unstarted(self, item_id: str, now: float) -> None:
@@ -741,6 +684,17 @@ class DaemonStore:
             self._conn.commit()
         log.debug("store.ledger_closed", run=run_id, result=result)
 
+    def runs_for_item(self, item_id: str) -> list[str]:
+        """Run ids the item has been dispatched under, oldest first."""
+        with self._lock:
+            return [
+                str(r["run_id"])
+                for r in self._conn.execute(
+                    "SELECT run_id FROM daemon_runs WHERE item_id = ? ORDER BY started_at",
+                    (item_id,),
+                )
+            ]
+
     # -- generic daemon state ---------------------------------------------------
 
     def get_value(self, key: str) -> str | None:
@@ -806,339 +760,6 @@ class DaemonStore:
                     ("breaker_opened_at", "" if opened_at is None else repr(float(opened_at))),
                     ("consecutive_failures", str(int(consecutive_failures))),
                 ],
-            )
-            self._conn.commit()
-
-    # -- backlog dedup ---------------------------------------------------------
-
-    def backlog_seen(self, fingerprint: str) -> bool:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM daemon_backlog_filed WHERE fingerprint = ?", (fingerprint,)
-            ).fetchone()
-            return row is not None
-
-    def backlog_record(self, fingerprint: str, run_id: str, filed_as: str, now: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_backlog_filed "
-                "(fingerprint, run_id, filed_as, filed_at) VALUES (?, ?, ?, ?)",
-                (fingerprint, run_id, filed_as, now),
-            )
-            self._conn.commit()
-
-    # -- post-mortems (discovery lane) ---------------------------------------
-
-    def runs_for_item(self, item_id: str) -> list[str]:
-        """Run ids the item has been dispatched under, oldest first."""
-        with self._lock:
-            return [
-                str(r["run_id"])
-                for r in self._conn.execute(
-                    "SELECT run_id FROM daemon_runs WHERE item_id = ? ORDER BY started_at",
-                    (item_id,),
-                )
-            ]
-
-    def postmortem_filed(self, run_id: str) -> bool:
-        with self._lock:
-            return (
-                self._conn.execute(
-                    "SELECT 1 FROM daemon_postmortems WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                is not None
-            )
-
-    def postmortems_since(self, ts: float) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_postmortems WHERE filed_at >= ?", (ts,)
-            ).fetchone()
-            return int(row["n"])
-
-    def record_postmortem(self, run_id: str, item_id: str, filed_as: str, now: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_postmortems (run_id, item_id, filed_as, filed_at) "
-                "VALUES (?, ?, ?, ?)",
-                (run_id, item_id, filed_as, now),
-            )
-            self._conn.commit()
-
-    # -- delivery reviews (discovery lane) ---------------------------------------
-
-    def review_filed(self, run_id: str) -> bool:
-        with self._lock:
-            return (
-                self._conn.execute(
-                    "SELECT 1 FROM daemon_reviews WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                is not None
-            )
-
-    def reviews_since(self, ts: float) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_reviews WHERE filed_at >= ?", (ts,)
-            ).fetchone()
-            return int(row["n"])
-
-    def review_target(self, filed_as: str) -> tuple[int, str] | None:
-        """(pr_number, origin run id) for the review filed as ``filed_as``.
-
-        The reverse of :meth:`record_review`: when that charter comes back
-        round as a work item, this is how the loop knows the item is a
-        review and which PR it belongs to — without parsing the issue body.
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT pr_number, run_id FROM daemon_reviews WHERE filed_as = ?",
-                (filed_as,),
-            ).fetchone()
-        return (int(row["pr_number"]), str(row["run_id"])) if row is not None else None
-
-    # -- PR acceptance state ---------------------------------------------------
-
-    def record_delivery(
-        self, item_id: str, pr_number: int, branch: str, now: float, *, url: str = ""
-    ) -> None:
-        """This item delivered ``pr_number``; start tracking its acceptance.
-
-        Idempotent on the item: a re-delivery of the same PR (a fix round
-        pushing to the same branch) must not reset the round count, which is
-        the only thing bounding the loop. It does re-arm the merge watch —
-        a fresh delivery means there is a PR to watch again.
-
-        ``updates`` deliberately survives, like ``rounds``: it is a budget.
-        """
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO daemon_pr_state (item_id, pr_number, branch, updated_at, pr_url) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET "
-                "pr_number = excluded.pr_number, branch = excluded.branch, "
-                "updated_at = excluded.updated_at, pr_url = excluded.pr_url, "
-                "settled = 0, merged_at = NULL, update_head = NULL",
-                (item_id, pr_number, branch, now, url),
-            )
-            self._conn.commit()
-
-    def pr_state(self, item_id: str) -> PrState | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM daemon_pr_state WHERE item_id = ?", (item_id,)
-            ).fetchone()
-        if row is None:
-            return None
-        return PrState(
-            pr_number=int(row["pr_number"]),
-            branch=str(row["branch"] or ""),
-            rounds=int(row["rounds"]),
-            gates=bool(row["gates"]),
-            reviewed=int(row["reviewed"]),
-            review_ref=row["review_ref"],
-            fix_brief=row["fix_brief"],
-            verdict=row["verdict"],
-            pr_url=str(row["pr_url"] or ""),
-            settled=bool(row["settled"]),
-            merged_at=row["merged_at"],
-            updates=int(row["updates"]),
-            update_head=row["update_head"],
-        )
-
-    def merge_watch(self, now: float, min_interval_s: float) -> list[tuple[str, int, str]]:
-        """(item_id, pr_number, pr_url) for every accepted-but-unsettled PR
-        due another merge check.
-
-        Joined on ``state = 'done'``: an item still reviewing is the
-        acceptance gate's to advance, and a failed/abandoned one has been
-        handed to a human — neither should cost a GitHub read here.
-        """
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT p.item_id, p.pr_number, p.pr_url FROM daemon_pr_state p "
-                "JOIN daemon_work_items w ON w.item_id = p.item_id "
-                "WHERE p.settled = 0 AND w.state = 'done' AND p.last_merge_check <= ? "
-                "ORDER BY p.updated_at ASC",
-                (now - min_interval_s,),
-            ).fetchall()
-        return [(str(r["item_id"]), int(r["pr_number"]), str(r["pr_url"] or "")) for r in rows]
-
-    def settle_merge(self, item_id: str, now: float, *, merged_at: float | None) -> None:
-        """The PR's fate has been seen and reported: merged (``merged_at``
-        set) or closed without merging. Either way the watch is over."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET settled = 1, merged_at = ?, "
-                "last_merge_check = ?, updated_at = ? WHERE item_id = ?",
-                (merged_at, now, now, item_id),
-            )
-            self._conn.commit()
-
-    def touch_merge_check(self, item_id: str, now: float) -> None:
-        """One merge check spent; the next is not due for another interval."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET last_merge_check = ? WHERE item_id = ?",
-                (now, item_id),
-            )
-            self._conn.commit()
-
-    def bump_pr_update(self, item_id: str) -> int:
-        """Spend one update-branch attempt; returns the new total."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET updates = updates + 1 WHERE item_id = ?", (item_id,)
-            )
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT updates FROM daemon_pr_state WHERE item_id = ?", (item_id,)
-            ).fetchone()
-        return int(row["updates"]) if row is not None else 0
-
-    def set_update_head(self, item_id: str, sha: str | None) -> None:
-        """Record (or clear) the head an update-branch request was made at."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET update_head = ? WHERE item_id = ?",
-                (sha, item_id),
-            )
-            self._conn.commit()
-
-    def review_in_flight(self, item_id: str, review_ref: str | None) -> None:
-        """Record the review charter now running for this PR, or None when
-        it has finished. ``pr_state.review_ref`` being set is what stops a
-        second review being filed while one is already in flight."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET review_ref = ? WHERE item_id = ?",
-                (review_ref, item_id),
-            )
-            self._conn.commit()
-
-    def awaiting_review(self, review_ref: str) -> str | None:
-        """The item whose PR ``review_ref`` is the review of.
-
-        The review runs as its *own* work item, so the charter's id is not
-        the id of the item waiting on the PR — settling against the wrong
-        one updates no row and leaves the waiter marked "review in flight"
-        for ever (field: gh:335 parked on PR #406).
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT item_id FROM daemon_pr_state WHERE review_ref = ?", (review_ref,)
-            ).fetchone()
-        return str(row["item_id"]) if row is not None else None
-
-    def review_settled(self, item_id: str, *, gates: bool, verdict: str) -> None:
-        """A review has been posted against this item's PR: it is no longer
-        in flight, and we now know both what it asked for and whether GitHub
-        will let that hold the merge."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET review_ref = NULL, gates = ?, verdict = ?, "
-                "reviewed = reviewed + 1 WHERE item_id = ?",
-                (int(gates), verdict, item_id),
-            )
-            self._conn.commit()
-
-    def bump_pr_round(self, item_id: str) -> int:
-        """Count one fix round; returns the new total. A round is a real run,
-        so this is the spend control that stops the loop spinning."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET rounds = rounds + 1 WHERE item_id = ?", (item_id,)
-            )
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT rounds FROM daemon_pr_state WHERE item_id = ?", (item_id,)
-            ).fetchone()
-        return int(row["rounds"]) if row is not None else 0
-
-    def queue_fix(self, item_id: str, brief: str, now: float) -> None:
-        """Send the item back to the queue for one fix round against its own
-        PR branch. The run id is cleared: a fix is a fresh run, not a resume
-        of the one that delivered."""
-        self._set_fix_brief(item_id, brief)
-        self._update(item_id, now, state="queued", run_id=None, last_error=None)
-
-    def clear_fix(self, item_id: str) -> None:
-        """The fix round has been dispatched; the brief is spent."""
-        self._set_fix_brief(item_id, None)
-
-    def _set_fix_brief(self, item_id: str, brief: str | None) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pr_state SET fix_brief = ? WHERE item_id = ?", (brief, item_id)
-            )
-            self._conn.commit()
-
-    def review_pr(self, run_id: str) -> tuple[int, bool, int] | None:
-        """(pr_number, gates_merge, rounds) for the review of ``run_id``.
-
-        ``gates_merge`` is False when the posted review could only be a
-        COMMENT — the identity is not an accepted reviewer on the repo — in
-        which case no approval will ever arrive and the acceptance gate must
-        not wait for one.
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT pr_number, gates, rounds FROM daemon_reviews WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return (int(row["pr_number"]), bool(row["gates"]), int(row["rounds"]))
-
-    def set_review_gates(self, run_id: str, gates: bool) -> None:
-        """Record whether the review that was actually posted can hold the
-        merge; set once the review lands, not when it is queued."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_reviews SET gates = ? WHERE run_id = ?", (int(gates), run_id)
-            )
-            self._conn.commit()
-
-    def bump_review_round(self, run_id: str) -> int:
-        """Count one poll that found the PR still unsatisfied; returns the
-        new total. This is what stops an item waiting forever."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_reviews SET rounds = rounds + 1 WHERE run_id = ?", (run_id,)
-            )
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT rounds FROM daemon_reviews WHERE run_id = ?", (run_id,)
-            ).fetchone()
-        return int(row["rounds"]) if row is not None else 0
-
-    def mark_reviewing(self, item_id: str, now: float) -> None:
-        """Delivered, not accepted: in flight until its PR is green and its
-        review satisfied."""
-        self._update(item_id, now, state="reviewing", last_error=None)
-
-    def record_review(self, run_id: str, pr_number: int, filed_as: str, now: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_reviews (run_id, pr_number, filed_as, filed_at) "
-                "VALUES (?, ?, ?, ?)",
-                (run_id, pr_number, filed_as, now),
-            )
-            self._conn.commit()
-
-    # -- scheduled audits (discovery lane) -------------------------------------
-
-    def audit_last_filed(self) -> dict[str, float]:
-        with self._lock:
-            return {
-                str(r["name"]): float(r["filed_at"])
-                for r in self._conn.execute("SELECT name, filed_at FROM daemon_audits")
-            }
-
-    def record_audit(self, name: str, filed_as: str, now: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO daemon_audits (name, filed_as, filed_at) VALUES (?, ?, ?)",
-                (name, filed_as, now),
             )
             self._conn.commit()
 

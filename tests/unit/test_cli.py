@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, ClassVar
@@ -15,10 +16,12 @@ from typer.testing import CliRunner
 import sbxloop
 from sbxloop.cli.app import app
 from sbxloop.cli.doctor import Check
+from sbxloop.daemon.model import WorkItem
 from sbxloop.engine.store import StateStore
 from sbxloop.events import Event
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
+from tests.fakes.fake_github import FakeGithub
 
 runner = CliRunner()
 
@@ -85,7 +88,6 @@ class TestBasics:
         for command in (
             "run",
             "resume",
-            "deliver",
             "status",
             "logs",
             "artifacts",
@@ -198,10 +200,10 @@ class TestStatusAndLogs:
         assert "run.end" in result.output
 
     def test_logs_follow_exits_on_stale_run(self, workdir: Path) -> None:
-        # A run whose driving process died hard stays `running` in the DB
+        # A run whose driving process died hard stays `building` in the DB
         # forever; --follow must notice the silence and exit, not spin.
         store = seed_store(workdir)
-        store.set_run_state("rseeded11", "running")
+        store.set_run_state("rseeded11", "building")
         store._conn.execute(  # backdate the state change (no public setter)
             "UPDATE runs SET updated_at = 1.0 WHERE run_id = 'rseeded11'"
         )
@@ -335,18 +337,24 @@ class TestConfigAndInit:
         forced = runner.invoke(app, ["init", "--force"])
         assert forced.exit_code == 0
 
-    def test_init_template_documents_tracker_knobs(self, workdir: Path) -> None:
+    def test_init_template_documents_landing_knobs(self, workdir: Path) -> None:
         result = runner.invoke(app, ["init"])
         assert result.exit_code == 0
         text = (workdir / "sbxloop.toml").read_text()
-        assert "close_on_success" in text
-        assert "tracking_issue" in text
+        # landing is always on; its budgets and the merge style are documented
+        assert "[landing]" in text
+        assert "max_review_rounds" in text and "merge_method" in text
+        # ...and the daemon's label for a PR the loop could not land
+        assert "blocked_label" in text
+        # the retired tracker knobs must not be taught to a fresh install
+        assert "close_on_success" not in text and "tracking_issue" not in text
 
         from sbxloop.config import load_config
 
         config = load_config(cwd=workdir, env={})
-        assert config.daemon.close_on_success is True
-        assert config.daemon.tracking_issue is True
+        assert config.retired_keys == ()
+        assert config.landing.max_review_rounds == 3
+        assert config.daemon.blocked_label == "sbxloop:blocked"
         # the concierge block documents its knobs and stays commented (defaults)
         assert "[concierge]" in text and "session_turns" in text
         assert config.concierge.enabled is True and config.concierge.model is None
@@ -421,63 +429,74 @@ class TestShellCommand:
 
 
 class TestDaemonCommand:
-    def test_no_sources_exits_2(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SBXLOOP_DAEMON__INBOX_DIR", "")
+    @staticmethod
+    def offline(monkeypatch: pytest.MonkeyPatch, items: list[WorkItem] | None = None) -> None:
+        """No sandbox, no GitHub: the stale-sandbox sweep is a no-op and the
+        issue poll answers from memory, so `daemon --repo o/r --once` runs a
+        whole tick without a network (the test_daemon_control pattern)."""
+        from sbxloop.daemon.github import DaemonGithub
+        from sbxloop.daemon.sources import GitHubIssueSource
+
+        monkeypatch.setattr(DaemonGithub, "remove_stale", lambda self: None)
+        monkeypatch.setattr(GitHubIssueSource, "poll", lambda self: list(items or []))
+
+    def test_no_repository_exits_2(self, workdir: Path) -> None:
+        # the daemon's work is the labeled issues of ONE repository
         result = runner.invoke(app, ["daemon"])
         assert result.exit_code == 2
-        assert "daemon.no_work_sources" in result.output
-
-    def test_backlog_github_without_repo_exits_2(self, workdir: Path) -> None:
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--backlog", "github"])
-        assert result.exit_code == 2
-        assert "daemon.backlog_needs_github" in result.output
+        assert "daemon.no_repository" in result.output
 
     def test_nonpositive_poll_interval_exits_2(self, workdir: Path) -> None:
         # review: Event.wait(<= 0) returns immediately → the loop would spin
         for value in ("0", "-5"):
             result = runner.invoke(
-                app, ["daemon", "--inbox", "inbox", "--poll-interval", value, "--once"]
+                app, ["daemon", "--repo", "o/r", "--poll-interval", value, "--once"]
             )
             assert result.exit_code == 2, result.output
             assert "daemon.invalid_option" in result.output
 
-    def test_bad_backlog_value_exits_2(self, workdir: Path) -> None:
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--backlog", "yolo"])
-        assert result.exit_code == 2
-        assert "daemon.invalid_option" in result.output
-
-    def test_dry_run_lists_inbox_candidates_without_claiming(
+    def test_dry_run_lists_candidates_without_claiming(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import os
-        import time
+        from sbxloop.daemon.sources import GitHubIssueSource
 
-        pending = workdir / "inbox" / "pending"
-        pending.mkdir(parents=True)
-        f = pending / "thing.md"
-        f.write_text("# Do the thing\n\nbody\n")
-        old = time.time() - 60
-        os.utime(f, (old, old))
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--dry-run"])
+        item = WorkItem(
+            item_id="gh:12",
+            source_key="12",
+            title="Do the thing",
+            url="https://github.com/o/r/issues/12",
+        )
+        self.offline(monkeypatch, [item])
+        claimed: list[WorkItem] = []
+
+        def claim(self: GitHubIssueSource, item: WorkItem) -> bool:
+            claimed.append(item)
+            return True
+
+        monkeypatch.setattr(GitHubIssueSource, "claim", claim)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--dry-run"])
         assert result.exit_code == 0, result.output
         # the listing is stdout output (pipeable), not only a log line
-        assert "inbox:thing.md" in result.stdout and "Do the thing" in result.stdout
-        assert f.exists()  # not claimed
+        assert "gh:12" in result.stdout and "Do the thing" in result.stdout
+        assert "issues/12" in result.stdout
+        assert claimed == []  # the label swap never happens on a dry run
 
     def test_discord_configured_without_token_exits_2(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
-        (workdir / "inbox" / "pending").mkdir(parents=True)
+        self.offline(monkeypatch)
         result = runner.invoke(
-            app, ["daemon", "--inbox", "inbox", "--discord-channel", "123", "--once"]
+            app, ["daemon", "--repo", "o/r", "--discord-channel", "123", "--once"]
         )
         assert result.exit_code == 2
         assert "DISCORD_BOT_TOKEN" in result.output
 
-    def test_once_runs_a_tick_and_exits(self, workdir: Path, fake_sbx: FakeSbx) -> None:
-        (workdir / "inbox" / "pending").mkdir(parents=True)
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+    def test_once_runs_a_tick_and_exits(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
         assert "tick:" in result.output and "no_work" in result.output
         assert "daemon.tick" in result.output  # and the structured record
@@ -493,18 +512,18 @@ class TestDaemonCommand:
         # Patch where it is USED: app binds the name at import time, so
         # patching sbxloop.daemon.versions would pass no matter what.
         monkeypatch.setattr(app_mod, "start_drift_check", lambda *a, **k: started.append(a))
-        (workdir / "inbox" / "pending").mkdir(parents=True)
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
         assert started == []
 
     def test_state_dir_defaults_outside_cwd_and_is_announced(
-        self, workdir: Path, fake_sbx: FakeSbx
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """#255: daemon state is anchored to XDG state home, not a relative
         .sbxloop that would nest run clones inside the workspace checkout."""
-        (workdir / "inbox" / "pending").mkdir(parents=True)
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
         expected = (workdir / "xdg-state" / "sbxloop" / workdir.name).resolve()
         assert (expected / "state.db").is_file()
@@ -513,19 +532,23 @@ class TestDaemonCommand:
         assert str(expected) in result.output.replace("\n", "")
 
     def test_startup_summary_names_the_configuration(
-        self, workdir: Path, fake_sbx: FakeSbx
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        (workdir / "inbox" / "pending").mkdir(parents=True)
+        self.offline(monkeypatch)
         result = runner.invoke(
-            app, ["daemon", "--inbox", "inbox", "--once", "--max-runs-per-day", "7"]
+            app, ["daemon", "--repo", "o/r", "--once", "--max-runs-per-day", "7"]
         )
         assert result.exit_code == 0, result.output
         (line,) = [ln for ln in result.output.splitlines() if "daemon.starting" in ln]
         for field in (
-            "sources=['inbox']",
+            "repo=o/r",
+            "trigger_label=",
             "max_runs_per_day=7",
             "poll_interval_s=",
-            "backlog=off",
+            "landing=on",
+            "max_review_rounds=3",
+            "max_ci_rounds=",
+            "merge_method=",
             "discord=off",
             "log_level=INFO",
             "state_dir_reason=",
@@ -551,23 +574,21 @@ class TestDaemonCommand:
     def test_log_level_flag_beats_env(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        (workdir / "inbox" / "pending").mkdir(parents=True)
+        self.offline(monkeypatch)
         monkeypatch.setenv("SBXLOOP_DAEMON__LOG_LEVEL", "WARNING")
-        quiet = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        quiet = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert quiet.exit_code == 0, quiet.output
         assert "daemon.starting" not in quiet.output  # INFO suppressed by env
-        loud = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once", "--log-level", "debug"])
+        loud = runner.invoke(app, ["daemon", "--repo", "o/r", "--once", "--log-level", "debug"])
         assert loud.exit_code == 0, loud.output
         assert "daemon.starting" in loud.output and "log_level=DEBUG" in loud.output
         assert "store.opened" in loud.output  # a DEBUG-only line
 
-    def test_log_format_json(self, workdir: Path, fake_sbx: FakeSbx) -> None:
-        import json
-
-        (workdir / "inbox" / "pending").mkdir(parents=True)
-        result = runner.invoke(
-            app, ["daemon", "--inbox", "inbox", "--once", "--log-format", "json"]
-        )
+    def test_log_format_json(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once", "--log-format", "json"])
         assert result.exit_code == 0, result.output
         objects = [json.loads(ln) for ln in result.output.splitlines() if ln.startswith("{")]
         events = [o["event"] for o in objects]
@@ -576,14 +597,16 @@ class TestDaemonCommand:
         assert tick["idle"] == "no_work" and tick["level"] == "info"
 
     def test_bad_log_level_exits_2(self, workdir: Path) -> None:
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--log-level", "loud"])
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--log-level", "loud"])
         assert result.exit_code == 2
         assert "daemon.invalid_option" in result.output
 
-    def test_legacy_state_dir_keeps_being_used(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+    def test_legacy_state_dir_keeps_being_used(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         seed_store(workdir)  # an existing ./.sbxloop/state.db from before the change
-        (workdir / "inbox" / "pending").mkdir(parents=True)
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
         assert "legacy" in result.output
         assert not (workdir / "xdg-state").exists()
@@ -592,10 +615,36 @@ class TestDaemonCommand:
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SBXLOOP_DAEMON__STATE_DIR", str(workdir / "elsewhere"))
-        (workdir / "inbox" / "pending").mkdir(parents=True)
-        result = runner.invoke(app, ["daemon", "--inbox", "inbox", "--once"])
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
         assert (workdir / "elsewhere" / "state.db").is_file()
+
+    def test_legacy_state_db_is_archived_on_start(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pre-1.0 daemon database (item kinds, no schema version) is moved
+        aside on the first start rather than migrated; the daemon begins
+        with a fresh store next to it and says so in the journal."""
+        state = workdir / "xdg-state" / "sbxloop" / workdir.name
+        state.mkdir(parents=True)
+        conn = sqlite3.connect(state / "state.db")
+        conn.execute("CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, kind TEXT)")
+        conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO daemon_work_items (item_id, kind) VALUES ('inbox:x.md', 'inbox')")
+        conn.commit()
+        conn.close()
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "store.archived_legacy" in result.output
+        assert (state / "state.db.pre-1.0").is_file()
+        assert (state / "state.db").is_file()
+        assert "daemon.tick" in result.output
+        # the fresh store knows nothing of the old lanes' items
+        listed = runner.invoke(app, ["daemon", "items"])
+        assert listed.exit_code == 0, listed.output
+        assert "no work items" in listed.output
 
 
 class TestDaemonItemControls:
@@ -611,14 +660,11 @@ class TestDaemonItemControls:
         return workdir / "xdg-state" / "sbxloop" / workdir.name
 
     def seed(self, workdir: Path) -> None:
-        from sbxloop.daemon.model import WorkItem
         from sbxloop.daemon.store import DaemonStore
 
         dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
-        dstore.upsert_new(
-            WorkItem(item_id="inbox:x.md", source="inbox", source_key="x.md", title="Do X"), 1.0
-        )
-        dstore.mark_running("inbox:x.md", "r_x", 2.0)
+        dstore.upsert_new(WorkItem(item_id="gh:12", source_key="12", title="Do X"), 1.0)
+        dstore.mark_running("gh:12", "r_x", 2.0)
         dstore.close()
 
     def test_items_lists_state_attempts_and_run(self, workdir: Path) -> None:
@@ -628,39 +674,61 @@ class TestDaemonItemControls:
         self.seed(workdir)
         result = runner.invoke(app, ["daemon", "items"])
         assert result.exit_code == 0, result.output
-        assert "inbox:x.md" in result.output and "running" in result.output
+        assert "gh:12" in result.output and "running" in result.output
         assert "r_x" in result.output
         result = runner.invoke(app, ["daemon", "items", "--state", "queued"])
         assert "no work items" in result.output
-        result = runner.invoke(app, ["daemon", "items", "--state", "bogus"])
-        assert result.exit_code == 2 and "unknown item state" in result.output
+        for bogus in ("bogus", "abandoned"):  # `abandoned` is not a state any more
+            result = runner.invoke(app, ["daemon", "items", "--state", bogus])
+            assert result.exit_code == 2 and "unknown item state" in result.output
 
     def test_abandon_retry_requeue_transitions(self, workdir: Path) -> None:
         from sbxloop.daemon.store import DaemonStore
 
         self.seed(workdir)
-        result = runner.invoke(app, ["daemon", "retry", "inbox:x.md"])
+        result = runner.invoke(app, ["daemon", "retry", "gh:12"])
         assert result.exit_code == 2 and "retry refused" in result.output
-        result = runner.invoke(
-            app, ["daemon", "abandon", "inbox:x.md", "--reason", "plan spiraled"]
-        )
-        assert result.exit_code == 0, result.output
-        assert "abandoned" in result.output and "r_x" in result.output
-        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
-        item = dstore.get("inbox:x.md")
-        assert item is not None and item.state == "abandoned"
-        assert item.last_error == "plan spiraled" and item.run_id == "r_x"
-        dstore.close()
-        result = runner.invoke(app, ["daemon", "requeue", "inbox:x.md"])
-        assert result.exit_code == 2 and "requeue refused" in result.output
-        result = runner.invoke(app, ["daemon", "retry", "inbox:x.md"])
+        result = runner.invoke(app, ["daemon", "abandon", "gh:12", "--reason", "plan spiraled"])
         assert result.exit_code == 0, result.output
         # FORCE_COLOR / a forced terminal makes rich highlight the number
-        # ("attempts \x1b[1;36m0"): assert on the ANSI-stripped text.
+        # ("attempts \x1b[1;36m1"): assert on the ANSI-stripped text.
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "queued" in plain and "attempts 0" in plain
+        # an operator abandon is a failure by decision; the run stays pinned
+        # so the ledger and `sbxloop logs` still tie the item to it
+        assert "gh:12: failed (attempts 1, run r_x)" in plain
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
+        item = dstore.get("gh:12")
+        assert item is not None and item.state == "failed"
+        assert item.last_error == "plan spiraled" and item.run_id == "r_x"
+        assert item.pending_report == "abandoned"  # the issue is owed the news
+        dstore.close()
+        result = runner.invoke(app, ["daemon", "requeue", "gh:12"])
+        assert result.exit_code == 2 and "requeue refused" in result.output
+        assert "use retry" in result.output
+        result = runner.invoke(app, ["daemon", "retry", "gh:12"])
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "gh:12: queued (attempts 0)" in plain
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
+        item = dstore.get("gh:12")
+        assert item is not None and item.run_id is None  # a fresh run, not a resume
+        assert item.pending_report == "requeued"
+        dstore.close()
         result = runner.invoke(app, ["daemon", "abandon", "gh:404"])
         assert result.exit_code == 2 and "unknown work item" in result.output
+
+    def test_requeue_unpins_a_running_item(self, workdir: Path) -> None:
+        from sbxloop.daemon.store import DaemonStore
+
+        self.seed(workdir)
+        result = runner.invoke(app, ["daemon", "requeue", "gh:12"])
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "gh:12: queued (attempts 1)" in plain  # attempts kept, run gone
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
+        item = dstore.get("gh:12")
+        assert item is not None and item.state == "queued" and item.run_id is None
+        dstore.close()
 
     def test_daemon_help_lists_subcommands_and_options(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch
@@ -669,11 +737,13 @@ class TestDaemonItemControls:
         result = runner.invoke(app, ["daemon", "--help"])
         assert result.exit_code == 0
         # GitHub Actions forces typer's help colours on and the option
-        # highlighter styles "--" and "inbox" separately, so "--inbox" is
+        # highlighter styles "--" and "repo" separately, so "--repo" is
         # never a contiguous substring of the raw output.
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        for word in ("--inbox", "--once", "items", "abandon", "retry", "requeue"):
+        for word in ("--repo", "--once", "--dry-run", "items", "abandon", "retry", "requeue"):
             assert word in plain
+        # the inbox and backlog lanes are gone: one labeled issue → one run
+        assert "--inbox" not in plain and "--backlog" not in plain
 
 
 class TestDoctor:
@@ -1265,54 +1335,6 @@ class TestRunCommand:
         assert "interrupted" in result.output
         assert "Traceback" not in result.output
 
-    def test_run_report_refused_without_github_config(
-        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self.make_run_env(workdir, monkeypatch, [])
-        result = runner.invoke(app, ["run", "anything", "--report", "--no-tui"])
-        assert result.exit_code == 2
-        assert "GitHub integration is not configured" in result.output
-        # refused before any sandbox was created
-        assert fake_sbx.invocations("create") == []
-
-    def test_run_report_config_without_repo_refused(
-        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self.make_run_env(workdir, monkeypatch, [])
-        monkeypatch.setenv("SBXLOOP_GITHUB__REPORT", "true")
-        result = runner.invoke(app, ["run", "anything", "--no-tui"])
-        assert result.exit_code == 2
-        assert "GitHub integration is not configured" in result.output
-
-    def test_run_no_report_overrides_config(
-        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # report=true in config but no repo: --no-report must make the run legal.
-        self.make_run_env(
-            workdir,
-            monkeypatch,
-            [
-                {
-                    "json": {
-                        "tasks": [
-                            {
-                                "id": "t1",
-                                "title": "Only task",
-                                "description": "",
-                                "depends_on": [],
-                                "acceptance_criteria": ["works"],
-                                "verify_commands": ["true"],
-                            }
-                        ]
-                    }
-                },
-                {"text": "did it"},
-            ],
-        )
-        monkeypatch.setenv("SBXLOOP_GITHUB__REPORT", "true")
-        result = runner.invoke(app, ["run", "make it so", "--no-report", "--no-tui"])
-        assert result.exit_code == 0, result.output
-
     def test_run_summary_lists_artifacts(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1356,126 +1378,76 @@ class TestRunCommand:
         bare = runner.invoke(app, ["artifacts", run_id, "--path"])
         assert bare.output.strip() == str(runs[0] / "workspace")
 
-    def test_run_deliver_flag_triggers_delivery(
+    # A single-task run that lands: the builder writes a file (delivery
+    # snapshots the workspace, so there has to be something to deliver) and
+    # the run's own review approves the diff first time.
+    LANDED_RUN: ClassVar[list[dict[str, Any]]] = [
+        HAPPY_RUN[0],
+        {"text": "did it", "files": {"hello.txt": "hi"}},
+        {"json": {"verdict": "approve", "summary": "looked", "findings": []}},
+    ]
+
+    def _delivery_env(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> FakeGithub:
+        """A scripted single-task run that lands a pull request on a
+        FakeGithub. The CLI builds its own engine, so the fake is threaded
+        in by wrapping ``LoopEngine`` where app.py binds it and handing it
+        through the engine's ``github_ops`` seam. Returns the fake, which
+        records everything the run asked GitHub for. The CI-wait knobs are
+        set the way an operator would set them (environment)."""
+        import sbxloop.cli.app as app_mod
+        from sbxloop.engine.engine import LoopEngine
+
+        fake = FakeGithub(repo="o/r", number=8, draft=True)
+
+        def engine_with_fake(config: Any, **kwargs: Any) -> LoopEngine:
+            return LoopEngine(config, github_ops=lambda client, run_id: fake, **kwargs)
+
+        monkeypatch.setattr(app_mod, "LoopEngine", engine_with_fake)
+        self.make_run_env(workdir, monkeypatch, self.LANDED_RUN)
+        monkeypatch.setenv("SBXLOOP_LANDING__CI_POLL_INTERVAL_S", "0.01")
+        monkeypatch.setenv("SBXLOOP_LANDING__CI_SETTLE_S", "0")
+        return fake
+
+    def test_run_with_repo_lands_a_pull_request(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.gh.ops import PrRef
-
-        delivered: list[str] = []
-
-        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
-            delivered.append(repo)
-            return PrRef(number=8, url="https://github.com/o/r/pull/8")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        self.make_run_env(
-            workdir,
-            monkeypatch,
-            [
-                {
-                    "json": {
-                        "tasks": [
-                            {
-                                "id": "t1",
-                                "title": "Only task",
-                                "description": "",
-                                "depends_on": [],
-                                "acceptance_criteria": ["works"],
-                                "verify_commands": ["true"],
-                            }
-                        ]
-                    }
-                },
-                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
-                {"text": "did it", "files": {"hello.txt": "hi"}},
-                {"json": {"verdict": "pass"}},
-                {"json": {"verdict": "accept"}},
-            ],
-        )
+        """With a repository configured, `sbxloop run` is the whole pipeline:
+        a draft PR, the run's own review, CI, the merge. The finish summary
+        restates the GitHub outcome — it must not live only in scrollback."""
+        fake = self._delivery_env(workdir, monkeypatch)
         monkeypatch.setenv("SBXLOOP_GITHUB__REPO", "o/r")
-        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver"])
+        result = runner.invoke(app, ["run", "ship it", "--no-tui"])
         assert result.exit_code == 0, result.output
-        assert delivered == ["o/r"]
-        assert "run.deliver" in result.output
-        assert "pull/8" in result.output
-        # the finish summary restates the GitHub outcome (it must not live
-        # only in scrollback)
+        assert len(fake.merges) == 1
+        assert fake.pr["merged"] is True
+        assert "finished: merged" in result.output
         assert "github: o/r" in result.output
-        assert "delivered: PR #8" in result.output
-
-    def test_run_deliver_refused_without_github_config(
-        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self.make_run_env(workdir, monkeypatch, [])
-        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver"])
-        assert result.exit_code == 2
-        assert "GitHub integration is not configured" in result.output
-        assert "--repo" in result.output  # the flag is offered as the quick fix
-        assert fake_sbx.invocations("create") == []
-
-    def _delivery_env(
-        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> tuple[list[str], list[dict[str, Any]]]:
-        """A scripted single-task run with delivery stubbed out; returns the
-        (repos, kwargs) each delivery call was made with."""
-        import sbxloop.engine.engine as engine_mod
-        from sbxloop.gh.ops import PrRef
-
-        repos: list[str] = []
-        calls: list[dict[str, Any]] = []
-
-        def fake_deliver(ops: Any, repo: str, **kwargs: Any) -> PrRef:
-            repos.append(repo)
-            calls.append(kwargs)
-            return PrRef(number=8, url="https://github.com/o/r/pull/8")
-
-        monkeypatch.setattr(engine_mod, "deliver_workspace", fake_deliver)
-        monkeypatch.setattr(engine_mod, "ensure_repository", lambda *a, **k: False)
-        self.make_run_env(
-            workdir,
-            monkeypatch,
-            [
-                {
-                    "json": {
-                        "tasks": [
-                            {
-                                "id": "t1",
-                                "title": "Only task",
-                                "description": "",
-                                "depends_on": [],
-                                "acceptance_criteria": ["works"],
-                                "verify_commands": ["true"],
-                            }
-                        ]
-                    }
-                },
-                {"json": {"steps": ["do"], "expected_artifacts": [], "verify_commands": []}},
-                {"text": "did it", "files": {"hello.txt": "hi"}},
-                {"json": {"verdict": "pass"}},
-                {"json": {"verdict": "accept"}},
-            ],
-        )
-        return repos, calls
+        assert "PR #8" in result.output and "pull/8" in result.output
+        assert "review round 1: approve" in result.output
+        assert "merged by sbxloop" in result.output
 
     def test_run_repo_flag_enables_github_without_config(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """--repo alone satisfies the GitHub gate — no sbxloop.toml needed."""
-        repos, _ = self._delivery_env(workdir, monkeypatch)
-        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver", "--repo", "o/cli"])
+        """--repo alone turns the GitHub integration on — no sbxloop.toml
+        needed — and the run lands there."""
+        fake = self._delivery_env(workdir, monkeypatch)
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--repo", "o/cli"])
         assert result.exit_code == 0, result.output
-        assert repos == ["o/cli"]
+        assert len(fake.merges) == 1
+        assert "finished: merged" in result.output
+        assert "github: o/cli" in result.output
 
     def test_run_repo_flag_overrides_configured_repo(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        repos, _ = self._delivery_env(workdir, monkeypatch)
+        fake = self._delivery_env(workdir, monkeypatch)
         monkeypatch.setenv("SBXLOOP_GITHUB__REPO", "o/toml")
-        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--deliver", "--repo", "o/cli"])
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--repo", "o/cli"])
         assert result.exit_code == 0, result.output
-        assert repos == ["o/cli"]
+        assert len(fake.merges) == 1
+        assert "github: o/cli" in result.output
+        assert "o/toml" not in result.output
 
     def test_run_create_repo_flags_reach_the_probe(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -1496,7 +1468,6 @@ class TestRunCommand:
                 "run",
                 "ship it",
                 "--no-tui",
-                "--deliver",
                 "--repo",
                 "o/new",
                 "--create-repo",
@@ -1509,35 +1480,27 @@ class TestRunCommand:
         assert "github: o/new" in result.output
         assert "created this run" in result.output
 
-    def test_run_deliver_base_and_draft_flags_are_forwarded(
+    def test_run_deliver_base_is_forwarded_and_pr_opens_as_draft(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _, calls = self._delivery_env(workdir, monkeypatch)
+        fake = self._delivery_env(workdir, monkeypatch)
         result = runner.invoke(
             app,
-            [
-                "run",
-                "ship it",
-                "--no-tui",
-                "--deliver",
-                "--repo",
-                "o/cli",
-                "--deliver-base",
-                "develop",
-                "--deliver-draft",
-            ],
+            ["run", "ship it", "--no-tui", "--repo", "o/cli", "--deliver-base", "develop"],
         )
         assert result.exit_code == 0, result.output
-        assert calls and calls[0]["base"] == "develop"
-        assert calls[0]["draft"] is True
+        assert fake.pr_kwargs["base"] == "develop"
+        # [landing] deliver_draft defaults on: the PR opens as a draft and is
+        # taken out of draft only once the run has cleared its own bar
+        assert fake.pr_kwargs["draft"] is True
+        assert fake.ready_calls == ["PR_node8"]
+        assert fake.pr["draft"] is False
 
     def test_run_malformed_repo_flag_refused_up_front(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self.make_run_env(workdir, monkeypatch, [])
-        result = runner.invoke(
-            app, ["run", "ship it", "--no-tui", "--deliver", "--repo", "not-a-repo"]
-        )
+        result = runner.invoke(app, ["run", "ship it", "--no-tui", "--repo", "not-a-repo"])
         assert result.exit_code == 2
         assert "invalid GitHub option" in result.output
         assert "Traceback" not in result.output
@@ -1604,65 +1567,6 @@ class TestRunCommand:
         assert "sandboxes kept:" in result.output
         assert "sbxloop shell" in result.output
         assert "sandbox rm --run" in result.output
-
-
-class TestDeliverCommand:
-    """`sbxloop deliver <run>` wiring; the engine path is covered in
-    test_engine.py. LoopEngine.deliver is patched here — no sandboxes."""
-
-    def test_unknown_run_errors(self, workdir: Path) -> None:
-        seed_store(workdir)
-        result = runner.invoke(app, ["deliver", "rghost", "--repo", "o/r"])
-        assert result.exit_code == 2
-        assert "unknown run" in result.output
-
-    def test_options_become_github_overrides(
-        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from sbxloop.gh.ops import PrRef
-
-        seed_store(workdir)
-        calls: list[dict[str, Any]] = []
-
-        def fake_deliver(self: Any, run_id: str, **kwargs: Any) -> PrRef:
-            calls.append({"run_id": run_id, **kwargs})
-            return PrRef(number=4, url="https://github.com/o/r/pull/4")
-
-        monkeypatch.setattr("sbxloop.engine.engine.LoopEngine.deliver", fake_deliver)
-        result = runner.invoke(
-            app,
-            ["deliver", "rseeded11", "--repo", "o/r", "--deliver-draft", "--report"],
-        )
-        assert result.exit_code == 0, result.output
-        assert calls == [
-            {
-                "run_id": "rseeded11",
-                "github_overrides": {"repo": "o/r", "deliver_draft": True},
-                "report": True,
-            }
-        ]
-        assert "PR #4" in result.output
-        assert "https://github.com/o/r/pull/4" in result.output
-
-    def test_invalid_repo_fails_before_provisioning(self, workdir: Path) -> None:
-        seed_store(workdir)
-        result = runner.invoke(app, ["deliver", "rseeded11", "--repo", "not-a-repo"])
-        assert result.exit_code == 2
-        assert "invalid GitHub option" in result.output
-
-    def test_delivery_failure_exits_2(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        from sbxloop.errors import DeliveryError
-
-        seed_store(workdir)
-
-        def fake_deliver(self: Any, run_id: str, **kwargs: Any) -> Any:
-            raise DeliveryError("nothing to deliver")
-
-        monkeypatch.setattr("sbxloop.engine.engine.LoopEngine.deliver", fake_deliver)
-        result = runner.invoke(app, ["deliver", "rseeded11", "--repo", "o/r"])
-        assert result.exit_code == 2
-        assert "delivery failed" in result.output
-        assert "nothing to deliver" in result.output
 
 
 class TestArtifactsTree:

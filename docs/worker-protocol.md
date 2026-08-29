@@ -162,7 +162,9 @@ produced. Query history with
 `github.op` jobs execute in the github sandbox only (the sole holder of
 `GH_TOKEN`). Ops: `issue.create`, `issue.comment`, `pr.create`, `pr.comment`,
 `contents.read`, `status.create`, `repo.get`, `ref.get`, `search.issues`,
-`raw.api`, `blobs.create_many`. Transport inside the sandbox: `gh api` when gh
+`raw.api`, `blobs.create_many`, `checks.failed_logs` (the failing check runs on a
+commit with their Actions job logs, head+tail clipped; the REST transport fetches
+the log's blob-storage redirect without the bearer token). Transport inside the sandbox: `gh api` when gh
 is available, otherwise a pure-stdlib REST client — both produce identical
 result shapes.
 

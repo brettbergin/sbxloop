@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from sbxloop.config import Config
-from sbxloop.engine.engine import LoopEngine
+from sbxloop.engine.engine import LoopEngine, Pipeline
 from sbxloop.engine.model import TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
 from sbxloop.events import EventBus
@@ -61,9 +61,22 @@ class Scheduler:
         self.started: list[str] = []
         self.ended: list[str] = []
         self._lock = threading.Lock()
+        # The scheduler reads only the run id off the pipeline; every
+        # collaborator a real task would touch is behind the stubbed
+        # `_run_task`.
+        self.pipeline = Pipeline(
+            run_id=self.run_id,
+            outcome="ship it",
+            pair=None,  # type: ignore[arg-type]
+            phases=None,  # type: ignore[arg-type]
+            granter=None,  # type: ignore[arg-type]
+            deadline=0.0,
+            ops=None,
+            repo=None,
+        )
 
     def run(self, body: Any) -> tuple[set[str], set[str]]:
-        def stub(_run_id: str, _phases: Any, task: TaskRecord, *_rest: Any) -> None:
+        def stub(_pipeline: Pipeline, task: TaskRecord) -> None:
             with self._lock:
                 self.started.append(task.spec.id)
             try:
@@ -74,7 +87,7 @@ class Scheduler:
 
         self.engine._run_task = stub  # type: ignore[method-assign]
         tasks = self.engine.store.get_tasks(self.run_id)
-        return self.engine._schedule_tasks(self.run_id, None, tasks, 0.0, None, None)  # type: ignore[arg-type]
+        return self.engine._schedule_tasks(self.pipeline, tasks)
 
 
 def done(task: TaskRecord) -> None:
@@ -260,10 +273,8 @@ class TestBuilderContinuityWiring:
 
     def test_the_prior_report_comes_off_the_committed_attempt(self, tmp_path: Path) -> None:
         """Read from the store rather than held in memory, so a resumed run's
-        revision gets the same context a fresh one would. A legacy
-        ``execute`` row (six-phase checkpoint) is read as a fallback so a
-        remapped mid-flight task keeps its old report across the upgrade;
-        a ``build`` row from this pipeline wins over it."""
+        revision gets the same context a fresh one would; the latest
+        ``build`` row wins."""
         sched = Scheduler(tmp_path, [spec("t1")], lanes=1)
         engine, run_id = sched.engine, sched.run_id
         task = engine.store.get_tasks(run_id)[0]
@@ -271,7 +282,7 @@ class TestBuilderContinuityWiring:
 
         engine.store.record_phase(
             run_id,
-            "execute",
+            "build",
             task_id="t1",
             attempt=1,
             status="ok",

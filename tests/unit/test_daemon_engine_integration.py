@@ -1,22 +1,23 @@
 """DaemonLoop driving the REAL LoopEngine (echo backend, fake sbx) for one
-inbox item — proves the shared-store / fresh-bus / default-runner wiring
-against the actual engine, not a stand-in."""
+issue — proves the shared-store / fresh-bus / default-runner wiring against
+the actual engine, not a stand-in. No repository is configured, so the
+engine ends `completed` after its gate and the daemon settles that as
+done; the pipeline's GitHub stages are covered by the engine tests."""
 
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop
-from sbxloop.daemon.sources import InboxSource
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.sbx.cli import SbxCLI
 from tests.conftest import FakeSbx
+from tests.unit.test_daemon_loop import FakeSource, gh_item
 from tests.unit.test_engine import BUILD, Harness, task, taskgraph
 
 
@@ -25,46 +26,40 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return Harness(fake_sbx, tmp_path, monkeypatch)
 
 
-def test_inbox_item_runs_through_the_real_engine(harness: Harness, tmp_path: Path) -> None:
+def test_an_issue_runs_through_the_real_engine(harness: Harness, tmp_path: Path) -> None:
     harness.script([taskgraph(task("t1")), BUILD])
     config = Config.model_validate(
         {
             "state_dir": str(harness.state_dir),
             "limits": {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0},
-            "daemon": {"inbox_dir": str(tmp_path / "inbox")},
         }
     )
     store = StateStore(harness.state_dir / "state.db")
     dstore = DaemonStore(harness.state_dir / "state.db")
-    # A clock far in the future makes the just-written file count as settled.
-    inbox = InboxSource(tmp_path / "inbox", clock=lambda: time.time() + 60.0)
-    (tmp_path / "inbox" / "pending" / "add-flag.md").write_text(
-        "# Add a flag\n\n--verbose please\n"
-    )
+    source = FakeSource([gh_item("7", title="Add a flag", body="--verbose please")])
 
     loop = DaemonLoop(
         config,
         store=store,
         dstore=dstore,
-        sources=[inbox],
+        source=source,
         sbx=SbxCLI(binary=str(harness.fake_sbx.binary)),
         worker_python=sys.executable,
         install_workers=False,
     )
     result = loop.tick()
 
-    assert result.dispatched == "inbox:add-flag.md"
+    assert result.dispatched == "gh:7"
     assert result.outcome == "done", result
-    item = dstore.get("inbox:add-flag.md")
+    item = dstore.get("gh:7")
     assert item is not None and item.state == "done" and item.run_id is not None
     # the run exists in the shared engine store, completed, with the
-    # daemon-built outcome text carrying the source trailer
+    # daemon-built outcome text carrying the provenance trailer
     run = store.get_run(item.run_id)
     assert run.state == "completed"
-    assert "inbox file `add-flag.md`" in run.outcome
+    assert "GitHub issue #7" in run.outcome
     assert run.outcome.startswith("Add a flag\n\n--verbose please")
     # source-side bookkeeping landed
-    assert (tmp_path / "inbox" / "done" / "add-flag.md").exists()
-    assert "completed" in (tmp_path / "inbox" / "done" / "add-flag.result.md").read_text()
+    assert [c[0] for c in source.calls] == ["claim", "started", "merged"]
     # sandboxes cleaned up (keep_on_failure forced off; run succeeded)
     assert harness.sandboxes_left() == []
