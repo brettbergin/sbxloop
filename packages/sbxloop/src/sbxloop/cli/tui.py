@@ -46,9 +46,7 @@ from sbxloop.events import Event, HostEventTypes, summarize_event
 from sbxloop.excerpt import TOOL_FAIL_OUTPUT_LINES_DEFAULT, excerpt_output_lines
 from sbxloop_worker.protocol import EventTypes
 
-# Live task states only; historical events replayed from a pre-BUILD run
-# may carry retired states (planning/scrutinizing/validating), which fall
-# through to the "dim" default in every lookup.
+# Any state not listed falls through to the "dim" default in every lookup.
 TASK_STATE_STYLES = {
     "pending": "dim",
     "executing": "cyan",

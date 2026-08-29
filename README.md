@@ -444,15 +444,13 @@ post-mortems, scheduled audit charters, the review lane, the inbox source,
 the per-run tracking issue — and with them their `[daemon]` keys and
 `[github] report` / `deliver`; the landing knobs (`deliver_draft`,
 `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`) moved to
-`[landing]`. A config still carrying a retired key **loads**, with a
-`config.retired_keys` warning at startup and a `retired config keys` row in
-`sbxloop doctor`, and a moved key's value is carried into `[landing]` unless
-that section sets it — the daemon host deploys unattended, and a hard
-failure there would roll the release back before anyone could edit the file.
-They become errors in 1.0.0, so delete them at leisure (`auto_merge = true`
-simply goes: landing is always on). A pre-1.0 `state.db` is moved aside to
-`state.db.pre-1.0` on first start rather than migrated, and the old lanes'
-issues and labels are closed by hand;
+`[landing]`. A config still carrying a retired key **fails to load** (every
+config model forbids unknown keys), so delete them before upgrading a
+0.7.x host straight to 1.0 — the 0.7.55–0.7.56 releases loaded them with a
+warning and a `sbxloop doctor` row to make that edit unhurried
+(`auto_merge = true` simply goes: landing is always on). A pre-1.0
+`state.db` is moved aside to `state.db.pre-1.0` on first start rather than
+migrated, and the old lanes' issues and labels are closed by hand;
 [docs/deploy.md → 1.0 cutover](docs/deploy.md#10-cutover) has the steps.
 
 ### Discord: chronology out, steering in

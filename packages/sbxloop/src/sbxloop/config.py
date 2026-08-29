@@ -32,12 +32,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    PrivateAttr,
     ValidationError,
     field_validator,
     model_validator,
 )
-from pydantic.functional_validators import ModelWrapValidatorHandler
 
 from sbxloop.errors import ConfigError
 from sbxloop.log import LogFormat, LogLevel, get_logger
@@ -138,10 +136,10 @@ class SandboxConfig(_ConfigModel):
 
 
 class PolicyConfig(_ConfigModel):
-    """Operator bounds for plan-declared egress.
+    """Operator bounds for task-declared egress.
 
-    The PLAN phase may request extra network allows for EXECUTE (each with a
-    justification). Requests are auto-granted just before EXECUTE only when
+    DECOMPOSE may declare extra network allows a task needs during BUILD
+    (each with a justification). Requests are auto-granted just before BUILD only when
     they match ``allow`` and no ``deny`` pattern; everything is event-logged
     (``sbxloop logs RUN --type policy.``). Patterns are exact domains,
     ``*.example.com`` wildcards (the domain and all subdomains), or ``*``
@@ -404,48 +402,6 @@ class LandingConfig(_ConfigModel):
     # The reviewer is shown the PR's diff inline; past this many characters
     # the diff is clipped and the reviewer reads the rest from the tree.
     review_diff_max_chars: int = Field(default=150_000, ge=10_000)
-
-
-# `[daemon]` keys retired by the 1.0 pipeline: the self-filing lanes
-# (backlog, audits, post-mortems, tool findings, tracking issues), the review
-# lane and its gates, the inbox source, and the landing knobs that moved to
-# `[landing]`. A config carrying one still loads — with a warning naming it
-# and, for the moved keys, its value carried over — because the daemon host
-# is deployed unattended and a hard failure there would roll the release
-# back before anyone could edit the file. The tolerance goes away in 1.0,
-# when these become the unknown keys they now are.
-RETIRED_DAEMON_KEYS: frozenset[str] = frozenset(
-    {
-        "inbox_dir",
-        "backlog",
-        "backlog_max_per_run",
-        "backlog_auto_trigger",
-        "backlog_label",
-        "audits",
-        "audit_dir",
-        "audit_label",
-        "delivered_label",
-        "postmortems",
-        "postmortems_per_day",
-        "review_deliveries",
-        "await_review",
-        "review_rounds",
-        "tool_repo",
-        "tracking_issue",
-        "close_on_success",
-        "auto_merge",
-    }
-)
-RETIRED_GITHUB_KEYS: frozenset[str] = frozenset({"report", "deliver"})
-# Keys whose value carries over into `[landing]` (unless `[landing]` sets
-# them itself): from `[daemon]` and `[github]` respectively.
-HOISTED_DAEMON_KEYS: tuple[str, ...] = (
-    "deliver_draft",
-    "merge_method",
-    "delete_branch_on_merge",
-    "merge_update_attempts",
-)
-HOISTED_GITHUB_KEYS: tuple[str, ...] = ("deliver_draft",)
 
 
 class DaemonConfig(_ConfigModel):
@@ -720,53 +676,6 @@ class Config(_ConfigModel):
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
-
-    # Dotted names of retired keys the loaded config carried (see
-    # RETIRED_DAEMON_KEYS); `doctor` reports them so they get removed.
-    _retired_keys: tuple[str, ...] = PrivateAttr(default=())
-
-    @property
-    def retired_keys(self) -> tuple[str, ...]:
-        return self._retired_keys
-
-    @model_validator(mode="wrap")
-    @classmethod
-    def _tolerate_retired(cls, data: Any, handler: ModelWrapValidatorHandler[Config]) -> Config:
-        """Drop the keys the 1.0 pipeline retired, carrying the landing knobs
-        over into ``[landing]``, and remember what was dropped."""
-        retired: list[str] = []
-        if isinstance(data, dict):
-            data = dict(data)
-            landing = data.get("landing")
-            landing = dict(landing) if isinstance(landing, dict) else {}
-            for section, retired_keys, hoisted in (
-                ("daemon", RETIRED_DAEMON_KEYS, HOISTED_DAEMON_KEYS),
-                ("github", RETIRED_GITHUB_KEYS, HOISTED_GITHUB_KEYS),
-            ):
-                block = data.get(section)
-                if not isinstance(block, dict):
-                    continue
-                block = dict(block)
-                for key in hoisted:
-                    if key in block:
-                        landing.setdefault(key, block.pop(key))
-                        retired.append(f"{section}.{key}")
-                for key in sorted(block):
-                    if key in retired_keys:
-                        block.pop(key)
-                        retired.append(f"{section}.{key}")
-                data[section] = block
-            if landing:
-                data["landing"] = landing
-        config = handler(data)
-        if retired:
-            config._retired_keys = tuple(retired)
-            log.warning(
-                "config.retired_keys",
-                keys=retired,
-                hint="remove them from sbxloop.toml; landing knobs now live under [landing]",
-            )
-        return config
 
     @field_validator("state_dir", mode="after")
     @classmethod

@@ -352,7 +352,6 @@ class TestConfigAndInit:
         from sbxloop.config import load_config
 
         config = load_config(cwd=workdir, env={})
-        assert config.retired_keys == ()
         assert config.landing.max_review_rounds == 3
         assert config.daemon.blocked_label == "sbxloop:blocked"
         # the concierge block documents its knobs and stays commented (defaults)
