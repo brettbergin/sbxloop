@@ -1,5 +1,7 @@
 # Deploying the daemon
 
+Targets the current sbxloop release; check the installed version with `pip show sbxloop`.
+
 Every merge to `main` auto-releases a patch to PyPI ([RELEASING.md](../RELEASING.md)). This
 pipeline carries that release the last mile: onto the host running `sbxloop daemon`, with the
 service restarted and health-checked, so a running daemon never silently drifts behind its
