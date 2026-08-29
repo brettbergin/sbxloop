@@ -2331,6 +2331,7 @@ mem_abort = 0.0
 # chronology_level = "normal"      # quiet (lifecycle+links+chat) | normal (tool bursts
 #                                  # digested into one edited line) | verbose (every call)
 # max_message_chars = 1900
+# embeds = true                    # headline / finished / status as embed cards
 # status_line = true               # one per-run message edited as tasks progress
 # tool_batch_lines = 8             # verbose: consecutive tool calls per code block
 # tool_output_lines = 0            # tail output lines echoed for a successful call (0 = none)
