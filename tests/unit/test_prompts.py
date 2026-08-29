@@ -317,3 +317,33 @@ def test_build_renders_standing_guidance() -> None:
 def test_bullet_list() -> None:
     assert bullet_list([]) == "(none)"
     assert bullet_list(["a", "b"]) == "- a\n- b"
+
+
+def test_decompose_states_the_config_scoped_tool_rule() -> None:
+    """#387: `uv run mypy packages` overrode the `files` key pinned in
+    pyproject.toml, pulled in a build-time-only import and could never go
+    green. The decomposer authors the exam, so the bare-invocation remedy
+    has to be stated where it reads."""
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
+    assert "pyproject.toml" in text
+    assert "`include`" in text
+    assert "uv run mypy packages" in text
+    # `testpaths` only supplies a default: a positional path narrows the run,
+    # so targeted pytest commands stay legal and must not be forbidden here.
+    assert "testpaths" in text
+    assert "uv run pytest tests/unit/test_x.py -q` is fine" in text.replace("\n  ", " ")
+    assert "overrides" in text
+    for bare in ("`uv run mypy`", "`uv run ruff check`"):
+        assert bare in text
+
+
+def test_build_reports_repeated_identical_verify_failure_as_suspect() -> None:
+    """#387: two revisions and a replan re-ran the same impossible check.
+    The builder must call a repeated identical failure a misconfigured
+    check and name the bare form."""
+    text = render("build", **build_context())
+    assert "fails identically twice" in text
+    assert "misconfigured" in text
+    assert "bare form" in text
+    assert "uv run mypy packages" in text
+    assert "bare `uv run mypy`" in text.replace("\n", " ")

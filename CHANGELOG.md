@@ -6,17 +6,33 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
-### Fixed
-
-- **A review refused for its anchors is re-posted with its findings in the
-  body.** Field run `rx8amxxvm` (#130 → PR #503) approved with two nits
-  anchored to lines outside the diff; GitHub 422'd the APPROVE *and* the
-  COMMENT fallback, and nothing reached the PR (the verdict, which is the
-  run's own, still decided correctly). The engine now retries once
-  without inline comments, listing every finding in the review body. The
-  stale `last_event_ts` docstring that review caught is fixed here too.
-
 ### Changed
+
+- **Impossible verify commands are caught before they burn the budget**
+  ([#387](https://github.com/brettbergin/sbxloop/issues/387)). A verify
+  command that passes explicit paths to a tool whose file set is pinned in
+  project config — mypy `files`/`packages`/`modules` or ruff `include`, in
+  `pyproject.toml`, `setup.cfg`, `mypy.ini` or `ruff.toml` — silently
+  overrides that scope and can drag in files that
+  cannot possibly pass: `uv run mypy packages` failed forever on a
+  build-time-only `hatchling` import while bare `uv run mypy` was clean,
+  costing two revisions, a replan and six agent sessions. Four changes:
+  `verifylint` gains a config-scoped-tool rule that rejects such commands
+  with a remedy naming the bare form; the rule runs at plan **acceptance**
+  time, so a bad command is rewritten before anything executes; a verify
+  failure that repeats **identically** (same command, same output, across
+  attempts and replans) is now detected mechanically and flagged to the
+  engine as a suspect check rather than re-run blindly; and the
+  `decompose.md` / `build.md` prompts document the config-override shape,
+  telling the decomposer to invoke config-scoped tools bare and the
+  builder to report a twice-identical failure as a misconfigured check.
+  The rule covers only keys that genuinely pin a file set: ruff `src` (an
+  import-resolution root), `extend-include` (additive) and pytest
+  `testpaths` (a default when no path is given) narrow rather than
+  override, so targeted commands like `uv run pytest tests/unit/x.py -q`
+  stay legal, and the suggested remedy is rebuilt from the command's own
+  tokens so subcommands and flags survive (`uv run ruff check`, never the
+  usage-banner `uv run ruff`).
 
 - **Streaming deltas are no longer persisted.** `agent.message_delta` is
   per-chunk UI telemetry: live surfaces (TUI, Discord) still receive every

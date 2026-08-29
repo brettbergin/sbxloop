@@ -26,6 +26,8 @@ Session strategy per phase (a deliberate design decision):
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -81,11 +83,70 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 class VerifyOutcome(NamedTuple):
     """VERIFY's result: pass/fail, failure feedback for the builder, and
     the full command transcript — persisted on the phase row so a resumed
-    run re-enters with the same evidence."""
+    run re-enters with the same evidence.
+
+    ``fingerprints`` are stable digests of this attempt's failures (see
+    :func:`verify_fingerprint`); ``repeated`` says at least one of them was
+    already seen on an earlier attempt of the same task, which is the #387
+    signature of a verify command that cannot pass.
+    """
 
     passed: bool
     feedback: str
     results: str
+    fingerprints: tuple[str, ...] = ()
+    repeated: bool = False
+
+
+# Prepended to the feedback when a failure fingerprint repeats: says plainly
+# that the check, not the code, is the likely defect so the next phase (and
+# the replan path) stops re-running an unpassable command (#387).
+VERIFY_REPEAT_NOTE = (
+    "repeated identical verify failure: this exact command produced this "
+    "exact output on an earlier attempt of this task. The check itself is "
+    "suspect — a further code change is unlikely to help, and the fix is "
+    "probably to the verify command (for example a config-driven tool given "
+    "explicit paths that override its own configuration), not to the code."
+)
+
+# Lines whose content moves run to run and must not enter the digest.
+_TIMING_LINE = re.compile(
+    r"""(?ix)
+    ^\s*(?:
+        .*\bin\s[\d.]+\s*(?:s|ms|sec|secs|second|seconds|minutes?)\b.* |
+        .*\b(?:elapsed|took|duration|real|user|sys)\b\s*[:=]?\s*[\d.]+.* |
+        .*\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}.*
+    )$""",
+)
+# Absolute run/workspace paths and bare durations inside a line.
+_ABS_PATH = re.compile(r"(?:/[\w.\-+@]+)+/")
+_DURATION = re.compile(r"\b\d+(?:\.\d+)?\s?(?:s|ms|sec|secs|seconds?|minutes?)\b", re.IGNORECASE)
+_HEXY = re.compile(r"\b(?:0x)?[0-9a-f]{8,}\b", re.IGNORECASE)
+
+
+def normalise_verify_output(text: str | None) -> str:
+    """Strip the noise that differs between two runs of the same failure:
+    timing lines and durations, absolute run/workspace path prefixes,
+    hex-ish ids, and trailing whitespace."""
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if _TIMING_LINE.match(line):
+            continue
+        line = _ABS_PATH.sub("/", line)
+        line = _DURATION.sub("<dur>", line)
+        line = _HEXY.sub("<hex>", line)
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def verify_fingerprint(command: str, output: str | None) -> str:
+    """A stable digest of one failing verify command plus its normalised
+    output, comparable across attempts and runs."""
+    payload = f"{command.strip()}\n--\n{normalise_verify_output(output)}"
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
 
 
 class PhaseSpend(NamedTuple):
@@ -183,7 +244,10 @@ class PhaseRunner:
         """
         uv_project = self.workspace is not None and (self.workspace / UV_LOCKFILE).is_file()
         return lint_verify_commands(
-            commands, self.config.sandbox.effective_languages, uv_project=uv_project
+            commands,
+            self.config.sandbox.effective_languages,
+            uv_project=uv_project,
+            workspace=self.workspace,
         )
 
     # -- job plumbing ------------------------------------------------------
@@ -412,16 +476,23 @@ class PhaseRunner:
         """
         from sbxloop.policy import effective_egress_bounds, egress_rejection
 
-        problems = [
-            f"- task {task.id}: {message}"
+        per_task = [
+            (task.id, message)
             for task in graph.tasks
             for message in self._lint_verify_commands(task.verify_commands)
         ]
+        problems = [f"- task {task_id}: {message}" for task_id, message in per_task]
         gate = self.project_gate()
         if gate:
             every_command = [c for task in graph.tasks for c in task.verify_commands]
+            seen = {message for _, message in per_task}
             problems += [
-                f"- {message}" for message in lint_verify_commands(every_command, (), gate=gate)
+                f"- {message}"
+                for message in lint_verify_commands(
+                    every_command, (), gate=gate, workspace=self.workspace
+                )
+                # Per-command messages are already reported against their task.
+                if message not in seen
             ]
         if problems:
             raise ValueError(
@@ -582,12 +653,19 @@ class PhaseRunner:
         )
         return verdict
 
-    def verify(self, task: TaskRecord) -> VerifyOutcome:
+    def verify(self, task: TaskRecord, *, prior_fingerprints: Sequence[str] = ()) -> VerifyOutcome:
         """Run the task's decomposer-authored verify commands; the transcript
-        rides on the outcome."""
+        rides on the outcome.
+
+        ``prior_fingerprints`` are the failure digests of this task's earlier
+        verify attempts. A match means the identical command produced the
+        identical output before (#387) — the outcome is flagged ``repeated``
+        and the feedback leads with :data:`VERIFY_REPEAT_NOTE`.
+        """
         commands = list(dict.fromkeys(task.spec.verify_commands))
         failures: list[str] = []
         results: list[str] = []
+        fingerprints: list[str] = []
         for result in self.shell_batch(commands) if commands else []:
             output = clip_head_tail(result.output)
             results.append(f"$ {result.command}\n(exit {result.exit_code})\n{output}")
@@ -596,8 +674,16 @@ class PhaseRunner:
                     f"{VERIFY_FAILURE_PREFIX} `{result.command}` "
                     f"(exit {result.exit_code})\n{output}"
                 )
+                fingerprints.append(verify_fingerprint(result.command, result.output))
+        seen = set(prior_fingerprints)
+        repeated = bool(failures) and any(fp in seen for fp in fingerprints)
+        feedback = "\n\n".join(failures)
+        if repeated:
+            feedback = f"{VERIFY_REPEAT_NOTE}\n\n{feedback}"
         return VerifyOutcome(
             passed=not failures,
-            feedback="\n\n".join(failures),
+            feedback=feedback,
             results="\n\n".join(results) or "(no verify commands)",
+            fingerprints=tuple(fingerprints),
+            repeated=repeated,
         )

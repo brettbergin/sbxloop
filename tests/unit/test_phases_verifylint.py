@@ -85,3 +85,27 @@ def test_declarable_registry_egress_is_accepted() -> None:
         "test -f README.md", egress=[{"domain": "registry.npmjs.org", "reason": "npm install"}]
     )
     phases._check_taskgraph(ok)
+
+
+def uv_mypy_workspace(tmp_path: Path) -> Path:
+    """A uv project that pins mypy's file set, as sbxloop itself does (#387)."""
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    (tmp_path / "packages").mkdir()
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\n\n'
+        '[tool.mypy]\nfiles = ["packages/sbxloop/src"]\n'
+    )
+    return tmp_path
+
+
+def test_explicit_path_overriding_mypy_config_is_rejected(tmp_path: Path) -> None:
+    phases = runner(uv_mypy_workspace(tmp_path))
+    with pytest.raises(ValueError, match=r"mypy"):
+        phases._check_taskgraph(graph("uv run mypy packages"))
+    with pytest.raises(ValueError, match=r"`uv run mypy`"):
+        phases._check_taskgraph(graph("uv run mypy packages"))
+
+
+def test_bare_mypy_is_accepted(tmp_path: Path) -> None:
+    phases = runner(uv_mypy_workspace(tmp_path))
+    phases._check_taskgraph(graph("uv run mypy"))

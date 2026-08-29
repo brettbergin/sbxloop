@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -469,12 +470,279 @@ def runs_gate(command: str, gate: str) -> bool:
     return False
 
 
+# Config-driven tools whose *file set* lives in project config (#387). A
+# verify command that passes explicit paths to one of these silently
+# overrides that configuration and drags in files the project deliberately
+# left out: `uv run mypy packages` pulled in packages/sbxloop/hatch_build.py,
+# which imports the build-time-only `hatchling`, and failed forever while
+# bare `uv run mypy` was clean — two revisions and a replan on a check that
+# could never go green.
+#
+# The rule only fires when the workspace actually declares the scoping key,
+# so a project that pins nothing is untouched. Only keys that genuinely pin a
+# *file set* count: mypy `files`/`packages`/`modules` and ruff `include`. Ruff
+# `src` is an import-resolution root, `extend-include` is additive, and pytest
+# `testpaths` is only a default used when no positional argument is given —
+# passing a path to those narrows the run rather than overriding it, and a
+# narrower run cannot drag in a file that could never pass.
+# The POSIX end-of-flags separator.
+_END_OF_FLAGS = "-" * 2
+
+
+@dataclass(frozen=True)
+class ConfigScopedTool:
+    """A tool whose checked file set is declared in project config."""
+
+    tool: str
+    # pyproject.toml [tool.<section>] keys that pin the file set.
+    pyproject_section: tuple[str, ...]
+    pyproject_keys: tuple[str, ...]
+    # (filename, key) pairs in ini-style config files.
+    ini_sources: tuple[tuple[str, str], ...]
+    # Flags that consume the following token as their value.
+    value_flags: frozenset[str]
+
+
+CONFIG_SCOPED_TOOLS: tuple[ConfigScopedTool, ...] = (
+    ConfigScopedTool(
+        tool="mypy",
+        pyproject_section=("tool", "mypy"),
+        pyproject_keys=("files", "packages", "modules"),
+        ini_sources=(("setup.cfg", "files"), ("mypy.ini", "files"), (".mypy.ini", "files")),
+        value_flags=frozenset(
+            {
+                "--config-file",
+                "--python-version",
+                "--python-executable",
+                "--exclude",
+                "--cache-dir",
+                "--follow-imports",
+                "--junit-xml",
+                "--shadow-file",
+                "--platform",
+                "-p",
+                "-m",
+                "-c",
+            }
+        ),
+    ),
+    ConfigScopedTool(
+        tool="ruff",
+        pyproject_section=("tool", "ruff"),
+        pyproject_keys=("include",),
+        ini_sources=((".ruff.toml", "include"), ("ruff.toml", "include")),
+        value_flags=frozenset(
+            {
+                "--config",
+                "--select",
+                "--ignore",
+                "--extend-select",
+                "--extend-ignore",
+                "--target-version",
+                "--line-length",
+                "--per-file-ignores",
+                "--output-format",
+                "--exclude",
+                "--extend-exclude",
+                "-e",
+                "-n",
+            }
+        ),
+    ),
+)
+
+# Wrappers that put the real tool at the head of what follows.
+_RUNNER_PREFIXES: dict[str, int] = {
+    "uv": 1,  # uv run <tool>
+    "uvx": 0,
+    "poetry": 1,  # poetry run <tool>
+    "pdm": 1,
+    "hatch": 1,
+    "rye": 1,
+    "pipenv": 1,
+    "nox": 0,
+}
+_PATHY_SUFFIX = re.compile(r"\.(py|pyi|toml|cfg|ini|txt|md)$")
+
+
+def _tool_arguments(segment: str, tool: str) -> list[str] | None:
+    """Arguments following ``tool`` in ``segment``, or None if absent.
+
+    Unwraps ``uv run`` / ``poetry run`` / ``python -m`` style prefixes so the
+    tool is found wherever the runner convention put it.
+    """
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        words = segment.split()
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if _ENV_ASSIGNMENT.match(word):
+            index += 1
+            continue
+        base = word.rsplit("/", 1)[-1]
+        if base == tool:
+            return words[index + 1 :]
+        if base in {"python", "python3"} or base.startswith("python3."):
+            # `python -m mypy ...`
+            rest = words[index + 1 :]
+            if rest and rest[0] == "-m":
+                index += 2
+                continue
+            return None
+        if base in _RUNNER_PREFIXES:
+            index += 1 + _RUNNER_PREFIXES[base]
+            # Skip the runner's own flags (`uv run --frozen mypy`).
+            while index < len(words) and words[index].startswith("-"):
+                index += 1
+            continue
+        return None
+    return None
+
+
+def _is_path_argument(token: str, workspace: Path) -> bool:
+    if not token or token.startswith("-"):
+        return False
+    if "/" in token or _PATHY_SUFFIX.search(token):
+        return True
+    try:
+        return (workspace / token).exists()
+    except OSError:
+        return False
+
+
+def _bare_form(segment: str, paths: Sequence[str], value_flags: frozenset[str]) -> str:
+    """``segment`` with only the offending positional paths removed.
+
+    Rebuilt from the tokenised words so subcommands and flags survive:
+    `uv run ruff check packages` becomes `uv run ruff check`, never
+    `uv run ruff` (which exits 2 with a usage banner).
+    """
+    try:
+        words = shlex.split(segment.strip())
+    except ValueError:
+        words = segment.strip().split()
+    remaining = list(paths)
+    kept: list[str] = []
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            kept.append(word)
+            continue
+        if word.startswith("-") and "=" not in word:
+            # A flag's value is never an offending positional argument.
+            skip = word in value_flags
+            kept.append(word)
+            continue
+        if word in remaining:
+            remaining.remove(word)
+            continue
+        kept.append(word)
+    return shlex.join(kept) if kept else segment.strip()
+
+
+def _explicit_paths(arguments: Sequence[str], spec: ConfigScopedTool, workspace: Path) -> list[str]:
+    """Path-like positional arguments among ``arguments``."""
+    paths: list[str] = []
+    skip = False
+    for token in arguments:
+        if skip:
+            skip = False
+            continue
+        if token == _END_OF_FLAGS:
+            continue
+        if token.startswith("-"):
+            if "=" not in token and token in spec.value_flags:
+                skip = True
+            continue
+        if _is_path_argument(token, workspace):
+            paths.append(token)
+    return paths
+
+
+def _pyproject_scope(workspace: Path, spec: ConfigScopedTool) -> str | None:
+    path = workspace / "pyproject.toml"
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    node: object = data
+    for part in spec.pyproject_section:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    if not isinstance(node, dict):
+        return None
+    for key in spec.pyproject_keys:
+        if node.get(key):
+            section = ".".join(spec.pyproject_section)
+            return f"pyproject.toml [{section}] {key}"
+    return None
+
+
+def _ini_scope(workspace: Path, spec: ConfigScopedTool) -> str | None:
+    for name, key in spec.ini_sources:
+        path = workspace / name
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(rf"^\s*{re.escape(key)}\s*=", text, re.M):
+            return f"{name} {key}"
+    return None
+
+
+def declared_path_scope(workspace: Path, spec: ConfigScopedTool) -> str | None:
+    """Where this workspace pins ``spec``'s file set, or None if nowhere."""
+    return _pyproject_scope(workspace, spec) or _ini_scope(workspace, spec)
+
+
+def config_scoped_paths(command: str, workspace: Path | None) -> list[str]:
+    """Messages for config-driven tools invoked with explicit paths (#387).
+
+    Silent when ``workspace`` is None (nothing to read the config from) and
+    when the project declares no path-scoping key for the tool: a project
+    that pins nothing is not overridden by an explicit path.
+    """
+    if workspace is None:
+        return []
+    problems: list[str] = []
+    segments = _SEGMENT_SPLIT.split(command)
+    for spec in CONFIG_SCOPED_TOOLS:
+        for segment in segments:
+            arguments = _tool_arguments(segment, spec.tool)
+            if arguments is None:
+                continue
+            paths = _explicit_paths(arguments, spec, workspace)
+            if not paths:
+                continue
+            scope = declared_path_scope(workspace, spec)
+            if scope is None:
+                continue
+            bare_form = _bare_form(segment, paths, spec.value_flags)
+            problems.append(
+                f"verify command `{command}` passes explicit path "
+                f"{', '.join(f'`{p}`' for p in paths)} to `{spec.tool}`, which "
+                f"overrides the file set this project already pins in {scope} — "
+                "an explicit path drags in files the project deliberately leaves "
+                "out (a build hook importing an uninstalled build-time dependency, "
+                "say), so the check can fail on work that is correct and no "
+                f"revision can fix it. Run `{bare_form}` with no path arguments — "
+                f"{scope} already pins what it checks"
+            )
+            break
+    return problems
+
+
 def lint_verify_commands(
     commands: Sequence[str],
     languages: Sequence[str],
     *,
     uv_project: bool = False,
     gate: str | None = None,
+    workspace: Path | None = None,
 ) -> list[str]:
     """Violation messages for ``commands`` under the run's toolchains.
 
@@ -500,6 +768,7 @@ def lint_verify_commands(
         command = unwrap_inert_shell(raw)
         for problem in bashisms(command):
             problems.append(f"verify command `{command}` {problem}")
+        problems.extend(config_scoped_paths(command, workspace))
         for head in command_heads(command):
             if head in MUTATING_COMMANDS:
                 problems.append(

@@ -540,3 +540,151 @@ class TestGateRuleText:
 
     def test_no_gate_says_so_rather_than_demanding_one(self) -> None:
         assert "no single gate" in gate_rule(None)
+
+
+class TestConfigScopedPaths:
+    """#387: explicit paths override a tool's own configured file set."""
+
+    @staticmethod
+    def _workspace(tmp_path: Path, pyproject: str) -> Path:
+        (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+        (tmp_path / "packages").mkdir(exist_ok=True)
+        return tmp_path
+
+    MYPY = '[tool.mypy]\nfiles = ["packages/sbxloop/src"]\n'
+
+    def test_uv_run_mypy_packages_is_rejected(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, self.MYPY)
+        problems = lint_verify_commands(
+            ["uv run mypy packages"], ("python",), uv_project=True, workspace=workspace
+        )
+        assert len(problems) == 1
+        assert "uv run mypy packages" in problems[0]
+        assert "mypy" in problems[0]
+        assert "files" in problems[0]
+        assert "no path arguments" in problems[0]
+        assert "`uv run mypy`" in problems[0]
+
+    def test_bare_mypy_is_accepted(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, self.MYPY)
+        assert (
+            lint_verify_commands(["uv run mypy"], ("python",), uv_project=True, workspace=workspace)
+            == []
+        )
+
+    def test_flags_only_is_accepted(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, self.MYPY)
+        assert (
+            lint_verify_commands(
+                ["uv run mypy --strict"], ("python",), uv_project=True, workspace=workspace
+            )
+            == []
+        )
+
+    def test_flag_value_is_not_mistaken_for_a_path(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, self.MYPY)
+        assert (
+            lint_verify_commands(
+                ["uv run mypy --python-version 3.13"],
+                ("python",),
+                uv_project=True,
+                workspace=workspace,
+            )
+            == []
+        )
+
+    def test_silent_when_the_project_pins_nothing(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, "[tool.mypy]\nstrict = true\n")
+        assert (
+            lint_verify_commands(
+                ["uv run mypy packages"], ("python",), uv_project=True, workspace=workspace
+            )
+            == []
+        )
+
+    def test_silent_without_a_workspace(self) -> None:
+        assert lint_verify_commands(["uv run mypy packages"], ("python",), uv_project=True) == []
+
+    def test_ruff_include_is_covered(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.ruff]\ninclude = ["src/**.py"]\n')
+        problems = lint_verify_commands(
+            ["uv run ruff check packages"], ("python",), uv_project=True, workspace=workspace
+        )
+        assert len(problems) == 1
+        assert "ruff" in problems[0]
+        assert "include" in problems[0]
+
+    def test_ruff_src_is_not_a_file_set_pin(self, tmp_path: Path) -> None:
+        """`[tool.ruff] src` is the import-resolution root for first-party
+        classification, not a file set: bare `ruff check` still defaults to
+        `.`, so a path narrows the run rather than overriding it."""
+        workspace = self._workspace(tmp_path, '[tool.ruff]\nsrc = ["packages"]\n')
+        assert (
+            lint_verify_commands(
+                ["uv run ruff check packages/sbxloop/src"],
+                ("python",),
+                uv_project=True,
+                workspace=workspace,
+            )
+            == []
+        )
+
+    def test_ruff_extend_include_is_not_a_file_set_pin(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.ruff]\nextend-include = ["*.pyi"]\n')
+        assert (
+            lint_verify_commands(
+                ["uv run ruff check ."], ("python",), uv_project=True, workspace=workspace
+            )
+            == []
+        )
+
+    def test_ruff_remedy_keeps_the_subcommand(self, tmp_path: Path) -> None:
+        """The bare form must drop only the positional paths: `uv run ruff`
+        alone exits 2 with a usage banner."""
+        workspace = self._workspace(tmp_path, '[tool.ruff]\ninclude = ["src/**.py"]\n')
+        (problem,) = lint_verify_commands(
+            ["uv run ruff check packages"], ("python",), uv_project=True, workspace=workspace
+        )
+        assert "`uv run ruff check`" in problem
+        assert "`uv run ruff`" not in problem
+
+    def test_ruff_remedy_keeps_flags_and_subcommand(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.ruff]\ninclude = ["src/**.py"]\n')
+        (workspace / "src").mkdir(exist_ok=True)
+        (problem,) = lint_verify_commands(
+            ["uv run ruff format --check src"], ("python",), uv_project=True, workspace=workspace
+        )
+        assert "`uv run ruff format --check`" in problem
+
+    def test_mypy_remedy_keeps_flags(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, self.MYPY)
+        (problem,) = lint_verify_commands(
+            ["uv run mypy --strict packages"], ("python",), uv_project=True, workspace=workspace
+        )
+        assert "`uv run mypy --strict`" in problem
+
+    def test_targeted_pytest_stays_legal(self, tmp_path: Path) -> None:
+        """`testpaths` is only a default used when no positional argument is
+        given: a path narrows the run and cannot pull in an unpassable file."""
+        workspace = self._workspace(tmp_path, '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        for command in (
+            "uv run pytest tests/unit/test_verifylint.py -q",
+            "uv run pytest packages/sbxloop-worker/tests -q",
+            "uv run pytest packages -q",
+        ):
+            assert (
+                lint_verify_commands([command], ("python",), uv_project=True, workspace=workspace)
+                == []
+            )
+
+    def test_ini_declared_scope_is_honoured(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, "[project]\nname = 'x'\nversion = '0'\n")
+        (workspace / "mypy.ini").write_text("[mypy]\nfiles = src\n", encoding="utf-8")
+        problems = lint_verify_commands(
+            ["uv run mypy packages"], ("python",), uv_project=True, workspace=workspace
+        )
+        assert len(problems) == 1
+        assert "mypy.ini" in problems[0]
+
+    def test_existing_callers_need_no_workspace(self) -> None:
+        assert lint_verify_commands(["uv run mypy packages"], ()) == []

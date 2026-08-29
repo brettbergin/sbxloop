@@ -84,6 +84,20 @@ $outcome
   workspace, not the network — an API rate limit or a flake must not be
   able to fail work that is done. Check the local files or run the local
   tests instead.
+- Tools whose **file set** is pinned in project configuration must be
+  invoked without positional paths. When a project declares mypy `files`
+  (also `packages`/`modules`, in `pyproject.toml`, `setup.cfg` or
+  `mypy.ini`) or ruff `include` (`pyproject.toml`, `ruff.toml`), a path on
+  the command line *overrides* that declaration and drags in files the
+  project deliberately left out. Real failure: `uv run mypy packages`
+  pulled in a `hatch_build.py` that imports the build-time-only
+  `hatchling`, so the check could never go green, while bare `uv run mypy`
+  was clean ("Success: no issues found"). Write `uv run mypy` and
+  `uv run ruff check` and let the config decide the scope; this is enforced
+  mechanically and violations are rejected. Narrow, targeted commands are
+  still welcome everywhere else — `uv run pytest tests/unit/test_x.py -q`
+  is fine, because pytest `testpaths` is only a default and a positional
+  path narrows the run rather than widening it.
   $project_gate
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.

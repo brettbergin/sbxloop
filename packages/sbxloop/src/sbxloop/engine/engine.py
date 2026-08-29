@@ -1138,36 +1138,14 @@ class LoopEngine:
         )
         posted_url = ""
         posted_event = ""
-        comments = verdict.comments()
         try:
-            try:
-                submitted = ops.pr_review_create(
-                    repo,
-                    run.pr_number,
-                    verdict.event,
-                    review_body(verdict, run_id=run_id, round=round_no),
-                    comments,
-                )
-            except GithubOpsError:
-                if not comments:
-                    raise
-                # A finding anchored to a line outside the diff makes GitHub
-                # refuse the whole review (422), in both the requested event
-                # and the COMMENT fallback. The findings matter more than
-                # their anchors: post them in the body instead.
-                log.warning(
-                    "review.post_inline_refused",
-                    run=run_id,
-                    pr=run.pr_number,
-                    comments=len(comments),
-                    hint="re-posting the review with its findings in the body",
-                )
-                submitted = ops.pr_review_create(
-                    repo,
-                    run.pr_number,
-                    verdict.event,
-                    review_body(verdict, run_id=run_id, round=round_no, anchored=False),
-                )
+            submitted = ops.pr_review_create(
+                repo,
+                run.pr_number,
+                verdict.event,
+                review_body(verdict, run_id=run_id, round=round_no),
+                verdict.comments(),
+            )
             posted_url, posted_event = submitted.url, submitted.event
         except GithubOpsError:
             # The record is a courtesy to whoever reads the PR; the verdict
@@ -1627,7 +1605,11 @@ class LoopEngine:
         task: TaskRecord,
     ) -> None:
         started = time.time()
-        passed, feedback, results = phases.verify(task)
+        prior = self.store.verify_fingerprints(run_id, task.spec.id)
+        passed, feedback, results, fingerprints, repeated = phases.verify(
+            task, prior_fingerprints=prior
+        )
+        task.verify_repeat = repeated
         # `results` (the full command transcript) is persisted so a resumed
         # run reads the evidence from phase_attempts rather than in-memory
         # state (#61).
@@ -1638,7 +1620,13 @@ class LoopEngine:
             attempt=task.revisions + 1,
             status="ok" if passed else "failed",
             output_json=json.dumps(
-                {"passed": passed, "feedback": clip(feedback), "results": results}
+                {
+                    "passed": passed,
+                    "feedback": clip(feedback),
+                    "results": results,
+                    "fingerprints": list(fingerprints),
+                    "repeated": repeated,
+                }
             ),
             started_at=started,
         )
@@ -1713,11 +1701,21 @@ class LoopEngine:
             # to where the commands expect files.
             task.replans += 1
             self._discard_session(task)
-            task.last_feedback = (
+            preamble = (
                 "every revision failed the same verify commands; start over "
                 "with a fresh approach whose file layout and setup satisfy "
-                "the commands exactly as written:\n\n" + feedback
+                "the commands exactly as written:"
             )
+            if task.verify_repeat:
+                # #387: the identical command produced identical output on an
+                # earlier attempt, so the replan is told to question the check
+                # itself before spending the fresh session on more code.
+                preamble += (
+                    " The failure repeated identically across attempts, so "
+                    "the check itself is suspect — judge whether the verify "
+                    "command can pass at all before changing more code."
+                )
+            task.last_feedback = preamble + "\n\n" + feedback
             self._set_task_state(run_id, task, "executing")
             return
         self._set_task_state(run_id, task, "failed")

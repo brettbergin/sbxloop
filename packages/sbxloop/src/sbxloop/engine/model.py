@@ -212,6 +212,10 @@ class TaskRecord(_Model):
     replans: int = 0
     last_feedback: str = ""
     session_id: str | None = None
+    # Set when a verify failure repeated identically (same command, same
+    # normalised output) across attempts (#387): the check itself is
+    # suspect, and the replan path consumes this to say so.
+    verify_repeat: bool = False
 
     @property
     def terminal(self) -> bool:

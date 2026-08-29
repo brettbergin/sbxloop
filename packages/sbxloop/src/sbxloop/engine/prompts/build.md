@@ -164,6 +164,16 @@ summary ("the verify command itself appears incorrect because …") so the
 humans reviewing the run can see it. A clear report beats another round of
 experiments.
 
+If a verify command **fails identically twice** — same command, same output,
+across attempts or a replan — stop re-running it and say in your report that
+the check itself looks misconfigured, naming the fix. The commonest shape is
+a config-scoped tool invoked with explicit paths: a project that pins mypy
+`files` or ruff `include` in `pyproject.toml` has that scope *overridden* by
+any path on the command line, which can pull in files that cannot possibly
+type-check or lint here — `uv run mypy packages` fails on a build-time-only
+`hatchling` import while bare `uv run mypy` is clean. When you see that, report the **bare form** of the command
+(`uv run mypy`, not `uv run mypy packages`) as the remedy.
+
 ## When you are done
 
 Finish with a short summary that opens with what you set out to do and why,

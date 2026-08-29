@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     replans    INTEGER NOT NULL DEFAULT 0,
     last_feedback TEXT NOT NULL DEFAULT '',
     session_id TEXT,
+    verify_repeat INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, task_id)
 );
 CREATE TABLE IF NOT EXISTS phase_attempts (
@@ -149,6 +150,12 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "ALTER TABLE phase_attempts ADD COLUMN cache_write_tokens INTEGER",
         ),
         ("turns", "ALTER TABLE phase_attempts ADD COLUMN turns INTEGER"),
+    ),
+    "tasks": (
+        (
+            "verify_repeat",
+            "ALTER TABLE tasks ADD COLUMN verify_repeat INTEGER NOT NULL DEFAULT 0",
+        ),
     ),
 }
 
@@ -467,13 +474,15 @@ class StateStore:
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE tasks SET state = ?, revisions = ?, replans = ?,"
-                " last_feedback = ?, session_id = ? WHERE run_id = ? AND task_id = ?",
+                " last_feedback = ?, session_id = ?, verify_repeat = ?"
+                " WHERE run_id = ? AND task_id = ?",
                 (
                     task.state,
                     task.revisions,
                     task.replans,
                     task.last_feedback,
                     task.session_id,
+                    int(task.verify_repeat),
                     run_id,
                     task.spec.id,
                 ),
@@ -496,6 +505,7 @@ class StateStore:
                     replans=row["replans"],
                     last_feedback=row["last_feedback"],
                     session_id=row["session_id"],
+                    verify_repeat=bool(row["verify_repeat"]),
                 )
             )
         return records
@@ -550,6 +560,30 @@ class StateStore:
         ).fetchone()
         return row["output_json"] if row is not None else None
 
+    def verify_fingerprints(self, run_id: str, task_id: str) -> list[str]:
+        """Failure fingerprints recorded by every prior verify attempt of the
+        task, oldest first. Rows from before fingerprints were persisted
+        simply contribute nothing."""
+        rows = self._conn.execute(
+            "SELECT output_json FROM phase_attempts"
+            " WHERE run_id = ? AND task_id = ? AND phase = 'verify'"
+            " ORDER BY id",
+            (run_id, task_id),
+        ).fetchall()
+        seen: list[str] = []
+        for row in rows:
+            raw = row["output_json"]
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                continue
+            for fp in payload.get("fingerprints") or []:
+                if isinstance(fp, str):
+                    seen.append(fp)
+        return seen
+
     def latest_phase_attempt(self, run_id: str, task_id: str, phase: str) -> sqlite3.Row | None:
         """The task's most recent attempt row of ``phase`` (attempt, status,
         output_json...), or None if it never ran."""
@@ -580,10 +614,9 @@ class StateStore:
     def last_event_ts(self, run_id: str) -> float | None:
         """Timestamp of the run's most recent persisted event, if any.
 
-        Every bus event except streaming deltas (heartbeats included) is
-        persisted, so this is the best liveness signal available for a run
-        whose recorded state says non-terminal but whose process may be
-        long dead.
+        Every bus event (heartbeats included) is persisted, so this is the
+        best liveness signal available for a run whose recorded state says
+        non-terminal but whose process may be long dead.
         """
         row = self._conn.execute(
             "SELECT MAX(ts) AS ts FROM events WHERE run_id = ?", (run_id,)
