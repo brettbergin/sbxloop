@@ -23,23 +23,10 @@ def ev(type: str, **data: Any) -> Event:
     return Event.now(type, "r1", **data)
 
 
-class FakeEmbed:
-    """Stands in for discord.Embed so the bridge's embed plumbing is
-    exercised whether or not discord.py is installed (CI syncs without the
-    extra)."""
-
-    def __init__(self, spec: Any) -> None:
-        self.spec = spec
-        self.fields = [
-            type("F", (), {"name": n, "value": v, "inline": i})() for n, v, i in spec.fields
-        ]
-
-
 @pytest.fixture(autouse=True)
 def _discord_adapters_without_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     from sbxloop.daemon import discord as bridge_module
 
-    monkeypatch.setattr(bridge_module, "_to_embed", lambda spec: FakeEmbed(spec.clamped()))
     monkeypatch.setattr(bridge_module, "_allowed_mentions_none", lambda: "none")
 
 
@@ -118,10 +105,9 @@ class FakeMessage:
     async def add_reaction(self, emoji: str) -> None:
         self.reactions.append(emoji)
 
-    async def edit(self, *, content: str | None = None, embed: Any = None) -> None:
+    async def edit(self, *, content: str | None = None) -> None:
         if content is not None:
             self.content = content
-        self.embed = embed
         self.edits = getattr(self, "edits", 0) + 1
 
     async def create_thread(self, name: str) -> FakeChannel:
@@ -141,12 +127,14 @@ class FakeChannel:
         self._next_id = 100
 
     async def send(self, text: str | None = None, **kwargs: Any) -> FakeMessage:
-        # discord.py signature: send(content=None, *, embed=..., allowed_mentions=..., ...)
+        # discord.py signature: send(content=None, *, allowed_mentions=..., ...)
+        # #519: the bridge posts plain markdown only — an embed kwarg reaching
+        # the send seam anywhere in the suite is a regression, not a variant.
+        assert not any(k.startswith("embed") for k in kwargs), f"embed at send seam: {kwargs}"
         self.sent.append(text or "")
         self.sent_kwargs.append(kwargs)
         self._next_id += 1
         msg = FakeMessage(text or "", self, bot=True, mid=self._next_id)
-        msg.embed = kwargs.get("embed")
         self.messages[msg.id] = msg
         return msg
 
@@ -343,9 +331,9 @@ class TestBridge:
             assert wait_for(
                 lambda: any("PR [#3 · o/r](https://x/pull/3)" in s for s in thread.sent)
             )
-            # every send disables mentions; the headline carries an embed card
+            # every send disables mentions; nothing is posted as an embed
             assert all("allowed_mentions" in k for k in control.sent_kwargs + thread.sent_kwargs)
-            assert control.sent_kwargs[0].get("embed") is not None
+            assert all("embed" not in k for k in control.sent_kwargs + thread.sent_kwargs)
             bridge.run_finished(
                 item,
                 RunReport(
@@ -355,22 +343,12 @@ class TestBridge:
                     pr=(3, "https://x/pull/3"),
                 ),
             )
-            assert wait_for(
-                lambda: any(s.startswith("**finished: completed**") for s in thread.sent)
-            )
-            # the PR rides on the finish text
-            finish_text = next(s for s in thread.sent if s.startswith("**finished"))
-            assert "\n🔀 PR #3 <https://x/pull/3>" in finish_text
+            assert wait_for(lambda: any("**finished: completed**" in s for s in thread.sent))
+            # the PR rides on the plain finish body
+            finish_body = next(s for s in thread.sent if "**finished: completed**" in s)
+            assert "PR [#3](https://x/pull/3)" in finish_body
             headline = control.messages[bridge.dstore.discord_thread("r1").headline_id]  # type: ignore[union-attr]
             assert wait_for(lambda: headline.content.startswith("✅"))
-            # the finished card is an embed with the PR field
-            finish_kwargs = [
-                k
-                for t, k in zip(thread.sent, thread.sent_kwargs, strict=True)
-                if t.startswith("**finished")
-            ]
-            assert finish_kwargs and finish_kwargs[0].get("embed") is not None
-            assert [f.name for f in finish_kwargs[0]["embed"].fields] == ["PR"]
         finally:
             bridge.close()
 
@@ -923,7 +901,7 @@ class TestBridge:
             assert wait_for(lambda: sum(1 for s in thread.sent if s.startswith("⚙ ")) == 2)
             assert thread.sent[-1] == "⚙ 1 tool call (edit) — last: `x.py`"
             bridge.run_finished(item, RunReport("r1", "completed", "1/1 tasks done"))
-            assert wait_for(lambda: any(s.startswith("**finished") for s in thread.sent))
+            assert wait_for(lambda: any("**finished" in s for s in thread.sent))
         finally:
             bridge.close()
 
@@ -996,6 +974,10 @@ class TestBridge:
             assert wait_for(lambda: "task 2/2" in status_msg.content, timeout=8)
             assert "✅ 1 done" in status_msg.content
             assert sum(1 for s in thread.sent if s.startswith("⏳")) == 1
+            # the live status message is plain markdown: no embed on the
+            # original send, and the edits only ever carry `content`.
+            assert all("embed" not in k for k in thread.sent_kwargs)
+            assert getattr(status_msg, "edits", 0) > 0
             bridge.run_finished(item, RunReport("r1", "completed", "2/2 tasks done"))
             assert wait_for(lambda: status_msg.content.startswith("✅ finished"), timeout=8)
         finally:
@@ -1015,11 +997,9 @@ class TestBridge:
             assert wait_for(lambda: getattr(headline, "edits", 0) >= 1)
             bus.emit("run.deliver", "r1", repo="o/r", pr=3, url="https://x/pull/3")
             assert wait_for(lambda: getattr(headline, "edits", 0) >= 2)
-            # the edited card lists the branch and PR (embed converted when discord.py present)
-            embed = headline.embed
-            assert embed is not None
-            names = [f.name for f in embed.fields]
-            assert "Branch" in names and "PR" in names
+            # the edited headline names the branch and PR in plain markdown
+            assert "branch `sbxloop/r1`" in headline.content
+            assert "PR [#3](https://x/pull/3)" in headline.content
         finally:
             bridge.close()
 
@@ -1071,7 +1051,7 @@ class TestBridge:
         assert control.sent and control.sent[0].startswith("▶ run `r1`")
         thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
         assert any("all done quickly" in s for s in thread.sent)
-        assert any(s.startswith("**finished: completed**") for s in thread.sent)
+        assert any("**finished: completed**" in s for s in thread.sent)
         assert control.messages[bridge.dstore.discord_thread("r1").headline_id].content.startswith(  # type: ignore[union-attr]
             "✅"
         )
@@ -1120,16 +1100,11 @@ class TestBridge:
             # After the finish card, nothing else lands in the thread.
             assert thread.sent[-1].startswith("📊 **run summary**")
             assert "1 turn(s)" in thread.sent[-1] and "1,200 in / 80 out tokens" in thread.sent[-1]
-            summary_kwargs = thread.sent_kwargs[-1]
-            card = summary_kwargs["embed"]
-            names = [f.name for f in card.fields]
-            assert names == ["Stats", "Went well", "Needed work"]
-            values = {f.name: f.value for f in card.fields}
-            assert "delivered PR [#3](https://x/pull/3)" in values["Went well"]
-            assert (
-                "`t1` verify: **failed** — verify command failed: `lint` (exit 1)"
-                in values["Needed work"]
-            )
+            assert "embed" not in thread.sent_kwargs[-1]
+            body = thread.sent[-1]
+            assert "**Stats**" in body and "**Went well**" in body and "**Needed work**" in body
+            assert "delivered PR [#3](https://x/pull/3)" in body
+            assert "`t1` verify: **failed** — verify command failed: `lint` (exit 1)" in body
         finally:
             bridge.close()
 
@@ -1196,7 +1171,7 @@ class TestBridge:
             assert note.content == "⏳ steer queued; answered at the next checkpoint"
             bridge.run_finished(item, RunReport("r1", "completed", "done"))
             assert wait_for(lambda: note.content.startswith("⚠ steer not answered"))
-            assert any("1 steering message(s) were not answered" in s for s in thread.sent)
+            assert any("1 message(s) were not answered" in s for s in thread.sent)
         finally:
             bridge.close()
 
@@ -1231,7 +1206,7 @@ class TestBridge:
         gate.set()
         bridge.close()  # drains: chat.reply first, then the finish marker
         thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
-        assert any(s.startswith("**finished: completed**") for s in thread.sent)
+        assert any("**finished: completed**" in s for s in thread.sent)
         assert not any("were not answered" in s for s in thread.sent)
         assert bridge._pending == {}
 

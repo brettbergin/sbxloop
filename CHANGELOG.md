@@ -39,6 +39,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **The Discord bridge posts plain markdown instead of rich cards** (#519).
+  The headline, the finish verdict, the run summary and the live status
+  message edited in place all render as ordinary Discord markdown now; the
+  cards took a lot of vertical space and buried the interleaved chronology
+  in a busy control channel. The live status message gained the plain
+  renderer it was missing and is still edited on the same cadence
+  (`STATUS_EDIT_MIN_S`); daemon notices, concierge tool notes and steering
+  status notes were converted too. Nothing is lost: run/issue/PR links, the
+  state and stage markers and the run stats all survive in the plain form,
+  where the markers carry the signal the card colours used to. The rich
+  rendering path is deleted rather than gated — nothing else used it — so
+  `EmbedSpec`, the `EMBED_*` and `COLOR_*` constants, `Chunk`'s card member,
+  the `clamped()` helper and the now-dead `[discord] embeds` setting are
+  gone with their tests. Output limits are unchanged: every message is
+  clamped to `DISCORD_MAX_MESSAGE`, long bodies still split via
+  `split_markdown`, commands and excerpts still pass through `redact_text`,
+  and every send still disables mentions.
+
 - **GitHub work-item ids are typed: `gh:issue:1234`, `gh:pr:1234`** (#508).
   The old `gh:1234` said nothing about what it pointed at, and a run carries
   an issue number *and* a PR number side by side in chat, issue comments,
