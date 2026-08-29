@@ -212,6 +212,13 @@ class TaskRecord(_Model):
     replans: int = 0
     last_feedback: str = ""
     session_id: str | None = None
+    # Fingerprints (command + normalised output) of every verify failure
+    # seen on this task, across revisions AND replans. A repeat means the
+    # identical check failed the identical way again (#387).
+    verify_fingerprints: list[str] = Field(default_factory=list)
+    # Set once a fingerprint repeats: the check, not the code, is the thing
+    # to change, and no further identical revision is spent.
+    verify_suspect: bool = False
 
     @property
     def terminal(self) -> bool:

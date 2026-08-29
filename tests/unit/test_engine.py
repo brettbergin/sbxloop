@@ -414,8 +414,7 @@ class TestReviseAndVerify:
             [
                 taskgraph(task("t1", verify=["test -f done.txt"])),
                 BUILD,
-                BUILD,
-                BUILD,  # revisions exhausted -> replan with a fresh session
+                BUILD,  # same failure twice -> verify-suspect replan, fresh session
                 {"text": "fresh approach, wrote done.txt", "files": {"done.txt": "ok\n"}},
             ]
         )
@@ -424,6 +423,7 @@ class TestReviseAndVerify:
         assert result.state == "completed"
         assert result.tasks[0].state == "done"
         assert result.tasks[0].replans == 1
+        assert result.tasks[0].verify_suspect
         # revisions were reset when the session was discarded, and the fresh
         # attempt passed first try
         assert result.tasks[0].revisions == 0
@@ -431,10 +431,8 @@ class TestReviseAndVerify:
         jobs = [j for j in harness.agent_jobs(result.run_id) if j.get("kind") == "agent.session"]
         # The two in-budget revisions continued their own session; nothing
         # else did (decompose is always fresh, and so is the replan build).
-        assert len([j for j in jobs if j.get("resume_session_id")]) == 2
-        (fresh,) = [
-            j for j in jobs if "start over with a fresh approach" in (j.get("prompt") or "")
-        ]
+        assert len([j for j in jobs if j.get("resume_session_id")]) == 1
+        (fresh,) = [j for j in jobs if "VERIFY COMMAND SUSPECT" in (j.get("prompt") or "")]
         assert fresh.get("resume_session_id") is None
 
     def test_verify_failure_exhausts_revisions_and_replans(self, harness: Harness) -> None:
@@ -444,18 +442,26 @@ class TestReviseAndVerify:
         harness.script([taskgraph(task("t1", verify=["false"])), *([BUILD] * 6)])
         result = harness.engine().start("verify never passes")
         assert result.state == "failed"
-        assert result.reason == "a task failed or was skipped"
+        assert "verify command that never changed its result" in (result.reason or "")
+        assert "`false`" in (result.reason or "")
         assert result.tasks[0].state == "failed"
         assert result.tasks[0].replans == 1
+        assert result.tasks[0].verify_suspect
+        # The suspect signal fires on the second identical failure, so the
+        # replan is spent there instead of after three wasted revisions
+        # (#387); the remaining budget is revisions carrying the suspect
+        # wording forward.
         assert result.tasks[0].revisions == 3
-        assert "verify command failed" in result.tasks[0].last_feedback
+        assert "VERIFY COMMAND SUSPECT" in result.tasks[0].last_feedback
 
     def test_verify_exhaustion_without_replan_budget_fails(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1", verify=["false"])), *([BUILD] * 3)])
         result = harness.engine(budgets={"max_replans_per_task": 0}).start("verify never passes")
         assert result.state == "failed"
         assert result.tasks[0].state == "failed"
-        assert result.tasks[0].revisions == 3
+        # With no replan to spend, the second identical failure fails the
+        # task immediately rather than burning the remaining revisions.
+        assert result.tasks[0].verify_suspect
 
     def test_verify_failure_surfaces_in_event_stream(self, harness: Harness) -> None:
         # Field failure (rv4zfdb1m): the transcript jumped verifying -> failed

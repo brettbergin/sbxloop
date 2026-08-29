@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     replans    INTEGER NOT NULL DEFAULT 0,
     last_feedback TEXT NOT NULL DEFAULT '',
     session_id TEXT,
+    verify_fingerprints TEXT NOT NULL DEFAULT '[]',
+    verify_suspect INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, task_id)
 );
 CREATE TABLE IF NOT EXISTS phase_attempts (
@@ -149,6 +151,16 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "ALTER TABLE phase_attempts ADD COLUMN cache_write_tokens INTEGER",
         ),
         ("turns", "ALTER TABLE phase_attempts ADD COLUMN turns INTEGER"),
+    ),
+    "tasks": (
+        (
+            "verify_fingerprints",
+            "ALTER TABLE tasks ADD COLUMN verify_fingerprints TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            "verify_suspect",
+            "ALTER TABLE tasks ADD COLUMN verify_suspect INTEGER NOT NULL DEFAULT 0",
+        ),
     ),
 }
 
@@ -467,13 +479,16 @@ class StateStore:
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE tasks SET state = ?, revisions = ?, replans = ?,"
-                " last_feedback = ?, session_id = ? WHERE run_id = ? AND task_id = ?",
+                " last_feedback = ?, session_id = ?, verify_fingerprints = ?,"
+                " verify_suspect = ? WHERE run_id = ? AND task_id = ?",
                 (
                     task.state,
                     task.revisions,
                     task.replans,
                     task.last_feedback,
                     task.session_id,
+                    json.dumps(task.verify_fingerprints),
+                    int(task.verify_suspect),
                     run_id,
                     task.spec.id,
                 ),
@@ -496,6 +511,8 @@ class StateStore:
                     replans=row["replans"],
                     last_feedback=row["last_feedback"],
                     session_id=row["session_id"],
+                    verify_fingerprints=json.loads(row["verify_fingerprints"] or "[]"),
+                    verify_suspect=bool(row["verify_suspect"]),
                 )
             )
         return records

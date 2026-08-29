@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **The verify-suspect signal no longer collides distinct failures, over-reaches
+  on narrowing commands, or orders an impossible re-author** (#387 review of
+  PR #509). Three corrections: the duration normaliser no longer treats
+  `line:column` coordinates as a timestamp (clock-style durations are matched
+  only after `in`/`took`/`elapsed`/`time`), so the same error at two different
+  positions is two fingerprints rather than one false "suspect"; the
+  config-override lint now fires only when the given path lies *outside* the
+  configured file set, keeping `uv run mypy packages` flagged while allowing
+  `uv run pytest -q tests/unit` and `uv run mypy packages/sbxloop/src/…`; and
+  the suspect feedback is written for the builder — the only agent it reaches,
+  and one that cannot edit the decomposer-authored commands — asking it to
+  satisfy the command as written or report it unpassable, with the suspect
+  state now surfaced in the run's failure reason.
+
 - **A fix round re-delivers onto the pull request it knows, never a blind
   create.** Field run `r8tzse1qa` (#387 → PR #505): round two force-moved
   the branch, POSTed a new PR, got the `gh` transport's bare "Validation
@@ -20,6 +34,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   message. (The old loop had filed exactly this as #488/#490/#495/#497
   before its findings were closed at the cutover — a reminder that the
   lane, not the findings, was the problem.)
+
 - **Every fix round starts from the current base**, not only a `conflict`
   one. CI judges GitHub's test merge of the branch with its base, so a red
   check can exist only in that merge — PR #505 failed a test that landed

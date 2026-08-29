@@ -26,6 +26,8 @@ Session strategy per phase (a deliberate design decision):
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -40,7 +42,13 @@ from sbxloop.engine.review import RefutedGuard, ReviewVerdict
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
-from sbxloop.verifylint import UV_LOCKFILE, gate_rule, lint_verify_commands, project_gate
+from sbxloop.verifylint import (
+    UV_LOCKFILE,
+    gate_problems,
+    gate_rule,
+    lint_verify_commands,
+    project_gate,
+)
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, Usage
 
@@ -58,6 +66,103 @@ VERIFY_TAIL_CLIP = 4_000
 # a display convention only — provenance decisions read the persisted
 # verify attempt, never this text (critic feedback is agent-authored).
 VERIFY_FAILURE_PREFIX = "verify command failed:"
+
+# Substitutions applied to verify output before fingerprinting it. A verify
+# command that cannot pass fails with the *same* diagnosis every attempt,
+# but never byte-identically: pytest prints "in 12.31s", mypy prints a
+# duration, tracebacks carry absolute sandbox paths whose run id differs
+# per attempt. Normalising those out is what lets the engine recognise "we
+# have already seen exactly this failure" without asking a model (#387).
+_NORMALISERS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Absolute paths (/home/agent/work/<run>/... ) -> the tail component,
+    # so the same file under a different run root compares equal.
+    (re.compile(r"(?<![\w/])/(?:[\w.+-]+/)+([\w.+-]+)"), r"<path>/\1"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}[\d:.]*\b"), "<ts>"),
+    # Durations: "in 12.31s", "took 1.2 sec", "(209s)" — a number carrying a
+    # time unit is unambiguous.
+    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:s|sec|secs|seconds|ms|m|min|minutes)\b"), "<dur>"),
+    # Clock-style durations ("0:00:12") only in an explicit duration
+    # context. A bare `\d+:\d{2}` also matches the `line:column` coordinates
+    # every compiler and linter prints, and normalising those collapsed two
+    # materially different failures (the same error at 10:12 and at 20:15)
+    # into one fingerprint — which made the engine call a working check
+    # suspect. The keyword prefix is kept so "took" survives the
+    # substitution and cannot itself be a filename.
+    (
+        re.compile(r"(?i)\b(in|took|elapsed|time)(\s+)\d+:\d{2}(?::\d{2})?(?:\.\d+)?\b"),
+        r"\1\2<dur>",
+    ),
+    # Hex ids / memory addresses and bare timestamps.
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<addr>"),
+)
+
+
+def normalise_verify_output(output: str) -> str:
+    """Strip the run-to-run noise (timings, absolute paths, addresses) from
+    verify output so two attempts of the same failure compare equal."""
+    text = output or ""
+    for pattern, replacement in _NORMALISERS:
+        text = pattern.sub(replacement, text)
+    # Collapse trailing whitespace and blank-line drift.
+    lines = [line.rstrip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def verify_fingerprint(command: str, output: str) -> str:
+    """Stable identity of one verify failure: the command plus its
+    normalised output. Equal fingerprints mean the identical check failed
+    the identical way again."""
+    payload = f"{(command or '').strip()}\n--\n{normalise_verify_output(output)}"
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+def verify_suspect_feedback(failures: Sequence[VerifyFailure]) -> str:
+    """Feedback for a verify command that has now failed identically twice.
+
+    Addressed to the *builder*, because the builder is the only agent this
+    signal can reach: the verify commands are decomposer-authored and
+    build.md tells the builder they run exactly as written and cannot be
+    edited. So this must not order a re-author it is unable to perform. What
+    it can ask for is the two things that are in the builder's hands —
+    making the work satisfy the command as written (layout, paths, setup),
+    or, when the command is genuinely unpassable, saying so plainly in the
+    report so a human sees the diagnosis instead of another silent retry.
+    """
+    quoted = "\n\n".join(
+        f"`{failure.command}` (exit {failure.exit_code}) failed again with the "
+        f"same output:\n\n{failure.output}"
+        for failure in failures
+    )
+    return (
+        "VERIFY COMMAND SUSPECT: the same verify command has now failed twice "
+        "with identical output across attempts, so repeating the same change "
+        "will not change the result — treat the check itself as suspect.\n\n"
+        f"{quoted}\n\n"
+        "You cannot edit the verify commands. Do two things instead. First, "
+        "work out whether the work can be made to satisfy this command "
+        "exactly as written — a different file layout, a path the command "
+        "actually looks at, or missing setup the command needs — and if so, "
+        "do that. Second, if the command cannot pass however the work is "
+        "arranged (for example a config-driven tool given explicit paths that "
+        "override its own configured file set, a path that does not exist, or "
+        "a command that contradicts the task), stop retrying and state that "
+        "plainly in your report, naming the command and why it is unpassable, "
+        "so the humans reviewing the run can re-author it."
+    )
+
+
+class VerifyFailure(NamedTuple):
+    """One failing verify command, with the fingerprint used to recognise
+    it recurring on a later attempt."""
+
+    command: str
+    exit_code: int
+    output: str
+
+    @property
+    def fingerprint(self) -> str:
+        return verify_fingerprint(self.command, self.output)
+
 
 # Persona label per phase prompt: stamped onto the job's agent.* events (via
 # WorkerClient.submit) so the transcript header says WHO is responding
@@ -86,6 +191,7 @@ class VerifyOutcome(NamedTuple):
     passed: bool
     feedback: str
     results: str
+    failures: tuple[VerifyFailure, ...] = ()
 
 
 class PhaseSpend(NamedTuple):
@@ -183,7 +289,10 @@ class PhaseRunner:
         """
         uv_project = self.workspace is not None and (self.workspace / UV_LOCKFILE).is_file()
         return lint_verify_commands(
-            commands, self.config.sandbox.effective_languages, uv_project=uv_project
+            commands,
+            self.config.sandbox.effective_languages,
+            uv_project=uv_project,
+            workspace=self.workspace,
         )
 
     # -- job plumbing ------------------------------------------------------
@@ -420,9 +529,7 @@ class PhaseRunner:
         gate = self.project_gate()
         if gate:
             every_command = [c for task in graph.tasks for c in task.verify_commands]
-            problems += [
-                f"- {message}" for message in lint_verify_commands(every_command, (), gate=gate)
-            ]
+            problems += [f"- {message}" for message in gate_problems(every_command, gate)]
         if problems:
             raise ValueError(
                 "verify commands violate the sandbox's toolchain conventions:\n"
@@ -586,18 +693,20 @@ class PhaseRunner:
         """Run the task's decomposer-authored verify commands; the transcript
         rides on the outcome."""
         commands = list(dict.fromkeys(task.spec.verify_commands))
-        failures: list[str] = []
+        failures: list[VerifyFailure] = []
         results: list[str] = []
         for result in self.shell_batch(commands) if commands else []:
             output = clip_head_tail(result.output)
             results.append(f"$ {result.command}\n(exit {result.exit_code})\n{output}")
             if result.exit_code != 0:
-                failures.append(
-                    f"{VERIFY_FAILURE_PREFIX} `{result.command}` "
-                    f"(exit {result.exit_code})\n{output}"
-                )
+                failures.append(VerifyFailure(result.command, result.exit_code, output))
         return VerifyOutcome(
             passed=not failures,
-            feedback="\n\n".join(failures),
+            feedback="\n\n".join(
+                f"{VERIFY_FAILURE_PREFIX} `{failure.command}` "
+                f"(exit {failure.exit_code})\n{failure.output}"
+                for failure in failures
+            ),
             results="\n\n".join(results) or "(no verify commands)",
+            failures=tuple(failures),
         )
