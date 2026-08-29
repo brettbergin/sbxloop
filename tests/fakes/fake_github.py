@@ -85,6 +85,9 @@ class FakeGithub(GithubOps):
         self.feedback = ""
         self.undraft_ok = True
         self.update_ok = True
+        # GitHub 422s a review whose inline comment is anchored outside the
+        # diff — every event, COMMENT included. True models that.
+        self.refuse_inline_comments = False
         self.merge_outcomes: list[MergeOutcome] = []
         self.user_login = "sbxloop-bot"
         self.fail_once: dict[str, Exception] = {}
@@ -243,8 +246,15 @@ class FakeGithub(GithubOps):
         body: str,
         comments: Sequence[ReviewComment] = (),
     ) -> SubmittedReview:
-        self.reviews.append((event, body, list(comments)))
         self._maybe_fail("pr_review_create")
+        if self.refuse_inline_comments and comments:
+            raise GithubOpsError(
+                "github op raw.api failed: GithubOpError: gh api POST "
+                f"/repos/{repo}/pulls/{number}/reviews failed (rc=1): gh: "
+                "Unprocessable Entity (HTTP 422)",
+                http_status=422,
+            )
+        self.reviews.append((event, body, list(comments)))
         url = f"{self.pr['html_url']}#pullrequestreview-{len(self.reviews)}"
         return SubmittedReview(url, event)
 

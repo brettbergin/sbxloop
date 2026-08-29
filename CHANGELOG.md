@@ -6,6 +6,16 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A review refused for its anchors is re-posted with its findings in the
+  body.** Field run `rx8amxxvm` (#130 → PR #503) approved with two nits
+  anchored to lines outside the diff; GitHub 422'd the APPROVE *and* the
+  COMMENT fallback, and nothing reached the PR (the verdict, which is the
+  run's own, still decided correctly). The engine now retries once
+  without inline comments, listing every finding in the review body. The
+  stale `last_event_ts` docstring that review caught is fixed here too.
+
 ### Changed
 
 - **Streaming deltas are no longer persisted.** `agent.message_delta` is

@@ -127,18 +127,30 @@ class ReviewRound(NamedTuple):
     response: str
 
 
-def review_body(verdict: ReviewVerdict, *, run_id: str, round: int) -> str:
+def review_body(verdict: ReviewVerdict, *, run_id: str, round: int, anchored: bool = True) -> str:
     """The review body posted to the PR: the reviewer's summary, any finding
     that had no line to anchor an inline comment to, the overflow the
-    comment cap dropped, and provenance."""
+    comment cap dropped, and provenance.
+
+    ``anchored=False`` renders *every* finding into the body instead — the
+    shape for a review posted without inline comments, which is what a
+    reviewer that anchored a finding to a line outside the diff gets
+    (GitHub 422s the whole review otherwise, and losing the findings over
+    an anchor would be the worst outcome).
+    """
     parts = [verdict.summary.strip()]
+    if not anchored:
+        if verdict.findings:
+            parts.append("Findings:\n" + "\n".join(f.render() for f in verdict.findings))
+        parts.append(f"<sub>sbxloop review round {round} of run `{run_id}`</sub>")
+        return "\n\n".join(parts)
     unanchored = [f for f in verdict.findings if f.line is None]
     if unanchored:
         parts.append(
             "Findings without a line anchor:\n" + "\n".join(f.render() for f in unanchored)
         )
-    anchored = [f for f in verdict.findings if f.line is not None]
-    dropped = max(0, len(anchored) - MAX_INLINE_COMMENTS)
+    anchored_findings = [f for f in verdict.findings if f.line is not None]
+    dropped = max(0, len(anchored_findings) - MAX_INLINE_COMMENTS)
     if dropped:
         parts.append(
             f"_{dropped} further inline comment(s) were not posted "
