@@ -22,7 +22,9 @@ Contract (test_review_prompt_carries_contract): the four lenses
 ("Concurrency and locking", "Failure ordering", "Input validation",
 "Cross-module interaction"), the phrases "read-only", "Do not modify",
 "refuted" and "ONLY the fenced JSON block", and the verdict/severity
-vocabulary must stay.
+vocabulary must stay. The wrong-check / verify-suspect section with its
+config-override worked example must stay too
+(test_review_prompt_describes_the_wrong_check_shape).
 -->
 
 # Review the pull request
@@ -100,6 +102,38 @@ lenses:
 Also check that the PR does what the outcome asked and nothing it did not:
 work deleted or rewritten beyond the outcome's scope is a finding, and so is
 an acceptance criterion the diff does not meet.
+
+## When the work is right and the check is wrong
+
+Some failures are not defects in the diff at all: the work is correct and the
+task's own verify command can never go green. Say so explicitly in the
+summary when you see it — a wrong check burns the run's whole revision and
+replan budget re-running a command no revision can fix, and your summary is
+where that gets caught.
+
+The commonest shape is a **config-override**: a tool whose file set is pinned
+in the project's configuration, invoked in the verify command with an
+explicit path that overrides it. Worked example:
+
+```toml
+[tool.mypy]
+files = ["packages/sbxloop/src", "packages/sbxloop-worker/src"]
+```
+
+The project gate runs `uv run mypy` and reports "Success: no issues found in
+74 source files". The task's verify command runs `uv run mypy packages`; the
+explicit path overrides `files` and pulls in
+`packages/sbxloop/hatch_build.py`, which imports `hatchling` — a build-time
+dependency absent from the sandbox — so the command exits 1 with
+"Cannot find implementation or library stub for module named
+hatchling.builders.hooks.plugin.interface" on every attempt. Nothing in the
+diff caused it and nothing in a diff can fix it; the remedy is re-authoring
+the command to the bare form. The same shape reaches ruff
+(`include`/`src`) and pytest (`testpaths`).
+
+So when a verify command keeps failing while the code it checks is sound, do
+not turn it into a finding against the author. Approve the work if it is
+sound, and name the misconfigured command and its remedy in the summary.
 
 A concrete, line-anchored finding is worth more than a polite approval.
 Approve only when you looked for these failure modes and did not find

@@ -35,12 +35,14 @@ shape and ``uv run`` is not demanded.
 
 from __future__ import annotations
 
+import configparser
 import json
 import re
 import shlex
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 @dataclass(frozen=True)
@@ -469,12 +471,337 @@ def runs_gate(command: str, gate: str) -> bool:
     return False
 
 
+# Config-driven tools whose *file set* lives in the project's config. Field
+# failure rrhb28j7n (#387): the plan's verify command was `uv run mypy
+# packages`. The repo pins `[tool.mypy] files = [...]` in pyproject.toml, and
+# passing an explicit path OVERRIDES that list — dragging in a build hook
+# that imports `hatchling`, absent from the sandbox. `uv run mypy` (bare)
+# passes; `uv run mypy packages` can never pass. The executor may not edit
+# verify commands, so the run burned two revisions and a replan on three
+# 208-second mypy invocations of a check that was unpassable by construction.
+#
+# The rule only fires when the project actually declares the key: a tool with
+# no configured file set is *supposed* to be given paths, and flagging that
+# would reject the only correct shape.
+@dataclass(frozen=True)
+class ConfigScopedTool:
+    """A tool whose configured file set explicit path arguments override."""
+
+    name: str
+    # (config file, section, keys) triples consulted in order.
+    sources: tuple[tuple[str, str, tuple[str, ...]], ...]
+    # Flags that consume the next word, so it is not a positional path.
+    value_flags: frozenset[str]
+    # Words that are subcommands rather than paths (`ruff check src`).
+    subcommands: frozenset[str] = frozenset()
+    # Arguments that are not a narrowing: `ruff check .` is the idiomatic
+    # whole-tree invocation and ruff still applies its own include/exclude
+    # underneath it, so flagging it would reject the canonical shape.
+    benign_args: frozenset[str] = frozenset()
+
+
+_PYPROJECT = "pyproject.toml"
+CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
+    "mypy": ConfigScopedTool(
+        name="mypy",
+        sources=(
+            (_PYPROJECT, "tool.mypy", ("files",)),
+            ("setup.cfg", "mypy", ("files",)),
+            ("mypy.ini", "mypy", ("files",)),
+            (".mypy.ini", "mypy", ("files",)),
+        ),
+        value_flags=frozenset(
+            {
+                "--config-file",
+                "--python-version",
+                "--cache-dir",
+                "--exclude",
+                "--follow-imports",
+                "--platform",
+                "-p",
+                "-m",
+                "-c",
+                "--module",
+                "--package",
+                "--command",
+            }
+        ),
+    ),
+    "ruff": ConfigScopedTool(
+        name="ruff",
+        sources=(
+            (_PYPROJECT, "tool.ruff", ("include", "src")),
+            ("ruff.toml", "", ("include", "src")),
+            (".ruff.toml", "", ("include", "src")),
+        ),
+        value_flags=frozenset(
+            {
+                "--config",
+                "--select",
+                "--ignore",
+                "--extend-select",
+                "--extend-ignore",
+                "--target-version",
+                "--line-length",
+                "--per-file-ignores",
+                "--cache-dir",
+                "-e",
+            }
+        ),
+        subcommands=frozenset({"check", "format", "rule", "linter", "clean", "version"}),
+        benign_args=frozenset({"."}),
+    ),
+    "pytest": ConfigScopedTool(
+        name="pytest",
+        sources=(
+            (_PYPROJECT, "tool.pytest.ini_options", ("testpaths",)),
+            ("pytest.ini", "pytest", ("testpaths",)),
+            ("tox.ini", "pytest", ("testpaths",)),
+            ("tox.ini", "tool:pytest", ("testpaths",)),
+            ("setup.cfg", "tool:pytest", ("testpaths",)),
+        ),
+        value_flags=frozenset(
+            {
+                "-k",
+                "-m",
+                "-p",
+                "-n",
+                "-o",
+                "-c",
+                "-W",
+                "--rootdir",
+                "--deselect",
+                "--ignore",
+                "--junitxml",
+                "--maxfail",
+                "--cov",
+                "--cov-report",
+                "--override-ini",
+                "--import-mode",
+            }
+        ),
+    ),
+}
+
+# Runner prefixes that stand in front of the tool word without changing it.
+_RUNNER_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("uv", "run"),
+    ("poetry", "run"),
+    ("pdm", "run"),
+    ("hatch", "run"),
+    ("pipenv", "run"),
+)
+# Directory names that read as a path even without a separator or extension.
+_PATHY_WORDS = frozenset({"src", "tests", "test", "packages", "lib", "app", "docs", "scripts", "."})
+_GLOB_CHARS = ("/", "\\", "*", "?", "[")
+
+
+def _config_tables(workspace: Path, filename: str) -> dict[str, dict[str, object]] | None:
+    """Section -> key map for a config file, or None when it is unreadable.
+
+    TOML sections are dotted paths (``tool.mypy``); INI sections are their
+    literal header (``tool:pytest``). A bare ``""`` section means the file's
+    top level (``ruff.toml``).
+    """
+    path = workspace / filename
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if filename.endswith(".toml"):
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            return None
+        tables: dict[str, dict[str, object]] = {}
+
+        def walk(node: dict[str, object], prefix: str) -> None:
+            tables[prefix] = node
+            for key, value in node.items():
+                if isinstance(value, dict):
+                    walk(value, f"{prefix}.{key}" if prefix else key)
+
+        walk(data, "")
+        return tables
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return None
+    return {section: dict(parser[section]) for section in parser.sections()}
+
+
+def _configured_file_set(
+    workspace: Path, tool: ConfigScopedTool
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """``(config file, key, declared entries)`` for ``tool``, or None."""
+    for filename, section, keys in tool.sources:
+        tables = _config_tables(workspace, filename)
+        if tables is None:
+            continue
+        table = tables.get(section)
+        if not isinstance(table, dict):
+            continue
+        for key in keys:
+            if key in table:
+                return filename, key, _declared_entries(table[key])
+    return None
+
+
+def _declared_entries(value: object) -> tuple[str, ...]:
+    """The configured paths, from a TOML list or an INI whitespace/comma list."""
+    if isinstance(value, str):
+        raw: list[str] = re.split(r"[,\s]+", value)
+    elif isinstance(value, (list, tuple)):
+        raw = [item for item in value if isinstance(item, str)]
+    else:
+        return ()
+    return tuple(entry.strip() for entry in raw if entry.strip())
+
+
+def _normalise_path_arg(word: str) -> str:
+    """A path argument reduced to the file part: pytest node ids carry a
+    ``::test_name`` suffix, and a trailing slash is not a difference."""
+    return word.split("::", 1)[0].rstrip("/") or word
+
+
+def _is_inside(path: str, entry: str) -> bool:
+    """True when ``path`` cannot reach outside ``entry``.
+
+    A narrowing argument (``pytest tests/unit`` under ``testpaths =
+    ["tests"]``) selects a subset of what the config already selects, so it
+    can never drag in a file the project excludes — the failure mode this
+    rule exists for. Glob patterns are not resolved; an entry containing one
+    is treated as not containing anything, which keeps the rule's default
+    conservative.
+    """
+    if any(char in entry for char in ("*", "?", "[")):
+        return False
+    left = PurePosixPath(_normalise_path_arg(path).lstrip("./") or ".")
+    right = PurePosixPath(entry.rstrip("/").lstrip("./") or ".")
+    if right == PurePosixPath("."):
+        return True
+    return left == right or right in left.parents
+
+
+def _looks_like_path(word: str) -> bool:
+    if any(char in word for char in _GLOB_CHARS):
+        return True
+    if word in _PATHY_WORDS:
+        return True
+    return word.endswith((".py", ".pyi", ".toml", ".cfg", ".txt"))
+
+
+def _explicit_path_arguments(command: str, tool: ConfigScopedTool) -> list[str]:
+    """Positional path-ish arguments given to ``tool`` in ``command``."""
+    found: list[str] = []
+    for segment in _SEGMENT_SPLIT.split(command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        words = [word for word in words if not _ENV_ASSIGNMENT.match(word)]
+        index = _tool_index(words, tool.name)
+        if index is None:
+            continue
+        rest = words[index + 1 :]
+        i = 0
+        while i < len(rest):
+            word = rest[i]
+            if word.startswith("-"):
+                if "=" not in word and word in tool.value_flags:
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if word in tool.subcommands or word in tool.benign_args:
+                i += 1
+                continue
+            if _looks_like_path(word):
+                found.append(word)
+            i += 1
+    return found
+
+
+def _tool_index(words: Sequence[str], tool: str) -> int | None:
+    """Index of ``tool`` when it heads the segment, after any runner prefix."""
+    for start in range(len(words)):
+        word = words[start]
+        base = word.rsplit("/", 1)[-1]
+        if base == tool and (start == 0 or _is_runner_prefix(words[:start])):
+            return start
+    return None
+
+
+def _is_runner_prefix(words: Sequence[str]) -> bool:
+    for prefix in _RUNNER_PREFIXES:
+        if len(words) >= len(prefix) and tuple(words[-len(prefix) :]) == prefix:
+            return True
+    return False
+
+
+def config_override_problems(command: str, workspace: Path | None) -> list[str]:
+    """Violations where a path argument overrides a tool's configured files.
+
+    ``workspace`` defaults to the current directory: the lint runs from the
+    run's workspace root, and a missing root should not silently switch the
+    rule off.
+    """
+    root = Path.cwd() if workspace is None else workspace
+    problems: list[str] = []
+    for tool in CONFIG_SCOPED_TOOLS.values():
+        paths = _explicit_path_arguments(command, tool)
+        if not paths:
+            continue
+        declared = _configured_file_set(root, tool)
+        if declared is None:
+            continue
+        filename, key, entries = declared
+        # A path already inside the configured set only narrows the run: it
+        # cannot pull in a file the project excludes, which is the whole
+        # failure this rule guards. `uv run pytest tests/unit` and `uv run
+        # mypy packages/sbxloop/src/...` are the ordinary faster-signal
+        # invocations and must stay legal; `uv run mypy packages` (a parent
+        # of the configured `packages/*/src`) still fires.
+        outside = [path for path in paths if not any(_is_inside(path, entry) for entry in entries)]
+        if not outside:
+            continue
+        bare = _bare_form(command, tool.name)
+        shown = ", ".join(f"`{path}`" for path in outside)
+        configured = ", ".join(f"`{entry}`" for entry in entries) or f"`{key}`"
+        problems.append(
+            f"verify command `{command}` passes explicit path(s) {shown} to "
+            f"`{tool.name}` — this project configures {tool.name}'s file set in "
+            f"`{filename}` (`{key}` = {configured}), an explicit path argument "
+            f"OVERRIDES it, and {shown} is not inside the configured set, so the "
+            f"command checks files the project deliberately excludes and can "
+            f"fail on work that is correct. Drop the path and use the bare form: "
+            f"`{bare}` (a path *inside* the configured set is fine — it only "
+            f"narrows the run)"
+        )
+    return problems
+
+
+def _bare_form(command: str, tool: str) -> str:
+    """The command's own invocation of ``tool`` with its path arguments gone."""
+    for segment in _SEGMENT_SPLIT.split(command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        index = _tool_index(words, tool)
+        if index is not None:
+            return " ".join(words[: index + 1])
+    return tool
+
+
 def lint_verify_commands(
     commands: Sequence[str],
     languages: Sequence[str],
     *,
     uv_project: bool = False,
     gate: str | None = None,
+    workspace: Path | None = None,
 ) -> list[str]:
     """Violation messages for ``commands`` under the run's toolchains.
 
@@ -484,7 +811,9 @@ def lint_verify_commands(
     ``uv.lock``, which swaps the Python convention from ``.venv/bin/...``
     to ``uv run`` (see the module docstring). ``gate`` is the project's own
     full check (see :func:`project_gate`); when the project declares one,
-    the verify commands must run it.
+    the verify commands must run it. ``workspace`` is the run's workspace
+    root, read for the tools' configured file sets; it defaults to the
+    current directory.
     """
     uv_python = uv_project and "python" in languages
     rules = [
@@ -500,6 +829,7 @@ def lint_verify_commands(
         command = unwrap_inert_shell(raw)
         for problem in bashisms(command):
             problems.append(f"verify command `{command}` {problem}")
+        problems.extend(config_override_problems(command, workspace))
         for head in command_heads(command):
             if head in MUTATING_COMMANDS:
                 problems.append(
@@ -525,11 +855,22 @@ def lint_verify_commands(
                         f"verify command `{command}` invokes bare `{head}` — {rule.remedy}"
                     )
                     break
-    if gate and not any(runs_gate(unwrap_inert_shell(command), gate) for command in commands):
-        problems.append(
-            f"none of the verify commands runs `{gate}`, this project's own gate — "
-            "the checks it bundles are what CI enforces on the pull request, so "
-            "work that skips it lands red. Add it as a verify command; keep the "
-            "narrower ones too if they give a faster signal."
-        )
+    problems.extend(gate_problems(commands, gate))
     return problems
+
+
+def gate_problems(commands: Sequence[str], gate: str | None) -> list[str]:
+    """The "no command runs the project gate" violation, if it applies.
+
+    Split out so a caller checking the gate across *all* tasks' commands can
+    do that without re-running the per-command rules (which would report
+    every other violation a second time).
+    """
+    if not gate or any(runs_gate(unwrap_inert_shell(command), gate) for command in commands):
+        return []
+    return [
+        f"none of the verify commands runs `{gate}`, this project's own gate — "
+        "the checks it bundles are what CI enforces on the pull request, so "
+        "work that skips it lands red. Add it as a verify command; keep the "
+        "narrower ones too if they give a faster signal."
+    ]

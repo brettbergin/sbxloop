@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from sbxloop.verifylint import (
     command_heads,
     gate_rule,
@@ -540,3 +542,150 @@ class TestGateRuleText:
 
     def test_no_gate_says_so_rather_than_demanding_one(self) -> None:
         assert "no single gate" in gate_rule(None)
+
+
+class TestConfigOverrideRule:
+    """Field failure rrhb28j7n (#387): `uv run mypy packages` overrode the
+    project's `[tool.mypy] files` and could never pass; the loop burned two
+    revisions and a replan re-running it."""
+
+    def _workspace(self, tmp_path: Path, pyproject: str) -> Path:
+        (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+        return tmp_path
+
+    def test_the_real_world_case_is_flagged(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.mypy]\nfiles = ["packages/sbxloop/src"]\n')
+        (problem,) = lint_verify_commands(
+            ["uv run mypy packages"], ["python"], uv_project=True, workspace=workspace
+        )
+        assert "uv run mypy packages" in problem
+        assert "OVERRIDES" in problem
+        assert "`uv run mypy`" in problem
+
+    def test_bare_mypy_is_accepted(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.mypy]\nfiles = ["src"]\n')
+        assert (
+            lint_verify_commands(["uv run mypy"], ["python"], uv_project=True, workspace=workspace)
+            == []
+        )
+
+    def test_flag_only_invocation_is_accepted(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.mypy]\nfiles = ["src"]\n')
+        assert (
+            lint_verify_commands(
+                ["uv run mypy --strict"], ["python"], uv_project=True, workspace=workspace
+            )
+            == []
+        )
+
+    def test_no_configured_file_set_means_no_rule(self, tmp_path: Path) -> None:
+        """A tool with no configured files is *supposed* to be given paths."""
+        workspace = self._workspace(tmp_path, "[tool.mypy]\nstrict = true\n")
+        assert (
+            lint_verify_commands(
+                ["uv run mypy packages"], ["python"], uv_project=True, workspace=workspace
+            )
+            == []
+        )
+
+    def test_no_config_file_at_all_means_no_rule(self, tmp_path: Path) -> None:
+        assert (
+            lint_verify_commands(
+                ["uv run mypy packages"], ["python"], uv_project=True, workspace=tmp_path
+            )
+            == []
+        )
+
+    def test_ruff_src_is_covered(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.ruff]\nsrc = ["src"]\n')
+        (problem,) = lint_verify_commands(
+            ["uv run ruff check packages"], ["python"], uv_project=True, workspace=workspace
+        )
+        assert "ruff" in problem and "`uv run ruff`" in problem
+        assert (
+            lint_verify_commands(
+                ["uv run ruff check"], ["python"], uv_project=True, workspace=workspace
+            )
+            == []
+        )
+
+    def test_ruff_include_is_covered(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.ruff]\ninclude = ["*.py"]\n')
+        assert lint_verify_commands(
+            ["uv run ruff check src/"], ["python"], uv_project=True, workspace=workspace
+        )
+
+    def test_pytest_testpaths_is_covered(self, tmp_path: Path) -> None:
+        """Only a path OUTSIDE testpaths overrides it."""
+        workspace = self._workspace(tmp_path, '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        (problem,) = lint_verify_commands(
+            ["uv run pytest packages"], ["python"], uv_project=True, workspace=workspace
+        )
+        assert "testpaths" in problem
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "uv run pytest -q tests/unit",
+            "uv run pytest tests/unit/test_verifylint.py",
+            "uv run pytest -q tests/unit/test_x.py::test_y",
+            "uv run pytest tests/",
+        ],
+    )
+    def test_narrowing_inside_testpaths_is_allowed(self, tmp_path: Path, command: str) -> None:
+        """`testpaths` is only the default search root when no args are
+        given; a path argument narrows and can never pull in a file the
+        project excludes, so the rule's rationale does not apply. Flagging
+        these forced every task to run the whole suite."""
+        workspace = self._workspace(tmp_path, '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        assert (
+            lint_verify_commands([command], ["python"], uv_project=True, workspace=workspace) == []
+        )
+
+    def test_mypy_path_inside_files_is_allowed(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.mypy]\nfiles = ["packages/sbxloop/src"]\n')
+        assert (
+            lint_verify_commands(
+                ["uv run mypy packages/sbxloop/src/sbxloop/verifylint.py"],
+                ["python"],
+                uv_project=True,
+                workspace=workspace,
+            )
+            == []
+        )
+
+    def test_pytest_flags_are_not_paths(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        assert (
+            lint_verify_commands(
+                ["uv run pytest -q -k 'verifylint or lint'"],
+                ["python"],
+                uv_project=True,
+                workspace=workspace,
+            )
+            == []
+        )
+
+    def test_setup_cfg_declaration_counts(self, tmp_path: Path) -> None:
+        (tmp_path / "setup.cfg").write_text("[mypy]\nfiles = src\n", encoding="utf-8")
+        assert lint_verify_commands(["mypy packages"], [], workspace=tmp_path)
+        # `src` *is* the configured set, so naming it is not an override.
+        assert lint_verify_commands(["mypy src"], [], workspace=tmp_path) == []
+
+    def test_tox_ini_pytest_section_counts(self, tmp_path: Path) -> None:
+        (tmp_path / "tox.ini").write_text("[pytest]\ntestpaths = tests\n", encoding="utf-8")
+        assert lint_verify_commands([".venv/bin/pytest packages"], [], workspace=tmp_path)
+
+    def test_venv_and_poetry_prefixes_are_recognised(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.mypy]\nfiles = ["src"]\n')
+        assert lint_verify_commands(["poetry run mypy packages"], [], workspace=workspace)
+        assert lint_verify_commands([".venv/bin/mypy packages"], [], workspace=workspace)
+
+    def test_module_flag_argument_is_not_a_path(self, tmp_path: Path) -> None:
+        workspace = self._workspace(tmp_path, '[tool.mypy]\nfiles = ["src"]\n')
+        assert lint_verify_commands(["uv run mypy -p sbxloop"], [], workspace=workspace) == []
+
+    def test_workspace_defaults_to_cwd(self, tmp_path: Path, monkeypatch) -> None:
+        self._workspace(tmp_path, '[tool.mypy]\nfiles = ["src"]\n')
+        monkeypatch.chdir(tmp_path)
+        assert lint_verify_commands(["uv run mypy packages"], [])

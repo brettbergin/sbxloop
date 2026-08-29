@@ -23,7 +23,10 @@ from policy.py, never hardcoded (test_registry_tiers_are_injected_not_hardcoded)
 Section rules:
 - "workspace root", "cannot edit" and the sh-c portability rules must stay —
   the builder cannot fix a wrong exam, so authoring time is the only
-  mitigation (test_decompose_carries_verify_authoring_rules).
+  mitigation (test_decompose_carries_verify_authoring_rules). The
+  config-override warning (explicit paths overriding a tool's configured
+  file set, with the `uv run mypy packages` case) must stay too
+  (test_decompose_warns_against_config_overriding_verify_paths).
 -->
 
 # Decompose an outcome into a task graph
@@ -85,6 +88,20 @@ $outcome
   able to fail work that is done. Check the local files or run the local
   tests instead.
   $project_gate
+- Never pass explicit paths to a config-driven tool whose file set is already
+  pinned in the project's configuration (mypy `files`, ruff `include`/`src`,
+  pytest `testpaths` in `pyproject.toml`, `setup.cfg`, `mypy.ini` or
+  equivalent). An explicit path argument **overrides the configured file
+  set** and drags in modules the project deliberately excludes — build hooks,
+  generated code, vendored trees — whose dependencies are not installed, so
+  the command fails for reasons no revision can fix. Field case: the Makefile
+  gate runs `uv run mypy` and reports success, while the verify command
+  `uv run mypy packages` overrode `files` and pulled in
+  `packages/sbxloop/hatch_build.py`, which imports the build-time-only
+  `hatchling` — the same check, impossible to pass, three times over. Write
+  the bare form (`uv run mypy`, `uv run ruff check`, `uv run pytest -q`) and
+  let the configuration choose the files; name a path only when the tool has
+  no configured file set, or when the task is genuinely about that one path.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
 

@@ -78,7 +78,14 @@ from sbxloop.engine.model import (
     TaskState,
     scan_artifacts,
 )
-from sbxloop.engine.phases import VERIFY_FAILURE_PREFIX, PhaseRunner, clip, clip_head_tail
+from sbxloop.engine.phases import (
+    VERIFY_FAILURE_PREFIX,
+    PhaseRunner,
+    VerifyFailure,
+    clip,
+    clip_head_tail,
+    verify_suspect_feedback,
+)
 from sbxloop.engine.review import (
     ReviewFinding,
     ReviewRound,
@@ -760,7 +767,7 @@ class LoopEngine:
         if stage not in PIPELINE_STAGES:
             failed = self._run_phases(p)
             if failed:
-                return "failed", "a task failed or was skipped"
+                return "failed", self._failure_reason(p.run_id)
             stage = "gating"
         # Every fix round returns to the gate: it is one cheap shell batch
         # and the guarantee that a red tree is never delivered, whatever the
@@ -827,6 +834,30 @@ class LoopEngine:
                 stage = "gating"
             else:  # pragma: no cover - defensive
                 raise StateError(f"run {p.run_id} in unexpected stage {stage!r}")
+
+    def _failure_reason(self, run_id: str) -> str:
+        """Why the task graph stopped, naming a suspect check when there is one.
+
+        A verify command that failed identically every attempt is not the
+        same failure as work that could not be done, and #387 is precisely
+        about that difference reaching a human instead of being spent as
+        another silent retry. The builder cannot re-author the command, so
+        the run outcome is where the diagnosis has to surface.
+        """
+        suspects = [
+            t
+            for t in self.store.get_tasks(run_id)
+            if t.state == "failed" and t.verify_suspect and t.spec.verify_commands
+        ]
+        if suspects:
+            task = suspects[0]
+            commands = ", ".join(f"`{c}`" for c in task.spec.verify_commands)
+            return (
+                f"task {task.spec.id} failed a verify command that never changed "
+                f"its result across attempts — the check looks unpassable and "
+                f"needs re-authoring: {commands}"
+            )
+        return "a task failed or was skipped"
 
     def _run_phases(self, p: Pipeline) -> bool:
         """DECOMPOSE (unless seeded or resumed) and the task graph; True when
@@ -1634,7 +1665,8 @@ class LoopEngine:
         task: TaskRecord,
     ) -> None:
         started = time.time()
-        passed, feedback, results = phases.verify(task)
+        outcome = phases.verify(task)
+        passed, feedback, results = outcome.passed, outcome.feedback, outcome.results
         # `results` (the full command transcript) is persisted so a resumed
         # run reads the evidence from phase_attempts rather than in-memory
         # state (#61).
@@ -1667,7 +1699,82 @@ class LoopEngine:
                 first_line if failure_count <= 1 else f"{first_line} (+{failure_count - 1} more)"
             ),
         )
+        repeated = self._record_verify_failures(task, outcome.failures)
+        if repeated and task.verify_suspect:
+            # Already flagged: keep the suspect wording (never fall back to
+            # plain "revise the code" feedback for a check we know repeats)
+            # but do not spend another replan on the same diagnosis.
+            # `verify_failure` stays False deliberately: its exhaustion path
+            # spends a replan AND overwrites last_feedback with the generic
+            # "start over with a fresh approach" text, which would undo the
+            # very wording this branch exists to preserve.
+            self._register_revision(run_id, task, verify_suspect_feedback(repeated))
+            return
+        if repeated:
+            # Mechanical verify-suspect signal (#387): the same command has
+            # now failed with the same (normalised) output on a later
+            # attempt, so another revision of the code cannot change the
+            # result. Route straight to a replan that says the check is
+            # what needs re-authoring — no model call is needed to see it.
+            task.verify_suspect = True
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="verify",
+                status="failed",
+                message=(
+                    f"verify command suspect: `{repeated[0].command}` failed identically again"
+                ),
+            )
+            self._register_verify_suspect(run_id, task, repeated)
+            return
         self._register_revision(run_id, task, feedback, verify_failure=True)
+
+    @staticmethod
+    def _record_verify_failures(
+        task: TaskRecord, failures: Sequence[VerifyFailure]
+    ) -> list[VerifyFailure]:
+        """Fingerprint this attempt's verify failures against everything the
+        task has seen before; return the ones that are exact repeats."""
+        seen = set(task.verify_fingerprints)
+        repeated: list[VerifyFailure] = []
+        for failure in failures:
+            fingerprint = failure.fingerprint
+            if fingerprint in seen:
+                repeated.append(failure)
+            else:
+                seen.add(fingerprint)
+                task.verify_fingerprints.append(fingerprint)
+        return repeated
+
+    def _register_verify_suspect(
+        self, run_id: str, task: TaskRecord, repeated: Sequence[VerifyFailure]
+    ) -> None:
+        """Spend one fresh-session attempt on the only thing the loop can do.
+
+        The verify commands are decomposer-authored and the builder is told
+        it cannot edit them, so this does NOT order a re-author (the review
+        of #509 was right that nothing in the loop re-runs decompose). What
+        it does is give the one remaining lever a fresh session: an approach
+        whose layout and setup satisfy the command exactly as written. The
+        feedback also tells the builder to report the command as unpassable
+        if it cannot be satisfied, and ``verify_suspect`` is carried into the
+        run's failure reason (``_failure_reason``) so the diagnosis reaches a
+        human rather than dying in the task row.
+
+        Deliberately does NOT increment ``revisions``: the whole point of
+        the signal is that identical revisions are wasted (field run
+        rrhb28j7n burned two revisions and a replan on one impossible
+        ``uv run mypy packages``).
+        """
+        task.last_feedback = verify_suspect_feedback(list(repeated))
+        if task.replans >= self.config.budgets.max_replans_per_task:
+            self._set_task_state(run_id, task, "failed")
+            return
+        task.replans += 1
+        self._discard_session(task)
+        self._set_task_state(run_id, task, "executing")
 
     @staticmethod
     def _discard_session(task: TaskRecord) -> None:

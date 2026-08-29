@@ -53,6 +53,20 @@ def test_decompose_carries_verify_authoring_rules() -> None:
     assert "test runner over shell pipelines" in text
 
 
+def test_decompose_warns_against_config_overriding_verify_paths() -> None:
+    """#387: `uv run mypy packages` overrides the `files` pinned in
+    pyproject.toml, drags in the hatchling build hook and can never pass,
+    while the bare `uv run mypy` the gate runs is clean. The decomposer
+    writes the verify commands, so the warning belongs in its prompt."""
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
+    assert "uv run mypy packages" in text
+    assert "`uv run mypy`" in text
+    assert "overrides the configured file" in text
+    for pinned in ("mypy `files`", "ruff `include`", "pytest `testpaths`"):
+        assert pinned in text, pinned
+    assert "hatchling" in text
+
+
 def test_build_carries_environment_notes() -> None:
     """Field regression: the agent burned its whole revision budget on
     `python3 -m venv` failing (missing ensurepip) and bare pip hitting
@@ -207,6 +221,21 @@ def test_review_prompt_carries_contract() -> None:
     assert "ONLY the fenced JSON block" in text
     for word in ("approve", "request_changes", "blocking", "major", "minor", "nit"):
         assert f"`{word}`" in text or f'"{word}"' in text, word
+
+
+def test_review_prompt_describes_the_wrong_check_shape() -> None:
+    """#387: the scrutinizer passed the work 6/6 and never said the check
+    itself was impossible, so the run burnt its whole revision and replan
+    budget. The prompt now carries the config-override worked example."""
+    text = render("review", **RENDER_CONTEXTS["review"])
+    assert "When the work is right and the check is wrong" in text
+    assert "config-override" in text
+    assert "uv run mypy packages" in text
+    assert "`uv run mypy`" in text
+    assert "[tool.mypy]" in text and 'files = ["packages/sbxloop/src"' in text
+    assert "hatchling" in text
+    assert "testpaths" in text
+    assert "name the misconfigured command and its remedy in the summary" in text
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:
