@@ -22,7 +22,7 @@ from sbxloop.engine.model import (
     TaskSpec,
 )
 from sbxloop.errors import StateError
-from sbxloop_worker.protocol import Event, Usage
+from sbxloop_worker.protocol import Event, EventTypes, Usage
 
 # Per-run counters the pipeline spends; the only columns `bump_run_counter`
 # may touch, so a caller cannot increment an arbitrary column by name.
@@ -32,6 +32,16 @@ RUN_COUNTERS: frozenset[str] = frozenset({"review_rounds", "ci_rounds", "update_
 # pre-1.0 state database still lists and resumes: both were "the task graph
 # is being worked", which `building` now names.
 _LEGACY_RUN_STATES: dict[str, RunState] = {"running": "building", "finalizing": "building"}
+
+# Event types that live on the bus only. Streaming deltas are pure UI
+# telemetry -- the full `agent.message` carries the same text, and resume
+# never reads deltas -- so persisting one row per chunk is pure overhead.
+EPHEMERAL_EVENT_TYPES: frozenset[str] = frozenset({EventTypes.AGENT_MESSAGE_DELTA})
+
+
+def _is_ephemeral(event: Event) -> bool:
+    return event.type in EPHEMERAL_EVENT_TYPES
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -157,6 +167,9 @@ class StateStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # WAL + NORMAL: commits no longer fsync per insert, and a crash can
+        # only lose the tail of the WAL (not corrupt the database).
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         for table, migrations in _MIGRATIONS.items():
             existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
@@ -577,6 +590,8 @@ class StateStore:
         return row["ts"] if row and row["ts"] is not None else None
 
     def append_event(self, event: Event) -> None:
+        if _is_ephemeral(event):
+            return
         with self._lock:
             self._conn.execute(
                 "INSERT INTO events (run_id, ts, type, job_id, data_json) VALUES (?, ?, ?, ?, ?)",
@@ -595,6 +610,8 @@ class StateStore:
         the state check and the marker are one atomic step against every
         other writer on the same state DB. Returns whether it was appended.
         """
+        if _is_ephemeral(event):
+            return False
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
