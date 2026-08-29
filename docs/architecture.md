@@ -189,12 +189,14 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   refuses the loop's identity as a reviewer of its own PR).
 - **FIX** — one seeded task (`fix-N`), built and verified like any other
   under the same revision/replan budgets, whose exam is the union of the
-  decomposer's verify commands plus the gate. Then back to GATE. A
-  `conflict` round first merges the current base into the run's clone
-  (`hostgit.merge_from_base`), so the conflict is real in the fixer's
-  working tree — delivery overlays files onto the current base tree and
-  would otherwise overwrite the conflicting hunks with the run's version —
-  and the conflicted paths ride in the brief. Every
+  decomposer's verify commands plus the gate. Then back to GATE. Every
+  round first merges the current base into the run's clone
+  (`hostgit.merge_from_base`): CI judges GitHub's test merge of the branch
+  with its base, so a red check may exist only there, and a real conflict
+  becomes markers in the fixer's working tree — delivery overlays files
+  onto the current base tree and would otherwise overwrite the
+  conflicting hunks with the run's version; the conflicted paths ride in
+  the brief. Every
   round sees the earlier rounds' findings and the fixer's per-finding
   `addressed` / `refuted: <why>` list, and the next review is told not to
   re-raise a refuted finding without a rebuttal (`RefutedGuard` sends such

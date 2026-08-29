@@ -103,6 +103,7 @@ class FakeGithub(GithubOps):
         self.blob_batches: list[list[dict[str, str]]] = []
         self.branches: set[str] = set()
         self.pr_created = False
+        self.pr_create_calls = 0
         self._commits = 0
         self._blobs = 0
         self._updates = 0
@@ -167,12 +168,14 @@ class FakeGithub(GithubOps):
             "body": body,
             "draft": draft,
         }
+        self.pr_create_calls += 1
         self._maybe_fail("pr_create")
         if self.pr_created:
             raise GithubOpsError(
                 "github op pr.create failed: GithubOpError: gh api POST "
-                f"/repos/{repo}/pulls failed (rc=1): A pull request already exists for "
-                f"{repo.split('/', 1)[0]}:{head}. (HTTP 422)",
+                # The gh transport's field wording: no "already exists"
+                # prose, just the status (run r8tzse1qa).
+                f"/repos/{repo}/pulls failed (rc=1): gh: Validation Failed (HTTP 422)",
                 http_status=422,
             )
         self.pr_created = True

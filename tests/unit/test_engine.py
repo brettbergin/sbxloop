@@ -1297,6 +1297,9 @@ class TestPipeline:
         assert "`hello.txt:1` [major]" in fix.description
         assert fix.verify_commands == ["true"]
 
+        # Two deliveries, one pull request: the fix round refreshed the
+        # branch under PR #7 and never POSTed a second one (#387 field run).
+        assert fake.pr_create_calls == 1
         # The review verdict is ours; it is posted for the record.
         assert [event for event, _, _ in fake.reviews] == ["REQUEST_CHANGES", "APPROVE"]
         _, body, comments = fake.reviews[0]
