@@ -32,6 +32,7 @@ from urllib.parse import quote
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
 from sbxloop.gh.ops import GithubOps
+from sbxloop.ghids import issue_item_id
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -201,7 +202,7 @@ class GitHubIssueSource:
             seen.add(str(number))
             items.append(
                 WorkItem(
-                    item_id=f"gh:{number}",
+                    item_id=issue_item_id(int(number)),
                     source_key=str(number),
                     title=str(issue.get("title") or f"issue #{number}"),
                     body=str(issue.get("body") or ""),

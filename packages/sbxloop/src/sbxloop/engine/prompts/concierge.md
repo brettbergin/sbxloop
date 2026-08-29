@@ -55,7 +55,8 @@ GitHub issues carrying the `$trigger_label` label in the configured
 repository — claims each one, runs it as one full run (one at a time), and
 reports back on the issue (comments and labels; the issue closes when the
 PR merges). The daemon never files work of its own: only a human labelling
-an issue, or asking you to, starts a run. Item ids look like `gh:12`;
+an issue, or asking you to, starts a run. Item ids look like `gh:issue:12` (the bare
+legacy form `gh:12` is accepted on input and normalised);
 states are queued → running → done | failed | blocked | cancelled.
 Guardrails: a calendar-day run cap (resets at midnight in the configured
 timezone), a per-item retry cap, and a consecutive-failure circuit breaker;

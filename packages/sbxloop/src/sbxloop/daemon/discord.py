@@ -75,6 +75,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.errors import DaemonError
 from sbxloop.events import Event, EventBus, HostEventTypes
+from sbxloop.ghids import normalize_item_id
 from sbxloop.log import get_logger
 
 if TYPE_CHECKING:
@@ -1539,7 +1540,9 @@ class DiscordBridge:
             if headline is None:
                 return None
             if self.discord.thread_per_run:
-                thread = await headline.create_thread(name=_clip(f"{run_id} · {item.title}", 90))
+                thread = await headline.create_thread(
+                    name=_clip(f"{run_id} · {normalize_item_id(item.item_id)} · {item.title}", 90)
+                )
             else:
                 thread = channel
             self.dstore.record_discord_thread(
@@ -1548,7 +1551,7 @@ class DiscordBridge:
             log.info(
                 "discord.thread_created",
                 run=run_id,
-                item=item.item_id,
+                item=normalize_item_id(item.item_id),
                 thread=int(thread.id),
                 headline=int(headline.id),
             )

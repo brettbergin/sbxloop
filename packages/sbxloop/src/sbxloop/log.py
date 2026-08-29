@@ -48,6 +48,8 @@ from typing import Any, Literal, NamedTuple, TextIO
 
 import structlog
 
+from sbxloop.ghids import normalize_item_id
+
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 LogFormat = Literal["console", "json"]
 
@@ -280,10 +282,16 @@ def drop_none_fields(
 def bind_run(run_id: str, item_id: str | None = None, **extra: Any) -> None:
     """Stamp ``run=`` (and ``item=``) on every record logged from this
     thread until :func:`clear_run`. Context vars do not cross
-    ``threading.Thread`` — call this *inside* the run thread."""
+    ``threading.Thread`` — call this *inside* the run thread.
+
+    ``item_id`` is normalised through :func:`sbxloop.ghids.normalize_item_id`,
+    so every log line carries the typed ``gh:issue:<n>`` / ``gh:pr:<n>``
+    form even when the caller still holds a legacy id."""
     fields: dict[str, Any] = {"run": run_id, **extra}
     if item_id is not None:
-        fields["item"] = item_id
+        # Canonicalise at the boundary: a legacy ``gh:<n>`` id read from an
+        # old checkpoint must not leak the ambiguous form into log lines.
+        fields["item"] = normalize_item_id(item_id)
     structlog.contextvars.bind_contextvars(**fields)
 
 

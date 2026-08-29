@@ -29,6 +29,7 @@ from sbxloop.daemon.discord_format import (
     format_for_discord,
     headline_embed,
     headline_text,
+    items_lines,
     mask_urls,
     output_excerpt,
     queue_lines,
@@ -620,12 +621,13 @@ class TestEmbeds:
         assert total <= EMBED_TOTAL_MAX
 
     def test_headline_card_by_state(self) -> None:
-        item = WorkItem(item_id="gh:4", source_key="4", title="Fix login", url="https://x/4")
+        item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login", url="https://x/4")
         running = headline_embed(item, "r1", hostname="db")
         assert running.title == "Fix login" and running.url == "https://x/4"
         assert running.color == COLOR_RUNNING and running.footer == "sbxloop · db"
         assert {n: v for n, v, _ in running.fields} == {
             "Source": "[issue #4](https://x/4)",
+            "Item": "`gh:issue:4`",
             "Run": "`r1`",
             "State": "running",
         }
@@ -640,16 +642,39 @@ class TestEmbeds:
             hostname="db",
         )
         names = [n for n, _, _ in done.fields]
-        assert names == ["Source", "Run", "State", "Branch", "PR", "Tasks", "Requested by"]
+        assert names == [
+            "Source",
+            "Item",
+            "Run",
+            "State",
+            "Branch",
+            "PR",
+            "Tasks",
+            "Requested by",
+        ]
         assert done.color == COLOR_OK
         assert {n: v for n, v, _ in done.fields}["Requested by"] == "<@4242>"
         assert headline_embed(item, "r1", "merged", hostname="db").color == COLOR_OK
         assert headline_embed(item, "r1", "failed", hostname="db").color == COLOR_FAIL
         assert headline_embed(item, "r1", "blocked", hostname="db").color == COLOR_WARN
         assert headline_text(item, "r2", "merged").startswith("🎉 run `r2` — **Fix login**")
+        assert "`gh:issue:4`" in headline_text(item, "r2", "merged")
+
+    def test_typed_ids_on_cards_and_listings(self) -> None:
+        """Legacy `gh:<n>` items still render, but always in the typed form."""
+        legacy = WorkItem(item_id="gh:4", source_key="4", title="Fix login", url="https://x/4")
+        card = headline_embed(legacy, "r1", hostname="db")
+        assert {n: v for n, v, _ in card.fields}["Item"] == "`gh:issue:4`"
+        assert "`gh:issue:4`" in headline_text(legacy, "r1")
+        assert "`gh:issue:4`" in queue_lines([legacy])
+        assert "`gh:issue:4`" in items_lines([legacy])
+        report = RunReport("r1", "cancelled", "1/3 tasks done", cancelled_by="ops")
+        cancelled = finish_embed(legacy, report, "cancelled")
+        note = {n: v for n, v, _ in cancelled.fields}["Cancelled"]
+        assert "!sbx retry gh:issue:4" in note
 
     def test_finish_card_and_text(self) -> None:
-        item = WorkItem(item_id="gh:4", source_key="4", title="Fix login")
+        item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login")
         report = RunReport("r1", "merged", "3/3 tasks done", pr=(34, "https://x/pull/34"), rounds=2)
         assert finish_text("merged", report) == "**finished: merged** — 3/3 tasks done"
         card = finish_embed(item, report, "merged", unanswered=1)
@@ -669,7 +694,7 @@ class TestEmbeds:
     def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
         """#246: a cancel is not a failure; the card must name the requester
         and tell the human the run is resumable (or already re-queued)."""
-        item = WorkItem(item_id="gh:8", source_key="8", title="Demo")
+        item = WorkItem(item_id="gh:issue:8", source_key="8", title="Demo")
         report = RunReport("r1", "cancelled", "1/3 tasks done", cancelled_by="Discord user `b`")
         text = finish_text("cancelled", report)
         assert "cancelled by Discord user `b`" in text and "`sbxloop resume r1`" in text
@@ -677,7 +702,7 @@ class TestEmbeds:
         assert card.title == "⏹ finished: cancelled"
         assert card.fields[0][0] == "Cancelled"
         assert "`sbxloop resume r1`" in card.fields[0][1]
-        assert "!sbx retry gh:8" in card.fields[0][1]
+        assert "!sbx retry gh:issue:8" in card.fields[0][1]
         requeued = finish_embed(item, report._replace(requeued=True), "cancelled")
         assert "re-queued" in requeued.fields[0][1] and "resume" not in requeued.fields[0][1]
 
@@ -711,11 +736,11 @@ class TestEmbeds:
                 title=f"T{i}",
                 url=f"https://x/{i}",
             )
-            for i in range(3)
+            for i in range(1, 4)
         ]
         assert (
             queue_lines(items, limit=2)
-            == "• `gh:0` [T0](https://x/0)\n• `gh:1` [T1](https://x/1)\n… and 1 more"
+            == "• `gh:issue:1` [T1](https://x/1)\n• `gh:issue:2` [T2](https://x/2)\n… and 1 more"
         )
 
     def test_daemon_notice_masks_urls(self) -> None:
@@ -724,17 +749,18 @@ class TestEmbeds:
             mask_urls("already <https://x> and [t](https://y)")
             == "already <https://x> and [t](https://y)"
         )
-        assert daemon_notice("✅ gh:8 done · PR https://x/pull/9", thread_id=77) == (
-            "✅ gh:8 done · PR <https://x/pull/9> · <#77>"
+        assert daemon_notice("✅ gh:issue:8 done · PR https://x/pull/9", thread_id=77) == (
+            "✅ gh:issue:8 done · PR <https://x/pull/9> · <#77>"
         )
-        notice = DaemonNotice("run.done", "🎉 gh:8 merged · PR https://x/pull/9", run_id="r1")
+        notice = DaemonNotice("run.done", "🎉 gh:issue:8 merged · PR https://x/pull/9", run_id="r1")
         assert (
-            daemon_notice(notice, thread_id=77) == "🎉 gh:8 merged · PR <https://x/pull/9> · <#77>"
+            daemon_notice(notice, thread_id=77)
+            == "🎉 gh:issue:8 merged · PR <https://x/pull/9> · <#77>"
         )
-        warn = DaemonNotice("run.failed", "gh:8 failed", level="warning")
-        assert daemon_notice(warn) == "⚠ gh:8 failed"
-        error = DaemonNotice("run.blocked", "🚧 gh:8 blocked", level="error")
-        assert daemon_notice(error) == "🛑 🚧 gh:8 blocked"
+        warn = DaemonNotice("run.failed", "gh:issue:8 failed", level="warning")
+        assert daemon_notice(warn) == "⚠ gh:issue:8 failed"
+        error = DaemonNotice("run.blocked", "🚧 gh:issue:8 blocked", level="error")
+        assert daemon_notice(error) == "🛑 🚧 gh:issue:8 blocked"
 
     def test_pipeline_events_render_one_line_each(self) -> None:
         assert texts(format_for_discord(ev("run.state", state="reviewing"))) == ["🔍 **reviewing**"]

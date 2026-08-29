@@ -123,7 +123,7 @@ class TestGitHubSource:
         ops = RecordingOps({"4": issue(4, "sbxloop:run"), "5": issue(5, "sbxloop:failed")})
         items = self.make(ops).poll()
         assert ops.searches == ['repo:o/r is:issue is:open label:"sbxloop:run"']
-        assert [i.item_id for i in items] == ["gh:4"]
+        assert [i.item_id for i in items] == ["gh:issue:4"]
         assert items[0].url == "https://x/issues/4" and items[0].body == "please do it"
         assert items[0].requested_by is None
 
@@ -358,7 +358,7 @@ class TestGitHubSource:
             {"labels": ["sbxloop:blocked"]},
         ) in ops.raw_calls
         body = ops.comments[-1][1]
-        assert "protection rule" in body and "pull/9" in body and "!sbx retry gh:4" in body
+        assert "protection rule" in body and "pull/9" in body and "!sbx retry gh:issue:4" in body
 
     def test_report_blocked_failure_returns_false(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
@@ -400,7 +400,7 @@ class TestGitHubSource:
         assert not any(m == "POST" for m, _, _ in ops.raw_calls)  # no failed label
         body = ops.comments[-1][1]
         assert "cancelled by Discord user `b`" in body
-        assert "`sbxloop resume r1`" in body and "!sbx retry gh:4" in body
+        assert "`sbxloop resume r1`" in body and "!sbx retry gh:issue:4" in body
 
     def test_cancelled_with_requeue_keeps_in_progress(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
@@ -478,7 +478,7 @@ class TestGitHubSourceLogging:
         polled = [m for m in messages if "'event': 'github.polled'" in m]
         assert polled and "'issues': 1" in polled[0]
         (claimed,) = [m for m in messages if "'event': 'github.claimed'" in m]
-        assert "'item': 'gh:4'" in claimed and "'duration_s'" in claimed
+        assert "'item': 'gh:issue:4'" in claimed and "'duration_s'" in claimed
 
     def test_claim_declined_when_trigger_gone_is_logged(
         self, caplog: pytest.LogCaptureFixture
@@ -495,7 +495,7 @@ class TestGitHubSourceLogging:
             for r in caplog.records
             if "'event': 'github.claim_declined'" in r.getMessage()
         ]
-        assert "'item': 'gh:4'" in declined and "trigger label gone" in declined
+        assert "'item': 'gh:issue:4'" in declined and "trigger label gone" in declined
 
 
 class TestDaemonGithubInstance:
@@ -597,3 +597,14 @@ class TestDaemonGithubProvisioning:
         gh_.provisioner = Boom()  # type: ignore[assignment]
         with pytest.raises(DaemonError, match="GH_TOKEN"):
             gh_.ops()
+
+
+class TestTypedItemIds:
+    """Freshly discovered issues are minted with the typed id grammar."""
+
+    def test_polled_items_carry_typed_ids(self) -> None:
+        ops = RecordingOps({"12": issue(12, "sbxloop:run")})
+        source = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        items = source.poll()
+        assert [i.item_id for i in items] == ["gh:issue:12"]
+        assert [i.source_key for i in items] == ["12"]

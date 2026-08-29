@@ -49,9 +49,9 @@ def test_an_issue_runs_through_the_real_engine(harness: Harness, tmp_path: Path)
     )
     result = loop.tick()
 
-    assert result.dispatched == "gh:7"
+    assert result.dispatched == "gh:issue:7"
     assert result.outcome == "done", result
-    item = dstore.get("gh:7")
+    item = dstore.get("gh:issue:7")
     assert item is not None and item.state == "done" and item.run_id is not None
     # the run exists in the shared engine store, completed, with the
     # daemon-built outcome text carrying the provenance trailer

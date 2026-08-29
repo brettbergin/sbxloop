@@ -89,8 +89,8 @@ def _daemon(
 def test_an_issue_becomes_a_merged_pr_and_a_closed_issue(tmp_path: Path) -> None:
     loop, source, front, dstore, store = _daemon(tmp_path, "merged")
     result = loop.tick()
-    assert result.dispatched == "gh:12" and result.outcome == "done"
-    item = dstore.get("gh:12")
+    assert result.dispatched == "gh:issue:12" and result.outcome == "done"
+    item = dstore.get("gh:issue:12")
     assert item is not None and item.state == "done" and item.pending_report is None
     assert item.requested_by == "4242"
     # The source heard: claim, start, merge — and nothing was filed.
@@ -104,7 +104,7 @@ def test_an_issue_becomes_a_merged_pr_and_a_closed_issue(tmp_path: Path) -> None
     kinds = [n.kind for n in front.notices]
     assert kinds == ["item.queued", "run.done"]
     done = front.notices[-1]
-    assert done.run_id == item.run_id and done.url == PR_URL and done.item_id == "gh:12"
+    assert done.run_id == item.run_id and done.url == PR_URL and done.item_id == "gh:issue:12"
     # Ledger closed as done; the engine row ended merged with the PR on it.
     assert store.get_run(item.run_id or "").state == "merged"  # type: ignore[arg-type]
     assert store.get_run(item.run_id or "").pr_number == 9  # type: ignore[arg-type]
@@ -114,7 +114,7 @@ def test_an_issue_becomes_a_merged_pr_and_a_closed_issue(tmp_path: Path) -> None
 def test_a_blocked_run_hands_the_pr_to_a_human(tmp_path: Path) -> None:
     loop, source, front, dstore, _ = _daemon(tmp_path, "blocked")
     assert loop.tick().outcome == "blocked"
-    item = dstore.get("gh:12")
+    item = dstore.get("gh:issue:12")
     assert item is not None and item.state == "blocked"
     assert item.last_error == "its draft status could not be cleared"
     assert source.calls[-1] == (

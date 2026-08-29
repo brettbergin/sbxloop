@@ -174,8 +174,8 @@ class TestTick:
         h = Harness(tmp_path)
         h.source.items = [gh_item()]
         result = h.loop.tick()
-        assert result.dispatched == "gh:1" and result.outcome == "done"
-        item = h.dstore.get("gh:1")
+        assert result.dispatched == "gh:issue:1" and result.outcome == "done"
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "done" and item.pending_report is None
         kinds = [c[0] for c in h.source.calls]
         assert kinds == ["claim", "started", "merged"]
@@ -193,7 +193,7 @@ class TestTick:
         assert h.loop.tick().outcome == "done"
         second = h.loop.tick()
         assert second.idle_reason == "daily_cap" and second.dispatched is None
-        assert h.dstore.get("gh:2").state == "queued"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:2").state == "queued"  # type: ignore[union-attr]
         # the calendar day rolls (local midnight passes) → dispatch resumes
         h.clock.t = day_window(h.clock.t, cfg.daemon.run_cap_timezone)[1]
         assert h.loop.tick().outcome == "done"
@@ -209,17 +209,17 @@ class TestTick:
         h.source.items = [gh_item()]
         h.outcomes = ["raise", "failed"]
         assert h.loop.tick().outcome == "retry"
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "queued"  # type: ignore[union-attr]
         assert ("retry", 1) in h.source.calls
         # backoff not elapsed → no dispatch, and the idle reason says so
         reason = h.loop.tick().idle_reason
         assert reason is not None and reason.startswith("backoff (1 queued")
         h.clock.t += 11
         assert h.loop.tick().outcome == "failed"
-        assert h.dstore.get("gh:1").state == "failed"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "failed"  # type: ignore[union-attr]
         assert any(c[0] == "abandoned" for c in h.source.calls)
         # claim happened once: retries reuse the claimed item
-        assert [c for c in h.source.calls if c[0] == "claim"] == [("claim", "gh:1")]
+        assert [c for c in h.source.calls if c[0] == "claim"] == [("claim", "gh:issue:1")]
 
     def test_claim_failure_drops_the_item_without_running(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
@@ -227,7 +227,7 @@ class TestTick:
         h.source.claim_ok = False
         assert h.loop.tick().outcome == "failed"
         assert h.runs == []
-        assert h.dstore.get("gh:1").state == "failed"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "failed"  # type: ignore[union-attr]
 
     def test_an_engine_failure_at_delivery_is_a_failed_attempt(self, tmp_path: Path) -> None:
         """Delivery is a stage of the run now: an error there propagates
@@ -237,7 +237,7 @@ class TestTick:
         h.source.items = [gh_item()]
         h.outcomes = ["raise"]
         assert h.loop.tick().outcome == "retry"
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "queued"  # type: ignore[union-attr]
         assert any(c[0] == "retry" for c in h.source.calls)
 
     def test_circuit_breaker_opens_cools_and_resets(self, tmp_path: Path) -> None:
@@ -286,7 +286,7 @@ class TestSettle:
         assert h.loop._consecutive_failures == 0
         done = [n for n in front.notices if n.kind == "run.done"]
         assert len(done) == 1 and done[0].url == PR_URL and done[0].run_id == h.runs[0][0]
-        assert "🎉 gh:1 merged" in done[0].text
+        assert "🎉 gh:issue:1 merged" in done[0].text
         (_, report) = front.finished[0]
         assert report.state == "merged" and report.pr == (9, PR_URL) and report.succeeded
 
@@ -297,7 +297,7 @@ class TestSettle:
         front = RecordingFrontend()
         h.loop.frontend = front  # type: ignore[assignment]
         assert h.loop.tick().outcome == "blocked"
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "blocked" and item.pending_report is None
         assert item.last_error is not None and "protection rule" in item.last_error
         assert h.loop._consecutive_failures == 0
@@ -311,7 +311,7 @@ class TestSettle:
         h.clock.t += 100_000
         assert h.loop.tick().idle_reason == "no_work"
         # ...but a human can retry it.
-        h.loop.retry_item("gh:1", "op")
+        h.loop.retry_item("gh:issue:1", "op")
         assert h.loop.tick().outcome == "done"
 
     def test_a_failed_close_stays_owed_and_is_retried_next_tick(self, tmp_path: Path) -> None:
@@ -321,14 +321,14 @@ class TestSettle:
         h.source.items = [gh_item()]
         h.source.merged_ok = False
         assert h.loop.tick().outcome == "done"
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "done" and item.pending_report == "merged"
         assert [c[0] for c in h.source.calls].count("merged") == 1
         h.source.merged_ok = True
         h.loop.pause()  # the sweep runs before every gate
         assert h.loop.tick().idle_reason == "paused"
         assert [c[0] for c in h.source.calls].count("merged") == 2
-        assert h.dstore.get("gh:1").pending_report is None  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").pending_report is None  # type: ignore[union-attr]
         h.loop.unpause()
         h.loop.tick()
         assert [c[0] for c in h.source.calls].count("merged") == 2  # paid exactly once
@@ -339,10 +339,10 @@ class TestSettle:
         h.outcomes = ["blocked"]
         h.source.blocked_ok = False
         assert h.loop.tick().outcome == "blocked"
-        assert h.dstore.get("gh:1").pending_report == "blocked"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").pending_report == "blocked"  # type: ignore[union-attr]
         h.source.blocked_ok = True
         h.loop.tick()
-        assert h.dstore.get("gh:1").pending_report is None  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").pending_report is None  # type: ignore[union-attr]
         assert [c[0] for c in h.source.calls].count("blocked") == 2
 
     def test_completed_with_a_repository_is_blocked_not_done(self, tmp_path: Path) -> None:
@@ -352,7 +352,7 @@ class TestSettle:
         h.source.items = [gh_item()]
         h.outcomes = ["completed"]
         assert h.loop.tick().outcome == "blocked"
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "blocked"
         assert item.last_error == "run ended completed without landing"
 
@@ -470,7 +470,7 @@ class TestOperatorCancel:
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
         self._run_until_cancelled(h, requester="Discord user `brett`")
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "cancelled"
         assert item.last_error == "cancelled by Discord user `brett`"
         # Not a failure: no retry report, no breaker count (limit is 1 here).
@@ -496,7 +496,7 @@ class TestOperatorCancel:
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
         self._run_until_cancelled(h, retry=True)
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "queued" and item.attempts == 0
         report = h.source.calls[-1][1]
         assert report.requeued is True and report.cancelled_by == "operator"
@@ -511,7 +511,7 @@ class TestOperatorCancel:
         h = Harness(tmp_path)
         h.source.items = [gh_item()]
         self._run_until_cancelled(h, requester="Discord user `brett`", retry=True)
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "queued"
         record = h.store.get_run(h.runs[0][0])
         assert record.state == "cancelled"
@@ -552,10 +552,10 @@ class TestOperatorCancel:
         t = threading.Thread(target=h.loop.tick)
         t.start()
         assert started.wait(5)
-        h.loop.abandon_item("gh:1", "operator says stop")
+        h.loop.abandon_item("gh:issue:1", "operator says stop")
         release.set()
         t.join(5)
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "failed"
         assert h.store.get_run(h.runs[0][0]).state in TERMINAL_RUN_STATES
 
@@ -564,11 +564,11 @@ class TestOperatorCancel:
         it `building`."""
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), h.clock())
-        h.dstore.mark_claimed("gh:1", h.clock())
-        h.dstore.mark_running("gh:1", "rdead", h.clock())
+        h.dstore.mark_claimed("gh:issue:1", h.clock())
+        h.dstore.mark_running("gh:issue:1", "rdead", h.clock())
         h.store.create_run("rdead", "x")
         h.store.set_run_state("rdead", "building")
-        h.loop.requeue_item("gh:1")
+        h.loop.requeue_item("gh:issue:1")
         record = h.store.get_run("rdead")
         assert record.state == "cancelled"
         assert record.reason is not None and "never resumed" in record.reason
@@ -582,7 +582,7 @@ class TestOperatorCancel:
         h = Harness(tmp_path)
         h.source.items = [gh_item()]
         self._run_until_cancelled(h, error=WorkerError)
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "queued" and item.attempts == 1
         assert h.loop._consecutive_failures == 1
         assert [c[0] for c in h.source.calls] == ["claim", "started", "retry"]
@@ -609,10 +609,10 @@ class TestOperatorCancel:
         assert h.loop.cancel_current("late")
         release.set()
         t.join(5)
-        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "done"  # type: ignore[union-attr]
         h.loop._runner = h.runner
         h.outcomes = ["raise"]
-        assert h.loop.tick().outcome == "retry"  # gh:2 fails as a failure, not a cancel
+        assert h.loop.tick().outcome == "retry"  # gh:issue:2 fails as a failure, not a cancel
         assert not any(c[0] == "cancelled" for c in h.source.calls)
 
     def test_retry_settled_item_is_attributed(self, tmp_path: Path) -> None:
@@ -625,8 +625,8 @@ class TestOperatorCancel:
         assert h.loop.tick().outcome == "failed"
         with pytest.raises(KeyError):
             h.loop.retry_item("gh:nope")
-        h.loop.retry_item("gh:1", "Discord user `brett`")
-        item = h.dstore.get("gh:1")
+        h.loop.retry_item("gh:issue:1", "Discord user `brett`")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "queued" and item.attempts == 0
         assert item.last_error == "re-queued by Discord user `brett`"
         assert ("requeued", "Discord user `brett`") in h.source.calls
@@ -638,12 +638,26 @@ class TestOperatorCancel:
         h = Harness(tmp_path)
         h.source.items = [gh_item()]
         h.dstore.upsert_new(gh_item(), 1.0)
-        h.dstore.mark_running("gh:1", "r1", 1.0)
-        h.dstore.mark_cancelled("gh:1", "cancelled by op", 2.0)
+        h.dstore.mark_running("gh:issue:1", "r1", 1.0)
+        h.dstore.mark_cancelled("gh:issue:1", "cancelled by op", 2.0)
         with pytest.raises(ValueError, match="use retry"):
-            h.loop.requeue_item("gh:1")
-        got = h.loop.retry_item("gh:1", "op")
+            h.loop.requeue_item("gh:issue:1")
+        got = h.loop.retry_item("gh:issue:1", "op")
         assert got.state == "queued" and got.attempts == 0 and got.run_id is None
+
+    def test_operator_controls_accept_legacy_ids(self, tmp_path: Path) -> None:
+        """#508: an operator (or an old watch) may still say `gh:1`. The loop
+        normalises at the boundary, so it resolves the same row and every id
+        it hands back and logs is typed."""
+        h = Harness(tmp_path)
+        h.dstore.upsert_new(gh_item(), 1.0)
+        assert h.loop.requeue_item("gh:1").item_id == "gh:issue:1"
+        h.dstore.mark_running("gh:issue:1", "r1", 1.0)
+        h.dstore.mark_cancelled("gh:issue:1", "cancelled by op", 2.0)
+        assert h.loop.retry_item("gh:1", "op").item_id == "gh:issue:1"
+        assert h.loop.abandon_item("gh:1", "enough").item_id == "gh:issue:1"
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "failed"
 
 
 class TestShutdownAndRecovery:
@@ -664,11 +678,11 @@ class TestShutdownAndRecovery:
         t = threading.Thread(target=h.loop.tick)
         t.start()
         assert started.wait(5)
-        assert h.loop.current is not None and h.loop.current.item.item_id == "gh:1"
+        assert h.loop.current is not None and h.loop.current.item.item_id == "gh:issue:1"
         h.loop.request_stop()
         release.set()
         t.join(5)
-        assert h.dstore.get("gh:1").state == "running"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "running"  # type: ignore[union-attr]
         assert h.loop.current is None
 
     def test_genuine_failure_after_stop_requested_still_settles(self, tmp_path: Path) -> None:
@@ -701,7 +715,7 @@ class TestShutdownAndRecovery:
         assert started.wait(5)
         h.loop.request_stop()
         t.join(5)
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "failed"  # settled, not left running
         assert any(c[0] == "abandoned" for c in h.source.calls)
 
@@ -728,31 +742,31 @@ class TestShutdownAndRecovery:
         assert started.wait(5)
         h.loop.request_stop()
         t.join(5)
-        assert h.dstore.get("gh:1").state == "running"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "running"  # type: ignore[union-attr]
 
     def test_recover_merged_run_settles(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_done", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_done", now=2.0)
         h.store.create_run("r_done", "x")
         h.store.set_run_pr("r_done", number=3, url="https://x/pull/3", branch="b", head_sha="s")
         h.store.set_run_state("r_done", "merged")
         h.loop.recover()
-        assert h.dstore.get("gh:1").state == "done"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "done"  # type: ignore[union-attr]
         assert ("merged", (3, "https://x/pull/3")) in h.source.calls
         assert h.runs == []  # nothing re-ran
 
     def test_recover_blocked_run_hands_over(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_blk", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_blk", now=2.0)
         h.store.create_run("r_blk", "x")
         h.store.set_run_reason("r_blk", "its draft status could not be cleared")
         h.store.set_run_state("r_blk", "blocked")
         h.loop.recover()
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "blocked"
         assert item.last_error == "its draft status could not be cleared"
         assert any(c[0] == "blocked" for c in h.source.calls)
@@ -760,19 +774,19 @@ class TestShutdownAndRecovery:
     def test_recover_nonterminal_run_resumes_same_attempt(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_live", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_live", now=2.0)
         h.store.create_run("r_live", "x")
         h.store.set_run_state("r_live", "building")
         h.outcomes = ["merged"]
         h.loop.recover()
         # Recovery only queues the resume (run pinned); the tick runs it.
-        pending = h.dstore.get("gh:1")
+        pending = h.dstore.get("gh:issue:1")
         assert pending is not None and pending.state == "queued" and pending.run_id == "r_live"
         assert h.runs == []
         assert h.loop.tick().outcome == "done"
         assert h.runs == [("r_live", True)]  # resumed, not restarted
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "done" and item.attempts == 1
         # A resume is the same attempt but a fresh engine wall clock: the
         # daily cap sees it (#254/#234).
@@ -784,13 +798,13 @@ class TestShutdownAndRecovery:
         attempt: the item stays pinned to its run."""
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_ci", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_ci", now=2.0)
         h.store.create_run("r_ci", "x")
         h.store.set_run_pr("r_ci", number=9, url=PR_URL, branch="b", head_sha="s")
         h.store.set_run_state("r_ci", "awaiting_ci")
         h.loop.recover()
-        pending = h.dstore.get("gh:1")
+        pending = h.dstore.get("gh:issue:1")
         assert pending is not None and pending.state == "queued" and pending.run_id == "r_ci"
         assert h.loop.tick().outcome == "done"
         assert h.runs == [("r_ci", True)]
@@ -820,8 +834,8 @@ class TestShutdownAndRecovery:
 
         h.loop.sbx = FakeSbx()  # type: ignore[assignment]
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_live", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_live", now=2.0)
         h.store.create_run("r_live", "x")
         h.store.set_run_state("r_live", "building")
         h.outcomes = ["merged"]
@@ -858,8 +872,8 @@ class TestShutdownAndRecovery:
 
         h.loop.sbx = FakeSbx()  # type: ignore[assignment]
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_live", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_live", now=2.0)
         h.store.create_run("r_live", "x")
         h.store.set_run_state("r_live", "building")
         h.outcomes = ["merged"]
@@ -872,8 +886,8 @@ class TestShutdownAndRecovery:
     def _interrupted(h: Harness, run_id: str = "r_live") -> None:
         now = h.clock()
         h.dstore.upsert_new(gh_item(), now=now)
-        h.dstore.mark_claimed("gh:1", now=now)
-        h.dstore.mark_running("gh:1", run_id, now=now)
+        h.dstore.mark_claimed("gh:issue:1", now=now)
+        h.dstore.mark_running("gh:issue:1", run_id, now=now)
         h.store.create_run(run_id, "x")
         h.store.set_run_state(run_id, "building")
 
@@ -914,11 +928,11 @@ class TestShutdownAndRecovery:
         )
         h = Harness(tmp_path, cfg)
         self._interrupted(h)
-        h.dstore.mark_resuming("gh:1", "r_live", now=h.clock())  # one resume spent
+        h.dstore.mark_resuming("gh:issue:1", "r_live", now=h.clock())  # one resume spent
         h.loop.recover()
         result = h.loop.tick()
         assert result.outcome == "retry" and h.runs == []  # not resumed
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "queued" and item.run_id is None
         assert any(c[0] == "retry" for c in h.source.calls)
         # The next tick (past the retry backoff) is a FRESH dispatch,
@@ -927,7 +941,7 @@ class TestShutdownAndRecovery:
         h.outcomes = ["merged"]
         assert h.loop.tick().outcome == "done"
         assert len(h.runs) == 1 and h.runs[0][1] is False
-        assert h.dstore.get("gh:1").attempts == 2  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").attempts == 2  # type: ignore[union-attr]
 
     def test_zero_resume_budget_never_resumes(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
@@ -995,7 +1009,7 @@ class TestSourceBackoff:
         h.loop.tick()  # failure 3
         h.clock.t += 8 * interval
         result = h.loop.tick()  # recovers and dispatches
-        assert polls == 4 and result.dispatched == "gh:1"
+        assert polls == 4 and result.dispatched == "gh:issue:1"
         assert h.loop._source_failures == 0
 
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
@@ -1004,20 +1018,20 @@ class TestSourceBackoff:
         )
         h = Harness(tmp_path, cfg)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_running("gh:1", "r_dead", now=2.0)
+        h.dstore.mark_running("gh:issue:1", "r_dead", now=2.0)
         h.store.create_run("r_dead", "x")
         h.store.set_run_state("r_dead", "failed")
         h.loop.recover()
-        assert h.dstore.get("gh:1").state == "queued"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "queued"  # type: ignore[union-attr]
         assert any(c[0] == "retry" for c in h.source.calls)
 
     def test_recover_claimed_but_unstarted_requeues(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.set_state("gh:1", "running", now=1.5)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.set_state("gh:issue:1", "running", now=1.5)
         h.loop.recover()
-        got = h.dstore.get("gh:1")
+        got = h.dstore.get("gh:issue:1")
         assert got is not None and got.state == "queued" and got.claimed is True
         # and the next tick runs it WITHOUT re-claiming
         h.outcomes = ["merged"]
@@ -1068,10 +1082,10 @@ class TestOperatorItemControls:
         assert started.wait(5)
         run_id = h.loop.current.run_id  # type: ignore[union-attr]
         # another process: only the row changes
-        h.dstore.abandon("gh:1", "operator: doomed plan", h.clock())
+        h.dstore.abandon("gh:issue:1", "operator: doomed plan", h.clock())
         t.join(10)
         assert results and results[0].outcome == "failed"
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "failed" and item.run_id == run_id
         assert [c for c in h.source.calls if c[0] == "abandoned"] == [
             ("abandoned", "operator: doomed plan")
@@ -1079,7 +1093,7 @@ class TestOperatorItemControls:
         assert h.loop._consecutive_failures == 0
         # ledger closed as abandoned, and recovery leaves the item alone
         h.loop.recover()
-        assert h.dstore.get("gh:1").state == "failed"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").state == "failed"  # type: ignore[union-attr]
 
     def test_cli_requeue_of_running_item_cancels_and_next_tick_starts_fresh(
         self, tmp_path: Path
@@ -1093,10 +1107,10 @@ class TestOperatorItemControls:
         t.start()
         assert started.wait(5)
         first_run = h.loop.current.run_id  # type: ignore[union-attr]
-        h.dstore.requeue("gh:1", h.clock())
+        h.dstore.requeue("gh:issue:1", h.clock())
         t.join(10)
         assert results and results[0].outcome == "requeued"
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "queued" and item.run_id is None
         assert item.attempts == 1  # requeue keeps the count
         assert not any(c[0] in ("abandoned", "retry") for c in h.source.calls)
@@ -1117,7 +1131,7 @@ class TestOperatorItemControls:
         t = threading.Thread(target=h.loop.tick)
         t.start()
         assert started.wait(5)
-        got = h.loop.abandon_item("gh:1", "operator says stop")
+        got = h.loop.abandon_item("gh:issue:1", "operator says stop")
         assert got.state == "failed"
         t.join(10)
         assert [c for c in h.source.calls if c[0] == "abandoned"] == [
@@ -1127,7 +1141,7 @@ class TestOperatorItemControls:
     def test_loop_abandon_queued_item_reports_immediately(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        got = h.loop.abandon_item("gh:1")
+        got = h.loop.abandon_item("gh:issue:1")
         assert got.state == "failed" and got.last_error == "abandoned by operator"
         assert h.source.calls == [("abandoned", "abandoned by operator")]
         assert h.loop.tick().idle_kind == "no_work"
@@ -1142,8 +1156,8 @@ class TestOperatorItemControls:
         assert h.loop.tick().outcome == "failed"
         first_run = h.runs[0][0]
         with pytest.raises(ValueError):
-            h.loop.requeue_item("gh:1")  # failed items need retry, not requeue
-        got = h.loop.retry_item("gh:1")
+            h.loop.requeue_item("gh:issue:1")  # failed items need retry, not requeue
+        got = h.loop.retry_item("gh:issue:1")
         assert got.state == "queued" and got.attempts == 0 and got.run_id is None
         assert h.loop.tick().outcome == "done"
         assert h.runs[-1][0] != first_run and h.runs[-1][1] is False
@@ -1175,14 +1189,14 @@ class TestOperatorItemControls:
         t.start()
         assert started.wait(5)
         assert h.loop.cancel_current("discord op", retry=True) is True
-        h.dstore.abandon("gh:1", "operator: doomed plan", h.clock())
+        h.dstore.abandon("gh:issue:1", "operator: doomed plan", h.clock())
         release.set()
         t.join(10)
         assert results and results[0].outcome == "failed"
-        a = h.dstore.get("gh:1")
+        a = h.dstore.get("gh:issue:1")
         assert a is not None and a.state == "failed" and a.attempts == 1
         assert [c[0] for c in h.source.calls if c[0] in ("abandoned", "cancelled")] == ["abandoned"]
-        # gh:2's failure settles as a failure: the stale cancel is gone.
+        # gh:issue:2's failure settles as a failure: the stale cancel is gone.
         h.loop._runner = h.runner
         h.outcomes = ["raise"]
         assert h.loop.tick().outcome == "retry"
@@ -1208,12 +1222,12 @@ class TestOperatorItemControls:
 
         h.loop.sbx = FakeSbx()  # type: ignore[assignment]
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_dead", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_dead", now=2.0)
         h.dstore.finish_ledger("r_dead", "interrupted", 3.0)  # clean shutdown
         h.store.create_run("r_dead", "x")
         h.store.set_run_state("r_dead", "building")
-        h.dstore.abandon("gh:1", "operator: doomed plan", 4.0)  # CLI, no daemon
+        h.dstore.abandon("gh:issue:1", "operator: doomed plan", 4.0)  # CLI, no daemon
         h.loop.recover()
         assert h.source.calls == [("abandoned", "operator: doomed plan")]
         assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
@@ -1221,7 +1235,7 @@ class TestOperatorItemControls:
             "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
         ).fetchone()
         assert row["result"] == "abandoned"
-        item = h.dstore.get("gh:1")
+        item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "failed" and item.run_id == "r_dead"
         assert h.loop.tick().idle_kind == "no_work"
         h.loop.recover()  # idempotent: the ledger is closed, nothing to report
@@ -1233,11 +1247,11 @@ class TestOperatorItemControls:
         report — requeue is not a verdict) and the item is dispatched fresh."""
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_dead", now=2.0)  # crash: ledger open
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_dead", now=2.0)  # crash: ledger open
         h.store.create_run("r_dead", "x")
         h.store.set_run_state("r_dead", "building")
-        h.dstore.requeue("gh:1", 4.0)
+        h.dstore.requeue("gh:issue:1", 4.0)
         h.loop.recover()
         row = h.dstore._conn.execute(
             "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
@@ -1253,7 +1267,7 @@ class TestOperatorItemControls:
         resume, not an offline requeue."""
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_running("gh:1", "r_live", now=2.0)
+        h.dstore.mark_running("gh:issue:1", "r_live", now=2.0)
         h.dstore.finish_ledger("r_live", "interrupted", 3.0)
         h.store.create_run("r_live", "x")
         h.store.set_run_state("r_live", "building")
@@ -1266,11 +1280,11 @@ class TestOperatorItemControls:
         (daemon idle) must unpin it so recovery does not resume it."""
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_old", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_old", now=2.0)
         h.store.create_run("r_old", "x")
         h.store.set_run_state("r_old", "building")
-        got = h.loop.requeue_item("gh:1")
+        got = h.loop.requeue_item("gh:issue:1")
         assert got.state == "queued" and got.run_id is None
         h.loop.recover()  # nothing running any more
         assert h.runs == []
@@ -1294,12 +1308,12 @@ class TestOperatorItemControls:
         h.source.items = [gh_item()]
         h.outcomes = ["failed"]
         assert h.loop.tick().outcome == "failed"
-        h.dstore.retry("gh:1", h.clock(), "re-queued by operator (CLI)")  # CLI, row only
+        h.dstore.retry("gh:issue:1", h.clock(), "re-queued by operator (CLI)")  # CLI, row only
         assert h.loop.tick().outcome == "done"
         kinds = [c[0] for c in h.source.calls]
         assert kinds == ["claim", "started", "abandoned", "requeued", "started", "merged"]
         assert h.source.calls[3] == ("requeued", "operator (CLI)")
-        assert h.dstore.get("gh:1").pending_report is None  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1").pending_report is None  # type: ignore[union-attr]
 
     def test_cli_abandon_of_queued_item_reaches_the_source(self, tmp_path: Path) -> None:
         """An item abandoned from the CLI while merely queued has no run in
@@ -1307,7 +1321,7 @@ class TestOperatorItemControls:
         sweep still delivers the abandon (paused or not), exactly once."""
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.abandon("gh:1", "not worth it", 2.0)  # CLI, row only
+        h.dstore.abandon("gh:issue:1", "not worth it", 2.0)  # CLI, row only
         h.loop.pause()
         assert h.loop.tick().idle_kind == "paused"
         assert h.source.calls == [("abandoned", "not worth it")]
@@ -1334,19 +1348,19 @@ class TestOperatorItemControls:
 
         h.loop.sbx = FakeSbx()  # type: ignore[assignment]
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_dead", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_dead", now=2.0)
         h.dstore.finish_ledger("r_dead", "interrupted", 3.0)
-        h.dstore.mark_resume_pending("gh:1", 4.0)
-        h.loop.abandon_item("gh:1", "never mind")
+        h.dstore.mark_resume_pending("gh:issue:1", 4.0)
+        h.loop.abandon_item("gh:issue:1", "never mind")
         assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
         assert h.source.calls == [("abandoned", "never mind")]
         removed.clear()
-        h.dstore.retry("gh:1", 5.0)
-        h.dstore.mark_running("gh:1", "r_dead2", now=6.0)
+        h.dstore.retry("gh:issue:1", 5.0)
+        h.dstore.mark_running("gh:issue:1", "r_dead2", now=6.0)
         h.dstore.finish_ledger("r_dead2", "interrupted", 7.0)
-        h.dstore.mark_resume_pending("gh:1", 8.0)
-        h.loop.requeue_item("gh:1")  # same for an unpin
+        h.dstore.mark_resume_pending("gh:issue:1", 8.0)
+        h.loop.requeue_item("gh:issue:1")  # same for an unpin
         assert removed == ["sbxloop-r_dead2-agent", "sbxloop-r_dead2-github"]
         assert h.dstore.unsettled_runs() == []
 
@@ -1447,8 +1461,8 @@ class TestWorkspacePosture:
         stale = hostgit.head_commit(checkout)
         h = Harness(tmp_path, self._config(tmp_path, checkout))
         h.dstore.upsert_new(gh_item(), h.clock())
-        h.dstore.mark_claimed("gh:1", h.clock())
-        h.dstore.mark_running("gh:1", "rres", h.clock())
+        h.dstore.mark_claimed("gh:issue:1", h.clock())
+        h.dstore.mark_running("gh:issue:1", "rres", h.clock())
         h.store.create_run("rres", "outcome")
         h.store.set_run_state("rres", "building")
         push_upstream_commit(tmp_path, upstream)
@@ -1481,7 +1495,7 @@ class TestLogging:
         with caplog.at_level(logging.INFO):
             assert h.loop.tick().outcome == "done"
         (dispatch,) = self._events(caplog, "run.dispatch")
-        assert "'item': 'gh:1'" in dispatch
+        assert "'item': 'gh:issue:1'" in dispatch
         assert "'resume': False" in dispatch and "'attempt': 1" in dispatch
         (finished,) = self._events(caplog, "run.finished")
         assert "'outcome': 'merged'" in finished and "'duration_s'" in finished
@@ -1511,7 +1525,7 @@ class TestLogging:
         with caplog.at_level(logging.INFO):
             h.loop.tick()
         (inside,) = [r.getMessage() for r in caplog.records if r.name == "sbxloop.test.inside"]
-        assert f"'run': '{seen[0]}'" in inside and "'item': 'gh:1'" in inside
+        assert f"'run': '{seen[0]}'" in inside and "'item': 'gh:issue:1'" in inside
 
     def test_idle_reason_logged_on_change_not_every_tick(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1556,7 +1570,7 @@ class TestLogging:
             release.set()
             t.join(5)
         (interrupted,) = self._events(caplog, "run.interrupted")
-        assert "'item': 'gh:1'" in interrupted and "'resumable': True" in interrupted
+        assert "'item': 'gh:issue:1'" in interrupted and "'resumable': True" in interrupted
         (finished,) = self._events(caplog, "run.finished")
         assert "'outcome': 'interrupted'" in finished
 
@@ -1741,14 +1755,14 @@ class TestOrphanRunReconciliation:
     def test_recover_reconciles_cancelled_item_run(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_cx", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_cx", now=2.0)
         h.store.create_run("r_cx", "x")
         h.store.set_run_state("r_cx", "building")
         h.store.append_event(Event.now("run.started", "r_cx"))
         before = len(list(h.store.events("r_cx")))
         h.dstore.mark_cancelled(
-            "gh:1", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
+            "gh:issue:1", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
         )
         h.loop.recover()
         record = h.store.get_run("r_cx")
@@ -1765,7 +1779,7 @@ class TestOrphanRunReconciliation:
         """The `runs` row is written only by the run loop, so a run that died
         inside a phase used to be left `decomposing` until the stale sweep
         timed it out — six hours in the field (runs rv2y1a8ke, rq826h546 of
-        item gh:478), during which `list_runs` and every active-run count
+        item gh:issue:478), during which `list_runs` and every active-run count
         disagreed with reality.
 
         Both settles close it now: the retry, whose item drops its run pin
@@ -1804,8 +1818,8 @@ class TestOrphanRunReconciliation:
         h = Harness(tmp_path)
         # Interrupted run: recover() queues it for resume and must not close it.
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_resume", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_resume", now=2.0)
         h.store.create_run("r_resume", "x")
         h.store.set_run_state("r_resume", "building")
         # Genuinely in-flight run in this process.
@@ -1815,7 +1829,7 @@ class TestOrphanRunReconciliation:
         h.loop.recover()
         assert h.store.get_run("r_resume").state == "building"
         assert h.store.get_run("r_live").state == "building"
-        pending = h.dstore.get("gh:1")
+        pending = h.dstore.get("gh:issue:1")
         assert pending is not None and pending.state == "queued" and pending.run_id == "r_resume"
         for run_id in ("r_resume", "r_live"):
             assert [e.type for _, e in h.store.events(run_id)] == []
@@ -1890,12 +1904,12 @@ class TestStaleRunReconciliation:
     def test_stale_run_with_cancelled_item_keeps_operator_reason(self, tmp_path: Path) -> None:
         h = self._stale_harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_cx", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_cx", now=2.0)
         h.store.create_run("r_cx", "x")
         h.store.set_run_state("r_cx", "building")
         h.dstore.mark_cancelled(
-            "gh:1", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
+            "gh:issue:1", "cancelled by Discord user brett.bergin (via concierge)", now=3.0
         )
         self._age(h, "r_cx", h.clock.t - 7200.0)
         h.loop.tick()
@@ -1906,11 +1920,11 @@ class TestStaleRunReconciliation:
     def test_resume_pending_stale_run_is_left_for_tick(self, tmp_path: Path) -> None:
         h = self._stale_harness(tmp_path)
         h.dstore.upsert_new(gh_item(), now=1.0)
-        h.dstore.mark_claimed("gh:1", now=1.0)
-        h.dstore.mark_running("gh:1", "r_resume", now=2.0)
+        h.dstore.mark_claimed("gh:issue:1", now=1.0)
+        h.dstore.mark_running("gh:issue:1", "r_resume", now=2.0)
         h.store.create_run("r_resume", "x")
         h.store.set_run_state("r_resume", "building")
-        h.dstore.mark_resume_pending("gh:1", now=3.0)
+        h.dstore.mark_resume_pending("gh:issue:1", now=3.0)
         self._age(h, "r_resume", h.clock.t - 7200.0)
         h.loop._reconcile_stale_runs(h.clock.t)
         assert h.store.get_run("r_resume").state == "building"

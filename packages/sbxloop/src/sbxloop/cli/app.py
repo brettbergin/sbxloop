@@ -42,6 +42,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
+from sbxloop.ghids import normalize_item_id
 from sbxloop.log import configure_logging, get_logger
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
@@ -1672,7 +1673,7 @@ def daemon_items(
 
 @daemon_app.command("abandon")
 def daemon_abandon(
-    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12).")],
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:issue:12).")],
     reason: Annotated[str | None, typer.Option("--reason", help="Recorded as last error.")] = None,
 ) -> None:
     """Give up on a queued or running item; its run will not be resumed."""
@@ -1681,7 +1682,7 @@ def daemon_abandon(
 
 @daemon_app.command("retry")
 def daemon_retry(
-    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12).")],
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:issue:12).")],
 ) -> None:
     """Re-queue a failed/blocked/cancelled item: attempts reset, fresh run (not a resume)."""
     _item_control("retry", item_id, None)
@@ -1689,13 +1690,16 @@ def daemon_retry(
 
 @daemon_app.command("requeue")
 def daemon_requeue(
-    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:12).")],
+    item_id: Annotated[str, typer.Argument(help="Work item id (e.g. gh:issue:12).")],
 ) -> None:
     """Unpin a running item from its run so the next dispatch starts fresh (attempts kept)."""
     _item_control("requeue", item_id, None)
 
 
 def _item_control(action: str, item_id: str, reason: str | None) -> None:
+    # The legacy bare `gh:<n>` spelling is accepted from the command line and
+    # normalised, so lookups and every message below show the typed id.
+    item_id = normalize_item_id(item_id)
     dstore = _daemon_store()
     try:
         now = time.time()

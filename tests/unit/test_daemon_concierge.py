@@ -701,8 +701,10 @@ class TestTools:
         assert "777" not in body  # the requester never reaches the public issue
         assert not any("/labels" in p for p in github.paths)  # already queued: no label call
         # ...but the daemon's store knows who asked, so the work item will.
-        dstore.upsert_new(WorkItem(item_id="gh:41", source_key="41", title="Add retries"), 1.0)
-        assert dstore.get("gh:41").requested_by == "777"  # type: ignore[union-attr]
+        dstore.upsert_new(
+            WorkItem(item_id="gh:issue:41", source_key="41", title="Add retries"), 1.0
+        )
+        assert dstore.get("gh:issue:41").requested_by == "777"  # type: ignore[union-attr]
         # An issue that already exists is queued with label_issue_for_run.
         turn(concierge, "run #12 too", author="Discord user `ana`")
         (labelled,) = client.responses[2:]
@@ -718,8 +720,8 @@ class TestTools:
         )
         turn(concierge, "do T")
         assert client.responses[0].ok
-        dstore.upsert_new(WorkItem(item_id="gh:41", source_key="41", title="T"), 1.0)
-        assert dstore.get("gh:41").requested_by is None  # type: ignore[union-attr]
+        dstore.upsert_new(WorkItem(item_id="gh:issue:41", source_key="41", title="T"), 1.0)
+        assert dstore.get("gh:issue:41").requested_by is None  # type: ignore[union-attr]
 
     def test_create_issue_mentions_a_paused_daemon(self, tmp_path: Path) -> None:
         concierge, client, _, loop, _ = make(
@@ -1058,10 +1060,10 @@ class TestTools:
                 ],
                 github=github,
             )
-            item = WorkItem(item_id="gh:12", source_key="12", title="T")
+            item = WorkItem(item_id="gh:issue:12", source_key="12", title="T")
             dstore.upsert_new(item, 1.0)
             if claimed:
-                dstore.mark_claimed("gh:12", 2.0)
+                dstore.mark_claimed("gh:issue:12", 2.0)
             turn(concierge)
             return client.responses[0].text
 
@@ -1071,7 +1073,7 @@ class TestTools:
         assert "nothing will run" in unclaimed_text and "WARNING" not in unclaimed_text
         # claimed: the claim check is skipped, so a run can still start
         claimed_text = close(tmp_path / "b", claimed=True)
-        assert "WARNING" in claimed_text and "abandon gh:12" in claimed_text
+        assert "WARNING" in claimed_text and "abandon gh:issue:12" in claimed_text
 
     def test_tool_exception_becomes_error_response_and_turn_survives(self, tmp_path: Path) -> None:
         concierge, client, _, loop, _ = make(
@@ -1523,3 +1525,56 @@ class TestWatchRun:
 
         source = Path(str(module.__file__)).read_text(encoding="utf-8")
         assert re.search(r"^\s*(import|from)\s+discord", source, re.M) is None
+
+
+class TestTypedGithubIds:
+    """Item ids are rendered typed and accepted in either spelling."""
+
+    def _seed(self, tmp_path: Path, dstore: DaemonStore, loop: LoopWithRuns) -> None:
+        store = StateStore(tmp_path / "state" / "state.db")
+        store.create_run("r1abcdefg", "Ship the widget")
+        store.set_run_state("r1abcdefg", "building")
+        item = WorkItem(item_id="gh:issue:12", source_key="12", title="Widget")
+        dstore.upsert_new(item, 1.0)
+        dstore.mark_running("gh:issue:12", "r1abcdefg", 2.0)
+        loop.reports["r1abcdefg"] = RunReport("r1abcdefg", "building", "1/2 tasks done")
+
+    def test_tool_descriptions_use_typed_example(self, tmp_path: Path) -> None:
+        concierge, _, _, _, _ = make(tmp_path, [])
+        blob = " ".join(t.spec.description for t in concierge._tools.values())
+        assert "gh:issue:12" in blob
+        assert "gh:12" not in blob
+
+    def test_item_and_run_detail_accept_legacy_and_render_typed(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, dstore = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("item_detail", {"item_id": "gh:12"}),
+                        ("run_detail", {"run_id": "r1abcdefg"}),
+                        ("list_runs", {"limit": 5}),
+                        ("item_detail", {"item_id": "gh:999"}),
+                    ]
+                }
+            ],
+        )
+        self._seed(tmp_path, dstore, loop)
+        turn(concierge)
+        item, detail, listing, missing = client.responses
+        assert item.text.startswith("gh:issue:12: state running")
+        assert "work item: gh:issue:12" in detail.text
+        assert "gh:issue:12 · Widget" in listing.text
+        assert "ids look like gh:issue:12" in missing.text
+
+    def test_watch_accepts_legacy_item_id(self, tmp_path: Path) -> None:
+        seen: list[tuple[str, str]] = []
+        concierge, client, _, loop, dstore = make(
+            tmp_path,
+            [{"calls": [("watch_run", {"run_id_or_item_id": "gh:12"})]}],
+            on_watch=lambda run_id, by: seen.append((run_id, by)) or None,
+        )
+        self._seed(tmp_path, dstore, loop)
+        turn(concierge, author="alice")
+        assert seen == [("r1abcdefg", "alice (via concierge)")]
+        assert "r1abcdefg" in client.responses[0].text

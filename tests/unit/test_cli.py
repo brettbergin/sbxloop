@@ -460,7 +460,7 @@ class TestDaemonCommand:
         from sbxloop.daemon.sources import GitHubIssueSource
 
         item = WorkItem(
-            item_id="gh:12",
+            item_id="gh:issue:12",
             source_key="12",
             title="Do the thing",
             url="https://github.com/o/r/issues/12",
@@ -476,7 +476,7 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["daemon", "--repo", "o/r", "--dry-run"])
         assert result.exit_code == 0, result.output
         # the listing is stdout output (pipeable), not only a log line
-        assert "gh:12" in result.stdout and "Do the thing" in result.stdout
+        assert "gh:issue:12" in result.stdout and "Do the thing" in result.stdout
         assert "issues/12" in result.stdout
         assert claimed == []  # the label swap never happens on a dry run
 
@@ -662,8 +662,8 @@ class TestDaemonItemControls:
         from sbxloop.daemon.store import DaemonStore
 
         dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
-        dstore.upsert_new(WorkItem(item_id="gh:12", source_key="12", title="Do X"), 1.0)
-        dstore.mark_running("gh:12", "r_x", 2.0)
+        dstore.upsert_new(WorkItem(item_id="gh:issue:12", source_key="12", title="Do X"), 1.0)
+        dstore.mark_running("gh:issue:12", "r_x", 2.0)
         dstore.close()
 
     def test_items_lists_state_attempts_and_run(self, workdir: Path) -> None:
@@ -673,7 +673,7 @@ class TestDaemonItemControls:
         self.seed(workdir)
         result = runner.invoke(app, ["daemon", "items"])
         assert result.exit_code == 0, result.output
-        assert "gh:12" in result.output and "running" in result.output
+        assert "gh:issue:12" in result.output and "running" in result.output
         assert "r_x" in result.output
         result = runner.invoke(app, ["daemon", "items", "--state", "queued"])
         assert "no work items" in result.output
@@ -685,47 +685,98 @@ class TestDaemonItemControls:
         from sbxloop.daemon.store import DaemonStore
 
         self.seed(workdir)
-        result = runner.invoke(app, ["daemon", "retry", "gh:12"])
+        result = runner.invoke(app, ["daemon", "retry", "gh:issue:12"])
         assert result.exit_code == 2 and "retry refused" in result.output
-        result = runner.invoke(app, ["daemon", "abandon", "gh:12", "--reason", "plan spiraled"])
+        result = runner.invoke(
+            app, ["daemon", "abandon", "gh:issue:12", "--reason", "plan spiraled"]
+        )
         assert result.exit_code == 0, result.output
         # FORCE_COLOR / a forced terminal makes rich highlight the number
         # ("attempts \x1b[1;36m1"): assert on the ANSI-stripped text.
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         # an operator abandon is a failure by decision; the run stays pinned
         # so the ledger and `sbxloop logs` still tie the item to it
-        assert "gh:12: failed (attempts 1, run r_x)" in plain
+        assert "gh:issue:12: failed (attempts 1, run r_x)" in plain
         dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
-        item = dstore.get("gh:12")
+        item = dstore.get("gh:issue:12")
         assert item is not None and item.state == "failed"
         assert item.last_error == "plan spiraled" and item.run_id == "r_x"
         assert item.pending_report == "abandoned"  # the issue is owed the news
         dstore.close()
-        result = runner.invoke(app, ["daemon", "requeue", "gh:12"])
+        result = runner.invoke(app, ["daemon", "requeue", "gh:issue:12"])
         assert result.exit_code == 2 and "requeue refused" in result.output
         assert "use retry" in result.output
-        result = runner.invoke(app, ["daemon", "retry", "gh:12"])
+        result = runner.invoke(app, ["daemon", "retry", "gh:issue:12"])
         assert result.exit_code == 0, result.output
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "gh:12: queued (attempts 0)" in plain
+        assert "gh:issue:12: queued (attempts 0)" in plain
         dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
-        item = dstore.get("gh:12")
+        item = dstore.get("gh:issue:12")
         assert item is not None and item.run_id is None  # a fresh run, not a resume
         assert item.pending_report == "requeued"
         dstore.close()
-        result = runner.invoke(app, ["daemon", "abandon", "gh:404"])
+        result = runner.invoke(app, ["daemon", "abandon", "gh:issue:404"])
         assert result.exit_code == 2 and "unknown work item" in result.output
+
+    def test_item_verbs_take_legacy_and_typed_ids(self, workdir: Path) -> None:
+        """#508: `gh:12` is the legacy spelling of `gh:issue:12`. Both forms
+        must reach the same row, and every rendering is the typed one."""
+        from sbxloop.daemon.store import DaemonStore
+
+        self.seed(workdir)
+        result = runner.invoke(app, ["daemon", "requeue", "gh:12"])  # legacy in
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "gh:issue:12: queued" in plain
+        assert not re.search(r"gh:\d", plain)
+        result = runner.invoke(app, ["daemon", "abandon", "gh:12", "--reason", "enough"])
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "gh:issue:12: failed" in plain and not re.search(r"gh:\d", plain)
+        result = runner.invoke(app, ["daemon", "retry", "gh:issue:12"])  # typed in
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "gh:issue:12: queued (attempts 0)" in plain
+        dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
+        item = dstore.get("gh:12")
+        assert item is not None and item.item_id == "gh:issue:12"
+        dstore.close()
+
+    def test_items_listing_renders_typed_ids_for_legacy_rows(self, workdir: Path) -> None:
+        """A row written by the pre-#508 daemon still lists — as `gh:issue:`."""
+        import sqlite3
+
+        from sbxloop.daemon.store import DaemonStore
+
+        self.seed(workdir)
+        db = self.daemon_state(workdir) / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE daemon_work_items SET item_id = 'gh:12'")
+        conn.commit()
+        conn.close()
+        result = runner.invoke(app, ["daemon", "items"])
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "gh:issue:12" in plain and not re.search(r"gh:\d", plain)
+        dstore = DaemonStore(db)
+        assert dstore.get("gh:issue:12") is not None
+        dstore.close()
+
+    def test_item_ids_in_help_are_typed(self, workdir: Path) -> None:
+        for word in ("abandon", "retry", "requeue"):
+            out = runner.invoke(app, ["daemon", word, "--help"]).output
+            assert "gh:issue:12" in out and not re.search(r"gh:\d", out)
 
     def test_requeue_unpins_a_running_item(self, workdir: Path) -> None:
         from sbxloop.daemon.store import DaemonStore
 
         self.seed(workdir)
-        result = runner.invoke(app, ["daemon", "requeue", "gh:12"])
+        result = runner.invoke(app, ["daemon", "requeue", "gh:issue:12"])
         assert result.exit_code == 0, result.output
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "gh:12: queued (attempts 1)" in plain  # attempts kept, run gone
+        assert "gh:issue:12: queued (attempts 1)" in plain  # attempts kept, run gone
         dstore = DaemonStore(self.daemon_state(workdir) / "state.db")
-        item = dstore.get("gh:12")
+        item = dstore.get("gh:issue:12")
         assert item is not None and item.state == "queued" and item.run_id is None
         dstore.close()
 

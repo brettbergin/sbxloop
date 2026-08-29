@@ -263,7 +263,7 @@ class TestBashisms:
         )
 
     def test_an_inert_sh_c_wrapper_is_unwrapped_not_rejected(self) -> None:
-        """Field failure (item gh:478, runs rv2y1a8ke and rq826h546): the
+        """Field failure (item gh:issue:478, runs rv2y1a8ke and rq826h546): the
         planner wrapped two checks as `sh -c 'exit 0'` and `sh -c 'git diff
         --quiet && git diff --cached --quiet'`. Both were rejected as nested
         shells, decompose was declared invalid twice, and the item was

@@ -5,9 +5,10 @@ from __future__ import annotations
 
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from sbxloop.engine.model import RunState
+from sbxloop.ghids import normalize_item_id
 
 # ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
 # it is terminal for the daemon (no retry, no breaker count) while the run
@@ -26,8 +27,14 @@ PendingReport = Literal["abandoned", "requeued", "merged", "blocked"]
 class WorkItem(BaseModel):
     """One unit of discovered work and its dispatch bookkeeping.
 
-    ``item_id`` is stable across polls (``gh:<issue#>``) so repeated
-    discovery of the same issue dedups on it. ``claimed`` records that the
+    ``item_id`` is stable across polls so repeated discovery of the same
+    issue dedups on it. GitHub ids are *typed* — ``gh:issue:<n>`` for an
+    issue, ``gh:pr:<n>`` for a pull request referenced as a work-item
+    resource — and the grammar lives entirely in :mod:`sbxloop.ghids`
+    (``format_gh_id`` / ``parse_gh_id``). The legacy bare form ``gh:<n>``
+    is still accepted on read and normalised to ``gh:issue:<n>``; nothing
+    new is ever written in that form. Ids from other sources (e.g.
+    ``inbox:x.md``) pass through untouched. ``claimed`` records that the
     source-side claim (label swap) already happened — a crash between claim
     and run start must not re-claim. ``requested_by`` is the Discord user
     who asked for the work through the concierge, when known, so the run's
@@ -50,6 +57,17 @@ class WorkItem(BaseModel):
     updated_at: float = 0.0
     pending_report: PendingReport | None = None
     requested_by: str | None = None
+
+    @field_validator("item_id")
+    @classmethod
+    def _normalize_item_id(cls, value: str) -> str:
+        """Legacy ``gh:<n>`` becomes ``gh:issue:<n>``; other ids pass through.
+
+        Normalising here means a row loaded from a store written before the
+        typed-id migration surfaces as a typed item without a schema
+        migration, and every id the model hands out is canonical.
+        """
+        return normalize_item_id(value)
 
 
 class RunReport(NamedTuple):

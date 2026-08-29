@@ -72,30 +72,65 @@ class TestDispatch:
         """#246: whoever asked is what the source hears — Discord passes its
         author, ctl its OS user; the dispatcher must not drop it."""
         floop = FakeLoop(_dstore(tmp_path))
-        floop.dstore.upsert_new(WorkItem(item_id="gh:8", source_key="8", title="Eight"), 1.0)
-        floop.dstore.mark_running("gh:8", "r1", 1.0)
-        floop.dstore.mark_cancelled("gh:8", "cancelled by op", 2.0)
+        floop.dstore.upsert_new(WorkItem(item_id="gh:issue:8", source_key="8", title="Eight"), 1.0)
+        floop.dstore.mark_running("gh:issue:8", "r1", 1.0)
+        floop.dstore.mark_cancelled("gh:issue:8", "cancelled by op", 2.0)
         assert dispatch(floop, "cancel", by="ops").ok
         assert dispatch(floop, "cancel --retry", by="ops").ok
         assert floop.cancel_calls == [("ops", False), ("ops", True)]
         assert "run again fresh" in dispatch(floop, "cancel --retry", by="ops").text
-        assert dispatch(floop, "retry gh:8", by="ops").ok
-        assert floop.retried == [("gh:8", "ops")]
+        assert dispatch(floop, "retry gh:issue:8", by="ops").ok
+        assert floop.retried == [("gh:issue:8", "ops")]
 
     def test_item_verbs_report_the_stores_reason(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))
-        floop.dstore.upsert_new(WorkItem(item_id="gh:9", source_key="9", title="Do A"), 1.0)
-        floop.dstore.mark_running("gh:9", "r1", 1.0)
+        floop.dstore.upsert_new(WorkItem(item_id="gh:issue:9", source_key="9", title="Do A"), 1.0)
+        floop.dstore.mark_running("gh:issue:9", "r1", 1.0)
         reply = dispatch(floop, "abandon")
         assert not reply.ok and reply.known and reply.text.startswith("usage: abandon")
-        reply = dispatch(floop, "retry gh:9")
+        reply = dispatch(floop, "retry gh:issue:9")
         assert not reply.ok and "retry failed:" in reply.text and "abandon it first" in reply.text
-        reply = dispatch(floop, "abandon gh:9 plan spiraled")
+        reply = dispatch(floop, "abandon gh:issue:9 plan spiraled")
         assert reply.ok and "abandoned" in reply.text and "`r1`" in reply.text
-        reply = dispatch(floop, "requeue gh:9")
+        reply = dispatch(floop, "requeue gh:issue:9")
         assert not reply.ok and "requeue failed:" in reply.text
-        assert "attempts reset" in dispatch(floop, "retry gh:9").text
-        assert not dispatch(floop, "abandon gh:404").ok
+        assert "attempts reset" in dispatch(floop, "retry gh:issue:9").text
+        assert not dispatch(floop, "abandon gh:issue:404").ok
+
+    def test_item_verbs_take_legacy_and_typed_ids(self, tmp_path: Path) -> None:
+        """#508: both spellings reach the row; only the typed one is echoed."""
+        import re as _re
+
+        floop = FakeLoop(_dstore(tmp_path))
+        floop.dstore.upsert_new(WorkItem(item_id="gh:issue:7", source_key="7", title="Seven"), 1.0)
+        floop.dstore.mark_running("gh:issue:7", "r1", 1.0)
+        reply = dispatch(floop, "requeue gh:7")  # legacy spelling
+        assert reply.ok and "`gh:issue:7`" in reply.text
+        assert not _re.search(r"gh:\d", reply.text)
+        reply = dispatch(floop, "abandon gh:7 enough")
+        assert reply.ok and "`gh:issue:7`" in reply.text
+        assert not _re.search(r"gh:\d", reply.text)
+        reply = dispatch(floop, "retry gh:issue:7", by="ops")  # typed spelling
+        assert reply.ok and "`gh:issue:7`" in reply.text
+        assert floop.retried[-1] == ("gh:issue:7", "ops")
+
+    def test_items_and_queue_render_typed_ids_for_legacy_rows(self, tmp_path: Path) -> None:
+        """Rows written by the pre-#508 daemon list as `gh:issue:<n>`."""
+        import re as _re
+        import sqlite3
+
+        db = tmp_path / "state" / "state.db"
+        floop = FakeLoop(_dstore(tmp_path))
+        floop.dstore.upsert_new(WorkItem(item_id="gh:issue:7", source_key="7", title="Seven"), 1.0)
+        floop.dstore.close()
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE daemon_work_items SET item_id = 'gh:7'")
+        conn.commit()
+        conn.close()
+        floop = FakeLoop(DaemonStore(db))
+        for word in ("items", "queue"):
+            text = dispatch(floop, word).text
+            assert "gh:issue:7" in text and not _re.search(r"gh:\d", text)
 
     def test_verbs_are_case_insensitive_and_take_no_extra_args(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))

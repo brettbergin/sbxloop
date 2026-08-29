@@ -68,6 +68,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import Event, EventBus
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
+from sbxloop.ghids import normalize_item_id
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -229,6 +230,7 @@ class DaemonLoop:
         engine is asked to cancel and the settle path reports the abandon
         (so the source hears about it exactly once, after the run is really
         down); otherwise the source is told right here."""
+        item_id = normalize_item_id(item_id)
         why = reason or "abandoned by operator"
         now = self.clock()
         fresh = self.dstore.abandon(item_id, why, now)
@@ -253,6 +255,7 @@ class DaemonLoop:
         """Put a settled (failed/blocked/cancelled) item back in the queue
         with a clean slate at a human's request — fresh plan, not a resume —
         and tell the source who did it (re-claim, drop the failed label)."""
+        item_id = normalize_item_id(item_id)
         who = by or "operator"
         fresh = self.dstore.retry(item_id, self.clock(), f"re-queued by {who}")
         log.info("item.retry", item=item_id, by=who)
@@ -262,6 +265,7 @@ class DaemonLoop:
     def requeue_item(self, item_id: str) -> WorkItem:
         """Drop an item's pinned run so its next dispatch starts fresh
         (attempts intact). Cancels the run if it is the one in flight."""
+        item_id = normalize_item_id(item_id)
         before = self.dstore.get(item_id)
         pinned = before.run_id if before is not None else None
         now = self.clock()
@@ -408,7 +412,7 @@ class DaemonLoop:
     def _cancel_if_current(self, item_id: str) -> bool:
         with self._current_lock:
             handle = self._current
-        if handle is None or handle.item.item_id != item_id:
+        if handle is None or handle.item.item_id != normalize_item_id(item_id):
             return False
         handle.engine.request_cancel()
         return True
@@ -418,7 +422,7 @@ class DaemonLoop:
         another process: an item that is no longer ``running`` on *this*
         run was abandoned/requeued by an operator. Returns the fresh row
         when so."""
-        fresh = self.dstore.get(item_id)
+        fresh = self.dstore.get(normalize_item_id(item_id))
         if fresh is None or (fresh.state == "running" and fresh.run_id == run_id):
             return None
         return fresh
@@ -907,7 +911,7 @@ class DaemonLoop:
         that died inside a phase (a decompose the verify lint rejected, say)
         left ``decomposing`` behind it. Recovery's stale sweep does close it
         eventually, after ``run_stale_after_s``: six hours in the field
-        (runs rv2y1a8ke and rq826h546 of item gh:478), and until then
+        (runs rv2y1a8ke and rq826h546 of item gh:issue:478), and until then
         ``list_runs`` and everything counting active runs disagreed with
         reality — the very mismatch #374 exists to prevent, on a path its
         sweep only reaches by timeout.
