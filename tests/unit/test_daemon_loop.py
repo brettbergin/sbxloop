@@ -24,7 +24,14 @@ from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, Tas
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
-from tests.unit.test_hostgit import make_repo, make_upstream_and_clone, push_upstream_commit
+from tests.unit.test_hostgit import (
+    git as git_cmd,
+)
+from tests.unit.test_hostgit import (
+    make_repo,
+    make_upstream_and_clone,
+    push_upstream_commit,
+)
 
 PR_URL = "https://x/pull/9"
 
@@ -2032,3 +2039,99 @@ class TestMultiRepoItemRouting:
         h = self._harness(tmp_path)
         assert h.loop._item_repo(gh_item("5", repo="o/gone")) is None
         assert h.loop._item_config(gh_item("5", repo="o/gone")).github.repo == "o/a"
+
+
+def _mkdir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+class TestPerRepoWorkspaceRefresh:
+    """#526: the pre-run fast-forward must touch the *claimed repo's*
+    checkout — never "the" daemon-wide one, which with several repos is
+    whichever repository that path happens to be."""
+
+    @staticmethod
+    def _two_repo_config(tmp_path: Path, ws_a: Path, ws_b: Path) -> Config:
+        return Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {
+                    "repos": [
+                        {"repo": "o/a", "workspace": str(ws_a)},
+                        {"repo": "o/b", "workspace": str(ws_b)},
+                    ]
+                },
+            }
+        )
+
+    def test_refresh_touches_only_the_claimed_repos_checkout(self, tmp_path: Path) -> None:
+        a_up, a_ws = make_upstream_and_clone(_mkdir(tmp_path / "a"))
+        b_up, b_ws = make_upstream_and_clone(_mkdir(tmp_path / "b"))
+        h = Harness(tmp_path, self._two_repo_config(tmp_path, a_ws, b_ws))
+        a_stale = hostgit.head_commit(a_ws)
+        push_upstream_commit(tmp_path / "a", a_up)
+        b_new = push_upstream_commit(tmp_path / "b", b_up)
+
+        h.loop._refresh_workspace("o/b")
+
+        assert hostgit.head_commit(b_ws) == b_new
+        assert hostgit.head_commit(a_ws) == a_stale
+
+    def test_dispatch_refreshes_the_items_repo(self, tmp_path: Path) -> None:
+        a_up, a_ws = make_upstream_and_clone(_mkdir(tmp_path / "a"))
+        b_up, b_ws = make_upstream_and_clone(_mkdir(tmp_path / "b"))
+        h = Harness(tmp_path, self._two_repo_config(tmp_path, a_ws, b_ws))
+        a_stale = hostgit.head_commit(a_ws)
+        push_upstream_commit(tmp_path / "a", a_up)
+        b_new = push_upstream_commit(tmp_path / "b", b_up)
+        h.source.items = [gh_item("7", item_id="gh:o/b:issue:7", repo="o/b")]
+
+        assert h.loop.tick().outcome == "done"
+
+        assert hostgit.head_commit(b_ws) == b_new
+        assert hostgit.head_commit(a_ws) == a_stale
+
+    def test_repo_without_a_workspace_is_skipped_not_an_error(self, tmp_path: Path) -> None:
+        _a_up, a_ws = make_upstream_and_clone(_mkdir(tmp_path / "a"))
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {
+                    "repos": [
+                        {"repo": "o/a", "workspace": str(a_ws)},
+                        {"repo": "o/b"},
+                    ]
+                },
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        a_stale = hostgit.head_commit(a_ws)
+
+        h.loop._refresh_workspace("o/b")  # no raise
+
+        assert hostgit.head_commit(a_ws) == a_stale
+
+    def test_origin_mismatch_is_refused(self, tmp_path: Path) -> None:
+        """A checkout whose origin names another repo is left alone rather
+        than fast-forwarded — the exact rvnbn7n2m shape."""
+        upstream, checkout = make_upstream_and_clone(_mkdir(tmp_path / "a"))
+        git_cmd("remote", "set-url", "origin", "https://github.com/o/a", cwd=checkout)
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repos": [{"repo": "o/b", "workspace": str(checkout)}]},
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        stale = hostgit.head_commit(checkout)
+        push_upstream_commit(tmp_path / "a", upstream)
+
+        h.loop._refresh_workspace("o/b")
+
+        assert hostgit.head_commit(checkout) == stale
+        # Refused outright, not attempted: a fetch against the foreign origin
+        # would have surfaced as a refresh-failed warning instead.
+        assert not any("workspace refresh" in t for t in front.seen)

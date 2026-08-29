@@ -55,6 +55,13 @@ HarvestMode = Literal["per-task", "final"]
 WorkspaceIsolation = Literal["auto", "clone", "in-place"]
 
 
+class _Unset:
+    """Sentinel for "argument not supplied", distinct from an explicit None."""
+
+
+_UNSET = _Unset()
+
+
 class _ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -186,6 +193,11 @@ class RepoConfig(_ConfigModel):
     """
 
     repo: str
+    # The host checkout of *this* repository that runs clone and refresh.
+    # None falls back to the legacy ``[sandbox] workspace``, but only when
+    # that checkout demonstrably belongs to this repo (see
+    # ``Config.workspace_for_repo``) — never another repository's tree.
+    workspace: Path | None = None
     deliver_base: str | None = None  # base branch; None → the repo's default
     create_repo: bool = False
     create_public: bool = False
@@ -235,6 +247,13 @@ class GithubConfig(_ConfigModel):
     # body so GitHub links issue and PR and closes the issue on merge even
     # when the daemon is not running. Set per run by the daemon.
     deliver_closes: int | None = Field(default=None, ge=1)
+    # How many repositories were enabled in the *un-narrowed* config this was
+    # derived from. `for_repo` cuts `repos` down to a single entry, so the
+    # list length downstream says nothing about the deployment's shape; the
+    # multi-repo guards (workspace resolution, the provision-time origin
+    # check) must not be able to disappear just because a run's config was
+    # narrowed (#526).
+    enabled_repo_count: int | None = None
 
     @field_validator("repo")
     @classmethod
@@ -346,19 +365,37 @@ class GithubConfig(_ConfigModel):
             }
         )
 
-    def for_repo(self, repo: str | None) -> GithubConfig:
+    def for_repo(
+        self, repo: str | None, *, workspace: Path | _Unset | None = _UNSET
+    ) -> GithubConfig:
         """This section narrowed to the one repository a run targets.
 
         The returned config keeps a single-entry ``repos`` list whose entry
         carries the effective (per-repo overriding global) settings, so
         everything downstream — including a resumed run reading its persisted
         config — sees exactly the repository the work item came from.
+
+        ``workspace`` pins the entry's checkout to the value the caller
+        resolved (``Config.workspace_for_repo``), so downstream code sees a
+        single authoritative workspace for the run. Passing ``None``
+        explicitly pins "this repo has no workspace"; omitting the argument
+        entirely leaves the entry's own value alone.
         """
+        count = self.enabled_repo_count
+        if count is None:
+            count = len(self.enabled_repos())
         entry = self.effective_repo(repo)
         if entry is None:
-            return self.model_copy(update={"repo": None, "repos": []})
+            return self.model_copy(update={"repo": None, "repos": [], "enabled_repo_count": count})
+        if not isinstance(workspace, _Unset):
+            # Pin unconditionally, including None: leaving the entry's
+            # workspace unset would let the narrowed config re-resolve the
+            # legacy [sandbox] workspace and hand this run another
+            # repository's tree (#526).
+            entry = entry.model_copy(update={"workspace": workspace})
         return self.model_copy(
             update={
+                "enabled_repo_count": count,
                 "repo": entry.repo,
                 "repos": [entry],
                 "deliver_base": entry.deliver_base,
@@ -366,6 +403,15 @@ class GithubConfig(_ConfigModel):
                 "create_public": entry.create_public,
             }
         )
+
+    @property
+    def multi_repo(self) -> bool:
+        """Whether the deployment this config came from has several enabled
+        repositories — preserved across narrowing by ``enabled_repo_count``."""
+        count = self.enabled_repo_count
+        if count is None:
+            count = len(self.enabled_repos())
+        return count > 1
 
     def default_repo(self) -> RepoConfig | None:
         """The sole enabled repository, or ``None`` when it is ambiguous."""
@@ -859,6 +905,38 @@ class Config(_ConfigModel):
         # `state_dir = "~/.sbxloop"` in TOML must mean the home directory,
         # not a literal "~" directory under the project.
         return value.expanduser()
+
+    def workspace_for_repo(self, repo: str | None) -> Path | None:
+        """The host checkout runs for ``repo`` clone and refresh from.
+
+        Resolution, in order:
+
+        1. the repo entry's own ``workspace``;
+        2. the legacy ``[sandbox] workspace`` — but only when it can be shown
+           to belong to this repository: with a single enabled repo (the
+           unchanged single-repo deployment) it applies as before; with
+           several, only when the checkout's ``origin`` names this entry;
+        3. otherwise ``None``.
+
+        It never returns a checkout that belongs to a different repository:
+        that is exactly the multi-repo failure this exists to prevent.
+        """
+        from sbxloop import hostgit
+
+        entry = self.github.find_repo(repo)
+        if entry is not None and entry.workspace is not None:
+            return entry.workspace.expanduser()
+        legacy = self.sandbox.workspace
+        if legacy is None:
+            return None
+        legacy = legacy.expanduser()
+        if entry is None:
+            # No repo entries at all (GitHub off, or the legacy [github] repo
+            # spelling): the single daemon-wide workspace is all there is.
+            return legacy if not self.github.enabled_repos() else None
+        if not self.github.multi_repo and entry.enabled:
+            return legacy
+        return legacy if hostgit.origin_matches_repo(legacy, entry.repo) else None
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

@@ -440,8 +440,9 @@ The split is deliberate and worth stating plainly:
 
 - **Per repository** — base branch (`deliver_base`), repo creation
   (`create_repo`, `create_public`), the trigger label
-  (`trigger_label`), extra `labels`, the `enabled` switch, and the token
-  environment variable (`token_env`).
+  (`trigger_label`), extra `labels`, the `enabled` switch, the token
+  environment variable (`token_env`), and the **workspace** the repo's
+  runs clone from (`workspace`).
 - **Daemon-wide** — the calendar-day run cap (`max_runs_per_day`), the
   per-item attempt cap (`max_attempts_per_item`) and resume cap, the
   consecutive-failure circuit breaker (`max_consecutive_failures`,
@@ -457,6 +458,37 @@ repository. Its github-ops sandbox is provisioned scoped to that repository
 and given that repository's `token_env` credential (falling back to the
 daemon-wide `GH_TOKEN`); the credential split is unchanged — the GitHub
 token never enters the agent sandbox.
+
+#### Workspaces are per repository
+
+A workspace is the host git checkout a run's tree comes from: the
+provisioner clones it into `runs/<run_id>/workspace` on the run's branch,
+and the daemon fast-forwards it from `origin` immediately before dispatch.
+Both are resolved **per repository** (`Config.workspace_for_repo`), from the
+entry's own `workspace`; `[sandbox] workspace` is the legacy single-repo
+spelling and, with several repositories configured, applies only to the
+entry whose `origin` it matches. It is never a daemon-wide stand-in: one
+`[sandbox] workspace` shared across two repositories is precisely how a run
+for repository B ended up built from repository A's tree (#526).
+
+Three points enforce the invariant that a run's tree belongs to its own
+repository:
+
+- `sbxloop doctor` fails a check per enabled repository whose workspace
+  `origin` names a different repository, with both names and the fix;
+- `sbxloop daemon` refuses to start on the same condition;
+- `Provisioner` refuses to clone a checkout whose `origin` does not match
+  the run's repository — belt and braces, so no configuration path can
+  reach the wrong tree.
+
+Remote URLs are compared as normalised `owner/name` (scp-style ssh, https
+with or without embedded userinfo, `.git` suffix, case). A repository with
+no workspace at all clones **from its own remote** into the run directory;
+because the host holds no git credential by design (#46) that mode is
+public-repository-only and a private repository fails the run explicitly.
+There is no fallback to another repository's checkout in any of these
+paths. Migration for an existing single-repo daemon: move
+`[sandbox] workspace` into the matching `[[github.repos]]` entry.
 
 `sbxloop doctor` checks each configured repository on its own line
 (reachable, token permissions), so one broken repo never masks the others'

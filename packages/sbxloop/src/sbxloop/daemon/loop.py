@@ -764,7 +764,7 @@ class DaemonLoop:
             self.source.report_started(item, run_id)
             # Fresh runs only: a resumed run is pinned to the clone it
             # already has, so moving the source would change nothing.
-            self._refresh_workspace()
+            self._refresh_workspace(self._item_repo(item))
         else:
             self.dstore.mark_resuming(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
@@ -1193,9 +1193,12 @@ class DaemonLoop:
     def _item_config(self, item: WorkItem) -> Config:
         # Narrow the section to the item's repository first, so the run's
         # per-repo deliver_base / token_env win over the global defaults.
+        item_repo = self._item_repo(item)
         gh = GithubConfig.model_validate(
             {
-                **self.config.github.for_repo(self._item_repo(item)).model_dump(),
+                **self.config.github.for_repo(
+                    item_repo, workspace=self.config.workspace_for_repo(item_repo)
+                ).model_dump(),
                 "create_repo": False,
                 # "Closes #N" in the PR body: GitHub links issue and PR and
                 # closes the issue on merge even when the daemon is not
@@ -1206,7 +1209,7 @@ class DaemonLoop:
         update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
         sandbox = self.config.sandbox
         if (
-            self._workspace_checkout() is not None
+            self._workspace_checkout(item_repo) is not None
             and sandbox.workspace_isolation != self.config.daemon.workspace_isolation
         ):
             # Unattended runs answer the dirty-tree question by config
@@ -1223,28 +1226,57 @@ class DaemonLoop:
             )
         return self.config.model_copy(update=update)
 
-    def _workspace_checkout(self) -> Path | None:
-        """The configured workspace when it is the root of a git checkout
-        (the only case isolation, and the fetch refresh, apply to)."""
-        source = self.config.sandbox.workspace
+    def _workspace_checkout(self, repo: str | None = None) -> Path | None:
+        """``repo``'s configured workspace when it is the root of a git
+        checkout (the only case isolation, and the fetch refresh, apply to).
+
+        Resolved per repository (:meth:`Config.workspace_for_repo`), never
+        from the daemon-wide path: with several repositories configured one
+        ``[sandbox] workspace`` would otherwise stand in for every repo's
+        tree (#526).
+        """
+        source = self.config.workspace_for_repo(repo)
         if source is None or hostgit.find_git() is None:
             return None
         source = source.resolve()
         return source if hostgit.repo_toplevel(source) == source else None
 
-    def _refresh_workspace(self) -> None:
-        """Fetch + fast-forward the source checkout so the run's clone starts
-        from current ``origin/<branch>`` (#255). Never fatal: a stale HEAD
-        is still a run, a failed fetch (network blip, remote gone) is a
-        warning in the chronology, not a failed issue."""
+    def _refresh_workspace(self, repo: str | None = None) -> None:
+        """Fetch + fast-forward *the claimed repo's* source checkout so the
+        run's clone starts from current ``origin/<branch>`` (#255). Never
+        fatal: a stale HEAD is still a run, a failed fetch (network blip,
+        remote gone) is a warning in the chronology, not a failed issue.
+
+        A repo with no workspace of its own is skipped with a log line, and
+        a checkout whose ``origin`` names a different repository is refused
+        rather than fast-forwarded (#526).
+        """
         if not self.config.daemon.refresh_workspace:
             return
         if self.config.daemon.workspace_isolation == "in-place":
             # In-place runs mutate the checkout directly; fast-forwarding
             # under a tree the previous run edited is not ours to do.
             return
-        source = self._workspace_checkout()
+        source = self._workspace_checkout(repo)
         if source is None:
+            log.info(
+                "workspace.refresh_skipped",
+                repo=repo,
+                reason="no git checkout resolved for this repository",
+            )
+            return
+        if repo is not None and hostgit.origin_matches_repo(source, repo) is False:
+            actual = hostgit.normalise_repo_url(hostgit.origin_url(source))
+            log.warning(
+                "workspace.refresh_refused",
+                repo=repo,
+                path=str(source),
+                origin=actual,
+                reason=(
+                    f"{source} is a checkout of {actual}, not {repo}; refusing to "
+                    "refresh another repository's tree"
+                ),
+            )
             return
         log.debug("workspace.refresh_start", path=str(source))
         started = time.monotonic()

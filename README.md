@@ -659,10 +659,12 @@ per-repo token environment variable:
 ```toml
 [[github.repos]]
 repo = "you/one"
+workspace = "~/src/one"   # this repo's host checkout; runs clone from it
 deliver_base = "main"
 
 [[github.repos]]
 repo = "you/two"
+workspace = "~/src/two"
 enabled = false           # registered but not polled
 token_env = "GH_TOKEN_TWO"  # unset uses the daemon-wide GH_TOKEN
 trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
@@ -676,6 +678,49 @@ repository's `token_env` credential — falling back to the daemon-wide
 unchanged by any of this: the GitHub token only ever enters the github-ops
 sandbox, never the agent sandbox (which holds the Copilot token alone) and
 never the host.
+
+#### A workspace per repository
+
+A **workspace** is the host git checkout a run's tree is cloned from: every
+fresh run clones it into `runs/<run_id>/workspace` on its own branch, so the
+run never disturbs the checkout, and the daemon fast-forwards it from
+`origin` before each run. With several repositories that checkout cannot be
+a single daemon-wide path — one repo's runs would be built out of another
+repo's tree — so each entry names its own with `workspace`:
+
+```toml
+[[github.repos]]
+repo = "you/one"
+workspace = "~/src/one"
+
+[[github.repos]]
+repo = "you/two"
+workspace = "~/src/two"
+```
+
+**The origin check.** For every enabled repository, the checkout's
+`origin` remote must name that repository (`.git` suffix, ssh vs https and
+case are normalised away). A mismatch is a hard failure, named at three
+points: `sbxloop doctor` reports it as a failing check, `sbxloop daemon`
+refuses to start, and provisioning refuses to clone even if it were somehow
+reached. The message names both repositories and the fix. Nothing falls
+back to another repository's tree, ever — silently building `you/two` from
+`you/one`'s checkout is the bug this check exists to prevent.
+
+**No workspace.** An entry with no `workspace` (and no legacy one that
+belongs to it) has no host tree, so its runs clone the repository from its
+own remote into the run directory. The host deliberately holds no git
+credential, so **this mode only works for a public repository**; for a
+private one the clone fails the run with that reason, rather than falling
+back to anything. Give private repositories a checkout of their own.
+
+**Migration.** A single-repo deployment's `[sandbox] workspace` keeps
+working exactly as before. When you add a second repository, **move
+`[sandbox] workspace` into the matching `[[github.repos]]` entry** as
+`workspace = "..."` and give the other entries their own. Left at the top
+level with several repositories configured, it applies only to the entry
+whose `origin` it actually matches; every other repository is refused at
+`doctor`/start rather than run from the wrong tree.
 
 The two forms are mutually exclusive: migrate by moving `[github] repo` (and
 its `deliver_base` / `create_repo` / `create_public`) into one

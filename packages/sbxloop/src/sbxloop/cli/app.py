@@ -603,7 +603,13 @@ def run(
         # Several repositories are configured but a run targets exactly one:
         # default to the sole enabled repo, else make the operator choose.
         entry = _resolve_repo(config, None)
-        config = config.model_copy(update={"github": config.github.for_repo(entry.repo)})
+        config = config.model_copy(
+            update={
+                "github": config.github.for_repo(
+                    entry.repo, workspace=config.workspace_for_repo(entry.repo)
+                )
+            }
+        )
     if (deliver_base or create_repo or create_public) and not config.github.enabled:
         console.print(
             "[bold red]GitHub integration is not configured.[/] Those options need a "
@@ -1527,6 +1533,22 @@ def daemon(
             hint="every configured repository is disabled — set enabled = true on at "
             "least one [[github.repos]] entry",
         )
+        raise typer.Exit(2)
+
+    # A repository whose workspace is another repository's checkout would
+    # have its runs built from the wrong tree (#526). Refuse to start.
+    from sbxloop.cli.doctor import workspace_origin_mismatches
+
+    mismatches = workspace_origin_mismatches(config)
+    if mismatches:
+        for mismatch in mismatches:
+            log.error(
+                "daemon.workspace_origin_mismatch",
+                repo=mismatch.repo,
+                workspace=str(mismatch.path),
+                origin_repo=mismatch.origin_repo,
+                hint=mismatch.message,
+            )
         raise typer.Exit(2)
 
     db_path = config.state_dir / "state.db"
