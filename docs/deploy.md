@@ -70,13 +70,13 @@ or the next deploy will roll you somewhere you did not expect.
 
 Set once, on the daemon host (`db`), by the user the daemon runs as:
 
-|             |                                                                                                   |
-| ----------- | ------------------------------------------------------------------------------------------------- |
-| Service     | user unit `~/.config/systemd/user/sbxloop-daemon.service`                                         |
-| Working dir | `~/sbxloop-work` — `ctl` resolves `state_dir` from the cwd, so every `ctl` call runs here         |
-| Interpreter | venv at `~/.sbxloop-venv`                                                                         |
-| Wrapper     | `~/.local/bin/sbxloop` sources `~/.config/sbxloop/env.sh` (PATH incl. `/usr/sbin`, dbus, secrets) |
-| Secrets     | `~/.config/sbxloop/secrets.env`, mode 0600                                                        |
+|             |                                                                                                                           |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Service     | user unit `~/.config/systemd/user/sbxloop-daemon.service`                                                                 |
+| Working dir | `~/sbxloop-work` — `ctl` resolves `state_dir` from the cwd, so every `ctl` call runs here                                 |
+| Interpreter | venv at `~/.sbxloop-venv`                                                                                                 |
+| Wrapper     | `~/.local/bin/sbxloop` sources `~/.config/sbxloop/env.sh` (PATH incl. `/usr/sbin`, dbus, secrets)                         |
+| Secrets     | `~/.config/sbxloop/secrets.env`, mode 0600 (shape: the repo-root [`.env.example`](../.env.example), "Daemon host layout") |
 
 All of these are `env:` values at the top of the deploy job — a host layout change is a
 one-line edit.
