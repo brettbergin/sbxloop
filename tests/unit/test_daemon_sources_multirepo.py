@@ -100,6 +100,24 @@ class TestBuild:
         assert isinstance(source, MultiRepoIssueSource)
         assert [s.labels.trigger for s in source.sources] == ["do-it", "sbxloop:run"]
 
+    def test_per_repo_extra_labels_are_applied_when_an_issue_is_claimed(
+        self, router: RouterOps
+    ) -> None:
+        entries = [RepoConfig(repo="o/a", labels=["team:core"]), RepoConfig(repo="o/b")]
+        source = build_github_source(lambda: router, entries, LABELS, host="db")  # type: ignore[arg-type]
+        items = source.poll()
+        assert source.claim(next(i for i in items if i.repo == "o/a")) is True
+        assert source.claim(next(i for i in items if i.repo == "o/b")) is True
+        posted = {
+            repo: [b for m, p, b in ops.raw_calls if m == "POST" and p.endswith("/labels")]
+            for repo, ops in router.per_repo.items()
+        }
+        # One POST per claim: the in-progress mark plus the repo's own labels.
+        assert posted == {
+            "o/a": [{"labels": ["sbxloop:in-progress", "team:core"]}],
+            "o/b": [{"labels": ["sbxloop:in-progress"]}],
+        }
+
     def test_empty_source_list_is_rejected(self) -> None:
         with pytest.raises(ValueError):
             MultiRepoIssueSource([])

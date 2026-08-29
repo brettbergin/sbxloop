@@ -10,6 +10,7 @@ legacy unqualified ids it always used.
 
 from __future__ import annotations
 
+import sqlite3
 import tomllib
 from pathlib import Path
 from typing import Any, cast
@@ -278,6 +279,26 @@ class TestSingleToMultiUpgrade:
         # No spurious claim failure: nothing was dispatched twice.
         assert len(upgraded.runner.seen) == 2
         assert upgraded.loop.tick().idle_reason == "no_work"
+
+    def test_startup_settles_a_bare_id_row_claimed_before_the_upgrade(
+        self, upgraded: Wiring
+    ) -> None:
+        """Same as above, but with the id stored in the bare pre-#508 form a
+        deployed daemon's store actually holds. The store's own writers
+        normalise ids, so the row is written raw to reach that shape."""
+        conn = sqlite3.connect(upgraded.config.state_dir / "state.db")
+        conn.execute(
+            "UPDATE daemon_work_items SET item_id = 'gh:7', state = 'running', claimed = 1, "
+            "run_id = 'r1' WHERE item_id = 'gh:issue:7'"
+        )
+        conn.commit()
+        conn.close()
+        assert self._start(upgraded) == 0
+        row = upgraded.dstore.get("gh:7")
+        assert row is not None and row.state == "failed" and row.run_id == "r1"
+        # Nothing repo-less is left in flight, so recovery has nothing to resume
+        # and a second start strands nothing.
+        assert upgraded.dstore.strand_repoless("no repo", now=1.6) == []
 
     def test_terminal_repoless_rows_are_kept_as_history(self, upgraded: Wiring) -> None:
         upgraded.dstore.mark_done("gh:issue:7", now=2.0)

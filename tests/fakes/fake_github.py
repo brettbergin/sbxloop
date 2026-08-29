@@ -216,6 +216,9 @@ class FakeGithub(GithubOps):
             return list(self.comments_payload)
         if method == "GET" and "/pulls?state=open&head=" in path:
             return [dict(self.pr)] if self.pr_created else []
+        if method == "POST" and path.endswith("/labels"):
+            assert body is not None
+            return [{"name": name} for name in body["labels"]]
         raise AssertionError(f"FakeGithub: unexpected raw call {method} {path}")
 
     # -- the pull request ----------------------------------------------------

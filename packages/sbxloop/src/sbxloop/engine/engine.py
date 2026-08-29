@@ -1158,6 +1158,8 @@ class LoopEngine:
             head_sha=head_sha,
             node_id=str(data["node_id"]) if data.get("node_id") else None,
         )
+        if run.pr_number is None:
+            self._label_pr(p, pr.number)
         p.delivered_at = self.clock()
         log.info(
             "run.delivered",
@@ -1178,6 +1180,21 @@ class LoopEngine:
             head_sha=head_sha,
             round=round_no,
         )
+
+    def _label_pr(self, p: Pipeline, number: int) -> None:
+        """Put the repository's own ``labels`` (``[[github.repos]]``) on the
+        pull request the run just opened — the other half of what the config
+        promises, the issue half being applied at claim. Best effort: a
+        label refusal must not fail a delivery that succeeded."""
+        labels = list(p.repo_config.labels) if p.repo_config is not None else []
+        if not labels or p.ops is None or p.repo is None:
+            return
+        try:
+            p.ops.raw("POST", f"/repos/{p.repo}/issues/{number}/labels", {"labels": labels})
+        except GithubOpsError:
+            log.warning(
+                "deliver.pr_labels_failed", run=p.run_id, pr=number, labels=labels, exc_info=True
+            )
 
     def _stage_review(self, p: Pipeline) -> ReviewVerdict:
         """The run's own adversarial review of its PR. The verdict is ours;

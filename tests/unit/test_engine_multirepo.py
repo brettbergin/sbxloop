@@ -156,6 +156,31 @@ class TestRunRoutesToItsRepo:
 
         assert fake.pr_kwargs["base"] == "trunk"
 
+    def test_per_repo_extra_labels_land_on_the_opened_pr(self, harness: Harness) -> None:
+        fake = RepoRecordingGithub(repo=REPO_B)
+        fake.checks = [GREEN]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        github = two_repos(labels=["team:core"])
+        engine = harness.engine(ops=fake, github=github, landing=FAST_LANDING)
+
+        result = engine.start("write hello.txt", repo=REPO_B)
+
+        assert result.state == "merged"
+        posts = [(p, b) for m, p, b in fake.raw_calls if m == "POST" and p.endswith("/labels")]
+        assert posts == [
+            (f"/repos/{REPO_B}/issues/{fake.number}/labels", {"labels": ["team:core"]})
+        ]
+
+    def test_a_repo_without_extra_labels_labels_nothing(self, harness: Harness) -> None:
+        fake = RepoRecordingGithub(repo=REPO_B)
+        fake.checks = [GREEN]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.engine(ops=fake, github=two_repos(), landing=FAST_LANDING)
+
+        engine.start("write hello.txt", repo=REPO_B)
+
+        assert not [p for m, p, _ in fake.raw_calls if m == "POST" and p.endswith("/labels")]
+
     def test_single_repo_runs_are_unchanged(self, harness: Harness) -> None:
         fake = RepoRecordingGithub()
         fake.checks = [GREEN]

@@ -737,6 +737,42 @@ class TestRepoScoping:
         assert settled.run_id == "r1"
         assert store.strand_repoless("no repo", now=6.0) == []
 
+    def test_strand_repoless_settles_a_row_stored_under_the_bare_legacy_id(
+        self, tmp_path: Path
+    ) -> None:
+        """The upgrade path's likely shape: a store written before typed ids
+        (#508) holds ``gh:<n>`` keys. ``_row_to_item`` normalises the id, so
+        the settle must bind the id as stored — otherwise the UPDATE matches
+        nothing, the row is reported settled while staying ``running``, and
+        every daemon start strands it again."""
+        path = _pre_multirepo_db(tmp_path)
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "INSERT INTO daemon_work_items (item_id, source_key, title, url, state, "
+            "claimed, run_id, created_at, updated_at, pending_report) "
+            "VALUES ('gh:7', '7', 'old', 'https://x/issues/7', 'running', 1, 'r1', 1.0, 1.0, "
+            "'merged')"
+        )
+        conn.commit()
+        conn.close()
+        store = DaemonStore(path)
+
+        stranded = store.strand_repoless("no repo", now=5.0)
+
+        assert [i.item_id for i in stranded] == ["gh:issue:7"]
+        row = store.get("gh:7")
+        assert row is not None
+        assert row.state == "failed"
+        assert row.last_error == "no repo"
+        assert row.pending_report is None
+        assert row.run_id == "r1"
+        # Idempotent: the row really was settled, so nothing is left to strand.
+        assert store.strand_repoless("no repo", now=6.0) == []
+        raw = (
+            sqlite3.connect(path).execute("SELECT item_id, state FROM daemon_work_items").fetchall()
+        )
+        assert raw == [("gh:7", "failed")]
+
     def test_attribute_repoless_names_rows_from_their_issue_url(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(

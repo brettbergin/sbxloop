@@ -26,6 +26,7 @@ import socket
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 
@@ -130,10 +131,15 @@ class GitHubIssueSource:
         host: str | None = None,
         on_failure: Callable[[BaseException], object] | None = None,
         qualify_ids: bool = False,
+        extra_labels: Sequence[str] = (),
     ) -> None:
         self._ops = ops
         self.repo = repo
         self.labels = labels
+        # The repository's own ``labels = [...]`` (``[[github.repos]]``): added
+        # to an issue alongside the in-progress mark when it is claimed. The
+        # engine puts the same labels on the pull request it opens.
+        self.extra_labels = tuple(extra_labels)
         # With several repositories in one daemon, issue numbers collide;
         # ids are then minted repo-qualified (``gh:<owner>/<name>:issue:<n>``).
         # A single-repo daemon keeps the historical bare form so existing
@@ -163,7 +169,10 @@ class GitHubIssueSource:
         return f"/repos/{self.repo}/issues/{number}"
 
     def _add_label(self, ops: GithubOps, number: str, label: str) -> None:
-        ops.raw("POST", f"{self._issue_path(number)}/labels", {"labels": [label]})
+        self._add_labels(ops, number, [label])
+
+    def _add_labels(self, ops: GithubOps, number: str, labels: Sequence[str]) -> None:
+        ops.raw("POST", f"{self._issue_path(number)}/labels", {"labels": list(labels)})
 
     def _remove_label(self, ops: GithubOps, number: str, label: str) -> None:
         try:
@@ -297,7 +306,7 @@ class GitHubIssueSource:
                 )
                 self._delete_comment_quietly(number, comment_id)
                 return False
-            self._add_label(ops, number, self.labels.in_progress)
+            self._add_labels(ops, number, [self.labels.in_progress, *self.extra_labels])
             added_in_progress = True
             self._remove_label(ops, number, trigger)
         except (GithubOpsError, WorkerError, SbxError) as exc:
@@ -312,10 +321,11 @@ class GitHubIssueSource:
             self._failed(exc)
             if added_in_progress:
                 # Best-effort: leave the issue exactly as we found it.
-                self._guard(
-                    "claim rollback",
-                    lambda ops: self._remove_label(ops, number, self.labels.in_progress),
-                )
+                for added in (self.labels.in_progress, *self.extra_labels):
+                    self._guard(
+                        "claim rollback",
+                        partial(self._remove_label, number=number, label=added),
+                    )
             self._delete_comment_quietly(number, comment_id)
             return False
         log.info(
@@ -644,6 +654,7 @@ def build_github_source(
             host=host,
             on_failure=on_failure,
             qualify_ids=qualify,
+            extra_labels=entry.labels,
         )
         for entry in enabled
     ]

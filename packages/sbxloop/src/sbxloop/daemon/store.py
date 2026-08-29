@@ -479,11 +479,19 @@ class DaemonStore:
                 tuple(sorted(TERMINAL_ITEM_STATES)),
             ).fetchall()
             stranded = [_row_to_item(row) for row in rows]
-            for item in stranded:
+            for row in rows:
+                # Bind the id *as stored*, through the same either-spelling
+                # match every other mutator uses: ``_row_to_item`` normalises
+                # ``gh:<n>`` to ``gh:issue:<n>``, and a pre-upgrade store is
+                # exactly where the bare legacy key still lives. Matching on
+                # the normalised id updated zero rows there, so the row was
+                # reported settled while staying ``running`` (and was
+                # re-stranded on every start).
+                where, ids = _id_match(row["item_id"])
                 self._conn.execute(
-                    "UPDATE daemon_work_items SET state = 'failed', last_error = ?, "
-                    "pending_report = NULL, updated_at = ? WHERE item_id = ?",
-                    (reason[:2000], now, item.item_id),
+                    "UPDATE daemon_work_items SET state = 'failed', last_error = ?, "  # nosec B608
+                    f"pending_report = NULL, updated_at = ? WHERE {where}",
+                    (reason[:2000], now, *ids),
                 )
             self._conn.commit()
         if stranded:
