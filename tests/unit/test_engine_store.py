@@ -20,6 +20,13 @@ def make_task(id: str = "t1") -> TaskRecord:
     return TaskRecord(spec=TaskSpec(id=id, title=id.upper()))
 
 
+class TestPragmas:
+    def test_wal_mode_with_normal_synchronous(self, store: StateStore) -> None:
+        conn = store._conn
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+
+
 class TestRuns:
     def test_create_get_update(self, store: StateStore) -> None:
         record = store.create_run("r1", "do things", "{}")
@@ -614,3 +621,61 @@ class TestWriterSerialization:
             if "_conn.commit()" in line and lock_at < 0 and current != "__init__":
                 unguarded.append(current)
         assert not unguarded, f"writers commit without self._lock: {unguarded}"
+
+
+class TestEphemeralDeltas:
+    """Streaming deltas are UI telemetry: the full ``agent.message`` carries
+    the same text and resume never reads deltas, so no persistence path may
+    write one row per chunk."""
+
+    def _event(self, type_: str, text: str) -> Event:
+        return Event(ts=1.0, run_id="r1", job_id=None, type=type_, data={"text": text})
+
+    def test_delta_is_not_persisted_but_full_message_is(self, store: StateStore) -> None:
+        from sbxloop_worker.protocol import EventTypes
+
+        store.create_run("r1", outcome="o")
+        store.append_event(self._event(EventTypes.AGENT_MESSAGE_DELTA, "he"))
+        store.append_event(self._event(EventTypes.AGENT_MESSAGE_DELTA, "llo"))
+        store.append_event(self._event(EventTypes.AGENT_MESSAGE, "hello"))
+
+        rows = [event for _, event in store.events("r1")]
+        assert [e.type for e in rows] == [EventTypes.AGENT_MESSAGE]
+        assert rows[0].data == {"text": "hello"}
+
+    def test_append_event_if_state_skips_deltas(self, store: StateStore) -> None:
+        from sbxloop_worker.protocol import EventTypes
+
+        store.create_run("r1", outcome="o")
+        assert (
+            store.append_event_if_state(
+                self._event(EventTypes.AGENT_MESSAGE_DELTA, "x"), {"created"}
+            )
+            is False
+        )
+        assert list(store.events("r1")) == []
+        assert (
+            store.append_event_if_state(self._event(EventTypes.AGENT_MESSAGE, "x"), {"created"})
+            is True
+        )
+        assert len(list(store.events("r1"))) == 1
+
+    def test_engine_still_publishes_deltas_to_subscribers(self, store: StateStore) -> None:
+        from sbxloop_worker.protocol import EventTypes
+
+        store.create_run("r1", outcome="o")
+        seen: list[Event] = []
+
+        from sbxloop.events import EventBus
+
+        bus = EventBus()
+        bus.subscribe(lambda e: seen.append(e))  # type: ignore[arg-type]
+        bus.subscribe(lambda e: store.append_event(e))  # type: ignore[arg-type]
+        bus.publish(self._event(EventTypes.AGENT_MESSAGE_DELTA, "he"))
+        bus.publish(self._event(EventTypes.AGENT_MESSAGE, "hello"))
+
+        assert [e.type for e in seen] == [
+            EventTypes.AGENT_MESSAGE_DELTA,
+            EventTypes.AGENT_MESSAGE,
+        ]
+        assert [e.type for _, e in store.events("r1")] == [EventTypes.AGENT_MESSAGE]

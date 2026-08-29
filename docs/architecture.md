@@ -290,7 +290,14 @@ cannot be mistaken for instructions.
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with
-four tables: `runs`, `tasks`, `phase_attempts`, `events`. A row is committed
+four tables: `runs`, `tasks`, `phase_attempts`, `events`. It runs
+`synchronous=NORMAL`, which is the safe setting under WAL: commits no longer
+fsync one-by-one, and a crash can only lose the tail of the WAL, never
+corrupt the database. Streaming `agent.message_delta` events are *not*
+persisted — they are per-chunk UI telemetry that live surfaces (TUI,
+Discord) read off the bus, while the full `agent.message` carries the same
+text and is committed like every other event; resume never reads deltas, so
+`sbxloop logs` differs only by those chunk lines. A row is committed
 after **every** state transition. Infrastructure failures propagate after
 persisting — a crash and a `kill -9` look identical to the store — and
 `resume`:

@@ -8,6 +8,16 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **Streaming deltas are no longer persisted.** `agent.message_delta` is
+  per-chunk UI telemetry: live surfaces (TUI, Discord) still receive every
+  delta over the event bus, but `StateStore.append_event` drops them
+  instead of writing one committed row per chunk. The full `agent.message`
+  is persisted as before, so `sbxloop logs <run>` and the daemon log sink
+  are unchanged apart from the absent delta lines, and resume — which
+  never read deltas — behaves identically. The state DB also runs
+  `PRAGMA synchronous=NORMAL`, the safe setting under WAL, so a commit no
+  longer fsyncs per event.
+
 - **Retired config keys are errors.** The `[daemon]`/`[github]` keys the 1.0
   pipeline retired (see 0.7.55 below) were loaded with a warning for two
   releases so the unattended daemon deploy could not roll back on them;
