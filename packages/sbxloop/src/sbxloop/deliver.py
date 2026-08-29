@@ -86,10 +86,12 @@ def _is_ref_collision(exc: GithubOpsError) -> bool:
 
 
 def _is_pr_collision(exc: GithubOpsError) -> bool:
-    """Whether a PR create failed because that head already has an open PR
-    (HTTP 422 "A pull request already exists for owner:branch")."""
-    text = str(exc)
-    return "HTTP 422" in text and "pull request already exists" in text.lower()
+    """Whether a PR create *may* have failed because that head already has
+    an open PR. GitHub's answer is HTTP 422 "A pull request already exists
+    for owner:branch" — but the `gh` transport used to hand back only
+    "Validation Failed (HTTP 422)" (field run r8tzse1qa, #387), so the
+    status alone is the test and the caller confirms with a lookup."""
+    return exc.http_status == 422 or "HTTP 422" in str(exc)
 
 
 def ensure_repository(
@@ -161,13 +163,16 @@ def deliver_workspace(
     exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES,
     branch: str | None = None,
     closes: int | None = None,
+    pr_number: int | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
     ``branch`` overrides the per-run branch name so a fix round lands on the
     pull request it was fixing: the refs POST 422s on the existing branch and
-    force-updates it, and the PR create 422s on the existing head and reuses
-    the open PR (see the module notes).
+    force-updates it. ``pr_number`` is that pull request when the caller
+    already knows it — a re-delivery then never POSTs a new PR at all (the
+    open PR follows its branch); without it, a 422 on the create is
+    confirmed by looking the branch's open PR up (see the module notes).
 
     ``closes`` is the issue this delivery resolves; it becomes a
     ``Closes #N`` line in the PR body, so GitHub links issue and PR and
@@ -251,6 +256,14 @@ def deliver_workspace(
     _point_branch(ops, repo, branch, commit)
     log.info("deliver.branch_pushed", run=run_id, repo=repo, branch=branch, commit=commit[:12])
 
+    if pr_number is not None:
+        # The PR already exists and its branch just moved under it: there
+        # is nothing to create. Blind-POSTing and parsing the refusal is
+        # how a fix round died with its PR number in hand (#387 field run).
+        data = ops.pr_get(repo, pr_number)
+        url = str(data.get("html_url") or "")
+        log.info("deliver.pr_refreshed", run=run_id, repo=repo, pr=pr_number, url=url)
+        return PrRef(number=pr_number, url=url)
     try:
         pr = ops.pr_create(
             repo,

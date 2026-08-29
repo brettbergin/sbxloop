@@ -674,3 +674,25 @@ class TestRunnerIntegration:
 
 if sys.platform == "win32":  # pragma: no cover
     pytest.skip("fake gh shims are POSIX shell scripts", allow_module_level=True)
+
+
+def test_gh_failure_keeps_the_api_error_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """gh prints its verdict on stderr and the API's error body on stdout;
+    a caller matching on the body's wording needs both (#387 field run)."""
+    import subprocess as sp
+
+    def fake_run(argv: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+        return sp.CompletedProcess(
+            argv,
+            1,
+            stdout='{"message":"Validation Failed","errors":[{"message":'
+            '"A pull request already exists for o:sbxloop/r42."}]}\n',
+            stderr="gh: Validation Failed (HTTP 422)\n",
+        )
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    with pytest.raises(GithubOpError) as info:
+        GhCliTransport().request("POST", "/repos/o/r/pulls", {"head": "sbxloop/r42"})
+    assert info.value.http_status == 422
+    assert "Validation Failed (HTTP 422)" in str(info.value)
+    assert "A pull request already exists" in str(info.value)

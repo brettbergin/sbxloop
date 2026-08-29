@@ -1082,6 +1082,7 @@ class LoopEngine:
             exclude=self.config.artifacts.exclude,
             branch=branch,
             closes=gh.deliver_closes,
+            pr_number=run.pr_number,
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
@@ -1288,11 +1289,17 @@ class LoopEngine:
         gate = phases.project_gate()
         if gate:
             verify_commands.append(gate)
+        # Every fix round starts from the current base. CI judges GitHub's
+        # test merge of the branch with the base, so a red check may only
+        # exist in that merge (field run r8tzse1qa: a test that landed on
+        # main after the run branched); a fixer working on a stale clone
+        # cannot even reproduce it. A base that no longer merges cleanly
+        # is left as conflict markers the brief lists.
         conflicts: tuple[str, ...] = ()
-        if kind == "conflict":
-            merged = self._merge_base_into_clone(p)
-            if merged is not None:
-                conflicts = merged.conflicts
+        merged = self._merge_base_into_clone(p)
+        if merged is not None:
+            conflicts = merged.conflicts
+            if kind == "conflict" or conflicts:
                 why = f"{why}; {merged.message}"
         spec = fix_task(
             round=round_no,
@@ -1335,11 +1342,11 @@ class LoopEngine:
         return "main"
 
     def _merge_base_into_clone(self, p: Pipeline) -> hostgit.MergeResult | None:
-        """Before a conflict fix round: bring the current base into the run's
-        clone so the conflict is real in the fixer's working tree (see
-        :func:`hostgit.merge_from_base`). None when the run has no mounted
-        clone to merge into; a fetch/merge failure is logged and the round
-        proceeds on the tree as it is."""
+        """Before a fix round: bring the current base into the run's clone,
+        so the fixer works on what CI actually judges and a conflict is
+        real in its working tree (see :func:`hostgit.merge_from_base`).
+        None when the run has no mounted clone to merge into; a fetch/merge
+        failure is logged and the round proceeds on the tree as it is."""
         workspace = p.pair.workspace
         if workspace is None or not p.pair.mounted or p.ops is None:
             return None

@@ -109,8 +109,14 @@ class GhCliTransport:
         )
         if proc.returncode != 0:
             stderr = proc.stderr.strip()[:2000]
+            # gh prints its one-line verdict ("gh: Validation Failed (HTTP
+            # 422)") on stderr and the API's error body — the part that
+            # says *what* failed — on stdout. The body is what a caller
+            # matching "pull request already exists" needs (#387 field run).
+            error_body = " ".join(proc.stdout.split())[:1000]
+            detail = f"{stderr} — {error_body}" if error_body else stderr
             raise GithubOpError(
-                f"gh api {method} {path} failed (rc={proc.returncode}): {stderr}",
+                f"gh api {method} {path} failed (rc={proc.returncode}): {detail}",
                 http_status=parse_gh_http_status(stderr),
             )
         return proc.stdout

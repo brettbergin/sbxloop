@@ -8,6 +8,28 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A fix round re-delivers onto the pull request it knows, never a blind
+  create.** Field run `r8tzse1qa` (#387 → PR #505): round two force-moved
+  the branch, POSTed a new PR, got the `gh` transport's bare "Validation
+  Failed (HTTP 422)" — the transport dropped the API's error body, so the
+  "pull request already exists" match never fired — and the run failed at
+  `delivering` with its PR number in hand. Three layers: delivery takes the
+  run's recorded `pr_number` and skips the create entirely; a 422 on a
+  create is confirmed by looking up the branch's open PR rather than by
+  matching prose; and the `gh` transport keeps the API error body in the
+  message. (The old loop had filed exactly this as #488/#490/#495/#497
+  before its findings were closed at the cutover — a reminder that the
+  lane, not the findings, was the problem.)
+- **Every fix round starts from the current base**, not only a `conflict`
+  one. CI judges GitHub's test merge of the branch with its base, so a red
+  check can exist only in that merge — PR #505 failed a test that landed
+  on `main` after its run branched — and a fixer on a stale clone cannot
+  even reproduce it. `hostgit.merge_from_base` now runs before any fix
+  round; a base that no longer merges cleanly leaves conflict markers the
+  brief lists.
+
+### Fixed
+
 - **A review refused for its anchors is re-posted with its findings in the
   body.** Field run `rx8amxxvm` (#130 → PR #503) approved with two nits
   anchored to lines outside the diff; GitHub 422'd the APPROVE *and* the

@@ -722,3 +722,51 @@ class TestRedeliveryCollisions:
                 outcome="x",
                 source_dir=make_workspace(tmp_path),
             )
+
+
+class TestRedeliveryOntoAKnownPr:
+    """Field run r8tzse1qa (#387): round two moved the branch, blind-POSTed a
+    new PR, got gh's bare "Validation Failed (HTTP 422)" and died — with the
+    PR number in hand all along."""
+
+    def test_known_pr_number_skips_the_create(self, tmp_path: Path) -> None:
+        class KnownPrOps(StubOps):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                return {"number": number, "html_url": f"https://github.com/o/r/pull/{number}"}
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise AssertionError("a known PR must not be re-created")
+
+        ops = KnownPrOps()
+        pr = deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=12,
+        )
+        assert pr == PrRef(number=12, url="https://github.com/o/r/pull/12")
+
+    def test_a_bare_422_is_confirmed_by_the_open_pr_lookup(self, tmp_path: Path) -> None:
+        class BareGhOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    return [{"number": 12, "html_url": "https://github.com/o/r/pull/12"}]
+                return super().raw(method, path, body)
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise GithubOpsError(
+                    "github op pr.create failed: GithubOpError: gh api POST /repos/o/r/pulls "
+                    "failed (rc=1): gh: Validation Failed (HTTP 422)",
+                    http_status=422,
+                )
+
+        pr = deliver_workspace(
+            BareGhOps(),  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert pr == PrRef(number=12, url="https://github.com/o/r/pull/12")
