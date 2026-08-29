@@ -358,6 +358,45 @@ class Concierge:
             turns = 0
         return session_id, turns
 
+    # -- repositories --------------------------------------------------------
+
+    def _repo_label(self) -> str:
+        """How the tool descriptions name the repositories they act on."""
+        repos = [r.repo for r in self.config.github.repo_list() if r.enabled]
+        if not repos:
+            return self.config.github.repo or "(no GitHub repository configured)"
+        if len(repos) == 1:
+            return repos[0]
+        return "the configured repositories (" + ", ".join(repos) + ")"
+
+    def _repo_lines(self) -> list[str]:
+        lines = []
+        for entry in self.config.github.repo_list():
+            base = entry.deliver_base or "(repo default)"
+            state = "enabled" if entry.enabled else "disabled"
+            trigger = entry.trigger_label or self.config.daemon.trigger_label
+            lines.append(f"{entry.repo} — {state}, base {base}, trigger label `{trigger}`")
+        return lines
+
+    def _resolve_repo(self, args: dict[str, Any]) -> tuple[str | None, str | None]:
+        """(repo, error) for a tool's optional ``repo`` argument.
+
+        With one configured repository the argument may be omitted; with
+        several, omitting it is an ambiguity the model must resolve.
+        """
+        gh = self.config.github
+        selector = str(args.get("repo") or "").strip()
+        entry = gh.find_repo(selector or None)
+        if entry is not None:
+            return entry.repo, None
+        known = ", ".join(r.repo for r in gh.repo_list()) or "(none)"
+        if selector:
+            return None, (f"unknown repository {selector!r} — configured repositories: {known}")
+        return None, (
+            "several repositories are configured, so this needs an explicit `repo` "
+            f"argument: {known}"
+        )
+
     # -- prompt --------------------------------------------------------------
 
     def _system_message(self) -> str:
@@ -377,7 +416,8 @@ class Concierge:
         return render(
             "concierge",
             command_prefix=self.config.discord.command_prefix,
-            repo=self.config.github.repo or "(no GitHub repository configured)",
+            repo=self._repo_label(),
+            repos=bullet_list(self._repo_lines()) or "(no GitHub repository configured)",
             model=self.config.concierge.model or self.config.model,
             trigger_label=self.config.daemon.trigger_label,
             tool_notes=bullet_list(
@@ -599,13 +639,30 @@ class Concierge:
                 self._tool_daemon_log,
             ),
         ]
+        if self.config.github.repo_list():
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="list_repos",
+                        description=(
+                            "The GitHub repositories this daemon is configured to work on — "
+                            "each with its enabled state and base branch. Answers 'what "
+                            "projects/repos are you configured to work on?'. The guardrails "
+                            "(daily run cap, retry cap, failure breaker, one run at a time) "
+                            "are daemon-wide, not per repository."
+                        ),
+                        parameters=_schema({}),
+                    ),
+                    self._tool_list_repos,
+                )
+            )
         if self.github is not None and self.config.github.repo:
             tools.append(
                 HostTool(
                     HostToolSpec(
                         name="github_get",
                         description=(
-                            f"Read from GitHub repository {self.config.github.repo}: "
+                            f"Read from a configured GitHub repository ({self._repo_label()}): "
                             "what=pr (summary), pr_files (changed files), pr_diff (patches), "
                             "issue, issue_comments — with number; what=file with path "
                             "(and optional ref)."
@@ -626,6 +683,7 @@ class Concierge:
                                 "number": {"type": "integer", "minimum": 1},
                                 "path": {"type": "string"},
                                 "ref": {"type": "string"},
+                                "repo": {"type": "string"},
                             },
                             ["what"],
                         ),
@@ -639,13 +697,16 @@ class Concierge:
                         name="pr_status",
                         description=(
                             "Report how a pull request in "
-                            f"{self.config.github.repo} is doing: CI check runs "
+                            f"{self._repo_label()} is doing: CI check runs "
                             "(with the failing ones' URLs), review state and reviewers, "
                             "mergeability, and whether the branch is behind its base. "
                             "Read-only: it never merges, closes or writes anything."
                         ),
                         parameters=_schema(
-                            {"number": {"type": "integer", "minimum": 1}},
+                            {
+                                "number": {"type": "integer", "minimum": 1},
+                                "repo": {"type": "string"},
+                            },
                             ["number"],
                         ),
                     ),
@@ -663,7 +724,7 @@ class Concierge:
                     HostToolSpec(
                         name="create_issue",
                         description=(
-                            f"File a NEW issue in {self.config.github.repo} for a feature or "
+                            f"File a NEW issue in {self._repo_label()} for a feature or "
                             "bug the person asked for, and queue it: the issue is created "
                             f"with the `{trigger}` label, the daemon claims it on its next "
                             "poll and runs it through to a merged pull request, and a run "
@@ -675,6 +736,7 @@ class Concierge:
                             {
                                 "title": {"type": "string", "maxLength": 200},
                                 "body": {"type": "string"},
+                                "repo": {"type": "string"},
                             },
                             ["title", "body"],
                         ),
@@ -687,7 +749,7 @@ class Concierge:
                     HostToolSpec(
                         name="list_issues",
                         description=(
-                            f"Open issues in {self.config.github.repo}, newest activity "
+                            f"Open issues in {self._repo_label()}, newest activity "
                             "first, each flagged QUEUED / RUNNING / FAILED / BLOCKED from the "
                             "daemon's labels; label narrows to one label. Each line: number, "
                             "title, labels, age, author, comments, url. Queue only what the "
@@ -698,6 +760,7 @@ class Concierge:
                                 "all": {"type": "boolean"},
                                 "label": {"type": "string"},
                                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                                "repo": {"type": "string"},
                             }
                         ),
                     ),
@@ -714,7 +777,11 @@ class Concierge:
                             "goes through create_issue, which queues it itself)."
                         ),
                         parameters=_schema(
-                            {"number": {"type": "integer", "minimum": 1}}, ["number"]
+                            {
+                                "number": {"type": "integer", "minimum": 1},
+                                "repo": {"type": "string"},
+                            },
+                            ["number"],
                         ),
                     ),
                     self._tool_label_issue_for_run,
@@ -725,7 +792,7 @@ class Concierge:
                     HostToolSpec(
                         name="comment_on_issue",
                         description=(
-                            f"Post a comment on an issue in {self.config.github.repo}: a "
+                            f"Post a comment on an issue in {self._repo_label()}: a "
                             "reply to whoever filed it, a triage note, a pointer to the "
                             "issue it duplicates. Write it as it should read on GitHub — "
                             "the author gets a notification and sees only the comment, not "
@@ -736,6 +803,7 @@ class Concierge:
                             {
                                 "number": {"type": "integer", "minimum": 1},
                                 "body": {"type": "string"},
+                                "repo": {"type": "string"},
                             },
                             ["number", "body"],
                         ),
@@ -748,7 +816,7 @@ class Concierge:
                     HostToolSpec(
                         name="close_issue",
                         description=(
-                            f"Close an issue in {self.config.github.repo}. reason="
+                            f"Close an issue in {self._repo_label()}. reason="
                             "`completed` when the work is genuinely done, `not_planned` for "
                             "a duplicate, a won't-fix or something stale. Pass `comment` to "
                             "say why — that comment is the whole explanation the person who "
@@ -763,6 +831,7 @@ class Concierge:
                                 "reason": {"type": "string", "enum": list(CLOSE_REASONS)},
                                 "comment": {"type": "string"},
                                 "confirmation": {"type": "string"},
+                                "repo": {"type": "string"},
                             },
                             ["number", "reason", "confirmation"],
                         ),
@@ -1074,9 +1143,23 @@ class Concierge:
         lines = [f"{r.timestamp} {r.level} {r.logger} {_one_line(r.line, 400)}" for r in records]
         return "\n".join([head, *lines])
 
+    def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
+        entries = self.config.github.repo_list()
+        if not entries:
+            return "no GitHub repository is configured — this daemon runs nothing on GitHub."
+        lines = [f"{len(entries)} configured repository(ies):"]
+        lines += [f"- {line}" for line in self._repo_lines()]
+        lines.append(
+            "The daily run cap, per-item retry cap, the consecutive-failure breaker and "
+            "one-run-at-a-time are daemon-wide, shared across every repository."
+        )
+        return "\n".join(lines)
+
     def _tool_github_get(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
-        repo = self.config.github.repo
+        repo, repo_error = self._resolve_repo(args)
+        if repo_error is not None:
+            return repo_error
         what = str(args.get("what", ""))
         number = args.get("number")
         path = args.get("path")
@@ -1118,7 +1201,9 @@ class Concierge:
 
     def _tool_pr_status(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
-        repo = self.config.github.repo
+        repo, repo_error = self._resolve_repo(args)
+        if repo_error is not None:
+            return repo_error
         number = args.get("number")
         if not number:
             return "pr_status needs number"
@@ -1178,7 +1263,9 @@ class Concierge:
 
     def _tool_create_issue(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
-        repo = self.config.github.repo
+        repo, repo_error = self._resolve_repo(args)
+        if repo_error is not None:
+            return repo_error
         assert repo is not None
         title = _one_line(str(args.get("title", "")).strip(), 200)
         body = str(args.get("body", "")).strip()
@@ -1196,7 +1283,9 @@ class Concierge:
             # Recorded here, not in the public issue body: the work item the
             # daemon builds from this issue inherits it, and the run's finish
             # pings the requester.
-            self.dstore.note_requester(str(ref.number), self._turn_author_id, self.clock())
+            self.dstore.note_requester(
+                str(ref.number), self._turn_author_id, self.clock(), repo=repo
+            )
         log.info("concierge.issue_created", number=ref.number, by=by, title=title[:80])
         status = self.loop.status()
         note = ""
@@ -1213,7 +1302,9 @@ class Concierge:
 
     def _tool_list_issues(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
-        repo = self.config.github.repo
+        repo, repo_error = self._resolve_repo(args)
+        if repo_error is not None:
+            return repo_error
         daemon = self.config.daemon
         limit = _int_arg(args, "limit", 20, 1, 50)
         label = str(args.get("label") or "").strip()
@@ -1263,7 +1354,9 @@ class Concierge:
 
     def _tool_label_issue_for_run(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
-        repo = self.config.github.repo
+        repo, repo_error = self._resolve_repo(args)
+        if repo_error is not None:
+            return repo_error
         number = _issue_number(args)
         if number <= 0:
             return "number is required"
@@ -1288,7 +1381,9 @@ class Concierge:
         ``create_issue``: the comment arrives under the bot's token, so the
         trailer is the only thing saying which human it came from."""
         assert self.github is not None
-        repo = self.config.github.repo
+        repo, repo_error = self._resolve_repo(args)
+        if repo_error is not None:
+            return repo_error
         assert repo is not None
         number = _issue_number(args)
         if number <= 0:
@@ -1320,7 +1415,9 @@ class Concierge:
         after dropping a dead sandbox and a replayed comment is a duplicate.
         """
         assert self.github is not None
-        repo = self.config.github.repo
+        repo, repo_error = self._resolve_repo(args)
+        if repo_error is not None:
+            return repo_error
         assert repo is not None
         number = _issue_number(args)
         if number <= 0:
@@ -1352,7 +1449,9 @@ class Concierge:
             was = str(data.get("state_reason") or "no reason recorded")
             return f'#{number} "{title}" is already closed ({was}) — nothing to do. {url}'
         labels = _label_names(data)
-        item = self.dstore.get(issue_item_id(int(number)))
+        item = self.dstore.get(issue_item_id(int(number), repo)) or self.dstore.get(
+            issue_item_id(int(number))
+        )
         running = item is not None and item.state == "running"
         if daemon.in_progress_label in labels or running:
             run = f" (run `{item.run_id}`)" if item is not None and item.run_id else ""

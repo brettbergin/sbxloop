@@ -39,8 +39,12 @@ Two distributions ship from this repo in lockstep versions:
 
 Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`.
 The github sandbox exists only when the GitHub integration is configured
-(`[github] repo = "owner/repo"`); without it, `pair.github` is `None`, `GH_TOKEN`
-is not required, and the run has no GitHub capability at all:
+(`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
+without it, `pair.github` is `None`, `GH_TOKEN`
+is not required, and the run has no GitHub capability at all. When several
+repositories are configured, the github sandbox is scoped to the one the
+run's work item came from, and carries that repository's `token_env`
+credential:
 
 |            | agent sandbox                                                                                                                                                           | github sandbox                    |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
@@ -177,7 +181,8 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   whole tree, mechanical. The decomposer must put the gate in *some* task's
   exam, but a later task can break what an earlier one proved; this is the
   last check on the tree exactly as it will be delivered. A run with no
-  `[github] repo` ends `completed` here, its work in the workspace.
+  `[github] repo` (and no `[[github.repos]]`) ends `completed` here, its
+  work in the workspace.
 - **DELIVER** — the tree becomes one commit on `sbxloop/<run>` and a draft
   PR (see [Delivery](#delivery)); every later round re-delivers onto the
   same branch, so one run is one PR.
@@ -391,8 +396,8 @@ spent are `blocked` for the same reason: nothing another round would change.
 ## The daemon
 
 `sbxloop daemon` is deliberately small: it claims issues carrying
-`sbxloop:run` in the one configured repository (a label swap plus a claim
-comment as the optimistic lock), runs each as **one** engine run, and
+`sbxloop:run` in **every configured, enabled repository** (a label swap plus
+a claim comment as the optimistic lock), runs each as **one** engine run, and
 reports the outcome on the issue — closed with `sbxloop:completed` when the
 PR merged (the PR body's `Closes #N` closes it even if the daemon is down),
 `sbxloop:failed` when the run gave up (after the per-item attempt cap and
@@ -403,6 +408,68 @@ starts a run. Everything else the daemon does is a guardrail or a
 recovery: the calendar-day run cap, the circuit breaker, the resume cap,
 pause and cancel, startup and staleness reconciliation, run-directory
 retention.
+
+### Repositories
+
+One daemon may tend several repositories. They are declared as an array of
+tables, each entry carrying its own settings:
+
+```toml
+[[github.repos]]
+repo = "you/one"
+deliver_base = "main"
+
+[[github.repos]]
+repo = "you/two"
+enabled = false              # registered but not polled
+token_env = "GH_TOKEN_TWO"   # unset uses the daemon-wide GH_TOKEN
+trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
+labels = ["team:core"]       # extra labels applied to issues/PRs here
+```
+
+The legacy `[github] repo = "owner/name"` form still loads and is
+normalised internally into a one-entry repo list carrying the same
+`deliver_base` / `create_repo` / `create_public`, so nothing about an
+existing single-repo deployment changes. The two forms are mutually
+exclusive; migrate by moving `[github] repo` and its delivery settings into
+one `[[github.repos]]` entry. Configuration is rejected with a clear error
+when a repository is listed twice, when a slug is not `owner/name`, or when
+the section carries delivery settings but names no repository at all.
+
+The split is deliberate and worth stating plainly:
+
+- **Per repository** — base branch (`deliver_base`), repo creation
+  (`create_repo`, `create_public`), the trigger label
+  (`trigger_label`), extra `labels`, the `enabled` switch, and the token
+  environment variable (`token_env`).
+- **Daemon-wide** — the calendar-day run cap (`max_runs_per_day`), the
+  per-item attempt cap (`max_attempts_per_item`) and resume cap, the
+  consecutive-failure circuit breaker (`max_consecutive_failures`,
+  `breaker_cooldown_s`), and **one run at a time**. A failing repository
+  spends the shared budget and can trip the breaker for every repository;
+  that is the point — the guardrails bound what this host does, not what
+  one project does.
+
+Discovery polls each enabled repository in turn, and every work item
+carries the `owner/name` it came from, so a run's clone, branch, draft PR,
+review, CI polling, merge and issue comments/labels all target that
+repository. Its github-ops sandbox is provisioned scoped to that repository
+and given that repository's `token_env` credential (falling back to the
+daemon-wide `GH_TOKEN`); the credential split is unchanged — the GitHub
+token never enters the agent sandbox.
+
+`sbxloop doctor` checks each configured repository on its own line
+(reachable, token permissions), so one broken repo never masks the others'
+verdicts. The host never holds the PAT, so that check is made from a
+short-lived github-ops sandbox per repository, provisioned with exactly that
+repository's credentials (`repo.get`, whose `permissions` block says whether
+the token has write access). If no sandbox can be provisioned the row is a
+soft "reachability unverified" rather than a verdict against the repo. `sbxloop config repos` lists the registered repositories, and
+`sbxloop status` / `sbxloop daemon items` carry a `repo` column. From chat,
+the concierge's `list_repos` tool answers "what projects are you configured
+to work on?" with each repository's enabled state, base branch and trigger
+label; its GitHub-reading tools take an optional `repo` selector and default
+to the sole configured repository when there is only one.
 
 ### Work item ids
 

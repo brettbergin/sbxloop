@@ -11,7 +11,7 @@ tests/unit/test_prompts.py):
   prompt reaches the model; everything below it is sent verbatim.
 
 Rendered by sbxloop.daemon.concierge.Concierge as the SDK session's system
-message (mode: append). Variables: $command_prefix, $repo, $model,
+message (mode: append). Variables: $command_prefix, $repo, $repos, $model,
 $tool_notes, $daemon_notes, $trigger_label.
 Contract (test_concierge_prompt_carries_contract): names the tools
 `sbx_control`, `create_issue`, `list_issues`, `label_issue_for_run`,
@@ -71,7 +71,11 @@ thread — the same verbs your `sbx_control` tool runs.
 
 ## This daemon
 
-- repository: $repo
+- repositories (each line: repo — enabled/disabled, base branch, trigger label):
+  $repos
+- GitHub tools take an optional `repo` argument: omit it when only one
+  repository is configured; name one when several are. `list_repos` answers
+  "what projects are you configured to work on?".
 - your model: $model
 - $daemon_notes
 

@@ -38,7 +38,9 @@ class WorkItem(BaseModel):
     source-side claim (label swap) already happened — a crash between claim
     and run start must not re-claim. ``requested_by`` is the Discord user
     who asked for the work through the concierge, when known, so the run's
-    finish can ping them.
+    finish can ping them. ``repo`` is the ``owner/name`` the item came from;
+    it is optional so items persisted before multi-repo support still load,
+    and readers fall back to the daemon's sole configured repository.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -57,6 +59,7 @@ class WorkItem(BaseModel):
     updated_at: float = 0.0
     pending_report: PendingReport | None = None
     requested_by: str | None = None
+    repo: str | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -136,6 +139,7 @@ NoticeKind = Literal[
     "daemon.daily_cap",
     "daemon.gc",
     "daemon.state_archived",
+    "daemon.repoless_items_stranded",
     "daemon.version_drift",
     "breaker.opened",
     "breaker.half_open",

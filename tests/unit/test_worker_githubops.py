@@ -12,6 +12,7 @@ runs against a scripted Transport (no gh, no network).
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -214,3 +215,153 @@ class TestRunnerErrorInfo:
         result = self._run(tmp_path, RuntimeError("boom"))
         assert result.error is not None
         assert result.error.http_status is None
+
+
+class TestGithubOpsSandboxScoping:
+    """Host-side provisioning of the github-ops sandbox is scoped to the
+    run's repository: its token comes from that repo's ``token_env`` when it
+    has one, its remote configuration names that repo — and the agent
+    sandbox still receives no GitHub credential at all."""
+
+    @staticmethod
+    def _provisioner(tmp_path: Path, repos: list[dict[str, Any]], env: dict[str, str]):
+        from sbxloop.config import Config
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.provision import Provisioner
+
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "github": {"repos": repos}}
+        )
+        return Provisioner(SbxCLI(binary="/bin/true"), config, env=env)
+
+    def test_per_repo_token_env_wins(self, tmp_path: Path) -> None:
+        provisioner = self._provisioner(
+            tmp_path,
+            [
+                {"repo": "o/a", "token_env": "TOKEN_A"},
+                {"repo": "o/b", "token_env": "TOKEN_B"},
+            ],
+            {"GH_TOKEN": "global", "TOKEN_A": "tok-a", "TOKEN_B": "tok-b"},
+        )
+        assert provisioner.gh_token("o/a") == "tok-a"
+        assert provisioner.gh_token("o/b") == "tok-b"
+
+    def test_falls_back_to_the_global_token(self, tmp_path: Path) -> None:
+        provisioner = self._provisioner(
+            tmp_path,
+            [{"repo": "o/a", "token_env": "TOKEN_A"}, {"repo": "o/b"}],
+            {"GH_TOKEN": "global", "TOKEN_A": "tok-a"},
+        )
+        assert provisioner.gh_token("o/b") == "global"
+
+    def test_missing_per_repo_token_names_the_variable(self, tmp_path: Path) -> None:
+        from sbxloop.errors import ProvisionError
+
+        provisioner = self._provisioner(
+            tmp_path, [{"repo": "o/a", "token_env": "TOKEN_A"}], {"GH_TOKEN": "global"}
+        )
+        with pytest.raises(ProvisionError, match="TOKEN_A"):
+            provisioner.gh_token("o/a")
+
+    def test_specs_carry_the_runs_repository(self, tmp_path: Path) -> None:
+        provisioner = self._provisioner(
+            tmp_path,
+            [{"repo": "o/a"}, {"repo": "o/b"}],
+            {"COPILOT_GITHUB_TOKEN": "copilot", "GH_TOKEN": "global"},
+        )
+        agent, github = provisioner.build_specs("r1", tmp_path, "o/b")
+        assert github.persistent_env["SBXLOOP_GITHUB_REPO"] == "o/b"
+        assert github.persistent_env["GH_REPO"] == "o/b"
+        # The isolation invariant: the agent sandbox carries no GitHub
+        # credential and no GitHub remote configuration — only the Copilot
+        # token, bound to the token-exchange host.
+        assert agent.persistent_env == {}
+        assert [(s.host, s.env) for s in agent.secrets] == [
+            ("api.github.com", "COPILOT_GITHUB_TOKEN")
+        ]
+        assert all(s.service != "github" for s in agent.secrets)
+        assert [s.service for s in github.secrets] == ["github"]
+
+    def test_daemon_wide_box_is_unscoped_when_several_repos(self, tmp_path: Path) -> None:
+        """One box polling several repositories must not silently inherit the
+        first repo's identity."""
+        provisioner = self._provisioner(
+            tmp_path, [{"repo": "o/a"}, {"repo": "o/b"}], {"GH_TOKEN": "global"}
+        )
+        assert provisioner.github_repo_env(None) == {}
+        assert provisioner.gh_token(None) == "global"
+
+    def test_single_repo_config_scopes_by_default(self, tmp_path: Path) -> None:
+        provisioner = self._provisioner(
+            tmp_path, [{"repo": "o/only", "token_env": "TOKEN_ONLY"}], {"TOKEN_ONLY": "tok"}
+        )
+        assert provisioner.github_repo_env(None)["SBXLOOP_GITHUB_REPO"] == "o/only"
+        assert provisioner.gh_token(None) == "tok"
+
+
+class TestGithubOpsSandboxProvisioning:
+    """A full pair provisioned for a chosen repository: the github box gets
+    that repo's token and remote, the agent box gets neither."""
+
+    def test_pair_is_scoped_to_the_runs_repository(self, fake_sbx: Any, tmp_path: Path) -> None:
+        from sbxloop.config import Config
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.provision import Provisioner
+
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {
+                    "repos": [
+                        {"repo": "o/a", "token_env": "TOKEN_A"},
+                        {"repo": "o/b", "token_env": "TOKEN_B"},
+                    ]
+                },
+            }
+        )
+        provisioner = Provisioner(
+            SbxCLI(binary=str(fake_sbx.binary)),
+            config,
+            env={
+                "COPILOT_GITHUB_TOKEN": "copilot-token",
+                "GH_TOKEN": "global-token",
+                "TOKEN_A": "tok-a",
+                "TOKEN_B": "tok-b",
+            },
+        )
+        pair = provisioner.ensure_pair("r1", tmp_path / "ws", "o/b")
+        try:
+            github_env = (
+                fake_sbx.sandbox_fs(pair.github.name) / "home/agent/.sbxloop/env.sh"
+            ).read_text()
+            assert "export SBXLOOP_GITHUB_REPO=o/b" in github_env
+            assert "export GH_REPO=o/b" in github_env
+            # ...and the repo's own token, not the daemon-wide one and not
+            # the other repository's.
+            secrets = [json.dumps(entry) for entry in fake_sbx.secrets()]
+            github_secrets = [e for e in secrets if pair.github.name in e]
+            assert github_secrets and all("tok-b" in e for e in github_secrets)
+            assert not any("tok-a" in e for e in secrets)
+            # Isolation invariant: the agent sandbox holds no GitHub token
+            # (neither the global one nor either per-repo one) and is told
+            # nothing about the run's repository.
+            for entry in secrets:
+                if pair.agent.name in entry:
+                    assert "tok-a" not in entry
+                    assert "tok-b" not in entry
+                    assert "global-token" not in entry
+            agent_env_file = fake_sbx.sandbox_fs(pair.agent.name) / "home/agent/.sbxloop/env.sh"
+            agent_env = agent_env_file.read_text() if agent_env_file.exists() else ""
+            # Only the Copilot token, under its own name: no GH_TOKEN /
+            # GITHUB_TOKEN export and none of the GitHub token values.
+            exported = {
+                line.removeprefix("export ").split("=", 1)[0]
+                for line in agent_env.splitlines()
+                if line.startswith("export ")
+            }
+            assert exported <= {"COPILOT_GITHUB_TOKEN"}
+            for forbidden in ("tok-a", "tok-b", "global-token"):
+                assert forbidden not in agent_env
+        finally:
+            pair.agent.rm()
+            pair.github.rm()

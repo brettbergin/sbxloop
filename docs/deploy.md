@@ -171,6 +171,39 @@ deploys unattended, none of that may fail the restart:
   (`gh pr list --search "head:sbxloop/ is:open"`) are merged or closed by
   hand — their items went with the archived state.
 
+## Multiple repositories on one host
+
+One daemon tends every repository declared in `sbxloop.toml`, so a second
+project does **not** need a second unit, state directory or control channel.
+Declare them as `[[github.repos]]` entries — each with its own
+`deliver_base`, `trigger_label`, extra `labels`, `enabled` switch and
+optional `token_env` — and export any per-repo token from the host's
+`secrets.env` alongside `GH_TOKEN`. The legacy `[github] repo = "owner/name"`
+still loads unchanged and is normalised into a one-entry list; migrating is
+moving that key (and its `deliver_base` / `create_repo` / `create_public`)
+into one `[[github.repos]]` entry. The two forms may not be mixed, and a
+duplicated repository or a malformed slug fails config loading. Work items
+queued by the pre-migration single-repo daemon carry no repository. At startup
+the daemon attributes what it can from each row's issue URL; of the rest, only
+items still sitting untouched in the queue are discarded and rediscovered,
+repo-qualified, on the next poll — an issue still carrying `sbxloop:run` is
+simply picked up again. An item that was already **claimed** (or running) is
+not: claiming replaces `sbxloop:run` with `sbxloop:in-progress`, so discovery
+will never see that issue again. Those items are failed with an explicit
+reason instead of being dropped, and the daemon logs
+`daemon.repoless_items_stranded` (and posts a control-channel notice) naming
+each item id and issue URL, so you can clear the in-progress label and re-add
+`sbxloop:run` by hand for anything that was in flight across the upgrade.
+
+Everything under `[[github.repos]]` is per repository; the `[daemon]`
+guardrails — the daily run cap, the per-item attempt and resume caps, the
+consecutive-failure circuit breaker, and one run at a time — stay
+**daemon-wide** and are shared across all of them. That is what makes one
+unit the right shape: the host's budget is bounded in total, and a
+repository that keeps failing trips the breaker for the whole daemon. Deploy
+health checks are unaffected; `sbxloop doctor` reports one row per
+configured repository, so a broken repo is visible without masking the rest.
+
 ## Operating it
 
 ```bash

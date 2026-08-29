@@ -2225,3 +2225,255 @@ class TestDoctorStatsProbe:
         assert "sandbox stats" in result.output
         # fake sbx has no stats command -> in-VM sampling (real 0.38 has one)
         assert "samples in-VM" in result.output
+
+
+MULTI_REPO_TOML = """
+[[github.repos]]
+repo = "acme/alpha"
+deliver_base = "main"
+
+[[github.repos]]
+repo = "acme/beta"
+token_env = "BETA_TOKEN"
+enabled = false
+"""
+
+
+class TestMultiRepoCli:
+    def test_status_shows_the_repo_a_run_targeted(self, workdir: Path) -> None:
+        store = seed_store(workdir)
+        from sbxloop.config import Config
+
+        config = Config.model_validate({"github": {"repo": "acme/alpha"}})
+        store.create_run("rmulti001", "second outcome", config.model_dump_json())
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        assert "repo" in result.output
+        assert "acme/alpha" in result.output
+
+    def test_status_detail_shows_the_repo(self, workdir: Path, fake_sbx: FakeSbx) -> None:
+        store = seed_store(workdir)
+        from sbxloop.config import Config
+
+        config = Config.model_validate({"github": {"repo": "acme/beta"}})
+        store.create_run("rmulti002", "an outcome", config.model_dump_json())
+        result = runner.invoke(app, ["status", "rmulti002"])
+        assert result.exit_code == 0
+        assert "repo: acme/beta" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+    def test_status_single_repo_shape_unchanged(self, workdir: Path) -> None:
+        seed_store(workdir)
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        assert "rseeded11" in result.output and "completed" in result.output
+
+    def test_daemon_items_show_their_repository(self, workdir: Path) -> None:
+        from sbxloop.daemon.store import DaemonStore
+
+        state = workdir / "xdg-state" / "sbxloop" / workdir.name
+        dstore = DaemonStore(state / "state.db")
+        dstore.upsert_new(
+            WorkItem(
+                item_id="gh:acme/alpha:issue:7",
+                source_key="acme/alpha#7",
+                title="alpha work",
+                repo="acme/alpha",
+            ),
+            1.0,
+        )
+        dstore.close()
+        result = runner.invoke(app, ["daemon", "items"])
+        assert result.exit_code == 0, result.output
+        assert "acme/alpha" in result.output
+
+    def test_config_repos_lists_registered_repositories(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(MULTI_REPO_TOML)
+        result = runner.invoke(app, ["config", "repos"])
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "acme/alpha" in plain and "acme/beta" in plain
+        assert "BETA_TOKEN" in plain
+        assert "no" in plain  # beta is disabled
+
+    def test_repo_selector_defaults_to_the_sole_repo(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text('[github]\nrepo = "acme/only"\n')
+        from sbxloop.cli.app import _resolve_repo
+        from sbxloop.config import load_config
+
+        assert _resolve_repo(load_config(), None).repo == "acme/only"
+
+    def test_repo_selector_is_ambiguous_with_several_repos(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[[github.repos]]\nrepo = "acme/alpha"\n[[github.repos]]\nrepo = "acme/beta"\n'
+        )
+        import typer
+
+        from sbxloop.cli.app import _resolve_repo
+        from sbxloop.config import load_config
+
+        config = load_config()
+        with pytest.raises(typer.Exit):
+            _resolve_repo(config, None)
+        assert _resolve_repo(config, "beta").repo == "acme/beta"
+        with pytest.raises(typer.Exit):
+            _resolve_repo(config, "acme/nope")
+
+    def test_config_repos_rejects_an_unknown_selector(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(MULTI_REPO_TOML)
+        result = runner.invoke(app, ["config", "repos", "--repo", "acme/nope"])
+        assert result.exit_code == 2
+        assert "unknown repository" in result.output
+
+
+class TestDoctorRepoChecks:
+    def _config(self, toml: str, workdir: Path) -> Any:
+        from sbxloop.config import load_config
+
+        (workdir / "sbxloop.toml").write_text(toml)
+        return load_config()
+
+    def test_one_row_per_configured_repository(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import repo_checks
+
+        config = self._config(MULTI_REPO_TOML, workdir)
+        rows = repo_checks(config, {"GH_TOKEN": "tok"})
+        names = [row.name for row in rows]
+        assert names == ["github repo acme/alpha", "github repo acme/beta"]
+        assert all(row.ok for row in rows)
+        assert "disabled" in rows[1].detail
+
+    def test_missing_per_repo_token_fails_only_that_repo(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import repo_checks
+
+        config = self._config(
+            '[[github.repos]]\nrepo = "acme/alpha"\n'
+            '[[github.repos]]\nrepo = "acme/beta"\ntoken_env = "BETA_TOKEN"\n',
+            workdir,
+        )
+        alpha, beta = repo_checks(config, {"GH_TOKEN": "tok"})
+        assert alpha.ok
+        assert not beta.ok and "BETA_TOKEN" in beta.detail
+
+    def test_probe_results_are_reported_per_repo(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config(
+            '[[github.repos]]\nrepo = "acme/alpha"\n[[github.repos]]\nrepo = "acme/beta"\n',
+            workdir,
+        )
+
+        def probe(entry: Any) -> RepoProbe:
+            if entry.repo == "acme/alpha":
+                return RepoProbe(reachable=True, detail="reachable")
+            return RepoProbe(reachable=True, missing_permissions=("issues:write",))
+
+        alpha, beta = repo_checks(config, {"GH_TOKEN": "tok"}, probe=probe)
+        assert alpha.ok and "reachable" in alpha.detail
+        assert not beta.ok and "issues:write" in beta.detail
+
+    def test_a_raising_probe_does_not_mask_the_other_repos(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config(
+            '[[github.repos]]\nrepo = "acme/alpha"\n[[github.repos]]\nrepo = "acme/beta"\n',
+            workdir,
+        )
+
+        def probe(entry: Any) -> RepoProbe:
+            if entry.repo == "acme/alpha":
+                raise RuntimeError("boom")
+            return RepoProbe(reachable=True)
+
+        alpha, beta = repo_checks(config, {"GH_TOKEN": "tok"}, probe=probe)
+        assert not alpha.ok and "boom" in alpha.detail
+        assert beta.ok
+
+    def test_missing_repo_is_ok_when_create_repo_is_on(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/new"\ncreate_repo = true\n', workdir)
+        (row,) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=False, creatable=True),
+        )
+        assert row.ok and "create_repo" in row.detail
+
+    def test_an_unavailable_probe_is_unverified_not_a_failure(self, workdir: Path) -> None:
+        """No github sandbox is "we could not ask", not "the repo is bad"."""
+        from sbxloop.cli.doctor import RepoProbeUnavailable, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+
+        def probe(_entry: Any) -> Any:
+            raise RepoProbeUnavailable("no github sandbox (boom)")
+
+        (row,) = repo_checks(config, {"GH_TOKEN": "tok"}, probe=probe)
+        assert row.ok and not row.hard and "unverified" in row.detail
+
+    def test_probe_reads_permissions_from_the_repo_payload(self) -> None:
+        from sbxloop.cli.doctor import _missing_permissions
+
+        assert _missing_permissions({"permissions": {"push": True}}) == ()
+        assert _missing_permissions({"permissions": {"admin": True}}) == ()
+        assert _missing_permissions({}) == ()  # not reported: no invented failure
+        missing = _missing_permissions({"permissions": {"pull": True, "push": False}})
+        assert "issues:write" in missing and "contents:write" in missing
+
+    def test_sandbox_probe_calls_repo_lookup_in_a_scoped_box(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One github-ops box per repository, scoped to that repository."""
+        import sbxloop.daemon.github as daemon_github
+        from sbxloop.cli.doctor import sandbox_repo_probe
+
+        seen: dict[str, object] = {}
+
+        class FakeOps:
+            def repo_lookup(self, repo: str) -> dict[str, object]:
+                seen["looked_up"] = repo
+                return {"permissions": {"push": True}}
+
+        class FakeBox:
+            def __init__(self, *_a: Any, repo: str | None = None, **_kw: Any) -> None:
+                seen["scoped_to"] = repo
+                self.closed = False
+
+            def ops(self) -> FakeOps:
+                return FakeOps()
+
+            def close(self) -> None:
+                seen["closed"] = True
+
+        monkeypatch.setattr(daemon_github, "DaemonGithub", FakeBox)
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        boxes: dict[str, Any] = {}
+        from sbxloop.sbx.cli import SbxCLI
+
+        probe = sandbox_repo_probe(config, SbxCLI(), boxes=boxes)
+        result = probe(config.github.repo_list()[0])
+        assert result.reachable and not result.missing_permissions
+        assert seen["scoped_to"] == "acme/alpha"
+        assert seen["looked_up"] == "acme/alpha"
+        assert set(boxes) == {"acme/alpha"}
+
+    def test_missing_repo_fails_without_create_repo(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/gone"\n', workdir)
+        (row,) = repo_checks(
+            config, {"GH_TOKEN": "tok"}, probe=lambda _e: RepoProbe(reachable=False)
+        )
+        assert not row.ok
+
+    def test_doctor_output_lists_every_repository(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        (workdir / "sbxloop.toml").write_text(MULTI_REPO_TOML)
+        monkeypatch.setenv("COLUMNS", "300")
+        result = runner.invoke(app, ["doctor"])
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "github repo acme/alpha" in plain
+        assert "github repo acme/beta" in plain

@@ -270,7 +270,28 @@ def select_transport() -> Transport:
 OpImpl = Callable[[Transport, dict[str, Any]], JsonValue]
 
 
+# The repository this sandbox is provisioned for. The host scopes the
+# github-ops sandbox to one repository (per run: the repository its work item
+# came from) by exporting these; an op that names no repo acts on it rather
+# than on some globally configured default. Credentials never travel here —
+# the token is a registered secret.
+REPO_ENVS = ("SBXLOOP_GITHUB_REPO", "GH_REPO")
+
+
+def sandbox_repo() -> str | None:
+    """The ``owner/name`` this sandbox is scoped to, if any."""
+    for name in REPO_ENVS:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
 def _require(params: dict[str, Any], *names: str) -> None:
+    if "repo" in names and not params.get("repo"):
+        scoped = sandbox_repo()
+        if scoped:
+            params["repo"] = scoped
     missing = [n for n in names if not params.get(n)]
     if missing:
         raise GithubOpError(f"missing required params: {', '.join(missing)}")

@@ -696,3 +696,42 @@ def test_gh_failure_keeps_the_api_error_body(monkeypatch: pytest.MonkeyPatch) ->
     assert info.value.http_status == 422
     assert "Validation Failed (HTTP 422)" in str(info.value)
     assert "A pull request already exists" in str(info.value)
+
+
+class TestSandboxRepoScope:
+    """The github-ops sandbox is provisioned for one repository; an op that
+    names none acts on that one rather than on a global default."""
+
+    def test_sandbox_repo_reads_the_scoped_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("GH_REPO", raising=False)
+        monkeypatch.setenv("SBXLOOP_GITHUB_REPO", "owner/scoped")
+        assert githubops.sandbox_repo() == "owner/scoped"
+
+    def test_gh_repo_is_the_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SBXLOOP_GITHUB_REPO", raising=False)
+        monkeypatch.setenv("GH_REPO", "owner/gh")
+        assert githubops.sandbox_repo() == "owner/gh"
+
+    def test_unscoped_sandbox_reports_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in githubops.REPO_ENVS:
+            monkeypatch.delenv(name, raising=False)
+        assert githubops.sandbox_repo() is None
+
+    def test_op_defaults_to_the_scoped_repository(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SBXLOOP_GITHUB_REPO", "owner/scoped")
+        transport = RecordingTransport({"/repos/": {"number": 7, "html_url": "u"}})
+        execute_op("issue.create", {"title": "t"}, transport=transport)
+        assert transport.calls[0][1] == "/repos/owner/scoped/issues"
+
+    def test_explicit_repo_wins_over_the_scope(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SBXLOOP_GITHUB_REPO", "owner/scoped")
+        transport = RecordingTransport({"/repos/": {"number": 7, "html_url": "u"}})
+        execute_op("issue.create", {"repo": "other/repo", "title": "t"}, transport=transport)
+        assert transport.calls[0][1] == "/repos/other/repo/issues"
+
+    def test_unscoped_sandbox_still_requires_a_repo(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in githubops.REPO_ENVS:
+            monkeypatch.delenv(name, raising=False)
+        transport = RecordingTransport({})
+        with pytest.raises(GithubOpError, match="missing required params: repo"):
+            execute_op("issue.create", {"title": "t"}, transport=transport)

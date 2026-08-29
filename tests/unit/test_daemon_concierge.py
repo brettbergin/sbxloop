@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -208,6 +208,9 @@ def make(
         raw.setdefault(key, {}).update(value) if isinstance(value, dict) else raw.update(
             {key: value}
         )
+    if raw.get("github", {}).get("repos"):
+        # An explicit repo list replaces the single-repo default above.
+        raw["github"].pop("repo", None)
     cfg = Config.model_validate(raw)
     dstore = DaemonStore(cfg.state_dir / "state.db")
     loop = LoopWithRuns(dstore)
@@ -1578,3 +1581,86 @@ class TestTypedGithubIds:
         turn(concierge, author="alice")
         assert seen == [("r1abcdefg", "alice (via concierge)")]
         assert "r1abcdefg" in client.responses[0].text
+
+
+class TestMultiRepo:
+    """One daemon, several repositories: the concierge must be able to say
+    which it works on, and every GitHub tool must know which one it is
+    acting against."""
+
+    MULTI: ClassVar[dict[str, Any]] = {
+        "github": {
+            "repos": [
+                {"repo": "owner/one", "deliver_base": "main"},
+                {"repo": "owner/two", "deliver_base": "trunk"},
+                {"repo": "owner/three", "enabled": False},
+            ]
+        }
+    }
+
+    def test_list_repos_reports_state_and_base(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"calls": [("list_repos", {})]}],
+            github=FakeGithub(),
+            config=self.MULTI,
+        )
+        turn(concierge, "what projects are you configured to work on?")
+        (repos,) = client.responses
+        assert repos.ok
+        assert "3 configured repository(ies):" in repos.text
+        assert "- owner/one — enabled, base main, trigger label `sbxloop:run`" in repos.text
+        assert "- owner/two — enabled, base trunk, trigger label `sbxloop:run`" in repos.text
+        assert (
+            "- owner/three — disabled, base (repo default), trigger label `sbxloop:run`"
+            in repos.text
+        )
+        assert "daemon-wide" in repos.text
+        names = [t.name for t in client.jobs[0].host_tools]
+        assert "list_repos" in names
+        for name in ("owner/one", "owner/two", "owner/three"):
+            assert name in client.jobs[0].system_message
+
+    def test_single_repo_tools_default_to_the_sole_repo(self, tmp_path: Path) -> None:
+        github = FakeGithub({"/issues/12/comments": {"html_url": "https://gh/c/1"}})
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"calls": [("comment_on_issue", {"number": 12, "body": "hi"})]}],
+            github=github,
+        )
+        turn(concierge)
+        (commented,) = client.responses
+        assert commented.ok
+        assert github.comments[0][0] == "owner/repo"
+
+    def test_multi_repo_tools_need_a_selector_and_route_to_it(self, tmp_path: Path) -> None:
+        github = FakeGithub({"/issues/12/comments": {"html_url": "https://gh/c/1"}})
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("comment_on_issue", {"number": 12, "body": "hi"}),
+                        ("comment_on_issue", {"number": 12, "body": "hi", "repo": "owner/two"}),
+                        ("comment_on_issue", {"number": 12, "body": "hi", "repo": "owner/nope"}),
+                        ("list_issues", {"repo": "one"}),
+                    ]
+                }
+            ],
+            github=github,
+            config=self.MULTI,
+        )
+        turn(concierge)
+        ambiguous, routed, unknown, listed = client.responses
+        assert "explicit `repo` argument" in ambiguous.text
+        assert "owner/one, owner/two" in ambiguous.text
+        assert routed.ok and github.comments[0][0] == "owner/two"
+        assert "unknown repository 'owner/nope'" in unknown.text
+        assert listed.ok
+        assert any(p.startswith("/repos/owner/one/issues?") for p in github.paths)
+
+    def test_tool_descriptions_name_every_repository(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub(), config=self.MULTI)
+        turn(concierge)
+        specs = {t.name: t.description for t in client.jobs[0].host_tools}
+        assert "owner/one" in specs["list_issues"] and "owner/two" in specs["list_issues"]

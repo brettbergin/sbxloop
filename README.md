@@ -333,7 +333,9 @@ Everything else the daemon does is a guardrail or a recovery. It is
 **fully autonomous** — a label alone starts a run *and merges the result* —
 so treat the trigger label as "execute arbitrary instructions with
 `GH_TOKEN`'s repo scope" and restrict who can apply it. The `[daemon]`
-guardrails are the safety net:
+guardrails are the safety net, and they are **daemon-wide**: they bound what
+this host does in total, not what one repository does, so with several
+repositories registered they are shared across all of them —
 
 - a **calendar-day run cap** (`max_runs_per_day`, default 12) counting the
   runs *started* since 00:00 in `run_cap_timezone` (any IANA zone, default
@@ -346,7 +348,8 @@ guardrails are the safety net:
   a failed attempt instead;
 - a **circuit breaker** (`max_consecutive_failures`, default 3, then
   `breaker_cooldown_s`, default 1 h) that is persisted, so a restart cannot
-  reset it;
+  reset it — and counts *consecutive failures across repositories*, so a
+  repo that keeps failing pauses the whole daemon;
 - **pause and cancel**, from Discord or `sbxloop daemon ctl` (below);
 - **reconciliation**: on start, and every tick while nothing is executing,
   runs the store still shows in flight with no process behind them are
@@ -357,8 +360,8 @@ guardrails are the safety net:
   start and daily (see [Sandbox hygiene](#sandbox-hygiene)).
 
 Polling and issue lifecycle run through a long-lived github-ops sandbox the
-daemon owns, so the host still never holds the PAT. Runs are one at a time.
-Ship it as a systemd user service with
+daemon owns, so the host still never holds the PAT. Runs are one at a time,
+across every configured repository. Ship it as a systemd user service with
 [`contrib/systemd/`](contrib/systemd/).
 
 Individual items are steerable from another shell without stopping the
@@ -632,8 +635,8 @@ silently truncated.
 
 ## GitHub integration
 
-sbxloop has **no** GitHub capability until you name the one repository it
-may work with — either per run on the command line:
+sbxloop has **no** GitHub capability until you name at least one repository
+it may work with — either per run on the command line:
 
 ```console
 $ sbxloop run "build the thing" --repo you/your-repo
@@ -648,6 +651,62 @@ deliver_base = ""        # base branch for the PR; unset uses the repo's default
 create_repo = false      # create the repo if missing (or `--create-repo`)
 create_public = false    # created repos are private unless flipped (or `--create-public`)
 ```
+
+Several repositories can be registered instead, as an array of tables — each
+entry carries its own delivery settings, an `enabled` switch and an optional
+per-repo token environment variable:
+
+```toml
+[[github.repos]]
+repo = "you/one"
+deliver_base = "main"
+
+[[github.repos]]
+repo = "you/two"
+enabled = false           # registered but not polled
+token_env = "GH_TOKEN_TWO"  # unset uses the daemon-wide GH_TOKEN
+trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
+labels = ["team:core"]      # extra labels for this repository
+```
+
+A run's github-ops sandbox is provisioned **scoped to the repository its work
+item came from**: it is told which repository it acts on, and it is given that
+repository's `token_env` credential — falling back to the daemon-wide
+`GH_TOKEN`/`GITHUB_TOKEN` when the entry names none. The credential split is
+unchanged by any of this: the GitHub token only ever enters the github-ops
+sandbox, never the agent sandbox (which holds the Copilot token alone) and
+never the host.
+
+The two forms are mutually exclusive: migrate by moving `[github] repo` (and
+its `deliver_base` / `create_repo` / `create_public`) into one
+`[[github.repos]]` entry. A single `[github] repo` keeps working unchanged and
+is normalised internally into a one-entry repo list. Everything under
+`[[github.repos]]` is **per repository**; the daemon-wide guardrails — the
+daily run cap, the per-item retry cap, the consecutive-failure circuit breaker
+and one-run-at-a-time — stay global to the daemon. Work items are keyed by
+issue number **and** repository, so issue #4 in two registered repositories is
+two independent items; an existing daemon state database is migrated in place
+on first start. Rows written before the migration carry no repository: when
+exactly one repository is configured they are backfilled with it. When
+several are, the daemon first names each row from its issue URL
+(`store.repo_attributed_from_url`); of what is left, only rows still sitting
+untouched in the queue are dropped (logging `store.repoless_items_dropped`)
+because only those can be rediscovered — claiming an issue swaps the
+`sbxloop:run` label for `sbxloop:in-progress`, so an already-claimed or
+in-flight item can **never** be picked up again by discovery. Those rows are
+therefore failed rather than deleted, with an operator notice naming each
+item id and issue URL (`daemon.repoless_items_stranded`): their issues keep
+the in-progress label until a human clears it and re-adds `sbxloop:run`.
+Finished items stay as history either way.
+
+`sbxloop config repos` lists the registered repositories with their enabled
+state, base branch, token variable and trigger label; `sbxloop doctor` checks
+each enabled repository on its own line (a failing repo never masks the
+others' verdicts); `sbxloop status` and `sbxloop daemon items` carry a `repo`
+column so every run and work item shows which repository it belongs to.
+Commands that need one repository — `sbxloop run`, `config repos --repo` —
+default to the sole configured repository and, when several are registered,
+ask for `--repo owner/name` rather than guessing.
 
 `repo` is the gate, and there is no separate switch behind it: unset, no
 github sandbox is provisioned, `GH_TOKEN` is not needed, and a run ends
