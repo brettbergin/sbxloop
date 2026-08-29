@@ -1408,13 +1408,6 @@ def daemon(
         )
         raise typer.Exit(2)
     assert config.github.repo is not None
-    if config.retired_keys:
-        log.warning(
-            "daemon.retired_config_keys",
-            keys=list(config.retired_keys),
-            hint="these keys are ignored (landing knobs were carried into [landing]); "
-            "remove them from sbxloop.toml — they become errors in 1.0",
-        )
 
     db_path = config.state_dir / "state.db"
     # A pre-1.0 state database carries the old daemon lanes' tables and item

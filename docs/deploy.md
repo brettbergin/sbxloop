@@ -156,13 +156,15 @@ deploys unattended, none of that may fail the restart:
   with empty tables. Engine run history goes with it — both stores share the
   file. Nothing is migrated; renaming the file back restores the old world
   for a 0.7.x rollback.
-- **Config.** The retired keys — `[daemon] inbox_dir, backlog*, audits, audit_dir, audit_label, backlog_label, delivered_label, postmortems*, review_deliveries, await_review, review_rounds, tool_repo, tracking_issue, close_on_success, auto_merge` and `[github] report, deliver` — still load, with a `config.retired_keys` warning at startup and
-  a `retired config keys` row in `sbxloop doctor`. `deliver_draft`,
-  `merge_method`, `delete_branch_on_merge` and `merge_update_attempts` are
-  carried into `[landing]` unless it sets them itself. They become hard
-  errors in 1.0.0, so edit the host's `sbxloop.toml` at leisure after the
-  first deploy: delete the retired keys and move `auto_merge = true`'s
-  intent — landing is always on now — by simply removing it.
+- **Config.** The retired keys — `[daemon] inbox_dir, backlog*, audits, audit_dir, audit_label, backlog_label, delivered_label, postmortems*, review_deliveries, await_review, review_rounds, tool_repo, tracking_issue, close_on_success, auto_merge` and `[github] report, deliver` — are unknown keys since 1.0.0 and fail config loading like any
+  other (`Extra inputs are not permitted`). The `deliver_draft`,
+  `merge_method`, `delete_branch_on_merge` and `merge_update_attempts`
+  knobs live under `[landing]`. The two releases before 1.0.0 (0.7.55,
+  0.7.56) tolerated them with a `config.retired_keys` warning and a
+  `sbxloop doctor` row precisely so an unattended deploy could not fail on
+  them; a host that skipped those releases must edit `sbxloop.toml` before
+  installing 1.0, or the daemon will not start (the deploy pipeline's
+  health check then rolls back).
 - **Issues and labels.** The old loop's `sbxloop:backlog` / `sbxloop:audit`
   issues are closed by hand at cutover (`gh issue close --reason "not planned"`), those two labels and `sbxloop:delivered` deleted, and
   `sbxloop:blocked` created. Any of the old loop's PRs still open

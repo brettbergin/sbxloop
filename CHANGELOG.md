@@ -8,6 +8,14 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **Retired config keys are errors.** The `[daemon]`/`[github]` keys the 1.0
+  pipeline retired (see 0.7.55 below) were loaded with a warning for two
+  releases so the unattended daemon deploy could not roll back on them;
+  that tolerance — `Config.retired_keys`, the `config.retired_keys`
+  warning, the `retired config keys` doctor row — is gone, and an unknown
+  key fails config loading like any other. Edit `sbxloop.toml` before
+  upgrading a 0.7.x host straight to 1.0 (docs/deploy.md, "1.0 cutover").
+
 - **The run thread follows the pipeline.** The per-run status line now says
   which stage the run is in once its tasks are built — `🚦 gate`,
   `🔀 delivering`, `🔍 review round 2`, `🛠 fix round 1 (review, budget 1/3) · build`, `⏳ CI · 2 pending` / `❌ CI red` / `✅ CI green`,

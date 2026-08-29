@@ -205,7 +205,7 @@ def test_unknown_key_is_config_error(tmp_path: Path) -> None:
     (tmp_path / "sbxloop.toml").write_text("no_such_option = 1\n")
     with pytest.raises(ConfigError, match="invalid sbxloop configuration"):
         load_config(cwd=tmp_path, env={})
-    # Retired keys are tolerated (below); any other unknown key in those
+    # Any unknown key in those
     # sections is still a hard error.
     for section in ("daemon", "github", "landing"):
         (tmp_path / "sbxloop.toml").write_text(f"[{section}]\nno_such_option = 1\n")
@@ -272,7 +272,6 @@ class TestLandingSection:
         assert landing.delete_branch_on_merge is True
         assert landing.merge_update_attempts == 3
         assert landing.review_diff_max_chars == 150_000
-        assert Config().retired_keys == ()
 
     def test_layers_and_validation(self, tmp_path: Path) -> None:
         (tmp_path / "sbxloop.toml").write_text(
@@ -305,95 +304,43 @@ class TestLandingSection:
                 load_config(cwd=tmp_path, env=bad)
 
 
-class TestRetiredKeys:
+class TestRetiredKeysAreErrors:
     """The 1.0 pipeline retired the daemon's self-filing lanes and moved the
-    landing knobs under [landing]. A config still carrying them loads with a
-    warning (the daemon host is unattended), the moved values carry over,
-    and `retired_keys` names them for `doctor`."""
+    landing knobs under [landing]. Until 1.0.0 a config still carrying them
+    loaded with a warning (the daemon host deploys unattended); now they are
+    unknown keys like any other, and `extra="forbid"` names them."""
 
-    def test_daemon_landing_knobs_are_hoisted(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "toml",
+        [
+            "[daemon]\nauto_merge = true\n",
+            '[daemon]\nmerge_method = "rebase"\n',
+            '[daemon]\nbacklog = "github"\n',
+            "[daemon]\npostmortems = true\n",
+            '[daemon]\ninbox_dir = "in"\n',
+            "[daemon]\ntracking_issue = false\n",
+            '[github]\nrepo = "o/r"\ndeliver = true\n',
+            '[github]\nrepo = "o/r"\nreport = false\n',
+            '[github]\nrepo = "o/r"\ndeliver_draft = false\n',
+        ],
+    )
+    def test_retired_keys_fail_to_load(self, tmp_path: Path, toml: str) -> None:
+        (tmp_path / "sbxloop.toml").write_text(toml)
+        with pytest.raises(ConfigError, match="Extra inputs are not permitted"):
+            load_config(cwd=tmp_path, env={})
+
+    def test_retired_keys_from_the_environment_fail_too(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError):
+            load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__AUTO_MERGE": "true"})
+
+    def test_landing_knobs_live_under_landing(self, tmp_path: Path) -> None:
         (tmp_path / "sbxloop.toml").write_text(
-            '[daemon]\nauto_merge = true\nmerge_method = "rebase"\n'
-            "delete_branch_on_merge = false\nmerge_update_attempts = 1\n"
+            '[landing]\nmerge_method = "rebase"\ndeliver_draft = false\n'
         )
         config = load_config(cwd=tmp_path, env={})
         assert config.landing.merge_method == "rebase"
-        assert config.landing.delete_branch_on_merge is False
-        assert config.landing.merge_update_attempts == 1
-        assert set(config.retired_keys) == {
-            "daemon.auto_merge",
-            "daemon.merge_method",
-            "daemon.delete_branch_on_merge",
-            "daemon.merge_update_attempts",
-        }
-        assert not hasattr(config.daemon, "auto_merge")
-
-    def test_github_deliver_keys_are_tolerated_and_deliver_draft_hoisted(
-        self, tmp_path: Path
-    ) -> None:
-        (tmp_path / "sbxloop.toml").write_text(
-            '[github]\nrepo = "o/r"\ndeliver = true\nreport = true\ndeliver_draft = false\n'
-        )
-        config = load_config(cwd=tmp_path, env={})
-        assert config.github.repo == "o/r"
         assert config.landing.deliver_draft is False
-        assert set(config.retired_keys) == {
-            "github.deliver",
-            "github.report",
-            "github.deliver_draft",
-        }
-
-    def test_an_explicit_landing_value_wins_over_a_hoisted_one(self, tmp_path: Path) -> None:
-        (tmp_path / "sbxloop.toml").write_text(
-            '[daemon]\nmerge_method = "rebase"\n[landing]\nmerge_method = "merge"\n'
-        )
-        config = load_config(cwd=tmp_path, env={})
-        assert config.landing.merge_method == "merge"
-        assert config.retired_keys == ("daemon.merge_method",)
-
-    def test_retired_lane_keys_are_dropped_with_a_warning(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        (tmp_path / "sbxloop.toml").write_text(
-            '[daemon]\nbacklog = "github"\nreview_deliveries = true\n'
-            "close_on_success = false\ntracking_issue = true\n"
-            'audit_label = "sbxloop:audit"\ntool_repo = "o/tool"\ninbox_dir = "in"\n'
-        )
-        with caplog.at_level("WARNING"):
-            config = load_config(cwd=tmp_path, env={})
-        assert set(config.retired_keys) == {
-            "daemon.backlog",
-            "daemon.review_deliveries",
-            "daemon.close_on_success",
-            "daemon.tracking_issue",
-            "daemon.audit_label",
-            "daemon.tool_repo",
-            "daemon.inbox_dir",
-        }
-        assert config.daemon.trigger_label == "sbxloop:run"
-        assert any("config.retired_keys" in r.getMessage() for r in caplog.records)
-
-    def test_retired_keys_arrive_from_the_environment_too(self, tmp_path: Path) -> None:
-        config = load_config(
-            cwd=tmp_path,
-            env={"SBXLOOP_DAEMON__AUTO_MERGE": "true", "SBXLOOP_DAEMON__MERGE_METHOD": "merge"},
-        )
-        assert config.landing.merge_method == "merge"
-        assert set(config.retired_keys) == {"daemon.auto_merge", "daemon.merge_method"}
-
-    def test_a_hoisted_value_is_still_validated(self, tmp_path: Path) -> None:
-        (tmp_path / "sbxloop.toml").write_text('[daemon]\nmerge_method = "yolo"\n')
-        with pytest.raises(ConfigError):
-            load_config(cwd=tmp_path, env={})
-
-    def test_retired_keys_survive_a_round_trip_through_json(self, tmp_path: Path) -> None:
-        """Persisted run configs (and resume's rehydration) carry the clean
-        shape: nothing retired leaks back in."""
-        (tmp_path / "sbxloop.toml").write_text('[daemon]\nmerge_method = "rebase"\n')
-        config = load_config(cwd=tmp_path, env={})
-        again = Config.model_validate_json(config.model_dump_json())
-        assert again.landing.merge_method == "rebase"
-        assert again.retired_keys == ()
+        assert not hasattr(config, "retired_keys")
 
 
 def test_policy_defaults_empty(tmp_path: Path) -> None:
