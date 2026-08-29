@@ -395,7 +395,7 @@ stale local HEAD (`[daemon] refresh_workspace`). Daemon runs use `clone`
 isolation regardless of `[sandbox] workspace_isolation` (`[daemon] workspace_isolation`, default `clone`): a dirty tree proceeds from committed
 HEAD with a warning, because `auto`'s refusal has no human present to answer
 it. Per-run clones point their `origin` at the source's origin URL (metadata
-only; any userinfo such as an inline token is stripped from the URL, so
+only; any userinfo such as an embedded token is stripped from the URL, so
 no credentials leave the host). And the daemon keeps its state
 **outside the workspace** at an absolute path — `[daemon] state_dir`, else
 an explicitly configured `state_dir`, else a pre-existing legacy
@@ -468,8 +468,8 @@ migrated, and the old lanes' issues and labels are closed by hand;
 
 With `pip install 'sbxloop[discord]'`, `DISCORD_BOT_TOKEN` in the
 environment, and `[discord] channel_id` set, a gateway bot posts a headline
-per run in the control channel (source issue, run id, branch, PR,
-task tally — plain markdown, with a state marker leading the line) and streams that run's
+card per run in the control channel (source issue, run id, branch, PR,
+task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
 code-fence boundaries instead of clipped — their **narration only**, never the
@@ -483,15 +483,13 @@ block, and `chronology_level = "verbose"` streams every call batched into
 code blocks instead; one **status line edited in place** as tasks
 progress (`⏳ task 2/5 · Add tests · verify`); issue, PR
 and branch as links; verify failures, worker errors, denied permissions and
-refused egress called out; and a finished report (the headline marker turns
-✅/❌/⚠) with the final state, the task tally and the PR. Every message
-is plain Discord markdown — no rich cards — so a busy control channel stays
-readable. How each item
+refused egress called out; and a finished report card (the headline turns
+✅/❌/⚠) with the final state, the task tally and the PR. How each item
 settled is a one-line notice in the control channel, pointing at the run's
 thread — `🎉 gh:issue:9 merged (2/2 tasks done) · PR …`,
 `❌ gh:issue:4 failed (…); 1 attempt(s) left`, `🚧 gh:issue:7 blocked: … — a human needs to look` when an issue lands in `sbxloop:blocked`, `🛑 circuit breaker opened …` — with every URL masked so nothing sprouts a preview.
 Mentions are always disabled, so model output can never ping the
-channel. `[discord] status_line`, `tool_batch_lines`,
+channel. `[discord] embeds`, `status_line`, `tool_batch_lines`,
 `tool_output_lines` (tail output lines echoed for a *successful* call,
 default `0` = none) and `tool_fail_output_lines` (head+tail lines echoed for a
 *failed* call, default `20` — a watcher needs the stderr) tune it, along with
@@ -1059,7 +1057,7 @@ pytest run's first traceback and its failure summary both survive.
 This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with two distributions:
 
 - [`packages/sbxloop`](packages/sbxloop) — the host orchestrator: sbx CLI wrapper, sandbox pair provisioning, worker transport, loop engine, typer CLI + rich TUI.
-- [`packages/sbxloop-worker`](packages/sbxloop-worker) — the in-sandbox runtime: shared protocol models, job runner, Copilot backend. Installed into sandboxes automatically (the host package vendors the worker wheel, so this works before anything is on PyPI).
+- [`packages/sbxloop-worker`](packages/sbxloop-worker) — the in-sandbox runtime: shared protocol models, job runner, Copilot backend. Installed into sandboxes automatically (the host package embeds the worker wheel, so this works before anything is on PyPI).
 
 ## Development
 

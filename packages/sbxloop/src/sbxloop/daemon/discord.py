@@ -49,6 +49,7 @@ from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
 from sbxloop.daemon.discord_format import (
     DISCORD_MAX_MESSAGE,
     Chunk,
+    EmbedSpec,
     RunStats,
     StatusLine,
     SteerProgress,
@@ -58,12 +59,15 @@ from sbxloop.daemon.discord_format import (
     _one_line,
     code,
     daemon_notice,
-    finish_body_text,
+    finish_embed,
+    finish_text,
     format_for_discord,
+    headline_embed,
     headline_text,
     split_markdown,
-    status_text,
-    summary_body_text,
+    status_embed,
+    summary_embed,
+    summary_text,
 )
 from sbxloop.daemon.discord_routing import route_message
 from sbxloop.daemon.model import TERMINAL_NOTICE_KINDS, DaemonNotice, RunReport, WorkItem
@@ -823,7 +827,7 @@ class DiscordBridge:
             return
         prefix = self.discord.command_prefix
         # Same dispatcher as `sbxloop daemon ctl` (#232): Discord only adds
-        # the author attribution and the rendering — the status text, and
+        # the author attribution and the rendering — the status embed, and
         # the steering hint on the usage line.
         word = (cmd.split() or [""])[0].lower()
         by = _author_name(message)
@@ -837,7 +841,7 @@ class DiscordBridge:
         else:
             reply = dispatch(loop, cmd, prefix=prefix, by=by, via="discord")
         if reply.status is not None:
-            await self._send(channel, f"{reply.text}\n{status_text(reply.status)}".strip())
+            await self._send(channel, reply.text, embed=status_embed(reply.status))
         elif not reply.known:
             hint = " — or @mention me in a run's thread to steer that run"
             if self.concierge is not None:
@@ -1129,7 +1133,9 @@ class DiscordBridge:
                 size += len(chunk.text) + 1
                 continue
             await send_group()
-            await self._send(thread, chunk.text, suppress_embeds=chunk.suppress_embeds)
+            await self._send(
+                thread, chunk.text, embed=chunk.embed, suppress_embeds=chunk.suppress_embeds
+            )
         await send_group()
 
     async def _daemon_notice(self, notice: DaemonNotice) -> None:
@@ -1182,17 +1188,36 @@ class DiscordBridge:
         if status is not None:
             status.finish(state)
             await self._edit_status(run_id, force=True)
-        for pending in unanswered:
-            await self._edit_steer_status(pending, "unanswered")
+        text = finish_text(state, report)
+        if report.pr:
+            marker = "🎉 merged" if state == "merged" else "🔀"
+            text += f"\n{marker} PR #{report.pr[0]} <{report.pr[1]}>"
+        if report.reason and state != "merged":
+            text += f"\n⚠ {_one_line(report.reason, 300)}"
+        # The item's own repository, not the daemon's first one: with several
+        # configured, the card must name where this run actually landed.
+        repo = item.repo or self.config.github.repo
+        if unanswered:
+            text += (
+                f"\n⚠ {len(unanswered)} steering message(s) were not answered before the run ended"
+            )
+            for pending in unanswered:
+                await self._edit_steer_status(pending, "unanswered")
         if thread is not None:
-            # One plain verdict post: state, cancel note, PR link, fix rounds,
-            # reason and any unanswered steering all render inline.
-            await self._send_long(thread, finish_body_text(item, report, state, len(unanswered)))
-            # The thread's LAST post: the summary — the run's numbers, what
-            # went well, what needed work — so a human opening the thread
-            # later reads the outcome bottom-up without scrolling.
+            await self._send(
+                thread,
+                text,
+                embed=finish_embed(item, report, state, len(unanswered), repo=repo),
+            )
+            # The thread's LAST post: the summary card — the run's numbers,
+            # what went well, what needed work — so a human opening the
+            # thread later reads the outcome bottom-up without scrolling.
             stats = self._runstats.get(run_id)
-            await self._send_long(thread, summary_body_text(stats, report, state, len(unanswered)))
+            await self._send(
+                thread,
+                summary_text(stats, state),
+                embed=summary_embed(stats, report, state, len(unanswered)),
+            )
         facts = self._facts.setdefault(run_id, {})
         if report.pr:
             facts["pr"] = report.pr
@@ -1406,13 +1431,14 @@ class DiscordBridge:
         target: Any,
         text: str = "",
         *,
+        embed: EmbedSpec | None = None,
         suppress_embeds: bool = False,
         reply_to: Any = None,
         mention_users: bool = False,
     ) -> Any:
         """The single send seam: content is clipped, mentions are always
-        disabled (agent prose can contain @everyone) and every message is
-        plain markdown — the bridge posts no embeds.
+        disabled (agent prose can contain @everyone), embeds are converted
+        here and dropped — text-only retry — if Discord rejects them.
         ``reply_to`` threads the message under a human's message
         (``send(reference=…)``); if Discord rejects the reference the text
         is sent plainly instead."""
@@ -1426,7 +1452,13 @@ class DiscordBridge:
             kwargs["allowed_mentions"] = mentions
         if suppress_embeds:
             kwargs["suppress_embeds"] = True
-        if content is None:
+        if embed is not None:
+            converted = _to_embed(embed) if self.discord.embeds else None
+            if converted is not None:
+                kwargs["embed"] = converted
+            elif not content:
+                content = _clip(embed.as_text(), self.discord.max_message_chars)
+        if content is None and "embed" not in kwargs:
             return None
         try:
             return await target.send(content, **kwargs)
@@ -1442,6 +1474,26 @@ class DiscordBridge:
                 except Exception:
                     log.warning("discord.reply_send_failed", target=target_id, exc_info=True)
                     return None
+            if "embed" in kwargs and embed is not None:
+                log.warning(
+                    "discord.embed_send_failed",
+                    target=target_id,
+                    action="retrying text-only",
+                    exc_info=True,
+                )
+                kwargs.pop("embed")
+                fallback = content or _clip(embed.as_text(), self.discord.max_message_chars)
+                try:
+                    return await target.send(fallback, **kwargs)
+                except Exception:
+                    log.warning(
+                        "discord.send_failed",
+                        target=target_id,
+                        chars=len(fallback),
+                        text_only_retry=True,
+                        exc_info=True,
+                    )
+                    return None
             log.warning(
                 "discord.send_failed",
                 target=target_id,
@@ -1450,18 +1502,12 @@ class DiscordBridge:
             )
             return None
 
-    async def _send_channel(self, text: str, *, mentions: bool = False) -> None:
+    async def _send_channel(
+        self, text: str, *, embed: EmbedSpec | None = None, mentions: bool = False
+    ) -> None:
         channel = await self._channel()
         if channel is not None:
-            await self._send(channel, text, mention_users=mentions)
-
-    async def _send_long(self, target: Any, text: str) -> Any:
-        """Send a body that may exceed one message: split on markdown
-        boundaries so fenced blocks stay intact, then clip each part."""
-        last = None
-        for part in split_markdown(text, self.discord.max_message_chars):
-            last = await self._send(target, part)
-        return last
+            await self._send(channel, text, embed=embed, mention_users=mentions)
 
     async def _react(self, message: Any, emoji: str) -> None:
         try:
@@ -1490,7 +1536,9 @@ class DiscordBridge:
             channel = await self._channel()
             if channel is None:
                 return None
-            headline = await self._send(channel, headline_text(item, run_id))
+            headline = await self._send(
+                channel, headline_text(item, run_id), embed=headline_embed(item, run_id)
+            )
             if headline is None:
                 return None
             if self.discord.thread_per_run:
@@ -1517,7 +1565,7 @@ class DiscordBridge:
     async def _refresh_headline(
         self, run_id: str, *, item: WorkItem | None = None, state: str | None = None
     ) -> None:
-        """Re-render the headline with everything known so far."""
+        """Re-render the headline (text + card) with everything known so far."""
         if item is None:
             with self._lock:
                 item = self._items.get(run_id)
@@ -1526,7 +1574,8 @@ class DiscordBridge:
         facts = self._facts.get(run_id, {})
         await self._edit_headline(
             run_id,
-            headline_text(
+            headline_text(item, run_id, state),
+            embed=headline_embed(
                 item,
                 run_id,
                 state,
@@ -1537,7 +1586,9 @@ class DiscordBridge:
             ),
         )
 
-    async def _edit_headline(self, run_id: str, text: str) -> None:
+    async def _edit_headline(
+        self, run_id: str, text: str, *, embed: EmbedSpec | None = None
+    ) -> None:
         known = self.dstore.discord_thread(run_id)
         if known is None or known.headline_id is None:
             return
@@ -1546,7 +1597,12 @@ class DiscordBridge:
             if channel is None:
                 return
             msg = await channel.fetch_message(known.headline_id)
-            await msg.edit(content=_clip(text, self.discord.max_message_chars))
+            kwargs: dict[str, Any] = {"content": _clip(text, self.discord.max_message_chars)}
+            if embed is not None and self.discord.embeds:
+                converted = _to_embed(embed)
+                if converted is not None:
+                    kwargs["embed"] = converted
+            await msg.edit(**kwargs)
         except Exception:
             log.warning("discord.headline_edit_failed", run=run_id, exc_info=True)
 
@@ -1641,6 +1697,24 @@ def _author_name(message: Any) -> str:
 
 
 # -- discord.py adapters (the only place the optional extra is touched) ------------------
+
+
+def _to_embed(spec: EmbedSpec) -> Any:
+    """``discord.Embed`` for a spec, or None when discord.py is unavailable
+    (tests, or a host without the extra — the caller falls back to text)."""
+    try:
+        import discord as discordpy
+    except ImportError:
+        return None
+    spec = spec.clamped()
+    embed = discordpy.Embed(
+        title=spec.title, description=spec.description, url=spec.url, colour=spec.color
+    )
+    for name, value, inline in spec.fields:
+        embed.add_field(name=name, value=value, inline=inline)
+    if spec.footer:
+        embed.set_footer(text=spec.footer)
+    return embed
 
 
 def _allowed_mentions_users() -> Any:

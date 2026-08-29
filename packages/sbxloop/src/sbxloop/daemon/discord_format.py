@@ -1,9 +1,9 @@
 """Pure Discord formatting for the daemon bridge — no discord.py import.
 
 Everything the bridge says is shaped here, as data: ``Chunk`` (a message
-part with a text body) and a few pure helpers. The output is plain Discord
-markdown — the bridge posts no embeds. The transport
-(``daemon/discord.py``) only decides *where* and *when* to send. Keeping
+part with a text body and/or an ``EmbedSpec``) and a few pure helpers. The
+transport (``daemon/discord.py``) only decides *where* and *when* to send;
+it converts ``EmbedSpec`` into a ``discord.Embed`` at the send seam. Keeping
 this layer free of the optional extra means the exact output is unit-tested
 on every CI matrix entry, not only where ``sbxloop[discord]`` is installed.
 
@@ -56,6 +56,16 @@ from sbxloop.log import redact_text
 # if a caller passes a nonsense limit.
 DISCORD_MAX_MESSAGE = 2000
 
+# Embed limits (Discord API): title 256, description 4096, field name 256,
+# field value 1024, 25 fields, 6000 characters in total.
+EMBED_TITLE_MAX = 256
+EMBED_DESCRIPTION_MAX = 4096
+EMBED_FIELD_NAME_MAX = 256
+EMBED_FIELD_VALUE_MAX = 1024
+EMBED_FIELDS_MAX = 25
+EMBED_TOTAL_MAX = 6000
+EMBED_FOOTER_MAX = 2048
+
 # -- tool output excerpt budget -------------------------------------------------------------
 # The line-selection caps (TOOL_OUTPUT_LINES_DEFAULT,
 # TOOL_FAIL_OUTPUT_LINES_DEFAULT, TOOL_EXCERPT_LINE_CLIP) and the rationale
@@ -66,6 +76,12 @@ DISCORD_MAX_MESSAGE = 2000
 # Total characters of fenced body across all excerpt lines.
 TOOL_EXCERPT_MAX_CHARS = 1200
 
+COLOR_RUNNING = 0x3498DB
+COLOR_OK = 0x2ECC71
+COLOR_FAIL = 0xE74C3C
+COLOR_WARN = 0xE67E22
+COLOR_DIM = 0x95A5A6
+
 # The daemon-side view of "how did the run end".
 STATE_MARKER = {
     "merged": "🎉",
@@ -73,6 +89,13 @@ STATE_MARKER = {
     "failed": "❌",
     "blocked": "🚧",
     "cancelled": "⏹",
+}
+STATE_COLOR = {
+    "merged": COLOR_OK,
+    "completed": COLOR_OK,
+    "failed": COLOR_FAIL,
+    "blocked": COLOR_WARN,
+    "cancelled": COLOR_DIM,
 }
 # How a post-build stage reads in the chronology when the run enters it.
 STAGE_MARKER = {
@@ -94,6 +117,14 @@ _URL_RE = re.compile(r"(?<![<(\[])https?://[^\s<>()\[\]]+")
 def _clip(text: str, limit: int) -> str:
     """Tail-truncate to ``limit`` (never above Discord's cap) with an ellipsis."""
     limit = max(1, min(int(limit), DISCORD_MAX_MESSAGE))
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…" if limit > 1 else "…"
+
+
+def _cut(text: str, limit: int) -> str:
+    """Tail-truncate to an embed-part limit (which may exceed the message cap)."""
+    limit = max(1, int(limit))
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…" if limit > 1 else "…"
@@ -128,15 +159,80 @@ def code(text: object) -> str:
 
 
 @dataclass(frozen=True)
+class EmbedSpec:
+    """A Discord embed as plain data (converted at the send seam)."""
+
+    title: str | None = None
+    description: str | None = None
+    url: str | None = None
+    color: int | None = None
+    fields: tuple[tuple[str, str, bool], ...] = ()  # (name, value, inline)
+    footer: str | None = None
+
+    def clamped(self) -> EmbedSpec:
+        """A copy that respects every embed limit (drops fields past 25,
+        clips each part, then trims the description if the total is over
+        the 6000-character ceiling)."""
+        title = _cut(self.title, EMBED_TITLE_MAX) if self.title else None
+        description = _cut(self.description, EMBED_DESCRIPTION_MAX) if self.description else None
+        footer = _cut(self.footer, EMBED_FOOTER_MAX) if self.footer else None
+        fields = tuple(
+            (_cut(n or "​", EMBED_FIELD_NAME_MAX), _cut(v or "​", EMBED_FIELD_VALUE_MAX), i)
+            for n, v, i in self.fields[:EMBED_FIELDS_MAX]
+        )
+        total = (
+            len(title or "")
+            + len(description or "")
+            + len(footer or "")
+            + sum(len(n) + len(v) for n, v, _ in fields)
+        )
+        # Over the total ceiling: shrink the description first (down to a
+        # readable floor), then drop trailing fields — the leading ones
+        # (source, run, state) matter most — then the footer.
+        kept = list(fields)
+        while total > EMBED_TOTAL_MAX:
+            over = total - EMBED_TOTAL_MAX
+            if description and len(description) > 200:
+                new = _cut(description, max(200, len(description) - over))
+                total -= len(description) - len(new)
+                description = new
+            elif kept:
+                n, v, _ = kept.pop()
+                total -= len(n) + len(v)
+            elif footer:
+                total -= len(footer)
+                footer = None
+            else:
+                break
+        return EmbedSpec(title, description, self.url, self.color, tuple(kept), footer)
+
+    def as_text(self) -> str:
+        """A text rendering for clients/tests without embed support."""
+        lines: list[str] = []
+        if self.title:
+            lines.append(f"**{self.title}**" + (f" {nolink(self.url)}" if self.url else ""))
+        if self.description:
+            lines.append(self.description)
+        for name, value, _ in self.fields:
+            lines.append(f"{name}: {value}")
+        if self.footer:
+            lines.append(f"_{self.footer}_")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class Chunk:
     """One message part.
 
     ``kind``: ``line`` chunks coalesce with neighbours into one message;
     ``block`` chunks are sent on their own (fenced code, long prose);
+    ``embed`` chunks carry an ``EmbedSpec`` (``text`` is the content
+    fallback shown in notifications and by clients that hide embeds).
     ``flush`` asks the pump to send everything buffered so far right away.
     """
 
     text: str = ""
+    embed: EmbedSpec | None = None
     kind: str = "line"
     flush: bool = False
     suppress_embeds: bool = False
@@ -382,7 +478,7 @@ def output_excerpt(
     body = "\n".join(picked)
     # Body cap, then a whole-message clamp that also re-closes the fence if
     # the clamp landed inside it.
-    body = _clip(body, max(1, int(max_chars)))
+    body = _cut(body, max(1, int(max_chars)))
     text = f"{head}\n```text\n{body}\n```"
     if len(text) > DISCORD_MAX_MESSAGE:
         text = _clip(text, DISCORD_MAX_MESSAGE - 4).rstrip("\n") + "\n```"
@@ -1329,7 +1425,18 @@ def _item_code(item: WorkItem) -> str:
     return code(normalize_item_id(item.item_id))
 
 
-def headline_text(
+def headline_text(item: WorkItem, run_id: str, state: str | None = None) -> str:
+    """The headline's content= text (notification preview / embed fallback)."""
+    origin, _ = _origin(item)
+    origin = link(origin, item.url) if item.url else origin
+    marker = STATE_MARKER.get(state or "", "▶")
+    return (
+        f"{marker} run {code(run_id)} — **{_one_line(item.title, 120)}** · "
+        f"{_item_code(item)} · {origin}"
+    )
+
+
+def headline_embed(
     item: WorkItem,
     run_id: str,
     state: str | None = None,
@@ -1339,32 +1446,32 @@ def headline_text(
     summary: str | None = None,
     requested_by: str | None = None,
     hostname: str | None = None,
-) -> str:
-    """The headline as plain markdown: state marker, run id, title, item id
-    and origin link on the first line; the optional facts the card used to
-    carried (branch, PR, task summary, requester, host) follow
-    on a second line so nothing is lost."""
-    origin, _ = _origin(item)
-    origin = link(origin, item.url) if item.url else origin
-    marker = STATE_MARKER.get(state or "", "▶")
-    head = (
-        f"{marker} run {code(run_id)} — **{_one_line(item.title, 120)}** · "
-        f"{_item_code(item)} · {origin}"
-    )
-    bits = [f"state {state or 'running'}"]
+) -> EmbedSpec:
+    origin, _kind = _origin(item)
+    fields: list[tuple[str, str, bool]] = [
+        ("Source", link(origin, item.url) if item.url else origin, True),
+        ("Item", _item_code(item), True),
+        ("Run", code(run_id), True),
+        ("State", state or "running", True),
+    ]
     if branch:
-        bits.append(f"branch {code(branch)}")
+        fields.append(("Branch", code(branch), True))
     if pr:
-        bits.append(f"PR {link(f'#{pr[0]}', pr[1])}")
+        fields.append(("PR", link(f"#{pr[0]}", pr[1]), True))
     if summary:
-        bits.append(_one_line(summary, 120))
+        fields.append(("Tasks", summary, True))
     if requested_by:
         # A plain mention renders as the name; the send path disables
-        # pings, so nobody is notified by the headline itself.
-        bits.append(f"requested by <@{requested_by}>")
+        # pings, so nobody is notified by the card itself.
+        fields.append(("Requested by", f"<@{requested_by}>", True))
     host = hostname if hostname is not None else socket.gethostname()
-    bits.append(f"sbxloop · {host}")
-    return _clip(head + "\n" + " · ".join(bits), DISCORD_MAX_MESSAGE)
+    return EmbedSpec(
+        title=_one_line(item.title, 200),
+        url=item.url or None,
+        color=STATE_COLOR.get(state or "", COLOR_RUNNING),
+        fields=tuple(fields),
+        footer=f"sbxloop · {host}",
+    ).clamped()
 
 
 def finish_text(state: str, report: RunReport) -> str:
@@ -1385,30 +1492,35 @@ def _cancel_note(item_id: str | None, report: RunReport) -> str:
     return note
 
 
-def finish_body_text(
+def finish_embed(
     item: WorkItem,
     report: RunReport,
     state: str,
     unanswered: int = 0,
-) -> str:
-    """The run's finish verdict as plain markdown. Everything the finish card
-    carried in fields — cancel note, PR link, fix rounds, reason, unanswered
-    steering, run id and item title — is rendered inline."""
-    marker = STATE_MARKER.get(state, "🏁")
-    head = f"{marker} **finished: {state}** — {report.task_summary}"
-    lines: list[str] = []
+    *,
+    repo: str | None = None,
+) -> EmbedSpec:
+    fields: list[tuple[str, str, bool]] = []
     if report.cancelled_by:
-        lines.append(_cancel_note(item.item_id, report))
+        fields.append(("Cancelled", _cancel_note(item.item_id, report), False))
     if report.pr:
-        lines.append(f"PR {link(f'#{report.pr[0]}', report.pr[1])}")
+        fields.append(("PR", link(f"#{report.pr[0]}", report.pr[1]), True))
     if report.rounds:
-        lines.append(f"fix rounds: {report.rounds}")
+        fields.append(("Fix rounds", str(report.rounds), True))
     if report.reason and state != "merged":
-        lines.append(f"reason: {_one_line(report.reason, 600)}")
+        fields.append(("Reason", _one_line(report.reason, 600), False))
     if unanswered:
-        lines.append(f"⚠ {unanswered} message(s) were not answered before the run ended")
-    lines.append(f"run {code(report.run_id)} · {_one_line(item.title, 80)}")
-    return _clip(head + "\n" + "\n".join(f"• {line}" for line in lines), DISCORD_MAX_MESSAGE)
+        fields.append(
+            ("Steering", f"⚠ {unanswered} message(s) were not answered before the run ended", False)
+        )
+    marker = STATE_MARKER.get(state, "🏁")
+    return EmbedSpec(
+        title=f"{marker} finished: {state}",
+        description=report.task_summary,
+        color=STATE_COLOR.get(state, COLOR_DIM),
+        fields=tuple(fields),
+        footer=f"run {report.run_id} · {_one_line(item.title, 80)}",
+    ).clamped()
 
 
 # -- end-of-run summary --------------------------------------------------------------
@@ -1525,7 +1637,8 @@ def _fmt_count(value: int | None) -> str:
 
 
 def summary_text(stats: RunStats | None, state: str) -> str:
-    """The lead over the summary body: the headline numbers."""
+    """The plain-text lead over the summary embed: the headline numbers, so
+    the card still reads where embeds are suppressed."""
     head = "📊 **run summary**"
     if stats is None:
         return head
@@ -1615,55 +1728,64 @@ def _bullets(lines: list[str], empty: str) -> str:
     return "\n".join(f"• {line}" for line in lines) if lines else empty
 
 
-def summary_body_text(
+def summary_embed(
     stats: RunStats | None,
     report: RunReport,
     state: str,
     unanswered: int = 0,
-) -> str:
-    """The full end-of-run summary as plain markdown — the last thing posted
-    in a run thread: the run's numbers, what went well, what needed work."""
+) -> EmbedSpec:
+    """The end-of-run summary card — the last thing posted in a run thread:
+    the run's numbers, what went well, and what needed work."""
     stats = stats or RunStats()
-    out = [summary_text(stats, state)]
     description = f"**{state}** — {report.task_summary}"
     if (dur := stats.duration_s) is not None:
         description += f" in {_fmt_duration(dur)}"
-    out.append(description)
     if stats.resumed:
-        out.append("_stats cover the run since the daemon last picked it up_")
+        description += "\n_stats cover the run since the daemon last picked it up_"
+    fields: list[tuple[str, str, bool]] = []
     if rows := _stat_rows(stats):
-        out.append("**Stats**\n" + "\n".join(rows))
-    out.append("**Went well**\n" + _bullets(_went_well(stats, report), "nothing stood out"))
-    out.append(
-        "**Needed work**\n"
-        + _bullets(_needed_work(stats, report, unanswered), "no setbacks observed")
+        fields.append(("Stats", "\n".join(rows), False))
+    fields.append(("Went well", _bullets(_went_well(stats, report), "nothing stood out"), False))
+    fields.append(
+        (
+            "Needed work",
+            _bullets(_needed_work(stats, report, unanswered), "no setbacks observed"),
+            False,
+        )
     )
-    out.append(f"_run {report.run_id}_")
-    return _clip("\n".join(out), DISCORD_MAX_MESSAGE)
+    return EmbedSpec(
+        title="📊 run summary",
+        description=description,
+        color=STATE_COLOR.get(state, COLOR_DIM),
+        fields=tuple(fields),
+        footer=f"run {report.run_id}",
+    ).clamped()
 
 
-def status_text(status: dict[str, Any]) -> str:
-    """The live daemon status message as plain markdown . The leading marker carries the at-a-glance
-    signal: 🛑 breaker open, ⏸ paused, ✅ healthy."""
+def status_embed(status: dict[str, Any]) -> EmbedSpec:
     cur = status.get("current")
     current = f"{code(cur['run_id'])} — {_one_line(cur.get('title') or '', 120)}" if cur else "idle"
     breaker = "open" if status.get("breaker_open") else "closed"
     resumes = status.get("resumes_today", 0)
     tz = status.get("run_cap_timezone", "UTC")
-    marker = "🛑" if status.get("breaker_open") else ("⏸" if status.get("paused") else "✅")
-    runs = (
-        f"{status.get('runs_today', 0)}/{status.get('max_runs_per_day', '?')}"
-        f" · resets 00:00 {tz}" + (f" ({resumes} resumed)" if resumes else "")
+    fields = (
+        ("Current", current, False),
+        ("Queued", str(status.get("queued", 0)), True),
+        (
+            f"Runs today ({tz})",
+            f"{status.get('runs_today', 0)}/{status.get('max_runs_per_day', '?')}"
+            f" · resets 00:00 {tz}" + (f" ({resumes} resumed)" if resumes else ""),
+            True,
+        ),
+        ("Breaker", breaker, True),
+        ("Paused", "yes" if status.get("paused") else "no", True),
     )
-    lines = [
-        f"{marker} **sbxloop daemon**",
-        f"• Current: {current}",
-        f"• Queued: {status.get('queued', 0)}",
-        f"• Runs today ({tz}): {runs}",
-        f"• Breaker: {breaker}",
-        f"• Paused: {'yes' if status.get('paused') else 'no'}",
-    ]
-    return _clip("\n".join(lines), DISCORD_MAX_MESSAGE)
+    color = (
+        COLOR_FAIL
+        if status.get("breaker_open")
+        else (COLOR_WARN if status.get("paused") else COLOR_OK)
+    )
+    return EmbedSpec(title="sbxloop daemon", color=color, fields=fields).clamped()
 
 
 def queue_lines(items: list[WorkItem], limit: int = 15) -> str:
@@ -1729,21 +1851,27 @@ def daemon_notice(notice: DaemonNotice | str, *, thread_id: int | None = None) -
 
 
 __all__ = [
+    "COLOR_FAIL",
+    "COLOR_OK",
+    "COLOR_RUNNING",
+    "COLOR_WARN",
     "DISCORD_MAX_MESSAGE",
     "TOOL_EXCERPT_LINE_CLIP",
     "TOOL_EXCERPT_MAX_CHARS",
     "TOOL_FAIL_OUTPUT_LINES_DEFAULT",
     "TOOL_OUTPUT_LINES_DEFAULT",
     "Chunk",
+    "EmbedSpec",
     "RunStats",
     "StatusLine",
     "ToolBatcher",
     "block",
     "code",
     "daemon_notice",
-    "finish_body_text",
+    "finish_embed",
     "finish_text",
     "format_for_discord",
+    "headline_embed",
     "headline_text",
     "items_lines",
     "line",
@@ -1754,8 +1882,8 @@ __all__ = [
     "queue_lines",
     "roster_text",
     "split_markdown",
-    "status_text",
+    "status_embed",
     "strip_json_payload",
-    "summary_body_text",
+    "summary_embed",
     "summary_text",
 ]
