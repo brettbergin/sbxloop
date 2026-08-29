@@ -29,7 +29,7 @@ from functools import partial
 from pathlib import Path
 
 from sbxloop import hostgit
-from sbxloop.config import Config
+from sbxloop.config import Config, RepoConfig
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.ids import branch_name
@@ -174,7 +174,9 @@ class Provisioner:
 
     # -- spec construction -------------------------------------------------
 
-    def build_specs(self, run_id: str, workspace: Path) -> tuple[SandboxSpec, SandboxSpec]:
+    def build_specs(
+        self, run_id: str, workspace: Path, repo: str | None = None
+    ) -> tuple[SandboxSpec, SandboxSpec]:
         extra = tuple(self.config.sandbox.extra_allow_domains)
         template = self.config.sandbox.template
         agent = SandboxSpec(
@@ -203,6 +205,7 @@ class Provisioner:
             template=template,
             policy_allows=[*GITHUB_ALLOW_DOMAINS, *extra],
             secrets=[SecretSpec(kind="service", service="github")],
+            persistent_env=self.github_repo_env(repo),
         )
         return agent, github
 
@@ -217,8 +220,26 @@ class Provisioner:
             )
         return token
 
-    def gh_token(self) -> str:
-        for name in GH_TOKEN_ENVS:
+    def gh_token(self, repo: str | None = None) -> str:
+        """The token the github sandbox gets, scoped to ``repo``.
+
+        A repository may name its own token variable (``[[github.repos]]
+        token_env``); that variable wins over the daemon-wide
+        GH_TOKEN/GITHUB_TOKEN, so a run against repo B authenticates with
+        B's credentials. ``repo`` is the run's repository; ``None`` uses the
+        configured default — which, for a run, is the one repository the
+        config was already narrowed to.
+        """
+        entry = self._repo_entry(repo)
+        names: tuple[str, ...] = GH_TOKEN_ENVS
+        if entry is not None and entry.token_env:
+            token = self.env.get(entry.token_env, "")
+            if token:
+                return token
+            raise ProvisionError(
+                f"{entry.token_env} (the token_env of {entry.repo}) is not set on the host."
+            )
+        for name in names:
             token = self.env.get(name, "")
             if token:
                 return token
@@ -228,9 +249,37 @@ class Provisioner:
             "contents:read) and export GH_TOKEN."
         )
 
+    def _repo_entry(self, repo: str | None) -> RepoConfig | None:
+        """The configured entry a sandbox is scoped to.
+
+        With no selector this resolves only when the choice is unambiguous —
+        the sole enabled repository, which is exactly what a run's narrowed
+        config holds. A daemon-wide sandbox with several repositories
+        configured must not silently inherit the first repo's token or
+        remote: it falls back to the daemon-wide credentials instead.
+        """
+        if repo is not None:
+            return self.config.github.effective_repo(repo)
+        return self.config.github.default_repo()
+
+    def github_repo_env(self, repo: str | None = None) -> dict[str, str]:
+        """Remote configuration for the github-ops sandbox.
+
+        The sandbox is told which repository it acts on (``GH_REPO``, which
+        gh itself honours) so ops that omit an explicit repo still target the
+        run's repository rather than a globally configured one. No credential
+        is carried here — the token is registered as a secret.
+        """
+        entry = self._repo_entry(repo)
+        if entry is None:
+            return {}
+        return {"GH_REPO": entry.repo, "SBXLOOP_GITHUB_REPO": entry.repo}
+
     # -- provisioning ------------------------------------------------------
 
-    def ensure_pair(self, run_id: str, workspace: Path | None = None) -> SandboxPair:
+    def ensure_pair(
+        self, run_id: str, workspace: Path | None = None, repo: str | None = None
+    ) -> SandboxPair:
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
             # resume pin from the runs table (which must be reused in place
@@ -241,7 +290,7 @@ class Provisioner:
         else:
             workspace = self._resolve_workspace(run_id)
         workspace.mkdir(parents=True, exist_ok=True)
-        return self._provision_pair(run_id, workspace)
+        return self._provision_pair(run_id, workspace, repo)
 
     def _resolve_workspace(self, run_id: str) -> Path:
         """Where this fresh run works: the per-run dir, the configured
@@ -351,7 +400,7 @@ class Provisioner:
         )
         return clone_dir
 
-    def _provision_pair(self, run_id: str, workspace: Path) -> SandboxPair:
+    def _provision_pair(self, run_id: str, workspace: Path, repo: str | None = None) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
         # no GitHub capability at all — and one less microVM to boot.
@@ -360,9 +409,9 @@ class Provisioner:
         # Fail fast on missing tokens before creating any microVM.
         tokens: dict[SandboxRole, str] = {"agent": self.copilot_token()}
         if github_enabled:
-            tokens["github"] = self.gh_token()
+            tokens["github"] = self.gh_token(repo)
 
-        agent_spec, github_spec = self.build_specs(run_id, workspace)
+        agent_spec, github_spec = self.build_specs(run_id, workspace, repo)
         specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
         created: list[Sandbox] = []
         registered_secret_rms: list[Callable[[], bool]] = []
@@ -395,6 +444,9 @@ class Provisioner:
             rms = self._apply_secrets(spec, sandbox, tokens[spec.role])
             with rollback_lock:
                 registered_secret_rms.extend(rms)
+            self._apply_persistent_env(spec, sandbox)
+            # After the env write: the fallback rewrites the whole file (it
+            # folds persistent_env in itself), so it must have the last word.
             self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
             sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             if self.post_create is not None:
@@ -488,7 +540,7 @@ class Provisioner:
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
 
-    def github_only_spec(self, name: str, workspace: Path) -> SandboxSpec:
+    def github_only_spec(self, name: str, workspace: Path, repo: str | None = None) -> SandboxSpec:
         """A github-role spec that is not tied to a run — the daemon's
         long-lived polling/ops sandbox. Mirrors the pair's github spec."""
         return SandboxSpec(
@@ -498,6 +550,7 @@ class Provisioner:
             template=self.config.sandbox.template,
             policy_allows=[*GITHUB_ALLOW_DOMAINS, *self.config.sandbox.extra_allow_domains],
             secrets=[SecretSpec(kind="service", service="github")],
+            persistent_env=self.github_repo_env(repo),
         )
 
     def agent_only_spec(self, name: str, workspace: Path) -> SandboxSpec:
@@ -524,6 +577,7 @@ class Provisioner:
         *,
         post_create: PostCreate | None = None,
         run_id: str | None = None,
+        repo: str | None = None,
     ) -> Sandbox:
         """Provision one github-role sandbox (GH_TOKEN only) outside a run's
         pair.
@@ -539,8 +593,8 @@ class Provisioner:
         *inside* that try, so a caller's worker install failing rolls the
         sandbox and its secrets back too.
         """
-        token = self.gh_token()
-        spec = self.github_only_spec(name, workspace)
+        token = self.gh_token(repo)
+        spec = self.github_only_spec(name, workspace, repo)
         return self._ensure_single(spec, token, post_create=post_create, run_id=run_id)
 
     def ensure_agent_only(
@@ -577,6 +631,7 @@ class Provisioner:
             created = Sandbox(self.cli, spec.name)
             self._apply_policy(spec)
             registered_secret_rms.extend(self._apply_secrets(spec, created, token))
+            self._apply_persistent_env(spec, created)
             self._verify_secret_env(label, spec, created, token)
             created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             hook = post_create or self.post_create
@@ -855,6 +910,24 @@ class Provisioner:
             message="workspace mount not found in VM; artifacts will be harvested",
         )
         return None
+
+    def _apply_persistent_env(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
+        """Write the spec's non-secret environment into the VM's env file.
+
+        Under ``plain-env`` the token writer already emitted these exports,
+        so this is the ``proxy`` (default) strategy's path: the repository a
+        github-ops sandbox is scoped to has to reach the worker, and the env
+        file is what the worker loads at startup. Nothing secret goes here.
+        """
+        if not spec.persistent_env or self.config.secret_strategy == "plain-env":  # nosec B105
+            return
+        lines = "".join(
+            f"export {key}={shlex.quote(value)}\n"
+            for key, value in sorted(spec.persistent_env.items())
+        )
+        sandbox.exec(["mkdir", "-p", ENV_FILE.rsplit("/", 1)[0]])
+        sandbox.write_text(ENV_FILE, lines)
+        sandbox.exec(["chmod", "600", ENV_FILE])
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""

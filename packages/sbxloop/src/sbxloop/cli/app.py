@@ -29,6 +29,7 @@ from sbxloop.config import (
     DaemonConfig,
     DiscordConfig,
     GithubConfig,
+    RepoConfig,
     load_config,
     load_config_with_sources,
     load_dotenv_file,
@@ -42,7 +43,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
-from sbxloop.ghids import normalize_item_id
+from sbxloop.ghids import normalize_item_id, try_parse_gh_id
 from sbxloop.log import configure_logging, get_logger
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import SbxCLI
@@ -121,6 +122,65 @@ def _config_with_overrides(**overrides: Any) -> Config:
 
 def _store(config: Config) -> StateStore:
     return StateStore(config.state_dir / "state.db")
+
+
+def _resolve_repo(config: Config, selector: str | None) -> RepoConfig:
+    """The repository a command acts on.
+
+    ``selector`` may be a full ``owner/name`` or an unambiguous bare name;
+    with no selector the sole configured repository is used. Anything else —
+    no repository at all, an unknown selector, or several configured repos
+    with nothing to choose between them — is a clear CLI error rather than a
+    silent pick of the first entry.
+    """
+    entries = config.github.repo_list()
+    if not entries:
+        console.print(
+            "[bold red]no GitHub repository is configured.[/] Add "
+            '[cyan]\\[github] repo = "owner/name"[/] or a [cyan]\\[\\[github.repos]][/] '
+            "entry to sbxloop.toml, or pass [cyan]--repo owner/name[/]."
+        )
+        raise typer.Exit(2)
+    entry = config.github.find_repo(selector)
+    if entry is not None:
+        return entry
+    known = ", ".join(r.repo for r in entries)
+    if selector is None:
+        console.print(
+            "[bold red]several repositories are configured[/] — pass "
+            f"[cyan]--repo owner/name[/] to choose one of: {known}"
+        )
+    else:
+        console.print(f"[bold red]unknown repository[/] {selector!r} — configured: {known}")
+    raise typer.Exit(2)
+
+
+def _run_repo(store: StateStore, run_id: str) -> str:
+    """The repository a run targeted, from the config persisted at its
+    creation. Empty when the run predates config persistence or had no
+    GitHub repository (a local, GitHub-less run)."""
+    try:
+        raw = store.get_run_config(run_id)
+    except SbxloopError:
+        return ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return ""
+    github = data.get("github") if isinstance(data, dict) else None
+    if not isinstance(github, dict):
+        return ""
+    return str(github.get("repo") or "")
+
+
+def _item_repo(item: Any) -> str:
+    """The repository a work item came from: its recorded repo, else the
+    repo its id is qualified with (legacy ids carry neither)."""
+    repo = getattr(item, "repo", None)
+    if repo:
+        return str(repo)
+    parsed = try_parse_gh_id(getattr(item, "item_id", "") or "")
+    return parsed.repo or "" if parsed is not None else ""
 
 
 # How long a Ctrl-C waits for the engine thread to reach a phase boundary
@@ -524,11 +584,26 @@ def run(
         # model_copy skips validation, so rebuild the section instead: an
         # ill-formed --repo must fail here, not as a mid-run GitHub error.
         try:
-            github = GithubConfig.model_validate({**config.github.model_dump(), **github_overrides})
+            base = config.github.model_dump()
+            if "repo" in github_overrides:
+                # --repo names the one repository this run targets, replacing
+                # any configured repo list — unless it selects one of them.
+                selected = config.github.find_repo(repo)
+                if selected is not None:
+                    github_overrides["repo"] = selected.repo
+                    base["repos"] = [selected.model_dump()]
+                else:
+                    base["repos"] = []
+            github = GithubConfig.model_validate({**base, **github_overrides})
         except ValidationError as exc:
             console.print(f"[bold red]invalid GitHub option:[/] {exc.errors()[0]['msg']}")
             raise typer.Exit(2) from exc
         config = config.model_copy(update={"github": github})
+    elif len(config.github.repo_list()) > 1:
+        # Several repositories are configured but a run targets exactly one:
+        # default to the sole enabled repo, else make the operator choose.
+        entry = _resolve_repo(config, None)
+        config = config.model_copy(update={"github": config.github.for_repo(entry.repo)})
     if (deliver_base or create_repo or create_public) and not config.github.enabled:
         console.print(
             "[bold red]GitHub integration is not configured.[/] Those options need a "
@@ -590,6 +665,7 @@ def status(
     if run_id is None:
         table = Table(title="sbxloop runs")
         table.add_column("run")
+        table.add_column("repo")
         table.add_column("state", max_width=60)
         table.add_column("outcome", max_width=60)
         table.add_column("updated")
@@ -599,6 +675,7 @@ def status(
             state = f"{record.state} — [dim]{record.reason}[/]" if record.reason else record.state
             table.add_row(
                 record.run_id,
+                _run_repo(store, record.run_id) or "[dim]—[/]",
                 state,
                 record.outcome[:60],
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(record.updated_at)),
@@ -612,6 +689,9 @@ def status(
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     console.print(f"run [bold cyan]{record.run_id}[/]  state: [bold]{record.state}[/]")
+    repo = _run_repo(store, record.run_id)
+    if repo:
+        console.print(f"repo: [bold]{repo}[/]")
     if record.reason:
         console.print(f"reason: {record.reason}")
     console.print(f"outcome: {record.outcome}")
@@ -1221,6 +1301,37 @@ def config_show() -> None:
     console.print(table)
 
 
+@config_app.command("repos")
+def config_repos(
+    repo: Annotated[
+        str | None,
+        typer.Option("--repo", help="Show only this repository (owner/name or bare name)."),
+    ] = None,
+) -> None:
+    """List the configured repositories with their enabled state and base branch."""
+    config = load_config()
+    entries = [_resolve_repo(config, repo)] if repo is not None else config.github.repo_list()
+    if not entries:
+        console.print(
+            "no GitHub repository configured — add [cyan]\\[github] repo[/] or "
+            "[cyan]\\[\\[github.repos]][/] to sbxloop.toml"
+        )
+        return
+    table = Table(title="sbxloop repositories")
+    for col in ("repo", "enabled", "base", "token env", "trigger label"):
+        table.add_column(col)
+    for entry in entries:
+        effective = config.github.effective_repo(entry.repo) or entry
+        table.add_row(
+            entry.repo,
+            "yes" if entry.enabled else "no",
+            effective.deliver_base or "(repo default)",
+            entry.token_env or "GH_TOKEN",
+            entry.trigger_label or config.daemon.trigger_label,
+        )
+    console.print(table)
+
+
 @config_app.command("policy")
 def config_policy() -> None:
     """Show the effective per-phase network egress policy."""
@@ -1356,9 +1467,9 @@ def daemon(
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.logsink import event_log_subscriber
     from sbxloop.daemon.loop import DaemonLoop
-    from sbxloop.daemon.model import DaemonNotice
+    from sbxloop.daemon.model import DaemonNotice, WorkItem
     from sbxloop.daemon.paths import resolve_state_dir
-    from sbxloop.daemon.sources import GitHubIssueSource, GitHubLabels
+    from sbxloop.daemon.sources import GitHubLabels, build_github_source
 
     log = get_logger("sbxloop.daemon")
     started_at = time.monotonic()
@@ -1387,7 +1498,9 @@ def daemon(
             )
             config = config.model_copy(update={"daemon": daemon_cfg})
         if repo is not None:
-            github_cfg = GithubConfig.model_validate({**config.github.model_dump(), "repo": repo})
+            github_cfg = GithubConfig.model_validate(
+                {**config.github.model_dump(), "repos": [], "repo": repo}
+            )
             config = config.model_copy(update={"github": github_cfg})
         if discord_channel is not None:
             discord_cfg = DiscordConfig.model_validate(
@@ -1404,11 +1517,17 @@ def daemon(
     if not config.github.enabled:
         log.error(
             "daemon.no_repository",
-            hint="set --repo owner/name (or [github] repo): the daemon's work is the "
-            "labeled issues of one repository",
+            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
+            "daemon's work is the labeled issues of the configured repositories",
         )
         raise typer.Exit(2)
-    assert config.github.repo is not None
+    if not config.github.enabled_repos():
+        log.error(
+            "daemon.no_enabled_repository",
+            hint="every configured repository is disabled — set enabled = true on at "
+            "least one [[github.repos]] entry",
+        )
+        raise typer.Exit(2)
 
     db_path = config.state_dir / "state.db"
     # A pre-1.0 state database carries the old daemon lanes' tables and item
@@ -1417,6 +1536,54 @@ def daemon(
     archived = DaemonStore.archive_legacy(db_path)
     store = _store(config)
     dstore = DaemonStore(db_path)
+    # Rows a single-repo daemon wrote carry no repository. Name it now, from
+    # the config, rather than letting whichever repository is polled first
+    # adopt them. With several repos configured there is no sole owner to
+    # attribute them to, so the non-terminal ones are dropped instead of
+    # left to double-queue or mis-route; the next poll re-creates them
+    # repo-qualified against the repository they actually came from.
+    configured = config.github.repo_list()
+    stranded: list[WorkItem] = []
+    if len(configured) == 1:
+        dstore.backfill_repo(configured[0].repo)
+    else:
+        repos = [r.repo for r in configured]
+        # Most repo-less rows name their repository in their issue URL, so
+        # they are attributed exactly rather than guessed at or discarded.
+        dstore.attribute_repoless(repos)
+        dropped = dstore.drop_repoless()
+        if dropped:
+            log.info(
+                "daemon.repoless_items_dropped",
+                rows=dropped,
+                repos=repos,
+                hint="work items written before multi-repo carry no repository and "
+                "could not be attributed to one of several configured repos; they "
+                "were never claimed, so they will be rediscovered, repo-qualified, "
+                "on the next poll",
+            )
+        # What is left is claimed or in flight: claiming swapped the trigger
+        # label for the in-progress one, so discovery can never re-create
+        # these. They are failed (not deleted) before recover() runs, so
+        # their pinned runs reconcile against a real item, and an operator
+        # is told which issues are left carrying the in-progress label.
+        stranded = dstore.strand_repoless(
+            "repository could not be determined after upgrading to multi-repo "
+            f"(configured: {', '.join(repos)}); settle the issue by hand",
+            time.time(),
+        )
+        if stranded:
+            log.error(
+                "daemon.repoless_items_stranded",
+                rows=len(stranded),
+                repos=repos,
+                items=[i.item_id for i in stranded],
+                urls=[i.url for i in stranded],
+                hint="these items were already claimed before the multi-repo "
+                "upgrade, so their issues still carry the in-progress label and "
+                "cannot be rediscovered; remove the label (and re-add the trigger "
+                "label) by hand to run them again",
+            )
     sbx = SbxCLI(app_name=config.app_name or None)
     bus = EventBus()
     bus.subscribe(event_log_subscriber)
@@ -1429,8 +1596,14 @@ def daemon(
         config.daemon.completed_label,
         config.daemon.blocked_label,
     )
-    source = GitHubIssueSource(
-        github.ops, config.github.repo, labels, on_failure=github.note_failure
+    # Every enabled configured repository is polled; the daemon-wide
+    # guardrails below (run cap, retry cap, breaker, one-run-at-a-time)
+    # stay global across all of them.
+    source = build_github_source(
+        github.ops,
+        config.github.enabled_repos(),
+        labels,
+        on_failure=github.note_failure,
     )
 
     # One line an operator can read back from the journal to know exactly
@@ -1445,6 +1618,7 @@ def daemon(
         state_dir_reason=state_choice.reason,
         archived_state=str(archived) if archived else None,
         repo=config.github.repo,
+        repos=[r.repo for r in config.github.enabled_repos()],
         trigger_label=config.daemon.trigger_label,
         poll_interval_s=config.daemon.poll_interval_s,
         max_runs_per_day=config.daemon.max_runs_per_day,
@@ -1512,6 +1686,21 @@ def daemon(
                 DaemonNotice(
                     kind="daemon.state_archived",
                     text=f"pre-1.0 daemon state moved aside to {archived}; starting fresh",
+                    level="warning",
+                )
+            )
+        if stranded:
+            listed = "\n".join(f"- {i.item_id} {i.url}".rstrip() for i in stranded)
+            bridge.daemon_notice(
+                DaemonNotice(
+                    kind="daemon.repoless_items_stranded",
+                    text=(
+                        f"{len(stranded)} in-flight work item(s) could not be "
+                        "attributed to a configured repository after the multi-repo "
+                        "upgrade and were failed. Their issues still carry the "
+                        "in-progress label and will not be rediscovered — clear it "
+                        f"by hand:\n{listed}"
+                    ),
                     level="warning",
                 )
             )
@@ -1657,11 +1846,12 @@ def daemon_items(
         console.print("no work items")
         return
     table = Table(box=None, pad_edge=False)
-    for col in ("item", "state", "attempts", "run", "title", "last error"):
+    for col in ("item", "repo", "state", "attempts", "run", "title", "last error"):
         table.add_column(col)
     for i in items:
         table.add_row(
             i.item_id,
+            _item_repo(i) or "—",
             i.state,
             str(i.attempts),
             i.run_id or "",
@@ -1985,6 +2175,25 @@ deny = []
 # fails the run before any work; needs a token allowed to create repos).
 # create_repo = false
 # create_public = false   # created repos are private unless flipped
+#
+# Several repositories: declare them as an array of tables instead of the
+# single `repo` above (the two forms are mutually exclusive — migrate by
+# moving `repo` and its delivery settings into one entry; a lone `[github]
+# repo` keeps working unchanged). The daemon polls every enabled entry for
+# the trigger label and routes each run — clone, branch, PR, review, CI,
+# merge, issue comments — to the repository its work item came from.
+# Everything here is PER REPOSITORY; the [daemon] guardrails (daily run
+# cap, per-item attempt cap, circuit breaker, one run at a time) stay
+# daemon-wide and are shared across all of them.
+# [[github.repos]]
+# repo = "you/one"
+# deliver_base = "main"        # base branch; unset uses the repo's default
+# [[github.repos]]
+# repo = "you/two"
+# enabled = false              # registered but not polled
+# token_env = "GH_TOKEN_TWO"   # unset uses the daemon-wide GH_TOKEN
+# trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
+# labels = ["team:core"]       # extra labels for issues/PRs in this repo
 
 [landing]
 # What happens after the tasks are built: the PR opens as a draft, the run
@@ -2045,14 +2254,18 @@ mem_warn = 90.0
 mem_abort = 0.0
 
 [daemon]
-# `sbxloop daemon` — the always-on outer loop. Polls the [github] repo for
+# `sbxloop daemon` — the always-on outer loop. Polls every configured,
+# enabled [github] repository for
 # issues carrying trigger_label; each one becomes ONE run that builds the
 # work, opens a draft PR, reviews and fixes it, waits for CI and merges it
 # (the landing knobs live under [landing]). The issue closes with
 # completed_label when the PR merges, gets failed_label when the run gave
 # up, blocked_label when GitHub would not let the loop finish. The daemon
 # never files work of its own; a label alone starts a run, so the guardrails
-# below are what stand between a mislabeled issue and your budget.
+# below are what stand between a mislabeled issue and your budget. All of
+# them are DAEMON-WIDE: with several repositories configured, the daily run
+# cap, the per-item attempt/resume caps, the consecutive-failure circuit
+# breaker and one-run-at-a-time are shared across every repository.
 # poll_interval_s = 60.0
 # trigger_label = "sbxloop:run"    # issue label that queues work
 # in_progress_label = "sbxloop:in-progress"

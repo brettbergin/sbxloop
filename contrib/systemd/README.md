@@ -15,6 +15,15 @@
    sbxloop doctor                   # confirms tokens, sbx, and the discord bridge row
    ```
 
+   One daemon can tend several repositories: declare them as
+   `[[github.repos]]` entries instead of a single `[github] repo` (see the
+   commented block `sbxloop init` writes). Each entry carries its own base
+   branch, labels, `enabled` switch and optional `token_env` — export any
+   per-repo token in the same `.env`. `sbxloop doctor` then checks every
+   configured repository on its own line. The `[daemon]` guardrails (daily
+   run cap, attempt/resume caps, circuit breaker, one run at a time) are
+   daemon-wide and shared across all of them, so one service is enough.
+
    Give the daemon a **dedicated clone nobody edits** as its workspace and
    point `[sandbox] workspace` at it — never the checkout you work in
    (the daemon fetches and fast-forwards it before every run, and runs

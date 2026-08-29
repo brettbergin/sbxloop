@@ -170,6 +170,50 @@ class PolicyConfig(_ConfigModel):
         return value
 
 
+_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
+
+
+def _valid_repo(value: str) -> bool:
+    return bool(_REPO_RE.fullmatch(value))
+
+
+class RepoConfig(_ConfigModel):
+    """One repository sbxloop works with.
+
+    Declared as ``[[github.repos]]`` entries. Everything here is per-repo;
+    the daemon-wide guardrails (daily run cap, per-item retry cap, the
+    consecutive-failure circuit breaker and one-run-at-a-time) stay global.
+    """
+
+    repo: str
+    deliver_base: str | None = None  # base branch; None → the repo's default
+    create_repo: bool = False
+    create_public: bool = False
+    enabled: bool = True
+    # Environment variable holding the token for this repository; None → the
+    # daemon-wide GH_TOKEN.
+    token_env: str | None = None
+    # Per-repo override of the daemon trigger label, plus extra labels applied
+    # to issues/PRs for this repository.
+    trigger_label: str | None = None
+    labels: list[str] = Field(default_factory=list)
+
+    @field_validator("repo")
+    @classmethod
+    def _check_repo(cls, value: str) -> str:
+        if not _valid_repo(value):
+            raise ValueError(f"github.repos[].repo must be owner/name, got {value!r}")
+        return value
+
+    @property
+    def owner(self) -> str:
+        return self.repo.split("/", 1)[0]
+
+    @property
+    def name(self) -> str:
+        return self.repo.split("/", 1)[1]
+
+
 class GithubConfig(_ConfigModel):
     """The GitHub integration. ``repo`` is the gate: unset (the default)
     disables GitHub entirely — no github sandbox is provisioned, no GH_TOKEN
@@ -179,6 +223,7 @@ class GithubConfig(_ConfigModel):
     carries it through review, CI and merge (see ``[landing]``)."""
 
     repo: str | None = None
+    repos: list[RepoConfig] = Field(default_factory=list)
     deliver_base: str | None = None  # base branch; None → the repo's default
     # Create `repo` when it does not exist (probed right after provisioning,
     # so a missing repo fails the run before any work). Opt-in so a typo'd
@@ -194,9 +239,140 @@ class GithubConfig(_ConfigModel):
     @field_validator("repo")
     @classmethod
     def _check_repo(cls, value: str | None) -> str | None:
-        if value is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+", value):
+        if value is not None and not _valid_repo(value):
             raise ValueError(f"github.repo must be owner/name, got {value!r}")
         return value
+
+    @model_validator(mode="after")
+    def _normalise_repos(self) -> GithubConfig:
+        # A dump/validate round-trip carries both keys; that is consistent (the
+        # list contains `repo`) and is accepted as the list form. Genuinely
+        # mixing the two forms is not.
+        if (
+            self.repo is not None
+            and self.repos
+            and not any(entry.repo.casefold() == self.repo.casefold() for entry in self.repos)
+        ):
+            raise ValueError(
+                "github.repo and github.repos are mutually exclusive: use one or "
+                "the other (move the legacy `repo` into a [[github.repos]] entry)"
+            )
+        if self.repo is not None and not self.repos:
+            # Legacy single-repo form: normalise into a one-entry repo list
+            # carrying the same effective settings.
+            self.repos = [
+                RepoConfig(
+                    repo=self.repo,
+                    deliver_base=self.deliver_base,
+                    create_repo=self.create_repo,
+                    create_public=self.create_public,
+                )
+            ]
+        elif self.repos:
+            seen: dict[str, str] = {}
+            for entry in self.repos:
+                key = entry.repo.casefold()
+                if key in seen:
+                    raise ValueError(f"github.repos contains duplicate repository {entry.repo!r}")
+                seen[key] = entry.repo
+            # Keep the single-repo surface working for callers that read
+            # `github.repo`: point it at the first enabled repository.
+            primary = next((r for r in self.repos if r.enabled), self.repos[0])
+            self.repo = primary.repo
+            if self.deliver_base is None:
+                self.deliver_base = primary.deliver_base
+        elif self._configured_without_repo():
+            raise ValueError(
+                "github is configured but no repository is set: add `[github] repo` "
+                "or at least one [[github.repos]] entry"
+            )
+        return self
+
+    def _configured_without_repo(self) -> bool:
+        """True when the section carries non-default settings but names no
+        repository — a config that means to use GitHub yet cannot."""
+        # Only delivery settings imply intent to use a repository;
+        # `deliver_closes` is set per run by the daemon, not by the operator.
+        for name in ("deliver_base", "create_repo", "create_public"):
+            field = type(self).model_fields[name]
+            if getattr(self, name) != field.get_default(call_default_factory=True):
+                return True
+        return False
+
+    def repo_list(self) -> list[RepoConfig]:
+        """Every configured repository, enabled or not."""
+        return list(self.repos)
+
+    def enabled_repos(self) -> list[RepoConfig]:
+        return [r for r in self.repos if r.enabled]
+
+    def find_repo(self, selector: str | None) -> RepoConfig | None:
+        """Match a repository by full ``owner/name`` or by bare name when
+        that name is unambiguous. ``None`` selects the default repository."""
+        if selector is None:
+            return self.default_repo()
+        want = selector.strip().casefold()
+        if not want:
+            return self.default_repo()
+        for entry in self.repos:
+            if entry.repo.casefold() == want:
+                return entry
+        matches = [r for r in self.repos if r.name.casefold() == want]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def effective_repo(self, repo: str | None = None) -> RepoConfig | None:
+        """The repository a run acts on, with daemon-wide defaults folded in.
+
+        ``repo`` is the ``owner/name`` the work item came from; ``None``
+        falls back to the default repository (the sole enabled one, else the
+        legacy ``github.repo``). Per-repo ``deliver_base``/``create_repo``/
+        ``create_public`` win over the global ``[github]`` settings; where a
+        repo entry leaves them unset the global value applies.
+        """
+        entry = self.find_repo(repo)
+        if entry is None and repo is None and self.repos:
+            entry = self.repos[0]
+        if entry is None:
+            return None
+        return entry.model_copy(
+            update={
+                "deliver_base": (
+                    entry.deliver_base if entry.deliver_base is not None else self.deliver_base
+                ),
+                "create_repo": entry.create_repo or self.create_repo,
+                "create_public": entry.create_public or self.create_public,
+            }
+        )
+
+    def for_repo(self, repo: str | None) -> GithubConfig:
+        """This section narrowed to the one repository a run targets.
+
+        The returned config keeps a single-entry ``repos`` list whose entry
+        carries the effective (per-repo overriding global) settings, so
+        everything downstream — including a resumed run reading its persisted
+        config — sees exactly the repository the work item came from.
+        """
+        entry = self.effective_repo(repo)
+        if entry is None:
+            return self.model_copy(update={"repo": None, "repos": []})
+        return self.model_copy(
+            update={
+                "repo": entry.repo,
+                "repos": [entry],
+                "deliver_base": entry.deliver_base,
+                "create_repo": entry.create_repo,
+                "create_public": entry.create_public,
+            }
+        )
+
+    def default_repo(self) -> RepoConfig | None:
+        """The sole enabled repository, or ``None`` when it is ambiguous."""
+        enabled = self.enabled_repos()
+        if len(enabled) == 1:
+            return enabled[0]
+        return None
 
     @property
     def enabled(self) -> bool:

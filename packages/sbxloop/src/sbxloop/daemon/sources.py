@@ -25,15 +25,18 @@ import re
 import socket
 import time
 import uuid
-from collections.abc import Callable, Iterator
-from typing import Any, Protocol
+from collections.abc import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
 from sbxloop.gh.ops import GithubOps
-from sbxloop.ghids import issue_item_id
+from sbxloop.ghids import issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from sbxloop.config import RepoConfig
 
 log = get_logger(__name__)
 
@@ -126,10 +129,16 @@ class GitHubIssueSource:
         *,
         host: str | None = None,
         on_failure: Callable[[BaseException], object] | None = None,
+        qualify_ids: bool = False,
     ) -> None:
         self._ops = ops
         self.repo = repo
         self.labels = labels
+        # With several repositories in one daemon, issue numbers collide;
+        # ids are then minted repo-qualified (``gh:<owner>/<name>:issue:<n>``).
+        # A single-repo daemon keeps the historical bare form so existing
+        # state, watches and operator commands resolve unchanged.
+        self.qualify_ids = qualify_ids
         self.host = host or socket.gethostname()
         # Told about every failed op (``DaemonGithub.note_failure``) so a
         # dead sandbox gets replaced; the source itself never retries.
@@ -202,11 +211,14 @@ class GitHubIssueSource:
             seen.add(str(number))
             items.append(
                 WorkItem(
-                    item_id=issue_item_id(int(number)),
+                    item_id=issue_item_id(
+                        int(number), repo=self.repo if self.qualify_ids else None
+                    ),
                     source_key=str(number),
                     title=str(issue.get("title") or f"issue #{number}"),
                     body=str(issue.get("body") or ""),
                     url=str(issue.get("html_url") or ""),
+                    repo=self.repo,
                 )
             )
         log.debug(
@@ -493,3 +505,161 @@ class GitHubIssueSource:
             self._comment(ops, n, f"Re-queued by {by}; a fresh run will start shortly.")
 
         self._guard("requeue report", go)
+
+
+# -- many repositories -------------------------------------------------------------
+
+
+class MultiRepoIssueSource:
+    """One :class:`GitHubIssueSource` per configured repository, fanned out.
+
+    Discovery polls every repository in order and concatenates the results,
+    so ordering across repos is deterministic (configuration order, then the
+    per-repo poll order). Every other operation is routed back to the source
+    that owns the item's repository, so a claim, comment or label always
+    lands on the repository the work came from.
+
+    A failure polling one repository is logged and skipped rather than
+    dropping the other repositories' items; only a *total* failure (every
+    configured repository failed) re-raises, preserving the single-repo
+    contract that the loop backs a failing source off instead of mistaking
+    an outage for an empty queue.
+    """
+
+    name = "github"
+
+    def __init__(self, sources: list[GitHubIssueSource]) -> None:
+        if not sources:
+            raise ValueError("MultiRepoIssueSource needs at least one repository source")
+        self._sources = list(sources)
+        self._by_repo = {s.repo.casefold(): s for s in self._sources}
+
+    @property
+    def sources(self) -> list[GitHubIssueSource]:
+        return list(self._sources)
+
+    @property
+    def repos(self) -> list[str]:
+        return [s.repo for s in self._sources]
+
+    @property
+    def repo(self) -> str:
+        """The first repository — what a single-repo caller means by "the repo"."""
+        return self._sources[0].repo
+
+    @property
+    def labels(self) -> GitHubLabels:
+        return self._sources[0].labels
+
+    def for_item(self, item: WorkItem) -> GitHubIssueSource:
+        """The source owning ``item``'s repository.
+
+        Falls back to the sole configured source when the item carries no
+        repository (persisted before multi-repo support, or a legacy
+        ``gh:<n>`` id), which is exactly the single-repo behaviour.
+        """
+        repo = item.repo
+        if repo is None:
+            parsed = try_parse_gh_id(item.item_id)
+            repo = parsed.repo if parsed is not None else None
+        if repo is not None:
+            found = self._by_repo.get(repo.casefold())
+            if found is not None:
+                return found
+            log.warning(
+                "github.unknown_repo",
+                item=item.item_id,
+                repo=repo,
+                known=self.repos,
+            )
+        return self._sources[0]
+
+    def poll(self) -> list[WorkItem]:
+        items: list[WorkItem] = []
+        failures: list[BaseException] = []
+        for source in self._sources:
+            try:
+                items.extend(source.poll())
+            except (GithubOpsError, WorkerError, SbxError) as exc:
+                # Logged per repo and skipped: one unreachable repository
+                # must not blank the queue for the healthy ones.
+                log.warning("github.repo_poll_failed", repo=source.repo, error=str(exc))
+                failures.append(exc)
+        if failures and len(failures) == len(self._sources):
+            raise failures[0]
+        return items
+
+    def claim(self, item: WorkItem) -> bool:
+        return self.for_item(item).claim(item)
+
+    def report_started(self, item: WorkItem, run_id: str) -> None:
+        self.for_item(item).report_started(item, run_id)
+
+    def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
+        self.for_item(item).report_retry(item, error, attempts_left)
+
+    def report_abandoned(self, item: WorkItem, error: str) -> None:
+        self.for_item(item).report_abandoned(item, error)
+
+    def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
+        self.for_item(item).report_cancelled(item, report)
+
+    def report_requeued(self, item: WorkItem, by: str) -> None:
+        self.for_item(item).report_requeued(item, by)
+
+    def report_merged(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
+        return self.for_item(item).report_merged(item, pr_number, pr_url)
+
+    def report_blocked(
+        self, item: WorkItem, reason: str, pr_number: int | None, pr_url: str
+    ) -> bool:
+        return self.for_item(item).report_blocked(item, reason, pr_number, pr_url)
+
+
+def build_github_source(
+    ops: Callable[[], GithubOps],
+    repos: Sequence[RepoConfig],
+    labels: GitHubLabels,
+    *,
+    host: str | None = None,
+    on_failure: Callable[[BaseException], object] | None = None,
+) -> WorkSource:
+    """A work source over every *enabled* repository in ``repos``.
+
+    A single enabled repository yields a plain :class:`GitHubIssueSource`
+    minting unqualified ids — byte-for-byte the pre-multi-repo behaviour.
+    Two or more yield a :class:`MultiRepoIssueSource` whose items carry
+    repo-qualified ids so issue numbers from different repositories cannot
+    collide.
+    """
+    enabled = [entry for entry in repos if entry.enabled]
+    if not enabled:
+        raise ValueError("no enabled repository configured for the daemon to poll")
+    qualify = len(enabled) > 1
+    built = [
+        GitHubIssueSource(
+            ops,
+            entry.repo,
+            _repo_labels(labels, entry),
+            host=host,
+            on_failure=on_failure,
+            qualify_ids=qualify,
+        )
+        for entry in enabled
+    ]
+    if len(built) == 1:
+        return built[0]
+    return MultiRepoIssueSource(built)
+
+
+def _repo_labels(labels: GitHubLabels, entry: RepoConfig) -> GitHubLabels:
+    """The daemon labels, with the repository's trigger override applied."""
+    if not entry.trigger_label:
+        return labels
+    return GitHubLabels(
+        entry.trigger_label,
+        labels.in_progress,
+        labels.failed,
+        labels.completed,
+        labels.blocked,
+    )

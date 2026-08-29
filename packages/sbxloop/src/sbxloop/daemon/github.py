@@ -62,9 +62,14 @@ class DaemonGithub:
         worker_python: str,
         install_workers: bool = True,
         name: str | None = None,
+        repo: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
+        # The repository this box's credentials are scoped to; None keeps the
+        # daemon-wide token (and is the only sane default when several
+        # repositories are polled from one box).
+        self.repo = repo
         self.sbx = sbx
         self.bus = bus
         self.worker_python = worker_python
@@ -182,7 +187,7 @@ class DaemonGithub:
         )
         try:
             sandbox = self.provisioner.ensure_github_only(
-                self.name, self.workspace, post_create=install
+                self.name, self.workspace, post_create=install, repo=self.repo
             )
         except SbxloopError as exc:
             # ProvisionError, WorkerError, SbxError alike: one daemon-level

@@ -156,6 +156,7 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "command_prefix": "!sbx",
         "repo": "owner/repo",
         "model": "auto",
+        "repos": "- owner/repo — enabled, base main, trigger label `sbxloop:run`",
         "tool_notes": "- `sbx_control` — run a verb",
         "daemon_notes": "- poll interval 60s",
         "trigger_label": "sbxloop:run",
@@ -183,6 +184,8 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "`comment_on_issue`" in text and "`close_issue`" in text
     assert "pass **their own words** as `confirmation`" in text
     assert "The one exception is\n  `close_issue`" in text
+    # the configured repositories reach the model, with their per-repo facts
+    assert "owner/repo — enabled, base main" in text and "`list_repos`" in text
     # drift: the concierge reports versions, a human does the upgrading
     assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
 

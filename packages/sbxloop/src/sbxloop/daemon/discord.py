@@ -1194,7 +1194,9 @@ class DiscordBridge:
             text += f"\n{marker} PR #{report.pr[0]} <{report.pr[1]}>"
         if report.reason and state != "merged":
             text += f"\n⚠ {_one_line(report.reason, 300)}"
-        repo = self.config.github.repo
+        # The item's own repository, not the daemon's first one: with several
+        # configured, the card must name where this run actually landed.
+        repo = item.repo or self.config.github.repo
         if unanswered:
             text += (
                 f"\n⚠ {len(unanswered)} steering message(s) were not answered before the run ended"

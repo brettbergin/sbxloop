@@ -271,6 +271,63 @@ class TestTick:
         assert h.loop.tick().outcome == "done"
 
 
+class TestGuardrailsAreDaemonWide:
+    """The daily run cap, the circuit breaker and one-run-at-a-time belong to
+    the daemon, not to a repository: with several repos registered, items from
+    *different* repositories share one budget (#511)."""
+
+    @staticmethod
+    def _multi_repo(tmp_path: Path, daemon: dict[str, Any]) -> Config:
+        return Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repos": [{"repo": "o/a"}, {"repo": "o/b"}]},
+                "daemon": daemon,
+            }
+        )
+
+    def test_daily_cap_counts_runs_across_repositories(self, tmp_path: Path) -> None:
+        cfg = self._multi_repo(tmp_path, {"max_runs_per_day": 1})
+        h = Harness(tmp_path, cfg)
+        h.source.items = [
+            gh_item("1", item_id="gh:o/a:issue:1", repo="o/a"),
+            gh_item("2", item_id="gh:o/b:issue:2", repo="o/b"),
+        ]
+        assert h.loop.tick().outcome == "done"
+        # The second item is a different repository — the cap does not reset.
+        second = h.loop.tick()
+        assert second.idle_reason == "daily_cap" and second.dispatched is None
+        assert h.dstore.get("gh:o/b:issue:2").state == "queued"  # type: ignore[union-attr]
+        h.clock.t = day_window(h.clock.t, cfg.daemon.run_cap_timezone)[1]
+        assert h.loop.tick().dispatched == "gh:o/b:issue:2"
+
+    def test_breaker_counts_failures_across_repositories(self, tmp_path: Path) -> None:
+        cfg = self._multi_repo(
+            tmp_path,
+            {
+                "max_attempts_per_item": 1,
+                "max_consecutive_failures": 2,
+                "breaker_cooldown_s": 100,
+                "max_runs_per_day": 100,
+            },
+        )
+        h = Harness(tmp_path, cfg)
+        h.source.items = [
+            gh_item("1", item_id="gh:o/a:issue:1", repo="o/a"),
+            gh_item("2", item_id="gh:o/b:issue:2", repo="o/b"),
+            gh_item("3", item_id="gh:o/a:issue:3", repo="o/a"),
+        ]
+        h.outcomes = ["raise", "raise", "merged"]
+        # One failure in o/a plus one in o/b trips a breaker of 2.
+        assert h.loop.tick().outcome == "failed"
+        assert h.loop.tick().outcome == "failed"
+        assert h.loop.tick().idle_reason == "breaker"
+        assert h.loop.status()["consecutive_failures"] == 2
+        h.clock.t += 101
+        assert h.loop.tick().outcome == "done"
+        assert h.loop.status()["breaker_open"] is False
+
+
 class TestSettle:
     """How the run ended decides what happens to the item — and nothing else
     does: there are no lanes to feed."""
@@ -1928,3 +1985,50 @@ class TestStaleRunReconciliation:
         self._age(h, "r_resume", h.clock.t - 7200.0)
         h.loop._reconcile_stale_runs(h.clock.t)
         assert h.store.get_run("r_resume").state == "building"
+
+
+class TestMultiRepoItemRouting:
+    """An item from the second configured repository runs against THAT repo."""
+
+    def _harness(self, tmp_path: Path) -> Harness:
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {
+                    "repos": [
+                        {"repo": "o/a"},
+                        {"repo": "o/b", "deliver_base": "develop"},
+                    ],
+                    "deliver_base": "trunk",
+                },
+            }
+        )
+        return Harness(tmp_path, cfg)
+
+    def test_item_config_is_narrowed_to_the_items_repo(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        cfg = h.loop._item_config(gh_item("5", item_id="gh:o/b:issue:5", repo="o/b"))
+        assert cfg.github.repo == "o/b"
+        assert [r.repo for r in cfg.github.repo_list()] == ["o/b"]
+        # The per-repo base wins over the global default.
+        assert cfg.github.deliver_base == "develop"
+
+    def test_a_repoless_legacy_item_keeps_the_default(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        cfg = h.loop._item_config(gh_item("5"))
+        assert cfg.github.repo == "o/a"
+        assert cfg.github.deliver_base == "trunk"
+
+    def test_the_repo_qualified_id_alone_routes_the_run(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        assert h.loop._item_repo(gh_item("5", item_id="gh:o/b:issue:5")) == "o/b"
+
+    def test_provenance_names_the_items_repo(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        text = h.loop.outcome_text(gh_item("5", item_id="gh:o/b:issue:5", repo="o/b"))
+        assert "GitHub issue #5 in o/b" in text
+
+    def test_an_unknown_repo_falls_back_to_the_default(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        assert h.loop._item_repo(gh_item("5", repo="o/gone")) is None
+        assert h.loop._item_config(gh_item("5", repo="o/gone")).github.repo == "o/a"

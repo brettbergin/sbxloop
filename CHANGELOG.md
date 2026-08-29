@@ -6,6 +6,37 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **One daemon can tend several GitHub repositories** (#511). `sbxloop.toml`
+  accepts an array of `[[github.repos]]` entries, each carrying its own
+  `deliver_base`, `create_repo`/`create_public`, `trigger_label`, extra
+  `labels`, an `enabled` switch and an optional `token_env`. The daemon polls
+  every enabled repository for the trigger label, work items carry the
+  `owner/name` they came from (ids are repo-qualified — `gh:o/r:issue:12` —
+  with the legacy `gh:12` form still resolving), and a run's clone, branch,
+  draft PR, review, CI polling, merge and issue comments/labels all target
+  that repository. Its github-ops sandbox is provisioned scoped to that repo
+  and given that repo's credential; the agent/github credential split is
+  unchanged. The single `[github] repo = "owner/name"` form still loads and
+  behaves exactly as before, normalised internally into a one-entry list;
+  the two forms are mutually exclusive and duplicate or malformed entries
+  fail config loading with an explicit error. `sbxloop doctor` checks each
+  configured repository on its own line, `sbxloop status` and
+  `sbxloop daemon items` carry a `repo` column, `sbxloop config repos` lists
+  the registrations, and the concierge gained a `list_repos` tool (plus an
+  optional `repo` selector on its GitHub-reading tools) so "what projects are
+  you configured to work on?" is answerable from chat. The `[daemon]`
+  guardrails — daily run cap, per-item attempt and resume caps,
+  consecutive-failure circuit breaker, one run at a time — remain
+  **daemon-wide** and are shared across every repository; README, the
+  architecture doc, the deploy doc and the `sbxloop init` template say so
+  explicitly, and tests assert the cap and the breaker apply across items
+  from different repositories. The daemon's work-item store keys an item by
+  `(issue number, repository)` rather than the issue number alone, so issue
+  #4 in two repositories is two items; a store written before multi-repo
+  support is migrated in place on open and its rows keep working.
+
 ### Changed
 
 - **GitHub work-item ids are typed: `gh:issue:1234`, `gh:pr:1234`** (#508).

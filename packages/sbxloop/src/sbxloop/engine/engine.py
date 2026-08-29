@@ -53,7 +53,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 
 from sbxloop import hostgit
-from sbxloop.config import Config, _flatten, load_config, load_dotenv_file
+from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace, ensure_repository
 from sbxloop.engine.landing import (
     Blocked,
@@ -145,6 +145,10 @@ class Pipeline:
     # the gate, `completed`.
     ops: GithubOps | None
     repo: str | None
+    # The run's repository entry (per-repo deliver_base, token_env, …) with
+    # the daemon-wide [github] defaults already folded in; None when the run
+    # has no repository.
+    repo_config: RepoConfig | None = None
     # The loop's own GitHub identity, read once and only when landing asks
     # (to tell a human's review objection from its own posted review).
     login: str | None = None
@@ -256,18 +260,40 @@ class LoopEngine:
         *,
         run_id: str | None = None,
         tasks: Sequence[TaskSpec] | None = None,
+        repo: str | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
         ``tasks`` pre-seeds the task graph and so skips DECOMPOSE — for work
         that is *already* decomposed. A normal run passes nothing.
+
+        ``repo`` is the ``owner/name`` this run belongs to — the repository
+        its work item came from. It narrows the engine's GitHub config to
+        that one repository for the whole run (and is persisted with the
+        run, so a resume routes there too); ``None`` keeps the configured
+        default, which is the only repository when just one is configured.
         """
         run_id = run_id or new_run_id()
+        self._select_repo(repo)
         self.store.create_run(run_id, outcome, self.config.model_dump_json())
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=outcome, seeded=len(tasks or ()))
         return self._drive(run_id, outcome)
+
+    def _select_repo(self, repo: str | None) -> None:
+        """Pin this engine's GitHub config to the run's repository.
+
+        Narrowing happens before the run row is written, so the persisted
+        config carries the one repository and a resume — which rehydrates
+        that config — routes every GitHub call to the same place. An unknown
+        selector is a configuration error, not a silent delivery elsewhere.
+        """
+        if repo is not None and self.config.github.find_repo(repo) is None:
+            known = ", ".join(r.repo for r in self.config.github.repo_list()) or "none"
+            raise StateError(f"repository {repo!r} is not configured (configured: {known})")
+        github = self.config.github.for_repo(repo)
+        self.config = self.config.model_copy(update={"github": github})
 
     def resume(self, run_id: str) -> RunResult:
         """Continue a run from the last stage it committed.
@@ -427,7 +453,9 @@ class LoopEngine:
         provisioner = Provisioner(self.sbx, self.config, self.bus)
         # A resumed run's workspace is pinned from the runs table — never
         # recomputed from config, which would silently relocate it (#60).
-        pair = provisioner.ensure_pair(run_id, workspace)
+        # The run's repository (its config was narrowed to it in
+        # _select_repo) scopes the github sandbox's token and remote.
+        pair = provisioner.ensure_pair(run_id, workspace, self.config.github.repo)
         assert pair.workspace is not None
         if workspace is not None and pair.workspace != workspace:
             raise StateError(
@@ -466,9 +494,10 @@ class LoopEngine:
                     )
                     if self.install_workers:
                         self._install_workers(run_id, pair, agent, github)
+                    repo_config = self.config.github.effective_repo(None)
                     ops = (
                         self._github_ops(github, run_id)
-                        if github is not None and self.config.github.repo
+                        if github is not None and repo_config is not None
                         else None
                     )
                     self._ensure_delivery_repo(run_id, ops)
@@ -494,7 +523,8 @@ class LoopEngine:
                         ),
                         deadline=deadline,
                         ops=ops,
-                        repo=self.config.github.repo if ops is not None else None,
+                        repo=repo_config.repo if ops is not None and repo_config else None,
+                        repo_config=repo_config if ops is not None else None,
                     )
                     try:
                         state, reason = self._run_pipeline(pipeline, stage)
@@ -745,12 +775,14 @@ class LoopEngine:
         the work is done. A creation is surfaced as a run.deliver event so
         the transcript records where the artifacts will land.
         """
-        gh = self.config.github
-        if ops is None or not gh.repo:
+        entry = self.config.github.effective_repo(None)
+        if ops is None or entry is None:
             return
-        created = ensure_repository(ops, gh.repo, create=gh.create_repo, public=gh.create_public)
+        created = ensure_repository(
+            ops, entry.repo, create=entry.create_repo, public=entry.create_public
+        )
         if created:
-            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=gh.repo, created=True)
+            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=entry.repo, created=True)
 
     # -- the pipeline ------------------------------------------------------
 
@@ -1108,7 +1140,7 @@ class LoopEngine:
             run_id=run_id,
             outcome=p.outcome,
             source_dir=source,
-            base=gh.deliver_base,
+            base=(p.repo_config.deliver_base if p.repo_config else gh.deliver_base),
             draft=landing.deliver_draft,
             exclude=self.config.artifacts.exclude,
             branch=branch,
@@ -1365,7 +1397,7 @@ class LoopEngine:
 
     def _base_branch(self, p: Pipeline) -> str:
         """The branch the PR targets: configured, else the repository's default."""
-        base = self.config.github.deliver_base
+        base = p.repo_config.deliver_base if p.repo_config else self.config.github.deliver_base
         if base:
             return base
         if p.ops is not None and p.repo is not None:

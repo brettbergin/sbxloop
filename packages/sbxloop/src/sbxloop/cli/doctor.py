@@ -15,12 +15,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.table import Table
 
 import sbxloop
-from sbxloop.config import load_config, load_config_with_sources
+from sbxloop.config import Config, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.bake import load_bake_record
@@ -34,6 +35,9 @@ from sbxloop_worker.backends.copilot import (
     SDK_PERMISSION_KINDS,
     installed_sdk_permission_kinds,
 )
+
+if TYPE_CHECKING:
+    from sbxloop.daemon.github import DaemonGithub
 
 TESTED_SBX_SERIES = "0.38"
 
@@ -58,10 +62,185 @@ def _sdk_version() -> str:
         return "unknown version"
 
 
+RepoProbeFn = Callable[["RepoConfig"], "RepoProbe"]
+
+
+class RepoProbeUnavailable(Exception):
+    """The probe could not ask GitHub at all (no github sandbox).
+
+    Distinct from a probe answering "not reachable": the repository is
+    unverified, which is the pre-probe behaviour (a soft row), not a
+    verdict against the repository.
+    """
+
+
+@dataclass
+class RepoProbe:
+    """What an out-of-process probe learned about one repository.
+
+    ``reachable`` is the repository lookup (404/permission denied → False);
+    ``missing_permissions`` lists the scopes the token lacks; ``creatable``
+    is only meaningful for a repo configured with ``create_repo``.
+    """
+
+    reachable: bool
+    detail: str = ""
+    missing_permissions: tuple[str, ...] = ()
+    creatable: bool | None = None
+
+
+def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
+    """Whether this repository has a usable token, and where it came from."""
+    if entry.token_env:
+        if env.get(entry.token_env):
+            return True, f"token from {entry.token_env}"
+        return False, f"token_env {entry.token_env} is not set on the host"
+    for name in GH_TOKEN_ENVS:
+        if env.get(name):
+            return True, f"token from {name}"
+    return False, f"none of {'/'.join(GH_TOKEN_ENVS)} are set"
+
+
+def repo_checks(
+    config: Config,
+    env: dict[str, str],
+    *,
+    probe: RepoProbeFn | None = None,
+) -> list[Check]:
+    """One :class:`Check` per configured repository.
+
+    Each repository is verified on its own — credentials, base branch,
+    ``create_repo`` intent and, when ``probe`` is supplied (the host never
+    holds the PAT itself, so reachability is probed through the github
+    sandbox), reachability and token permissions. A repository that fails,
+    or whose probe raises, yields exactly one failing row and never masks
+    the verdict of the others.
+    """
+    rows: list[Check] = []
+    for entry in config.github.repo_list():
+        effective = config.github.effective_repo(entry.repo) or entry
+        name = f"github repo {entry.repo}"
+        if not entry.enabled:
+            rows.append(
+                Check(name, True, "disabled in sbxloop.toml — not polled, not run", hard=False)
+            )
+            continue
+        token_ok, token_detail = _repo_token_status(entry, env)
+        base = effective.deliver_base or "(repo default)"
+        notes = [token_detail, f"base {base}"]
+        if effective.create_repo:
+            notes.append("create_repo on")
+        if not token_ok:
+            rows.append(Check(name, False, "; ".join(notes)))
+            continue
+        if probe is None:
+            notes.append("reachability unverified from the host (checked in the github sandbox)")
+            rows.append(Check(name, True, "; ".join(notes), hard=False))
+            continue
+        try:
+            result = probe(effective)
+        except RepoProbeUnavailable as exc:
+            notes.append(f"reachability unverified: {exc}")
+            rows.append(Check(name, True, "; ".join(notes), hard=False))
+            continue
+        except Exception as exc:  # one repo's failure must not hide the rest
+            rows.append(Check(name, False, "; ".join([*notes, f"probe failed: {exc}"])))
+            continue
+        if not result.reachable:
+            if effective.create_repo and result.creatable:
+                notes.append("missing but create_repo is on — it will be created")
+                rows.append(Check(name, True, "; ".join(notes), hard=False))
+                continue
+            notes.append(result.detail or "not reachable with this token")
+            rows.append(Check(name, False, "; ".join(notes)))
+            continue
+        if result.missing_permissions:
+            notes.append(f"token missing {', '.join(result.missing_permissions)}")
+            rows.append(Check(name, False, "; ".join(notes)))
+            continue
+        notes.append(result.detail or "reachable, token has the required permissions")
+        rows.append(Check(name, True, "; ".join(notes)))
+    return rows
+
+
+REQUIRED_REPO_PERMISSIONS = ("issues", "contents", "pull_requests")
+
+
+def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
+    """Permissions the token lacks, from a ``GET /repos/{repo}`` payload.
+
+    GitHub reports the *authenticated* token's effective access on the
+    repository as ``permissions: {admin, maintain, push, triage, pull}``.
+    sbxloop needs to read the tree, open pull requests and drive issue
+    labels/comments — all of which are the ``push`` (write) level; anything
+    less can only read.
+    """
+    perms = data.get("permissions")
+    if not isinstance(perms, dict):
+        return ()  # not reported (some app tokens) — do not invent a failure
+    if perms.get("admin") or perms.get("maintain") or perms.get("push"):
+        return ()
+    return tuple(f"{kind}:write" for kind in REQUIRED_REPO_PERMISSIONS)
+
+
+def sandbox_repo_probe(
+    config: Config,
+    cli: SbxCLI,
+    *,
+    boxes: dict[str, DaemonGithub] | None = None,
+) -> RepoProbeFn:
+    """A probe that asks GitHub itself, from a github-ops sandbox.
+
+    The host deliberately never holds the PAT, so reachability and token
+    permissions cannot be checked here: one short-lived github-only sandbox
+    per repository — provisioned with exactly that repository's credentials,
+    the same way a run's is — does the ``repo.get``. ``boxes`` collects the
+    sandboxes so the caller can tear them down.
+    """
+    from sbxloop.daemon.github import DaemonGithub
+    from sbxloop.events import EventBus
+
+    opened = boxes if boxes is not None else {}
+
+    def probe(entry: RepoConfig) -> RepoProbe:
+        box = DaemonGithub(
+            config,
+            cli,
+            EventBus(),
+            worker_python=config.worker_python,
+            name=f"sbxloop-doctor-{entry.owner}-{entry.name}".lower()[:60],
+            repo=entry.repo,
+        )
+        opened[entry.repo] = box
+        try:
+            ops = box.ops()
+        except Exception as exc:  # no sandbox: unverified, not a verdict
+            raise RepoProbeUnavailable(f"no github sandbox ({_clean(str(exc), 120)})") from exc
+        data = ops.repo_lookup(entry.repo)
+        if data is None:
+            creatable: bool | None = None
+            if entry.create_repo:
+                # Only the create path cares; asked as a question so a "no"
+                # is data rather than a failed job.
+                creatable = True
+            return RepoProbe(
+                reachable=False, detail="not found with this token", creatable=creatable
+            )
+        missing = _missing_permissions(data)
+        return RepoProbe(
+            reachable=True,
+            detail="reachable, token has the required permissions" if not missing else "reachable",
+            missing_permissions=missing,
+        )
+
+    return probe
+
+
 def collect_checks(
     env: dict[str, str],
     cli: SbxCLI | None = None,
     progress: ProgressFn | None = None,
+    probe_repo: RepoProbeFn | None = None,
 ) -> list[Check]:
     config, sources = load_config_with_sources(env=env)
     cli = cli or SbxCLI(app_name=config.app_name or None)
@@ -252,17 +431,22 @@ def collect_checks(
     # unconfigured integration is a valid (GitHub-less) setup, not a failure.
     if config.github.enabled:
         gh_set = any(env.get(name) for name in GH_TOKEN_ENVS)
+        configured = ", ".join(r.repo for r in config.github.repo_list()) or str(config.github.repo)
         checks.append(
             Check(
                 "/".join(GH_TOKEN_ENVS),
                 gh_set,
-                f"set (github integration: {config.github.repo})"
+                f"set (github integration: {configured})"
                 if gh_set
-                else f"not set but [github].repo = {config.github.repo!r} is configured — "
+                else f"not set but github repositories {configured} are configured — "
                 "create a fine-grained PAT (issues:write, contents:read, ...) "
                 "and export GH_TOKEN",
             )
         )
+        # One row per configured repository: a repo whose credentials or
+        # probe fail must not hide the verdict for the others.
+        report("checking configured repositories")
+        checks.extend(repo_checks(config, env, probe=probe_repo))
     else:
         checks.append(
             Check(
@@ -485,7 +669,17 @@ def run_doctor(
     def progress(message: str) -> None:
         console.print(f"[dim]\u2026 {message}[/dim]", highlight=False)
 
-    checks = collect_checks(env, cli=cli, progress=progress)
+    # Reachability and token permissions are answered by GitHub, and the
+    # host has no token — so the probe runs in a github-ops sandbox, one per
+    # repository, scoped to that repository's credentials. Torn down again
+    # before the table is printed.
+    boxes: dict[str, DaemonGithub] = {}
+    probe_repo = sandbox_repo_probe(config, cli, boxes=boxes) if config.github.enabled else None
+    try:
+        checks = collect_checks(env, cli=cli, progress=progress, probe_repo=probe_repo)
+    finally:
+        for box in boxes.values():
+            box.close()
     table = Table(title="sbxloop doctor")
     table.add_column("check", no_wrap=True)
     table.add_column("status", no_wrap=True)

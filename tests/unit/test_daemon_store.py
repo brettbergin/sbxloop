@@ -25,6 +25,28 @@ def item(key: str = "7", **overrides: object) -> WorkItem:
     return WorkItem(**fields)  # type: ignore[arg-type]
 
 
+def _pre_multirepo_db(tmp_path: Path) -> Path:
+    """A state.db in the shape sbxloop wrote before multi-repo support."""
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, "
+        "source_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, "
+        "body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', "
+        "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
+        "claimed INTEGER NOT NULL DEFAULT 0, run_id TEXT, last_error TEXT, "
+        "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+        "pending_report TEXT, requested_by TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE daemon_requesters (source_key TEXT PRIMARY KEY, "
+        "requester_id TEXT NOT NULL, created_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
 class TestUpsert:
     def test_first_upsert_is_new_then_dedups(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -552,3 +574,184 @@ class TestLegacyItemIds:
         with sqlite3.connect(db) as conn:
             stored = [r[0] for r in conn.execute("SELECT item_id FROM daemon_work_items")]
         assert stored == ["gh:issue:7"]
+
+
+class TestRepoScoping:
+    """Item identity is (issue number, repository) since multi-repo."""
+
+    def test_same_issue_number_in_two_repos_is_two_items(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        a = item("4", item_id="gh:o/a:issue:4", repo="o/a")
+        b = item("4", item_id="gh:o/b:issue:4", repo="o/b")
+        assert store.upsert_new(a, now=1.0) is True
+        assert store.upsert_new(b, now=1.0) is True
+        assert store.upsert_new(a, now=2.0) is False
+        got_a, got_b = store.get("gh:o/a:issue:4"), store.get("gh:o/b:issue:4")
+        assert got_a is not None and got_a.repo == "o/a"
+        assert got_b is not None and got_b.repo == "o/b"
+
+    def test_repoless_item_round_trips_as_none(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("7"), now=1.0)
+        got = store.get("gh:issue:7")
+        assert got is not None and got.repo is None
+
+    def test_a_legacy_row_is_matched_and_backfilled(self, tmp_path: Path) -> None:
+        """An upgraded daemon re-discovers items it stored without a repo:
+        they must dedup, not collide on item_id."""
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.upsert_new(item("7"), now=1.0) is True
+        qualified = item("7", item_id="gh:issue:7", repo="o/r")
+        assert store.upsert_new(qualified, now=2.0) is False
+        got = store.get("gh:issue:7")
+        assert got is not None and got.repo == "o/r"
+
+    def test_requesters_are_scoped_per_repo(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.note_requester("4", "111", now=0.5, repo="o/a")
+        store.note_requester("4", "222", now=0.5, repo="o/b")
+        store.upsert_new(item("4", item_id="gh:o/a:issue:4", repo="o/a"), now=1.0)
+        store.upsert_new(item("4", item_id="gh:o/b:issue:4", repo="o/b"), now=1.0)
+        assert store.get("gh:o/a:issue:4").requested_by == "111"  # type: ignore[union-attr]
+        assert store.get("gh:o/b:issue:4").requested_by == "222"  # type: ignore[union-attr]
+
+    def test_a_pre_multirepo_database_gains_the_repo_columns(self, tmp_path: Path) -> None:
+        """A store created before multi-repo is migrated in place, keeping
+        the rows it already had."""
+        path = tmp_path / "state.db"
+        conn = sqlite3.connect(path)
+        # The pre-multi-repo shape, verbatim: no repo column anywhere.
+        conn.execute(
+            "CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, "
+            "source_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, "
+            "body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', "
+            "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
+            "claimed INTEGER NOT NULL DEFAULT 0, run_id TEXT, last_error TEXT, "
+            "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+            "pending_report TEXT, requested_by TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE daemon_requesters (source_key TEXT PRIMARY KEY, "
+            "requester_id TEXT NOT NULL, created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
+            "created_at, updated_at) VALUES ('gh:issue:7', '7', 't', 'b', '', 'queued', 1.0, 1.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = DaemonStore(path)
+        assert "repo" in {
+            str(r[1]) for r in store._conn.execute("PRAGMA table_info(daemon_work_items)")
+        }
+        got = store.get("gh:issue:7")
+        assert got is not None and got.repo is None
+
+    def test_migration_drops_the_single_repo_unique_key(self, tmp_path: Path) -> None:
+        """The rebuilt table keys on (source_key, repo): two repositories may
+        each have an issue #4 without an IntegrityError killing the poll."""
+        path = _pre_multirepo_db(tmp_path)
+        store = DaemonStore(path)
+        assert store.upsert_new(item("4", item_id="gh:o/a:issue:4", repo="o/a"), now=1.0) is True
+        assert store.upsert_new(item("4", item_id="gh:o/b:issue:4", repo="o/b"), now=1.0) is True
+        store.note_requester("4", "111", now=1.0, repo="o/a")
+        store.note_requester("4", "222", now=1.0, repo="o/b")
+        assert store.get("gh:o/a:issue:4").repo == "o/a"  # type: ignore[union-attr]
+        assert store.get("gh:o/b:issue:4").repo == "o/b"  # type: ignore[union-attr]
+
+    def test_a_qualified_item_never_adopts_a_repoless_row(self, tmp_path: Path) -> None:
+        """Whichever repo is polled first must not claim the legacy row."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("4", item_id="gh:issue:4"), now=1.0)
+        assert store.upsert_new(item("4", item_id="gh:o/b:issue:4", repo="o/b"), now=2.0) is True
+        legacy = store.get("gh:issue:4")
+        assert legacy is not None and legacy.repo is None
+
+    def test_backfill_names_the_sole_configured_repo(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("4", item_id="gh:issue:4"), now=1.0)
+        assert store.backfill_repo("o/a") == 1
+        got = store.get("gh:issue:4")
+        assert got is not None and got.repo == "o/a"
+        assert store.backfill_repo("o/a") == 0
+        assert store.backfill_repo(None) == 0
+
+    def test_drop_repoless_clears_unattributable_live_rows(self, tmp_path: Path) -> None:
+        """With several repos configured no name can be backfilled, so the
+        non-terminal repo-less rows go and discovery re-creates them."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("4", item_id="gh:issue:4"), now=1.0)
+        store.upsert_new(item("5", item_id="gh:issue:5"), now=1.0)
+        store.mark_done("gh:issue:5", now=2.0)
+        store.upsert_new(item("6", item_id="gh:o/a:issue:6", repo="o/a"), now=1.0)
+
+        assert store.drop_repoless() == 1
+        assert store.get("gh:issue:4") is None
+        # Terminal history and repo-qualified rows are untouched.
+        done = store.get("gh:issue:5")
+        assert done is not None and done.state == "done"
+        assert store.get("gh:o/a:issue:6") is not None
+        assert store.drop_repoless() == 0
+
+    def test_drop_repoless_keeps_claimed_and_in_flight_rows(self, tmp_path: Path) -> None:
+        """Claiming swaps the trigger label away, so a claimed row can never
+        be rediscovered: deleting it would strand the issue silently."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("4", item_id="gh:issue:4"), now=1.0)
+        store.upsert_new(item("5", item_id="gh:issue:5"), now=1.0)
+        store.mark_claimed("gh:issue:5", 2.0)
+        store.upsert_new(item("6", item_id="gh:issue:6"), now=1.0)
+        store.mark_claimed("gh:issue:6", 2.0)
+        store.mark_running("gh:issue:6", "r1", 3.0)
+        store.upsert_new(item("7", item_id="gh:issue:7"), now=1.0)
+        store.mark_claimed("gh:issue:7", 2.0)
+        store.mark_running("gh:issue:7", "r2", 3.0)
+        store.mark_resume_pending("gh:issue:7", 4.0)
+
+        # Only the untouched queued row goes.
+        assert store.drop_repoless() == 1
+        assert store.get("gh:issue:4") is None
+        for still_here in ("gh:issue:5", "gh:issue:6", "gh:issue:7"):
+            assert store.get(still_here) is not None
+
+    def test_strand_repoless_settles_what_cannot_be_rediscovered(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("6", item_id="gh:issue:6"), now=1.0)
+        store.mark_claimed("gh:issue:6", 2.0)
+        store.mark_running("gh:issue:6", "r1", 3.0)
+        store.upsert_new(item("8", item_id="gh:o/a:issue:8", repo="o/a"), now=1.0)
+        store.mark_done("gh:o/a:issue:8", now=2.0)
+
+        stranded = store.strand_repoless("no repo", now=5.0)
+        assert [i.item_id for i in stranded] == ["gh:issue:6"]
+        assert stranded[0].url  # the operator needs the issue link
+        settled = store.get("gh:issue:6")
+        assert settled is not None
+        assert settled.state == "failed"
+        assert settled.last_error == "no repo"
+        # No report debt: the repository is exactly what is unknown, so a
+        # comment would land on some other repo's issue #6.
+        assert settled.pending_report is None
+        # The run stays pinned, so recovery reconciles against a real item.
+        assert settled.run_id == "r1"
+        assert store.strand_repoless("no repo", now=6.0) == []
+
+    def test_attribute_repoless_names_rows_from_their_issue_url(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(
+            item("4", item_id="gh:issue:4", url="https://github.com/o/a/issues/4"), now=1.0
+        )
+        store.upsert_new(
+            item("5", item_id="gh:issue:5", url="https://github.com/o/z/issues/5"), now=1.0
+        )
+        store.upsert_new(item("6", item_id="gh:issue:6", url=""), now=1.0)
+
+        assert store.attribute_repoless(["o/a", "o/b"]) == 1
+        got = store.get("gh:issue:4")
+        assert got is not None and got.repo == "o/a"
+        # Unconfigured or URL-less rows are left for drop/strand to settle.
+        for left in ("gh:issue:5", "gh:issue:6"):
+            row = store.get(left)
+            assert row is not None and row.repo is None
+        assert store.attribute_repoless([]) == 0

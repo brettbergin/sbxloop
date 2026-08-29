@@ -26,6 +26,7 @@ the deliberate "fresh state" of the cutover.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 import time
@@ -43,10 +44,9 @@ log = get_logger(__name__)
 SCHEMA_VERSION = "2"
 LEGACY_SUFFIX = ".pre-1.0"
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS daemon_work_items (
+_WORK_ITEMS_BODY = """(
     item_id     TEXT PRIMARY KEY,
-    source_key  TEXT NOT NULL UNIQUE,
+    source_key  TEXT NOT NULL,
     title       TEXT NOT NULL,
     body        TEXT NOT NULL DEFAULT '',
     url         TEXT NOT NULL DEFAULT '',
@@ -58,8 +58,32 @@ CREATE TABLE IF NOT EXISTS daemon_work_items (
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
     pending_report TEXT,
-    requested_by TEXT
-);
+    requested_by TEXT,
+    -- The owner/name the item came from, '' for rows written before
+    -- multi-repo support (they belong to the sole configured repository).
+    -- Identity is (source_key, repo): issue #4 in two repositories is two
+    -- work items, which a bare UNIQUE(source_key) would have collided.
+    repo        TEXT NOT NULL DEFAULT '',
+    UNIQUE(source_key, repo)
+)"""
+
+_WORK_ITEMS_COLUMNS = (
+    "item_id, source_key, title, body, url, state, attempts, claimed, run_id, "
+    "last_error, created_at, updated_at, pending_report, requested_by"
+)
+
+_REQUESTERS_BODY = """(
+    source_key   TEXT NOT NULL,
+    repo         TEXT NOT NULL DEFAULT '',
+    requester_id TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    PRIMARY KEY (source_key, repo)
+)"""
+
+_REQUESTERS_COLUMNS = "source_key, requester_id, created_at"
+
+_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS daemon_work_items {_WORK_ITEMS_BODY};
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);
 
 CREATE TABLE IF NOT EXISTS daemon_runs (
@@ -101,11 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_daemon_run_watches_run ON daemon_run_watches(run_
 -- it filed, so the work item that discovery later builds from that issue
 -- carries the requester — recorded here rather than in the public issue
 -- body, which would expose a Discord user id.
-CREATE TABLE IF NOT EXISTS daemon_requesters (
-    source_key   TEXT PRIMARY KEY,
-    requester_id TEXT NOT NULL,
-    created_at   REAL NOT NULL
-);
+CREATE TABLE IF NOT EXISTS daemon_requesters {_REQUESTERS_BODY};
 
 CREATE TABLE IF NOT EXISTS daemon_discord_threads (
     run_id      TEXT PRIMARY KEY,
@@ -169,6 +189,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         updated_at=row["updated_at"],
         pending_report=row["pending_report"],
         requested_by=row["requested_by"],
+        repo=row["repo"] or None,
     )
 
 
@@ -180,6 +201,14 @@ def _loggable(fields: dict[str, object]) -> dict[str, object]:
             continue  # already logged from the re-read row
         out[key] = value[:120] if isinstance(value, str) else value
     return out
+
+
+def _repo_from_url(url: object) -> str | None:
+    """``owner/name`` out of a GitHub issue URL, or None if it is not one."""
+    if not isinstance(url, str) or not url:
+        return None
+    match = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/(?:issues|pull)/\d+", url)
+    return f"{match.group(1)}/{match.group(2)}" if match else None
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -254,6 +283,7 @@ class DaemonStore:
                 f"to archive it (to {path.name}{LEGACY_SUFFIX}) and begin a fresh store"
             )
         self._conn.executescript(_SCHEMA)
+        self._migrate_repo_columns()
         self._conn.execute(
             "INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('schema_version', ?)",
             (SCHEMA_VERSION,),
@@ -269,6 +299,203 @@ class DaemonStore:
     def close(self) -> None:
         self._conn.close()
 
+    def _migrate_repo_columns(self) -> None:
+        """Bring a store created before multi-repo to the current shape.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table alone, so a
+        daemon upgraded in place still has the single-repo shape — and its
+        key is the one that must change: ``UNIQUE(source_key)`` on
+        ``daemon_work_items`` (``PRIMARY KEY(source_key)`` on
+        ``daemon_requesters``) collides the moment two configured
+        repositories each have an issue with the same number, which is
+        exactly what an upgraded store is about to see. SQLite cannot drop a
+        constraint with ALTER, so the tables are rebuilt: new shape, rows
+        copied with ``repo = ''``, drop, rename, indexes recreated — all in
+        one transaction. Copied rows are then settled at daemon startup —
+        backfilled with the sole configured repository
+        (:meth:`backfill_repo`) or, when several are configured, named from
+        their issue URL (:meth:`attribute_repoless`), with whatever is left
+        over dropped if discovery can re-create it (:meth:`drop_repoless`)
+        and otherwise failed with an operator notice
+        (:meth:`strand_repoless`) — so they are never claimed by whichever
+        repo happens to be polled first.
+        """
+        rebuilds = (
+            ("daemon_work_items", _WORK_ITEMS_BODY, _WORK_ITEMS_COLUMNS),
+            ("daemon_requesters", _REQUESTERS_BODY, _REQUESTERS_COLUMNS),
+        )
+        todo = [r for r in rebuilds if "repo" not in _columns(self._conn, r[0])]
+        if not todo:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table, body, columns in todo:
+                tmp = f"{table}__new"
+                self._conn.execute(f"CREATE TABLE {tmp} {body}")  # nosec B608 - literals above
+                self._conn.execute(
+                    f"INSERT INTO {tmp} ({columns}, repo) "  # nosec B608 - literals above
+                    f"SELECT {columns}, '' FROM {table}"
+                )
+                self._conn.execute(f"DROP TABLE {table}")  # nosec B608 - literal above
+                self._conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")  # nosec B608
+                log.info("store.migrated", table=table, rebuilt_for="repo")
+            # Dropping the old table took its indexes with it.
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def backfill_repo(self, repo: str | None) -> int:
+        """Give repo-less rows the daemon's sole configured repository.
+
+        Rows written before multi-repo (or by a single-repo daemon) carry
+        ``repo = ''``. They belong to whatever repository *that* daemon
+        polled, which only the caller knows — so the daemon names it at
+        startup rather than letting the first repository discovered claim
+        them. ``UPDATE OR IGNORE``: a row that would collide with an already
+        qualified row for the same issue is left as it is. Returns the number
+        of rows updated.
+        """
+        if not repo:
+            return 0
+        updated = 0
+        with self._lock:
+            for table in ("daemon_work_items", "daemon_requesters"):
+                cur = self._conn.execute(
+                    f"UPDATE OR IGNORE {table} SET repo = ? WHERE repo = ''",  # nosec B608
+                    (repo,),
+                )
+                updated += cur.rowcount or 0
+            self._conn.commit()
+        if updated:
+            log.info("store.repo_backfilled", repo=repo, rows=updated)
+        return updated
+
+    def attribute_repoless(self, repos: Sequence[str]) -> int:
+        """Give repo-less rows the repository named by their issue URL.
+
+        A row written before multi-repo carries ``repo = ''``, but its
+        ``url`` (``https://github.com/<owner>/<name>/issues/<n>``) still
+        names the repository it came from. When that repository is one of
+        the configured ones the row can be attributed exactly, with no
+        guessing — which matters most for rows discovery cannot re-create
+        (see :meth:`drop_repoless`). ``UPDATE OR IGNORE``: a row colliding
+        with an already qualified row for the same issue is left alone.
+        Returns the number of rows updated.
+        """
+        known = {r.casefold(): r for r in repos if r}
+        if not known:
+            return 0
+        updated = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT item_id, url FROM daemon_work_items WHERE repo = ''"
+            ).fetchall()
+            for row in rows:
+                repo = known.get((_repo_from_url(row["url"]) or "").casefold())
+                if repo is None:
+                    continue
+                cur = self._conn.execute(
+                    "UPDATE OR IGNORE daemon_work_items SET repo = ? "
+                    "WHERE item_id = ? AND repo = ''",
+                    (repo, row["item_id"]),
+                )
+                updated += cur.rowcount or 0
+            self._conn.commit()
+        if updated:
+            log.info("store.repo_attributed_from_url", rows=updated)
+        return updated
+
+    def drop_repoless(self) -> int:
+        """Discard the repo-less rows discovery can genuinely re-create.
+
+        Called at startup when no single configured repository can own them
+        (several repos configured, or the legacy ``[github] repo`` is gone)
+        and their issue URL named no configured repository either
+        (:meth:`attribute_repoless`). Leaving such a row would be worse than
+        dropping it: a ``repo = ''`` row no longer dedups against the
+        repo-qualified item discovery builds for the same issue, so the
+        issue would be queued twice and the second copy would fail to claim
+        its trigger label; and running the legacy row itself would route the
+        clone/branch/PR to whichever repository happens to be first in the
+        config.
+
+        Only *untouched queue* rows are deleted: ``state = 'queued'`` with
+        ``claimed = 0`` and no pinned run. Those are the only ones the next
+        poll re-creates, because claiming swaps the trigger label for the
+        in-progress one — once an item is claimed its issue no longer
+        matches the discovery search and can never be rediscovered. Claimed,
+        running and resume-pending repo-less rows are therefore left for
+        :meth:`strand_repoless` to settle visibly instead of vanishing.
+        Terminal rows are kept as history — they are never dispatched and
+        never dedup against a live item (a changed terminal row is
+        superseded). Requester notes are kept too: they are read with a
+        repo-less fallback only for unqualified items, and are harmless
+        otherwise. Returns the number of rows deleted.
+        """
+        where = "WHERE repo = '' AND state = 'queued' AND claimed = 0 AND run_id IS NULL"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT item_id FROM daemon_work_items {where}"  # nosec B608 - literal above
+            ).fetchall()
+            if not rows:
+                return 0
+            self._conn.execute(
+                f"DELETE FROM daemon_work_items {where}"  # nosec B608 - literal above
+            )
+            self._conn.commit()
+        log.info(
+            "store.repoless_items_dropped",
+            rows=len(rows),
+            items=[str(r["item_id"]) for r in rows],
+            reason="no configured repository to attribute them to; they were never "
+            "claimed, so discovery will re-create them repo-qualified",
+        )
+        return len(rows)
+
+    def strand_repoless(self, reason: str, now: float) -> list[WorkItem]:
+        """Settle the repo-less rows that must not simply vanish.
+
+        Whatever :meth:`attribute_repoless` could not name and
+        :meth:`drop_repoless` must not delete — claimed, running or
+        resume-pending rows — is failed here with an explicit ``reason``, so
+        the row stays visible in ``items`` and any pinned run reconciles
+        against a real item rather than being force-failed as an orphan.
+
+        No ``pending_report`` debt is left: these are exactly the rows whose
+        repository could *not* be named, so a report would be posted against
+        whichever repository the source happens to try first — a comment on
+        an unrelated issue with the same number. The caller gets the items
+        back instead and must raise an operator notice naming each id and
+        issue URL, because their issue is left carrying
+        ``sbxloop:in-progress`` for a human to clear.
+        """
+        marks = ", ".join("?" * len(TERMINAL_ITEM_STATES))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM daemon_work_items "  # nosec B608 - literals above
+                f"WHERE repo = '' AND state NOT IN ({marks})",
+                tuple(sorted(TERMINAL_ITEM_STATES)),
+            ).fetchall()
+            stranded = [_row_to_item(row) for row in rows]
+            for item in stranded:
+                self._conn.execute(
+                    "UPDATE daemon_work_items SET state = 'failed', last_error = ?, "
+                    "pending_report = NULL, updated_at = ? WHERE item_id = ?",
+                    (reason[:2000], now, item.item_id),
+                )
+            self._conn.commit()
+        if stranded:
+            log.warning(
+                "store.repoless_items_stranded",
+                rows=len(stranded),
+                items=[i.item_id for i in stranded],
+                urls=[i.url for i in stranded],
+                reason=reason,
+            )
+        return stranded
+
     # -- work items ----------------------------------------------------------
 
     def upsert_new(self, item: WorkItem, now: float) -> bool:
@@ -280,10 +507,40 @@ class DaemonStore:
         onto the item.
         """
         with self._lock:
-            row = self._conn.execute(
-                "SELECT item_id, state, title, body FROM daemon_work_items WHERE source_key = ?",
-                (item.source_key,),
-            ).fetchone()
+            repo = item.repo or ""
+            # Identity is (issue, repository), matched exactly — with one
+            # concession: an item whose id is *unqualified* can only come
+            # from a single-repo daemon (discovery qualifies ids as soon as
+            # a second repository is configured), so it may adopt a row
+            # written before items carried a repo at all. A qualified item
+            # never does: letting it claim a repo-less row would hand rows
+            # from the old sole repository to whichever repository happens
+            # to be polled first. Those rows are given their repository once,
+            # by name, in :meth:`backfill_repo` at daemon startup — or, when
+            # no single repository can own them, dropped there
+            # (:meth:`drop_repoless`) so discovery re-creates them qualified,
+            # once every row that could be attributed has been.
+            parsed = try_parse_gh_id(item.item_id)
+            adopt_legacy = bool(repo) and (parsed is None or parsed.repo is None)
+            if adopt_legacy:
+                row = self._conn.execute(
+                    "SELECT item_id, state, title, body, repo FROM daemon_work_items "
+                    "WHERE source_key = ? AND repo IN (?, '') ORDER BY repo = ? DESC LIMIT 1",
+                    (item.source_key, repo, repo),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT item_id, state, title, body, repo FROM daemon_work_items "
+                    "WHERE source_key = ? AND repo = ? LIMIT 1",
+                    (item.source_key, repo),
+                ).fetchone()
+            if row is not None and row["repo"] == "" and repo:
+                # Backfill: the item now knows its repository.
+                self._conn.execute(
+                    "UPDATE daemon_work_items SET repo = ? WHERE item_id = ?",
+                    (repo, row["item_id"]),
+                )
+                self._conn.commit()
             if row is not None:
                 terminal = row["state"] in TERMINAL_ITEM_STATES
                 changed = (row["title"], row["body"]) != (item.title, item.body)
@@ -298,9 +555,21 @@ class DaemonStore:
                 self._conn.execute(
                     "DELETE FROM daemon_work_items WHERE item_id = ?", (row["item_id"],)
                 )
+            # Exact repository, plus — for the same reason as above — a note
+            # written before notes carried one, but only for an unqualified
+            # item (a single-repo daemon, where there is only one repository
+            # the note can mean).
+            where, params = (
+                ("repo IN (?, '')", (item.source_key, repo))
+                if repo and adopt_legacy
+                else ("repo = ?", (item.source_key, repo))
+                if repo
+                else ("1 = 1", (item.source_key,))
+            )
             requester = self._conn.execute(
-                "SELECT requester_id FROM daemon_requesters WHERE source_key = ?",
-                (item.source_key,),
+                "SELECT requester_id FROM daemon_requesters "  # nosec B608 - literal above
+                f"WHERE source_key = ? AND {where} ORDER BY repo != '' DESC LIMIT 1",
+                params,
             ).fetchone()
             requested_by = (
                 item.requested_by
@@ -309,8 +578,9 @@ class DaemonStore:
             )
             self._conn.execute(
                 "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
-                "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?)",
+                "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by, "
+                "repo) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?)",
                 (
                     normalize_item_id(item.item_id),
                     item.source_key,
@@ -320,20 +590,24 @@ class DaemonStore:
                     now,
                     now,
                     requested_by,
+                    repo,
                 ),
             )
             self._conn.commit()
             return True
 
-    def note_requester(self, source_key: str, requester_id: str, now: float) -> None:
+    def note_requester(
+        self, source_key: str, requester_id: str, now: float, repo: str | None = None
+    ) -> None:
         """Remember who asked for the issue ``source_key`` (the concierge's
         write path), so the work item discovery builds from it carries the
-        requester and the run's finish can ping them."""
+        requester and the run's finish can ping them. ``repo`` scopes the
+        note: the same issue number in two repositories is two requests."""
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO daemon_requesters (source_key, requester_id, created_at) "
-                "VALUES (?, ?, ?)",
-                (source_key, requester_id, now),
+                "INSERT OR REPLACE INTO daemon_requesters "
+                "(source_key, repo, requester_id, created_at) VALUES (?, ?, ?, ?)",
+                (source_key, repo or "", requester_id, now),
             )
             self._conn.commit()
 

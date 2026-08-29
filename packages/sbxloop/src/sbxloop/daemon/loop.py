@@ -68,7 +68,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import Event, EventBus
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
-from sbxloop.ghids import normalize_item_id
+from sbxloop.ghids import normalize_item_id, try_parse_gh_id
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -1174,10 +1174,28 @@ class DaemonLoop:
 
     # -- item -> run mapping ---------------------------------------------------------
 
+    def _item_repo(self, item: WorkItem) -> str | None:
+        """The ``owner/name`` this item's run must act on.
+
+        The item carries it since multi-repo discovery; rows written before
+        that (and legacy ``gh:<n>`` ids) carry none, and fall back to the
+        configured default — the single-repo behaviour, unchanged.
+        """
+        repo = item.repo
+        if repo is None:
+            parsed = try_parse_gh_id(item.item_id)
+            repo = parsed.repo if parsed is not None else None
+        if repo is not None and self.config.github.find_repo(repo) is None:
+            log.warning("run.unknown_item_repo", item=item.item_id, repo=repo)
+            return None
+        return repo
+
     def _item_config(self, item: WorkItem) -> Config:
+        # Narrow the section to the item's repository first, so the run's
+        # per-repo deliver_base / token_env win over the global defaults.
         gh = GithubConfig.model_validate(
             {
-                **self.config.github.model_dump(),
+                **self.config.github.for_repo(self._item_repo(item)).model_dump(),
                 "create_repo": False,
                 # "Closes #N" in the PR body: GitHub links issue and PR and
                 # closes the issue on merge even when the daemon is not
@@ -1265,7 +1283,9 @@ class DaemonLoop:
         body = _MARKER_RE.sub("", item.body).strip()
         if body:
             parts.append(body)
-        origin = f"GitHub issue #{item.source_key} in {self.config.github.repo}"
+        origin = (
+            f"GitHub issue #{item.source_key} in {self._item_repo(item) or self.config.github.repo}"
+        )
         if item.url:
             origin += f" ({item.url})"
         parts.append(f"---\nThis work item came from: {origin}.")
@@ -1281,7 +1301,7 @@ class DaemonLoop:
         engine = handle.engine
         if resume:
             return engine.resume(run_id)
-        return engine.start(self.outcome_text(item), run_id=run_id)
+        return engine.start(self.outcome_text(item), run_id=run_id, repo=self._item_repo(item))
 
     # -- reporting -----------------------------------------------------------------------
 
