@@ -288,19 +288,44 @@ class Provisioner:
             # config-sourced workspaces on fresh runs.
             workspace = workspace.resolve()
         else:
-            workspace = self._resolve_workspace(run_id)
+            workspace = self._resolve_workspace(run_id, repo)
         workspace.mkdir(parents=True, exist_ok=True)
         return self._provision_pair(run_id, workspace, repo)
 
-    def _resolve_workspace(self, run_id: str) -> Path:
-        """Where this fresh run works: the per-run dir, the configured
-        workspace, or — when that workspace is a git checkout — a per-run
-        clone of it, so runs never disturb the checkout's branch setup.
+    def _run_repo(self, repo: str | None) -> str | None:
+        """The ``owner/name`` this run acts on, or None when there is none."""
+        entry = self.config.github.find_repo(repo)
+        if entry is not None:
+            return entry.repo
+        if repo:
+            return repo
+        return self.config.github.repo
+
+    def _resolve_workspace(self, run_id: str, repo: str | None = None) -> Path:
+        """Where this fresh run works: the per-run dir, *this repo's*
+        configured workspace, or — when that workspace is a git checkout — a
+        per-run clone of it, so runs never disturb the checkout's branch
+        setup.
+
+        The clone source is resolved per repository
+        (:meth:`Config.workspace_for_repo`), never from a daemon-wide path:
+        with several repositories configured, one ``[sandbox] workspace``
+        would otherwise build every repo's runs from whichever repository
+        that checkout happens to be (#526).
         """
         clone_dir = (self.config.state_dir / "runs" / run_id / "workspace").resolve()
         mode = self.config.sandbox.workspace_isolation
-        source = self.config.sandbox.workspace
+        run_repo = self._run_repo(repo)
+        source = self.config.workspace_for_repo(run_repo)
         if source is None:
+            configured = self.config.sandbox.workspace is not None or any(
+                entry.workspace is not None for entry in self.config.github.repos
+            )
+            if configured and run_repo is not None:
+                # A workspace is configured somewhere, but none of it belongs
+                # to this repository. Its tree must come from its own remote
+                # or not at all — never from another repo's checkout.
+                return self._clone_repo_remote(run_id, run_repo, clone_dir)
             if mode == "clone":
                 raise ProvisionError(
                     "workspace_isolation = 'clone' requires [sandbox] workspace "
@@ -308,6 +333,7 @@ class Provisioner:
                 )
             return clone_dir
         source = source.resolve()
+        self._assert_origin_matches(source, run_repo)
         if mode == "in-place" or source == clone_dir:
             return source
         git = hostgit.find_git()
@@ -352,6 +378,100 @@ class Provisioner:
                 "'in-place' to run directly in the checkout"
             )
         return self._clone_workspace(run_id, source, clone_dir, dirty=dirty)
+
+    def _assert_origin_matches(self, source: Path, repo: str | None) -> None:
+        """Refuse a source checkout whose ``origin`` names another repository.
+
+        Belt and braces behind the daemon-start/``doctor`` preflight: a run
+        must never be built from a tree belonging to a different repo, no
+        matter how the workspace was configured or resolved (#526).
+
+        With several repositories configured this fails *closed*: an origin
+        that cannot be shown to belong to this repo (no ``origin`` remote at
+        all, a non-GitHub or nested-path URL, an ssh alias, a local path
+        remote) is refused too. "Nothing to contradict it" is not evidence of
+        ownership, and no preflight covers that case. With a single repo the
+        unknown case stays permissive — that is the unchanged single-repo
+        deployment, where there is no other tree to confuse it with.
+        """
+        if repo is None:
+            return
+        origin = hostgit.origin_url(source)
+        matches = hostgit.origin_matches_repo(source, repo)
+        if matches is True:
+            return
+        if matches is None and not self.config.github.multi_repo:
+            return
+        if matches is None:
+            actual = origin or "no origin remote"
+            detail = f"workspace {source} has no origin that can be shown to be {repo} ({actual})"
+        else:
+            named = hostgit.normalise_repo_url(origin) or origin
+            detail = f"workspace {source} is a checkout of {named}"
+        if not (source / ".git").exists() and hostgit.repo_toplevel(source) is None:
+            # Not a git checkout at all: there is no origin to check and the
+            # isolation logic handles it (in-place / clone refusal).
+            return
+        raise ProvisionError(
+            f"{detail}, but this run is for {repo}; refusing to build {repo} "
+            "from a tree that is not demonstrably its own. Point that "
+            "repository's [[github.repos]] entry at its own workspace (or "
+            "move [sandbox] workspace into the matching entry)"
+        )
+
+    def _clone_repo_remote(self, run_id: str, repo: str, clone_dir: Path) -> Path:
+        """Clone the run's repository from its remote into the run dir.
+
+        The explicit no-workspace path: this repository has no host checkout,
+        so its tree comes from its own remote. Only credential-free (public)
+        remotes can succeed — the host holds no git credential by design
+        (#46) — and a failure is raised with that reason rather than falling
+        back to another repository's tree or to an empty directory.
+        """
+        if (clone_dir / ".git").exists():
+            self.bus.emit(
+                "sandbox.workspace_clone",
+                run_id,
+                source=repo,
+                target=str(clone_dir),
+                commit=hostgit.head_commit(clone_dir),
+                branch=branch_name(run_id),
+                dirty=False,
+                reused=True,
+                message=f"reusing existing run clone at {clone_dir}",
+            )
+            return clone_dir
+        if hostgit.find_git() is None:
+            raise ProvisionError(
+                f"no workspace is configured for {repo} and no git binary is on "
+                "PATH to clone it from its remote"
+            )
+        url = f"https://github.com/{repo}"
+        branch = self.config.sandbox.continue_branch or branch_name(run_id)
+        clone_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            sha = hostgit.clone_from_remote(
+                url, clone_dir, branch, existing=bool(self.config.sandbox.continue_branch)
+            )
+        except ProvisionError as exc:
+            raise ProvisionError(
+                f"no workspace is configured for {repo}, and cloning it from "
+                f"{url} failed: {exc}. The host holds no git credential, so this "
+                "path only works for a public repository; configure a workspace "
+                "for this repository in its [[github.repos]] entry (see #46)"
+            ) from exc
+        self.bus.emit(
+            "sandbox.workspace_clone",
+            run_id,
+            source=url,
+            target=str(clone_dir),
+            commit=sha,
+            branch=branch,
+            dirty=False,
+            reused=False,
+            message=f"cloned {url} at {sha[:12]} onto branch {branch}",
+        )
+        return clone_dir
 
     def _clone_workspace(self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool) -> Path:
         branch = branch_name(run_id)

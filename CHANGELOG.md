@@ -37,6 +37,26 @@ All notable changes to sbxloop are documented here. The project adheres to
   #4 in two repositories is two items; a store written before multi-repo
   support is migrated in place on open and its rows keep working.
 
+### Fixed
+
+- **A run for repository B is no longer built from repository A's checkout**
+  (#526). Multi-repo support resolved a run's *workspace* — the host git
+  checkout every run clones its tree from — from the single daemon-wide
+  `[sandbox] workspace`, so a daemon upgraded from a working single-repo
+  deployment routed everything else per repository (claim, labels, PR) while
+  building each run out of whichever repository that one checkout happened
+  to be. `[[github.repos]]` entries now take their own `workspace`, and both
+  the pre-run fast-forward and the provisioner clone resolve it per
+  repository. A checkout whose `origin` names a different repository is a
+  hard failure at three points — `sbxloop doctor` fails a check per
+  offending repo, `sbxloop daemon` refuses to start, and the provisioner
+  refuses the clone — each naming both repositories and the fix. A repository
+  with no workspace clones from its own remote (public repositories only:
+  the host holds no git credential, see #46) or fails the run with that
+  reason; there is no fallback to another repository's tree anywhere.
+  `[sandbox] workspace` still works unchanged for a single repository; with
+  several, migrate by moving it into the matching `[[github.repos]]` entry.
+
 ### Changed
 
 - **The Discord bridge posts plain markdown instead of rich cards** (#519).

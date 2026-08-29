@@ -144,6 +144,50 @@ def public_remote_url(url: str) -> str:
     return f"{scheme}://{host if at else authority}{slash}{path}"
 
 
+def normalise_repo_url(url: str | None) -> str | None:
+    """Canonical lowercased ``owner/name`` for a GitHub remote URL, or None.
+
+    Accepts scp-style ssh (``git@github.com:owner/name.git``), https/git
+    scheme URLs with or without embedded credentials, a trailing slash or a
+    ``.git`` suffix, and a bare ``owner/name`` slug. Anything that does not
+    yield exactly an owner and a name is None.
+    """
+    if url is None:
+        return None
+    text = url.strip()
+    if not text:
+        return None
+    _scheme, sep, rest = text.partition("://")
+    if sep:
+        _authority, _slash, path = rest.partition("/")
+    else:
+        _userinfo, at, remainder = text.rpartition("@")
+        path = remainder.partition(":")[2] if at else text
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) != 2:
+        return None
+    owner, name = parts
+    return f"{owner.lower()}/{name.lower()}"
+
+
+def origin_matches_repo(path: Path, repo: str) -> bool | None:
+    """Whether ``path``'s origin names ``repo``; None when it cannot be told.
+
+    None means the path is not a git checkout, has no origin, or either URL
+    is not a recognisable ``owner/name`` remote.
+    """
+    origin = normalise_repo_url(origin_url(path))
+    if origin is None:
+        return None
+    expected = normalise_repo_url(repo)
+    if expected is None:
+        return None
+    return origin == expected
+
+
 def clone_for_run(source: Path, target: Path, branch: str) -> str:
     """Clone ``source`` into ``target`` on a fresh ``branch``; return HEAD sha.
 
@@ -179,6 +223,43 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
             shutil.rmtree(target, ignore_errors=True)
         raise ProvisionError(
             f"cloning workspace {source} into {target} failed: {_describe(exc)}"
+        ) from exc
+
+
+def clone_from_remote(repo_url: str, target: Path, branch: str, *, existing: bool = False) -> str:
+    """Clone a *remote* URL into ``target`` on a fresh ``branch``; return sha.
+
+    The no-local-checkout path of per-repo workspace resolution: a repo
+    entry configured without a workspace has no host tree to clone, so the
+    run's tree comes from the remote itself. Only credential-free (public)
+    remotes can work here — the host deliberately holds no git credential
+    (#46) — so the clone runs with terminal and credential-helper prompting
+    disabled and fails loudly rather than hanging on an auth prompt.
+
+    ``ProvisionError`` on any failure; a half-created target is removed so a
+    retry starts clean. Never falls back to another tree.
+    """
+    env = {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "GCM_INTERACTIVE": "never",
+    }
+    try:
+        with Repo.clone_from(repo_url, str(target), env=env) as clone:
+            if existing:
+                # A fix round continuing its own pull request: start from what
+                # the remote branch actually has.
+                clone.git.checkout("-B", branch, f"origin/{branch}")
+            else:
+                clone.git.checkout("-b", branch)
+            sha = clone.head.commit.hexsha
+            clone.git.update_ref(CLONE_BASE_REF, sha)
+            return sha
+    except (GitCommandError, NoSuchPathError, OSError, ValueError) as exc:
+        if target.exists() and not (target / ".git").is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        raise ProvisionError(
+            f"cloning {public_remote_url(repo_url)} into {target} failed: {_describe(exc)}"
         ) from exc
 
 
