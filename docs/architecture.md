@@ -745,6 +745,23 @@ calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
   `sbxloop watch` TUI renders a failed tool call through the same shared
   helper, so its excerpt has the same head+tail shape, per-line clip and
   elision marker rather than a plain last-N-lines tail.
+- **No link previews, ever.** The bridge posts its own embed cards (headline,
+  finished verdict, run summary, live status), but Discord's *automatic* URL
+  unfurl — the grey preview card it generates under any message containing a
+  bare link — is suppressed at the send seam. `DiscordBridge._send` sets the
+  `SUPPRESS_EMBEDS` message flag (`suppress_embeds=True`) on every message
+  that does not carry one of our own embeds; when one does, the flag would
+  hide that embed too, so the text body goes through
+  `discord_format.no_unfurl` instead, which angle-brackets bare http(s) URLs
+  (`<https://…>`) outside code spans and leaves already-bracketed or
+  markdown-link URLs alone, so it is idempotent. Edits go through
+  `DiscordBridge._edit`, which re-asserts the flag (`suppress=True`) because
+  discord.py clears it otherwise — without that, the first edit of a
+  live-edited status, digest or concierge note would bring the preview back.
+  `[discord] embeds = false` turns the bridge's own cards into their
+  plain-markdown twins (`headline_text`, `finish_text`, `summary_text`, and
+  `EmbedSpec.as_text()` for anything without a hand-written twin); unfurl
+  suppression is unaffected by the toggle.
 - **Redaction at the render seam.** The worker already redacts an event's
   output before it leaves the sandbox; because this feature *publishes* more
   of what a command printed, every rendered command and every excerpt passes

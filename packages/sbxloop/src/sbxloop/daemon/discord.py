@@ -64,6 +64,7 @@ from sbxloop.daemon.discord_format import (
     format_for_discord,
     headline_embed,
     headline_text,
+    no_unfurl,
     split_markdown,
     status_embed,
     summary_embed,
@@ -789,7 +790,7 @@ class DiscordBridge:
         if not response.ok:
             turn.failed += 1
         if turn.note is None:
-            turn.note = await self._send(turn.channel, turn.render(), suppress_embeds=True)
+            turn.note = await self._send(turn.channel, turn.render())
             turn.last_edit = time.monotonic()
             return
         self._schedule_note_edit(turn)
@@ -809,7 +810,7 @@ class DiscordBridge:
         if turn.note is None:
             return
         try:
-            await turn.note.edit(content=_clip(turn.render(), self.discord.max_message_chars))
+            await self._edit(turn.note, turn.render())
             turn.last_edit = time.monotonic()
         except Exception:
             log.warning("discord.concierge_note_edit_failed", exc_info=True)
@@ -848,7 +849,7 @@ class DiscordBridge:
                 hint += ", or here to ask in plain language"
             await self._send(channel, f"{reply.text}{hint}.")
         else:
-            await self._send(channel, reply.text, suppress_embeds=True)
+            await self._send(channel, reply.text)
 
     # -- pump: queue -> discord (discord thread) -------------------------------------
 
@@ -1101,7 +1102,7 @@ class DiscordBridge:
                         if msg is not None:
                             self._digest_msg[run_id] = msg
                 else:
-                    await msg.edit(content=text)
+                    await self._edit(msg, text)
                 self._digest_last_edit[run_id] = now
             except Exception:
                 log.warning("discord.digest_edit_failed", run=run_id, exc_info=True)
@@ -1133,9 +1134,7 @@ class DiscordBridge:
                 size += len(chunk.text) + 1
                 continue
             await send_group()
-            await self._send(
-                thread, chunk.text, embed=chunk.embed, suppress_embeds=chunk.suppress_embeds
-            )
+            await self._send(thread, chunk.text, embed=chunk.embed)
         await send_group()
 
     async def _daemon_notice(self, notice: DaemonNotice) -> None:
@@ -1284,7 +1283,7 @@ class DiscordBridge:
                     self._status_last_edit[run_id] = asyncio.get_event_loop().time()
                     return
                 self._status_msg[run_id] = msg
-            await msg.edit(content=text)
+            await self._edit(msg, text)
             self._status_last_edit[run_id] = asyncio.get_event_loop().time()
         except Exception:
             log.warning("discord.status_edit_failed", run=run_id, exc_info=True)
@@ -1336,9 +1335,7 @@ class DiscordBridge:
             return  # not posted yet; _post_steer_status catches up
         progress = self._progress.get(pending.run_id) or SteerProgress()
         try:
-            await pending.status.edit(
-                content=_clip(progress.render(state=state), self.discord.max_message_chars)
-            )
+            await self._edit(pending.status, progress.render(state=state))
         except Exception:
             log.warning(
                 "discord.steer_status_edit_failed", run=pending.run_id, state=state, exc_info=True
@@ -1432,7 +1429,6 @@ class DiscordBridge:
         text: str = "",
         *,
         embed: EmbedSpec | None = None,
-        suppress_embeds: bool = False,
         reply_to: Any = None,
         mention_users: bool = False,
     ) -> Any:
@@ -1441,8 +1437,13 @@ class DiscordBridge:
         here and dropped — text-only retry — if Discord rejects them.
         ``reply_to`` threads the message under a human's message
         (``send(reference=…)``); if Discord rejects the reference the text
-        is sent plainly instead."""
-        content = _clip(text, self.discord.max_message_chars) if text else None
+        is sent plainly instead.
+
+        Link previews never survive this seam: unless the message carries
+        one of our own embeds, ``suppress_embeds=True`` is always set so
+        Discord renders no auto-generated unfurl. When one of our embeds
+        *is* attached the flag would hide it too, so the text body is run
+        through ``no_unfurl`` instead."""
         kwargs: dict[str, Any] = {}
         if reply_to is not None:
             kwargs["reference"] = reply_to
@@ -1450,14 +1451,15 @@ class DiscordBridge:
         mentions = _allowed_mentions_users() if mention_users else _allowed_mentions_none()
         if mentions is not None:
             kwargs["allowed_mentions"] = mentions
-        if suppress_embeds:
+        converted = _to_embed(embed) if (embed is not None and self.discord.embeds) else None
+        if converted is not None:
+            kwargs["embed"] = converted
+            text = no_unfurl(text) if text else text
+        else:
             kwargs["suppress_embeds"] = True
-        if embed is not None:
-            converted = _to_embed(embed) if self.discord.embeds else None
-            if converted is not None:
-                kwargs["embed"] = converted
-            elif not content:
-                content = _clip(embed.as_text(), self.discord.max_message_chars)
+        content = _clip(text, self.discord.max_message_chars) if text else None
+        if converted is None and embed is not None and not content:
+            content = _clip(no_unfurl(embed.as_text()), self.discord.max_message_chars)
         if content is None and "embed" not in kwargs:
             return None
         try:
@@ -1482,6 +1484,7 @@ class DiscordBridge:
                     exc_info=True,
                 )
                 kwargs.pop("embed")
+                kwargs["suppress_embeds"] = True
                 fallback = content or _clip(embed.as_text(), self.discord.max_message_chars)
                 try:
                     return await target.send(fallback, **kwargs)
@@ -1501,6 +1504,33 @@ class DiscordBridge:
                 exc_info=True,
             )
             return None
+
+    async def _edit(self, message: Any, text: str, *, embed: EmbedSpec | None = None) -> None:
+        """Edit a message we posted, re-asserting unfurl suppression.
+
+        discord.py drops the ``SUPPRESS_EMBEDS`` flag unless the edit
+        re-asserts it (``suppress=True``), so a link preview would come
+        back on the first edit of a live status/digest/note message. When
+        the message carries one of our own embeds the flag would hide it,
+        so the body is angle-bracketed via ``no_unfurl`` instead. Errors
+        propagate: callers already log them with their own context."""
+        converted = _to_embed(embed) if (embed is not None and self.discord.embeds) else None
+        kwargs: dict[str, Any] = {}
+        if converted is not None:
+            kwargs["embed"] = converted
+            body = no_unfurl(text)
+        else:
+            kwargs["suppress"] = True
+            body = text
+        kwargs["content"] = _clip(body, self.discord.max_message_chars)
+        try:
+            await message.edit(**kwargs)
+        except TypeError:
+            # Message object without a ``suppress`` keyword: fall back to
+            # angle-bracketing so the preview still cannot appear.
+            kwargs.pop("suppress", None)
+            kwargs["content"] = _clip(no_unfurl(text), self.discord.max_message_chars)
+            await message.edit(**kwargs)
 
     async def _send_channel(
         self, text: str, *, embed: EmbedSpec | None = None, mentions: bool = False
@@ -1597,12 +1627,7 @@ class DiscordBridge:
             if channel is None:
                 return
             msg = await channel.fetch_message(known.headline_id)
-            kwargs: dict[str, Any] = {"content": _clip(text, self.discord.max_message_chars)}
-            if embed is not None and self.discord.embeds:
-                converted = _to_embed(embed)
-                if converted is not None:
-                    kwargs["embed"] = converted
-            await msg.edit(**kwargs)
+            await self._edit(msg, text, embed=embed)
         except Exception:
             log.warning("discord.headline_edit_failed", run=run_id, exc_info=True)
 

@@ -39,9 +39,8 @@ pip install sbxloop
 # one-time host setup
 sbx login
 sbx policy init balanced
-sbxloop doctor          # verifies sbx, policy, tokens, worker wheel — boots nothing
-sbxloop doctor --probe  # + asks GitHub about each repo from one github sandbox per credential
-sbxloop doctor --deep   # + full sbx conformance suite in a scratch sandbox (implies --probe)
+sbxloop doctor          # verifies sbx, policy, tokens, worker wheel
+sbxloop doctor --deep   # + full sbx conformance suite in a scratch sandbox
 
 # go
 sbxloop run "Add mypy strict typing to every module in ./src and fix all findings"
@@ -225,7 +224,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                   |
 | `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints).                                                                                                                                                  |
 | `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                              |
-| `sbxloop doctor [--probe] [--deep]`             | Verify the host setup. `--probe` asks GitHub about each configured repository from a github sandbox (one per distinct credential); `--deep` boots a scratch sandbox for the full sbx conformance suite and implies `--probe`. The default boots nothing.         |
+| `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                      |
 | `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                               |
 | `sbxloop gc`                                    | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                  |
 | `sbxloop secrets list\|clean\|rotate`           | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                         |
@@ -522,7 +521,11 @@ settled is a one-line notice in the control channel, pointing at the run's
 thread — `🎉 gh:issue:9 merged (2/2 tasks done) · PR …`,
 `❌ gh:issue:4 failed (…); 1 attempt(s) left`, `🚧 gh:issue:7 blocked: … — a human needs to look` when an issue lands in `sbxloop:blocked`, `🛑 circuit breaker opened …` — with every URL masked so nothing sprouts a preview.
 Mentions are always disabled, so model output can never ping the
-channel. `[discord] embeds`, `status_line`, `tool_batch_lines`,
+channel, and Discord's automatic link previews (unfurls) are suppressed on
+every send *and* every edit, so no message sprouts a grey preview card — the
+bridge's own embed cards still render. `[discord] embeds` (set `false` to
+render those cards as plain-markdown twins instead; unfurl suppression is
+unaffected), `status_line`, `tool_batch_lines`,
 `tool_output_lines` (tail output lines echoed for a *successful* call,
 default `0` = none) and `tool_fail_output_lines` (head+tail lines echoed for a
 *failed* call, default `20` — a watcher needs the stderr) tune it, along with
