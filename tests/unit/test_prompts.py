@@ -224,6 +224,12 @@ def test_review_prompt_carries_contract() -> None:
     assert "ONLY the fenced JSON block" in text
     for word in ("approve", "request_changes", "blocking", "major", "minor", "nit"):
         assert f"`{word}`" in text or f'"{word}"' in text, word
+    # #521: every blocking/major finding carries the reviewer's reproduction,
+    # concrete enough to become a failing test, and names the neighbours.
+    assert "## Reproduce before you file" in text
+    assert "`repro` is required on every `blocking` and `major` finding" in text
+    assert '"repro":' in text
+    assert "name the neighbours" in text
 
 
 def test_review_prompt_describes_the_wrong_check_shape() -> None:

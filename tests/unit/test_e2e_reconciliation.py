@@ -51,12 +51,16 @@ INLINE_FINDING = {
     "line": 1,
     "body": "hello.txt must greet with hello, not hi",
     "severity": "major",
+    # #521: a major finding without a repro is sent back once.
+    "repro": "cat hello.txt prints 'hi'; expected 'hello'",
 }
 BODY_FINDING = {
     "path": "docs/greeting.md",
     "line": None,
     "body": "the greeting is not documented anywhere",
     "severity": "major",
+    # #521: a major finding without a repro is sent back once.
+    "repro": "grep -r greeting docs/ finds nothing; expected a docs/greeting.md entry",
 }
 
 
@@ -219,11 +223,13 @@ class TestTwoRoundRunIsReconciledOnThePr:
                 "anchor": "hello.txt:1",
                 "status": "addressed",
                 "note": "say hello, not hi",
+                "test": "",
             },
             {
                 "anchor": "docs/greeting.md:0",
                 "status": "refuted",
                 "note": "a one-line fixture needs no documentation",
+                "test": "",
             },
         ]
 
@@ -328,6 +334,8 @@ MAJOR_FINDING = {
     "line": 1,
     "body": "the greeting should end with a newline",
     "severity": "major",
+    # #521: a major finding without a repro is sent back once.
+    "repro": "tail -c1 hello.txt is not a newline; expected one",
 }
 APPROVE_WITH_MAJOR = review_round(
     "approve", "approving anyway; noting one thing", findings=[MAJOR_FINDING]

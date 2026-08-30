@@ -21,8 +21,8 @@ render()).
 Contract (test_review_prompt_carries_contract): the four lenses
 ("Concurrency and locking", "Failure ordering", "Input validation",
 "Cross-module interaction"), the phrases "read-only", "Do not modify",
-"refuted" and "ONLY the fenced JSON block", and the verdict/severity
-vocabulary must stay. The wrong-check / verify-suspect section with its
+"refuted", "repro" and "ONLY the fenced JSON block", and the
+verdict/severity vocabulary must stay. The wrong-check / verify-suspect section with its
 config-override worked example must stay too
 (test_review_prompt_describes_the_wrong_check_shape).
 -->
@@ -166,6 +166,21 @@ Approve only when you looked for these failure modes and did not find
 them — say so in the summary. Anything real but out of scope for this PR
 goes in the summary as prose; do not file it anywhere.
 
+## Reproduce before you file
+
+Reproduce every `blocking` or `major` finding against this tree before you
+file it — run the code, build the failing input, watch it fail — and put
+that reproduction in the finding's `repro`: the minimal setup (the row,
+the stored value, the malformed input, the sequence of calls), what
+happens, and what should happen. Make it concrete enough that the fixer
+can turn it into a test that fails on this tree: the fixer is a fresh
+session that never saw your reasoning, and a repro it can run is worth
+more than a paragraph it has to interpret. A finding you cannot reproduce
+is `minor` at most. When a finding is one case of a wider gap — the same
+code path also sees other row states, id forms or inputs — say so in the
+body and name the neighbours: a fix that settles only the case you named
+costs the run another round for the next one.
+
 ## Response format
 
 Respond with exactly one fenced JSON block:
@@ -179,7 +194,8 @@ Respond with exactly one fenced JSON block:
       "path": "src/module.py",
       "line": 42,
       "body": "what is wrong here and what would fix it",
-      "severity": "major"
+      "severity": "major",
+      "repro": "setup: a stored row with id 'gh:7' and state 'running'; call migrate(); observed: the row is deleted; expected: it is re-keyed to 'gh:issue:7'"
     }
   ],
   "confirmations": [
@@ -196,6 +212,9 @@ Respond with exactly one fenced JSON block:
 - `line` is a line of the *changed* file the finding is about (omit it for
   a finding with no single line). `path` is relative to the repository
   root.
+- `repro` is required on every `blocking` and `major` finding (see
+  "Reproduce before you file"); omit it on `minor` findings and nits. A
+  blocking/major finding without one is sent back to you once.
 - If the PR is fine, `approve` with a summary saying why and an empty
   `findings` list — a clean review is a valid result.
 - `confirmations` is your anchor-keyed verdict on each carried-over finding

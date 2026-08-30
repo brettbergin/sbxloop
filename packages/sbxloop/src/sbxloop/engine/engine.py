@@ -109,6 +109,7 @@ from sbxloop.engine.review import (
     prior_findings,
     reconcile,
     refuted_anchors,
+    render_fix_history,
     render_review_history,
     review_body,
     split_carried,
@@ -1719,7 +1720,7 @@ class LoopEngine:
             return None
         items = reconcile(ReviewRound(open_round.round, open_round.verdict, report))
         return [
-            {"anchor": anchor, "status": item.status, "note": item.note}
+            {"anchor": anchor, "status": item.status, "note": item.note, "test": item.test}
             for anchor, item in items.items()
         ]
 
@@ -1794,6 +1795,9 @@ class LoopEngine:
                 failed_checks=failed_checks,
                 objections=objections,
                 conflicts=conflicts,
+                # The fixer is a fresh session: hand it what its
+                # predecessors decided and why (#521).
+                history=render_fix_history(self._review_rounds(run_id)),
             ),
             verify_commands=verify_commands,
             failed_checks=failed_checks,

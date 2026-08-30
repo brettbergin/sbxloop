@@ -204,8 +204,14 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   the brief. Every
   round sees the earlier rounds' findings and the fixer's per-finding
   `addressed` / `refuted: <why>` list, and the next review is told not to
-  re-raise a refuted finding without a rebuttal (`RefutedGuard` sends such
-  a verdict back once) — the memory the old loop never had.
+  re-raise a refuted finding without a rebuttal (`ReviewGuard` sends such
+  a verdict back once) — the memory the old loop never had. Every
+  blocking/major finding carries the reviewer's `repro` (the guard sends
+  back, once, one that does not); the fix brief turns it into a
+  regression test that must fail first, asks for the neighbourhood the
+  same code path sees, and shows the fixer the earlier rounds with each
+  finding's fate in the previous fixer's words (#521) — so rounds stop
+  converging one adjacent case at a time.
 - **CI** — poll the delivered head's check runs; red fetches the failing
   jobs' logs into a fix brief. "No check runs yet" is trusted as "no CI"
   only after `ci_settle_s`.
@@ -372,13 +378,14 @@ threads themselves.
 brief by asking for one line per finding or objection:
 
 ```
-addressed: <path:line> — what changed
+addressed: <path:line> — what changed; test: <the regression test it added>
 refuted:   <path:line> — why it is not a problem
 ```
 
 `review.reconcile(round)` parses that report against the round's findings and
 returns, per anchor, one of `addressed`, `refuted` or `unanswered` with the
-note the fixer gave. Parsing is deliberately forgiving — dash variants, list
+note the fixer gave and the test it named (`Reconciliation.test`, carried
+into the thread reply and the next fixer's history). Parsing is deliberately forgiving — dash variants, list
 markers, case and stray whitespace — and matches on the exact `path:line`
 anchor first, the bare path second. `unanswered` is its own status on
 purpose: "the round said nothing about this" is not "the round decided to

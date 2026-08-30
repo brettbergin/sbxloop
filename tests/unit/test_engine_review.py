@@ -10,8 +10,8 @@ from sbxloop.engine.review import (
     FIX_TASK_PREFIX,
     FIX_TASK_TITLE,
     MAX_INLINE_COMMENTS,
-    RefutedGuard,
     ReviewFinding,
+    ReviewGuard,
     ReviewRound,
     ReviewVerdict,
     fix_brief,
@@ -20,8 +20,10 @@ from sbxloop.engine.review import (
     reconcile,
     reconcile_rounds,
     refuted_anchors,
+    render_fix_history,
     render_review_history,
     review_body,
+    split_test,
 )
 from sbxloop.gh.ops import FailedCheck, ReviewComment
 
@@ -31,9 +33,10 @@ def finding(
     line: int | None = 12,
     body: str = "the lock is released before the write",
     severity: str = "major",
+    repro: str = "two writers on one row; observed: the second write is lost; expected: kept",
 ) -> ReviewFinding:
     return ReviewFinding.model_validate(
-        {"path": path, "line": line, "body": body, "severity": severity}
+        {"path": path, "line": line, "body": body, "severity": severity, "repro": repro}
     )
 
 
@@ -47,7 +50,7 @@ def request_changes(*findings: ReviewFinding, summary: str = "one real defect") 
 
 class TestReviewFinding:
     def test_anchor_and_render(self) -> None:
-        f = finding()
+        f = finding(repro="")
         assert f.anchor == "src/app.py:12"
         assert f.blocking
         assert f.render() == "- `src/app.py:12` [major] the lock is released before the write"
@@ -56,7 +59,7 @@ class TestReviewFinding:
         )
 
     def test_unanchored_finding_has_no_inline_comment(self) -> None:
-        f = finding(line=None, severity="nit")
+        f = finding(line=None, severity="nit", repro="")
         assert f.anchor == "src/app.py:0"
         assert not f.blocking
         assert f.render() == "- `src/app.py` [nit] the lock is released before the write"
@@ -158,9 +161,9 @@ class TestReconcile:
             "refuted: src/db.py:3 — the connection is per-thread, no race",
         )
         assert reconcile(round) == {
-            "src/app.py:12": ("addressed", "moved the write under the lock"),
-            "src/db.py:3": ("refuted", "the connection is per-thread, no race"),
-            "src/net.py:9": ("unanswered", ""),
+            "src/app.py:12": ("addressed", "moved the write under the lock", ""),
+            "src/db.py:3": ("refuted", "the connection is per-thread, no race", ""),
+            "src/net.py:9": ("unanswered", "", ""),
         }
 
     def test_dash_variants_case_and_list_markers(self) -> None:
@@ -177,9 +180,9 @@ class TestReconcile:
             "addressed: src/net.py:9: added the timeout\n",
         )
         assert reconcile(round) == {
-            "src/app.py:12": ("addressed", "swapped the order"),
-            "src/db.py:3": ("refuted", "by design"),
-            "src/net.py:9": ("addressed", "added the timeout"),
+            "src/app.py:12": ("addressed", "swapped the order", ""),
+            "src/db.py:3": ("refuted", "by design", ""),
+            "src/net.py:9": ("addressed", "added the timeout", ""),
         }
 
     def test_unknown_anchors_and_malformed_lines_are_ignored(self) -> None:
@@ -194,13 +197,13 @@ class TestReconcile:
             "addressed: src/app.py:12\n",
         )
         assert reconcile(round) == {
-            "src/app.py:12": ("addressed", ""),
-            "src/db.py:3": ("unanswered", ""),
+            "src/app.py:12": ("addressed", "", ""),
+            "src/db.py:3": ("unanswered", "", ""),
         }
 
     def test_empty_response_leaves_every_finding_unanswered(self) -> None:
         assert reconcile(ReviewRound(1, request_changes(finding()), "")) == {
-            "src/app.py:12": ("unanswered", "")
+            "src/app.py:12": ("unanswered", "", "")
         }
 
     def test_refutation_wins_over_an_addressed_line_for_the_same_anchor(self) -> None:
@@ -209,14 +212,14 @@ class TestReconcile:
             request_changes(finding()),
             "addressed: src/app.py:12 — touched it\nrefuted: src/app.py:12 — actually fine",
         )
-        assert reconcile(round)["src/app.py:12"] == ("refuted", "actually fine")
+        assert reconcile(round)["src/app.py:12"] == ("refuted", "actually fine", "")
 
     def test_reconcile_rounds_merges_and_keeps_answers_over_silence(self) -> None:
         rounds = [
             ReviewRound(1, request_changes(finding()), "refuted: src/app.py:12 — not a bug"),
             ReviewRound(2, request_changes(finding()), "the fixer said nothing useful"),
         ]
-        assert reconcile_rounds(rounds) == {"src/app.py:12": ("refuted", "not a bug")}
+        assert reconcile_rounds(rounds) == {"src/app.py:12": ("refuted", "not a bug", "")}
 
 
 class TestRenderReviewHistory:
@@ -236,9 +239,9 @@ class TestRenderReviewHistory:
         assert "(no fix round ran after this review)" in text
 
 
-class TestRefutedGuard:
+class TestReviewGuard:
     def test_trips_once_on_a_verdict_built_only_on_refuted_findings(self) -> None:
-        guard = RefutedGuard({"src/app.py:12"})
+        guard = ReviewGuard({"src/app.py:12"})
         verdict = request_changes(finding())
         with pytest.raises(ValueError, match=r"already refuted.*src/app\.py:12"):
             guard.check(verdict)
@@ -247,18 +250,42 @@ class TestRefutedGuard:
         guard.check(verdict)
 
     def test_a_new_blocking_finding_passes(self) -> None:
-        guard = RefutedGuard({"src/app.py:12"})
+        guard = ReviewGuard({"src/app.py:12"})
         guard.check(request_changes(finding(), finding(path="new.py", line=1)))
         assert not guard.tripped
 
     def test_approvals_and_empty_refutations_never_trip(self) -> None:
-        RefutedGuard({"src/app.py:12"}).check(approve(finding()))
-        RefutedGuard(set()).check(request_changes(finding()))
+        ReviewGuard({"src/app.py:12"}).check(approve(finding()))
+        ReviewGuard(set()).check(request_changes(finding()))
 
     def test_refuted_nits_alongside_a_real_blocker_do_not_count(self) -> None:
-        guard = RefutedGuard({"src/app.py:12"})
+        guard = ReviewGuard({"src/app.py:12"})
         guard.check(request_changes(finding(severity="nit"), finding(path="x.py", line=2)))
         assert not guard.tripped
+
+    def test_a_blocking_finding_without_a_repro_is_sent_back_once(self) -> None:
+        """#521: the reviewer reproduced it; the fixer needs that repro as a
+        test. Sent back once with the anchors named, then accepted."""
+        guard = ReviewGuard(set())
+        bare = finding().model_copy(update={"repro": ""})
+        with pytest.raises(ValueError, match=r"carry no `repro` \(src/app\.py:12\)"):
+            guard.check(request_changes(bare))
+        assert guard.tripped
+        guard.check(request_changes(bare))  # told once; the second is accepted
+
+    def test_nits_and_minors_need_no_repro(self) -> None:
+        guard = ReviewGuard(set())
+        guard.check(approve(finding(severity="nit").model_copy(update={"repro": ""})))
+        guard.check(approve(finding(severity="minor").model_copy(update={"repro": ""})))
+        assert not guard.tripped
+
+    def test_one_trip_in_total(self) -> None:
+        """The acceptance path retries exactly once: after the refuted rule
+        trips, a missing repro on the retry must not fail the run."""
+        guard = ReviewGuard({"src/app.py:12"})
+        with pytest.raises(ValueError, match="already refuted"):
+            guard.check(request_changes(finding()))
+        guard.check(request_changes(finding(path="x.py", line=2).model_copy(update={"repro": ""})))
 
 
 class TestFixBrief:
@@ -281,9 +308,63 @@ class TestFixBrief:
             "a finding you refuted with a stated reason will not be raised again "
             "without a rebuttal."
         )
-        assert "`addressed: <path:line> — what changed`" in brief
+        assert "`addressed: <path:line> — what changed; test: <the regression test" in brief
         assert "Failing checks" not in brief
         assert "Review comments a human left" not in brief
+        assert "Earlier fix rounds" not in brief
+
+    def test_a_repro_becomes_a_required_failing_test_and_the_neighbourhood_is_asked(
+        self,
+    ) -> None:
+        """#521: the reviewer's reproduction reaches the fixer as a test to
+        write first, and the brief asks for the adjacent cases the same
+        path sees — the two halves of "one adjacent case per round"."""
+        brief = fix_brief(
+            pr_number=9,
+            kind="review",
+            why="the review requested changes",
+            round=2,
+            findings=[
+                finding(repro="a raw row with id 'gh:7', state 'running'; migrate() deletes it"),
+                finding(path="src/other.py", line=3, severity="minor", repro=""),
+            ],
+        )
+        assert (
+            "- `src/app.py:12` [major] the lock is released before the write\n"
+            "  Repro: a raw row with id 'gh:7', state 'running'; migrate() deletes it" in brief
+        )
+        assert (
+            "- `src/other.py:3` [minor]" in brief
+            and "src/other.py:3` [minor]\n  Repro" not in brief
+        )
+        assert "Reproduce it first, as a test that fails on the current tree" in brief
+        assert "not through the code path under test" in brief
+        assert "list the other inputs this same code path sees" in brief
+        assert "row states, id forms, config shapes or error paths" in brief
+
+    def test_without_a_repro_no_test_instruction_but_still_the_neighbourhood(self) -> None:
+        brief = fix_brief(
+            pr_number=9, kind="review", why="x", round=1, findings=[finding(repro="")]
+        )
+        assert "Reproduce it first" not in brief
+        assert "list the other inputs this same code path sees" in brief
+
+    def test_history_precedes_the_findings(self) -> None:
+        brief = fix_brief(
+            pr_number=9,
+            kind="review",
+            why="x",
+            round=3,
+            findings=[finding()],
+            history="### Round 1 — request_changes\n\n- `a.py:1` [major] b\n  → addressed — c",
+        )
+        head = brief.index("Earlier fix rounds on this pull request")
+        assert "build on those decisions rather than re-deriving" in brief
+        assert (
+            head
+            < brief.index("### Round 1 — request_changes")
+            < brief.index("The review's findings:")
+        )
 
     def test_failed_checks_quote_their_log_excerpt(self) -> None:
         brief = fix_brief(
@@ -366,3 +447,99 @@ def test_review_body_unanchored_lists_every_finding() -> None:
     # the anchored shape lists only what has no inline comment
     anchored = review_body(verdict, run_id="r1", round=2)
     assert "anchored nit" not in anchored and "unanchored" in anchored
+
+
+class TestRepro:
+    """#521: a finding carries the reviewer's reproduction; the fixer names
+    the regression test it wrote; the next fixer sees both."""
+
+    def test_render_and_comment_carry_the_repro(self) -> None:
+        f = finding(repro="  raw row id 'gh:7'\n  state running;\n migrate() deletes it ")
+        assert f.render() == (
+            "- `src/app.py:12` [major] the lock is released before the write\n"
+            "  Repro: raw row id 'gh:7' state running; migrate() deletes it"
+        )
+        assert f.render(repro=False) == (
+            "- `src/app.py:12` [major] the lock is released before the write"
+        )
+        comment = f.comment()
+        assert comment is not None
+        assert comment.body == (
+            "[major] the lock is released before the write\n\n"
+            "**Repro:** raw row id 'gh:7' state running; migrate() deletes it"
+        )
+        bare = finding(repro="")
+        assert "Repro" not in bare.render() and "Repro" not in bare.comment().body  # type: ignore[union-attr]
+        assert bare.needs_repro and not finding(severity="nit", repro="").needs_repro
+
+    def test_repro_is_optional_in_the_parsed_verdict(self) -> None:
+        verdict = ReviewVerdict.model_validate(
+            {
+                "verdict": "approve",
+                "summary": "fine",
+                "findings": [{"path": "a.py", "line": 1, "body": "b", "severity": "nit"}],
+            }
+        )
+        assert verdict.findings[0].repro == ""
+
+    def test_split_test_takes_the_tail_off_the_note(self) -> None:
+        assert split_test("re-keyed the row; test: tests/unit/test_store.py::test_raw_row") == (
+            "re-keyed the row",
+            "tests/unit/test_store.py::test_raw_row",
+        )
+        assert split_test("re-keyed the row (test: tests/test_x.py::test_y)") == (
+            "re-keyed the row",
+            "tests/test_x.py::test_y",
+        )
+        assert split_test("re-keyed the row, tests: `test_x.py::test_y`.") == (
+            "re-keyed the row",
+            "test_x.py::test_y",
+        )
+        assert split_test("re-keyed the row.") == ("re-keyed the row", "")
+        assert split_test("") == ("", "")
+
+    def test_reconcile_records_the_named_test(self) -> None:
+        rnd = ReviewRound(
+            1,
+            request_changes(finding(), finding(path="src/other.py", line=3)),
+            "Summary.\n\n"
+            "- addressed: src/app.py:12 — take the lock first; test: tests/test_app.py::test_lock\n"
+            "- refuted: src/other.py:3 — the caller holds it",
+        )
+        items = reconcile(rnd)
+        assert items["src/app.py:12"] == (
+            "addressed",
+            "take the lock first",
+            "tests/test_app.py::test_lock",
+        )
+        assert (
+            items["src/app.py:12"].text
+            == "take the lock first (test: `tests/test_app.py::test_lock`)"
+        )
+        assert items["src/other.py:3"] == ("refuted", "the caller holds it", "")
+        assert items["src/other.py:3"].text == "the caller holds it"
+
+    def test_fix_history_shows_each_findings_fate_and_test(self) -> None:
+        rounds = [
+            ReviewRound(
+                1,
+                request_changes(finding(), finding(path="src/other.py", line=3)),
+                "- addressed: src/app.py:12 — lock first; test: tests/test_app.py::test_lock\n"
+                "- refuted: src/other.py:3 — the caller holds it",
+            ),
+            ReviewRound(2, request_changes(finding(path="src/third.py", line=9)), ""),
+        ]
+        text = render_fix_history(rounds)
+        assert text.startswith("### Round 1 — request_changes\n\n")
+        assert (
+            "- `src/app.py:12` [major] the lock is released before the write\n"
+            "  → addressed — lock first (test: `tests/test_app.py::test_lock`)" in text
+        )
+        assert "- `src/other.py:3` [major]" in text and "→ refuted — the caller holds it" in text
+        assert "Repro:" not in text, "the fixer gets the fate, not the old repro"
+        assert "Round 2" not in text, "the open round is the brief itself"
+        assert render_fix_history([]) == "" and render_fix_history(rounds[1:]) == ""
+
+    def test_fix_history_marks_unanswered(self) -> None:
+        rounds = [ReviewRound(1, request_changes(finding()), "I fixed things.")]
+        assert "→ unanswered" in render_fix_history(rounds)
