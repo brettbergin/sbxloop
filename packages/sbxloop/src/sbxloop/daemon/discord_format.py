@@ -1239,14 +1239,25 @@ def format_for_discord(
         parts = [
             f"{data.get('addressed', 0)} addressed",
             f"{data.get('refuted', 0)} refuted",
-            f"{data.get('unanswered', 0)} unanswered",
         ]
+        if data.get("deferred"):
+            parts.append(f"{data['deferred']} deferred")
+        parts.append(f"{data.get('unanswered', 0)} unanswered")
         text = f"🧾 reconciled round {data.get('round')}: " + " · ".join(parts)
         replied, resolved = data.get("replied", 0), data.get("resolved", 0)
         text += f" · {replied} repl(ies), {resolved} thread(s) resolved"
         if data.get("comment_url"):
             text += f" · {link('body-only', data['comment_url'])}"
         return [line(text, flush=True)]
+    if t == HostEventTypes.FIX_UNANSWERED:
+        anchors = ", ".join(code(str(a)) for a in _list(data, "anchors")) or "(none)"
+        return [
+            line(
+                f"⚠ fix round {data.get('round')} left {len(_list(data, 'anchors'))} finding(s) "
+                f"unanswered — carried into the next round: {anchors}",
+                flush=True,
+            )
+        ]
     if t == HostEventTypes.FIX_ROUND:
         why = _one_line(data.get("why") or "", 200)
         return [

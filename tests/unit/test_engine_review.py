@@ -14,6 +14,7 @@ from sbxloop.engine.review import (
     ReviewGuard,
     ReviewRound,
     ReviewVerdict,
+    closed_anchors,
     fix_brief,
     fix_task,
     is_fix_task,
@@ -24,6 +25,7 @@ from sbxloop.engine.review import (
     render_review_history,
     review_body,
     split_test,
+    unanswered_findings,
 )
 from sbxloop.gh.ops import FailedCheck, ReviewComment
 
@@ -320,13 +322,19 @@ class TestFixBrief:
             "the review requested changes."
         )
         assert "do not start over" in brief
-        assert "The review's findings:\n- `src/app.py:12` [major] the lock" in brief
-        assert "may be refuted, but only with a specific reason" in brief
+        assert (
+            "The review's blocking findings — each must be addressed, or refuted with a "
+            "specific reason:\n- `src/app.py:12` [major] the lock" in brief
+        )
+        assert "The review's non-blocking findings" not in brief
+        assert "each must be addressed, or refuted with a specific reason" in brief
         assert brief.endswith(
-            "a finding you refuted with a stated reason will not be raised again "
-            "without a rebuttal."
+            "a finding you refuted with a stated reason or deferred will not be raised "
+            "again without a rebuttal, and a finding with no line at all comes back as "
+            "unanswered."
         )
         assert "`addressed: <path:line> — what changed; test: <the regression test" in brief
+        assert "`deferred: <path:line> — why it can wait`" in brief
         assert "Failing checks" not in brief
         assert "Review comments a human left" not in brief
         assert "Earlier fix rounds" not in brief
@@ -381,7 +389,7 @@ class TestFixBrief:
         assert (
             head
             < brief.index("### Round 1 — request_changes")
-            < brief.index("The review's findings:")
+            < brief.index("The review's blocking findings")
         )
 
     def test_failed_checks_quote_their_log_excerpt(self) -> None:
@@ -560,4 +568,75 @@ class TestRepro:
 
     def test_fix_history_marks_unanswered(self) -> None:
         rounds = [ReviewRound(1, request_changes(finding()), "I fixed things.")]
-        assert "→ unanswered" in render_fix_history(rounds)
+        assert "→ UNANSWERED — neither addressed, refuted nor deferred" in render_fix_history(
+            rounds
+        )
+
+
+class TestDeferredAndUnanswered:
+    """#522: `deferred:` is the third answer; silence is not closure."""
+
+    def test_deferred_lines_parse_and_take_precedence_over_addressed_wording(self) -> None:
+        rnd = ReviewRound(
+            1,
+            request_changes(finding(), finding(path="src/other.py", line=3, severity="minor")),
+            "- addressed: src/app.py:12 — lock first\n"
+            "- deferred: src/other.py:3 — will address the unread key in a follow-up",
+        )
+        items = reconcile(rnd)
+        assert items["src/other.py:3"] == (
+            "deferred",
+            "will address the unread key in a follow-up",
+            "",
+        )
+        assert closed_anchors([rnd]) == {"src/other.py:3"}
+        assert refuted_anchors([rnd]) == set()
+
+    def test_unanswered_findings_are_those_no_answered_round_spoke_to(self) -> None:
+        minor = finding(path="src/other.py", line=3, severity="minor", body="key read nowhere")
+        rounds = [
+            ReviewRound(1, request_changes(finding(), minor), "- addressed: src/app.py:12 — done"),
+            ReviewRound(2, request_changes(finding(path="b.py", line=1)), ""),  # open round
+        ]
+        assert [f.anchor for f in unanswered_findings(rounds)] == ["src/other.py:3"]
+        assert unanswered_findings(rounds).pop().body == "key read nowhere"
+        assert unanswered_findings([]) == [] and unanswered_findings(rounds[1:]) == []
+        # Answered later — even by deferral — it is no longer unanswered.
+        rounds.append(ReviewRound(3, approve(minor), "- deferred: src/other.py:3 — follow-up"))
+        assert unanswered_findings(rounds) == []
+
+    def test_review_history_marks_each_findings_fate(self) -> None:
+        minor = finding(path="src/other.py", line=3, severity="minor")
+        rounds = [
+            ReviewRound(1, request_changes(finding(), minor), "- addressed: src/app.py:12 — ok")
+        ]
+        text = render_review_history(rounds)
+        assert "- `src/app.py:12` [major]" in text and "→ addressed — ok" in text
+        assert (
+            "- `src/other.py:3` [minor] the lock is released before the write\n"
+            "  Repro: two writers on one row; observed: the second write is lost; expected: kept\n"
+            "  → UNANSWERED — neither addressed, refuted nor deferred; "
+            "still a finding at its original severity" in text
+        )
+        assert "The fixer's response:\n\n- addressed: src/app.py:12 — ok" in text
+
+    def test_the_brief_lists_unanswered_first_then_blocking_then_non_blocking(self) -> None:
+        minor = finding(path="src/other.py", line=3, severity="minor", body="key read nowhere")
+        nit = finding(path="docs/x.md", line=None, severity="nit", body="typo", repro="")
+        brief = fix_brief(
+            pr_number=9,
+            kind="review",
+            why="the review requested changes",
+            round=2,
+            findings=[finding(), nit, minor],  # minor is also carried: listed once, first
+            unanswered=[minor],
+        )
+        first = brief.index("Findings the previous fix round did not answer")
+        blocking = brief.index("The review's blocking findings")
+        rest = brief.index("The review's non-blocking findings")
+        assert first < blocking < rest
+        assert brief.count("- `src/other.py:3` [minor] key read nowhere") == 1
+        assert brief.index("- `src/other.py:3`") < blocking
+        assert "- `docs/x.md` [nit] typo" in brief[rest:]
+        assert "defer it with a reason" in brief
+        assert "leaving one unmentioned brings it back next round" in " ".join(brief.split())

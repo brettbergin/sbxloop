@@ -2,7 +2,7 @@
 
 A fix round already reconciles every finding of the review that seeded it —
 :func:`sbxloop.engine.review.reconcile` turns the fixer's report into
-``addressed`` / ``refuted`` / ``unanswered`` per anchor. Until now that
+``addressed`` / ``refuted`` / ``deferred`` / ``unanswered`` per anchor. Until now that
 answer never left the engine: the threads GitHub opened for those findings
 stayed open through the merge and the next round restated everything in a
 fresh review body.
@@ -70,6 +70,7 @@ class ReconcileOutcome(NamedTuple):
     addressed: int = 0
     refuted: int = 0
     unanswered: int = 0
+    deferred: int = 0
     replied: int = 0
     resolved: int = 0
     body_only: int = 0
@@ -78,7 +79,7 @@ class ReconcileOutcome(NamedTuple):
 
     @property
     def total(self) -> int:
-        return self.addressed + self.refuted + self.unanswered
+        return self.addressed + self.refuted + self.deferred + self.unanswered
 
     @property
     def did_anything(self) -> bool:
@@ -95,10 +96,15 @@ def reply_body(
         text = f"**addressed{where}**" + (f": {note}" if note else ".")
     elif status == "refuted":
         text = "**refuted**" + (f": {note}" if note else ".")
+    elif status == "deferred":
+        text = (
+            "**deferred**" + (f": {note}" if note else "") + " — not in this pull request; "
+            "noted for a follow-up. Resolving."
+        )
     else:
         text = (
             f"**not answered** — fix round {round} did not report on this finding; "
-            "leaving the thread open."
+            "leaving the thread open. It is carried into the next fix round as unanswered."
         )
     return f"{text}\n\n{marker(run_id, round)}"
 
@@ -194,7 +200,12 @@ def reconcile_round(
             loaded = (_thread_index(found), _anchor_index(found))
         return loaded
 
-    counts: dict[ReconcileStatus, int] = {"addressed": 0, "refuted": 0, "unanswered": 0}
+    counts: dict[ReconcileStatus, int] = {
+        "addressed": 0,
+        "refuted": 0,
+        "deferred": 0,
+        "unanswered": 0,
+    }
     replied = resolved = skipped = 0
     body_entries: list[tuple[str, Reconciliation]] = []
 
@@ -240,9 +251,10 @@ def reconcile_round(
         replied += 1
         node_id = rec.thread_node_id or (thread.node_id if thread is not None else None)
         did_resolve = False
-        # Only a finding the fixer actually addressed is settled; refuted and
-        # unanswered threads stay open for a human to have the last word.
-        if item.status == "addressed" and node_id:
+        # A finding the fixer addressed, or deliberately deferred to a
+        # follow-up, is settled; refuted and unanswered threads stay open
+        # for a human to have the last word.
+        if item.status in ("addressed", "deferred") and node_id:
             try:
                 did_resolve = ops.resolve_review_thread(node_id)
             except GithubOpsError:
@@ -275,6 +287,7 @@ def reconcile_round(
         addressed=counts["addressed"],
         refuted=counts["refuted"],
         unanswered=counts["unanswered"],
+        deferred=counts["deferred"],
         replied=replied,
         resolved=resolved,
         body_only=len(body_entries),
@@ -460,6 +473,8 @@ def human_reply_body(
         text = f"**addressed{where}**" + (f": {note}" if note else ".")
     elif item.status == "refuted":
         text = "**not changed**" + (f": {note}" if note else " — see the reasoning above.")
+    elif item.status == "deferred":
+        text = "**deferred**" + (f": {note}" if note else "") + " — not in this pull request."
     else:
         summary = " ".join(objection.split()).strip()
         text = (

@@ -344,3 +344,33 @@ class TestStoreRecords:
         assert store.reconciliations(RUN, 2) == {"b.py:2": "refuted"}
         assert store.reconciliations(RUN) == {"a.py:1": "addressed", "b.py:2": "refuted"}
         assert store.reconciliations("nobody") == {}
+
+
+class TestDeferred:
+    """#522: a deferred finding is replied to as such and its thread resolved."""
+
+    def test_deferred_reply_names_the_reason_and_resolves(self) -> None:
+        body = reply_body("deferred", "unread key, follow-up", head_sha="abc", run_id="r1", round=2)
+        assert body.startswith("**deferred**: unread key, follow-up — not in this pull request")
+        assert "Resolving." in body and marker("r1", 2) in body
+
+    def test_deferred_threads_are_resolved_and_counted(self) -> None:
+        gh = FakeGithub()
+        posted = seed(gh, ("a.py", 1), ("b.py", 2))
+        items = {
+            "a.py:1": Reconciliation("deferred", "later", ""),
+            "b.py:2": Reconciliation("unanswered", "", ""),
+        }
+        outcome = reconcile_round(
+            gh, "o/r", 7, run_id="r1", round=1, head_sha="abc", posted=posted, items=items
+        )
+        assert (outcome.deferred, outcome.unanswered, outcome.resolved, outcome.replied) == (
+            1,
+            1,
+            1,
+            2,
+        )
+        assert outcome.total == 2
+        by_anchor = {t.anchor: t for t in gh.threads}
+        assert by_anchor["a.py:1"].is_resolved and not by_anchor["b.py:2"].is_resolved
+        assert "carried into the next fix round as unanswered" in gh.replies[-1][1]

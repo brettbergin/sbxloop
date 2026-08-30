@@ -8,6 +8,28 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **The fixer can no longer drop a non-blocking finding on the floor**
+  (#522). Only blocking findings reached the fix brief, so a `minor`
+  finding got neither an `addressed:` nor a `refuted:` line, was re-raised
+  once, and was then carried as prose until the run failed (PR #512's
+  unread `RepoConfig.labels`). Every finding of a `request_changes` round is
+  now in the brief — blocking ones to address or refute, the rest to
+  address, refute or **`deferred: <path:line> — why`** (parsed alongside
+  the other two; the thread is resolved and the finding is closed for this
+  PR as a follow-up). A finding with no line is *unanswered*: the engine
+  logs `fix.unanswered_findings` and narrates `fix.unanswered` in Discord,
+  the next fix brief lists those findings first marked as previously
+  unanswered, the review history marks them `UNANSWERED`, and the reviewer
+  is told silence is not closure — the finding stays at its original
+  severity and is carried as `still_open`. Refuted and deferred findings
+  are what the reviewer must not re-raise without a rebuttal. A late answer
+  — a finding round *k* left unanswered that round *k+n*'s report finally
+  addresses, refutes or defers — is replied onto round *k*'s own thread
+  under the later round's marker. Also fixed on the way: a finding the
+  reviewer *re-filed* on an earlier anchor (rather than confirming it) was
+  carried by `split_carried` but never reached the fix brief, because the
+  engine read `carried_forward` off the pre-split verdict.
+
 - **A daemon killed mid-claim no longer orphans the issue** (#530). A
   restart between "claim comment posted" and "claim persisted" left the
   new process losing the claim race to its own dead predecessor and

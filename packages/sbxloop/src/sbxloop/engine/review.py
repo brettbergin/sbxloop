@@ -337,6 +337,7 @@ def review_body(
 
 
 _REFUTED_LINE = re.compile(r"refut", re.IGNORECASE)
+_DEFERRED_LINE = re.compile(r"defer", re.IGNORECASE)
 _ADDRESSED_LINE = re.compile(r"address", re.IGNORECASE)
 # Leading list markers/emphasis the fixer's report often wraps the line in.
 _LEAD = re.compile(r"^[\s>*_`-]+")
@@ -344,7 +345,11 @@ _LEAD = re.compile(r"^[\s>*_`-]+")
 # hyphen, or a colon — the brief asks for an em dash, models write all four.
 _SEP = re.compile(r"\s*[\u2014\u2013:-]+\s*")
 
-ReconcileStatus = Literal["addressed", "refuted", "unanswered"]
+# What the fixer said about a finding. ``deferred`` (#522) is the honest
+# third answer for a non-blocking finding: acknowledged, not in this PR, a
+# follow-up. ``unanswered`` is the absence of any of the three — silence,
+# which is not closure: the finding stays at its severity.
+ReconcileStatus = Literal["addressed", "refuted", "deferred", "unanswered"]
 
 
 class Reconciliation(NamedTuple):
@@ -390,7 +395,11 @@ def _note_after(line: str, *, path: str, anchor: str) -> str:
         if idx >= 0:
             cut = max(cut, idx + len(token))
     if cut < 0:
-        match = _REFUTED_LINE.search(text) or _ADDRESSED_LINE.search(text)
+        match = (
+            _REFUTED_LINE.search(text)
+            or _DEFERRED_LINE.search(text)
+            or _ADDRESSED_LINE.search(text)
+        )
         cut = match.end() if match else 0
     rest = text[cut:]
     rest = re.sub(r"^[`'\"\s]+", "", rest)
@@ -419,18 +428,23 @@ def _names_path(line: str, path: str, lineno: int | None) -> bool:
     return not re.search(re.escape(path) + r":\d+", line)
 
 
-def _status_lines(report: str) -> tuple[list[str], list[str]]:
-    """The report's ``refuted`` and ``addressed`` lines, in that order."""
+def _status_lines(report: str) -> tuple[tuple[ReconcileStatus, list[str]], ...]:
+    """The report's ``refuted``, ``deferred`` and ``addressed`` lines, in
+    that order of precedence: a line that says "deferred … will address in
+    a follow-up" is a deferral."""
     refuted: list[str] = []
+    deferred: list[str] = []
     addressed: list[str] = []
     for line in report.splitlines():
         if not line.strip():
             continue
         if _REFUTED_LINE.search(line):
             refuted.append(line)
+        elif _DEFERRED_LINE.search(line):
+            deferred.append(line)
         elif _ADDRESSED_LINE.search(line):
             addressed.append(line)
-    return refuted, addressed
+    return (("refuted", refuted), ("deferred", deferred), ("addressed", addressed))
 
 
 def reconcile_anchor(report: str, anchor: str) -> Reconciliation:
@@ -450,12 +464,11 @@ def reconcile_anchor(report: str, anchor: str) -> Reconciliation:
         lineno = int(tail) if tail.isdigit() else None
         if lineno is None:
             path = anchor
-    refuted, addressed = _status_lines(report)
-    for status, lines in (("refuted", refuted), ("addressed", addressed)):
+    for status, lines in _status_lines(report):
         hit = next((line for line in lines if _names_path(line, path, lineno)), None)
         if hit is not None:
             note, test = split_test(_note_after(hit, path=path, anchor=anchor))
-            return Reconciliation(status, note, test)  # type: ignore[arg-type]
+            return Reconciliation(status, note, test)
     return Reconciliation("unanswered", "")
 
 
@@ -471,14 +484,14 @@ def reconcile(round: ReviewRound) -> dict[str, Reconciliation]:
     ``unanswered`` — the round said nothing about it, which is not the same
     as leaving it alone deliberately.
     """
-    refuted_lines, addressed_lines = _status_lines(round.response)
+    status_lines = _status_lines(round.response)
     out: dict[str, Reconciliation] = {}
     for f in round.verdict.findings:
-        for status, lines in (("refuted", refuted_lines), ("addressed", addressed_lines)):
+        for status, lines in status_lines:
             hit = next((line for line in lines if _names(line, f)), None)
             if hit is not None:
                 note, test = split_test(_note_after(hit, path=f.path, anchor=f.anchor))
-                out[f.anchor] = Reconciliation(status, note, test)  # type: ignore[arg-type]
+                out[f.anchor] = Reconciliation(status, note, test)
                 break
         else:
             out[f.anchor] = Reconciliation("unanswered", "")
@@ -507,13 +520,52 @@ def refuted_anchors(rounds: Sequence[ReviewRound]) -> set[str]:
     }
 
 
+def closed_anchors(rounds: Sequence[ReviewRound]) -> set[str]:
+    """Anchors the reviewer must not re-raise without a rebuttal: refuted
+    with a reason, or deferred to a follow-up (#522)."""
+    return {
+        anchor
+        for entry in rounds
+        for anchor, item in reconcile(entry).items()
+        if item.status in ("refuted", "deferred")
+    }
+
+
+def unanswered_findings(rounds: Sequence[ReviewRound]) -> list[ReviewFinding]:
+    """Findings no fix round has answered yet (#522), latest wording first.
+
+    Silence is not closure: a finding the fixer neither addressed, refuted
+    nor deferred rides into the next fix brief marked as unanswered, so it
+    cannot slip through a second time. Only rounds that had a fix round are
+    judged — the open round's findings are the brief itself.
+    """
+    answered = [r for r in rounds if r.response.strip()]
+    if not answered:
+        return []
+    fates = reconcile_rounds(answered)
+    by_anchor = prior_findings(answered)
+    return [
+        by_anchor[anchor]
+        for anchor, item in fates.items()
+        if item.status == "unanswered" and anchor in by_anchor
+    ]
+
+
 def render_review_history(rounds: Sequence[ReviewRound]) -> str:
     """The earlier rounds as the next reviewer should see them."""
     if not rounds:
         return "(first review of this pull request)"
     blocks: list[str] = []
     for entry in rounds:
-        findings = "\n".join(f.render() for f in entry.verdict.findings) or "- (no findings)"
+        fates = reconcile(entry) if entry.response.strip() else {}
+        lines: list[str] = []
+        for finding in entry.verdict.findings:
+            line = finding.render()
+            item = fates.get(finding.anchor)
+            if item is not None:
+                line += f"\n  → {_fate(item)}"
+            lines.append(line)
+        findings = "\n".join(lines) or "- (no findings)"
         response = entry.response.strip() or "(no fix round ran after this review)"
         blocks.append(
             f"### Round {entry.round} — {entry.verdict.verdict}\n\n"
@@ -521,6 +573,16 @@ def render_review_history(rounds: Sequence[ReviewRound]) -> str:
             f"The fixer's response:\n\n{response}"
         )
     return "\n\n".join(blocks)
+
+
+def _fate(item: Reconciliation) -> str:
+    """One finding's fate in the fixer's words, for either history."""
+    if item.status == "unanswered":
+        return (
+            "UNANSWERED — neither addressed, refuted nor deferred; "
+            "still a finding at its original severity"
+        )
+    return f"{item.status} — {item.text}" if item.text else str(item.status)
 
 
 def render_fix_history(rounds: Sequence[ReviewRound]) -> str:
@@ -542,8 +604,7 @@ def render_fix_history(rounds: Sequence[ReviewRound]) -> str:
         lines: list[str] = []
         for finding in entry.verdict.findings:
             item = items.get(finding.anchor, Reconciliation("unanswered", ""))
-            fate = f"{item.status} — {item.text}" if item.text else str(item.status)
-            lines.append(f"{finding.render(repro=False)}\n  → {fate}")
+            lines.append(f"{finding.render(repro=False)}\n  → {_fate(item)}")
         blocks.append(
             f"### Round {entry.round} — {entry.verdict.verdict}\n\n"
             + ("\n".join(lines) or "- (no findings)")
@@ -618,6 +679,7 @@ def fix_brief(
     objections: str = "",
     conflicts: Sequence[str] = (),
     history: str = "",
+    unanswered: Sequence[ReviewFinding] = (),
 ) -> str:
     """What one fix round is for, concretely.
 
@@ -649,13 +711,30 @@ def fix_brief(
             "the previous fixer's words — build on those decisions rather than "
             "re-deriving or silently reversing them:\n\n" + history.strip()
         )
-    if findings:
-        with_repro = [f for f in findings if f.repro.strip()]
+    skip = {f.anchor for f in unanswered}
+    findings = [f for f in findings if f.anchor not in skip]
+    if unanswered:
         parts.append(
-            "The review's findings:\n" + "\n".join(f.render() for f in findings) + "\n\n"
-            "Address each one. A finding you believe is wrong may be refuted, "
-            "but only with a specific reason."
+            "Findings the previous fix round did not answer — it neither addressed, "
+            "refuted nor deferred them, so they are still open at their original "
+            "severity. Answer each of these first:\n" + "\n".join(f.render() for f in unanswered)
         )
+    if findings or unanswered:
+        with_repro = [f for f in [*unanswered, *findings] if f.repro.strip()]
+        blocking = [f for f in findings if f.blocking]
+        minor = [f for f in findings if not f.blocking]
+        if blocking:
+            parts.append(
+                "The review's blocking findings — each must be addressed, or refuted "
+                "with a specific reason:\n" + "\n".join(f.render() for f in blocking)
+            )
+        if minor:
+            parts.append(
+                "The review's non-blocking findings — address each, refute it with a "
+                "specific reason, or defer it with a reason (a deferred finding becomes "
+                "a follow-up rather than a repeat; leaving one unmentioned brings it "
+                "back next round):\n" + "\n".join(f.render() for f in minor)
+            )
         if with_repro:
             parts.append(
                 "Each finding's **Repro** is how the reviewer reproduced it against "
@@ -701,9 +780,11 @@ def fix_brief(
     parts.append(
         "End your summary with one line per finding or objection above, in the form "
         "`addressed: <path:line> — what changed; test: <the regression test you added, "
-        "e.g. tests/test_x.py::test_y>` or `refuted: <path:line> — why it "
-        "is not a problem`. The next review reads that list; a finding you refuted "
-        "with a stated reason will not be raised again without a rebuttal."
+        "e.g. tests/test_x.py::test_y>`, `refuted: <path:line> — why it "
+        "is not a problem`, or `deferred: <path:line> — why it can wait` (non-blocking "
+        "findings only). The next review reads that list; a finding you refuted "
+        "with a stated reason or deferred will not be raised again without a rebuttal, "
+        "and a finding with no line at all comes back as unanswered."
     )
     return "\n\n".join(parts)
 

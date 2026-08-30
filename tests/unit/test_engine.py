@@ -1616,6 +1616,67 @@ class TestPipeline:
         assert [e for e, _, _ in fake.reviews] == ["APPROVE"]
         assert fake.reviews[0][1].startswith("**Review verdict: approve** (round 1)")
 
+    def test_an_unanswered_minor_finding_reappears_in_the_next_brief(
+        self, harness: Harness
+    ) -> None:
+        """#522: round 1 raises a major and a minor; the fix round answers
+        only the major. The minor is not dropped: `fix.unanswered` says so,
+        and the round-2 brief lists it first, marked as unanswered."""
+        fake = FakeGithub()
+        minor = {
+            "path": "hello.txt",
+            "line": 2,
+            "body": "the greeting has no trailing newline",
+            "severity": "minor",
+        }
+        fix_major_only = {"text": "Fixed.\n\naddressed: hello.txt:1 — say hello, not hi"}
+        round_two = review("request_changes", "the major is fixed; the minor still stands", FINDING)
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                FILES_BUILD,
+                review("request_changes", "one real problem and a nit", FINDING, minor),
+                fix_major_only,
+                round_two,
+                {"text": "Done.\n\naddressed: hello.txt:1 — really\ndeferred: hello.txt:2 — later"},
+                REVIEW_OK,
+            ]
+        )
+        result = harness.pipeline(fake).start("ship hello")
+        assert result.state == "merged"
+        tasks = {t.spec.id: t for t in result.tasks}
+        # Round 1's brief carried both findings, split by severity.
+        brief1 = tasks["fix-1"].spec.description
+        assert "The review's blocking findings" in brief1
+        assert "The review's non-blocking findings" in brief1 and "hello.txt:2" in brief1
+        # The fixer said nothing about the minor: narrated, then re-briefed first.
+        (unanswered,) = self._events(harness, HostEventTypes.FIX_UNANSWERED)
+        assert (
+            unanswered.data["anchors"] == ["hello.txt:2"] and unanswered.data["task_id"] == "fix-1"
+        )
+        brief2 = tasks["fix-2"].spec.description
+        head = brief2.index("Findings the previous fix round did not answer")
+        assert "- `hello.txt:2` [minor] the greeting has no trailing newline" in brief2
+        # (The history section above also lists it, with its UNANSWERED fate.)
+        assert "→ UNANSWERED" in brief2[:head]
+        assert (
+            head
+            < brief2.index("- `hello.txt:2`", head)
+            < brief2.index("The review's blocking findings")
+        )
+        # Round 2 deferred it: resolved on the PR, counted, and closed for good.
+        reconciled = self._events(harness, HostEventTypes.REVIEW_RECONCILED)
+        counts = [
+            (e.data["round"], e.data.get("deferred", 0), e.data["unanswered"]) for e in reconciled
+        ]
+        # Round 1's own pass: the major addressed, the minor left unanswered.
+        assert (1, 0, 1) in counts
+        # The late answer from round 2's report reaches round 1's thread,
+        # replied under round 2's marker.
+        assert (2, 1, 0) in counts
+        (thread,) = [t for t in fake.threads if t.anchor == "hello.txt:2"]
+        assert thread.is_resolved and any("**deferred**" in c.body for c in thread.comments[1:])
+
     def test_review_exhaustion_fails_with_the_pr_left_a_draft(self, harness: Harness) -> None:
         fake = FakeGithub()
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_RC])
