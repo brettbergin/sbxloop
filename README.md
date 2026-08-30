@@ -576,7 +576,9 @@ run store (runs, tasks, chronology, reports), fetches PR/issue/diff/file
 details through the github-ops sandbox, and turns a described feature or
 bug into work in **one hop**: `create_issue` files the issue in the
 configured repo with a self-contained title and body *and* the
-`sbxloop:run` label, and the daemon claims it on its next poll. There is
+`sbxloop:run` label, and the daemon claims it on its next poll (backlog
+capture, triage notes and canaries take the explicit opt-in path instead —
+filed with no trigger label, left for `label_issue_for_run`). There is
 no triage lane in between — which is why the concierge writes a body a
 fresh clone can act on, and why the channel is the access boundary. That
 body is **symptom-first**: what the person observes today in their own

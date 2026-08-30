@@ -660,6 +660,7 @@ class TestTools:
         everything, capped, bugs = client.responses
         assert everything.text.startswith("3 open issue(s) in owner/repo (newest activity first")
         assert "- #7 Retry the fetch client · [bug]" in everything.text
+        assert "NOT QUEUED" in everything.text
         assert "by ana · 2 comments · https://gh/i/7" in everything.text
         assert "#9 Already going" in everything.text and "QUEUED for a run" in everything.text
         assert "#11 Stuck" in everything.text and "BLOCKED — needs a human" in everything.text
@@ -669,6 +670,160 @@ class TestTools:
         assert "per_page=5" in github.paths[1]
         assert "labels=bug" in github.paths[2]
         assert capped.ok and bugs.ok
+
+    def test_list_issues_flags_unlabelled_issues_as_not_queued(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            {
+                "/issues?": [
+                    {
+                        "number": 7,
+                        "title": "Backlog capture",
+                        "labels": [],
+                        "created_at": "2026-08-01T00:00:00Z",
+                        "user": {"login": "ana"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/7",
+                    },
+                    {
+                        "number": 8,
+                        "title": "Queued one",
+                        "labels": [{"name": "sbxloop:run"}],
+                        "created_at": "bogus",
+                        "user": {"login": "bo"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/8",
+                    },
+                    {
+                        "number": 9,
+                        "title": "Running one",
+                        "labels": [{"name": "sbxloop:in-progress"}],
+                        "created_at": "bogus",
+                        "user": {"login": "bo"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/9",
+                    },
+                    {
+                        "number": 10,
+                        "title": "Failed one",
+                        "labels": [{"name": "sbxloop:failed"}],
+                        "created_at": "bogus",
+                        "user": {"login": "bo"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/10",
+                    },
+                    {
+                        "number": 11,
+                        "title": "Blocked one",
+                        "labels": [{"name": "sbxloop:blocked"}],
+                        "created_at": "bogus",
+                        "user": {"login": "bo"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/11",
+                    },
+                ]
+            }
+        )
+        concierge, client, *_ = make(tmp_path, [{"calls": [("list_issues", {})]}], github=github)
+        turn(concierge, "what's open?")
+        (listing,) = client.responses
+        by_number = {
+            line.split()[1]: line for line in listing.text.splitlines() if line.startswith("- #")
+        }
+        assert "NOT QUEUED" in by_number["#7"]
+        assert "QUEUED for a run" in by_number["#8"]
+        assert "NOT QUEUED" not in by_number["#8"]
+        assert "RUNNING" in by_number["#9"] and "NOT QUEUED" not in by_number["#9"]
+        assert "FAILED before" in by_number["#10"] and "NOT QUEUED" not in by_number["#10"]
+        assert "BLOCKED" in by_number["#11"] and "NOT QUEUED" not in by_number["#11"]
+        assert "label_issue_for_run" in listing.text
+
+    def test_list_issues_filters_by_queue_state(self, tmp_path: Path) -> None:
+        issues = [
+            {
+                "number": 7,
+                "title": "Backlog capture",
+                "labels": [],
+                "created_at": "2026-08-01T00:00:00Z",
+                "user": {"login": "ana"},
+                "comments": 0,
+                "html_url": "https://gh/i/7",
+            },
+            {
+                "number": 8,
+                "title": "Queued one",
+                "labels": [{"name": "sbxloop:run"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/8",
+            },
+            {
+                "number": 9,
+                "title": "Running one",
+                "labels": [{"name": "sbxloop:in-progress"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/9",
+            },
+            {
+                "number": 10,
+                "title": "Blocked one",
+                "labels": [{"name": "sbxloop:blocked"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/10",
+            },
+        ]
+        github = FakeGithub({"/issues?": issues})
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {"calls": [("list_issues", {"queued": False})]},
+                {"calls": [("list_issues", {"queued": True})]},
+                {"calls": [("list_issues", {})]},
+            ],
+            github=github,
+        )
+        turn(concierge, "backlog?")
+        turn(concierge, "queued?")
+        turn(concierge, "everything?")
+        backlog, queued, everything = client.responses
+
+        def numbers(text: str) -> set[str]:
+            return {line.split()[1] for line in text.splitlines() if line.startswith("- #")}
+
+        assert numbers(backlog.text) == {"#7"}
+        assert "not-queued open issue(s)" in backlog.text
+        assert numbers(queued.text) == {"#8", "#9"}
+        assert "queued open issue(s)" in queued.text
+        assert numbers(everything.text) == {"#7", "#8", "#9", "#10"}
+        assert "4 open issue(s)" in everything.text
+        assert "NOT QUEUED" in everything.text
+
+    def test_list_issues_names_the_empty_subset(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            {
+                "/issues?": [
+                    {
+                        "number": 7,
+                        "title": "Backlog capture",
+                        "labels": [],
+                        "created_at": "2026-08-01T00:00:00Z",
+                        "user": {"login": "ana"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/7",
+                    }
+                ]
+            }
+        )
+        concierge, client, *_ = make(
+            tmp_path, [{"calls": [("list_issues", {"queued": True})]}], github=github
+        )
+        turn(concierge, "queued?")
+        (listing,) = client.responses
+        assert "no queued open issues in" in listing.text
 
     def test_create_issue_files_and_queues_in_one_hop(self, tmp_path: Path) -> None:
         github = FakeGithub()
@@ -713,6 +868,63 @@ class TestTools:
         (labelled,) = client.responses[2:]
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #12")
         assert github.paths[-1] == "/repos/owner/repo/issues/12/labels"
+
+    def test_create_issue_can_file_without_queueing(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "create_issue",
+                            {"title": "Backlog: retries", "body": "Someday.", "queue": False},
+                        )
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "note this for the backlog", author="Discord user `ana`", author_id="777")
+        (filed,) = client.responses
+        assert filed.ok and filed.text.startswith("filed issue #41 https://gh/i/41")
+        assert "NOT queued" in filed.text and "label_issue_for_run" in filed.text
+        assert "queued issue" not in filed.text
+        (_repo, _title, _body, labels) = github.created[0]
+        assert labels == []
+        assert not any("/labels" in p for p in github.paths)
+        dstore.upsert_new(WorkItem(item_id="gh:issue:41", source_key="41", title="Backlog"), 1.0)
+        assert dstore.get("gh:issue:41").requested_by == "777"  # type: ignore[union-attr]
+
+    def test_create_issue_queues_when_queue_is_true_or_omitted(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("create_issue", {"title": "A", "body": "b", "queue": True}),
+                        ("create_issue", {"title": "B", "body": "b"}),
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "please fix it")
+        for response in client.responses:
+            assert response.text.startswith("created and queued issue #41")
+            assert "`sbxloop:run`" in response.text
+        assert [c[3] for c in github.created] == [["sbxloop:run"], ["sbxloop:run"]]
+
+    def test_create_issue_tool_description_covers_both_paths(self, tmp_path: Path) -> None:
+        concierge, client, _, _, _ = make(tmp_path, [{}], github=FakeGithub())
+        turn(concierge)
+        spec = next(t for t in client.jobs[0].host_tools if t.name == "create_issue")
+        assert "queue" in spec.parameters["properties"]
+        assert spec.parameters["properties"]["queue"]["type"] == "boolean"
+        assert "queue" not in spec.parameters.get("required", [])
+        assert "backlog" in spec.description.lower()
+        assert "label_issue_for_run" in spec.description
 
     def test_create_issue_without_an_author_id_records_no_requester(self, tmp_path: Path) -> None:
         github = FakeGithub()
