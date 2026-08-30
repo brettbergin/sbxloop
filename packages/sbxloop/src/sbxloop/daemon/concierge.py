@@ -851,7 +851,12 @@ class Concierge:
                         description=(
                             f"Open issues in {self._repo_label()}, newest activity "
                             "first, each flagged QUEUED / RUNNING / FAILED / BLOCKED from the "
-                            "daemon's labels; label narrows to one label. Each line: number, "
+                            "daemon's labels, or NOT QUEUED when it carries none of them (filed "
+                            "for the backlog, waiting on a person); label narrows to one label; "
+                            "queued narrows by queue state — true lists only issues the daemon "
+                            "has queued or is running, false lists only the backlog (issues "
+                            "carrying none of the daemon's state labels), omit it for all. "
+                            "Each line: number, "
                             "title, labels, age, author, comments, url. Queue only what the "
                             "person names, with label_issue_for_run."
                         ),
@@ -859,6 +864,7 @@ class Concierge:
                             {
                                 "all": {"type": "boolean"},
                                 "label": {"type": "string"},
+                                "queued": {"type": "boolean"},
                                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                                 "repo": {"type": "string"},
                             }
@@ -1436,11 +1442,31 @@ class Concierge:
         if not isinstance(data, list):
             return json.dumps(data, default=str)[:2000]
         issues = [d for d in data if isinstance(d, dict) and "pull_request" not in d]
+        queued_arg = args.get("queued")
+        subset = ""
+        if queued_arg is not None:
+            want_queued = bool(queued_arg)
+            state_labels = {
+                daemon.trigger_label,
+                daemon.in_progress_label,
+                daemon.failed_label,
+                daemon.blocked_label,
+            }
+            active_labels = {daemon.trigger_label, daemon.in_progress_label}
+
+            def _keep(issue: dict[str, Any]) -> bool:
+                labels = set(_label_names(issue))
+                if want_queued:
+                    return bool(labels & active_labels)
+                return not (labels & state_labels)
+
+            issues = [d for d in issues if _keep(d)]
+            subset = " queued" if want_queued else " not-queued"
         if not issues:
-            return f"no open issues in {repo}" + (f" with label `{label}`" if label else "")
+            return f"no{subset} open issues in {repo}" + (f" with label `{label}`" if label else "")
         now = self.clock()
         lines = [
-            f"{len(issues)} open issue(s) in {repo}"
+            f"{len(issues)}{subset} open issue(s) in {repo}"
             + (f" with `{label}`" if label else "")
             + f" (newest activity first, max {limit}):"
         ]
@@ -1455,13 +1481,15 @@ class Concierge:
                 flags.append("FAILED before")
             if daemon.blocked_label in labels:
                 flags.append("BLOCKED — needs a human")
+            if not flags:
+                flags.append("NOT QUEUED")
             created = _iso_age(str(issue.get("created_at") or ""), now)
             user = (issue.get("user") or {}).get("login", "?")
             lines.append(
                 f"- #{issue.get('number')} {_one_line(str(issue.get('title') or ''), 100)} · "
                 f"[{', '.join(labels) or 'no labels'}] · {created} old · by {user} · "
                 f"{issue.get('comments', 0)} comments · {issue.get('html_url')}"
-                + (f" · {' / '.join(flags)}" if flags else "")
+                + f" · {' / '.join(flags)}"
             )
         lines.append(
             f"Issues without `{daemon.trigger_label}` are not queued: label_issue_for_run "
