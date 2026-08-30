@@ -2603,3 +2603,53 @@ class TestDoctorProbeCost:
         self.Box.instances = []
         result = runner.invoke(app, ["doctor", "--deep"])
         assert len(self.Box.instances) == 2, "--deep implies --probe"
+
+
+class TestDoctorRepoHealthRow:
+    """#516: doctor shows the polling health the daemon persisted."""
+
+    def test_suspended_and_backing_off_repos_are_flagged(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import repo_checks
+        from sbxloop.config import load_config
+
+        (workdir / "sbxloop.toml").write_text(
+            '[[github.repos]]\nrepo = "acme/alpha"\n\n[[github.repos]]\nrepo = "acme/beta"\n'
+        )
+        config = load_config()
+        health = {
+            "acme/alpha": {"suspended": True, "reason": "gone for this token (HTTP 404)"},
+            "acme/beta": {"suspended": False, "next_poll": 99.0, "failures": 2},
+        }
+        alpha, beta = repo_checks(config, {"GH_TOKEN": "tok"}, health=health)
+        assert alpha.ok and not alpha.hard
+        assert (
+            "SUSPENDED from polling by the daemon: gone for this token (HTTP 404)" in alpha.detail
+        )
+        assert "ctl resume-repo acme/alpha" in alpha.detail
+        assert "backing off after 2 poll failure(s)" in beta.detail
+
+    def test_health_is_read_from_the_daemon_store_only_when_it_exists(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        from sbxloop.cli.doctor import daemon_repo_health
+        from sbxloop.config import load_config_with_sources
+        from sbxloop.daemon.paths import resolve_state_dir
+        from sbxloop.daemon.sources import REPO_HEALTH_KEY
+        from sbxloop.daemon.store import DaemonStore
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(workdir / "xdg"))
+        (workdir / "sbxloop.toml").write_text('[[github.repos]]\nrepo = "acme/alpha"\n')
+        config, sources = load_config_with_sources()
+        env = dict(os.environ)
+        assert daemon_repo_health(config, sources, env) == {}
+        state_dir = resolve_state_dir(config, sources, cwd=workdir, env=env, home=Path.home()).path
+        state_dir.mkdir(parents=True, exist_ok=True)
+        store = DaemonStore(state_dir / "state.db")
+        store.set_value(
+            REPO_HEALTH_KEY + "acme/alpha", json.dumps({"suspended": True, "reason": "x"})
+        )
+        store.close()
+        got = daemon_repo_health(config, sources, env)
+        assert got == {"acme/alpha": {"suspended": True, "reason": "x"}}

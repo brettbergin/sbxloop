@@ -11,9 +11,12 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.sources import (
     GitHubIssueSource,
     MultiRepoIssueSource,
+    RepoHealth,
     build_github_source,
+    permanent_failure,
 )
 from sbxloop.errors import GithubOpsError
+from tests.fakes.github_errors import github_error
 
 from .test_daemon_sources import LABELS, RecordingOps, issue
 
@@ -29,6 +32,8 @@ class RouterOps:
         self.per_repo = per_repo
         self.searched: list[str] = []
         self.fail_search: set[str] = set()
+        # The exception a failing search raises; None is a plain HTTP 500.
+        self.fail_with: GithubOpsError | None = None
 
     def _for_path(self, path: str) -> RecordingOps:
         parts = path.lstrip("/").split("/")
@@ -38,7 +43,7 @@ class RouterOps:
         repo = query.split("repo:", 1)[1].split(" ", 1)[0]
         self.searched.append(repo)
         if repo in self.fail_search:
-            raise GithubOpsError(f"search {repo} -> HTTP 500")
+            raise self.fail_with or GithubOpsError(f"search {repo} -> HTTP 500", http_status=500)
         return self.per_repo[repo].search_issues(query, per_page=per_page)
 
     def raw(self, method: str, path: str, body: Any = None) -> Any:
@@ -195,3 +200,127 @@ class TestRouting:
         assert isinstance(source, MultiRepoIssueSource)
         item = WorkItem(item_id="gh:o/b:issue:4", source_key="4", title="x")
         assert source.for_item(item).repo == "o/b"
+
+
+class Clock:
+    def __init__(self, t: float = 1_000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def health_source(router: RouterOps, *names: str, **kw: Any) -> tuple[Any, Clock, list, dict]:
+    """A multi-repo source with a fake clock and recording persist/notify."""
+    clock = Clock()
+    notices: list[tuple[str, str, str]] = []
+    persisted: dict[str, Any] = {}
+    source = build_github_source(
+        lambda: router,  # type: ignore[arg-type,return-value]
+        repos(*names),
+        LABELS,
+        host="db",
+        poll_interval_s=60.0,
+        suspend_after=kw.pop("suspend_after", 3),
+        persist=lambda repo, data: persisted.__setitem__(repo, data),
+        notify=lambda kind, repo, text: notices.append((kind, repo, text)),
+        **kw,
+    )
+    source._clock = clock  # the fake clock, after construction
+    return source, clock, notices, persisted
+
+
+class TestPerRepoHealth:
+    """#516: a failing repository backs off on its own, is suspended after
+    enough failures (or at once when GitHub says it is gone), and never
+    slows a healthy neighbour."""
+
+    def test_transient_failure_backs_off_that_repo_only_then_recovers(
+        self, router: RouterOps
+    ) -> None:
+        source, clock, notices, persisted = health_source(router, "o/a", "o/b")
+        router.fail_search.add("o/a")
+        assert [i.repo for i in source.poll()] == ["o/b", "o/b"]
+        (a, b) = source.repo_health
+        assert a.state == "backoff" and a.failures == 1 and a.next_poll == clock.t + 60
+        assert b.state == "ok"
+        assert persisted["o/a"]["next_poll"] == clock.t + 60 and "o/b" not in persisted
+        # Within the backoff o/a is not polled at all; o/b still is.
+        calls_before = len(router.per_repo["o/a"].searches)
+        assert [i.repo for i in source.poll()] == ["o/b", "o/b"]
+        assert len(router.per_repo["o/a"].searches) == calls_before
+        # Past it, a second failure doubles the wait.
+        clock.t += 61
+        source.poll()
+        assert source.repo_health[0].failures == 2
+        assert source.repo_health[0].next_poll == clock.t + 120
+        # Recovery is silent apart from one info line and one notice.
+        router.fail_search.discard("o/a")
+        clock.t += 121
+        assert [i.repo for i in source.poll()] == ["o/a", "o/b", "o/b"]
+        assert source.repo_health[0] == RepoHealth("o/a")
+        assert persisted["o/a"] is None
+        assert [k for k, _, _ in notices] == ["source.repo_recovered"]
+
+    def test_enough_consecutive_failures_suspend_the_repo(self, router: RouterOps) -> None:
+        source, clock, notices, persisted = health_source(router, "o/a", "o/b", suspend_after=3)
+        router.fail_search.add("o/a")
+        for _ in range(3):
+            source.poll()
+            clock.t += 3600
+        a = source.repo_health[0]
+        assert a.suspended and a.failures == 3 and "3 consecutive poll failures" in a.reason
+        assert persisted["o/a"]["suspended"] is True
+        assert [k for k, _, _ in notices] == ["source.repo_suspended"]
+        assert "resume-repo o/a" in notices[0][2]
+        # Suspended: not polled, not a failure, forever — even once it would work.
+        router.fail_search.discard("o/a")
+        calls = len(router.per_repo["o/a"].searches)
+        clock.t += 7200
+        assert [i.repo for i in source.poll()] == ["o/b", "o/b"]
+        assert len(router.per_repo["o/a"].searches) == calls
+        assert len(notices) == 1, "narrated once, not per tick"
+
+    def test_a_permanent_refusal_suspends_at_once(self, router: RouterOps) -> None:
+        source, _, notices, _ = health_source(router, "o/a", "o/b")
+        router.fail_search.add("o/a")
+        router.fail_with = github_error("repo_missing_404")
+        source.poll()
+        a = source.repo_health[0]
+        assert a.suspended and a.failures == 1 and "gone for this token" in a.reason
+        assert [k for k, _, _ in notices] == ["source.repo_suspended"]
+
+    def test_classification(self) -> None:
+        assert permanent_failure(GithubOpsError("x", http_status=404))
+        assert permanent_failure(GithubOpsError("x", http_status=410))
+        assert permanent_failure(GithubOpsError("Resource not accessible", http_status=403))
+        assert not permanent_failure(GithubOpsError("API rate limit exceeded", http_status=403))
+        assert not permanent_failure(GithubOpsError("secondary rate limit", http_status=403))
+        assert not permanent_failure(GithubOpsError("bad gateway", http_status=502))
+        assert not permanent_failure(GithubOpsError("no status"))
+
+    def test_resume_repo_polls_it_again_now(self, router: RouterOps) -> None:
+        source, _clock, _notices, persisted = health_source(router, "o/a", "o/b", suspend_after=1)
+        router.fail_search.add("o/a")
+        source.poll()
+        assert source.repo_health[0].suspended
+        with pytest.raises(KeyError, match="unknown repository"):
+            source.resume_repo("o/zzz")
+        with pytest.raises(ValueError, match="not suspended"):
+            source.resume_repo("o/b")
+        router.fail_search.discard("o/a")
+        health = source.resume_repo("O/A")
+        assert health == RepoHealth("o/a") and persisted["o/a"] is None
+        assert [i.repo for i in source.poll()] == ["o/a", "o/b", "o/b"]
+
+    def test_all_polled_repos_failing_still_raises(self, router: RouterOps) -> None:
+        source, clock, _, _ = health_source(router, "o/a", "o/b")
+        router.fail_search.update({"o/a", "o/b"})
+        with pytest.raises(GithubOpsError):
+            source.poll()
+        # Both now back off: nothing is polled, nothing fails, nothing raises.
+        assert source.poll() == []
+        # A suspended repo does not count as a failure of the ones polled.
+        clock.t += 61
+        router.fail_search.discard("o/b")
+        assert [i.repo for i in source.poll()] == ["o/b", "o/b"]

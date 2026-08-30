@@ -68,6 +68,10 @@ class ClaimComment(NamedTuple):
     pid: int | None
 
 
+def _clean_error(text: str, limit: int = 200) -> str:
+    return " ".join(text.split())[:limit]
+
+
 def pid_alive(pid: int) -> bool:
     """Whether ``pid`` is a live process on this host (signal 0 probe)."""
     try:
@@ -667,6 +671,51 @@ class GitHubIssueSource:
 # -- many repositories -------------------------------------------------------------
 
 
+# Per-repository failure accounting (#516). Transient failures back off per
+# repo; a permanent one — or enough consecutive ones — suspends the repo.
+REPO_HEALTH_KEY = "repo_health:"
+PERMANENT_STATUSES: frozenset[int] = frozenset({404, 410})
+
+
+def permanent_failure(exc: BaseException) -> bool:
+    """Whether GitHub said this repository is gone for this token: 404/410,
+    or a 403 that is a permission refusal rather than a rate limit."""
+    status = getattr(exc, "http_status", None)
+    if status in PERMANENT_STATUSES:
+        return True
+    if status == 403:
+        text = str(exc).lower()
+        return "rate limit" not in text and "abuse" not in text and "secondary" not in text
+    return False
+
+
+class RepoHealth(NamedTuple):
+    """One repository's polling health, as ``status`` and ``doctor`` show it."""
+
+    repo: str
+    failures: int = 0
+    next_poll: float | None = None  # backing off until then (None: polled every tick)
+    suspended: bool = False
+    reason: str = ""
+    since: float | None = None
+
+    @property
+    def state(self) -> str:
+        if self.suspended:
+            return "suspended"
+        return "backoff" if self.next_poll is not None else "ok"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "repo": self.repo,
+            "failures": self.failures,
+            "next_poll": self.next_poll,
+            "suspended": self.suspended,
+            "reason": self.reason,
+            "since": self.since,
+        }
+
+
 class MultiRepoIssueSource:
     """One :class:`GitHubIssueSource` per configured repository, fanned out.
 
@@ -681,15 +730,40 @@ class MultiRepoIssueSource:
     configured repository failed) re-raises, preserving the single-repo
     contract that the loop backs a failing source off instead of mistaking
     an outage for an empty queue.
+
+    Per-repository health (#516): a repository that keeps failing is backed
+    off on its own — skipped for ``poll_interval_s * 2**(failures-1)``,
+    capped at an hour — and after ``suspend_after`` consecutive failures,
+    or at once when GitHub says it is gone for this token (404/410, a
+    permission 403), it is **suspended**: excluded from polling until an
+    operator resumes it (``ctl resume-repo``) or the daemon restarts with a
+    changed configuration. Healthy neighbours are never punished. The
+    state is narrated once per transition, not once per tick, and handed
+    to ``persist`` so ``doctor`` in another process can show it.
     """
 
     name = "github"
 
-    def __init__(self, sources: list[GitHubIssueSource]) -> None:
+    def __init__(
+        self,
+        sources: list[GitHubIssueSource],
+        *,
+        poll_interval_s: float = 60.0,
+        suspend_after: int = 10,
+        clock: Callable[[], float] = time.time,
+        persist: Callable[[str, dict[str, Any] | None], None] | None = None,
+        notify: Callable[[str, str, str], None] | None = None,
+    ) -> None:
         if not sources:
             raise ValueError("MultiRepoIssueSource needs at least one repository source")
         self._sources = list(sources)
         self._by_repo = {s.repo.casefold(): s for s in self._sources}
+        self.poll_interval_s = poll_interval_s
+        self.suspend_after = suspend_after
+        self._clock = clock
+        self._persist = persist
+        self._notify = notify
+        self._health: dict[str, RepoHealth] = {s.repo: RepoHealth(s.repo) for s in self._sources}
 
     @property
     def sources(self) -> list[GitHubIssueSource]:
@@ -731,18 +805,127 @@ class MultiRepoIssueSource:
             )
         return self._sources[0]
 
+    # -- per-repository health ------------------------------------------------
+
+    @property
+    def notify(self) -> Callable[[str, str, str], None] | None:
+        return self._notify
+
+    @notify.setter
+    def notify(self, fn: Callable[[str, str, str], None] | None) -> None:
+        # Set after the loop exists: the source is built before it.
+        self._notify = fn
+
+    @property
+    def repo_health(self) -> list[RepoHealth]:
+        return [self._health[s.repo] for s in self._sources]
+
+    def _set_health(self, health: RepoHealth) -> None:
+        self._health[health.repo] = health
+        if self._persist is not None:
+            self._persist(health.repo, None if health.state == "ok" else health.to_json())
+
+    def _say(self, kind: str, repo: str, text: str) -> None:
+        if self._notify is not None:
+            self._notify(kind, repo, text)
+
+    def _record_failure(self, source: GitHubIssueSource, exc: BaseException) -> None:
+        now = self._clock()
+        before = self._health[source.repo]
+        failures = before.failures + 1
+        reason = _clean_error(str(exc))
+        permanent = permanent_failure(exc)
+        if permanent or failures >= self.suspend_after:
+            why = (
+                f"GitHub says the repository is gone for this token ({reason})"
+                if permanent
+                else f"{failures} consecutive poll failures, last: {reason}"
+            )
+            self._set_health(
+                RepoHealth(source.repo, failures, None, True, why, before.since or now)
+            )
+            log.error(
+                "github.repo_suspended",
+                repo=source.repo,
+                failures=failures,
+                permanent=permanent,
+                error=reason,
+                hint="excluded from polling until `ctl resume-repo <repo>` or a restart with "
+                "a changed configuration",
+            )
+            self._say(
+                "source.repo_suspended",
+                source.repo,
+                f"🚫 repository {source.repo} suspended from polling: {why} — "
+                f"`resume-repo {source.repo}` once it is fixed",
+            )
+            return
+        delay = min(self.poll_interval_s * 2 ** (failures - 1), 3600.0)
+        health = RepoHealth(source.repo, failures, now + delay, False, reason, before.since or now)
+        self._set_health(health)
+        if failures == 1:
+            log.warning(
+                "github.repo_poll_failed",
+                repo=source.repo,
+                error=reason,
+                next_poll_in_s=round(delay),
+                hint="backing this repository off on its own; the others poll as usual",
+            )
+        else:
+            log.warning(
+                "github.repo_backoff",
+                repo=source.repo,
+                failures=failures,
+                next_poll_in_s=round(delay),
+                error=reason,
+            )
+
+    def _record_success(self, source: GitHubIssueSource) -> None:
+        before = self._health[source.repo]
+        if before.state == "ok":
+            return
+        self._set_health(RepoHealth(source.repo))
+        log.info("github.repo_poll_recovered", repo=source.repo, after_failures=before.failures)
+        self._say(
+            "source.repo_recovered",
+            source.repo,
+            f"repository {source.repo} polls again after {before.failures} failure(s)",
+        )
+
+    def resume_repo(self, repo: str) -> RepoHealth:
+        """Operator: poll a suspended (or backing-off) repository again now."""
+        source = self._by_repo.get(repo.casefold())
+        if source is None:
+            raise KeyError(f"unknown repository {repo!r}; configured: {', '.join(self.repos)}")
+        before = self._health[source.repo]
+        if before.state == "ok":
+            raise ValueError(f"{source.repo} is not suspended or backing off")
+        self._set_health(RepoHealth(source.repo))
+        log.info(
+            "github.repo_resumed", repo=source.repo, was=before.state, failures=before.failures
+        )
+        return self._health[source.repo]
+
     def poll(self) -> list[WorkItem]:
         items: list[WorkItem] = []
         failures: list[BaseException] = []
+        now = self._clock()
+        polled = 0
         for source in self._sources:
+            health = self._health[source.repo]
+            if health.suspended or (health.next_poll is not None and now < health.next_poll):
+                continue  # its own clock, not the loop's (#516)
+            polled += 1
             try:
                 items.extend(source.poll())
             except (GithubOpsError, WorkerError, SbxError) as exc:
-                # Logged per repo and skipped: one unreachable repository
+                # Accounted per repo and skipped: one unreachable repository
                 # must not blank the queue for the healthy ones.
-                log.warning("github.repo_poll_failed", repo=source.repo, error=str(exc))
+                self._record_failure(source, exc)
                 failures.append(exc)
-        if failures and len(failures) == len(self._sources):
+            else:
+                self._record_success(source)
+        if failures and polled and len(failures) == polled:
             raise failures[0]
         return items
 
@@ -784,6 +967,10 @@ def build_github_source(
     host: str | None = None,
     on_failure: Callable[[BaseException], object] | None = None,
     stale_after_s: float = 300.0,
+    poll_interval_s: float = 60.0,
+    suspend_after: int = 10,
+    persist: Callable[[str, dict[str, Any] | None], None] | None = None,
+    notify: Callable[[str, str, str], None] | None = None,
 ) -> WorkSource:
     """A work source over every *enabled* repository in ``repos``.
 
@@ -812,7 +999,13 @@ def build_github_source(
     ]
     if len(built) == 1:
         return built[0]
-    return MultiRepoIssueSource(built)
+    return MultiRepoIssueSource(
+        built,
+        poll_interval_s=poll_interval_s,
+        suspend_after=suspend_after,
+        persist=persist,
+        notify=notify,
+    )
 
 
 def _repo_labels(labels: GitHubLabels, entry: RepoConfig) -> GitHubLabels:

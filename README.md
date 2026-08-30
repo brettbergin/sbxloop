@@ -538,7 +538,7 @@ Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|grant-rounds <run> <n>` in the control channel drive the daemon
+when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|grant-rounds <run> <n>|resume-repo <owner/name>` in the control channel drive the daemon
 itself. Pause is a set of **named holds**: a bare `pause`/`resume` acts on the
 operator's hold, the deploy pipeline holds `deploy-<run id>` while it waits for
 the daemon to go idle, and the daemon idles while any hold stands — so an

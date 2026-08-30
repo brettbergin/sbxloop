@@ -2655,3 +2655,53 @@ class TestClaimProtocol:
             assert signal.getsignal(signal.SIGTERM) is not None
         finally:
             signal.signal(signal.SIGTERM, previous)
+
+
+class TestRepoHealthSurface:
+    """#516: the loop exposes the source's per-repo health and narrates
+    suspension/recovery/resume as daemon notices."""
+
+    class HealthySource(FakeSource):
+        def __init__(self) -> None:
+            super().__init__()
+            from sbxloop.daemon.sources import RepoHealth
+
+            self.health = [RepoHealth("o/a"), RepoHealth("o/b", 4, None, True, "gone", 1.0)]
+
+        @property
+        def repo_health(self) -> list[Any]:
+            return list(self.health)
+
+        def resume_repo(self, repo: str) -> Any:
+            from sbxloop.daemon.sources import RepoHealth
+
+            if repo != "o/b":
+                raise KeyError(f"unknown repository {repo!r}")
+            self.health[1] = RepoHealth("o/b")
+            return self.health[1]
+
+    def test_status_carries_repo_health_and_resume_narrates(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        source = self.HealthySource()
+        h.loop.source = source
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        repos = h.loop.status()["repos"]
+        assert [(r["repo"], r["state"]) for r in repos] == [("o/a", "ok"), ("o/b", "suspended")]
+        assert repos[1]["reason"] == "gone"
+        got = h.loop.resume_repo("o/b", by="brett")
+        assert got["state"] == "ok"
+        (notice,) = [n for n in front.notices if n.kind == "source.repo_resumed"]
+        assert notice.text == "brett resumed polling of o/b"
+        with pytest.raises(KeyError):
+            h.loop.resume_repo("o/zzz")
+        # The source's own transitions arrive as notices too.
+        h.loop.source_notice("source.repo_suspended", "o/a", "🚫 repository o/a suspended")
+        (suspended,) = [n for n in front.notices if n.kind == "source.repo_suspended"]
+        assert suspended.level == "error"
+
+    def test_a_single_repo_daemon_has_no_repo_health(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        assert h.loop.status()["repos"] == []
+        with pytest.raises(ValueError, match="only a multi-repository daemon"):
+            h.loop.resume_repo("o/a")

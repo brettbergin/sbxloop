@@ -36,7 +36,7 @@ from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from sbxloop import hostgit
@@ -580,7 +580,36 @@ class DaemonLoop:
             # either — a restart here orphans the issue (#530).
             "claiming": self._claiming,
             "stopping": self._stop.is_set(),
+            # Per-repository polling health (#516); [] for a single-repo daemon.
+            "repos": [
+                {**h.to_json(), "state": h.state}
+                for h in getattr(self.source, "repo_health", None) or []
+            ],
         }
+
+    # -- multi-repo polling health (#516) -----------------------------------------
+
+    def source_notice(self, kind: str, repo: str, text: str) -> None:
+        """The source's own transitions (suspended / recovered), narrated
+        like any daemon notice so Discord sees a repository go dark once."""
+        level: NoticeLevel = "error" if kind == "source.repo_suspended" else "info"
+        self._notice(cast(NoticeKind, kind), text, level=level, repo=repo)
+
+    def resume_repo(self, repo: str, by: str | None = None) -> dict[str, Any]:
+        """Operator: poll a suspended (or backing-off) repository again now.
+        Refused with the reason when the source has no such state."""
+        resume = getattr(self.source, "resume_repo", None)
+        if resume is None:
+            raise ValueError("only a multi-repository daemon has per-repository polling state")
+        health = resume(repo)
+        who = by or "operator"
+        self._notice(
+            "source.repo_resumed",
+            f"{who} resumed polling of {health.repo}",
+            repo=health.repo,
+            by=who,
+        )
+        return {**health.to_json(), "state": health.state}
 
     # -- main loop --------------------------------------------------------------------
 

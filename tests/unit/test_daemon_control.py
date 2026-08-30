@@ -622,3 +622,31 @@ class TestGrantRounds:
         floop = FakeLoop(_dstore(tmp_path))
         reply = dispatch(floop, "grant-rounds r_unknown 1")
         assert not reply.ok and reply.text == "grant-rounds failed: unknown run r_unknown"
+
+
+class TestRepoHealth:
+    """#516: `resume-repo` and the status line that appears only when a
+    repository is not healthy."""
+
+    def test_resume_repo_reaches_the_loop(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "resume-repo o/a", by="brett")
+        assert reply.ok and "polling `o/a` again" in reply.text
+        assert floop.resumed_repos == [("o/a", "brett")]
+        assert not dispatch(floop, "resume-repo").ok
+        assert not dispatch(floop, "resume-repo a b").ok
+        reply = dispatch(floop, "resume-repo o/zzz")
+        assert not reply.ok and reply.text.startswith("resume-repo failed: unknown repository")
+
+    def test_status_names_only_unwell_repos(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        floop.repos = [{"repo": "o/a", "state": "ok"}, {"repo": "o/b", "state": "ok"}]
+        assert "repos:" not in plain(dispatch(floop, "status").text)
+        floop.repos = [
+            {"repo": "o/a", "state": "ok"},
+            {"repo": "o/b", "state": "suspended", "reason": "gone for this token (404)"},
+            {"repo": "o/c", "state": "backoff", "failures": 2},
+        ]
+        text = plain(dispatch(floop, "status").text)
+        assert "repos: o/b suspended (gone for this token (404)) · o/c backoff" in text
+        assert "o/a" not in text.split("repos:")[1]

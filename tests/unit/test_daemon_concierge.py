@@ -1760,3 +1760,31 @@ class TestSymptomFirstIssues:
         assert not refused.ok or "symptom is required" in refused.text
         assert "What are you seeing that you want gone or changed?" in refused.text
         assert len(github.created) == 1, "the fix-shaped ask was not filed"
+
+
+class TestRepoLinesHealth:
+    """#516: the concierge's repository listing shows a suspended repo."""
+
+    def test_list_repos_flags_suspended_and_backing_off(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [{"calls": [("list_repos", {})], "text": "here they are"}],
+            config={
+                "github": {"repos": [{"repo": "owner/repo"}, {"repo": "owner/other"}]},
+            },
+        )
+        loop.repos = [
+            {"repo": "owner/repo", "state": "suspended", "reason": "gone for this token"},
+            {"repo": "owner/other", "state": "backoff", "failures": 3},
+        ]
+        turn(concierge, "what repos are configured?")
+        (resp,) = client.responses
+        assert "owner/repo — enabled" in resp.text
+        assert (
+            "**SUSPENDED from polling**: gone for this token (`resume-repo owner/repo` once fixed)"
+            in resp.text
+        )
+        assert (
+            "owner/other — enabled" in resp.text
+            and "backing off after 3 poll failure(s)" in resp.text
+        )
