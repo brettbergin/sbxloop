@@ -2147,9 +2147,18 @@ def doctor(
             "a warning).",
         ),
     ] = False,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe/--no-probe",
+            help="Ask GitHub about each configured repository (reachability, token "
+            "permissions) from a github-ops sandbox — one microVM per distinct "
+            "credential. Off by default; --deep implies it.",
+        ),
+    ] = False,
 ) -> None:
     """Check that this host is ready to run sbxloop."""
-    ok = run_doctor(console, deep=deep, fail_on_drift=fail_on_drift)
+    ok = run_doctor(console, deep=deep, fail_on_drift=fail_on_drift, probe=probe)
     raise typer.Exit(0 if ok else 1)
 
 
