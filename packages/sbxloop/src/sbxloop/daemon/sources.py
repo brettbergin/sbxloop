@@ -21,13 +21,15 @@ happened.
 
 from __future__ import annotations
 
+import os
 import re
 import socket
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 from urllib.parse import quote
 
 from sbxloop.daemon.model import RunReport, WorkItem
@@ -44,7 +46,41 @@ log = get_logger(__name__)
 # The claim comment doubles as the claim lock (see GitHubIssueSource.claim);
 # this hidden marker is how competing daemons recognise each other's claims.
 CLAIM_MARKER = "<!-- sbxloop-claim "
-_CLAIM_RE = re.compile(re.escape(CLAIM_MARKER) + r"([0-9a-f]{32}) -->")
+# `<!-- sbxloop-claim <token> host=<host> pid=<pid> started=<iso> -->`; the
+# metadata is what tells a claim from a dead process apart (#530). Claims
+# written before the metadata existed still parse (empty host/pid).
+_CLAIM_RE = re.compile(
+    re.escape(CLAIM_MARKER)
+    + r"(?P<token>[0-9a-f]{32})"
+    + r"(?: host=(?P<host>\S+))?(?: pid=(?P<pid>\d+))?(?: started=(?P<started>\S+))?"
+    + r" -->"
+)
+_STARTED_RE = re.compile(r"^Run `[^`]+` started\.")
+
+
+class ClaimComment(NamedTuple):
+    """One claim comment of the current trigger cycle, as GitHub lists it."""
+
+    created: str
+    comment_id: int
+    token: str
+    host: str
+    pid: int | None
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether ``pid`` is a live process on this host (signal 0 probe)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, someone else's
+    except OSError:
+        return True  # unknown: assume alive, never reclaim on a guess
+    return True
+
+
 # GitHub list endpoints page at 100; an issue with more history than this
 # many pages is not one the daemon should be arbitrating by comment anyway.
 _MAX_PAGES = 10
@@ -55,6 +91,7 @@ class WorkSource(Protocol):
 
     def poll(self) -> list[WorkItem]: ...
     def claim(self, item: WorkItem) -> bool: ...
+    def settle_claim(self, item: WorkItem) -> bool: ...
     def report_started(self, item: WorkItem, run_id: str) -> None: ...
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None: ...
     def report_abandoned(self, item: WorkItem, error: str) -> None: ...
@@ -132,10 +169,20 @@ class GitHubIssueSource:
         on_failure: Callable[[BaseException], object] | None = None,
         qualify_ids: bool = False,
         extra_labels: Sequence[str] = (),
+        stale_after_s: float = 300.0,
+        pid: int | None = None,
+        alive: Callable[[int], bool] = pid_alive,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._ops = ops
         self.repo = repo
         self.labels = labels
+        # A claim comment older than this with no run started after it is
+        # stale; one from this host whose pid is dead is stale at once.
+        self.stale_after_s = stale_after_s
+        self.pid = os.getpid() if pid is None else pid
+        self._alive = alive
+        self._clock = clock
         # The repository's own ``labels = [...]`` (``[[github.repos]]``): added
         # to an issue alongside the in-progress mark when it is claimed. The
         # engine puts the same labels on the pull request it opens.
@@ -289,14 +336,30 @@ class GitHubIssueSource:
                 )
                 return False
             epoch = self._trigger_epoch(ops, number, trigger)
-            token = uuid.uuid4().hex
-            self._comment(
-                ops,
-                number,
-                f"{CLAIM_MARKER}{token} -->\n"
-                f"sbxloop daemon claimed this issue (host `{self.host}`).",
-            )
-            comment_id, first_token = self._first_claim(ops, number, epoch, token)
+            # The daemon persisted the token before calling (#530), so a
+            # crash between the comment and the persist is recoverable.
+            token = item.claim_token or uuid.uuid4().hex
+            self._comment(ops, number, self._claim_body(token))
+            claims = self._claims(ops, number, epoch)
+            mine = next((c for c in claims if c.token == token), None)
+            comment_id = mine.comment_id if mine else None
+            # Earlier claims from a process that is gone are not live claims:
+            # release them, then judge the race among the live ones.
+            live = []
+            for claim in claims:
+                if claim.token != token and self._stale(claim, claims, ops, number):
+                    log.warning(
+                        "github.claim_reclaimed",
+                        item=item.item_id,
+                        stale_token=claim.token,
+                        stale_host=claim.host or None,
+                        stale_pid=claim.pid,
+                        hint="an earlier claim comment from a process that is gone; released",
+                    )
+                    self._delete_comment_quietly(number, claim.comment_id)
+                    continue
+                live.append(claim)
+            first_token = live[0].token if live else None
             if first_token != token:
                 log.info(
                     "github.claim_lost_race",
@@ -351,25 +414,109 @@ class GitHubIssueSource:
                     latest = max(latest, str(event.get("created_at") or ""))
         return latest
 
-    def _first_claim(
-        self, ops: GithubOps, number: str, epoch: str, token: str
-    ) -> tuple[int | None, str | None]:
-        """(id of OUR claim comment if found, token of the FIRST claim
-        comment of this cycle). Ordered by GitHub's own timestamps so host
-        clock skew cannot decide the race; ids break same-second ties."""
-        claims: list[tuple[str, int, str]] = []
+    def _claim_body(self, token: str) -> str:
+        started = datetime.fromtimestamp(self._clock(), tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (
+            f"{CLAIM_MARKER}{token} host={self.host} pid={self.pid} started={started} -->\n"
+            f"sbxloop daemon claimed this issue (host `{self.host}`)."
+        )
+
+    def _claims(self, ops: GithubOps, number: str, epoch: str) -> list[ClaimComment]:
+        """The claim comments of this trigger cycle, oldest first. Ordered by
+        GitHub's own timestamps so host clock skew cannot decide the race;
+        ids break same-second ties. ``self._last_comments`` keeps the raw
+        rows for :meth:`_stale`, which needs to see what came after."""
+        claims: list[ClaimComment] = []
+        rows: list[dict[str, Any]] = []
         for comments in self._pages(ops, f"{self._issue_path(number)}/comments"):
             for comment in comments:
                 if not isinstance(comment, dict):
                     continue
+                rows.append(comment)
                 match = _CLAIM_RE.search(str(comment.get("body") or ""))
                 created = str(comment.get("created_at") or "")
                 if match is None or created < epoch:
                     continue
-                claims.append((created, int(comment.get("id") or 0), match.group(1)))
+                pid = match.group("pid")
+                claims.append(
+                    ClaimComment(
+                        created,
+                        int(comment.get("id") or 0),
+                        match.group("token"),
+                        match.group("host") or "",
+                        int(pid) if pid else None,
+                    )
+                )
+        self._last_comments = rows
         claims.sort()
-        mine = next((cid for _, cid, tok in claims if tok == token), None)
-        return mine, claims[0][2] if claims else None
+        return claims
+
+    def _stale(
+        self, claim: ClaimComment, claims: Sequence[ClaimComment], ops: GithubOps, number: str
+    ) -> bool:
+        """A claim from a process that is gone (#530): from this host with
+        a dead pid, or older than ``stale_after_s`` with no run started
+        after it — a live claimer starts its run within a poll interval."""
+        if (
+            claim.host == self.host
+            and claim.pid is not None
+            and claim.pid != self.pid
+            and not self._alive(claim.pid)
+        ):
+            return True
+        if self.stale_after_s <= 0:
+            return False
+        try:
+            created = datetime.strptime(claim.created, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        except ValueError:
+            return False
+        if self._clock() - created.timestamp() < self.stale_after_s:
+            return False
+        rows = getattr(self, "_last_comments", [])
+        for row in rows:
+            body = str(row.get("body") or "")
+            if str(row.get("created_at") or "") >= claim.created and _STARTED_RE.match(body):
+                return False  # its run did start; a stuck run is recovery's job, not ours
+        return True
+
+    def settle_claim(self, item: WorkItem) -> bool:
+        """Finish or forget a half-claim after a restart (#530).
+
+        The token was persisted before the comment was posted; whether the
+        comment landed is the question. Present → the claim is ours: make
+        sure the labels are swapped and report it claimed. Absent → nothing
+        reached the source; the caller clears the token and the next tick
+        claims from scratch. A GitHub failure reads as absent — a re-claim
+        is cheap, an orphaned issue is not.
+        """
+        token = item.claim_token
+        if not token:
+            return False
+        number = item.source_key
+        try:
+            ops = self._ops()
+            epoch = self._trigger_epoch(ops, number)
+            claims = self._claims(ops, number, epoch)
+            if not any(c.token == token for c in claims):
+                # Also look outside the cycle window: a claim from before a
+                # re-trigger is still ours, just no longer relevant.
+                return False
+            issue = ops.raw("GET", self._issue_path(number))
+            names = {
+                label.get("name")
+                for label in (issue.get("labels") if isinstance(issue, dict) else []) or []
+                if isinstance(label, dict)
+            }
+            if self.labels.in_progress not in names:
+                self._add_labels(ops, number, [self.labels.in_progress, *self.extra_labels])
+            if self.labels.trigger in names:
+                self._remove_label(ops, number, self.labels.trigger)
+        except (GithubOpsError, WorkerError, SbxError) as exc:
+            log.warning("github.claim_settle_failed", item=item.item_id, exc_info=True)
+            self._failed(exc)
+            return False
+        log.info("github.claim_settled", item=item.item_id, repo=self.repo, token=token)
+        return True
 
     def _pages(self, ops: GithubOps, path: str) -> Iterator[list[Any]]:
         for page in range(1, _MAX_PAGES + 1):
@@ -602,6 +749,9 @@ class MultiRepoIssueSource:
     def claim(self, item: WorkItem) -> bool:
         return self.for_item(item).claim(item)
 
+    def settle_claim(self, item: WorkItem) -> bool:
+        return self.for_item(item).settle_claim(item)
+
     def report_started(self, item: WorkItem, run_id: str) -> None:
         self.for_item(item).report_started(item, run_id)
 
@@ -633,6 +783,7 @@ def build_github_source(
     *,
     host: str | None = None,
     on_failure: Callable[[BaseException], object] | None = None,
+    stale_after_s: float = 300.0,
 ) -> WorkSource:
     """A work source over every *enabled* repository in ``repos``.
 
@@ -655,6 +806,7 @@ def build_github_source(
             on_failure=on_failure,
             qualify_ids=qualify,
             extra_labels=entry.labels,
+            stale_after_s=stale_after_s,
         )
         for entry in enabled
     ]

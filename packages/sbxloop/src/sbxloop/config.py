@@ -692,6 +692,12 @@ class DaemonConfig(_ConfigModel):
     # fresh engine wall clock; past this many per item the interrupted run is
     # settled as a failed attempt instead of resumed (#234). 0 = never resume.
     max_resumes_per_item: int = Field(default=2, ge=0)
+    # A claim comment from a process that is gone is not a live claim
+    # (#530): one from this host whose pid is dead is reclaimed at once, and
+    # one from anywhere older than this with no "Run … started" comment
+    # after it is reclaimed too. A few poll intervals: a live claimer
+    # starts its run within one.
+    claim_stale_after_s: float = Field(default=300.0, ge=0)
     retry_backoff_s: float = 900.0
     max_consecutive_failures: int = 3
     breaker_cooldown_s: float = 3600.0

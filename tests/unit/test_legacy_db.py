@@ -39,7 +39,7 @@ class TestDaemonShapes:
         (state x id form); every row reads back under its typed id with
         its state, pin and report intact, and a reopen changes nothing."""
         path = daemon_db(tmp_path, shape)
-        repo = "o/r" if shape == "pre_scheduled_retry" else None
+        repo = "o/r" if shape in ("pre_scheduled_retry", "pre_claim_token") else None
         written = every_daemon_row(path, repo=repo)
         assert len(written) == 2 * len(DAEMON_ITEM_STATES)
 
@@ -49,7 +49,7 @@ class TestDaemonShapes:
             assert got is not None, item_id
             assert got.item_id == normalize_item_id(item_id)
             assert got.state == state
-            assert got.not_before is None
+            assert got.not_before is None and got.claim_token is None
         # The raw file is untouched by reading: ids stay as stored.
         assert raw_daemon_rows(path) == written
         # Live rows are still live: the run in flight and the pending resume.

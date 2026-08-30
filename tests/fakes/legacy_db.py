@@ -16,6 +16,7 @@ Daemon store (``daemon_work_items`` and friends):
   ``repo`` column and still ``UNIQUE(source_key)``.
 - ``pre_scheduled_retry`` — before #523: ``repo`` and the
   ``(source_key, repo)`` key, but no ``not_before``.
+- ``pre_claim_token`` — before #530: ``not_before`` but no ``claim_token``.
 
 Engine store (``runs`` / ``phase_attempts``):
 
@@ -72,10 +73,15 @@ _DAEMON_REQUESTERS_REPO = (
     "repo TEXT NOT NULL DEFAULT '', PRIMARY KEY (source_key, repo))"
 )
 
+_DAEMON_ITEMS_NOT_BEFORE = _DAEMON_ITEMS_REPO.replace(
+    "repo TEXT NOT NULL DEFAULT '', ", "repo TEXT NOT NULL DEFAULT '', not_before REAL, "
+)
+
 DAEMON_SHAPES: dict[DaemonShape, tuple[str, ...]] = {
     "pre_typed_ids": (_DAEMON_ITEMS_NO_REPO, _DAEMON_REQUESTERS_NO_REPO),
     "pre_multirepo": (_DAEMON_ITEMS_NO_REPO, _DAEMON_REQUESTERS_NO_REPO),
     "pre_scheduled_retry": (_DAEMON_ITEMS_REPO, _DAEMON_REQUESTERS_REPO),
+    "pre_claim_token": (_DAEMON_ITEMS_NOT_BEFORE, _DAEMON_REQUESTERS_REPO),
 }
 
 # Every state a work-item row can be in, with the bookkeeping a deployed

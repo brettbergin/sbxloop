@@ -498,7 +498,11 @@ spent are `blocked` for the same reason: nothing another round would change.
 
 `sbxloop daemon` is deliberately small: it claims issues carrying
 `sbxloop:run` in **every configured, enabled repository** (a label swap plus
-a claim comment as the optimistic lock), runs each as **one** engine run, and
+a claim comment as the optimistic lock — carrying host, pid and start time so a
+claim from a dead process can be told apart and reclaimed, persisted as a
+token before it is posted and shielded from SIGTERM until it completes, and
+settled on the next start if the process died in between; a claim that is not
+ours leaves no row, never a terminal one, #530), runs each as **one** engine run, and
 reports the outcome on the issue — closed with `sbxloop:completed` when the
 PR merged (the PR body's `Closes #N` closes it even if the daemon is down),
 `sbxloop:failed` when the run gave up (after the per-item attempt cap and

@@ -27,9 +27,12 @@ tick resumes it through the same guardrails as any dispatch.
 from __future__ import annotations
 
 import re
+import signal
 import threading
 import time
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
@@ -81,6 +84,45 @@ log = get_logger(__name__)
 # Hidden markers earlier sbxloop versions left in issue bodies; they are
 # bookkeeping, not part of the outcome the agent should read.
 _MARKER_RE = re.compile(r"<!--\s*sbxloop-\S+.*?-->", re.DOTALL)
+
+
+@contextmanager
+def defer_signals(signals: Sequence[int] = (signal.SIGINT, signal.SIGTERM)) -> Iterator[None]:
+    """Hold SIGINT/SIGTERM for the duration of the block, then deliver them.
+
+    The cleanup registry's handler quiesces and then raises ``SystemExit``
+    on the main thread — which, arriving between "claim comment posted"
+    and "claim persisted", is exactly the kill that orphaned #527 (#530).
+    A claim is seconds of GitHub calls; holding the signal that long costs
+    nothing and makes the claim atomic. Only the main thread may install
+    handlers: anywhere else this is a no-op.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: list[tuple[int, Any]] = []
+    previous: dict[int, Any] = {}
+
+    def hold(signum: int, frame: Any) -> None:
+        log.info("signals.deferred", signal=signal.Signals(signum).name, hint="claim in flight")
+        pending.append((signum, frame))
+
+    for signum in signals:
+        with suppress(ValueError, OSError):
+            previous[signum] = signal.signal(signum, hold)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        for signum, frame in pending:
+            handler = previous.get(signum)
+            if callable(handler):
+                handler(signum, frame)
+            elif signum == signal.SIGINT:
+                raise KeyboardInterrupt
+            else:
+                raise SystemExit(128 + signum)
 
 
 def day_window(now: float, tz: str) -> tuple[float, float]:
@@ -642,18 +684,32 @@ class DaemonLoop:
                 )
             return TickResult(discovered=discovered, idle_kind="no_work")
         if not item.claimed:
+            # The claim's token is persisted before the comment goes up, and
+            # SIGTERM/SIGINT are held until the claim is complete (#530): a
+            # process that dies mid-claim either never posted, or left a row
+            # recovery can settle against the comment it did post.
+            token = item.claim_token or uuid.uuid4().hex
+            self.dstore.mark_claiming(item.item_id, token, now)
+            item = self.dstore.get(item.item_id) or item.model_copy(update={"claim_token": token})
             self._claiming = item.item_id
             try:
-                claimed = self.source.claim(item)
-                if claimed:
-                    self.dstore.mark_claimed(item.item_id, now)
+                with defer_signals():
+                    claimed = self.source.claim(item)
+                    if claimed:
+                        self.dstore.mark_claimed(item.item_id, now)
             finally:
                 self._claiming = None
             if not claimed:
-                self.dstore.mark_failed(item.item_id, "claim failed", now, requeue=False)
+                # Not ours to run — another daemon won, the issue closed, the
+                # trigger label went away, or GitHub was down. Never a
+                # terminal row: that is what discovery dedups against, and
+                # what made a lost race permanent. The next poll re-creates
+                # the row if the trigger label is (still, or again) there.
+                self.dstore.discard(item.item_id)
                 self._notice(
                     "item.claim_failed",
-                    f"could not claim {item.item_id} ({item.title}); dropped",
+                    f"could not claim {item.item_id} ({item.title}); forgotten — "
+                    "re-queued by the next poll if the trigger label is still on it",
                     item=item.item_id,
                     title=item.title,
                 )
@@ -1644,6 +1700,7 @@ class DaemonLoop:
 
         Finishes with :meth:`_reconcile_orphan_runs`, which closes any run
         row a dead process left non-terminal (#374)."""
+        self._settle_half_claims()
         for item in self.dstore.running_items():
             now = self.clock()
             if item.run_id is None:
@@ -1709,6 +1766,34 @@ class DaemonLoop:
                 )
         self._settle_offline_overrides()
         self._reconcile_orphan_runs()
+
+    def _settle_half_claims(self) -> None:
+        """Rows whose claim was started but never completed (#530): the
+        previous process died between posting the claim comment and
+        persisting the claim. The source says whether the comment landed —
+        then the claim is finished and the item dispatches normally; else
+        the token is cleared and the next tick claims from scratch. Either
+        way the issue is never left wearing a claim nobody will act on."""
+        for item in self.dstore.half_claimed():
+            now = self.clock()
+            if self.source.settle_claim(item):
+                self.dstore.mark_claimed(item.item_id, now)
+                outcome = "claimed"
+            else:
+                self.dstore.clear_claim(item.item_id, now)
+                outcome = "cleared"
+            self._notice(
+                "recovery.claim_settled",
+                f"recovery: {item.item_id} was half-claimed by the previous process; "
+                + (
+                    "its claim comment is on the issue, so the claim is finished"
+                    if outcome == "claimed"
+                    else "nothing reached the issue, so it will be claimed again"
+                ),
+                item=item.item_id,
+                outcome=outcome,
+                token=item.claim_token,
+            )
 
     def _reconcile_orphan_runs(self) -> None:
         """Force every *orphaned* non-terminal run to a terminal state (#374).

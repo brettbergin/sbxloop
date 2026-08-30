@@ -222,6 +222,7 @@ secret_strategy = "proxy"
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
+# claim_stale_after_s = 300        # a claim comment older than this with no run started is reclaimed
 # retry_backoff_s = 900.0          # times the attempt number
 # max_consecutive_failures = 3     # circuit breaker ...
 # breaker_cooldown_s = 3600.0      # ... and how long it stays open
