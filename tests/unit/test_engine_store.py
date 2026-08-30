@@ -1,12 +1,13 @@
 """StateStore tests."""
 
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from sbxloop.engine.model import TaskRecord, TaskSpec
-from sbxloop.engine.store import StateStore
+from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
 
@@ -679,3 +680,94 @@ class TestEphemeralDeltas:
             EventTypes.AGENT_MESSAGE,
         ]
         assert [e.type for _, e in store.events("r1")] == [EventTypes.AGENT_MESSAGE]
+
+
+class TestPostedFindings:
+    """Thread identity persisted by the review round, read back across
+    rounds and across a reopen (resume) with no GitHub call."""
+
+    @staticmethod
+    def _record(
+        store: StateStore, round_no: int, review_id: int | None, posted: list[dict]
+    ) -> None:
+        store.record_phase(
+            "r1",
+            "review",
+            task_id=None,
+            attempt=round_no,
+            status="request_changes",
+            output_json=json.dumps(
+                {
+                    "verdict": {"verdict": "request_changes"},
+                    "review": {"url": "u", "event": "COMMENT", "id": review_id},
+                    "posted": posted,
+                }
+            ),
+            started_at=float(round_no),
+        )
+
+    def test_reads_back_rounds_anchors_and_body_only(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        self._record(
+            store,
+            1,
+            7001,
+            [
+                {"anchor": "a.py:10", "comment_id": 101, "thread_node_id": "PRRT_1"},
+                {"anchor": "gone.py:99", "comment_id": None, "thread_node_id": None},
+            ],
+        )
+        store.record_phase(
+            "r1", "build", task_id="fix-1", attempt=1, status="ok", output_json="{}", started_at=3.0
+        )
+        self._record(
+            store, 2, 7002, [{"anchor": "b.py:3", "comment_id": 102, "thread_node_id": "PRRT_2"}]
+        )
+
+        posted = store.posted_findings("r1")
+        assert [
+            (p.round, p.anchor, p.comment_id, p.thread_node_id, p.body_only) for p in posted
+        ] == [
+            (1, "a.py:10", 101, "PRRT_1", False),
+            (1, "gone.py:99", None, None, True),
+            (2, "b.py:3", 102, "PRRT_2", False),
+        ]
+        assert [p.review_id for p in posted] == [7001, 7001, 7002]
+
+    def test_survives_reopening_the_store(self, store: StateStore, tmp_path: Path) -> None:
+        store.create_run("r1", "x")
+        self._record(
+            store, 1, 7001, [{"anchor": "a.py:10", "comment_id": 101, "thread_node_id": "PRRT_1"}]
+        )
+        store.close()
+
+        reopened = StateStore(tmp_path / "state.db")
+        try:
+            assert reopened.posted_findings("r1") == [
+                PostedRecord(1, "a.py:10", 101, "PRRT_1", 7001)
+            ]
+        finally:
+            reopened.close()
+
+    def test_tolerates_rows_without_posted_data(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        store.record_phase(
+            "r1",
+            "review",
+            task_id=None,
+            attempt=1,
+            status="approve",
+            output_json=None,
+            started_at=1.0,
+        )
+        store.record_phase(
+            "r1",
+            "review",
+            task_id=None,
+            attempt=2,
+            status="approve",
+            output_json="not json",
+            started_at=2.0,
+        )
+        self._record(store, 3, None, [{"comment_id": 5}, {"anchor": "a.py:1", "comment_id": 9}])
+        assert store.posted_findings("r1") == [PostedRecord(3, "a.py:1", 9, None, None)]

@@ -177,6 +177,10 @@ class HostEventTypes:
     # `waited_s`). `land.*`: the landing steps GitHub was asked for.
     # `run.merged` / `run.blocked`: how the pipeline ended.
     REVIEW_VERDICT = "review.verdict"
+    # The fix round's answer spoken back onto the PR's own threads
+    # (`round`, `addressed`, `refuted`, `unanswered`, `replied`, `resolved`,
+    # `body_only`, `comment_url`).
+    REVIEW_RECONCILED = "review.reconciled"
     FIX_ROUND = "fix.round"
     CI_STATUS = "ci.status"
     LAND_UNDRAFT = "land.undraft"
