@@ -23,14 +23,14 @@ loop simply re-judges the new head.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Container, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from sbxloop.config import LandingConfig
 from sbxloop.engine.model import FixKind
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ChecksVerdict, FailedCheck, GithubOps, fold_reviews
+from sbxloop.gh.ops import ChecksVerdict, FailedCheck, GithubOps, ReviewThread, fold_reviews
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -50,11 +50,31 @@ class Blocked(NamedTuple):
     why: str
 
 
+class HumanObjection(NamedTuple):
+    """One standing objection from a human reviewer, as something the loop
+    can answer *in place* rather than only in a build report.
+
+    ``key`` is the stable identity the store records a reply under, so a
+    resumed run — and the next landing pass — knows this objection has
+    already been answered. Inline objections carry a thread; a review body
+    objection does not (``comment_id is None``) and is answered with a PR
+    comment instead.
+    """
+
+    key: str
+    login: str
+    body: str
+    anchor: str = ""
+    comment_id: int | None = None
+    thread_node_id: str | None = None
+
+
 class NeedsFix(NamedTuple):
     kind: FixKind
     why: str
     failed_checks: tuple[FailedCheck, ...] = ()
     objections: str = ""
+    human: tuple[HumanObjection, ...] = ()
 
 
 class Closed(NamedTuple):
@@ -148,6 +168,137 @@ def human_objection(ops: GithubOps, repo: str, number: int, *, login: str) -> bo
     return fold_reviews(others) == "CHANGES_REQUESTED"
 
 
+def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> list[HumanObjection]:
+    """The standing human objections on a PR, one entry per thing to answer.
+
+    A reviewer's ``CHANGES_REQUESTED`` body is one objection; each of that
+    reviewer's inline comments is another, carrying the comment id the loop
+    replies on. Only reviewers whose *latest* verdict is
+    ``CHANGES_REQUESTED`` count, matching :func:`human_objection` — an
+    objection a later approval cleared is not standing any more.
+
+    Returns ``[]`` when nothing stands, which is not the same as a standing
+    objection with no readable text: that yields the review entry with an
+    empty body, so the loop still has something to answer.
+    """
+
+    def login_of(entry: dict[str, Any]) -> str:
+        return str((entry.get("user") or {}).get("login") or "")
+
+    payload = ops.raw("GET", f"/repos/{repo}/pulls/{number}/reviews")
+    latest: dict[str, dict[str, Any]] = {}
+    for review in payload if isinstance(payload, list) else []:
+        if not isinstance(review, dict):
+            continue
+        who = login_of(review)
+        if who == login:
+            continue
+        state = str(review.get("state") or "").upper()
+        if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest[who] = review
+    objectors = {
+        who
+        for who, review in latest.items()
+        if str(review.get("state") or "").upper() == "CHANGES_REQUESTED"
+    }
+    if not objectors:
+        return []
+    out: list[HumanObjection] = []
+    for who in sorted(objectors):
+        review = latest[who]
+        out.append(
+            HumanObjection(
+                key=f"human:review:{review.get('id')}",
+                login=who,
+                body=str(review.get("body") or "").strip(),
+            )
+        )
+    comments = ops.raw("GET", f"/repos/{repo}/pulls/{number}/comments")
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        who = login_of(comment)
+        if who not in objectors:
+            continue
+        body = str(comment.get("body") or "").strip()
+        if not body:
+            continue
+        path = str(comment.get("path") or "")
+        line = comment.get("line") or comment.get("original_line")
+        anchor = f"{path}:{line}" if path and line else path
+        comment_id = comment.get("id")
+        out.append(
+            HumanObjection(
+                key=f"human:comment:{comment_id}",
+                login=who,
+                body=body,
+                anchor=anchor,
+                comment_id=int(comment_id) if comment_id is not None else None,
+            )
+        )
+    return out
+
+
+def unreconciled_threads(
+    threads: Sequence[ReviewThread], *, login: str
+) -> tuple[list[str], list[str]]:
+    """Split the PR's inline threads into the loop's own and the humans'
+    that are *not* reconciled yet, as anchors ready to name in a reason.
+
+    A **loop-authored** thread (its root comment is the loop's) is reconciled
+    when it is resolved — the addressed case — or carries a later reply from
+    the loop, which is the refuted case: the loop said why it disagrees and
+    deliberately left the thread open.
+
+    A **human** thread is reconciled when the loop replied in it. It is
+    never required to be resolved: closing a human's thread is theirs to do.
+
+    Threads with no comments at all cannot be spoken to and are ignored.
+    """
+    loop_open: list[str] = []
+    human_open: list[str] = []
+    for thread in threads:
+        if not thread.comments:
+            continue
+        author = thread.comments[0].login
+        if author == login:
+            if thread.is_resolved or thread.has_reply_from(login):
+                continue
+            loop_open.append(thread.anchor)
+        else:
+            if thread.has_reply_from(login):
+                continue
+            human_open.append(thread.anchor)
+    return loop_open, human_open
+
+
+def _reconciliation_block(ops: GithubOps, repo: str, number: int, *, login: str) -> Blocked | None:
+    """The merge gate of #520 step 5: a pull request does not merge while a
+    review finding on it is still unanswered.
+
+    Returns ``None`` when every thread is reconciled (including the trivial
+    case of a PR with no inline threads at all), a :class:`Blocked` naming
+    the offending threads otherwise. A thread read that fails also blocks:
+    "we could not tell" is not "there is nothing to answer", and merging on
+    an unread PR is precisely the silent merge this gate exists to stop.
+    """
+    try:
+        threads = ops.pr_review_threads(repo, number)
+    except GithubOpsError as exc:
+        log.warning("land.threads_unreadable", repo=repo, pr=number, error=str(exc))
+        return Blocked(
+            "its review threads could not be read, so reconciliation cannot be confirmed"
+        )
+    loop_open, human_open = unreconciled_threads(threads, login=login)
+    if loop_open:
+        return Blocked(f"{len(loop_open)} review threads unreconciled: {', '.join(loop_open)}")
+    if human_open:
+        return Blocked(
+            f"{len(human_open)} human review threads have no reply: {', '.join(human_open)}"
+        )
+    return None
+
+
 def land(
     ops: GithubOps,
     repo: str,
@@ -162,6 +313,8 @@ def land(
     tick: Tick,
     emit: Emit,
     clock: Callable[[], float] = time.monotonic,
+    answered: Container[str] = frozenset(),
+    review_posted: bool = True,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
@@ -171,6 +324,10 @@ def land(
     conflict with the base, a human's objection) or ``Closed`` (someone
     closed the PR unmerged). ``ci_timeout_s`` bounds the whole wait; a
     landing that has not settled by then is ``Blocked`` too.
+
+    ``review_posted`` is whether the round that approved this PR actually
+    got its review onto GitHub. False blocks the merge: a run whose review
+    post failed would otherwise merge with no reviewable record at all.
     """
     started = clock()
     while True:
@@ -191,11 +348,24 @@ def land(
             tick("undraft")
             continue
         head = _head_sha(pr)
-        if human_objection(ops, repo, number, login=login):
+        standing = human_objections(ops, repo, number, login=login)
+        unanswered = [o for o in standing if o.key not in answered]
+        if standing and unanswered:
             return NeedsFix(
                 "human",
                 "a reviewer requested changes on the pull request",
                 objections=ops.pr_review_feedback(repo, number, exclude_login=login),
+                human=tuple(unanswered),
+            )
+        if standing:
+            # Every objection of this standing CHANGES_REQUESTED has already
+            # been answered in this run. Only the reviewer can dismiss their
+            # own review, so spending another full fix pass on the same
+            # words would be pure repeat work (#520): say so and hand over.
+            emit("land.human_answered", pr=number, objections=len(standing))
+            return Blocked(
+                f"a reviewer's changes-requested review is still standing after "
+                f"{len(standing)} replied objection(s); only they can dismiss it"
             )
         checks = ops.pr_checks(repo, head)
         if checks.state == "pending":
@@ -234,6 +404,17 @@ def land(
             # re-delivery rebuilds the commit on the current base, so this
             # is genuinely fixable.
             return NeedsFix("conflict", "the pull request conflicts with its base branch")
+        # #520 step 5: the last gates before the merge are about the review
+        # record itself. A run that could not post its approving review has
+        # no review on the PR at all (#503), and a PR whose findings are
+        # still open on their threads has not been reconciled — neither may
+        # merge silently.
+        if not review_posted:
+            return Blocked("review record could not be posted")
+        blocked = _reconciliation_block(ops, repo, number, login=login)
+        if blocked is not None:
+            emit("land.unreconciled", pr=number, why=blocked.why)
+            return blocked
         outcome = ops.pr_merge(repo, number, method=cfg.merge_method, sha=head)
         if outcome.stale:
             # The head moved between the read that judged it and the merge;

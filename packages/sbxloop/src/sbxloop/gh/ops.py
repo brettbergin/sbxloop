@@ -75,20 +75,89 @@ class ReviewComment(BaseModel):
     side: Literal["LEFT", "RIGHT"] = "RIGHT"
 
 
+class PostedFinding(NamedTuple):
+    """Where one review finding actually landed on the PR.
+
+    ``anchor`` is the ``path:line`` key the engine carries across rounds.
+    ``comment_id`` is the REST id of the inline comment that anchors the
+    finding's thread — ``None`` when the finding was posted in the review
+    body instead (anchor refused by GitHub, cap overflow, or no line at
+    all), which is exactly the case a later reconciliation pass must fall
+    back to a plain PR comment for. ``thread_node_id`` is the GraphQL node
+    id of that comment's review thread, needed to resolve it; ``None`` when
+    there is no inline comment or the lookup could not answer.
+    """
+
+    anchor: str
+    comment_id: int | None = None
+    thread_node_id: str | None = None
+
+
+class ThreadComment(NamedTuple):
+    """One comment inside a review thread."""
+
+    comment_id: int | None
+    login: str
+    body: str
+
+
+class ReviewThread(NamedTuple):
+    """An inline review thread as it stands on the PR right now.
+
+    Read for idempotency: a reconciliation pass skips a thread that already
+    carries its own reply.
+    """
+
+    node_id: str
+    is_resolved: bool
+    path: str
+    line: int | None
+    comments: tuple[ThreadComment, ...] = ()
+
+    @property
+    def anchor(self) -> str:
+        return f"{self.path}:{self.line}" if self.line is not None else self.path
+
+    @property
+    def root_comment_id(self) -> int | None:
+        return self.comments[0].comment_id if self.comments else None
+
+    def has_reply_from(self, login: str) -> bool:
+        return any(c.login == login for c in self.comments[1:])
+
+    def has_reply_marked(self, marker: str) -> bool:
+        return any(marker in c.body for c in self.comments[1:])
+
+
 class SubmittedReview(NamedTuple):
     """A posted review: its url, and the event GitHub actually accepted.
 
     ``event`` is not necessarily the one requested — see
     :meth:`GithubOps.pr_review_create`.
+
+    ``review_id`` and ``posted`` are the thread identity a later round needs
+    to reply on a finding rather than restate it in a fresh review body.
     """
 
     url: str
     event: ReviewEvent
+    review_id: int | None = None
+    posted: tuple[PostedFinding, ...] = ()
 
     @property
     def gates_merge(self) -> bool:
         """Whether this review can hold the merge. A COMMENT cannot."""
         return self.event in ("APPROVE", "REQUEST_CHANGES")
+
+    @property
+    def inline(self) -> tuple[PostedFinding, ...]:
+        """Findings that got their own thread."""
+        return tuple(p for p in self.posted if p.comment_id is not None)
+
+    @property
+    def body_only(self) -> tuple[PostedFinding, ...]:
+        """Findings that ended up in the review body, with no thread."""
+        return tuple(p for p in self.posted if p.comment_id is None)
 
 
 class ChecksVerdict(NamedTuple):
@@ -216,6 +285,57 @@ def review_payload(
             {"path": c.path, "line": c.line, "side": c.side, "body": c.body} for c in comments
         ]
     return payload
+
+
+def anchor_of(comment: ReviewComment) -> str:
+    """The ``path:line`` key a finding is tracked by across rounds."""
+    return f"{comment.path}:{comment.line}"
+
+
+def fold_review_threads(payload: Any) -> list[ReviewThread]:
+    """The GraphQL ``pullRequest.reviewThreads`` page folded to typed rows.
+
+    Malformed nodes are skipped rather than raising: a thread the API
+    describes in a shape we do not understand must not take down the
+    reconciliation pass that was going to leave it alone anyway.
+    """
+    threads: list[ReviewThread] = []
+    if not isinstance(payload, dict):
+        return threads
+    nodes = (((payload.get("data") or {}).get("repository") or {}).get("pullRequest") or {}).get(
+        "reviewThreads"
+    ) or {}
+    entries = nodes.get("nodes") if isinstance(nodes, dict) else None
+    for node in entries if isinstance(entries, list) else []:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or "")
+        if not node_id:
+            continue
+        raw_line = node.get("line")
+        comments: list[ThreadComment] = []
+        comment_nodes = (node.get("comments") or {}).get("nodes")
+        for comment in comment_nodes if isinstance(comment_nodes, list) else []:
+            if not isinstance(comment, dict):
+                continue
+            database_id = comment.get("databaseId")
+            comments.append(
+                ThreadComment(
+                    comment_id=int(database_id) if isinstance(database_id, int) else None,
+                    login=str((comment.get("author") or {}).get("login") or ""),
+                    body=str(comment.get("body") or ""),
+                )
+            )
+        threads.append(
+            ReviewThread(
+                node_id=node_id,
+                is_resolved=bool(node.get("isResolved")),
+                path=str(node.get("path") or ""),
+                line=int(raw_line) if isinstance(raw_line, int) else None,
+                comments=tuple(comments),
+            )
+        )
+    return threads
 
 
 class GithubOps:
@@ -440,7 +560,10 @@ class GithubOps:
         def submit(kind: ReviewEvent) -> SubmittedReview:
             data = self.raw("POST", path, review_payload(kind, body, comments))
             url = str(data.get("html_url", "")) if isinstance(data, dict) else ""
-            return SubmittedReview(url, kind)
+            raw_id = data.get("id") if isinstance(data, dict) else None
+            review_id = int(raw_id) if isinstance(raw_id, int) else None
+            posted = self._capture_posted(repo, number, review_id, comments)
+            return SubmittedReview(url, kind, review_id, posted)
 
         try:
             return submit(event)
@@ -459,6 +582,140 @@ class GithubOps:
                 ),
             )
             return submit("COMMENT")
+
+    def _capture_posted(
+        self,
+        repo: str,
+        number: int,
+        review_id: int | None,
+        comments: Sequence[ReviewComment],
+    ) -> tuple[PostedFinding, ...]:
+        """Map each requested finding to the comment GitHub actually created.
+
+        A finding whose anchor GitHub dropped (or that was never inline to
+        begin with) is still recorded, with ``comment_id=None`` — losing it
+        here would make it invisible to reconciliation, which is the whole
+        failure this capture exists to end.
+
+        Capture is best-effort: a review *was* posted, and failing the whole
+        call because the follow-up read 404'd would throw away feedback that
+        is already on the PR.
+        """
+        if not comments:
+            return ()
+        wanted = [anchor_of(c) for c in comments]
+        if review_id is None:
+            return tuple(PostedFinding(anchor) for anchor in wanted)
+        try:
+            data = self.raw("GET", f"/repos/{repo}/pulls/{number}/reviews/{review_id}/comments")
+        except GithubOpsError as exc:
+            log.warning("gh.review_comments_read_failed", repo=repo, pr=number, error=str(exc))
+            return tuple(PostedFinding(anchor) for anchor in wanted)
+        by_anchor: dict[str, int] = {}
+        for entry in data if isinstance(data, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            comment_id = entry.get("id")
+            if not isinstance(comment_id, int):
+                continue
+            line = entry.get("line")
+            if line is None:
+                line = entry.get("original_line")
+            anchor = f"{entry.get('path') or ''}:{line}"
+            by_anchor.setdefault(anchor, comment_id)
+        threads_by_comment: dict[int, str] = {}
+        if by_anchor:
+            try:
+                for thread in self.pr_review_threads(repo, number):
+                    for comment in thread.comments:
+                        if comment.comment_id is not None:
+                            threads_by_comment[comment.comment_id] = thread.node_id
+            except GithubOpsError as exc:
+                log.warning("gh.review_threads_read_failed", repo=repo, pr=number, error=str(exc))
+        posted: list[PostedFinding] = []
+        for anchor in wanted:
+            comment_id = by_anchor.get(anchor)
+            posted.append(
+                PostedFinding(
+                    anchor=anchor,
+                    comment_id=comment_id,
+                    thread_node_id=(
+                        threads_by_comment.get(comment_id) if comment_id is not None else None
+                    ),
+                )
+            )
+        return tuple(posted)
+
+    # -- reconciling review findings ----------------------------------------
+    #
+    # Replying on a finding's own thread, and resolving it, is what turns
+    # "the fix round addressed it" into something a human reading the PR can
+    # see. These are the only GitHub writes that touch an existing thread.
+
+    _THREADS_QUERY = (
+        "query($owner: String!, $name: String!, $number: Int!) { "
+        "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+        "reviewThreads(first: 100) { nodes { id isResolved path line "
+        "comments(first: 50) { nodes { databaseId body author { login } } } } } } } }"
+    )
+
+    _RESOLVE_MUTATION = (
+        "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) "
+        "{ thread { isResolved } } }"
+    )
+
+    def pr_comment_reply(self, repo: str, number: int, comment_id: int, body: str) -> str:
+        """Reply in the thread rooted at ``comment_id``; returns its url."""
+        data = self.raw(
+            "POST",
+            f"/repos/{repo}/pulls/{number}/comments/{comment_id}/replies",
+            {"body": body},
+        )
+        return str(data.get("html_url", "")) if isinstance(data, dict) else ""
+
+    def pr_issue_comment(self, repo: str, number: int, body: str) -> str:
+        """A plain PR-level comment — the fallback for body-only findings."""
+        data = self.raw("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body})
+        return str(data.get("html_url", "")) if isinstance(data, dict) else ""
+
+    def resolve_review_thread(self, thread_node_id: str) -> bool:
+        """Mark a review thread resolved; True when it now is.
+
+        GraphQL answers a failed mutation with a 200 and an ``errors`` array,
+        so the body is the verdict, not the status.
+        """
+        data = self.raw(
+            "POST",
+            "/graphql",
+            {"query": self._RESOLVE_MUTATION, "variables": {"id": thread_node_id}},
+        )
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"resolveReviewThread returned a malformed result: {data!r}")
+        errors = data.get("errors")
+        if errors:
+            raise GithubOpsError(f"resolveReviewThread failed: {errors!r}")
+        thread = ((data.get("data") or {}).get("resolveReviewThread") or {}).get("thread")
+        if not isinstance(thread, dict) or "isResolved" not in thread:
+            raise GithubOpsError(f"resolveReviewThread returned no thread: {data!r}")
+        return bool(thread["isResolved"])
+
+    def pr_review_threads(self, repo: str, number: int) -> list[ReviewThread]:
+        """Every inline review thread on the PR, with its replies."""
+        owner, _, name = repo.partition("/")
+        data = self.raw(
+            "POST",
+            "/graphql",
+            {
+                "query": self._THREADS_QUERY,
+                "variables": {"owner": owner, "name": name, "number": number},
+            },
+        )
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"reviewThreads returned a malformed result: {data!r}")
+        errors = data.get("errors")
+        if errors:
+            raise GithubOpsError(f"reviewThreads failed: {errors!r}")
+        return fold_review_threads(data)
 
     # -- landing a pull request ---------------------------------------------
     #

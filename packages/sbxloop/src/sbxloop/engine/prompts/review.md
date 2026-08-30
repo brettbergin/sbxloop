@@ -62,6 +62,32 @@ refuted finding otherwise, and in round 2 or later do not raise new nits on
 lines the fix round did not change: the point of a further round is the
 problems that are still there, not new opinions about old lines.
 
+In round 2 or later, every finding an earlier round raised gets an explicit
+verdict from you — but **not as a finding and not in your summary**. Each
+earlier finding already has its own conversation on the pull request; your
+verdict on it is posted there, as a reply, keyed by its `path:line` anchor.
+Put those verdicts in the `confirmations` list of your response:
+
+```json
+"confirmations": [
+  {"anchor": "src/module.py:42", "status": "confirmed_fixed",
+   "note": "the lock is now taken before the read"},
+  {"anchor": "src/other.py:7", "status": "still_open",
+   "note": "the error path still returns before the cleanup"}
+]
+```
+
+- `anchor` is the earlier finding's `path:line`, exactly as it appears in
+  the rounds above (a finding with no line uses `path:0`).
+- `status` is `"confirmed_fixed"` or `"still_open"`.
+- `note` is your one-sentence reason, which is what the reply says.
+- A `still_open` verdict carries that finding into the next fix round on
+  its own — you do not need to re-file it in `findings`, and `summary` must
+  not restate it either. `findings` is for problems **no earlier round
+  raised**; `summary` is the overall call plus anything genuinely new.
+
+A finding you leave out of `confirmations` is treated as closed.
+
 ## Standing user guidance
 
 $user_guidance
@@ -155,6 +181,9 @@ Respond with exactly one fenced JSON block:
       "body": "what is wrong here and what would fix it",
       "severity": "major"
     }
+  ],
+  "confirmations": [
+    {"anchor": "src/older.py:7", "status": "still_open", "note": "why"}
   ]
 }
 ```
@@ -169,6 +198,9 @@ Respond with exactly one fenced JSON block:
   root.
 - If the PR is fine, `approve` with a summary saying why and an empty
   `findings` list — a clean review is a valid result.
+- `confirmations` is your anchor-keyed verdict on each carried-over finding
+  (see "Earlier rounds"); omit it or leave it empty in the first round,
+  where there is nothing carried over.
 
 Respond with ONLY the fenced JSON block — no prose before or after it.
 $retry_context

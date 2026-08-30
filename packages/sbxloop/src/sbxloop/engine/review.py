@@ -22,7 +22,7 @@ same findings run after run.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -84,6 +84,38 @@ class ReviewFinding(_Model):
         return ReviewComment(path=self.path, line=self.line, body=f"[{self.severity}] {self.body}")
 
 
+CarriedStatus = Literal["confirmed_fixed", "still_open"]
+
+
+class CarriedVerdict(_Model):
+    """Round *n+1*'s verdict on one finding an earlier round raised.
+
+    Keyed by the earlier finding's ``path:line`` anchor, which is how the
+    engine finds the thread that finding opened: the verdict is posted as a
+    reply *there* rather than restated in a new review body (#520 step 4).
+    """
+
+    anchor: str
+    status: CarriedStatus
+    note: str = ""
+
+    @property
+    def fixed(self) -> bool:
+        return self.status == "confirmed_fixed"
+
+    def finding(self, severity: Severity = "major") -> ReviewFinding:
+        """The still-open carried finding this verdict stands for, so a
+        round that only confirms old problems still drives a fix round."""
+        path, _, tail = self.anchor.rpartition(":")
+        line = int(tail) if path and tail.isdigit() and int(tail) > 0 else None
+        return ReviewFinding(
+            path=path if line is not None else self.anchor,
+            line=line,
+            body=self.note.strip() or "still open after the fix round.",
+            severity=severity,
+        )
+
+
 class ReviewVerdict(_Model):
     """REVIEW's output: the call on the PR, in the reviewer's words and as
     anchored findings."""
@@ -91,18 +123,34 @@ class ReviewVerdict(_Model):
     verdict: Verdict
     summary: str
     findings: list[ReviewFinding] = Field(default_factory=list)
+    # Round n+1 only: the verdict on each carried-over finding, keyed by its
+    # anchor. Posted in that finding's thread, never in this review's body.
+    confirmations: list[CarriedVerdict] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check(self) -> ReviewVerdict:
         if not self.summary.strip():
             raise ValueError("`summary` must say what the reviewer looked at and concluded")
-        if self.verdict == "request_changes" and not any(f.blocking for f in self.findings):
+        if (
+            self.verdict == "request_changes"
+            and not any(f.blocking for f in self.findings)
+            and not self.still_open
+        ):
             raise ValueError(
                 "`request_changes` needs at least one finding of severity `blocking` "
                 "or `major`; minor findings and nits do not block a pull request — "
                 "either raise the severity of a real problem or `approve`"
             )
         return self
+
+    @property
+    def still_open(self) -> list[CarriedVerdict]:
+        """Carried-over findings this round says are *not* fixed."""
+        return [c for c in self.confirmations if not c.fixed]
+
+    @property
+    def confirmed_fixed(self) -> list[CarriedVerdict]:
+        return [c for c in self.confirmations if c.fixed]
 
     @property
     def blocking(self) -> list[ReviewFinding]:
@@ -116,6 +164,26 @@ class ReviewVerdict(_Model):
         anchored = [c for c in (f.comment() for f in self.findings) if c is not None]
         return anchored[:MAX_INLINE_COMMENTS]
 
+    def carried_forward(self, prior: Mapping[str, ReviewFinding]) -> list[ReviewFinding]:
+        """The still-open carried findings, as findings a fix round can act on.
+
+        The earlier round's finding is reused when it is known (its severity
+        and its own words are the record); the reviewer's note is appended so
+        the fixer sees why the previous attempt did not settle it.
+        """
+        out: list[ReviewFinding] = []
+        for carried in self.still_open:
+            note = " ".join(carried.note.split()).strip()
+            original = prior.get(carried.anchor)
+            if original is None:
+                out.append(carried.finding())
+                continue
+            body = original.body.rstrip()
+            if note:
+                body = f"{body}\n\nStill open after the fix round: {note}"
+            out.append(original.model_copy(update={"body": body}))
+        return out
+
 
 class ReviewRound(NamedTuple):
     """One earlier round: what the reviewer found and what the fixer said."""
@@ -125,6 +193,60 @@ class ReviewRound(NamedTuple):
     # The fix task's build report — where the fixer lists, per finding,
     # `addressed` or `refuted: <reason>`. Empty when no fix ran.
     response: str
+
+
+def prior_findings(rounds: Sequence[ReviewRound]) -> dict[str, ReviewFinding]:
+    """Every earlier round's findings by anchor — the carried-over set.
+
+    A later round's wording wins for the same anchor: it is the most recent
+    statement of the same problem.
+    """
+    out: dict[str, ReviewFinding] = {}
+    for entry in rounds:
+        for finding in entry.verdict.findings:
+            out[finding.anchor] = finding
+    return out
+
+
+def split_carried(
+    verdict: ReviewVerdict, prior: Mapping[str, ReviewFinding]
+) -> tuple[ReviewVerdict, list[CarriedVerdict]]:
+    """Separate round *n+1*'s word on old findings from its genuinely new ones.
+
+    Two things land in the carried set: the reviewer's own ``confirmations``
+    (anchor-keyed, as ``prompts/review.md`` asks for), and any finding it
+    filed on an anchor an earlier round already raised — that is a restated
+    carried finding, and it belongs in the existing thread, not in a fresh
+    review body. Findings on anchors nobody raised before are left alone, so
+    a first-round review (empty ``prior``) is returned untouched.
+    """
+    if not prior:
+        return verdict, []
+    carried: dict[str, CarriedVerdict] = {}
+    for item in verdict.confirmations:
+        if item.anchor in prior:
+            carried[item.anchor] = item
+    fresh: list[ReviewFinding] = []
+    for finding in verdict.findings:
+        if finding.anchor not in prior:
+            fresh.append(finding)
+            continue
+        # A restated old finding is by definition still open.
+        existing = carried.get(finding.anchor)
+        note = finding.body.strip()
+        if existing is not None and existing.fixed:
+            # The reviewer both confirmed it fixed and re-filed it; the
+            # re-filing is the more specific claim, so it wins.
+            carried[finding.anchor] = CarriedVerdict(
+                anchor=finding.anchor, status="still_open", note=note
+            )
+        elif existing is None:
+            carried[finding.anchor] = CarriedVerdict(
+                anchor=finding.anchor, status="still_open", note=note
+            )
+    ordered = [carried[a] for a in dict.fromkeys(list(carried))]
+    body_verdict = verdict.model_copy(update={"findings": fresh, "confirmations": ordered})
+    return body_verdict, ordered
 
 
 def review_body(verdict: ReviewVerdict, *, run_id: str, round: int, anchored: bool = True) -> str:
@@ -161,27 +283,157 @@ def review_body(verdict: ReviewVerdict, *, run_id: str, round: int, anchored: bo
 
 
 _REFUTED_LINE = re.compile(r"refut", re.IGNORECASE)
+_ADDRESSED_LINE = re.compile(r"address", re.IGNORECASE)
+# Leading list markers/emphasis the fixer's report often wraps the line in.
+_LEAD = re.compile(r"^[\s>*_`-]+")
+# The separator between the anchor and the note: em dash, en dash, ASCII
+# hyphen, or a colon — the brief asks for an em dash, models write all four.
+_SEP = re.compile(r"\s*[\u2014\u2013:-]+\s*")
+
+ReconcileStatus = Literal["addressed", "refuted", "unanswered"]
+
+
+class Reconciliation(NamedTuple):
+    """What the fixer said about one finding: its status and its own words."""
+
+    status: ReconcileStatus
+    note: str
+
+
+def _note_after(line: str, *, path: str, anchor: str) -> str:
+    """The fixer's 'what changed' / 'why' from one report line.
+
+    Everything after the anchor (or, failing that, after the status word),
+    with the separator and any list decoration stripped. Prose lines that
+    carry no note at all yield "".
+    """
+    text = _LEAD.sub("", line.strip()).rstrip()
+    lowered = text.lower()
+    cut = -1
+    for token in (anchor, path):
+        idx = lowered.find(token.lower())
+        if idx >= 0:
+            cut = max(cut, idx + len(token))
+    if cut < 0:
+        match = _REFUTED_LINE.search(text) or _ADDRESSED_LINE.search(text)
+        cut = match.end() if match else 0
+    rest = text[cut:]
+    rest = re.sub(r"^[`'\"\s]+", "", rest)
+    return _SEP.sub("", rest, count=1).strip(" `'\".") if _SEP.match(rest) else rest.strip(" `'\".")
+
+
+def _names(line: str, finding: ReviewFinding) -> bool:
+    """Does this report line name the finding?
+
+    An exact ``path:line`` anchor wins; otherwise the path alone is enough —
+    a loose match on purpose: the cost of a miss is one more review turn,
+    the cost of a false positive is a reviewer forced to restate a real
+    problem, and both are bounded.
+    """
+    return _names_path(line, finding.path, finding.line)
+
+
+def _names_path(line: str, path: str, lineno: int | None) -> bool:
+    if not path:
+        return False
+    if lineno is not None and f"{path}:{lineno}" in line:
+        return True
+    if path not in line:
+        return False
+    # Another finding on the same path claimed this line by exact anchor.
+    return not re.search(re.escape(path) + r":\d+", line)
+
+
+def _status_lines(report: str) -> tuple[list[str], list[str]]:
+    """The report's ``refuted`` and ``addressed`` lines, in that order."""
+    refuted: list[str] = []
+    addressed: list[str] = []
+    for line in report.splitlines():
+        if not line.strip():
+            continue
+        if _REFUTED_LINE.search(line):
+            refuted.append(line)
+        elif _ADDRESSED_LINE.search(line):
+            addressed.append(line)
+    return refuted, addressed
+
+
+def reconcile_anchor(report: str, anchor: str) -> Reconciliation:
+    """The fixer's answer to one ``path:line`` (or bare ``path``) anchor.
+
+    The same parsing :func:`reconcile` does per finding, exposed for
+    objections that are not findings of a review round — a human's inline
+    review comment, most of all (#520). An anchor no line names, and an
+    empty anchor (a review *body* objection, which has no path at all), come
+    back ``unanswered`` unless the report is a single overall statement; the
+    caller decides what to do with that.
+    """
+    path, _, tail = anchor.rpartition(":")
+    if not path:
+        path, lineno = anchor, None
+    else:
+        lineno = int(tail) if tail.isdigit() else None
+        if lineno is None:
+            path = anchor
+    refuted, addressed = _status_lines(report)
+    for status, lines in (("refuted", refuted), ("addressed", addressed)):
+        hit = next((line for line in lines if _names_path(line, path, lineno)), None)
+        if hit is not None:
+            return Reconciliation(
+                status,  # type: ignore[arg-type]
+                _note_after(hit, path=path, anchor=anchor),
+            )
+    return Reconciliation("unanswered", "")
+
+
+def reconcile(round: ReviewRound) -> dict[str, Reconciliation]:
+    """Per-finding reconciliation of one review round against the fixer's
+    report — ``addressed`` / ``refuted`` / ``unanswered``, with the note.
+
+    The fixer's report is prose; ``fix_brief`` asks it to end with one line
+    per finding in the form ``addressed: <path:line> — what changed`` or
+    ``refuted: <path:line> — why``. Parsing tolerates the dash variants,
+    stray whitespace, list markers and case; lines naming anchors that are
+    not findings of this round are ignored. A finding no line names is
+    ``unanswered`` — the round said nothing about it, which is not the same
+    as leaving it alone deliberately.
+    """
+    refuted_lines, addressed_lines = _status_lines(round.response)
+    out: dict[str, Reconciliation] = {}
+    for f in round.verdict.findings:
+        for status, lines in (("refuted", refuted_lines), ("addressed", addressed_lines)):
+            hit = next((line for line in lines if _names(line, f)), None)
+            if hit is not None:
+                out[f.anchor] = Reconciliation(
+                    status,  # type: ignore[arg-type]
+                    _note_after(hit, path=f.path, anchor=f.anchor),
+                )
+                break
+        else:
+            out[f.anchor] = Reconciliation("unanswered", "")
+    return out
+
+
+def reconcile_rounds(rounds: Sequence[ReviewRound]) -> dict[str, Reconciliation]:
+    """:func:`reconcile` across rounds; a later round's word wins, except
+    that an ``unanswered`` never overwrites a status already given."""
+    out: dict[str, Reconciliation] = {}
+    for entry in rounds:
+        for anchor, item in reconcile(entry).items():
+            if item.status == "unanswered" and anchor in out:
+                continue
+            out[anchor] = item
+    return out
 
 
 def refuted_anchors(rounds: Sequence[ReviewRound]) -> set[str]:
-    """Anchors of findings the fixer refuted in an earlier round.
-
-    The fixer's report is prose; the brief asks it to end with one line per
-    finding saying ``addressed`` or ``refuted: <reason>``. A finding counts
-    as refuted when a line of the response mentions refuting and names the
-    finding's path — a loose match on purpose: the cost of a miss is one
-    more review turn, the cost of a false positive is a reviewer forced to
-    restate a real problem, and both are bounded.
-    """
-    refuted: set[str] = set()
-    for entry in rounds:
-        lines = [line for line in entry.response.splitlines() if _REFUTED_LINE.search(line)]
-        if not lines:
-            continue
-        for finding in entry.verdict.findings:
-            if any(finding.path in line for line in lines):
-                refuted.add(finding.anchor)
-    return refuted
+    """Anchors of findings the fixer refuted in an earlier round."""
+    return {
+        anchor
+        for entry in rounds
+        for anchor, item in reconcile(entry).items()
+        if item.status == "refuted"
+    }
 
 
 def render_review_history(rounds: Sequence[ReviewRound]) -> str:

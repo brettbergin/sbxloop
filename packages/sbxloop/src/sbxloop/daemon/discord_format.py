@@ -1235,6 +1235,18 @@ def format_for_discord(
         if data.get("url"):
             text += f" · {link('review', data['url'])}"
         return [line(text, flush=True)]
+    if t == HostEventTypes.REVIEW_RECONCILED:
+        parts = [
+            f"{data.get('addressed', 0)} addressed",
+            f"{data.get('refuted', 0)} refuted",
+            f"{data.get('unanswered', 0)} unanswered",
+        ]
+        text = f"🧾 reconciled round {data.get('round')}: " + " · ".join(parts)
+        replied, resolved = data.get("replied", 0), data.get("resolved", 0)
+        text += f" · {replied} repl(ies), {resolved} thread(s) resolved"
+        if data.get("comment_url"):
+            text += f" · {link('body-only', data['comment_url'])}"
+        return [line(text, flush=True)]
     if t == HostEventTypes.FIX_ROUND:
         why = _one_line(data.get("why") or "", 200)
         return [

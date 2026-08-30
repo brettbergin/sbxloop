@@ -10,6 +10,7 @@ then the merge — with 405 an answer (Blocked) and 409 a race (re-judge).
 
 from __future__ import annotations
 
+from collections.abc import Container
 from typing import Any
 
 import pytest
@@ -23,6 +24,7 @@ from sbxloop.engine.landing import (
     NeedsFix,
     UpdateState,
     human_objection,
+    human_objections,
     land,
     poll_checks,
 )
@@ -37,6 +39,7 @@ from tests.fakes.fake_github import (
     RED,
     STALE_409,
     FakeGithub,
+    human_comment,
     human_review,
 )
 
@@ -189,6 +192,38 @@ class TestHumanObjection:
         assert human_objection(fake, REPO, 7, login=LOGIN) is False
 
 
+class TestHumanObjections:
+    """Each thing a human asked for, as something the loop can answer."""
+
+    def test_the_review_body_and_each_inline_comment_are_objections(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "rename foo", id=41)]
+        fake.comments_payload = [
+            human_comment("alice", "and this", path="a.py", line=3, id=91),
+            human_comment("bob", "nit from a non-objector", path="b.py", line=1, id=92),
+        ]
+        found = human_objections(fake, REPO, 7, login=LOGIN)
+        assert [(o.key, o.anchor, o.comment_id) for o in found] == [
+            ("human:review:41", "", None),
+            ("human:comment:91", "a.py:3", 91),
+        ]
+        assert found[0].body == "rename foo"
+
+    def test_nothing_stands_when_the_objection_was_cleared(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review("alice", "CHANGES_REQUESTED", "no", id=1),
+            human_review("alice", "APPROVED", "ok now", id=2),
+        ]
+        fake.comments_payload = [human_comment("alice", "old", path="a.py", line=3, id=91)]
+        assert human_objections(fake, REPO, 7, login=LOGIN) == []
+
+    def test_the_loops_own_review_is_not_an_objection(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(LOGIN, "CHANGES_REQUESTED", "ours", id=1)]
+        assert human_objections(fake, REPO, 7, login=LOGIN) == []
+
+
 class Landing:
     """One ``land`` call with its bookkeeping in reach."""
 
@@ -200,7 +235,14 @@ class Landing:
         self.update = UpdateState()
         self.persisted: list[tuple[int, str | None]] = []
 
-    def run(self, *, branch: str | None = "sbxloop/r1", login: str = LOGIN) -> Any:
+    def run(
+        self,
+        *,
+        branch: str | None = "sbxloop/r1",
+        login: str = LOGIN,
+        answered: Container[str] = frozenset(),
+        review_posted: bool = True,
+    ) -> Any:
         return land(
             self.fake,
             REPO,
@@ -214,6 +256,8 @@ class Landing:
             tick=self.rec.tick,
             emit=self.rec.emit,
             clock=self.clock,
+            answered=answered,
+            review_posted=review_posted,
         )
 
 
@@ -289,12 +333,40 @@ class TestLand:
         fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "rename foo")]
         fake.feedback = "rename foo\n\n- `a.py:3`: and this"
         outcome = Landing(fake).run()
-        assert outcome == NeedsFix(
-            "human",
-            "a reviewer requested changes on the pull request",
-            objections=fake.feedback,
-        )
+        assert isinstance(outcome, NeedsFix)
+        assert outcome.kind == "human"
+        assert outcome.why == "a reviewer requested changes on the pull request"
+        assert outcome.objections == fake.feedback
+        assert [o.login for o in outcome.human] == ["alice"]
         assert fake.merges == []
+
+    def test_an_already_answered_objection_does_not_buy_another_fix_round(self) -> None:
+        """Only its author can dismiss a CHANGES_REQUESTED, so the same
+        review stands on the next landing pass. Once every objection in it
+        has a loop reply, the run hands over rather than re-fixing (#520)."""
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "rename foo", id=41)]
+        fake.comments_payload = [
+            human_comment("alice", "and this", path="a.py", line=3, id=91),
+        ]
+        landing = Landing(fake)
+        first = landing.run()
+        assert isinstance(first, NeedsFix)
+        answered = {o.key for o in first.human}
+        assert answered == {"human:review:41", "human:comment:91"}
+
+        outcome = Landing(fake).run(answered=answered)
+        assert isinstance(outcome, Blocked)
+        assert "still standing" in outcome.why
+        assert fake.merges == []
+
+    def test_a_partly_answered_objection_still_fixes_the_rest(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "rename foo", id=41)]
+        fake.comments_payload = [human_comment("alice", "and this", path="a.py", line=3, id=91)]
+        outcome = Landing(fake).run(answered={"human:review:41"})
+        assert isinstance(outcome, NeedsFix)
+        assert [o.key for o in outcome.human] == ["human:comment:91"]
 
     def test_the_loops_own_request_changes_does_not_block_itself(self) -> None:
         fake = FakeGithub()

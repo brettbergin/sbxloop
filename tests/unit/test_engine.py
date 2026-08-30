@@ -1405,6 +1405,117 @@ class TestPipeline:
         rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "review"]
         assert [r["attempt"] for r in rows] == [1, 2]
 
+    def test_fix_round_reconciliation_is_persisted_and_survives_reopen(
+        self, harness: Harness
+    ) -> None:
+        """The fixer's per-finding answer is parsed once and kept on the fix
+        round's build row, so a resumed run can still reply on the PR."""
+        fake = FakeGithub()
+        refute = {"text": "Left as is.\n\nrefuted: hello.txt:1 — the greeting is specified as hi"}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, refute, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+
+        reopened = StateStore(harness.state_dir / "state.db")
+        rows = [
+            r
+            for r in reopened.phase_attempts(result.run_id)
+            if r["phase"] == "build" and r["task_id"] == "fix-1"
+        ]
+        assert rows
+        assert json.loads(rows[-1]["output_json"])["reconciled"] == [
+            {
+                "anchor": "hello.txt:1",
+                "status": "refuted",
+                "note": "the greeting is specified as hi",
+            }
+        ]
+        t1 = [
+            r
+            for r in reopened.phase_attempts(result.run_id)
+            if r["phase"] == "build" and r["task_id"] == "t1"
+        ]
+        assert "reconciled" not in json.loads(t1[-1]["output_json"])
+
+    def test_reconciliation_replies_and_resolves_before_the_next_review(
+        self, harness: Harness
+    ) -> None:
+        """Between the fix round's re-delivery and round 2, the round-1
+        finding's own thread gets the loop's answer and is resolved."""
+        fake = FakeGithub()
+        fixed = {
+            "text": "Greeting corrected.\n\naddressed: hello.txt:1 — say hello, not hi",
+            "files": {"hello.txt": "hello\n"},
+        }
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, fixed, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+
+        assert len(fake.replies) == 1
+        _, body = fake.replies[0]
+        assert body.startswith("**addressed in commit2**: say hello, not hi")
+        assert f"sbxloop:reconciled run={result.run_id} round=1" in body
+        assert fake.resolved and all(t.is_resolved for t in fake.threads)
+        assert fake.issue_comments == []
+
+        (event,) = self._events(harness, HostEventTypes.REVIEW_RECONCILED)
+        assert event.data["round"] == 1
+        assert (event.data["addressed"], event.data["refuted"], event.data["unanswered"]) == (
+            1,
+            0,
+            0,
+        )
+        assert (event.data["replied"], event.data["resolved"]) == (1, 1)
+        assert engine.store.reconciliations(result.run_id, 1) == {"hello.txt:1": "addressed"}
+
+    def test_reconciliation_is_not_repeated_on_a_later_delivery(self, harness: Harness) -> None:
+        """Round 1 is answered once; the third delivery adds no second reply."""
+        fake = FakeGithub()
+        refute = {"text": "Left as is.\n\nrefuted: hello.txt:1 — the greeting is specified as hi"}
+        harness.script(
+            [taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, refute, REVIEW_RC, REVIEW_OK]
+        )
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        # Round 1's finding: one reply, refuted, thread left open.
+        assert len(fake.replies) == 1
+        assert fake.replies[0][1].startswith("**refuted**: the greeting is specified as hi")
+        assert fake.resolved == []
+        assert not any(t.is_resolved for t in fake.threads)
+
+    def test_posted_review_threads_are_persisted_and_read_back_after_reopen(
+        self, harness: Harness
+    ) -> None:
+        """Each review round stores the review id and where every finding
+        landed, so a resumed run reconstructs thread identity from the store
+        with no GitHub call."""
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+
+        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "review"]
+        first = json.loads(rows[0]["output_json"])
+        assert first["review"]["id"] is not None
+        assert [p["anchor"] for p in first["posted"]] == ["hello.txt:1"]
+
+        reopened = StateStore(harness.state_dir / "state.db")
+        try:
+            posted = reopened.posted_findings(result.run_id)
+        finally:
+            reopened.close()
+        assert [(p.round, p.anchor, p.body_only) for p in posted] == [(1, "hello.txt:1", False)]
+        (only,) = posted
+        assert only.comment_id is not None and only.thread_node_id is not None
+        assert (only.comment_id, only.thread_node_id) == (
+            fake.threads[0].root_comment_id,
+            fake.threads[0].node_id,
+        )
+
     def test_delivery_opens_one_draft_pr_and_refreshes_it(self, harness: Harness) -> None:
         fake = FakeGithub()
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_OK])
@@ -1424,12 +1535,17 @@ class TestPipeline:
         patches = [p for m, p, _ in fake.raw_calls if m == "PATCH"]
         assert patches == [f"/repos/o/r/git/refs/heads/sbxloop/{result.run_id}"]
 
-    def test_the_review_still_counts_when_github_refuses_the_post(self, harness: Harness) -> None:
+    def test_a_refused_review_post_blocks_the_merge(self, harness: Harness) -> None:
+        """#503, now gated: the review 422'd, so there is no review record on
+        the PR — the verdict still counts in the run, but the loop refuses to
+        merge a pull request nobody can read a review on (#520 step 5)."""
         fake = FakeGithub()
         fake.fail_once["pr_review_create"] = GithubOpsError("reviews closed", http_status=422)
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
         result = harness.pipeline(fake).start("ship hello")
-        assert result.state == "merged"
+        assert result.state == "blocked"
+        assert result.reason == "review record could not be posted"
+        assert fake.merges == []
         (verdict,) = self._events(harness, HostEventTypes.REVIEW_VERDICT)
         assert verdict.data["verdict"] == "approve" and verdict.data["url"] == ""
 

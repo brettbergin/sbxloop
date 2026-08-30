@@ -39,10 +39,14 @@ from sbxloop.gh.ops import (
     FailedCheck,
     GithubOps,
     MergeOutcome,
+    PostedFinding,
     PrRef,
     ReviewComment,
     ReviewEvent,
+    ReviewThread,
     SubmittedReview,
+    ThreadComment,
+    anchor_of,
 )
 
 GREEN = ChecksVerdict("green", 1, (), ())
@@ -55,9 +59,18 @@ BLOCKED_405 = MergeOutcome(False, "", "Pull Request is not mergeable (HTTP 405)"
 STALE_409 = MergeOutcome(False, "", "Head branch was modified (HTTP 409)", stale=True)
 
 
-def human_review(login: str, state: str, body: str = "") -> dict[str, Any]:
+def human_review(
+    login: str, state: str, body: str = "", *, id: int | None = None
+) -> dict[str, Any]:
     """One entry of the reviews payload, as GitHub shapes it."""
-    return {"user": {"login": login}, "state": state, "body": body}
+    return {"user": {"login": login}, "state": state, "body": body, "id": id}
+
+
+def human_comment(
+    login: str, body: str, *, path: str = "", line: int | None = None, id: int | None = None
+) -> dict[str, Any]:
+    """One entry of the pull request review comments payload."""
+    return {"user": {"login": login}, "body": body, "path": path, "line": line, "id": id}
 
 
 class FakeGithub(GithubOps):
@@ -104,6 +117,11 @@ class FakeGithub(GithubOps):
         self.branches: set[str] = set()
         self.pr_created = False
         self.pr_create_calls = 0
+        self.threads: list[ReviewThread] = []
+        self.replies: list[tuple[int, str]] = []
+        self.issue_comments: list[str] = []
+        self.resolved: list[str] = []
+        self._comment_id = 0
         self._commits = 0
         self._blobs = 0
         self._updates = 0
@@ -262,7 +280,55 @@ class FakeGithub(GithubOps):
             )
         self.reviews.append((event, body, list(comments)))
         url = f"{self.pr['html_url']}#pullrequestreview-{len(self.reviews)}"
-        return SubmittedReview(url, event)
+        review_id = len(self.reviews)
+        posted: list[PostedFinding] = []
+        for comment in comments:
+            self._comment_id += 1
+            node_id = f"PRRT_{self._comment_id}"
+            self.threads.append(
+                ReviewThread(
+                    node_id=node_id,
+                    is_resolved=False,
+                    path=comment.path,
+                    line=comment.line,
+                    comments=(ThreadComment(self._comment_id, self.user_login, comment.body),),
+                )
+            )
+            posted.append(PostedFinding(anchor_of(comment), self._comment_id, node_id))
+        return SubmittedReview(url, event, review_id, tuple(posted))
+
+    def pr_review_threads(self, repo: str, number: int) -> list[ReviewThread]:
+        self._maybe_fail("pr_review_threads")
+        return list(self.threads)
+
+    def pr_comment_reply(self, repo: str, number: int, comment_id: int, body: str) -> str:
+        self.replies.append((comment_id, body))
+        self._maybe_fail("pr_comment_reply")
+        for index, thread in enumerate(self.threads):
+            if thread.root_comment_id == comment_id:
+                self._comment_id += 1
+                self.threads[index] = thread._replace(
+                    comments=(
+                        *thread.comments,
+                        ThreadComment(self._comment_id, self.user_login, body),
+                    )
+                )
+                break
+        return f"{self.pr['html_url']}#discussion_r{comment_id}"
+
+    def pr_issue_comment(self, repo: str, number: int, body: str) -> str:
+        self.issue_comments.append(body)
+        self._maybe_fail("pr_issue_comment")
+        return f"{self.pr['html_url']}#issuecomment-{len(self.issue_comments)}"
+
+    def resolve_review_thread(self, thread_node_id: str) -> bool:
+        self.resolved.append(thread_node_id)
+        self._maybe_fail("resolve_review_thread")
+        for index, thread in enumerate(self.threads):
+            if thread.node_id == thread_node_id:
+                self.threads[index] = thread._replace(is_resolved=True)
+                return True
+        return False
 
     def pr_ready_for_review(self, node_id: str) -> bool:
         self.ready_calls.append(node_id)

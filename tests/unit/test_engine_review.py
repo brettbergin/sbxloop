@@ -17,6 +17,8 @@ from sbxloop.engine.review import (
     fix_brief,
     fix_task,
     is_fix_task,
+    reconcile,
+    reconcile_rounds,
     refuted_anchors,
     render_review_history,
     review_body,
@@ -139,6 +141,82 @@ class TestRefutedAnchors:
             ),
         ]
         assert refuted_anchors(rounds) == {"src/app.py:12", "b.py:1"}
+
+
+class TestReconcile:
+    def test_addressed_refuted_and_unanswered_with_notes(self) -> None:
+        verdict = request_changes(
+            finding(),
+            finding(path="src/db.py", line=3),
+            finding(path="src/net.py", line=9),
+        )
+        round = ReviewRound(
+            1,
+            verdict,
+            "Summary of the fix.\n\n"
+            "addressed: src/app.py:12 — moved the write under the lock\n"
+            "refuted: src/db.py:3 — the connection is per-thread, no race",
+        )
+        assert reconcile(round) == {
+            "src/app.py:12": ("addressed", "moved the write under the lock"),
+            "src/db.py:3": ("refuted", "the connection is per-thread, no race"),
+            "src/net.py:9": ("unanswered", ""),
+        }
+
+    def test_dash_variants_case_and_list_markers(self) -> None:
+        verdict = request_changes(
+            finding(),
+            finding(path="src/db.py", line=3),
+            finding(path="src/net.py", line=9),
+        )
+        round = ReviewRound(
+            1,
+            verdict,
+            "- **Addressed**: `src/app.py:12` - swapped the order\n"
+            "  * REFUTED:   src/db.py:3   \u2013 by design\n"
+            "addressed: src/net.py:9: added the timeout\n",
+        )
+        assert reconcile(round) == {
+            "src/app.py:12": ("addressed", "swapped the order"),
+            "src/db.py:3": ("refuted", "by design"),
+            "src/net.py:9": ("addressed", "added the timeout"),
+        }
+
+    def test_unknown_anchors_and_malformed_lines_are_ignored(self) -> None:
+        verdict = request_changes(finding(), finding(path="src/db.py", line=3))
+        round = ReviewRound(
+            1,
+            verdict,
+            "addressed: other/file.py:99 — not a finding of this round\n"
+            "refuted\n"
+            "   \n"
+            "some prose that names nothing\n"
+            "addressed: src/app.py:12\n",
+        )
+        assert reconcile(round) == {
+            "src/app.py:12": ("addressed", ""),
+            "src/db.py:3": ("unanswered", ""),
+        }
+
+    def test_empty_response_leaves_every_finding_unanswered(self) -> None:
+        assert reconcile(ReviewRound(1, request_changes(finding()), "")) == {
+            "src/app.py:12": ("unanswered", "")
+        }
+
+    def test_refutation_wins_over_an_addressed_line_for_the_same_anchor(self) -> None:
+        round = ReviewRound(
+            1,
+            request_changes(finding()),
+            "addressed: src/app.py:12 — touched it\nrefuted: src/app.py:12 — actually fine",
+        )
+        assert reconcile(round)["src/app.py:12"] == ("refuted", "actually fine")
+
+    def test_reconcile_rounds_merges_and_keeps_answers_over_silence(self) -> None:
+        rounds = [
+            ReviewRound(1, request_changes(finding()), "refuted: src/app.py:12 — not a bug"),
+            ReviewRound(2, request_changes(finding()), "the fixer said nothing useful"),
+        ]
+        assert reconcile_rounds(rounds) == {"src/app.py:12": ("refuted", "not a bug")}
 
 
 class TestRenderReviewHistory:

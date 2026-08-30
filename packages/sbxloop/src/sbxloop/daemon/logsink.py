@@ -52,6 +52,7 @@ INFO_TYPES: frozenset[str] = frozenset(
         HostEventTypes.RUN_ARTIFACTS,
         HostEventTypes.RUN_DELIVER,
         HostEventTypes.REVIEW_VERDICT,
+        HostEventTypes.REVIEW_RECONCILED,
         HostEventTypes.FIX_ROUND,
         HostEventTypes.CI_STATUS,
         HostEventTypes.LAND_UNDRAFT,
