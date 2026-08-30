@@ -190,8 +190,13 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   adversarially (concurrency, failure ordering, trust-boundary parsing,
   cross-module invariants, scope) and returns a verdict with line-anchored
   findings. The verdict is the run's own and is authoritative; it is also
-  posted to the PR for the record (as a `COMMENT` review when GitHub
-  refuses the loop's identity as a reviewer of its own PR).
+  posted to the PR for the record — as PR comments when the loop authored
+  the PR (single-identity mode, #513: one review comment per anchored
+  finding, refused anchors degraded per finding, and the verdict in words
+  in a top-level comment; GitHub refuses `REQUEST_CHANGES`/`APPROVE` from
+  an author, so the review feature is not asked), and as an
+  `APPROVE`/`REQUEST_CHANGES` review (`COMMENT` fallback) when a distinct
+  identity reviews.
 - **FIX** — one seeded task (`fix-N`), built and verified like any other
   under the same revision/replan budgets, whose exam is the union of the
   decomposer's verify commands plus the gate. Then back to GATE. Every

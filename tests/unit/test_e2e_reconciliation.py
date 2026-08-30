@@ -177,7 +177,9 @@ class TestTwoRoundRunIsReconciledOnThePr:
         assert comments == []
         assert "must greet with hello" not in body
         assert "not documented anywhere" not in body
-        assert body.startswith("the carried-over findings are settled")
+        assert body.startswith(
+            "**Review verdict: approve** (round 2)\n\nthe carried-over findings are settled"
+        )
 
     # -- step 3: the event, with its counts ----------------------------------
 

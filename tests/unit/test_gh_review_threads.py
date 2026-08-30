@@ -8,7 +8,7 @@ both the captured mapping and the exact request shapes.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -23,6 +23,7 @@ from sbxloop.gh.ops import (
     anchor_of,
     fold_review_threads,
 )
+from tests.fakes.github_errors import github_error
 
 REPO = "o/r"
 PR = 7
@@ -371,3 +372,89 @@ class TestFakeGithubModelsThreads:
         comment = ThreadComment(1, "someone", "body")
         thread = ReviewThread("n", False, "a.py", 1, (comment,))
         assert thread.comments[0].login == "someone"
+
+
+class SequencedOps(RawOps):
+    """RawOps whose route answers may be lists, consumed one call at a time
+    — the per-comment POSTs of the single-identity review hit one path."""
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        answer = self.routes.get((method, path))
+        if isinstance(answer, list) and answer and not isinstance(answer[0], dict | Exception):
+            return super().raw(method, path, body)
+        if isinstance(answer, list):
+            self.calls.append((method, path, body))
+            nxt = answer.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+        return super().raw(method, path, body)
+
+
+class TestReviewComments:
+    """`pr_review_comments_create` (#513): one review comment per finding,
+    refused anchors degraded per finding, thread ids looked up once."""
+
+    COMMENTS: ClassVar[list[ReviewComment]] = [
+        ReviewComment(path="a.py", line=10, body="[major] one"),
+        ReviewComment(path="b.py", line=3, body="[major] two"),
+    ]
+
+    def test_each_finding_becomes_its_own_thread(self) -> None:
+        ops = SequencedOps(
+            {
+                ("POST", f"/repos/{REPO}/pulls/{PR}/comments"): [
+                    {"id": 101, "html_url": "u1"},
+                    {"id": 102, "html_url": "u2"},
+                ],
+                ("POST", "/graphql"): threads_payload(
+                    thread_node("PRRT_1", "a.py", 10, 101), thread_node("PRRT_2", "b.py", 3, 102)
+                ),
+            }
+        )
+        posted = ops.pr_review_comments_create(REPO, PR, self.COMMENTS, commit_id="sha9")
+        assert posted == (
+            PostedFinding("a.py:10", 101, "PRRT_1"),
+            PostedFinding("b.py:3", 102, "PRRT_2"),
+        )
+        bodies = [c[2] for c in ops.calls if c[1].endswith("/comments")]
+        assert bodies[0] == {
+            "body": "[major] one",
+            "commit_id": "sha9",
+            "path": "a.py",
+            "line": 10,
+            "side": "RIGHT",
+        }
+        assert not any(c[1].endswith("/reviews") for c in ops.calls), "no review-feature call"
+        assert sum(1 for c in ops.calls if c[1] == "/graphql") == 1, "threads looked up once"
+
+    def test_a_refused_anchor_fails_only_its_own_comment(self) -> None:
+        ops = SequencedOps(
+            {
+                ("POST", f"/repos/{REPO}/pulls/{PR}/comments"): [
+                    github_error("review_line_unresolved_422"),
+                    {"id": 102, "html_url": "u2"},
+                ],
+                ("POST", "/graphql"): threads_payload(thread_node("PRRT_2", "b.py", 3, 102)),
+            }
+        )
+        posted = ops.pr_review_comments_create(REPO, PR, self.COMMENTS, commit_id="sha9")
+        assert posted == (
+            PostedFinding("a.py:10", None, None),
+            PostedFinding("b.py:3", 102, "PRRT_2"),
+        )
+
+    def test_a_failed_thread_lookup_keeps_the_comment_ids(self) -> None:
+        ops = SequencedOps(
+            {
+                ("POST", f"/repos/{REPO}/pulls/{PR}/comments"): [{"id": 101, "html_url": "u1"}],
+                ("POST", "/graphql"): GithubOpsError("graphql down"),
+            }
+        )
+        posted = ops.pr_review_comments_create(REPO, PR, self.COMMENTS[:1], commit_id="sha9")
+        assert posted == (PostedFinding("a.py:10", 101, None),)
+
+    def test_no_comments_makes_no_calls(self) -> None:
+        ops = SequencedOps({})
+        assert ops.pr_review_comments_create(REPO, PR, [], commit_id="sha9") == ()
+        assert ops.calls == []

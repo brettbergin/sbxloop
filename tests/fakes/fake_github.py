@@ -48,6 +48,7 @@ from sbxloop.gh.ops import (
     ThreadComment,
     anchor_of,
 )
+from tests.fakes.github_errors import github_error
 
 GREEN = ChecksVerdict("green", 1, (), ())
 PENDING = ChecksVerdict("pending", 1, ("ci",), ())
@@ -74,13 +75,27 @@ def human_comment(
 
 
 class FakeGithub(GithubOps):
-    def __init__(self, *, repo: str = "o/r", number: int = 7, draft: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        repo: str = "o/r",
+        number: int = 7,
+        draft: bool = False,
+        self_review: bool = False,
+    ) -> None:
         # Deliberately no super().__init__: there is no worker client.
         self.run_id = "fake"
         self.timeout_s = 0.0
         self.repo = repo
+        # ``self_review`` models the field: one token opens the PR and
+        # reviews it, so the PR's author is the loop's own login and GitHub
+        # refuses REQUEST_CHANGES/APPROVE (#513). The default keeps a
+        # distinct author so the review-feature path stays exercised.
+        self.user_login = "sbxloop-bot"
+        self.pr_author = self.user_login if self_review else "someone-else"
         self.pr: dict[str, Any] = {
             "number": number,
+            "user": {"login": self.pr_author},
             "html_url": f"https://github.com/{repo}/pull/{number}",
             "node_id": f"PR_node{number}",
             "draft": draft,
@@ -102,7 +117,10 @@ class FakeGithub(GithubOps):
         # diff — every event, COMMENT included. True models that.
         self.refuse_inline_comments = False
         self.merge_outcomes: list[MergeOutcome] = []
-        self.user_login = "sbxloop-bot"
+        # Anchors whose individual review comment GitHub refuses (422 "line
+        # could not be resolved") in comment mode — per anchor, unlike
+        # ``refuse_inline_comments`` which fails a whole review.
+        self.refuse_anchors: set[str] = set()
         self.fail_once: dict[str, Exception] = {}
         # What the engine asked for.
         self.reviews: list[tuple[ReviewEvent, str, list[ReviewComment]]] = []
@@ -237,6 +255,27 @@ class FakeGithub(GithubOps):
         if method == "POST" and path.endswith("/labels"):
             assert body is not None
             return [{"name": name} for name in body["labels"]]
+        if method == "POST" and path.endswith("/pulls/" + str(self.number) + "/comments"):
+            # One review comment, standalone (#513): a thread of its own.
+            assert body is not None
+            anchor = f"{body['path']}:{body['line']}"
+            if anchor in self.refuse_anchors:
+                raise github_error("review_line_unresolved_422")
+            assert body["commit_id"] == self.pr["head"]["sha"], "anchored to the delivered head"
+            self._comment_id += 1
+            self.threads.append(
+                ReviewThread(
+                    node_id=f"PRRT_{self._comment_id}",
+                    is_resolved=False,
+                    path=str(body["path"]),
+                    line=int(body["line"]),
+                    comments=(ThreadComment(self._comment_id, self.user_login, str(body["body"])),),
+                )
+            )
+            return {
+                "id": self._comment_id,
+                "html_url": f"{self.pr['html_url']}#discussion_r{self._comment_id}",
+            }
         raise AssertionError(f"FakeGithub: unexpected raw call {method} {path}")
 
     # -- the pull request ----------------------------------------------------

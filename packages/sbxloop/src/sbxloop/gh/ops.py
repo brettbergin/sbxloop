@@ -646,6 +646,80 @@ class GithubOps:
             )
         return tuple(posted)
 
+    def pr_review_comments_create(
+        self,
+        repo: str,
+        number: int,
+        comments: Sequence[ReviewComment],
+        *,
+        commit_id: str,
+    ) -> tuple[PostedFinding, ...]:
+        """Post each finding as its own review comment — the single-identity
+        review (#513).
+
+        GitHub refuses ``REQUEST_CHANGES`` and ``APPROVE`` from a PR's own
+        author, so when the loop reviews the PR it opened, the review
+        feature buys nothing but 422s. Individual review comments
+        (``POST /pulls/{n}/comments``) are accepted from anyone, and each
+        opens a thread that can be replied to and resolved exactly like one
+        a review created — which is all reconciliation needs.
+
+        Per anchor, not per review: a finding anchored outside the diff
+        fails *its* comment (422 "line could not be resolved") and is
+        returned with ``comment_id=None`` for the caller to put in the
+        body, instead of taking every other finding down with it (#514).
+        Thread ids are looked up once afterwards, best effort.
+        """
+        if not comments:
+            return ()
+        by_anchor: dict[str, int] = {}
+        for comment in comments:
+            anchor = anchor_of(comment)
+            try:
+                data = self.raw(
+                    "POST",
+                    f"/repos/{repo}/pulls/{number}/comments",
+                    {
+                        "body": comment.body,
+                        "commit_id": commit_id,
+                        "path": comment.path,
+                        "line": comment.line,
+                        "side": comment.side,
+                    },
+                )
+            except GithubOpsError as exc:
+                log.warning(
+                    "gh.review_comment_refused",
+                    repo=repo,
+                    pr=number,
+                    anchor=anchor,
+                    error=str(exc)[:300],
+                    hint="the finding goes in the review comment's body instead",
+                )
+                continue
+            comment_id = data.get("id") if isinstance(data, dict) else None
+            if isinstance(comment_id, int):
+                by_anchor[anchor] = comment_id
+        threads_by_comment: dict[int, str] = {}
+        if by_anchor:
+            try:
+                for thread in self.pr_review_threads(repo, number):
+                    for entry in thread.comments:
+                        if entry.comment_id is not None:
+                            threads_by_comment[entry.comment_id] = thread.node_id
+            except GithubOpsError as exc:
+                log.warning("gh.review_threads_read_failed", repo=repo, pr=number, error=str(exc))
+        return tuple(
+            PostedFinding(
+                anchor=anchor_of(c),
+                comment_id=by_anchor.get(anchor_of(c)),
+                thread_node_id=threads_by_comment.get(by_anchor[anchor_of(c)])
+                if anchor_of(c) in by_anchor
+                else None,
+            )
+            for c in comments
+        )
+
     # -- reconciling review findings ----------------------------------------
     #
     # Replying on a finding's own thread, and resolving it, is what turns

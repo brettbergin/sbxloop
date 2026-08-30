@@ -8,6 +8,23 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Single-identity review posts PR comments, not a doomed review** (#513).
+  One token opens the PR and reviews it, so every round POSTed
+  `REQUEST_CHANGES`/`APPROVE`, took a 422 ("can not request changes on your
+  own pull request") and a `gh.review_event_refused` warning, and re-posted
+  as a `COMMENT` review — two doomed calls per round on every run. When the
+  PR's author is the loop's login (decided once per drive from the PR), the
+  review is now posted as PR comments: each anchored finding as its own
+  review comment via `POST /pulls/{n}/comments` (a resolvable thread, which
+  later rounds reply in and resolve exactly as before), and the verdict —
+  in words, `**Review verdict: changes requested** (round 2)` — with the
+  summary and every finding that got no thread in one top-level comment. An
+  anchor GitHub refuses fails only its own comment and lands in the body
+  (per-finding degradation, the #514 shape), instead of 422ing the whole
+  review. A distinct reviewer identity still uses the review feature with
+  the `COMMENT` fallback; the review body now opens with the verdict line in
+  every mode.
+
 - **Fix rounds no longer converge one adjacent case at a time** (#521). Run
   `rfxja288b` spent its whole review budget on one migration, one real
   finding per round, each in the previous round's new lines, because the

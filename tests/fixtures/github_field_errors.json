@@ -68,6 +68,12 @@
       "status": 422,
       "provenance": "synthetic",
       "observed": "not yet captured: GitHub's answer when a branch cannot be updated - already current, expected_head_sha stale, or the update itself would conflict."
+    },
+    "review_line_unresolved_422": {
+      "message": "github op raw.api failed: GithubOpError: gh api POST /repos/o/r/pulls/7/comments failed (rc=1): gh: Validation Failed: Line could not be resolved (HTTP 422)",
+      "status": 422,
+      "provenance": "field",
+      "observed": "run rfxja288b, PR #512, 2026-08-29: a review finding anchored to a line outside the diff (#514); the same text 422s POST /pulls/{n}/reviews with inline comments and, in single-identity mode, the one POST /pulls/{n}/comments for that finding (#513)."
     }
   }
 }

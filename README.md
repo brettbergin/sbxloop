@@ -803,11 +803,21 @@ watching human reads "draft" as "sbxloop is still working on this".
 
 **The review is the run's own.** A fresh read-only session reads the diff
 and returns a verdict; the run acts on that verdict whatever GitHub does
-with it. It is also posted to the PR for the record — as `APPROVE` /
-`REQUEST_CHANGES` when the repository accepts the loop's identity as a
-reviewer, and as a plain `COMMENT` review when it does not (GitHub refuses a
-PR author's approval of its own PR, among other rules). A `COMMENT` gates
-nothing on GitHub's side, which is fine: the gate is in the run. A *human's*
+with it. It is also posted to the PR for the record. **Single-identity
+mode** is the common case: one token opens the PR *and* reviews it, and
+GitHub refuses `REQUEST_CHANGES` / `APPROVE` from a PR's own author — so
+when the PR's author is the loop's login, the review is posted as PR
+comments instead of through the review feature: each anchored finding as
+its own review comment (a thread that can be replied to and resolved, which
+is what reconciliation does in later rounds), and the verdict — in words,
+`**Review verdict: changes requested** (round 2)` — with the summary and
+any finding that got no thread (no line, over the inline cap, or an anchor
+GitHub refused, degraded per finding rather than per review) in one
+top-level comment. No review-feature call is attempted, so a round costs no
+422s. When a *different* identity reviews (a second token), the verdict is
+posted as `APPROVE` / `REQUEST_CHANGES`, falling back to a `COMMENT` review
+if the repository refuses it. Neither gates anything on GitHub's side, which
+is fine: the gate is in the run. A *human's*
 standing `REQUEST_CHANGES` on the PR is honoured — it costs a fix round on
 the CI budget — and a human merging the PR themselves is the acceptance,
 while a human closing it unmerged fails the run.

@@ -208,6 +208,11 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return Harness(fake_sbx, tmp_path, monkeypatch)
 
 
+def harness_rows(harness: Harness, run_id: str) -> list[Any]:
+    """The run's phase rows, read back from the harness's state db."""
+    return list(StateStore(harness.state_dir / "state.db").phase_attempts(run_id))
+
+
 class TestHappyPath:
     def test_single_task_completes(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
@@ -1552,6 +1557,64 @@ class TestPipeline:
         assert fake.merges == []
         (verdict,) = self._events(harness, HostEventTypes.REVIEW_VERDICT)
         assert verdict.data["verdict"] == "approve" and verdict.data["url"] == ""
+
+    def test_self_review_posts_comments_not_a_review(self, harness: Harness) -> None:
+        """#513: the loop authored the PR, so GitHub would refuse
+        REQUEST_CHANGES/APPROVE. No review-feature call is made at all: each
+        finding is its own review comment (a thread reconciliation replies
+        in and resolves), the verdict goes in a top-level comment, and the
+        run still merges through the same gates."""
+        fake = FakeGithub(self_review=True)
+        fix = {"text": "Greeting corrected.\n\naddressed: hello.txt:1 — say hello, not hi"}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, fix, REVIEW_OK])
+        result = harness.pipeline(fake).start("ship hello")
+        assert result.state == "merged"
+        assert fake.reviews == [], "the review feature was never asked"
+        assert not any(m == "POST" and p.endswith("/reviews") for m, p, _ in fake.raw_calls)
+        # Round 1: the finding's own thread + the verdict comment.
+        posts = [b for m, p, b in fake.raw_calls if m == "POST" and p.endswith("/pulls/7/comments")]
+        assert [(b["path"], b["line"], b["commit_id"]) for b in posts] == [
+            ("hello.txt", 1, "commit1")
+        ]
+        assert len(fake.issue_comments) >= 2
+        assert fake.issue_comments[0].startswith("**Review verdict: changes requested** (round 1)")
+        assert "Findings without a thread" not in fake.issue_comments[0]
+        assert fake.issue_comments[-1].startswith("**Review verdict: approve** (round 2)")
+        # The thread was reconciled like any review-created one.
+        (thread,) = [t for t in fake.threads if t.anchor == "hello.txt:1"]
+        assert thread.is_resolved and thread.has_reply_from(fake.user_login)
+        # The review record is the comment's url, so the merge gate is satisfied.
+        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "review"]
+        assert all(
+            json.loads(r["output_json"])["review"]["url"].startswith("https://") for r in rows
+        )
+        assert json.loads(rows[0]["output_json"])["review"]["event"] == "COMMENT"
+        assert fake.merges == [(7, "squash", "commit2")]
+
+    def test_self_review_degrades_a_refused_anchor_per_finding(self, harness: Harness) -> None:
+        fake = FakeGithub(self_review=True)
+        fake.refuse_anchors = {"hello.txt:1"}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("ship hello")
+        assert result.state == "merged"
+        assert fake.threads == [], "the refused anchor opened no thread"
+        assert (
+            "Findings without a thread of their own:\n- `hello.txt:1` [major]"
+            in (fake.issue_comments[0])
+        )
+        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "review"]
+        posted = json.loads(rows[0]["output_json"])["posted"]
+        assert posted[0]["anchor"] == "hello.txt:1" and posted[0]["comment_id"] is None
+
+    def test_a_distinct_reviewer_identity_still_uses_the_review_feature(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()  # PR author != loop login
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("ship hello")
+        assert result.state == "merged"
+        assert [e for e, _, _ in fake.reviews] == ["APPROVE"]
+        assert fake.reviews[0][1].startswith("**Review verdict: approve** (round 1)")
 
     def test_review_exhaustion_fails_with_the_pr_left_a_draft(self, harness: Harness) -> None:
         fake = FakeGithub()
