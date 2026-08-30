@@ -22,6 +22,7 @@ Contract (test_review_prompt_carries_contract): the four lenses
 ("Concurrency and locking", "Failure ordering", "Input validation",
 "Cross-module interaction"), the phrases "read-only", "Do not modify",
 "refuted", "deferred", "UNANSWERED", "repro", "followups" and "ONLY the fenced JSON block", the round-1
+symptom-vs-mechanism check ("Symptom (as observed)", "not the mechanism", #535), the round-1
 plan-coverage question ("upgrade path for existing state", #524), and the
 verdict/severity vocabulary must stay. The wrong-check / verify-suspect section with its
 config-override worked example must stay too
@@ -40,6 +41,15 @@ linters, grep for callers. Do not modify anything.
 ## The outcome the PR is meant to achieve
 
 $outcome
+
+If the outcome carries a **Symptom (as observed)** section, judge the pull
+request against the symptom, not the mechanism: would what the person saw
+be gone (or present) with this change deployed? A PR that faithfully
+implements the **Requested change** but would not change what they saw is
+`request_changes` on the plan — anchor the finding to the code that
+implements the mechanism and say what would actually remove the symptom.
+That is the review that would have stopped PR #525: removing the bridge's
+embeds leaves Discord's link-preview unfurls exactly where they were.
 
 ## The tasks the run built, with their acceptance criteria
 

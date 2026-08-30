@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, get_args
@@ -129,6 +129,62 @@ ToolImpl = Callable[[dict[str, Any], str], str]
 class HostTool(NamedTuple):
     spec: HostToolSpec
     impl: ToolImpl
+
+
+def compose_issue_body(args: Mapping[str, Any]) -> str:
+    """The issue body ``create_issue`` files, symptom first (#535).
+
+    Issue #519 was filed as the mechanism the person named ("remove the
+    embeds"); the loop implemented exactly that, and it was wrong — what
+    they were seeing was Discord's link-preview unfurls. The loop optimises
+    hard for the words in the issue, so the words must describe what is
+    observed, not the fix: **Symptom (as observed)**, the person's own
+    words; **Requested change**, the mechanism they asked for, a hint;
+    **Goal**, the concierge's restatement; **Acceptance criteria**, written
+    against the symptom. A fix-shaped ask with no symptom is refused here
+    with the question the concierge should relay, so the tool itself is the
+    backstop for the prompt's rule.
+
+    Plain ``body`` alone (older callers, or a person who pasted a whole
+    issue) still files as is.
+    """
+    symptom = " ".join(str(args.get("symptom") or "").split()).strip()
+    requested = " ".join(str(args.get("requested_change") or "").split()).strip()
+    goal = " ".join(str(args.get("goal") or "").split()).strip()
+    raw = args.get("acceptance_criteria") or []
+    criteria = [" ".join(str(c).split()).strip() for c in (raw if isinstance(raw, list) else [raw])]
+    criteria = [c for c in criteria if c]
+    extra = str(args.get("body") or "").strip()
+    structured = bool(symptom or requested or goal or criteria)
+    if not structured:
+        return extra
+    if not symptom:
+        raise ValueError(
+            "symptom is required: what is the person seeing (or missing) today, in their "
+            "own words? A request that names only a mechanism ('remove X', 'replace X "
+            "with Y') cannot be filed until that is known — ask them one question: "
+            '"What are you seeing that you want gone or changed? A pasted line or a '
+            'screenshot is ideal."'
+        )
+    if not criteria:
+        raise ValueError(
+            "acceptance_criteria is required: at least one checkable statement written "
+            "against the symptom (what will no longer be seen, or will be), not the "
+            "mechanism"
+        )
+    parts = [f"## Symptom (as observed)\n\n{symptom}"]
+    if requested:
+        parts.append(
+            f"## Requested change\n\n{requested}\n\n_The mechanism the person asked for — "
+            "a hint. The symptom above is what the work must remove; if this change would "
+            "not remove it, do something that does._"
+        )
+    if goal:
+        parts.append(f"## Goal\n\n{goal}")
+    parts.append("## Acceptance criteria\n\n" + "\n".join(f"- [ ] {c}" for c in criteria))
+    if extra:
+        parts.append(extra)
+    return "\n\n".join(parts)
 
 
 class Concierge:
@@ -735,16 +791,29 @@ class Concierge:
                             f"with the `{trigger}` label, the daemon claims it on its next "
                             "poll and runs it through to a merged pull request, and a run "
                             "thread appears in this channel. One call, no confirmation. "
-                            "Write a crisp issue: a specific title, a paragraph of context "
-                            "(what and why), acceptance criteria as a checklist."
+                            "The issue is symptom-first: `symptom` is what the person "
+                            "observes today, in their own words (the thing that must be "
+                            "gone or present when the work is done); `requested_change` is "
+                            "the mechanism they asked for, a hint not the spec; `goal` is "
+                            "your restatement; `acceptance_criteria` are checkable "
+                            "statements written against the symptom, never the mechanism. "
+                            "A fix-shaped ask with no symptom cannot be filed: ask what they "
+                            "are seeing first. `body` is optional extra context."
                         ),
                         parameters=_schema(
                             {
                                 "title": {"type": "string", "maxLength": 200},
+                                "symptom": {"type": "string"},
+                                "requested_change": {"type": "string"},
+                                "goal": {"type": "string"},
+                                "acceptance_criteria": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
                                 "body": {"type": "string"},
                                 "repo": {"type": "string"},
                             },
-                            ["title", "body"],
+                            ["title", "symptom", "goal", "acceptance_criteria"],
                         ),
                     ),
                     self._tool_create_issue,
@@ -1274,7 +1343,10 @@ class Concierge:
             return repo_error
         assert repo is not None
         title = _one_line(str(args.get("title", "")).strip(), 200)
-        body = str(args.get("body", "")).strip()
+        try:
+            body = compose_issue_body(args)
+        except ValueError as exc:
+            return str(exc)
         if not title or not body:
             return "both title and body are required"
         trigger = self.config.daemon.trigger_label
