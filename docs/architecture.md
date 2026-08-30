@@ -46,13 +46,13 @@ repositories are configured, the github sandbox is scoped to the one the
 run's work item came from, and carries that repository's `token_env`
 credential:
 
-|            | agent sandbox                                                                                                                                                           | github sandbox                    |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| name       | `sbxloop-<run>-agent`                                                                                                                                                   | `sbxloop-<run>-github`            |
-| credential | `COPILOT_GITHUB_TOKEN` only                                                                                                                                             | `GH_TOKEN` only                   |
-| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` secret service  |
-| network    | balanced policy + copilot hosts + plan-declared grants                                                                                                                  | balanced policy + github hosts    |
-| runs       | Copilot SDK agent sessions, shell checks                                                                                                                                | `github.op` jobs (gh CLI or REST) |
+|            | agent sandbox                                                                                                                                                           | github sandbox                                                                                                     |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| name       | `sbxloop-<run>-agent`                                                                                                                                                   | `sbxloop-<run>-github`                                                                                             |
+| credential | `COPILOT_GITHUB_TOKEN` only                                                                                                                                             | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
+| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
+| network    | balanced policy + copilot hosts + plan-declared grants                                                                                                                  | balanced policy + github hosts                                                                                     |
+| runs       | Copilot SDK agent sessions, shell checks                                                                                                                                | `github.op` jobs (gh CLI or REST)                                                                                  |
 
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
@@ -67,6 +67,38 @@ blip must never silently select the weaker strategy. In fallback mode the token 
 visible inside its own microVM, but the credential *split* still holds
 (each sandbox only ever receives its own token) and egress remains bounded
 by the balanced network policy.
+
+Once that probe's verdict is in the version-keyed conformance cache,
+provisioning stops re-living the doomed sequence: under `proxy`, a cached
+`invisible-under-exec` / `sentinel-under-exec` verdict for the running sbx
+version sends credentials straight to the env file — no registration, no
+probe, one calm `sandbox.secret_env_fallback` event with `cached=true` —
+while an unknown (new) sbx version still registers and probes once, so an
+sbx release that fixes exec injection is picked up automatically (#568).
+
+### GitHub App installation auth (#568)
+
+`GITHUB_APP_ID` + `GITHUB_APP_INSTALLATION_ID` +
+`GITHUB_APP_PRIVATE_KEY[_PATH]` switch the github-ops credential from a
+PAT to a GitHub App installation. The **host** signs a ≤10-minute RS256
+App JWT with its `openssl` binary, exchanges it at
+`POST /app/installations/{id}/access_tokens` — the one host→GitHub call in
+the system, on the credential-minting plane, not the ops plane — and
+injects only the resulting ~1-hour `ghs_` installation token into the
+github-ops sandbox, always via the env file: each short-lived token would
+otherwise have to be re-registered with sbx every hour for no security
+gain. The private key never enters any VM, and GitHub attributes every
+operation to the app installation (`<app>[bot]`).
+
+Refresh is wired into the job path: `WorkerClient` runs
+`Provisioner.gh_refresher`'s hook before each github job; inside a
+10-minute expiry margin it re-mints and rewrites the env file, and since
+worker processes are spawned per job and load the env file at startup, the
+next job authenticates with the fresh token — covering both a run's pair
+and the daemon's long-lived polling sandbox. PAT and App credentials are
+mutually exclusive and a partial App set is refused, both validated before
+any microVM boots; a `[[github.repos]] token_env` remains an explicit
+per-repo PAT override.
 
 Both sandboxes run under sbx's **balanced** network policy (default-deny plus
 a curated allowlist), with per-sandbox allow rules added for exactly the

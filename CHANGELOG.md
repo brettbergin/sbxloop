@@ -8,6 +8,25 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **GitHub App installation auth as an alternative to a PAT** (#568). With
+  `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and
+  `GITHUB_APP_PRIVATE_KEY[_PATH]` configured (env / `.env`, like the PATs),
+  the host signs an RS256 App JWT with its own `openssl` (no new
+  dependency), exchanges it for a short-lived installation token, and
+  delivers only that token to the github-ops sandbox via the in-VM env
+  file — the private key never leaves the host, the agent sandbox still
+  sees no GitHub credential, and every daemon/run operation is attributed
+  on GitHub to the app (`<app>[bot]`) rather than a personal account.
+  Tokens auto-refresh: `WorkerClient` invokes `Provisioner.gh_refresher`'s
+  hook before each github job, re-minting and rewriting the env file
+  inside a 10-minute expiry margin, so runs and the daemon's long-lived
+  polling sandbox outlive the ~1 hour token. PAT-only deployments are
+  untouched (`GH_TOKEN`/`GITHUB_TOKEN` and per-repo `token_env` behave
+  exactly as before); supplying both credential sets, or a partial App
+  set, is a named startup error before any microVM boots. `sbxloop doctor`
+  reports the selected mode (plus an openssl check in App mode), and the
+  README / `.env.example` / architecture docs describe both modes.
+
 - **Slack as an alternative chat backend** (#532). The daemon's human
   channel — headline cards, a thread per run streaming its chronology,
   `!sbx` operator commands in the control channel and in run threads,
@@ -26,6 +45,22 @@ All notable changes to sbxloop are documented here. The project adheres to
   `daemon_discord_threads` table is folded in on first open. `sbxloop daemon --slack-channel`, a `chat bridge (slack)` doctor row, the
   `sbxloop.toml.example` / `.env.example` entries and the README's Slack
   app setup (scopes, events, Socket Mode) document it.
+
+### Changed
+
+- **Provisioning skips the doomed proxy-secret dance on a known sbx
+  version** (#568). The register→probe→auto-downgrade sequence (and its
+  per-run `sandbox.secret_env_fallback` *warning*) ran on every provision,
+  even though the probe's verdict — sbx proxy secrets never reach `sbx exec` workers — has been field-stable since sbx 0.35 and was already
+  recorded in the version-keyed conformance cache. Under the default
+  `proxy` strategy provisioning now consults that cache first: a cached
+  invisible/sentinel-under-exec verdict goes straight to the in-VM env
+  file (one calm `cached=true` event, info-level log), while an unknown or
+  new sbx version still registers + probes exactly as before, so the cache
+  re-learns per version and a future sbx that fixes exec injection is
+  picked up automatically. GitHub App installation tokens never use the
+  proxy path at all — they rotate ~hourly and every refresh rewrites the
+  env file, so registering each one with sbx would be pure ceremony.
 
 ### Fixed
 

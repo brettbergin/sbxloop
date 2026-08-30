@@ -19,15 +19,17 @@ Checkpointing, resume and artifact harvesting throughout.
 
 Every run gets an isolated microVM agent sandbox — plus, when the GitHub integration is configured, a second github-ops sandbox, so no single environment ever holds both credentials:
 
-| Sandbox                | Credential                                                                       | Purpose                                                                                                                                                                   |
-| ---------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission)         | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM.                            |
-| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: contents write, pull requests write, issues write) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set. |
+| Sandbox                | Credential                                                                                                                                                                                  | Purpose                                                                                                                                                                   |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission)                                                                                                                    | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM.                            |
+| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: contents write, pull requests write, issues write) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth)) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set. |
 
 Both sandboxes run under sbx's **balanced network policy** (default-deny
 egress plus a curated allowlist), and tokens are injected through sbx's secret
 proxy — **credential values never enter the VM**; the host proxy substitutes
-them only on egress to their declared domains. Sandboxes are cattle: they are
+them only on egress to their declared domains (where sbx's proxy cannot feed
+exec'd workers, a 0600 in-VM env file stands in — see
+docs/architecture.md). Sandboxes are cattle: they are
 torn down at run end and re-provisioned on resume, while all durable state
 (workspace, SQLite checkpoints, event log) lives on the host.
 
@@ -860,7 +862,8 @@ PAT, `GH_TOKEN`, used *only* by that sandbox. It needs `contents:write` (the
 branch, the merge) and `pull_requests:write` (the PR, the review, un-drafting,
 update-branch) on the repository; the daemon also needs `issues:write` to
 claim and settle issues. Without it, no github sandbox exists and
-repo-facing features refuse to run.
+repo-facing features refuse to run. The PAT can be replaced wholesale by a
+GitHub App installation — see [GitHub App auth](#github-app-auth).
 
 **Delivery** is one atomic commit via the git data API on branch
 `sbxloop/<run>`, opened as a draft pull request, with the harvested tree
@@ -927,6 +930,39 @@ to PyPI and redeploys the daemon host on every merge to `main` — every
 merged run is therefore an unattended release. That is the existing pipeline
 working as designed, with nobody in front of it; the round budgets and the
 daemon's guardrails are what you are trusting instead.
+
+### GitHub App auth
+
+The github-ops side can authenticate as a **GitHub App installation**
+instead of a PAT (#568): create a GitHub App (repository permissions:
+Contents read & write, Pull requests read & write, Issues read & write),
+install it on the repository, and configure
+
+```bash
+GITHUB_APP_ID=12345                         # the App's numeric id
+GITHUB_APP_INSTALLATION_ID=987654           # from the installation's settings URL
+GITHUB_APP_PRIVATE_KEY_PATH=~/keys/app.pem  # or GITHUB_APP_PRIVATE_KEY (PEM inline)
+```
+
+in the environment / `.env`, leaving `GH_TOKEN`/`GITHUB_TOKEN` unset. The
+host signs a short-lived App JWT with its own `openssl`, exchanges it for a
+~1 hour **installation token**, and delivers only that token to the
+github-ops sandbox; the private key never leaves the host, and the agent
+sandbox still sees no GitHub credential. Every operation — issue claims,
+comments, labels, PRs, reviews, merges — is attributed on GitHub to the
+app (`<app-name>[bot]`) rather than to a personal account, with no
+personal-token expiry to babysit.
+
+Tokens refresh themselves: before each github job the loop re-mints when
+less than ten minutes of lifetime remain and rewrites the sandbox's env
+file, so long runs and the daemon's long-lived polling sandbox never hit
+an auth failure mid-flight. The mode is chosen by which credentials you
+set: configuring **both** a PAT and App credentials — or an incomplete App
+set — is a startup error that names the fix, raised before any microVM
+boots. A `[[github.repos]] token_env` stays an explicit per-repo PAT
+choice and wins over App credentials for that repository. (App JWTs are
+signed with the host `openssl` binary; `sbxloop doctor` checks it is on
+PATH.)
 
 ## Debugging failed runs
 
@@ -1100,7 +1136,8 @@ back within the retention window — the finish summary prints it.
    `SBXLOOP_*` override the code reads.
 
 3. **Optional** — configure the [GitHub integration](#github-integration)
-   (adds the second PAT, `GH_TOKEN`).
+   (adds the second credential: the `GH_TOKEN` PAT, or
+   [GitHub App auth](#github-app-auth)).
 
 4. `sbxloop doctor` verifies all of it and prints remediation for anything
    missing.
@@ -1229,7 +1266,7 @@ The real-sbx end-to-end suite runs in CI via a manually dispatched workflow.
 
 - Python ≥ 3.13
 - [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/) on the host (macOS Apple silicon, Windows 11, or Ubuntu 24.04+/KVM)
-- A GitHub Copilot subscription (any plan) + a fine-grained PAT (a second one only if the GitHub integration is configured — see above)
+- A GitHub Copilot subscription (any plan) + a fine-grained PAT (plus a second PAT or a GitHub App installation only if the GitHub integration is configured — see above)
 
 ## Releasing
 

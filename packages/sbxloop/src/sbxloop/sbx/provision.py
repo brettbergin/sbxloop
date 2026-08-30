@@ -6,14 +6,26 @@ The credential split is enforced here:
   environment), injected via ``sbx secret set-custom`` bound to the
   token-exchange host — the value never enters the VM under the default
   ``proxy`` strategy.
-- **github sandbox** gets only ``GH_TOKEN`` via sbx's built-in ``github``
-  secret service (scoped to github.com hosts). It is provisioned only when
-  the GitHub integration is configured (``[github].repo``); otherwise runs
-  have no GitHub capability and GH_TOKEN is not required.
+- **github sandbox** gets only ``GH_TOKEN`` — either the operator's PAT
+  (via sbx's built-in ``github`` secret service, as before), or a
+  host-minted GitHub App installation token (#568; see
+  :mod:`sbxloop.gh.appauth`). It is provisioned only when the GitHub
+  integration is configured (``[github].repo``); otherwise runs have no
+  GitHub capability and no GitHub credential is required.
 
 The ``plain-env`` fallback strategy writes tokens to ``~/.sbxloop/env.sh``
 inside the sandbox (weaker: the value is visible in the VM) for environments
-where the experimental ``set-custom`` proxy rewriting is unavailable.
+where the experimental ``set-custom`` proxy rewriting is unavailable. Under
+the default ``proxy`` strategy the env file is also chosen directly — no
+doomed registration, no probe, no per-run warning — when either
+
+- the conformance cache already knows this sbx version leaves proxy secrets
+  invisible (or sentinel-shaped) under ``exec`` — the field-verified sbx
+  behavior since 0.35. An unknown/new sbx version still probes once, so the
+  "sbx fixed exec injection" upside is never lost; or
+- the github sandbox authenticates as a GitHub App installation: its token
+  rotates ~hourly and the host must rewrite the env file on refresh anyway,
+  so registering each short-lived token with sbx would be pure ceremony.
 """
 
 from __future__ import annotations
@@ -25,13 +37,23 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Literal, NamedTuple
 
 from sbxloop import hostgit
 from sbxloop.config import Config, RepoConfig
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
+from sbxloop.gh.appauth import (
+    APP_ID_ENV,
+    APP_INSTALLATION_ID_ENV,
+    APP_KEY_ENV,
+    APP_KEY_PATH_ENV,
+    AppTokenSource,
+    app_credentials,
+)
 from sbxloop.ids import branch_name
 from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
@@ -39,6 +61,7 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     PROBE_SECRET_ENV_VISIBILITY,
     PROBE_WORKSPACE_MOUNT,
+    load_verdicts,
     record_field_verdict,
 )
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
@@ -95,6 +118,90 @@ MOUNT_SEARCH_MAXDEPTH = 4
 # Secret-visibility probe exit code for "set, but not a credential" —
 # sbx's proxy sentinel. 0 is a usable token, 1 is unset/empty.
 _SENTINEL_EXIT = 3
+
+# Cached probe verdicts that mean the sbx proxy cannot feed exec'd workers:
+# under the ``proxy`` strategy, provisioning on an sbx version already known
+# to behave this way goes straight to the in-VM env file instead of
+# re-living the register→probe→downgrade dance (and its per-run warning).
+_PROXY_BROKEN_VERDICTS = ("invisible-under-exec", "sentinel-under-exec")
+
+# Why a sandbox's credentials are delivered via the in-VM env file rather
+# than the sbx secret proxy. ``None`` means the proxy path is attempted.
+EnvFileReason = Literal["strategy", "cached", "app"]
+
+
+@dataclass(frozen=True)
+class GhPat:
+    """A personal access token, as configured today."""
+
+    value: str
+
+    def token(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class GhApp:
+    """A GitHub App installation: short-lived tokens minted on the host."""
+
+    source: AppTokenSource
+
+    def token(self) -> str:
+        return self.source.current()
+
+
+GhCredential = GhPat | GhApp
+
+
+class GhCredentialStatus(NamedTuple):
+    """A describable answer to "which github credential is configured?" —
+    the advisory twin of :meth:`Provisioner.gh_credential` for `doctor`,
+    which must report rather than raise. Keep the two in step."""
+
+    ok: bool
+    detail: str
+    mode: Literal["pat", "app", "none"]
+
+
+def gh_credential_status(
+    env: Mapping[str, str], *, token_env: str | None = None
+) -> GhCredentialStatus:
+    """Describe the credential :meth:`Provisioner.gh_credential` would pick.
+
+    ``token_env`` is a repository's own ``[[github.repos]] token_env``,
+    which — as in resolution — is an explicit per-repo PAT choice and wins
+    over the ambient PAT/App decision.
+    """
+    if token_env:
+        if env.get(token_env):
+            return GhCredentialStatus(True, f"token from {token_env}", "pat")
+        return GhCredentialStatus(False, f"token_env {token_env} is not set on the host", "pat")
+    try:
+        app = app_credentials(env)
+    except ProvisionError as exc:
+        return GhCredentialStatus(False, str(exc), "app")
+    pat_name = next((name for name in GH_TOKEN_ENVS if env.get(name)), None)
+    if app is not None and pat_name:
+        return GhCredentialStatus(
+            False,
+            f"both {pat_name} and GitHub App credentials ({APP_ID_ENV}, …) are set — "
+            "unset the PAT to run as the App installation, or the GITHUB_APP_* "
+            "variables to keep the PAT",
+            "app",
+        )
+    if app is not None:
+        return GhCredentialStatus(
+            True,
+            f"GitHub App installation {app.installation_id} (app {app.app_id})",
+            "app",
+        )
+    if pat_name:
+        return GhCredentialStatus(True, f"token from {pat_name}", "pat")
+    return GhCredentialStatus(
+        False,
+        f"none of {'/'.join(GH_TOKEN_ENVS)} are set and no GitHub App credentials are configured",
+        "none",
+    )
 
 
 def mount_search_roots(workspace: Path | None) -> tuple[str, ...]:
@@ -153,6 +260,9 @@ class Provisioner:
         # Serializes the version lookup and the cache file's read-modify-
         # write: the two sandboxes provision on parallel threads (#127).
         self._probe_lock = threading.Lock()
+        # One shared token source per provisioner: provisioning and the
+        # refresh hook must see the same cached installation token.
+        self._app_source: AppTokenSource | None = None
 
     def _record_probe(self, probe_id: str, verdict: str, detail: str = "") -> None:
         """Refresh the conformance cache from a field observation.
@@ -220,34 +330,61 @@ class Provisioner:
             )
         return token
 
-    def gh_token(self, repo: str | None = None) -> str:
-        """The token the github sandbox gets, scoped to ``repo``.
+    def gh_credential(self, repo: str | None = None) -> GhCredential:
+        """The credential the github sandbox authenticates with, scoped to
+        ``repo`` — a PAT (as today) or a GitHub App installation (#568).
 
-        A repository may name its own token variable (``[[github.repos]]
-        token_env``); that variable wins over the daemon-wide
-        GH_TOKEN/GITHUB_TOKEN, so a run against repo B authenticates with
-        B's credentials. ``repo`` is the run's repository; ``None`` uses the
-        configured default — which, for a run, is the one repository the
-        config was already narrowed to.
+        Resolution order:
+
+        - a repository's own ``[[github.repos]] token_env`` is an explicit
+          per-repo choice and always wins (a PAT, as before);
+        - otherwise the ambient credential set decides: GH_TOKEN /
+          GITHUB_TOKEN → PAT mode; GITHUB_APP_ID +
+          GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY[_PATH] →
+          App mode (the host mints short-lived installation tokens);
+        - both ambient sets, or neither, fail loudly here — before any
+          microVM exists — naming what to fix, instead of an obscure
+          401/403 later.
         """
         entry = self._repo_entry(repo)
-        names: tuple[str, ...] = GH_TOKEN_ENVS
         if entry is not None and entry.token_env:
             token = self.env.get(entry.token_env, "")
             if token:
-                return token
+                return GhPat(token)
             raise ProvisionError(
                 f"{entry.token_env} (the token_env of {entry.repo}) is not set on the host."
             )
-        for name in names:
-            token = self.env.get(name, "")
-            if token:
-                return token
+        app = app_credentials(self.env)
+        pat = next((self.env.get(name, "") for name in GH_TOKEN_ENVS if self.env.get(name)), "")
+        if app is not None and pat:
+            raise ProvisionError(
+                "both a PAT (GH_TOKEN/GITHUB_TOKEN) and GitHub App credentials "
+                f"({APP_ID_ENV}, {APP_INSTALLATION_ID_ENV}, …) are set — sbxloop cannot "
+                "choose for you: unset the PAT to run as the App installation, or unset "
+                "the GITHUB_APP_* variables to keep the PAT"
+            )
+        if app is not None:
+            if self._app_source is None:
+                self._app_source = AppTokenSource(app)
+            return GhApp(self._app_source)
+        if pat:
+            return GhPat(pat)
         raise ProvisionError(
-            f"none of {', '.join(GH_TOKEN_ENVS)} are set on the host. Create a fine-grained "
-            "PAT with the repository permissions sbxloop should act with (e.g. issues:write, "
-            "contents:read) and export GH_TOKEN."
+            f"none of {', '.join(GH_TOKEN_ENVS)} are set on the host and no GitHub App "
+            "credentials are configured. Either create a fine-grained PAT with the "
+            "repository permissions sbxloop should act with (e.g. issues:write, "
+            "contents:read) and export GH_TOKEN, or install a GitHub App on the "
+            f"repository and set {APP_ID_ENV}, {APP_INSTALLATION_ID_ENV} and "
+            f"{APP_KEY_PATH_ENV} (or {APP_KEY_ENV})."
         )
+
+    def gh_token(self, repo: str | None = None) -> str:
+        """The token value the github sandbox gets right now.
+
+        See :meth:`gh_credential`; in App mode this mints (or reuses) an
+        installation token.
+        """
+        return self.gh_credential(repo).token()
 
     def _repo_entry(self, repo: str | None) -> RepoConfig | None:
         """The configured entry a sandbox is scoped to.
@@ -526,10 +663,18 @@ class Provisioner:
         # no GitHub capability at all — and one less microVM to boot.
         github_enabled = self.config.github.enabled
 
-        # Fail fast on missing tokens before creating any microVM.
+        # Fail fast on missing credentials before creating any microVM. In
+        # App mode this mints the first installation token here.
+        gh_cred = self.gh_credential(repo) if github_enabled else None
         tokens: dict[SandboxRole, str] = {"agent": self.copilot_token()}
-        if github_enabled:
-            tokens["github"] = self.gh_token(repo)
+        if gh_cred is not None:
+            tokens["github"] = gh_cred.token()
+        # Decided once, before the parallel threads: a probe verdict recorded
+        # by one thread must not flip the other thread's delivery mid-flight.
+        env_file_reasons: dict[SandboxRole, EnvFileReason | None] = {
+            "agent": self._env_file_reason("agent", None),
+            "github": self._env_file_reason("github", gh_cred),
+        }
 
         agent_spec, github_spec = self.build_specs(run_id, workspace, repo)
         specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
@@ -561,13 +706,18 @@ class Provisioner:
             with rollback_lock:
                 created.append(sandbox)
             self._apply_policy(spec)
-            rms = self._apply_secrets(spec, sandbox, tokens[spec.role])
-            with rollback_lock:
-                registered_secret_rms.extend(rms)
-            self._apply_persistent_env(spec, sandbox)
-            # After the env write: the fallback rewrites the whole file (it
-            # folds persistent_env in itself), so it must have the last word.
-            self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
+            reason = env_file_reasons[spec.role]
+            if reason is not None:
+                self._apply_env_file_only(run_id, spec, sandbox, tokens[spec.role], reason)
+            else:
+                rms = self._apply_secrets(spec, sandbox, tokens[spec.role])
+                with rollback_lock:
+                    registered_secret_rms.extend(rms)
+                self._apply_persistent_env(spec, sandbox)
+                # After the env write: the fallback rewrites the whole file
+                # (it folds persistent_env in itself), so it must have the
+                # last word.
+                self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
             sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             if self.post_create is not None:
                 self.post_create(sandbox, spec.role)
@@ -713,9 +863,15 @@ class Provisioner:
         *inside* that try, so a caller's worker install failing rolls the
         sandbox and its secrets back too.
         """
-        token = self.gh_token(repo)
+        cred = self.gh_credential(repo)
         spec = self.github_only_spec(name, workspace, repo)
-        return self._ensure_single(spec, token, post_create=post_create, run_id=run_id)
+        return self._ensure_single(
+            spec,
+            cred.token(),
+            reason=self._env_file_reason("github", cred),
+            post_create=post_create,
+            run_id=run_id,
+        )
 
     def ensure_agent_only(
         self,
@@ -730,13 +886,20 @@ class Provisioner:
         :meth:`ensure_github_only`."""
         token = self.copilot_token()
         spec = self.agent_only_spec(name, workspace)
-        return self._ensure_single(spec, token, post_create=post_create, run_id=run_id)
+        return self._ensure_single(
+            spec,
+            token,
+            reason=self._env_file_reason("agent", None),
+            post_create=post_create,
+            run_id=run_id,
+        )
 
     def _ensure_single(
         self,
         spec: SandboxSpec,
         token: str,
         *,
+        reason: EnvFileReason | None,
         post_create: PostCreate | None,
         run_id: str | None,
     ) -> Sandbox:
@@ -750,9 +913,12 @@ class Provisioner:
             self.cli.create(spec)
             created = Sandbox(self.cli, spec.name)
             self._apply_policy(spec)
-            registered_secret_rms.extend(self._apply_secrets(spec, created, token))
-            self._apply_persistent_env(spec, created)
-            self._verify_secret_env(label, spec, created, token)
+            if reason is not None:
+                self._apply_env_file_only(label, spec, created, token, reason)
+            else:
+                registered_secret_rms.extend(self._apply_secrets(spec, created, token))
+                self._apply_persistent_env(spec, created)
+                self._verify_secret_env(label, spec, created, token)
             created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             hook = post_create or self.post_create
             if hook is not None:
@@ -787,13 +953,12 @@ class Provisioner:
     def _apply_secrets(
         self, spec: SandboxSpec, sandbox: Sandbox, token: str
     ) -> list[Callable[[], bool]]:
-        """Register the spec's secrets, returning one rollback (rm) callable
-        per registration this attempt actually created — so a provisioning
-        failure can unregister them symmetric with sandbox removal, instead
-        of leaving entries owned by a scope that no longer exists."""
-        if self.config.secret_strategy == "plain-env":  # nosec B105 - strategy label
-            self._apply_plain_env(spec, sandbox, token)
-            return []
+        """Register the spec's secrets with sbx (the proxy path), returning
+        one rollback (rm) callable per registration this attempt actually
+        created — so a provisioning failure can unregister them symmetric
+        with sandbox removal, instead of leaving entries owned by a scope
+        that no longer exists. Callers choose the in-VM env file instead
+        via :meth:`_apply_env_file_only` (see :meth:`_env_file_reason`)."""
         rollbacks: list[Callable[[], bool]] = []
         for secret in spec.secrets:
             if secret.kind == "service":
@@ -835,6 +1000,93 @@ class Provisioner:
         return self.cli.secret_rm(host=host, env=env, sandbox=scope) or self.cli.secret_rm(
             env=env, sandbox=scope
         )
+
+    def _env_file_reason(
+        self, role: SandboxRole, gh_cred: GhCredential | None
+    ) -> EnvFileReason | None:
+        """Why ``role``'s credentials go to the in-VM env file (``None`` →
+        try the sbx secret proxy)."""
+        if self.config.secret_strategy == "plain-env":  # nosec B105 - strategy label
+            return "strategy"
+        if role == "github" and isinstance(gh_cred, GhApp):
+            # Installation tokens rotate ~hourly and every refresh rewrites
+            # the env file; registering each short-lived value with sbx
+            # would be ceremony with no security upside.
+            return "app"
+        if self._proxy_cached_broken():
+            return "cached"
+        return None
+
+    def _proxy_cached_broken(self) -> bool:
+        """Whether the conformance cache already says this sbx version's
+        proxy secrets never reach exec'd workers — in which case the
+        register→probe→downgrade dance (and its per-run warning) is skipped
+        and the env file is used directly. Unknown or unreadable answers
+        count as "not known broken", so a new sbx version is probed exactly
+        as before and the cache re-learns per version. Read fresh on every
+        provision (only the sbx version lookup is memoized): a long-lived
+        daemon whose first provision recorded the verdict benefits on its
+        next re-provision, not its next restart."""
+        try:
+            with self._probe_lock:
+                if not self._sbx_version_known:
+                    self._sbx_version = self.cli.version()
+                    self._sbx_version_known = True
+                version = self._sbx_version
+        except SbxError:
+            return False  # undecided, not cached: probe as before
+        record = load_verdicts(self.config.state_dir, version).get(PROBE_SECRET_ENV_VISIBILITY)
+        return record is not None and record.verdict in _PROXY_BROKEN_VERDICTS
+
+    def _apply_env_file_only(
+        self,
+        run_id: str,
+        spec: SandboxSpec,
+        sandbox: Sandbox,
+        token: str,
+        reason: EnvFileReason,
+    ) -> None:
+        """Deliver credentials via the in-VM env file, saying why.
+
+        ``strategy`` (explicit plain-env config) stays silent, exactly as
+        before. ``cached`` emits the same ``sandbox.secret_env_fallback``
+        event the probe-driven downgrade emits — the semantic is identical,
+        the decision just came from the conformance cache — but calmly
+        (info log, ``cached=True``) rather than as a per-run warning.
+        ``app`` announces the App identity once per sandbox.
+        """
+        self._apply_plain_env(spec, sandbox, token)
+        env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
+        if reason == "cached":
+            message = (
+                f"{env_name}: sbx proxy secrets are invisible under exec on this sbx "
+                "version (cached conformance verdict) — using the in-VM env file "
+                'directly (secret_strategy="plain-env" silences this)'
+            )
+            log.info(
+                "sandbox.secret_env_fallback",
+                run=run_id,
+                sandbox=spec.name,
+                env=env_name,
+                cached=True,
+                detail=message,
+            )
+            self.bus.emit(
+                "sandbox.secret_env_fallback",
+                run_id,
+                name=spec.name,
+                env=env_name,
+                cached=True,
+                message=message,
+            )
+        elif reason == "app":
+            message = (
+                "github sandbox authenticates as a GitHub App installation; the host "
+                "mints short-lived installation tokens and refreshes them in the "
+                "in-VM env file"
+            )
+            log.info("sandbox.github_app_auth", run=run_id, sandbox=spec.name, detail=message)
+            self.bus.emit("sandbox.github_app_auth", run_id, name=spec.name, message=message)
 
     def _verify_secret_env(
         self, run_id: str, spec: SandboxSpec, sandbox: Sandbox, token: str
@@ -1049,6 +1301,15 @@ class Provisioner:
         sandbox.write_text(ENV_FILE, lines)
         sandbox.exec(["chmod", "600", ENV_FILE])
 
+    def _write_env_file(self, sandbox: Sandbox, exports: Mapping[str, str]) -> None:
+        """(Re)write the in-VM env file the worker loads at startup."""
+        lines = "".join(
+            f"export {key}={shlex.quote(value)}\n" for key, value in sorted(exports.items())
+        )
+        sandbox.exec(["mkdir", "-p", ENV_FILE.rsplit("/", 1)[0]])
+        sandbox.write_text(ENV_FILE, lines)
+        sandbox.exec(["chmod", "600", ENV_FILE])
+
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""
         exports: dict[str, str] = dict(spec.persistent_env)
@@ -1057,9 +1318,30 @@ class Provisioner:
         else:
             exports["GH_TOKEN"] = token
             exports["GITHUB_TOKEN"] = token
-        lines = "".join(
-            f"export {key}={shlex.quote(value)}\n" for key, value in sorted(exports.items())
-        )
-        sandbox.exec(["mkdir", "-p", ENV_FILE.rsplit("/", 1)[0]])
-        sandbox.write_text(ENV_FILE, lines)
-        sandbox.exec(["chmod", "600", ENV_FILE])
+        self._write_env_file(sandbox, exports)
+
+    def gh_refresher(self, sandbox: Sandbox, repo: str | None = None) -> Callable[[], None] | None:
+        """A hook keeping a live github sandbox's credential fresh (App mode).
+
+        ``None`` for PAT credentials — nothing to refresh, zero per-job
+        overhead. For a GitHub App, the returned callable is what
+        WorkerClient invokes before each job: when the cached installation
+        token is inside its refresh margin it re-mints and rewrites the
+        in-VM env file, so the job's worker process (spawned per job; loads
+        the env file at startup) authenticates with a live token. This is
+        what lets a run — or the daemon's long-lived polling sandbox —
+        outlive the ~1 hour installation token lifetime (#568).
+        """
+        cred = self.gh_credential(repo)
+        if not isinstance(cred, GhApp):
+            return None
+        persistent = self.github_repo_env(repo)
+
+        def refresh() -> None:
+            if not cred.source.refresh_due():
+                return
+            token = cred.source.current()
+            self._write_env_file(sandbox, {**persistent, "GH_TOKEN": token, "GITHUB_TOKEN": token})
+            log.info("github.app_token_refreshed", sandbox=sandbox.name)
+
+        return refresh

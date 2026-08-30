@@ -543,6 +543,11 @@ class LoopEngine:
                             python=self.worker_python,
                             role="github",
                             limits=self.config.limits,
+                            # App auth: keep the installation token fresh for
+                            # every github op; None under a PAT.
+                            credential_refresh=provisioner.gh_refresher(
+                                pair.github, self.config.github.repo
+                            ),
                         )
                         if pair.github is not None
                         else None

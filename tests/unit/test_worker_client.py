@@ -1433,3 +1433,18 @@ class TestHostTools:
             client.submit(self._job())
         with pytest.raises(WorkerError, match="must be given together"):
             client.submit(agent_job(), tool_handler=lambda call: None)  # type: ignore[arg-type,return-value]
+
+
+class TestCredentialRefresh:
+    def test_refresh_hook_runs_before_submit(self, sandbox: Sandbox) -> None:
+        calls: list[str] = []
+        client = make_client(
+            sandbox, EventBus(), credential_refresh=lambda: calls.append("refresh")
+        )
+        result = client.submit(agent_job())
+        assert result.status == "ok"
+        assert calls == ["refresh"]
+
+    def test_no_hook_by_default(self, sandbox: Sandbox) -> None:
+        client = make_client(sandbox, EventBus())
+        assert client.credential_refresh is None
