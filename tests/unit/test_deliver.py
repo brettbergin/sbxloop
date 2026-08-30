@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,9 @@ class StubOps:
         self.pr_kwargs: dict[str, Any] = {}
         self.blob_batches: list[list[dict[str, str]]] = []
         self.blob_count = 0
+        # Where the run's delivery branch already sits, or None when a prior
+        # delivery never created it (the first round).
+        self.branch_sha: str | None = None
 
     def repo_get(self, repo: str) -> dict[str, Any]:
         self.repo_get_calls.append(repo)
@@ -37,6 +41,8 @@ class StubOps:
 
     def ref_lookup(self, repo: str, ref: str) -> str | None:
         self.ref_lookups.append((repo, ref))
+        if ref.startswith("heads/sbxloop/"):
+            return self.branch_sha
         return "base123"
 
     def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
@@ -57,6 +63,8 @@ class StubOps:
             return {"sha": "commit789"}
         if path.endswith("/git/refs"):
             return {"ref": body["ref"] if body else ""}
+        if method == "PATCH" and "/git/refs/heads/" in path:
+            return {"ref": path}
         raise AssertionError(f"unexpected raw call {method} {path}")
 
     def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
@@ -86,9 +94,10 @@ class TestDeliverWorkspace:
         )
         assert pr == PrRef(number=7, url="https://github.com/o/r/pull/7")
 
-        # base resolved from the repo's default branch
+        # base resolved from the repo's default branch; the delivery branch
+        # looked up (and found missing) before it is created
         assert ops.repo_get_calls == ["o/r"]
-        assert ops.ref_lookups == [("o/r", "heads/main")]
+        assert ops.ref_lookups == [("o/r", "heads/main"), ("o/r", f"heads/{branch_name('r42')}")]
 
         # all blobs ride ONE batched worker job (base64, binary-safe);
         # .git excluded
@@ -203,7 +212,10 @@ class TestDeliverWorkspace:
             draft=True,
         )
         assert ops.repo_get_calls == []
-        assert ops.ref_lookups == [("o/r", "heads/develop")]
+        assert ops.ref_lookups == [
+            ("o/r", "heads/develop"),
+            ("o/r", f"heads/{branch_name('r1')}"),
+        ]
         assert ops.pr_kwargs["base"] == "develop"
         assert ops.pr_kwargs["draft"] is True
 
@@ -370,6 +382,8 @@ class TestEmptyRepoBootstrap:
             # gets and the 404 an absent branch gets (#222); the host sees
             # None either way and bootstraps.
             def ref_lookup(self, repo: str, ref: str) -> str | None:
+                if ref != "heads/main":
+                    return super().ref_lookup(repo, ref)
                 self.ref_lookups.append((repo, ref))
                 return "base123" if self.bootstrapped else None
 
@@ -394,8 +408,11 @@ class TestEmptyRepoBootstrap:
         assert puts[0][2] is not None and puts[0][2]["branch"] == "main"
         # the bootstrap README round-trips as valid base64
         base64.b64decode(puts[0][2]["content"])
-        # ref looked up twice: the miss, then the bootstrapped base
-        assert ops.ref_lookups == [("o/r", "heads/main")] * 2
+        # base looked up twice (the miss, then the bootstrapped base), then
+        # the delivery branch once before it is created
+        assert ops.ref_lookups == [("o/r", "heads/main")] * 2 + [
+            ("o/r", f"heads/{branch_name('r9')}")
+        ]
 
     def test_still_missing_after_bootstrap_is_loud(self, tmp_path: Path) -> None:
         class NeverThereOps(StubOps):
@@ -627,41 +644,121 @@ class TestGitDiffDelivery:
         assert "**Files (" in ops.pr_kwargs["body"]
 
 
-class TestRedeliveryCollisions:
-    """`sbxloop deliver <run>` re-runs delivery for a run id whose branch
-    (and maybe PR) a prior partial attempt already created (#223). The 422
-    shapes are GitHub's documented answers, not yet field-observed."""
+def _refs_calls(ops: StubOps) -> list[tuple[str, str]]:
+    return [(m, p) for m, p, _ in ops.raw_calls if "/git/refs" in p]
 
-    def test_existing_branch_is_force_updated(self, tmp_path: Path) -> None:
-        class BranchExistsOps(StubOps):
+
+def _force_moves(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "deliver.branch_force_moved" in r.getMessage()
+    ]
+
+
+class TestRedeliveryCollisions:
+    """The delivery branch is a pure function of the run id, so it already
+    exists for every fix round after the first and for a manual
+    `sbxloop deliver <run>` after a failed attempt (#223). Field run
+    `rfxja288b` (#518) showed each such round paying a doomed refs POST —
+    a `worker.error` panel per healthy re-delivery — before the force-move
+    that was the real operation; the ref is now looked up first."""
+
+    def test_fresh_branch_is_created_with_one_call(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        ops = StubOps()  # branch_sha None: no prior delivery
+        with caplog.at_level(logging.INFO, logger="sbxloop.deliver"):
+            deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                round_no=1,
+            )
+        assert _refs_calls(ops) == [("POST", "/repos/o/r/git/refs")]
+        assert _force_moves(caplog) == []
+
+    def test_existing_branch_is_force_moved_without_a_doomed_create(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Round >= 2: the lookup finds the branch, so the POST that could
+        only 422 is never made — no `worker.error`, no `job_done error=`."""
+        ops = StubOps()
+        ops.branch_sha = "e31ae110407f0000deadbeef"
+        with caplog.at_level(logging.INFO, logger="sbxloop.deliver"):
+            pr = deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                round_no=3,
+            )
+        assert pr.number == 7
+        assert _refs_calls(ops) == [("PATCH", f"/repos/o/r/git/refs/heads/{branch_name('r42')}")]
+        (patch,) = [call for call in ops.raw_calls if call[0] == "PATCH"]
+        assert patch[2] == {"sha": "commit789", "force": True}
+        # a fresh PR was still opened from the (moved) branch
+        assert ops.pr_kwargs["head"] == branch_name("r42")
+        # the event says which round superseded which commit, not "a prior
+        # attempt"
+        (event,) = _force_moves(caplog)
+        assert "'from': 'e31ae110407f'" in event
+        assert "'to': 'commit789'" in event
+        assert "'round': 3" in event
+        assert "'run': 'r42'" in event
+        assert "prior attempt" not in event
+
+    def test_manual_redelivery_has_no_round_to_report(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`sbxloop deliver <run>` (#223) lands on the same branch; it does
+        not count rounds, and the event does not invent one."""
+        ops = StubOps()
+        ops.branch_sha = "abc123abc123abc123"
+        with caplog.at_level(logging.INFO, logger="sbxloop.deliver"):
+            deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        assert _refs_calls(ops) == [("PATCH", f"/repos/o/r/git/refs/heads/{branch_name('r42')}")]
+        (event,) = _force_moves(caplog)
+        assert "'from': 'abc123abc123'" in event and "'round'" not in event
+
+    def test_branch_appearing_between_lookup_and_create_is_still_force_moved(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The race the 422 catch is kept for: the lookup misses, then the
+        create collides anyway. Delivery still lands rather than failing."""
+
+        class RacedOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
                     self.raw_calls.append((method, path, body))
                     raise github_error("ref_exists_422")
-                if method == "PATCH" and "/git/refs/heads/" in path:
-                    self.raw_calls.append((method, path, body))
-                    return {"ref": path}
                 return super().raw(method, path, body)
 
-        ops = BranchExistsOps()
-        pr = deliver_workspace(
-            ops,  # type: ignore[arg-type]
-            "o/r",
-            run_id="r42",
-            outcome="x",
-            source_dir=make_workspace(tmp_path),
-        )
-        assert pr.number == 7
-        patches = [call for call in ops.raw_calls if call[0] == "PATCH"]
-        assert patches == [
-            (
-                "PATCH",
-                f"/repos/o/r/git/refs/heads/{branch_name('r42')}",
-                {"sha": "commit789", "force": True},
+        ops = RacedOps()
+        with caplog.at_level(logging.INFO, logger="sbxloop.deliver"):
+            pr = deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                round_no=1,
             )
+        assert pr.number == 7
+        assert _refs_calls(ops) == [
+            ("POST", "/repos/o/r/git/refs"),
+            ("PATCH", f"/repos/o/r/git/refs/heads/{branch_name('r42')}"),
         ]
-        # a fresh PR was still opened from the (moved) branch
-        assert ops.pr_kwargs["head"] == branch_name("r42")
+        (event,) = _force_moves(caplog)
+        assert "'to': 'commit789'" in event and "'from'" not in event
+        assert "between the lookup and the create" in event
 
     def test_existing_open_pr_is_reused(self, tmp_path: Path) -> None:
         class PrExistsOps(StubOps):

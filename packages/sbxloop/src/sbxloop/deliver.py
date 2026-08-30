@@ -164,15 +164,18 @@ def deliver_workspace(
     branch: str | None = None,
     closes: int | None = None,
     pr_number: int | None = None,
+    round_no: int | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
     ``branch`` overrides the per-run branch name so a fix round lands on the
-    pull request it was fixing: the refs POST 422s on the existing branch and
-    force-updates it. ``pr_number`` is that pull request when the caller
-    already knows it — a re-delivery then never POSTs a new PR at all (the
-    open PR follows its branch); without it, a 422 on the create is
-    confirmed by looking the branch's open PR up (see the module notes).
+    pull request it was fixing: the existing branch is looked up and
+    force-moved to the new commit (#518). ``pr_number`` is that pull request
+    when the caller already knows it — a re-delivery then never POSTs a new
+    PR at all (the open PR follows its branch); without it, a 422 on the
+    create is confirmed by looking the branch's open PR up (see the module
+    notes). ``round_no`` is the delivery round when the caller counts them
+    (the engine's fix rounds); it only decorates the force-move event.
 
     ``closes`` is the issue this delivery resolves; it becomes a
     ``Closes #N`` line in the PR body, so GitHub links issue and PR and
@@ -253,7 +256,7 @@ def deliver_workspace(
         f"commit for {repo}",
     )
     branch = branch or branch_name(run_id)
-    _point_branch(ops, repo, branch, commit)
+    _point_branch(ops, repo, branch, commit, run_id=run_id, round_no=round_no)
     log.info("deliver.branch_pushed", run=run_id, repo=repo, branch=branch, commit=commit[:12])
 
     if pr_number is not None:
@@ -292,28 +295,75 @@ def deliver_workspace(
     return pr
 
 
-def _point_branch(ops: GithubOps, repo: str, branch: str, commit: str) -> None:
-    """Create the delivery branch at ``commit`` — or, when a prior attempt
-    for the same run already created it, force-move it there.
+def _point_branch(
+    ops: GithubOps,
+    repo: str,
+    branch: str,
+    commit: str,
+    *,
+    run_id: str,
+    round_no: int | None = None,
+) -> None:
+    """Point the delivery branch at ``commit``: create it when it does not
+    exist yet, force-move it when it does.
 
-    The branch name is a pure function of the run id, so a re-delivery
-    (``sbxloop deliver <run>`` after a failed first attempt, #223) collides
-    with whatever the earlier attempt left. Force-updating rather than
-    suffixing keeps one branch (and one PR) per run: the newer commit is
-    built from the same artifacts and supersedes the old one.
+    The branch name is a pure function of the run id, so it already exists
+    for every fix round's re-delivery (round >= 2) and for a manual
+    ``sbxloop deliver <run>`` after a failed first attempt (#223).
+    Force-moving rather than suffixing keeps one branch (and one PR) per
+    run: the newer commit is built from the same artifacts and supersedes
+    the old one.
+
+    The ref is looked *up* before anything is created (#518). A blind POST
+    is guaranteed to 422 on every round after the first, and the worker
+    paints that expected refusal as a ``worker.error`` in the run's
+    chronology — one doomed API call and one red panel per healthy
+    re-delivery. The lookup makes the collision an answer, not an error;
+    the 422 catch stays only for the race where the ref appears between
+    the lookup and the create.
     """
+    previous = ops.ref_lookup(repo, f"heads/{branch}")
+    if previous is not None:
+        _force_move(ops, repo, branch, commit, run_id=run_id, round_no=round_no, previous=previous)
+        return
     try:
         ops.raw("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": commit})
     except GithubOpsError as exc:
         if not _is_ref_collision(exc):
             raise
-        log.info(
-            "deliver.branch_force_moved",
-            repo=repo,
-            branch=branch,
-            hint="a prior attempt for this run created the branch",
+        _force_move(
+            ops,
+            repo,
+            branch,
+            commit,
+            run_id=run_id,
+            round_no=round_no,
+            previous=None,
+            hint="the branch appeared between the lookup and the create",
         )
-        ops.raw("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": commit, "force": True})
+
+
+def _force_move(
+    ops: GithubOps,
+    repo: str,
+    branch: str,
+    commit: str,
+    *,
+    run_id: str,
+    round_no: int | None,
+    previous: str | None,
+    hint: str | None = None,
+) -> None:
+    """Force-move ``branch`` to ``commit`` and say what it superseded."""
+    fields: dict[str, Any] = {"run": run_id, "repo": repo, "branch": branch, "to": commit[:12]}
+    if previous is not None:
+        fields["from"] = previous[:12]
+    if round_no is not None:
+        fields["round"] = round_no
+    if hint is not None:
+        fields["hint"] = hint
+    log.info("deliver.branch_force_moved", **fields)
+    ops.raw("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": commit, "force": True})
 
 
 def _find_open_pr(ops: GithubOps, repo: str, branch: str) -> PrRef | None:

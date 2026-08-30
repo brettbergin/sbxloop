@@ -1209,6 +1209,7 @@ class LoopEngine:
             branch=branch,
             closes=gh.deliver_closes,
             pr_number=run.pr_number,
+            round_no=round_no,
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")

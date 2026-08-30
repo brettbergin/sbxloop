@@ -181,6 +181,12 @@ class FakeGithub(GithubOps):
         return {"default_branch": "main"}
 
     def ref_lookup(self, repo: str, ref: str) -> str | None:
+        # A delivery branch (``sbxloop/<run>``) exists only once delivery
+        # created it, and then sits at the PR head; anything else is a base
+        # branch that is simply there.
+        branch = ref.removeprefix("heads/")
+        if branch.startswith("sbxloop/"):
+            return self.head_sha if branch in self.branches else None
         return "base123"
 
     def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
