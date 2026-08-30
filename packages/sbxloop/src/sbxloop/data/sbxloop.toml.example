@@ -147,6 +147,9 @@ secret_strategy = "proxy"
 # merge_method = "squash"    # squash | merge | rebase
 # delete_branch_on_merge = true
 # merge_update_attempts = 3  # update-branch calls when protection wants "up to date"
+# followups = "issues"       # after the merge, the review's out-of-scope notes: issues | comment | off
+# followup_label = "sbxloop:follow-up"  # never the trigger label — a human promotes a follow-up
+# max_followups_per_run = 5
 # review_diff_max_chars = 150000  # diff budget handed to the self-review
 
 # [artifacts]

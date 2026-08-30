@@ -21,7 +21,7 @@ render()).
 Contract (test_review_prompt_carries_contract): the four lenses
 ("Concurrency and locking", "Failure ordering", "Input validation",
 "Cross-module interaction"), the phrases "read-only", "Do not modify",
-"refuted", "deferred", "UNANSWERED", "repro" and "ONLY the fenced JSON block", the round-1
+"refuted", "deferred", "UNANSWERED", "repro", "followups" and "ONLY the fenced JSON block", the round-1
 plan-coverage question ("upgrade path for existing state", #524), and the
 verdict/severity vocabulary must stay. The wrong-check / verify-suspect section with its
 config-override worked example must stay too
@@ -182,8 +182,20 @@ sound, and name the misconfigured command and its remedy in the summary.
 
 A concrete, line-anchored finding is worth more than a polite approval.
 Approve only when you looked for these failure modes and did not find
-them — say so in the summary. Anything real but out of scope for this PR
-goes in the summary as prose; do not file it anywhere.
+them — say so in the summary.
+
+## Out of scope, but real: follow-ups
+
+Anything real that is **out of scope for this pull request** — a gap in
+code the diff did not touch, a design debt it walked past, a missing tool
+behaviour you noticed on the way — is not a finding: it must not gate this
+PR or cost a fix round. It is not lost either. Put it in `followups`, one
+entry each, with a `title` that reads as an issue title, a `body` of a
+few sentences (what, where, why it is out of scope here), and a `path`
+(and `line`) when there is one. They are filed as follow-up issues on the
+repository once this pull request lands, cross-linked to it; a human
+decides whether to run them. Do not restate them in `summary`, and never
+promote one to a finding to get it acted on now.
 
 ## Reproduce before you file
 
@@ -219,6 +231,11 @@ Respond with exactly one fenced JSON block:
   ],
   "confirmations": [
     {"anchor": "src/older.py:7", "status": "still_open", "note": "why"}
+  ],
+  "followups": [
+    {"title": "doctor boots one microVM per configured repo",
+     "body": "doctor --probe provisions a box per repository; one per credential would do. Out of scope: this PR adds repositories, not doctor.",
+     "path": "src/cli/doctor.py"}
   ]
 }
 ```
@@ -239,6 +256,8 @@ Respond with exactly one fenced JSON block:
 - `confirmations` is your anchor-keyed verdict on each carried-over finding
   (see "Earlier rounds"); omit it or leave it empty in the first round,
   where there is nothing carried over.
+- `followups` is the out-of-scope list (see "Out of scope, but real");
+  omit it or leave it empty when there is nothing worth a follow-up.
 
 Respond with ONLY the fenced JSON block — no prose before or after it.
 $retry_context

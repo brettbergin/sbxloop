@@ -112,6 +112,34 @@ class ReviewFinding(_Model):
         return ReviewComment(path=self.path, line=self.line, body=body)
 
 
+class Followup(_Model):
+    """Something real the reviewer saw that is out of scope for this PR
+    (#517): not a finding — it must not gate the PR or cost a fix round —
+    but not lost either. Filed as a follow-up issue once the run lands."""
+
+    title: str
+    body: str = ""
+    path: str = ""
+    line: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _check(self) -> Followup:
+        if not self.title.strip():
+            raise ValueError("a follow-up needs a `title`")
+        return self
+
+    @property
+    def anchor(self) -> str:
+        if not self.path:
+            return ""
+        return f"{self.path}:{self.line}" if self.line else self.path
+
+    def render(self) -> str:
+        where = f" (`{self.anchor}`)" if self.anchor else ""
+        body = " ".join(self.body.split())
+        return f"- **{self.title.strip()}**{where}" + (f" — {body}" if body else "")
+
+
 CarriedStatus = Literal["confirmed_fixed", "still_open"]
 
 
@@ -154,6 +182,9 @@ class ReviewVerdict(_Model):
     # Round n+1 only: the verdict on each carried-over finding, keyed by its
     # anchor. Posted in that finding's thread, never in this review's body.
     confirmations: list[CarriedVerdict] = Field(default_factory=list)
+    # Real but out of scope for this PR (#517): rendered in the review body
+    # under their own heading and filed as issues once the run lands.
+    followups: list[Followup] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check(self) -> ReviewVerdict:
@@ -313,11 +344,13 @@ def review_body(
             parts.append(
                 "Findings without a thread of their own:\n" + "\n".join(f.render() for f in in_body)
             )
+        parts.extend(_followups_section(verdict))
         parts.append(f"<sub>sbxloop review round {round} of run `{run_id}`</sub>")
         return "\n\n".join(parts)
     if not anchored:
         if verdict.findings:
             parts.append("Findings:\n" + "\n".join(f.render() for f in verdict.findings))
+        parts.extend(_followups_section(verdict))
         parts.append(f"<sub>sbxloop review round {round} of run `{run_id}`</sub>")
         return "\n\n".join(parts)
     unanchored = [f for f in verdict.findings if f.line is None]
@@ -332,8 +365,18 @@ def review_body(
             f"_{dropped} further inline comment(s) were not posted "
             f"(cap {MAX_INLINE_COMMENTS}); the ones above are the review's own order._"
         )
+    parts.extend(_followups_section(verdict))
     parts.append(f"<sub>sbxloop review round {round} of run `{run_id}`</sub>")
     return "\n\n".join(parts)
+
+
+def _followups_section(verdict: ReviewVerdict) -> list[str]:
+    if not verdict.followups:
+        return []
+    return [
+        "Follow-ups — real, but out of scope for this pull request (filed as issues "
+        "once it lands):\n" + "\n".join(f.render() for f in verdict.followups)
+    ]
 
 
 _REFUTED_LINE = re.compile(r"refut", re.IGNORECASE)

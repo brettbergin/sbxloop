@@ -208,6 +208,13 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return Harness(fake_sbx, tmp_path, monkeypatch)
 
 
+def new_run_id_for(engine: LoopEngine) -> str:
+    """A run id to pre-seed store rows under before `start(run_id=...)`."""
+    from sbxloop.ids import new_run_id
+
+    return new_run_id()
+
+
 def harness_rows(harness: Harness, run_id: str) -> list[Any]:
     """The run's phase rows, read back from the harness's state db."""
     return list(StateStore(harness.state_dir / "state.db").phase_attempts(run_id))
@@ -1676,6 +1683,144 @@ class TestPipeline:
         assert (2, 1, 0) in counts
         (thread,) = [t for t in fake.threads if t.anchor == "hello.txt:2"]
         assert thread.is_resolved and any("**deferred**" in c.body for c in thread.comments[1:])
+
+    FOLLOWUP_A: ClassVar[dict[str, str]] = {
+        "title": "doctor boots one microVM per configured repo",
+        "body": "one per credential would do",
+        "path": "src/cli/doctor.py",
+    }
+    FOLLOWUP_A_AGAIN: ClassVar[dict[str, str]] = {
+        "title": "Doctor boots one micro-VM per configured repo",
+        "body": "again",
+    }
+    FOLLOWUP_B: ClassVar[dict[str, str]] = {
+        "title": "a permanently-404 repo warns every poll forever"
+    }
+
+    def _followup_script(self) -> list[dict[str, Any]]:
+        minor = {
+            "path": "hello.txt",
+            "line": 2,
+            "body": "the greeting is not documented",
+            "severity": "minor",
+        }
+        round_one = review("request_changes", "one problem, one nit", FINDING, minor)
+        round_one["json"]["followups"] = [self.FOLLOWUP_A]
+        fix = {
+            "text": "Fixed.\n\naddressed: hello.txt:1 — hello\ndeferred: hello.txt:2 — docs later"
+        }
+        round_two = review("approve", "fixed; the nit is deferred")
+        round_two["json"]["followups"] = [self.FOLLOWUP_A_AGAIN, self.FOLLOWUP_B]
+        return [taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two]
+
+    def test_a_landed_run_files_deduped_followups_never_queued(self, harness: Harness) -> None:
+        """#517: the reviewer's out-of-scope notes and the fix round's
+        deferral become issues once the PR merges — one each, cross-linked,
+        with the follow-up label and never the trigger label."""
+        fake = FakeGithub()
+        harness.script(self._followup_script())
+        result = harness.pipeline(fake).start("ship hello")
+        assert result.state == "merged"
+        titles = [t for t, _, _ in fake.issues_created]
+        assert titles == [
+            "doctor boots one microVM per configured repo",
+            "a permanently-404 repo warns every poll forever",
+            "the greeting is not documented",
+        ]
+        for _, body, labels in fake.issues_created:
+            assert labels == ["sbxloop:follow-up"]
+            assert "sbxloop:run" not in labels
+            assert "Out of scope for [PR #7]" in body and f"run `{result.run_id}`" in body
+            assert "<!-- sbxloop-followup run=" in body
+        assert "the fix round deferred" in fake.issues_created[2][1]
+        assert fake.labels_created == ["sbxloop:follow-up"]
+        # The PR gets one pointer comment listing them.
+        pointer = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        assert len(pointer) == 1 and "issues/901" in pointer[0] and "issues/903" in pointer[0]
+        (event,) = self._events(harness, HostEventTypes.RUN_FOLLOWUPS)
+        assert event.data["mode"] == "issues" and len(event.data["filed"]) == 3
+        # Filed after the merge, recorded per issue.
+        merged_at = harness.event_types().index(HostEventTypes.RUN_MERGED)
+        assert harness.event_types().index(HostEventTypes.RUN_FOLLOWUPS) > merged_at
+        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "followup"]
+        assert [r["status"] for r in rows] == ["filed", "filed", "filed", "listed"]
+
+    def test_a_failed_run_files_nothing(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        script = self._followup_script()
+        script[-1] = review("request_changes", "still bad", FINDING)  # exhausts with max 1
+        harness.script(script)
+        result = harness.pipeline(fake, landing={"max_review_rounds": 1}).start("ship hello")
+        assert result.state == "failed"
+        assert (
+            fake.issues_created == [] and self._events(harness, HostEventTypes.RUN_FOLLOWUPS) == []
+        )
+
+    def test_resume_after_filing_does_not_double_file(self, harness: Harness) -> None:
+        """Two windows: an issue recorded in the store, and one filed on the
+        repository but not yet recorded (found by its body marker)."""
+        fake = FakeGithub()
+        harness.script(self._followup_script())
+        engine = harness.pipeline(fake)
+        run_id = new_run_id_for(engine)
+        # Pretend an earlier attempt filed A (recorded) and B (on the repo only).
+        from sbxloop.engine.followups import followup_key, followup_marker
+
+        engine.store.record_phase(
+            run_id,
+            "followup",
+            task_id=None,
+            attempt=1,
+            status="filed",
+            output_json=json.dumps(
+                {"key": followup_key(self.FOLLOWUP_A["title"]), "title": "A", "url": "https://x/1"}
+            ),
+            started_at=1.0,
+        )
+        fake.existing_issues = [
+            {
+                "html_url": "https://x/2",
+                "body": "…\n" + followup_marker(run_id, followup_key(self.FOLLOWUP_B["title"])),
+            }
+        ]
+        result = engine.start("ship hello", run_id=run_id)
+        assert result.state == "merged"
+        assert [t for t, _, _ in fake.issues_created] == ["the greeting is not documented"]
+        (event,) = self._events(harness, HostEventTypes.RUN_FOLLOWUPS)
+        assert [f["url"] for f in event.data["filed"]] == [
+            "https://x/1",
+            "https://x/2",
+            "https://github.com/o/r/issues/901",
+        ]
+
+    def test_comment_mode_lists_on_the_pr_instead_of_filing(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script(self._followup_script())
+        result = harness.pipeline(fake, landing={"followups": "comment"}).start("ship hello")
+        assert result.state == "merged" and fake.issues_created == []
+        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        assert (
+            "Not filed as issues" in listed and "- [ ] **the greeting is not documented**" in listed
+        )
+        (event,) = self._events(harness, HostEventTypes.RUN_FOLLOWUPS)
+        assert event.data["mode"] == "comment" and len(event.data["listed"]) == 3
+
+    def test_off_drops_followups_entirely(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script(self._followup_script())
+        result = harness.pipeline(fake, landing={"followups": "off"}).start("ship hello")
+        assert result.state == "merged" and fake.issues_created == []
+        assert not any(c.startswith("## Follow-ups") for c in fake.issue_comments)
+        assert self._events(harness, HostEventTypes.RUN_FOLLOWUPS) == []
+
+    def test_the_cap_bounds_what_is_filed(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script(self._followup_script())
+        result = harness.pipeline(fake, landing={"max_followups_per_run": 1}).start("ship hello")
+        assert result.state == "merged"
+        assert [t for t, _, _ in fake.issues_created] == [
+            "doctor boots one microVM per configured repo"
+        ]
 
     def test_review_exhaustion_fails_with_the_pr_left_a_draft(self, harness: Harness) -> None:
         fake = FakeGithub()

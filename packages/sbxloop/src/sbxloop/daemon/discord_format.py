@@ -1285,6 +1285,25 @@ def format_for_discord(
         label = f"#{data.get('pr')}"
         who = " (by a human)" if data.get("by_human") else ""
         return [line(f"🎉 **merged** PR {link(label, data.get('url'))}{who}", flush=True)]
+    if t == HostEventTypes.RUN_FOLLOWUPS:
+        filed = [f for f in _list(data, "filed") if isinstance(f, dict)]
+        if filed:
+            refs = ", ".join(
+                link(_one_line(str(f.get("title") or ""), 60), f.get("url")) for f in filed
+            )
+            return [
+                line(f"📌 filed {len(filed)} follow-up issue(s) (not queued): {refs}", flush=True)
+            ]
+        listed = _list(data, "listed")
+        if listed:
+            return [
+                line(
+                    f"📌 {len(listed)} follow-up(s) listed on the PR, not filed: "
+                    + "; ".join(_one_line(str(t), 60) for t in listed),
+                    flush=True,
+                )
+            ]
+        return []
     if t == HostEventTypes.RUN_BLOCKED:
         why = _one_line(data.get("why") or "", 300)
         label = f"#{data.get('pr')}"

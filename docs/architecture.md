@@ -220,7 +220,19 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
 - **CI** — poll the delivered head's check runs; red fetches the failing
   jobs' logs into a fix brief. "No check runs yet" is trusted as "no CI"
   only after `ci_settle_s`.
-- **LAND** — see below.
+- **LAND** — see below. Once the PR has merged — never before — the
+  review's `followups` (real, out of scope, kept out of `findings` so they
+  cost no fix round) and the fix rounds' `deferred:` findings are filed as
+  follow-up issues on the repository (#517): `engine/followups.py` merges
+  duplicates across rounds by title, each issue carries a
+  `<!-- sbxloop-followup run=… key=… -->` marker and is recorded as a
+  `followup` phase row before the next is filed (a resume between filing
+  and recording finds it on the repository by marker), the count is capped
+  by `[landing] max_followups_per_run`, and the label is
+  `followup_label`, **never** the trigger label — the 1.0 rule that the
+  loop files no work of its own stands; a human promotes a follow-up.
+  `followups = "comment"` posts one checklist comment on the PR instead;
+  `"off"` drops them.
 
 Two round budgets bound the fix loop: `[landing] max_review_rounds` for
 verdicts that request changes, `max_ci_rounds` for the mechanical failures

@@ -255,6 +255,10 @@ def test_review_prompt_carries_contract() -> None:
     # #524: round 1 reviews the plan too — a persisted-state change with no
     # upgrade-path task is a blocking finding on the plan.
     assert "review the **plan** as well as the diff" in text
+    # #517: out-of-scope notes are a first-class output, never a finding.
+    assert "## Out of scope, but real: follow-ups" in text
+    assert '"followups":' in text and "never\npromote one to a finding" in text
+    assert "do not file it anywhere" not in text
     assert "**upgrade path for existing state**" in text
     assert "raw pre-change database" in text
     assert "`blocking` finding on the plan" in text

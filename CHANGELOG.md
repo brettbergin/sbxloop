@@ -6,6 +6,26 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Follow-up issues from a landed run** (#517). The reviewer's out-of-scope
+  notes used to be prose in a review body nobody reads after the merge
+  (run rfxja288b left two, both worth issues, both filed by hand).
+  `ReviewVerdict` gains `followups` (`title`, `body`, optional
+  `path`/`line`), the review prompt asks for them separately from
+  `findings` and forbids promoting one to a finding, and they render in
+  the review body under their own heading. After the pull request merges —
+  never on a failed or blocked run — the engine files them as issues on the
+  run's repository, along with the findings the fix rounds `deferred:`
+  (#522), each cross-linked to the PR, originating issue, run and round.
+  Deduplicated by normalised title within the run and by a body marker
+  against the repository (a resume between filing and recording does not
+  double-file), capped by `[landing] max_followups_per_run` (5), labelled
+  `[landing] followup_label` (`sbxloop:follow-up`) and **never** the trigger
+  label — the loop still files no work of its own; a human promotes one. A
+  PR comment lists what was filed; `followups = "comment"` lists them on the
+  PR instead of filing, `"off"` drops them. Narrated as `run.followups`.
+
 ### Fixed
 
 - **The fixer can no longer drop a non-blocking finding on the floor**

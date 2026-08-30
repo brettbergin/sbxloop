@@ -627,6 +627,14 @@ class LandingConfig(_ConfigModel):
     merge_method: MergeMethod = "squash"
     delete_branch_on_merge: bool = True
     merge_update_attempts: int = Field(default=3, ge=0)
+    # What becomes of the review's out-of-scope notes and the fix rounds'
+    # deferred findings once the PR merges (#517): filed as issues on the
+    # repository with `followup_label` — never the trigger label, a human
+    # promotes them — listed in one PR comment instead, or dropped. Capped
+    # per run so a chatty reviewer cannot fill the tracker.
+    followups: Literal["issues", "comment", "off"] = "issues"
+    followup_label: str = "sbxloop:follow-up"
+    max_followups_per_run: int = Field(default=5, ge=0)
     # The reviewer is shown the PR's diff inline; past this many characters
     # the diff is clipped and the reviewer reads the rest from the tree.
     review_diff_max_chars: int = Field(default=150_000, ge=10_000)

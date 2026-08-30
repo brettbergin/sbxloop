@@ -54,12 +54,19 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib.parse import quote
 
 from pydantic import ValidationError
 
 from sbxloop import hostgit
 from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace, ensure_repository
+from sbxloop.engine.followups import (
+    checklist_comment,
+    collect_followups,
+    issue_body,
+    marker_key,
+)
 from sbxloop.engine.landing import (
     Blocked,
     CiTimeout,
@@ -2091,12 +2098,177 @@ class LoopEngine:
                 review_rounds=run.review_rounds,
                 ci_rounds=run.ci_rounds,
             )
+            # Only now (#517): a run that failed or was blocked files nothing.
+            self._file_followups(p, run)
         elif isinstance(outcome, Blocked):
             log.warning("run.blocked", run=run_id, pr=number, why=outcome.why)
             self.bus.emit(
                 HostEventTypes.RUN_BLOCKED, run_id, pr=number, url=run.pr_url, why=outcome.why
             )
         return outcome
+
+    def _file_followups(self, p: Pipeline, run: RunRecord) -> None:
+        """File the run's follow-ups on its repository after the merge (#517).
+
+        Best-effort and idempotent: the PR is merged, so a GitHub failure
+        here is logged, never raised. Each filed issue is recorded as a
+        ``followup`` phase row before the next is filed, and the body carries
+        a run/key marker, so a resume between filing and recording finds the
+        issue on the repository rather than filing it twice. Never queued for
+        the loop: the follow-up label, not the trigger label.
+        """
+        ops, repo, run_id = p.ops, p.repo, p.run_id
+        cfg = self.config.landing
+        if ops is None or repo is None or cfg.followups == "off" or run.pr_number is None:
+            return
+        candidates = collect_followups(self._review_rounds(run_id))[: cfg.max_followups_per_run]
+        if not candidates:
+            return
+        already = self._recorded_followups(run_id)
+        filed: list[tuple[str, str]] = []
+        listed: list[str] = []
+        started = time.time()
+        try:
+            if cfg.followups == "issues":
+                on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
+                self._ensure_label(ops, repo, cfg.followup_label)
+                for cand in candidates:
+                    title = cand.followup.title.strip()
+                    if cand.key in already:
+                        filed.append((title, already[cand.key]))
+                        continue
+                    if cand.key in on_repo:
+                        url = on_repo[cand.key]
+                    else:
+                        ref = ops.issue_create(
+                            repo,
+                            title,
+                            issue_body(
+                                cand,
+                                run_id=run_id,
+                                repo=repo,
+                                pr_number=run.pr_number,
+                                pr_url=run.pr_url or "",
+                                closes=self.config.github.deliver_closes,
+                            ),
+                            labels=[cfg.followup_label],
+                        )
+                        url = ref.url
+                    filed.append((title, url))
+                    self.store.record_phase(
+                        run_id,
+                        "followup",
+                        task_id=None,
+                        attempt=len(already) + len(filed),
+                        status="filed",
+                        output_json=json.dumps({"key": cand.key, "title": title, "url": url}),
+                        started_at=started,
+                    )
+                    already[cand.key] = url
+                if filed and "(comment)" not in already:
+                    # One pointer on the PR, so the human sees them without
+                    # opening the tracker.
+                    ops.pr_issue_comment(
+                        repo,
+                        run.pr_number,
+                        checklist_comment(candidates, run_id=run_id, filed=filed),
+                    )
+                    self._record_followup_comment(run_id, len(already) + 1, len(filed), started)
+            else:
+                if "(comment)" not in already:
+                    ops.pr_issue_comment(
+                        repo, run.pr_number, checklist_comment(candidates, run_id=run_id)
+                    )
+                    self._record_followup_comment(
+                        run_id, len(already) + 1, len(candidates), started
+                    )
+                listed = [c.followup.title.strip() for c in candidates]
+        except GithubOpsError:
+            log.warning("run.followups_failed", run=run_id, pr=run.pr_number, exc_info=True)
+        if not filed and not listed:
+            return
+        log.info(
+            "run.followups",
+            run=run_id,
+            pr=run.pr_number,
+            mode=cfg.followups,
+            filed=[url for _, url in filed],
+            listed=len(listed),
+        )
+        self.bus.emit(
+            HostEventTypes.RUN_FOLLOWUPS,
+            run_id,
+            pr=run.pr_number,
+            mode=cfg.followups,
+            filed=[{"title": t, "url": u} for t, u in filed],
+            listed=listed,
+        )
+
+    def _record_followup_comment(
+        self, run_id: str, attempt: int, count: int, started: float
+    ) -> None:
+        self.store.record_phase(
+            run_id,
+            "followup",
+            task_id=None,
+            attempt=attempt,
+            status="listed",
+            output_json=json.dumps({"key": "(comment)", "count": count}),
+            started_at=started,
+        )
+
+    def _recorded_followups(self, run_id: str) -> dict[str, str]:
+        """``{key: url}`` of the follow-ups this run already filed (or
+        ``"(comment)"`` when the checklist comment was posted)."""
+        out: dict[str, str] = {}
+        for row in self.store.phase_attempts(run_id):
+            if row["phase"] != "followup":
+                continue
+            try:
+                data = json.loads(row["output_json"] or "{}")
+            except ValueError:
+                continue
+            key = str(data.get("key") or "")
+            if key:
+                out[key] = str(data.get("url") or "")
+        return out
+
+    @staticmethod
+    def _filed_on_repo(ops: GithubOps, repo: str, label: str, run_id: str) -> dict[str, str]:
+        """Follow-ups already on the repository for this run, by key — the
+        crash-window dedup (filed, died before recording). Read from the
+        label's issue list, which unlike search is not eventually consistent."""
+        out: dict[str, str] = {}
+        try:
+            data = ops.raw(
+                "GET",
+                f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all&per_page=100",
+            )
+        except GithubOpsError:
+            log.warning("run.followups_list_failed", repo=repo, exc_info=True)
+            return out
+        for issue in data if isinstance(data, list) else []:
+            if not isinstance(issue, dict):
+                continue
+            found = marker_key(str(issue.get("body") or ""))
+            if found and found[0] == run_id:
+                out[found[1]] = str(issue.get("html_url") or "")
+        return out
+
+    @staticmethod
+    def _ensure_label(ops: GithubOps, repo: str, label: str) -> None:
+        """Create the follow-up label if the repository lacks it; an
+        existing one (422) is fine, and a refusal must not stop the filing —
+        GitHub accepts an issue whose label it cannot find."""
+        try:
+            ops.raw(
+                "POST",
+                f"/repos/{repo}/labels",
+                {"name": label, "color": "c5def5", "description": "filed by sbxloop after a merge"},
+            )
+        except GithubOpsError as exc:
+            if "422" not in str(exc) and "already_exists" not in str(exc):
+                log.warning("run.followup_label_failed", repo=repo, label=label, error=str(exc))
 
     def _login(self, p: Pipeline) -> str:
         """The loop's own GitHub login, read once per drive."""
