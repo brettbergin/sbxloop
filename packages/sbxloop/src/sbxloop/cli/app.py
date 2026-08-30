@@ -1502,7 +1502,12 @@ def daemon(
     from sbxloop.daemon.loop import DaemonLoop
     from sbxloop.daemon.model import DaemonNotice, WorkItem
     from sbxloop.daemon.paths import resolve_state_dir
-    from sbxloop.daemon.sources import GitHubLabels, build_github_source
+    from sbxloop.daemon.sources import (
+        REPO_HEALTH_KEY,
+        GitHubLabels,
+        MultiRepoIssueSource,
+        build_github_source,
+    )
 
     log = get_logger("sbxloop.daemon")
     started_at = time.monotonic()
@@ -1648,12 +1653,24 @@ def daemon(
     # Every enabled configured repository is polled; the daemon-wide
     # guardrails below (run cap, retry cap, breaker, one-run-at-a-time)
     # stay global across all of them.
+    # Per-repository polling health (#516) is persisted so `doctor` in
+    # another process can show a suspended repository; a new daemon process
+    # starts every repository fresh (a config edit is the usual reason for
+    # the restart, and a still-broken repo re-suspends on its own).
+    dstore.clear_prefix(REPO_HEALTH_KEY)
+
+    def persist_repo_health(repo: str, data: dict[str, Any] | None) -> None:
+        dstore.set_value(f"{REPO_HEALTH_KEY}{repo}", json.dumps(data) if data else None)
+
     source = build_github_source(
         github.ops,
         config.github.enabled_repos(),
         labels,
         on_failure=github.note_failure,
         stale_after_s=config.daemon.claim_stale_after_s,
+        poll_interval_s=config.daemon.poll_interval_s,
+        suspend_after=config.daemon.repo_suspend_after,
+        persist=persist_repo_health,
     )
 
     # One line an operator can read back from the journal to know exactly
@@ -1718,6 +1735,8 @@ def daemon(
         raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx)
+    if isinstance(source, MultiRepoIssueSource):
+        source.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so
     # the concierge's first `version_status` answers without a network call.
     versions = VersionProbe(sbx=sbx)

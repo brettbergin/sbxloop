@@ -219,7 +219,15 @@ each item id and issue URL, so you can clear the in-progress label and re-add
 Everything under `[[github.repos]]` is per repository; the `[daemon]`
 guardrails — the daily run cap, the per-item attempt and resume caps, the
 consecutive-failure circuit breaker, and one run at a time — stay
-**daemon-wide** and are shared across all of them. That is what makes one
+**daemon-wide** and are shared across all of them. Polling health is the
+one per-repository guardrail (#516): a repository that fails to poll is
+backed off on its own (doubling, capped at an hour) and, after
+`[daemon] repo_suspend_after` consecutive failures — or at once when GitHub
+says it is gone for this token (404/410, a permission 403) — **suspended**
+from polling, announced once on Discord, shown in `ctl status`, the
+concierge's repository listing and `sbxloop doctor`, and resumed with
+`sbxloop daemon ctl resume-repo <owner/name>` (or a daemon restart, which
+starts every repository fresh). The healthy repositories poll on as usual. That is what makes one
 unit the right shape: the host's budget is bounded in total, and a
 repository that keeps failing trips the breaker for the whole daemon. Deploy
 health checks are unaffected; `sbxloop doctor` reports one row per

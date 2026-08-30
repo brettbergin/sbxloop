@@ -8,6 +8,26 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A repository that keeps failing to poll is backed off and suspended on
+  its own, not warned about every tick forever** (#516).
+  `MultiRepoIssueSource` swallowed a per-repository poll failure so the
+  healthy repositories still fed the queue — right for an outage, wrong
+  for a renamed, private or misspelled repository, which logged a warning
+  and wasted an API call every poll indefinitely while the daemon looked
+  healthy from Discord and `status`. Each repository now has its own
+  health: a failure backs it off (poll interval doubling per consecutive
+  failure, capped at an hour) while its neighbours poll on; after
+  `[daemon] repo_suspend_after` (default 10) consecutive failures — or at
+  once when GitHub says the repository is gone for this token (404/410, a
+  permission 403; rate limits and 5xx back off instead) — it is
+  **suspended**: excluded from polling, announced once on Discord
+  (`source.repo_suspended`), shown in `ctl status` (`repos:` line, only
+  when something is wrong), the concierge's `list_repos` and `sbxloop doctor` (from the health the daemon persists), and resumed with the new
+  `ctl resume-repo <owner/name>` / `!sbx resume-repo`, or by a daemon
+  restart. Recovery is one info line and one notice. The all-repositories-
+  failed re-raise that drives the loop-level source backoff is unchanged,
+  and a suspended repository no longer counts toward it.
+
 - **`sbxloop doctor` boots nothing by default, and at most one github
   sandbox per credential when it probes** (#515). Multi-repo support (#511)
   wired a reachability probe that provisioned one github-only microVM per

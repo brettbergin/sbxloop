@@ -10,12 +10,13 @@ for the full suite and refreshes the version-keyed verdict cache.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.table import Table
@@ -101,11 +102,49 @@ def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, st
     return False, f"none of {'/'.join(GH_TOKEN_ENVS)} are set"
 
 
+def daemon_repo_health(
+    config: Config, sources: dict[str, str], env: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """Per-repository polling health the running daemon persisted (#516),
+    by repository, from the daemon's own state db — read only when that
+    file exists, so doctor never creates one."""
+    from sbxloop.daemon.paths import resolve_state_dir
+    from sbxloop.daemon.sources import REPO_HEALTH_KEY
+    from sbxloop.daemon.store import DaemonStore
+
+    try:
+        state_dir = resolve_state_dir(
+            config, sources, cwd=Path.cwd(), env=env, home=Path.home()
+        ).path
+    except Exception:
+        return {}
+    db = state_dir / "state.db"
+    if not db.is_file():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        store = DaemonStore(db)
+        try:
+            for key, value in store.values_with_prefix(REPO_HEALTH_KEY).items():
+                try:
+                    data = json.loads(value)
+                except ValueError:
+                    continue
+                if isinstance(data, dict):
+                    out[key[len(REPO_HEALTH_KEY) :].casefold()] = data
+        finally:
+            store.close()
+    except Exception:  # a store doctor cannot read is its own row elsewhere
+        return {}
+    return out
+
+
 def repo_checks(
     config: Config,
     env: dict[str, str],
     *,
     probe: RepoProbeFn | None = None,
+    health: dict[str, dict[str, Any]] | None = None,
 ) -> list[Check]:
     """One :class:`Check` per configured repository.
 
@@ -128,6 +167,25 @@ def repo_checks(
         token_ok, token_detail = _repo_token_status(entry, env)
         base = effective.deliver_base or "(repo default)"
         notes = [token_detail, f"base {base}"]
+        state = (health or {}).get(entry.repo.casefold())
+        if state and state.get("suspended"):
+            rows.append(
+                Check(
+                    name,
+                    True,
+                    "; ".join(
+                        [
+                            *notes,
+                            f"SUSPENDED from polling by the daemon: {state.get('reason')} "
+                            f"— `sbxloop daemon ctl resume-repo {entry.repo}` once fixed",
+                        ]
+                    ),
+                    hard=False,
+                )
+            )
+            continue
+        if state and state.get("next_poll"):
+            notes.append(f"backing off after {state.get('failures')} poll failure(s)")
         if effective.create_repo:
             notes.append("create_repo on")
         if not token_ok:
@@ -528,7 +586,11 @@ def collect_checks(
         # One row per configured repository: a repo whose credentials or
         # probe fail must not hide the verdict for the others.
         report("checking configured repositories")
-        checks.extend(repo_checks(config, env, probe=probe_repo))
+        checks.extend(
+            repo_checks(
+                config, env, probe=probe_repo, health=daemon_repo_health(config, sources, env)
+            )
+        )
         # A workspace that is a checkout of another repository would build a
         # repo's runs from the wrong tree (#526): refuse before dispatch.
         checks.extend(workspace_origin_checks(config))

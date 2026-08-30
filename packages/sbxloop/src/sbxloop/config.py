@@ -706,6 +706,12 @@ class DaemonConfig(_ConfigModel):
     # after it is reclaimed too. A few poll intervals: a live claimer
     # starts its run within one.
     claim_stale_after_s: float = Field(default=300.0, ge=0)
+    # With several repositories, one that keeps failing to poll is backed
+    # off on its own (doubling, capped at an hour) and, after this many
+    # consecutive failures — or at once when GitHub says it is gone for this
+    # token — suspended from polling until `ctl resume-repo` (#516). The
+    # healthy repositories are never punished for a bad neighbour.
+    repo_suspend_after: int = Field(default=10, ge=1)
     retry_backoff_s: float = 900.0
     max_consecutive_failures: int = 3
     breaker_cooldown_s: float = 3600.0

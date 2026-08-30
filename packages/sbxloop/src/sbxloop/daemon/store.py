@@ -1154,6 +1154,25 @@ class DaemonStore:
                 )
             self._conn.commit()
 
+    def values_with_prefix(self, prefix: str) -> dict[str, str]:
+        """Every ``daemon_state`` value whose key starts with ``prefix``."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM daemon_state WHERE key LIKE ? ESCAPE '\\'",
+                (prefix.replace("%", "\\%").replace("_", "\\_") + "%",),
+            )
+            return {str(r["key"]): str(r["value"]) for r in rows if r["value"] is not None}
+
+    def clear_prefix(self, prefix: str) -> int:
+        """Delete every ``daemon_state`` value whose key starts with ``prefix``."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM daemon_state WHERE key LIKE ? ESCAPE '\\'",
+                (prefix.replace("%", "\\%").replace("_", "\\_") + "%",),
+            )
+            self._conn.commit()
+            return int(cursor.rowcount)
+
     def item_for_run(self, run_id: str) -> str | None:
         """The work item a run was dispatched for (ledger lookup)."""
         with self._lock:

@@ -201,6 +201,8 @@ class FakeLoop:
         self.retried: list[tuple[str, str | None]] = []
         self.hold_calls: list[tuple[str, str | None, str | None]] = []
         self.granted: list[tuple[str, int, str | None]] = []
+        self.repos: list[dict[str, Any]] = []
+        self.resumed_repos: list[tuple[str, str | None]] = []
 
     @property
     def paused(self) -> bool:
@@ -227,6 +229,7 @@ class FakeLoop:
             "holds": sorted(self.holds),
             "claiming": self.claiming,
             "stopping": False,
+            "repos": list(self.repos),
         }
 
     def pause(self, hold: str = "operator", *, by: str | None = None) -> list[str]:
@@ -258,6 +261,12 @@ class FakeLoop:
 
     def requeue_item(self, item_id: str) -> WorkItem:
         return self.dstore.requeue(item_id, 1.0)
+
+    def resume_repo(self, repo: str, by: str | None = None) -> dict[str, Any]:
+        self.resumed_repos.append((repo, by))
+        if repo == "o/zzz":
+            raise KeyError(f"unknown repository {repo!r}")
+        return {"repo": repo, "state": "ok"}
 
     def grant_rounds(self, run_id: str, rounds: int, by: str | None = None) -> WorkItem:
         self.granted.append((run_id, rounds, by))

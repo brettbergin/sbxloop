@@ -52,6 +52,7 @@ COMMANDS: tuple[str, ...] = (
     "retry <item>",
     "requeue <item>",
     "grant-rounds <run> <n>",
+    "resume-repo <owner/name>",
 )
 # Verbs that may talk to the source (GitHub through the ops sandbox —
 # seconds, not milliseconds); a surface with an event loop to protect runs
@@ -172,6 +173,19 @@ def _dispatch(
             f"**breaker:** {'open' if s['breaker_open'] else 'closed'} · **paused:** {s['paused']}",
             f"**holds:** {', '.join(holds) if holds else 'none'}",
         ]
+        repos = [r for r in (s.get("repos") or []) if isinstance(r, dict)]
+        unwell = [r for r in repos if r.get("state") != "ok"]
+        if unwell:
+            # Only when something is wrong: a healthy multi-repo daemon
+            # keeps the status short.
+            lines.append(
+                "**repos:** "
+                + " · ".join(
+                    f"{r.get('repo')} {r.get('state')}"
+                    + (f" ({r.get('reason')})" if r.get("state") == "suspended" else "")
+                    for r in unwell
+                )
+            )
         return CommandReply("\n".join(lines), status=s)
     if word == "pause":
         hold, err = _hold_arg(args, word, prefix, allow_all=False)
@@ -230,6 +244,14 @@ def _dispatch(
         return CommandReply(items_lines(loop.dstore.items()))
     if word == "grant-rounds":
         return _grant_rounds(loop, args, by)
+    if word == "resume-repo":
+        if len(args) != 1:
+            return CommandReply("usage: resume-repo <owner/name>", ok=False)
+        try:
+            health = loop.resume_repo(args[0], by)
+        except (KeyError, ValueError) as exc:
+            return CommandReply(f"resume-repo failed: {exc.args[0] if exc.args else exc}", ok=False)
+        return CommandReply(f"polling {code(health['repo'])} again from the next tick.")
     if word in ITEM_COMMANDS:
         return _item_command(loop, word, args, by)
     return CommandReply(usage(prefix), ok=False, known=False)

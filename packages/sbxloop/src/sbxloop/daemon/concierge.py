@@ -427,11 +427,27 @@ class Concierge:
 
     def _repo_lines(self) -> list[str]:
         lines = []
+        health: dict[str, dict[str, Any]] = {}
+        try:
+            for row in self.loop.status().get("repos") or []:
+                if isinstance(row, dict) and row.get("repo"):
+                    health[str(row["repo"]).casefold()] = row
+        except Exception:  # the listing must not depend on the loop answering
+            health = {}
         for entry in self.config.github.repo_list():
             base = entry.deliver_base or "(repo default)"
             state = "enabled" if entry.enabled else "disabled"
             trigger = entry.trigger_label or self.config.daemon.trigger_label
-            lines.append(f"{entry.repo} — {state}, base {base}, trigger label `{trigger}`")
+            line = f"{entry.repo} — {state}, base {base}, trigger label `{trigger}`"
+            row = health.get(entry.repo.casefold())
+            if row and row.get("state") == "suspended":
+                line += (
+                    f" — **SUSPENDED from polling**: {row.get('reason')} "
+                    f"(`resume-repo {entry.repo}` once fixed)"
+                )
+            elif row and row.get("state") == "backoff":
+                line += f" — backing off after {row.get('failures')} poll failure(s)"
+            lines.append(line)
         return lines
 
     def _resolve_repo(self, args: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -552,7 +568,8 @@ class Concierge:
                         f"Run one operator command exactly as `{prefix} <command>` would: "
                         "status | pause [--hold NAME] | resume [--hold NAME|--all] | "
                         "cancel [--retry] | queue | items | abandon <item> [reason] | "
-                        "retry <item> | requeue <item> | grant-rounds <run> <n>. Pass the "
+                        "retry <item> | requeue <item> | grant-rounds <run> <n> | "
+                        "resume-repo <owner/name>. Pass the "
                         "command line without the prefix. Mutating commands take effect "
                         "immediately. grant-rounds gives a run that exhausted its fix "
                         'rounds n more and resumes it on its own PR at once ("give '
