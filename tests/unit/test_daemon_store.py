@@ -11,6 +11,7 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import LEGACY_SUFFIX, SCHEMA_VERSION, DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import DaemonError
+from tests.fakes.legacy_db import daemon_db, insert_daemon_row
 
 
 def item(key: str = "7", **overrides: object) -> WorkItem:
@@ -27,24 +28,7 @@ def item(key: str = "7", **overrides: object) -> WorkItem:
 
 def _pre_multirepo_db(tmp_path: Path) -> Path:
     """A state.db in the shape sbxloop wrote before multi-repo support."""
-    path = tmp_path / "state.db"
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, "
-        "source_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, "
-        "body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', "
-        "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
-        "claimed INTEGER NOT NULL DEFAULT 0, run_id TEXT, last_error TEXT, "
-        "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
-        "pending_report TEXT, requested_by TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE daemon_requesters (source_key TEXT PRIMARY KEY, "
-        "requester_id TEXT NOT NULL, created_at REAL NOT NULL)"
-    )
-    conn.commit()
-    conn.close()
-    return path
+    return daemon_db(tmp_path, "pre_multirepo")
 
 
 class TestUpsert:
@@ -796,30 +780,20 @@ class TestRepoScoping:
 def _pre_not_before_db(tmp_path: Path) -> Path:
     """A state.db in the multi-repo shape from before scheduled retries
     (#523): `daemon_work_items` has `repo` but no `not_before`."""
-    path = tmp_path / "state.db"
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, "
-        "source_key TEXT NOT NULL, title TEXT NOT NULL, "
-        "body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', "
-        "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
-        "claimed INTEGER NOT NULL DEFAULT 0, run_id TEXT, last_error TEXT, "
-        "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
-        "pending_report TEXT, requested_by TEXT, repo TEXT NOT NULL DEFAULT '', "
-        "UNIQUE(source_key, repo))"
+    path = daemon_db(tmp_path, "pre_scheduled_retry")
+    insert_daemon_row(
+        path,
+        item_id="gh:o/r:issue:3",
+        source_key="3",
+        title="Three",
+        state="queued",
+        attempts=1,
+        claimed=1,
+        run_id="r_old",
+        created_at=1.0,
+        updated_at=2.0,
+        repo="o/r",
     )
-    conn.execute(
-        "CREATE TABLE daemon_requesters (source_key TEXT NOT NULL, "
-        "requester_id TEXT NOT NULL, created_at REAL NOT NULL, "
-        "repo TEXT NOT NULL DEFAULT '', PRIMARY KEY (source_key, repo))"
-    )
-    conn.execute(
-        "INSERT INTO daemon_work_items (item_id, source_key, title, state, attempts, claimed, "
-        "run_id, created_at, updated_at, repo) VALUES "
-        "('gh:o/r:issue:3', '3', 'Three', 'queued', 1, 1, 'r_old', 1.0, 2.0, 'o/r')"
-    )
-    conn.commit()
-    conn.close()
     return path
 
 

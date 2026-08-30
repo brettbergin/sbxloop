@@ -301,7 +301,22 @@ that a bare `$` anywhere else — a shell `$PID` in an example — breaks render
 (a literal dollar is `$$`), and `tests/unit/test_prompts.py` pins further
 section-level rules: build.md's environment notes and decompose.md's
 verify-authoring rules must keep their field-regression markers, and every
-ecosystem's notes must keep theirs. Each template opens with an HTML comment stating its own
+ecosystem's notes must keep theirs. Three templates share one rule about
+persisted state (#524): decompose.md's risk pass demands a dedicated
+*upgrade path for existing state* task — criteria that enumerate the row
+states and id forms a deployed instance holds, verify commands that start
+from a raw pre-change database — whenever the outcome alters a schema, an
+id format, a stored config key or a state-directory layout; review.md asks
+in round 1 whether the plan has that task and files a blocking finding on
+the plan when it is missing; concierge.md adds a "Migration of existing
+state" section to an issue whose ask touches persisted state. The fixture
+those tests start from is `tests/fakes/legacy_db.py`: hand-written SQL
+frozen at each released shape (pre-#508 bare ids, pre-#511 single-repo,
+pre-#523 unscheduled retries; the engine's pre-workspace, pre-guidance,
+pre-usage, pre-pipeline and pre-granted-rounds `runs`), plus a sweep that
+writes one work item per state × id form — `tests/unit/test_legacy_db.py`
+opens every shape and proves each row survives. A change to persisted
+state adds the shape before it there and a case in the sweep. Each template opens with an HTML comment stating its own
 contract (variables, escaping, which test guards which section); `render` strips
 that header before the prompt reaches the model, so it costs no tokens and
 cannot be mistaken for instructions.

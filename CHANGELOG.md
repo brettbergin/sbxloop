@@ -8,6 +8,25 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A change to persisted state gets its own upgrade-path task** (#524).
+  Issue #511's plan buried the store migration inside two tasks with no
+  acceptance criteria of its own, and all four review rounds on PR #512 —
+  and the run's failure — were about that migration. The decomposer prompt
+  now carries a risk pass: when the outcome alters a SQLite schema or row
+  meaning, an id or key format, a stored config key or a state-directory
+  layout, it must add a dedicated *upgrade path for existing state* task
+  whose acceptance criteria enumerate the row states and id forms a
+  deployed instance can hold and whose verify commands run tests that
+  start from a raw pre-change database. The reviewer asks the same
+  question of the plan in round 1 (a missing task is a blocking finding on
+  the plan), and the concierge adds a "Migration of existing state"
+  section to issues whose ask touches persisted state.
+  `tests/fakes/legacy_db.py` freezes every released schema shape (daemon:
+  pre-#508, pre-#511, pre-#523; engine: pre-workspace through
+  pre-granted-rounds) with helpers that write raw rows, and
+  `tests/unit/test_legacy_db.py` sweeps one work item per state × id form
+  through each shape; the existing migration tests build on it.
+
 - **Fix rounds no longer converge one adjacent case at a time** (#521). Run
   `rfxja288b` spent its whole review budget on one migration, one real
   finding per round, each in the previous round's new lines, because the
