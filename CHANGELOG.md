@@ -31,6 +31,59 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Review findings are reconciled on the pull request** (#520): between a
+  fix round's re-delivery and the next review, the engine now speaks the
+  fixer's per-finding answer back onto the review's own threads. Each
+  prior-round finding with an inline thread gets exactly one reply —
+  `addressed in <sha>: <what changed>` (and the thread resolved), `refuted: <why>`, or a note that the round did not answer it (both left open) —
+  while findings posted body-only are gathered into a single
+  `Reconciliation — round n` pull request comment. Every reply carries a
+  machine-readable `run`/`round` marker, and the reply/resolve is recorded
+  in the state database as it happens, so a resume between posting and
+  recording does not double-reply. A new `review.reconciled` event carries
+  the addressed/refuted/unanswered counts into the log sink and the Discord
+  chronology.
+
+- **The next review round confirms carried-over findings in their own
+  threads** (#520): a round-*n+1* reviewer now returns an anchor-keyed
+  `confirmations` list — `confirmed_fixed` or `still_open` per finding an
+  earlier round raised — and the engine posts each verdict as a reply in
+  that finding's existing thread, resolving the ones confirmed fixed. The
+  new review body carries only the overall summary and genuinely new
+  findings; a carried finding is never restated there. A `still_open`
+  verdict leaves the thread unresolved and carries the original finding
+  (its severity and words, plus the reviewer's note) into the next fix
+  round. First-round reviews are unchanged, and the confirmation replies
+  are marker-stamped and store-recorded so a resume does not double-post.
+
+- **A human's changes-requested review is answered on its own threads** (#520): a `NeedsFix("human")` round now carries the objections it was
+  seeded with — the reviewer's review body and each of their inline
+  comments — and after the fix re-delivers, each inline objection receives
+  one reply stating the change (`addressed in <sha>: …`), the fixer's
+  reasoned explanation (`not changed: …`), or, when the round said nothing
+  about it, that it is being left open. A human's thread is **never**
+  resolved by the loop; objections raised in the review body are answered in
+  a single pull request comment instead. Each answered objection is recorded
+  in the state database, which fixes a repeat-work bug: only its author can
+  dismiss a `CHANGES_REQUESTED`, so the same review still stands on the next
+  landing pass — that pass now hands over as `Blocked` naming the replied
+  objections rather than spending another full `max_ci_rounds` fix pass on
+  words already answered.
+
+- **A pull request does not merge until its review record is complete**
+  (#520): `land()` gained two preconditions immediately before the merge
+  call. The approving round's review must actually have posted — a run whose
+  review post failed used to merge with no review on the pull request at all
+  — and every inline review thread must be reconciled: a loop thread counts
+  when it is resolved or carries a later loop reply (the refuted case), a
+  human thread when the loop replied in it at all. Anything left over ends
+  the run as `Blocked`, naming the offending anchors
+  (`N review threads unreconciled: …`), and a thread read that *fails*
+  blocks too, since "we could not tell" is not "there is nothing to answer".
+  `docs/architecture.md` gained a *Reconciling review findings on the pull
+  request* section covering the contract, the fixer's per-finding report
+  format and this gate.
+
 - **`sbxloop.toml.example` at the repository root** (#527), covering every
   section and key the config model knows — including both `[github]` forms
   (the legacy single `repo` and the `[[github.repos]]` array with

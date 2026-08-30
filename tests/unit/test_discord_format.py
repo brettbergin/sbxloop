@@ -778,6 +778,23 @@ class TestEmbeds:
         assert texts(
             format_for_discord(ev("review.verdict", round=3, verdict="approve", findings=0))
         ) == ["🔍 review round 3: **approved** · 0 finding(s)"]
+        reconciled = format_for_discord(
+            ev(
+                "review.reconciled",
+                round=2,
+                addressed=2,
+                refuted=1,
+                unanswered=0,
+                replied=3,
+                resolved=2,
+                comment_url="https://c",
+            )
+        )
+        assert texts(reconciled) == [
+            "🧾 reconciled round 2: 2 addressed · 1 refuted · 0 unanswered · "
+            "3 repl(ies), 2 thread(s) resolved · [body-only](https://c)"
+        ]
+        assert reconciled[0].flush
         assert texts(
             format_for_discord(
                 ev("fix.round", round=1, kind="ci", budget="1/2", why="mdformat, security failed")

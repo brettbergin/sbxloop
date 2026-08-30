@@ -59,6 +59,7 @@ from sbxloop.engine.landing import (
     Blocked,
     CiTimeout,
     Closed,
+    HumanObjection,
     Landed,
     NeedsFix,
     UpdateState,
@@ -86,18 +87,28 @@ from sbxloop.engine.phases import (
     clip_head_tail,
     verify_suspect_feedback,
 )
+from sbxloop.engine.reconcile import (
+    note_nonblocking,
+    post_confirmations,
+    reconcile_human,
+    reconcile_round,
+)
 from sbxloop.engine.review import (
+    CarriedVerdict,
     ReviewFinding,
     ReviewRound,
     ReviewVerdict,
     fix_brief,
     fix_task,
     is_fix_task,
+    prior_findings,
+    reconcile,
     refuted_anchors,
     render_review_history,
     review_body,
+    split_carried,
 )
-from sbxloop.engine.store import StateStore
+from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     GithubOpsError,
@@ -109,7 +120,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gc import workspace_pruned
-from sbxloop.gh.ops import FailedCheck, GithubOps
+from sbxloop.gh.ops import FailedCheck, GithubOps, PostedFinding
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter
@@ -156,6 +167,9 @@ class Pipeline:
     # window; None on a resume (the wait then settles from its own start).
     delivered_at: float | None = None
     fix_kinds: dict[str, FixKind] = field(default_factory=dict)
+    # Human objections a `NeedsFix("human")` round is answering, held until
+    # the fix re-delivers so the reply can name the sha that carries it.
+    pending_human: tuple[HumanObjection, ...] = ()
 
 
 class LoopEngine:
@@ -820,6 +834,8 @@ class LoopEngine:
                 stage = "delivering"
             elif stage == "delivering":
                 self._stage_deliver(p)
+                self._stage_reconcile(p)
+                self._stage_reconcile_human(p)
                 stage = "reviewing"
             elif stage == "reviewing":
                 verdict = self._stage_review(p)
@@ -865,6 +881,7 @@ class LoopEngine:
                     outcome.why,
                     failed_checks=outcome.failed_checks,
                     objections=outcome.objections,
+                    human=outcome.human,
                 )
                 if reason is not None:
                     return "failed", reason
@@ -1222,16 +1239,29 @@ class LoopEngine:
             history=render_review_history(rounds),
             refuted=refuted_anchors(rounds),
         )
+        # Round n+1's word on a finding an earlier round raised belongs in
+        # that finding's own thread, not restated in a fresh review body
+        # (#520 step 4). ``posting`` is the body/inline half — summary plus
+        # genuinely new findings; ``carried`` is replied in-thread below.
+        prior = prior_findings(rounds)
+        posting, carried = split_carried(verdict, prior)
+        # The run acts on the union: new findings plus the carried ones this
+        # round says are still open, so "still open" keeps driving fix rounds.
+        verdict = posting.model_copy(
+            update={"findings": [*posting.findings, *verdict.carried_forward(prior)]}
+        )
         posted_url = ""
         posted_event = ""
-        comments = verdict.comments()
+        posted_findings: tuple[PostedFinding, ...] = ()
+        posted_review_id: int | None = None
+        comments = posting.comments()
         try:
             try:
                 submitted = ops.pr_review_create(
                     repo,
                     run.pr_number,
                     verdict.event,
-                    review_body(verdict, run_id=run_id, round=round_no),
+                    review_body(posting, run_id=run_id, round=round_no),
                     comments,
                 )
             except GithubOpsError:
@@ -1252,13 +1282,38 @@ class LoopEngine:
                     repo,
                     run.pr_number,
                     verdict.event,
-                    review_body(verdict, run_id=run_id, round=round_no, anchored=False),
+                    review_body(posting, run_id=run_id, round=round_no, anchored=False),
                 )
             posted_url, posted_event = submitted.url, submitted.event
+            posted_review_id = submitted.review_id
+            # Every finding is accounted for, thread or not: the ones the
+            # review posted inline keep their comment/thread ids, the rest
+            # (no line, over the cap, or an anchor GitHub refused) are
+            # recorded body-only so reconciliation can still speak to them.
+            captured = {p.anchor: p for p in submitted.posted}
+            posted_findings = tuple(
+                captured.get(f.anchor, PostedFinding(f.anchor)) for f in posting.findings
+            )
+            # A carried finding still open keeps the thread it already has,
+            # so the fix round that follows reconciles onto it rather than
+            # into a body comment.
+            posted_findings += tuple(
+                PostedFinding(rec.anchor, rec.comment_id, rec.thread_node_id)
+                for rec in self._threads_for(run_id, [c.anchor for c in carried if not c.fixed])
+            )
         except GithubOpsError:
-            # The record is a courtesy to whoever reads the PR; the verdict
-            # itself is already in hand.
-            log.warning("review.post_failed", run=run_id, pr=run.pr_number, exc_info=True)
+            # No longer a courtesy (#520 step 5): the review record *is* the
+            # PR's audit trail, and a round that could not post one leaves
+            # `review.url` empty — which `land()` reads as a merge block
+            # rather than merging silently (#503).
+            log.error("review.post_failed", run=run_id, pr=run.pr_number, exc_info=True)
+        self._post_confirmations(p, round_no, carried)
+        # An approving round's own `minor`/`nit` findings each opened a
+        # thread that no fix round will ever answer — there is no fix round
+        # after an approval. Answer them here, or the merge gate blocks on
+        # threads nothing in the pipeline can reconcile.
+        if verdict.verdict == "approve":
+            self._note_nonblocking(p, round_no, posted_findings, posting)
         spend = phases.drain_spend()
         self.store.record_phase(
             run_id,
@@ -1269,7 +1324,12 @@ class LoopEngine:
             output_json=json.dumps(
                 {
                     "verdict": verdict.model_dump(),
-                    "posted": {"url": posted_url, "event": posted_event},
+                    "review": {
+                        "url": posted_url,
+                        "event": posted_event,
+                        "id": posted_review_id,
+                    },
+                    "posted": [p._asdict() for p in posted_findings],
                 }
             ),
             started_at=started,
@@ -1290,6 +1350,273 @@ class LoopEngine:
             summary=" ".join(verdict.summary.split())[:300],
         )
         return verdict
+
+    def _threads_for(self, run_id: str, anchors: Sequence[str]) -> list[PostedRecord]:
+        """The thread identity earlier rounds recorded for these anchors."""
+        wanted = list(dict.fromkeys(anchors))
+        if not wanted:
+            return []
+        best: dict[str, PostedRecord] = {}
+        for rec in self.store.posted_findings(run_id):
+            if rec.anchor in wanted and not rec.body_only:
+                best[rec.anchor] = rec
+        return [best[a] for a in wanted if a in best]
+
+    def _post_confirmations(
+        self, p: Pipeline, round_no: int, carried: Sequence[CarriedVerdict]
+    ) -> None:
+        """Reply, in each carried-over finding's own thread, with this round's
+        verdict on it — and resolve the ones confirmed fixed (#520 step 4)."""
+        run_id, ops, repo = p.run_id, p.ops, p.repo
+        if ops is None or repo is None or not carried:
+            return
+        run = self.store.get_run(run_id)
+        if run.pr_number is None:
+            return
+        try:
+            outcome = post_confirmations(
+                ops,
+                repo,
+                run.pr_number,
+                run_id=run_id,
+                round=round_no,
+                items=carried,
+                posted=self.store.posted_findings(run_id),
+                done=self.store.confirmations(run_id, round_no),
+                record=partial(self._record_confirmation, run_id, round_no),
+            )
+        except GithubOpsError:
+            log.warning("review.confirm_failed", run=run_id, pr=run.pr_number, exc_info=True)
+            return
+        if not outcome.did_anything:
+            return
+        self.bus.emit(
+            HostEventTypes.REVIEW_RECONCILED,
+            run_id,
+            pr=run.pr_number,
+            round=round_no,
+            addressed=outcome.confirmed,
+            refuted=0,
+            unanswered=outcome.still_open,
+            replied=outcome.replied,
+            resolved=outcome.resolved,
+            body_only=outcome.body_only,
+            comment_url="",
+            confirmations=len(carried),
+        )
+
+    def _record_confirmation(
+        self, run_id: str, round: int, *, anchor: str, status: str, resolved: bool
+    ) -> None:
+        self.store.record_confirmation(run_id, round, anchor, status, resolved=resolved)
+
+    def _record_noted(
+        self, run_id: str, round: int, *, anchor: str, status: str, resolved: bool
+    ) -> None:
+        self.store.record_noted(run_id, round, anchor, status, resolved=resolved)
+
+    def _note_nonblocking(
+        self,
+        p: Pipeline,
+        round_no: int,
+        posted: Sequence[PostedFinding],
+        verdict: ReviewVerdict,
+    ) -> None:
+        """Reconcile an approving round's findings in-thread.
+
+        `approve` ends the review stage — no fix round follows, so nothing
+        else would ever speak to the threads this round's findings opened,
+        and `land()`'s reconciliation gate would block the merge on them
+        forever. Which findings need an answer is decided by reachability,
+        not severity: an `approve` may carry a `major`, and that finding
+        gets an inline thread like any other. Each gets a reply worded for
+        its severity and is resolved.
+        """
+        run_id, ops, repo = p.run_id, p.ops, p.repo
+        if ops is None or repo is None:
+            return
+        severities = {f.anchor: f.severity for f in verdict.findings}
+        if not severities:
+            return
+        run = self.store.get_run(run_id)
+        if run.pr_number is None:
+            return
+        records = [PostedRecord(round_no, f.anchor, f.comment_id, f.thread_node_id) for f in posted]
+        try:
+            outcome = note_nonblocking(
+                ops,
+                repo,
+                run.pr_number,
+                run_id=run_id,
+                round=round_no,
+                findings=severities,
+                posted=records,
+                done=self.store.noted(run_id, round_no),
+                record=partial(self._record_noted, run_id, round_no),
+            )
+        except GithubOpsError:
+            log.warning("review.noted_failed", run=run_id, pr=run.pr_number, exc_info=True)
+            return
+        if not outcome.did_anything:
+            return
+        self.bus.emit(
+            HostEventTypes.REVIEW_RECONCILED,
+            run_id,
+            pr=run.pr_number,
+            round=round_no,
+            addressed=0,
+            refuted=0,
+            unanswered=0,
+            replied=outcome.replied,
+            resolved=outcome.resolved,
+            body_only=outcome.body_only,
+            comment_url="",
+            noted=outcome.noted,
+        )
+
+    def _stage_reconcile(self, p: Pipeline) -> None:
+        """Speak each closed review round's answer back onto its own threads.
+
+        Run between a fix round's re-delivery and the next review: the
+        findings of every review round the fixer has since answered get a
+        reply on their thread (resolved when addressed), and body-only
+        findings one ``Reconciliation — round n`` comment. Best effort by
+        design — the review that follows is worth more than a failed
+        courtesy reply — but idempotent and resume-safe via the store.
+        """
+        run_id, ops, repo = p.run_id, p.ops, p.repo
+        if ops is None or repo is None:
+            return
+        run = self.store.get_run(run_id)
+        if run.pr_number is None:
+            return
+        posted = self.store.posted_findings(run_id)
+        if not posted:
+            return
+        by_round: dict[int, list[PostedRecord]] = {}
+        for rec in posted:
+            by_round.setdefault(rec.round, []).append(rec)
+        for round_ in self._review_rounds(run_id):
+            # A round whose fix task has not reported yet has nothing to say.
+            if not round_.response.strip():
+                continue
+            records = by_round.get(round_.round)
+            if not records:
+                continue
+            items = reconcile(round_)
+            if not items:
+                continue
+            try:
+                outcome = reconcile_round(
+                    ops,
+                    repo,
+                    run.pr_number,
+                    run_id=run_id,
+                    round=round_.round,
+                    head_sha=run.head_sha,
+                    posted=records,
+                    items=items,
+                    done=self.store.reconciliations(run_id, round_.round),
+                    record=partial(self._record_reconciliation, run_id, round_.round),
+                )
+            except GithubOpsError:
+                log.warning("review.reconcile_failed", run=run_id, pr=run.pr_number, exc_info=True)
+                continue
+            if not outcome.did_anything:
+                continue
+            self.bus.emit(
+                HostEventTypes.REVIEW_RECONCILED,
+                run_id,
+                pr=run.pr_number,
+                round=outcome.round,
+                addressed=outcome.addressed,
+                refuted=outcome.refuted,
+                unanswered=outcome.unanswered,
+                replied=outcome.replied,
+                resolved=outcome.resolved,
+                body_only=outcome.body_only,
+                comment_url=outcome.comment_url or "",
+            )
+
+    def _stage_reconcile_human(self, p: Pipeline) -> None:
+        """Answer the human objections the last fix round was seeded with.
+
+        Their thread gets the reply; it is never resolved — a human closes
+        their own conversation. Each answered objection is recorded so the
+        next landing pass, which still sees the same standing
+        ``CHANGES_REQUESTED`` (only its author can dismiss it), does not buy
+        another full fix pass on words already answered (#520).
+        """
+        run_id, ops, repo = p.run_id, p.ops, p.repo
+        objections = p.pending_human
+        if ops is None or repo is None or not objections:
+            return
+        run = self.store.get_run(run_id)
+        if run.pr_number is None:
+            return
+        report, round_no = self._last_fix_report(run_id)
+        try:
+            outcome = reconcile_human(
+                ops,
+                repo,
+                run.pr_number,
+                run_id=run_id,
+                round=round_no,
+                head_sha=run.head_sha,
+                objections=objections,
+                report=report,
+                done=self.store.answered_objections(run_id),
+                record=partial(self._record_human_reply, run_id),
+            )
+        except GithubOpsError:
+            log.warning(
+                "review.human_reconcile_failed", run=run_id, pr=run.pr_number, exc_info=True
+            )
+            return
+        # Answered is answered even when the reply itself failed to post for
+        # the body-only ones: what must not repeat is the fix pass.
+        p.pending_human = ()
+        if not outcome.did_anything:
+            return
+        self.bus.emit(
+            HostEventTypes.REVIEW_RECONCILED,
+            run_id,
+            pr=run.pr_number,
+            round=outcome.round,
+            addressed=0,
+            refuted=0,
+            unanswered=0,
+            replied=outcome.replied,
+            resolved=0,
+            body_only=outcome.body_only,
+            comment_url=outcome.comment_url or "",
+            human=len(objections),
+        )
+
+    def _record_human_reply(self, run_id: str, *, key: str, status: str) -> None:
+        self.store.record_human_reply(run_id, key, status)
+
+    def _last_fix_report(self, run_id: str) -> tuple[str, int]:
+        """The most recent fix task's build report and its round number."""
+        report, seen = "", []
+        for row in self.store.phase_attempts(run_id):
+            if row["phase"] != "build" or not row["task_id"]:
+                continue
+            task_id = str(row["task_id"])
+            if not is_fix_task(task_id):
+                continue
+            if task_id not in seen:
+                seen.append(task_id)
+            try:
+                report = str(json.loads(row["output_json"] or "{}").get("report") or "")
+            except ValueError:
+                report = ""
+        return report, len(seen)
+
+    def _record_reconciliation(
+        self, run_id: str, round: int, *, anchor: str, status: str, resolved: bool
+    ) -> None:
+        self.store.record_reconciliation(run_id, round, anchor, status, resolved=resolved)
 
     def _diff_for_review(self, p: Pipeline, head_sha: str | None) -> str | None:
         """The PR's diff as text, or None when the workspace has no base
@@ -1343,6 +1670,44 @@ class LoopEngine:
                 rounds[-1] = ReviewRound(last.round, last.verdict, str(report))
         return rounds
 
+    def _review_posted(self, run_id: str) -> bool:
+        """Whether the most recent review round got its record onto GitHub.
+
+        Read from the ``review`` phase rows: a round that posted carries a
+        url, a round whose post failed carries an empty one (#503). A run
+        with no review round at all has nothing to have failed, so True.
+        """
+        for row in reversed(self.store.phase_attempts(run_id)):
+            if row["phase"] != "review":
+                continue
+            try:
+                data = json.loads(row["output_json"] or "{}")
+            except ValueError:
+                return False
+            review = data.get("review") if isinstance(data, dict) else None
+            return bool(isinstance(review, dict) and review.get("url"))
+        return True
+
+    def _reconcile_fix(
+        self, run_id: str, task: TaskRecord, report: str
+    ) -> list[dict[str, str]] | None:
+        """The fix round's per-finding answer to the review that seeded it,
+        as JSON for the build row. None for a non-fix task, or when no
+        review round is open to reconcile against."""
+        if not is_fix_task(task.spec.id):
+            return None
+        rounds = self._review_rounds(run_id)
+        # The open round is the last one whose response is not yet recorded
+        # — this build *is* that response.
+        open_round = next((r for r in reversed(rounds) if not r.response.strip()), None)
+        if open_round is None:
+            return None
+        items = reconcile(ReviewRound(open_round.round, open_round.verdict, report))
+        return [
+            {"anchor": anchor, "status": item.status, "note": item.note}
+            for anchor, item in items.items()
+        ]
+
     def _fix_round(
         self,
         p: Pipeline,
@@ -1352,11 +1717,15 @@ class LoopEngine:
         findings: Sequence[ReviewFinding] = (),
         failed_checks: Sequence[FailedCheck] = (),
         objections: str = "",
+        human: Sequence[HumanObjection] = (),
     ) -> str | None:
         """Spend one fix round: a seeded task built and verified like any
         other, then back to the gate. Returns the reason the run failed —
         the budget, or the task — or None when the fix is in."""
         run_id, phases = p.run_id, p.phases
+        # Held for the reconciliation that follows the re-delivery: the
+        # human hears back on their own thread, not only in a build report.
+        p.pending_human = tuple(human)
         counter, limit = (
             ("review_rounds", self.config.landing.max_review_rounds)
             if kind == "review"
@@ -1533,6 +1902,8 @@ class LoopEngine:
             tick=partial(self._tick, p),
             emit=emit,
             clock=self.clock,
+            answered=self.store.answered_objections(run_id),
+            review_posted=self._review_posted(run_id),
         )
         if isinstance(outcome, Landed):
             log.info(
@@ -1684,13 +2055,22 @@ class LoopEngine:
             self._live_sessions.add(result.session_id)
         builder_report = clip(result.output_text)
         spend = phases.drain_spend()
+        payload: dict[str, Any] = {"report": builder_report, "session_id": result.session_id}
+        # A fix round's report is the per-finding answer to the review that
+        # seeded it. Parse it once, here, and persist it with the build row:
+        # the reconciliation that gets replied onto the PR threads must
+        # survive a resume, and re-deriving it later depends on the report
+        # still being parseable by whatever the code says then.
+        reconciled = self._reconcile_fix(run_id, task, builder_report)
+        if reconciled is not None:
+            payload["reconciled"] = reconciled
         self.store.record_phase(
             run_id,
             "build",
             task_id=task.spec.id,
             attempt=task.revisions + 1,
             status="ok",
-            output_json=json.dumps({"report": builder_report, "session_id": result.session_id}),
+            output_json=json.dumps(payload),
             started_at=started,
             usage=spend.usage,
             turns=spend.turns,

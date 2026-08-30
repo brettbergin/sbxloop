@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
@@ -41,6 +42,25 @@ EPHEMERAL_EVENT_TYPES: frozenset[str] = frozenset({EventTypes.AGENT_MESSAGE_DELT
 
 def _is_ephemeral(event: Event) -> bool:
     return event.type in EPHEMERAL_EVENT_TYPES
+
+
+class PostedRecord(NamedTuple):
+    """One review finding as it was posted on the PR, read back from the store.
+
+    ``round`` is the review round that posted it (the phase attempt number).
+    ``comment_id``/``thread_node_id`` are ``None`` for a finding that landed
+    in the review body instead of its own thread — see ``body_only``.
+    """
+
+    round: int
+    anchor: str
+    comment_id: int | None = None
+    thread_node_id: str | None = None
+    review_id: int | None = None
+
+    @property
+    def body_only(self) -> bool:
+        return self.comment_id is None
 
 
 _SCHEMA = """
@@ -97,6 +117,15 @@ CREATE TABLE IF NOT EXISTS phase_attempts (
     cache_read_tokens INTEGER,
     cache_write_tokens INTEGER,
     turns      INTEGER
+);
+CREATE TABLE IF NOT EXISTS reconciliations (
+    run_id     TEXT NOT NULL,
+    round      INTEGER NOT NULL,
+    anchor     TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    resolved   INTEGER NOT NULL DEFAULT 0,
+    ts         REAL NOT NULL,
+    PRIMARY KEY (run_id, round, anchor)
 );
 CREATE TABLE IF NOT EXISTS events (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -591,6 +620,135 @@ class StateStore:
                 (run_id, task_id),
             )
         )
+
+    def posted_findings(self, run_id: str) -> list[PostedRecord]:
+        """Every review finding this run posted on its PR, oldest round first.
+
+        Read back from the ``review`` phase rows' ``output_json['posted']``,
+        so a resumed run reconstructs prior-round thread identity from the
+        store alone — no GitHub call. Body-only findings (no inline comment)
+        are included, flagged ``body_only``.
+        """
+        records: list[PostedRecord] = []
+        for row in self.phase_attempts(run_id):
+            if row["phase"] != "review":
+                continue
+            try:
+                data = json.loads(row["output_json"] or "{}")
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            review = data.get("review")
+            review_id = review.get("id") if isinstance(review, dict) else None
+            posted = data.get("posted")
+            if not isinstance(posted, list):
+                continue
+            for item in posted:
+                if not isinstance(item, dict) or not item.get("anchor"):
+                    continue
+                comment_id = item.get("comment_id")
+                records.append(
+                    PostedRecord(
+                        round=int(row["attempt"]),
+                        anchor=str(item["anchor"]),
+                        comment_id=int(comment_id) if comment_id is not None else None,
+                        thread_node_id=(
+                            str(item["thread_node_id"])
+                            if item.get("thread_node_id") is not None
+                            else None
+                        ),
+                        review_id=int(review_id) if review_id is not None else None,
+                    )
+                )
+        return records
+
+    # -- reconciliation ----------------------------------------------------
+
+    def record_reconciliation(
+        self, run_id: str, round: int, anchor: str, status: str, *, resolved: bool = False
+    ) -> None:
+        """Note that this run/round has spoken to ``anchor`` on the PR.
+
+        Written as each reply lands, so a resume between posting a reply and
+        recording it is the only window the (second, live-thread) idempotency
+        check has to cover. Idempotent by primary key.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO reconciliations (run_id, round, anchor, status, resolved, ts)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(run_id, round, anchor) DO UPDATE SET"
+                " status = excluded.status, resolved = excluded.resolved, ts = excluded.ts",
+                (run_id, round, anchor, status, 1 if resolved else 0, time.time()),
+            )
+            self._conn.commit()
+
+    def reconciliations(self, run_id: str, round: int | None = None) -> dict[str, str]:
+        """``{anchor: status}`` already reconciled for this run (and round)."""
+        if round is None:
+            rows = self._conn.execute(
+                "SELECT anchor, status FROM reconciliations WHERE run_id = ?", (run_id,)
+            )
+        else:
+            rows = self._conn.execute(
+                "SELECT anchor, status FROM reconciliations WHERE run_id = ? AND round = ?",
+                (run_id, round),
+            )
+        return {str(row["anchor"]): str(row["status"]) for row in rows}
+
+    # Human objections are recorded in the same table under a sentinel round:
+    # they belong to the run, not to a review round of ours, and the key is
+    # the objection's GitHub identity rather than a `path:line` anchor.
+    HUMAN_ROUND = -1
+
+    def record_human_reply(self, run_id: str, key: str, status: str) -> None:
+        """Note that this run has replied to the human objection ``key``.
+
+        What stops a standing ``CHANGES_REQUESTED`` — which only its author
+        can dismiss — from buying another full fix pass on every landing
+        attempt (#520).
+        """
+        self.record_reconciliation(run_id, self.HUMAN_ROUND, key, status)
+
+    def answered_objections(self, run_id: str) -> dict[str, str]:
+        """``{key: status}`` of the human objections this run has answered."""
+        return self.reconciliations(run_id, self.HUMAN_ROUND)
+
+    # Round n+1's confirmations of carried-over findings share the table too,
+    # under their own negative rounds: they are keyed by the *same* anchors a
+    # reconciliation pass uses, so mixing them would make one look like the
+    # other's idempotency record.
+    CONFIRM_ROUND_BASE = -100
+
+    def record_confirmation(
+        self, run_id: str, round: int, anchor: str, status: str, *, resolved: bool = False
+    ) -> None:
+        """Note that review round ``round`` has confirmed ``anchor`` in its thread."""
+        self.record_reconciliation(
+            run_id, self.CONFIRM_ROUND_BASE - round, anchor, status, resolved=resolved
+        )
+
+    def confirmations(self, run_id: str, round: int) -> dict[str, str]:
+        """``{anchor: status}`` this review round has already confirmed."""
+        return self.reconciliations(run_id, self.CONFIRM_ROUND_BASE - round)
+
+    # "noted, not blocking" replies live in their own negative band too, so
+    # an approving round's note on an anchor never shadows a reconciliation
+    # or a confirmation of the same anchor.
+    NOTED_ROUND_BASE = -1000
+
+    def record_noted(
+        self, run_id: str, round: int, anchor: str, status: str, *, resolved: bool = False
+    ) -> None:
+        """Note that review round ``round`` has answered a non-blocking finding."""
+        self.record_reconciliation(
+            run_id, self.NOTED_ROUND_BASE - round, anchor, status, resolved=resolved
+        )
+
+    def noted(self, run_id: str, round: int) -> dict[str, str]:
+        """``{anchor: status}`` this review round has already noted."""
+        return self.reconciliations(run_id, self.NOTED_ROUND_BASE - round)
 
     # -- events ------------------------------------------------------------
 

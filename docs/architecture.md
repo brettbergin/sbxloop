@@ -353,6 +353,72 @@ staleness sweep does not run at all while a run is executing. The persisted
 reason is surfaced next to the state in `sbxloop status` / `list_runs` output,
 on the `reason:` line of `sbxloop status <run>`, and in the TUI run header.
 
+## Reconciling review findings on the pull request
+
+A finding is *addressed* when the code changes; it is **reconciled** when the
+pull request says so, in the place the finding was raised. Before #520 the
+loop only did the first: a fix round fixed things and the next round posted a
+fresh review saying "Addressed.", while the original threads stayed open
+through the merge. The engine now speaks each round's answer back onto the
+threads themselves.
+
+**The fixer's report format.** `review.fix_brief` closes every fix round's
+brief by asking for one line per finding or objection:
+
+```
+addressed: <path:line> — what changed
+refuted:   <path:line> — why it is not a problem
+```
+
+`review.reconcile(round)` parses that report against the round's findings and
+returns, per anchor, one of `addressed`, `refuted` or `unanswered` with the
+note the fixer gave. Parsing is deliberately forgiving — dash variants, list
+markers, case and stray whitespace — and matches on the exact `path:line`
+anchor first, the bare path second. `unanswered` is its own status on
+purpose: "the round said nothing about this" is not "the round decided to
+leave it". The parse is done once and persisted on the fix round's build row,
+so a resumed run can still reply without re-reading the agent's prose.
+
+**The reconciliation contract.** Between a fix round's re-delivery and the
+next review, for each finding of the previous round:
+
+- with a thread (the finding was posted inline): exactly one reply —
+  `addressed in <head sha>: <what changed>` and the thread **resolved**, or
+  `refuted: <why>` and the thread deliberately left **open**, or a note that
+  the round did not answer it, also left open;
+- without a thread (no line to anchor to, an anchor GitHub refused, or the
+  inline cap): gathered into a single `Reconciliation — round n` pull request
+  comment listing each with its status;
+- raised by a **human**: replied to the same way, and **never** resolved by
+  the loop — closing a human's thread is theirs to do.
+
+Round *n+1* then rules on carried-over findings through an anchor-keyed
+`confirmations` list rather than restating them: each `confirmed_fixed` /
+`still_open` verdict is posted as a reply **in that finding's own thread**
+(fixed ones resolved), and the new review body carries only the summary and
+genuinely new findings. A `still_open` verdict carries the original finding —
+its severity and its words — into the next fix round.
+
+Every reply and comment carries an HTML-comment marker naming the run and the
+round, and the posting is recorded in the state database as it happens, so a
+resume between posting and recording skips a thread that already has the
+loop's answer instead of double-replying. Each round emits `review.reconciled`
+with its addressed / refuted / unanswered counts and how many threads it
+replied to and resolved, so the Discord chronology shows reconciliation as a
+step rather than a silence.
+
+**The merge gate.** `landing.land` will not merge a pull request whose review
+record is incomplete. Two preconditions sit immediately before `pr_merge`:
+the approving round's review must actually have posted — a run whose review
+failed to post used to merge with no review on the PR at all — and every
+inline thread must be reconciled. `landing.unreconciled_threads` splits the
+PR's threads by author: a loop thread counts as reconciled when it is
+resolved *or* carries a later loop reply (the refuted case), a human thread
+when it carries a loop reply at all. Anything left over is
+`Blocked("N review threads unreconciled: <anchors>")`, naming them, and a
+thread read that *fails* blocks too — "we could not tell" is not "there is
+nothing to answer".
+
 ## Landing
 
 A delivered PR is not done because it exists, and merging is not optional:
@@ -381,7 +447,9 @@ mergeability, and only then the merge:
 3. **Conflicted, red, or objected to → a fix round**, on the CI budget. A
    re-delivery rebuilds the commit on the current base, so a real conflict
    is genuinely fixable.
-4. **Merge**, sending the head sha the loop actually judged. A push that
+4. **Reconciled?** Every review thread on the PR must be answered, and the
+   approving review must actually have posted — see the section above.
+5. **Merge**, sending the head sha the loop actually judged. A push that
    landed since loses the race with a 409 rather than being merged over.
 
 Two answers come back as *data* rather than as exceptions, and the difference
@@ -558,7 +626,12 @@ sink and the Discord bridge are all just bus subscribers.
 The stages that decide something also emit what they *decided*, parsed:
 `run.tasks` (the roster, re-announced on resume and after a fix task is
 appended), `review.verdict` (the round, the verdict, how many findings and
-how many block, the posted review's url), `fix.round` (the round, its kind
+how many block, the posted review's url), `review.reconciled` (the fix
+round's answer spoken back onto the review's own threads: how many findings
+were addressed, refuted and left unanswered, and how many threads were
+replied to and resolved) — also emitted when a later round confirms a
+carried-over finding in its own thread rather than restating it in a fresh
+review body, resolving the ones it confirms fixed, `fix.round` (the round, its kind
 — `review`, `gate`, `ci`, `conflict`, `human` — the task appended and the
 budget it spent), `ci.status` (the folded check-run state, emitted on change
 only), `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
@@ -656,7 +729,8 @@ subscribed to every run's bus under the logger `sbxloop.run`
   `sandbox.tooling_warning`, `sandbox.resources_warning`,
   `agent.permission_denied`, `agent.tool_cap`, `run.config_drift`.
 - `INFO` — lifecycle: `run.*`, task and phase start/state/end, what the
-  pipeline decided (`review.verdict`, `fix.round`, `ci.status`, `land.*`),
+  pipeline decided (`review.verdict`, `review.reconciled`, `fix.round`,
+  `ci.status`, `land.*`),
   sandbox provisioning, worker job start/end/result, GitHub op start/end,
   policy denials, chat (steering) traffic, gc.
 - `DEBUG` — everything else: individual tool calls, agent messages and
