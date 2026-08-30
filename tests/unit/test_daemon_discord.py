@@ -4,6 +4,7 @@ client, non-blocking bus subscription. No network, discord.py not required."""
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.discord import DiscordBridge, _Pending, format_for_discord, headline_text
+from sbxloop.daemon.discord_format import Chunk
 from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.errors import DaemonError
@@ -118,10 +120,15 @@ class FakeMessage:
     async def add_reaction(self, emoji: str) -> None:
         self.reactions.append(emoji)
 
-    async def edit(self, *, content: str | None = None, embed: Any = None) -> None:
+    async def edit(
+        self, *, content: str | None = None, embed: Any = None, suppress: bool | None = None
+    ) -> None:
         if content is not None:
             self.content = content
         self.embed = embed
+        self.suppress = suppress
+        self.edit_kwargs = getattr(self, "edit_kwargs", [])
+        self.edit_kwargs.append({"content": content, "embed": embed, "suppress": suppress})
         self.edits = getattr(self, "edits", 0) + 1
 
     async def create_thread(self, name: str) -> FakeChannel:
@@ -1721,3 +1728,300 @@ class TestToolOutputRedactionWiring:
             assert literal not in blob, literal
         assert "***" in blob
         assert all(len(t) <= 2000 for t in texts)
+
+
+class TestSendSuppressesUnfurls:
+    """The send seam defaults to Discord's SUPPRESS_EMBEDS flag so agent
+    prose never sprouts link previews; messages carrying one of our own
+    embed cards angle-bracket their URLs instead (the flag would hide the
+    card too)."""
+
+    def _send(self, bridge: DiscordBridge, channel: Any, *args: Any, **kwargs: Any) -> Any:
+        return asyncio.run(bridge._send(channel, *args, **kwargs))
+
+    def test_plain_send_sets_suppress_embeds(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        self._send(bridge, channel, "see https://example.com/x")
+        assert channel.sent == ["see https://example.com/x"]
+        assert channel.sent_kwargs[0]["suppress_embeds"] is True
+        assert channel.sent_kwargs[0]["allowed_mentions"] == "none"
+
+    def test_send_with_our_embed_masks_urls_instead_of_flagging(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord_format import EmbedSpec
+
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        self._send(bridge, channel, "run https://x/run/1", embed=EmbedSpec(title="t"))
+        assert "suppress_embeds" not in channel.sent_kwargs[0]
+        assert channel.sent == ["run <https://x/run/1>"]
+        assert channel.sent_kwargs[0].get("embed") is not None
+
+    def test_embed_rejection_retry_is_text_only_and_suppressed(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord_format import EmbedSpec
+
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        real_send = channel.send
+
+        async def send(text: str | None = None, **kwargs: Any) -> Any:
+            if "embed" in kwargs:
+                raise RuntimeError("embeds rejected")
+            return await real_send(text, **kwargs)
+
+        channel.send = send  # type: ignore[assignment]
+        self._send(bridge, channel, "body", embed=EmbedSpec(title="t"))
+        assert channel.sent == ["body"]
+        assert channel.sent_kwargs[0]["suppress_embeds"] is True
+        assert "embed" not in channel.sent_kwargs[0]
+
+    def test_content_is_clipped_on_every_path(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path, max_message_chars=200)
+        channel = client.channels[42]
+        self._send(bridge, channel, "x" * 500)
+        assert len(channel.sent[0]) <= 200
+        assert channel.sent_kwargs[0]["suppress_embeds"] is True
+
+
+def _no_unfurl_possible(text: str, kwargs: dict[str, Any]) -> bool:
+    """A sent message can render no auto preview: either the message flag
+    is set, or every bare URL in the body is angle-bracketed."""
+    if kwargs.get("suppress_embeds") is True:
+        return True
+    return not re.search(r"(?<![<(\[])https?://", text or "")
+
+
+class TestEditsKeepSuppression:
+    """discord.py drops SUPPRESS_EMBEDS unless an edit re-asserts it, so
+    every in-place edit surface (live status, concierge note, steering
+    note, tool digest, headline) goes through ``_edit``."""
+
+    def _edit(self, bridge: DiscordBridge, *args: Any, **kwargs: Any) -> Any:
+        return asyncio.run(bridge._edit(*args, **kwargs))
+
+    def test_edit_sets_suppress_and_clips(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path, max_message_chars=200)
+        channel = client.channels[42]
+        msg = asyncio.run(channel.send("old"))
+        self._edit(bridge, msg, "see https://example.com/x" + "y" * 500)
+        assert msg.suppress is True
+        assert msg.content.startswith("see https://example.com/x")
+        assert len(msg.content) <= 200
+
+    def test_edit_with_our_embed_masks_urls_instead(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord_format import EmbedSpec
+
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        msg = asyncio.run(channel.send("old"))
+        self._edit(bridge, msg, "run https://x/run/1", embed=EmbedSpec(title="t"))
+        assert msg.suppress is None
+        assert msg.content == "run <https://x/run/1>"
+
+    def test_edit_falls_back_to_masking_without_suppress_kwarg(self, tmp_path: Path) -> None:
+        bridge, _client, _ = make_bridge(tmp_path)
+        seen: dict[str, Any] = {}
+
+        class OldMessage:
+            async def edit(self, *, content: str | None = None, **kwargs: Any) -> None:
+                if "suppress" in kwargs:
+                    raise TypeError("unexpected keyword 'suppress'")
+                seen["content"] = content
+
+        self._edit(bridge, OldMessage(), "run https://x/run/1")
+        assert seen["content"] == "run <https://x/run/1>"
+
+    def test_status_message_create_and_edit_are_suppressed(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bus.emit("task.start", "r1", task_id="t1", title="First https://x/t/1")
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1").status_id is not None)  # type: ignore[union-attr]
+            status_id = bridge.dstore.discord_thread("r1").status_id  # type: ignore[union-attr]
+            idx = thread.sent.index(thread.messages[status_id].content)
+            assert thread.sent_kwargs[idx]["suppress_embeds"] is True
+            assert thread.sent_kwargs[idx].get("embed") is None
+            bus.emit("task.end", "r1", task_id="t1", state="done")
+            assert wait_for(lambda: getattr(thread.messages[status_id], "edits", 0) > 0)
+            assert thread.messages[status_id].suppress is True
+        finally:
+            bridge.close()
+
+    def test_concierge_note_edit_is_suppressed(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord import _ConciergeTurn
+
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        turn = _ConciergeTurn(FakeMessage("hi", channel))
+        turn.calls = ["`gh issue list` https://x/i/1"]
+        turn.note = asyncio.run(channel.send(turn.render()))
+        turn.calls.append("`gh pr list`")
+        asyncio.run(bridge._edit_concierge_note(turn))
+        assert turn.note.suppress is True
+        assert "gh pr list" in turn.note.content
+
+    def test_steer_status_edit_is_suppressed(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord import _Pending
+
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        pending = _Pending("r1", 42, 778)
+        pending.status = asyncio.run(channel.send("⏳ queued"))
+        asyncio.run(bridge._edit_steer_status(pending, "delivered"))
+        assert pending.status.suppress is True
+
+    def test_chronology_chunk_send_is_suppressed(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            control = client.channels[42]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            assert _no_unfurl_possible(control.sent[0], control.sent_kwargs[0])
+            bus.emit("run.deliver", "r1", repo="o/r", pr=3, url="https://x/pull/3")
+            assert wait_for(lambda: any("https://x/pull/3" in s for s in thread.sent))
+            bridge.run_finished(
+                item,
+                RunReport("r1", "completed", "1/1 tasks done", pr=(3, "https://x/pull/3")),
+            )
+            assert wait_for(
+                lambda: any(s.startswith("**finished: completed**") for s in thread.sent)
+            )
+            assert all(
+                _no_unfurl_possible(t, k)
+                for t, k in zip(thread.sent, thread.sent_kwargs, strict=True)
+            )
+        finally:
+            bridge.close()
+
+
+class TestEmbedsArePreserved:
+    """Regression guard for #519: suppressing Discord's *link previews* must
+    not take the bridge's own embed cards with it. With ``[discord] embeds``
+    at its default (true) a real embed object still reaches ``target.send``
+    for the headline, the finish verdict, the run summary and the live
+    status message; with ``embeds = false`` the plain-text twins are used
+    and the message is unfurl-suppressed instead."""
+
+    def _run(self, bridge: DiscordBridge, client: Any, item: WorkItem, report: RunReport) -> Any:
+        bridge.start()
+        try:
+            bus = EventBus()
+            bridge.run_started(item, "r1", FakeEngine(), bus)  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            known = bridge.dstore.discord_thread("r1")
+            assert known is not None
+            thread = client.channels[known.thread_id]
+            bus.emit("task.start", "r1", task_id="t1", title="First")
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1").status_id is not None)  # type: ignore[union-attr]
+            bridge.run_finished(item, report)
+            assert wait_for(
+                lambda: any(s.startswith("**finished: completed**") for s in thread.sent)
+            )
+            return thread
+        finally:
+            bridge.close()
+
+    @staticmethod
+    def _item() -> WorkItem:
+        return WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login", url="https://x/4")
+
+    @staticmethod
+    def _report() -> RunReport:
+        return RunReport("r1", "completed", "1/1 tasks done", pr=(3, "https://x/pull/3"))
+
+    def test_embeds_default_to_true(self) -> None:
+        assert Config().discord.embeds is True
+
+    def test_format_module_still_exports_the_embed_path(self) -> None:
+        from sbxloop.daemon import discord_format as fmt
+
+        assert fmt.EmbedSpec is not None
+        assert hasattr(fmt.EmbedSpec(title="t"), "clamped")
+        for name in (
+            "EMBED_TITLE_MAX",
+            "EMBED_DESCRIPTION_MAX",
+            "EMBED_FIELD_NAME_MAX",
+            "EMBED_FIELD_VALUE_MAX",
+            "EMBED_FIELDS_MAX",
+            "EMBED_TOTAL_MAX",
+            "EMBED_FOOTER_MAX",
+            "COLOR_RUNNING",
+            "COLOR_OK",
+            "COLOR_FAIL",
+            "COLOR_WARN",
+            "COLOR_DIM",
+        ):
+            assert isinstance(getattr(fmt, name), int), name
+        for renderer in ("headline_embed", "finish_embed", "summary_embed", "status_embed"):
+            assert callable(getattr(fmt, renderer)), renderer
+        assert "embed" in Chunk.__dataclass_fields__
+
+    def test_headline_finish_summary_still_send_embeds(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        item, report = self._item(), self._report()
+        thread = self._run(bridge, client, item, report)
+        control = client.channels[42]
+        # headline card on the control channel
+        assert isinstance(control.sent_kwargs[0].get("embed"), FakeEmbed)
+        assert control.sent[0].startswith("▶ run `r1`")
+        titles = [
+            k["embed"].spec.title
+            for k in thread.sent_kwargs
+            if isinstance(k.get("embed"), FakeEmbed)
+        ]
+        assert len(titles) >= 2  # finish verdict + run summary
+        blob = "\n".join(
+            (k["embed"].spec.as_text() if isinstance(k.get("embed"), FakeEmbed) else "")
+            for k in thread.sent_kwargs
+        )
+        assert "https://x/pull/3" in blob
+
+    def test_live_status_message_stays_text_and_unfurl_free(self, tmp_path: Path) -> None:
+        """The live status line has no embed twin and never had one — it is
+        plain text, edited in place, and must stay unfurl-suppressed."""
+        bridge, client, _ = make_bridge(tmp_path)
+        thread = self._run(bridge, client, self._item(), self._report())
+        known = bridge.dstore.discord_thread("r1")
+        assert known is not None and known.status_id
+        status = thread.messages[known.status_id]
+        assert status.embed is None
+        assert getattr(status, "edit_kwargs", [{}])[-1].get("suppress") is True
+
+    def test_ctl_status_reply_still_carries_an_embed(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        asyncio.run(bridge._command(FakeMessage("!status", channel), "status"))
+        assert isinstance(channel.sent_kwargs[-1].get("embed"), FakeEmbed)
+
+    def test_embeds_false_uses_text_twins_and_suppresses_unfurls(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord_format import finish_text, headline_text, summary_text
+
+        bridge, client, _ = make_bridge(tmp_path, embeds=False)
+        item, report = self._item(), self._report()
+        thread = self._run(bridge, client, item, report)
+        control = client.channels[42]
+        assert control.sent[0].startswith(headline_text(item, "r1").split("\n")[0])
+        assert control.sent_kwargs[0].get("embed") is None
+        assert control.sent_kwargs[0]["suppress_embeds"] is True
+        assert not any(isinstance(k.get("embed"), FakeEmbed) for k in thread.sent_kwargs)
+        assert all(k.get("suppress_embeds") is True for k in thread.sent_kwargs)
+        assert any(
+            s.startswith(finish_text("completed", report).split("\n")[0]) for s in thread.sent
+        )
+        assert any(
+            s.startswith(summary_text(None, "completed").split("\n")[0][:20]) for s in thread.sent
+        )
+        known = bridge.dstore.discord_thread("r1")
+        assert known is not None and known.status_id
+        status = thread.messages[known.status_id]
+        assert status.embed is None
+        assert getattr(status, "edit_kwargs", [{}])[-1].get("suppress") is True

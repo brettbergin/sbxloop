@@ -8,17 +8,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
-- **`sbxloop doctor` boots nothing by default, and at most one github
-  sandbox per credential when it probes** (#515). Multi-repo support (#511)
-  wired a reachability probe that provisioned one github-only microVM per
-  configured repository on every `doctor` invocation, so the deploy health
-  step's wall clock scaled with the repository count. Probing is now behind
-  `--probe` (implied by `--deep`); the default rows say "reachability
-  unverified from the host … `sbxloop doctor --probe` boots one to ask".
-  When it probes, repositories are grouped by credential (`token_env`, or
-  the daemon-wide token) and share one sandbox per group; a credential
-  whose sandbox will not boot answers "unverified" for every repository on
-  it without re-provisioning.
+- **Discord's automatic link previews are suppressed in bridge output**
+  (#519). The grey unfurl cards Discord generates under any message
+  containing a bare URL were what made the control channel hard to read —
+  not the bridge's own embed cards, which stay. Every send now sets the
+  `SUPPRESS_EMBEDS` message flag unless the message carries one of our
+  embeds, in which case the body is angle-bracketed through the new
+  `discord_format.no_unfurl` (idempotent; leaves code spans, already-
+  bracketed URLs and markdown link targets alone). Edits go through a new
+  `DiscordBridge._edit` that re-asserts the flag, because discord.py
+  clears it otherwise and the first edit of a live status, tool digest or
+  concierge note would bring the preview back. `[discord] embeds = false`
+  still falls back to the plain-markdown twins of the cards; unfurl
+  suppression is unaffected by that toggle.
 
 - **The concierge files symptom-first issues and asks before filing a fix
   with no symptom** (#535). #519 was filed as the mechanism the person
