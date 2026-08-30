@@ -628,7 +628,11 @@ class DaemonLoop:
             waiting = self.dstore.queued()
             if waiting:
                 soonest = min(
-                    max(0.0, w.attempts * self.config.daemon.retry_backoff_s - (now - w.updated_at))
+                    max(
+                        0.0,
+                        w.attempts * self.config.daemon.retry_backoff_s - (now - w.updated_at),
+                        (w.not_before - now) if w.not_before is not None else 0.0,
+                    )
                     for w in waiting
                 )
                 return TickResult(
@@ -668,6 +672,23 @@ class DaemonLoop:
         forever (#234)."""
         run_id = item.run_id
         assert run_id is not None
+        granted = self._granted_retry(run_id)
+        if granted is not None:
+            # Not an interruption (#523): the run ended one fix round short
+            # and was granted more. The resume budget bounds crash-resume
+            # churn; this continuation is bounded by the grant itself.
+            self._remove_stale_run_sandboxes(run_id)
+            self._notice(
+                "run.resuming",
+                f"resuming {run_id} for {item.item_id} on its own PR with {granted.granted_rounds} "
+                f"granted fix round(s)",
+                item=item.item_id,
+                run=run_id,
+                url=granted.pr_url,
+                granted_rounds=granted.granted_rounds,
+                pr=granted.pr_number,
+            )
+            return self._dispatch(item, resume_run_id=run_id)
         resumes = self.dstore.resumes_for_item(item.item_id)
         budget = self.config.daemon.max_resumes_per_item
         if resumes >= budget:
@@ -700,6 +721,65 @@ class DaemonLoop:
             budget=budget,
         )
         return self._dispatch(item, resume_run_id=run_id)
+
+    def _granted_retry(self, run_id: str) -> RunRecord | None:
+        """The run record when the pinned run is a *granted* continuation: it
+        ended ``failed`` by exhausting a fix-round budget and has since been
+        granted more rounds (by :meth:`_settle` or an operator)."""
+        try:
+            record = self.store.get_run(run_id)
+        except SbxloopError:
+            return None
+        if record.state == "failed" and record.granted_rounds > 0 and record.exhausted is None:
+            return record
+        return None
+
+    # -- operator: more rounds for an exhausted run (#523) ---------------------------
+
+    def grant_rounds(self, run_id: str, rounds: int, by: str | None = None) -> WorkItem:
+        """Give an exhausted run ``rounds`` more fix rounds and resume it now,
+        skipping the retry backoff. The run must have ended by exhausting a
+        budget and be pinned to an item that is failed (handed over) or
+        queued (waiting out its backoff); anything else is refused with the
+        state that is actually there."""
+        if rounds < 1:
+            raise ValueError(f"rounds must be at least 1, not {rounds}")
+        try:
+            record = self.store.get_run(run_id)
+        except SbxloopError as exc:
+            raise ValueError(f"unknown run {run_id}") from exc
+        item_id = self.dstore.item_for_run(run_id)
+        item = self.dstore.get(item_id) if item_id else None
+        if item is None or item.run_id != run_id:
+            raise ValueError(f"run {run_id} is not the pinned run of any work item")
+        if record.state != "failed" or (record.exhausted is None and record.granted_rounds == 0):
+            raise ValueError(
+                f"run {run_id} is {record.state}"
+                + (f" ({record.reason})" if record.reason else "")
+                + "; grant-rounds only applies to a run that exhausted its fix rounds"
+            )
+        if item.state == "running":
+            raise ValueError(f"{item.item_id} is running; wait for the run to finish")
+        who = by or "operator"
+        total = self.store.grant_rounds(run_id, rounds)
+        now = self.clock()
+        fresh = self.dstore.resume_exhausted(
+            item.item_id, run_id, now, f"{rounds} more fix round(s) granted by {who}"
+        )
+        self._notice(
+            "run.rounds_granted",
+            f"{who} granted {run_id} {rounds} more fix round(s) ({total} granted in all); "
+            f"{item.item_id} resumes on its own PR at the next tick",
+            item=item.item_id,
+            run=run_id,
+            url=record.pr_url,
+            by=who,
+            rounds=rounds,
+            granted_rounds=total,
+            pr=record.pr_number,
+        )
+        self._deliver_report(fresh, by=who)
+        return fresh
 
     # -- state-dir retention -------------------------------------------------------
 
@@ -1122,6 +1202,9 @@ class DaemonLoop:
             return "blocked"
         reason = str(error) if error is not None else (report.reason or f"run ended {report.state}")
         attempts_left = self.config.daemon.max_attempts_per_item - item.attempts
+        exhausted = self._exhaustion(run_id, result)
+        if exhausted is not None:
+            return self._settle_exhausted(item, run_id, exhausted, report, reason, now)
         self._set_breaker(self._breaker_opened_at, self._consecutive_failures + 1)
         self.dstore.finish_ledger(run_id, "failed", now)
         self._close_run_record(run_id, reason)
@@ -1407,6 +1490,105 @@ class DaemonLoop:
         """The report card of any run this daemon's store knows — what the
         settle path reads, for the concierge and other readers."""
         return self._report(run_id, None)
+
+    def _exhaustion(self, run_id: str, result: RunResult | None) -> RunRecord | None:
+        """The run record when the run ended by exhausting a fix-round
+        budget — the engine marks ``runs.exhausted`` at that moment."""
+        if result is None or result.state != "failed":
+            return None
+        try:
+            record = self.store.get_run(run_id)
+        except SbxloopError:
+            return None
+        return record if record.exhausted is not None else None
+
+    def _settle_exhausted(
+        self,
+        item: WorkItem,
+        run_id: str,
+        record: RunRecord,
+        report: RunReport,
+        reason: str,
+        now: float,
+    ) -> TickOutcome:
+        """The run stopped one fix round short (#523): its branch is green
+        and its PR is open, so starting over — a fresh plan, a second PR —
+        throws away hours of work that was one round from landing.
+
+        First exhaustion: grant ``[landing] retry_rounds`` and schedule a
+        resume of the *same* run after the retry backoff; the attempt count
+        and the breaker are untouched (a scheduled continuation is not a
+        failure). Second exhaustion, or ``retry_rounds = 0``: hand over —
+        the item fails with the run pinned, the issue gets the failed
+        label, and ``grant-rounds`` is the operator's way to continue it."""
+        landing = self.config.landing
+        rounds = landing.retry_rounds
+        pr = report.pr
+        pr_text = f" on PR {pr[1]}" if pr and pr[1] else ""
+        if record.granted_rounds == 0 and rounds > 0:
+            self.store.grant_rounds(run_id, rounds)
+            self.dstore.finish_ledger(run_id, "exhausted", now)
+            backoff = self.config.daemon.retry_backoff_s
+            item_reason = (
+                f"{reason}. Resuming this run{pr_text} with {rounds} more fix round(s) "
+                f"after the retry backoff ({backoff:.0f}s)"
+            )
+            self.dstore.mark_exhausted(item.item_id, item_reason, now, not_before=now + backoff)
+            attempts_left = max(0, self.config.daemon.max_attempts_per_item - item.attempts)
+            self.source.report_retry(item, item_reason, attempts_left)
+            self._notice(
+                "run.exhausted",
+                f"⏳ {item.item_id} exhausted its {record.exhausted} fix rounds ({reason})"
+                f"{pr_text}; resuming the same run in {backoff / 60:.0f} min with {rounds} more "
+                f"round(s) — `grant-rounds {run_id} N` resumes now, `abandon {item.item_id}` stops",
+                level="warning",
+                item=item.item_id,
+                run=run_id,
+                url=pr[1] if pr else None,
+                reason=reason,
+                budget=record.exhausted,
+                granted_rounds=rounds,
+                retry_backoff_s=backoff,
+                pr=pr[0] if pr else None,
+            )
+            self._frontend_finished(item, report)
+            return "retry"
+        self._set_breaker(self._breaker_opened_at, self._consecutive_failures + 1)
+        self.dstore.finish_ledger(run_id, "failed", now)
+        why = (
+            f"{reason} ({record.granted_rounds} already granted)"
+            if record.granted_rounds
+            else f"{reason} (retry_rounds = 0)"
+        )
+        self.dstore.mark_failed(item.item_id, why, now, requeue=False)
+        self.source.report_abandoned(item, why)
+        self._notice(
+            "run.exhausted",
+            f"❌ {item.item_id} exhausted its {record.exhausted} fix rounds again ({reason})"
+            f"{pr_text}; handed over — `grant-rounds {run_id} N` continues the same PR, "
+            f"`retry {item.item_id}` starts a fresh plan",
+            level="error",
+            item=item.item_id,
+            run=run_id,
+            url=pr[1] if pr else None,
+            reason=reason,
+            budget=record.exhausted,
+            granted_rounds=record.granted_rounds,
+            pr=pr[0] if pr else None,
+            consecutive_failures=self._consecutive_failures,
+        )
+        self._frontend_finished(item, report)
+        if self._consecutive_failures >= self.config.daemon.max_consecutive_failures:
+            self._set_breaker(now, self._consecutive_failures)
+            self._notice(
+                "breaker.opened",
+                f"🛑 circuit breaker opened after {self._consecutive_failures} consecutive "
+                f"failures; pausing dispatch for {self.config.daemon.breaker_cooldown_s:.0f}s",
+                level="error",
+                consecutive_failures=self._consecutive_failures,
+                cooldown_s=self.config.daemon.breaker_cooldown_s,
+            )
+        return "failed"
 
     def _report(self, run_id: str, result: RunResult | None) -> RunReport:
         record: RunRecord | None

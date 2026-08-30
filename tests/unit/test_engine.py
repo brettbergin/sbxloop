@@ -1562,8 +1562,52 @@ class TestPipeline:
         assert fake.merges == [] and fake.ready_calls == []
         assert [t.spec.id for t in result.tasks] == ["t1", "fix-1"]
         run = engine.store.get_run(result.run_id)
-        assert run.review_rounds == 2 and run.stage == "reviewing"
+        assert run.review_rounds == 1, "the counter is rounds actually spent"
+        assert run.stage == "reviewing"
         assert run.reason == result.reason
+        # The budget that ran out is recorded, for the daemon and the run end.
+        assert run.exhausted == "review" and result.exhausted == "review"
+        (end,) = self._events(harness, HostEventTypes.RUN_END)
+        assert end.data["exhausted"] == "review"
+
+    def test_an_exhausted_run_resumes_with_granted_rounds(self, harness: Harness) -> None:
+        """#523: the PR is one round from mergeable. A bare resume is refused
+        (it would spend a review only to re-exhaust); with rounds granted the
+        run re-enters review on its own branch, spends a *real* further
+        round, and lands — no new PR, no new plan."""
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_RC])
+        engine = harness.pipeline(fake, landing={"max_review_rounds": 1})
+        result = engine.start("never good enough")
+        assert result.state == "failed" and result.exhausted == "review"
+        run_id = result.run_id
+        with pytest.raises(StateError, match="exhausted its review fix rounds; grant more"):
+            harness.pipeline(fake, landing={"max_review_rounds": 1}).resume(run_id)
+
+        assert engine.store.grant_rounds(run_id, 1) == 1
+        harness.script([REVIEW_RC, BUILD, REVIEW_OK])
+        again = harness.pipeline(fake, landing={"max_review_rounds": 1})
+        result = again.resume(run_id)
+        assert result.state == "merged" and result.exhausted is None
+        assert result.pr_number == 7 and fake.merges == [(7, "squash", "commit3")]
+        run = again.store.get_run(run_id)
+        assert run.review_rounds == 2 and run.granted_rounds == 1 and run.exhausted is None
+        assert [t.spec.id for t in result.tasks] == ["t1", "fix-1", "fix-2"]
+        # The round that landed it knew its budget was extended.
+        rounds = [e for e in harness.events if e.type == HostEventTypes.FIX_ROUND]
+        assert rounds[-1].data["budget"] == "2/2"
+
+    def test_a_granted_run_that_exhausts_again_says_so(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, BUILD, REVIEW_RC])
+        engine = harness.pipeline(fake, landing={"max_review_rounds": 1})
+        run_id = engine.start("never good enough").run_id
+        engine.store.grant_rounds(run_id, 1)
+        harness.script([REVIEW_RC, BUILD, REVIEW_RC])
+        result = harness.pipeline(fake, landing={"max_review_rounds": 1}).resume(run_id)
+        assert result.state == "failed" and result.exhausted == "review"
+        assert result.reason is not None
+        assert "(1 allowed by [landing] review_rounds + 1 granted)" in result.reason
 
     def test_gate_red_spends_a_ci_round_before_delivering(self, harness: Harness) -> None:
         """A later task breaks what an earlier one proved: the gate over the

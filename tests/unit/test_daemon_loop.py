@@ -141,6 +141,28 @@ class Harness:
         if not resume:
             self.store.create_run(run_id, "outcome")
         reason = None
+        if kind == "exhausted":
+            # The engine's shape for a run one round short (#523): PR open,
+            # the review budget spent past its limit, the budget recorded.
+            self.store.set_run_pr(
+                run_id, number=9, url=PR_URL, branch=f"sbxloop/{run_id}", head_sha="abc"
+            )
+            self.store.set_run_state(run_id, "reviewing")
+            limit = cfg.landing.max_review_rounds + self.store.get_run(run_id).granted_rounds
+            while self.store.get_run(run_id).review_rounds < limit:
+                self.store.bump_run_counter(run_id, "review_rounds")
+            self.store.set_run_exhausted(run_id, "review")
+            reason = "review fix rounds exhausted (3 allowed by [landing] review_rounds): x"
+            self.store.set_run_reason(run_id, reason)
+            self.store.set_run_state(run_id, "failed")
+            return RunResult(
+                run_id=run_id,
+                state="failed",
+                pr_number=9,
+                pr_url=PR_URL,
+                reason=reason,
+                exhausted="review",
+            )
         if kind in ("merged", "blocked"):
             self.store.set_run_pr(
                 run_id, number=9, url=PR_URL, branch=f"sbxloop/{run_id}", head_sha="abc"
@@ -2327,3 +2349,179 @@ class TestDeployChoreography:
         dispatch(h.loop, f"pause --hold {self.HOLD}")
         assert dispatch(h.loop, f"resume --hold {self.HOLD}").text == "resumed."
         assert not h.loop.paused
+
+
+class TestExhaustedRuns:
+    """A run that exhausts a fix-round budget resumes its own PR (#523)
+    instead of being retried from scratch with a second PR."""
+
+    def _harness(self, tmp_path: Path, **overrides: Any) -> Harness:
+        cfg = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repo": "o/r"},
+                "daemon": {"max_attempts_per_item": 2, "retry_backoff_s": 100},
+                **overrides,
+            }
+        )
+        return Harness(tmp_path, cfg)
+
+    def test_first_exhaustion_schedules_a_resume_of_the_same_run(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted", "merged"]
+        assert h.loop.tick().outcome == "retry"
+        (run_id, _) = h.runs[0]
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "queued"
+        assert item.run_id == run_id, "the run stays pinned: the retry is a resume"
+        assert item.not_before == h.clock() + 100
+        assert item.attempts == 1, "a scheduled continuation is not a second attempt"
+        assert h.loop._consecutive_failures == 0, "nor a breaker count"
+        run = h.store.get_run(run_id)
+        assert run.granted_rounds == 2 and run.exhausted is None and run.state == "failed"
+        # The issue and Discord hear what will happen, not a generic failure.
+        retry = [c for c in h.source.calls if c[0] == "retry"]
+        assert retry == [("retry", 1)]
+        (notice,) = [n for n in front.notices if n.kind == "run.exhausted"]
+        assert "resuming the same run in 2 min with 2 more round(s)" in notice.text
+        assert f"grant-rounds {run_id} N" in notice.text and notice.url == PR_URL
+        assert not any(n.kind == "run.failed" for n in front.notices)
+        # Backoff not elapsed: nothing dispatches, and the idle reason says so.
+        reason = h.loop.tick().idle_reason
+        assert reason is not None and reason.startswith("backoff (1 queued; next eligible in 100s")
+        h.clock.t += 101
+        assert h.loop.tick().outcome == "done"
+        assert h.runs == [(run_id, False), (run_id, True)], "same run, resumed"
+        assert h.dstore.get("gh:issue:1").state == "done"  # type: ignore[union-attr]
+        assert h.dstore.runs_started_since(0) == 2, "the daily cap counts the resume"
+        resuming = [n for n in front.notices if n.kind == "run.resuming"]
+        assert resuming and "2 granted fix round(s)" in resuming[0].text
+
+    def test_the_granted_resume_ignores_the_resume_budget(self, tmp_path: Path) -> None:
+        """The resume budget bounds crash-resume churn; a granted
+        continuation is bounded by the grant, and an operator's grant must
+        never be refused for it."""
+        h = self._harness(tmp_path, daemon={"max_resumes_per_item": 0, "retry_backoff_s": 1})
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted", "merged"]
+        assert h.loop.tick().outcome == "retry"
+        h.clock.t += 2
+        assert h.loop.tick().outcome == "done"
+        assert h.runs[1][1] is True
+
+    def test_second_exhaustion_hands_over_with_the_run_pinned(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path, daemon={"retry_backoff_s": 1})
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted", "exhausted"]
+        assert h.loop.tick().outcome == "retry"
+        h.clock.t += 2
+        assert h.loop.tick().outcome == "failed"
+        (run_id, _) = h.runs[0]
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "failed" and item.run_id == run_id
+        assert item.last_error is not None and "2 already granted" in item.last_error
+        assert h.source.calls[-1][0] == "abandoned"
+        assert h.loop._consecutive_failures == 1
+        notices = [n for n in front.notices if n.kind == "run.exhausted"]
+        assert len(notices) == 2 and notices[1].level == "error"
+        assert "handed over" in notices[1].text and f"grant-rounds {run_id} N" in notices[1].text
+        # No fresh run was ever started for it: one run id throughout.
+        assert {r for r, _ in h.runs} == {run_id}
+
+    def test_retry_rounds_zero_hands_over_at_once(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path, landing={"retry_rounds": 0})
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted"]
+        assert h.loop.tick().outcome == "failed"
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "failed" and item.run_id == h.runs[0][0]
+        assert "retry_rounds = 0" in (item.last_error or "")
+        assert h.store.get_run(h.runs[0][0]).granted_rounds == 0
+
+    def test_grant_rounds_resumes_a_handed_over_item_now(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path, landing={"retry_rounds": 0})
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted", "merged"]
+        assert h.loop.tick().outcome == "failed"
+        (run_id, _) = h.runs[0]
+        fresh = h.loop.grant_rounds(run_id, 3, by="brett")
+        assert fresh.state == "queued" and fresh.run_id == run_id and fresh.not_before is None
+        run = h.store.get_run(run_id)
+        assert run.granted_rounds == 3 and run.exhausted is None
+        # The source drops the failed label and re-claims, attributed.
+        assert h.source.calls[-1] == ("requeued", "brett")
+        (granted,) = [n for n in front.notices if n.kind == "run.rounds_granted"]
+        assert "brett granted" in granted.text and "3 more fix round(s)" in granted.text
+        assert h.loop.tick().outcome == "done"
+        assert h.runs == [(run_id, False), (run_id, True)]
+
+    def test_grant_rounds_during_the_backoff_skips_it(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted", "merged"]
+        assert h.loop.tick().outcome == "retry"
+        (run_id, _) = h.runs[0]
+        assert h.loop.tick().idle_kind == "backoff"
+        fresh = h.loop.grant_rounds(run_id, 1)
+        assert fresh.not_before is None and fresh.pending_report is None
+        assert h.store.get_run(run_id).granted_rounds == 3  # 2 automatic + 1
+        assert not any(c[0] == "requeued" for c in h.source.calls)
+        assert h.loop.tick().outcome == "done"
+
+    def test_grant_rounds_refuses_anything_but_an_exhausted_run(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        h.source.items = [gh_item("1"), gh_item("2")]
+        h.outcomes = ["merged", "failed"]
+        assert h.loop.tick().outcome == "done"
+        assert h.loop.tick().outcome == "retry"
+        merged_run, failed_run = h.runs[0][0], h.runs[1][0]
+        with pytest.raises(ValueError, match="is merged"):
+            h.loop.grant_rounds(merged_run, 1)
+        with pytest.raises(ValueError, match="not the pinned run"):
+            h.loop.grant_rounds(failed_run, 1)  # a plain failure unpins its run
+        with pytest.raises(ValueError, match="unknown run"):
+            h.loop.grant_rounds("r_nope", 1)
+        with pytest.raises(ValueError, match="at least 1"):
+            h.loop.grant_rounds(merged_run, 0)
+
+    def test_grant_rounds_refuses_the_run_in_flight(self, tmp_path: Path) -> None:
+        h = self._harness(tmp_path)
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted", "exhausted"]
+        assert h.loop.tick().outcome == "retry"
+        (run_id, _) = h.runs[0]
+        # Fake "in flight": the item is running on that run.
+        h.dstore.mark_resuming("gh:issue:1", run_id, h.clock())
+        with pytest.raises(ValueError, match="is running"):
+            h.loop.grant_rounds(run_id, 1)
+
+    def test_a_scheduled_resume_survives_a_daemon_restart(self, tmp_path: Path) -> None:
+        """The pin and the clock live in the store: a new process neither
+        reconciles the run away nor resumes it early."""
+        h = self._harness(tmp_path)
+        h.source.items = [gh_item()]
+        h.outcomes = ["exhausted"]
+        assert h.loop.tick().outcome == "retry"
+        (run_id, _) = h.runs[0]
+        again = DaemonLoop(
+            h.config,
+            store=h.store,
+            dstore=h.dstore,
+            source=h.source,
+            runner=h.runner,
+            clock=h.clock,
+        )
+        again.recover()
+        assert h.store.get_run(run_id).state == "failed"
+        assert again.tick().idle_kind == "backoff"
+        h.clock.t += 101
+        h.outcomes = ["merged"]
+        assert again.tick().outcome == "done"
+        assert h.runs[-1] == (run_id, True)

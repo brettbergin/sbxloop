@@ -64,6 +64,9 @@ _WORK_ITEMS_BODY = """(
     -- Identity is (source_key, repo): issue #4 in two repositories is two
     -- work items, which a bare UNIQUE(source_key) would have collided.
     repo        TEXT NOT NULL DEFAULT '',
+    -- Earliest dispatch time, when a retry is scheduled rather than backed
+    -- off by attempt count (an exhausted run resuming its own PR, #523).
+    not_before  REAL,
     UNIQUE(source_key, repo)
 )"""
 
@@ -190,6 +193,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         pending_report=row["pending_report"],
         requested_by=row["requested_by"],
         repo=row["repo"] or None,
+        not_before=row["not_before"],
     )
 
 
@@ -284,6 +288,7 @@ class DaemonStore:
             )
         self._conn.executescript(_SCHEMA)
         self._migrate_repo_columns()
+        self._migrate_added_columns()
         self._conn.execute(
             "INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('schema_version', ?)",
             (SCHEMA_VERSION,),
@@ -345,6 +350,24 @@ class DaemonStore:
         except Exception:
             self._conn.rollback()
             raise
+
+    # Columns added after the multi-repo rebuild, applied idempotently on
+    # open so a store written by an older daemon upgrades in place.
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        (
+            "daemon_work_items",
+            "not_before",
+            "ALTER TABLE daemon_work_items ADD COLUMN not_before REAL",
+        ),
+    )
+
+    def _migrate_added_columns(self) -> None:
+        for table, column, ddl in self._ADDED_COLUMNS:
+            if column in _columns(self._conn, table):
+                continue
+            self._conn.execute(ddl)
+            self._conn.commit()
+            log.info("store.migrated", table=table, added=column)
 
     def backfill_repo(self, repo: str | None) -> int:
         """Give repo-less rows the daemon's sole configured repository.
@@ -647,6 +670,8 @@ class DaemonStore:
                 "ORDER BY (run_id IS NULL) ASC, created_at ASC, rowid ASC"
             ):
                 item = _row_to_item(row)
+                if item.not_before is not None and now < item.not_before:
+                    continue  # a scheduled retry (#523) waits its own clock
                 if (
                     item.run_id is not None
                     or item.attempts == 0
@@ -871,8 +896,8 @@ class DaemonStore:
         item_id = normalize_item_id(item_id)
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE daemon_work_items SET state = 'running', updated_at = ? "  # nosec B608
-                f"WHERE {where} AND run_id = ?",
+                "UPDATE daemon_work_items SET state = 'running', not_before = NULL, "  # nosec B608
+                f"updated_at = ? WHERE {where} AND run_id = ?",
                 (now, *ids, run_id),
             )
             if cursor.rowcount != 1:
@@ -907,10 +932,43 @@ class DaemonStore:
         fields: dict[str, object] = {
             "state": "queued" if requeue else "failed",
             "last_error": error[:2000],
+            "not_before": None,
         }
         if requeue:
             fields["run_id"] = None
         self._update(item_id, now, **fields)
+
+    def mark_exhausted(self, item_id: str, error: str, now: float, *, not_before: float) -> None:
+        """The run stopped one fix round short (#523): back to the queue with
+        the run *pinned* — the next dispatch resumes it on its own branch and
+        PR — but not before ``not_before``, the retry backoff. The attempt
+        count is untouched: a resume is the same attempt."""
+        self._update(item_id, now, state="queued", last_error=error[:2000], not_before=not_before)
+
+    def resume_exhausted(self, item_id: str, run_id: str, now: float, reason: str) -> WorkItem:
+        """Operator ``grant-rounds``: an exhausted item — failed and handed
+        over, or queued and waiting out its backoff — resumes its pinned run
+        on the next tick. A failed item owes the source a ``requeued`` report
+        (drop the failed label, re-claim); a queued one owes nothing new."""
+        item = self._require(item_id)
+        if item.run_id != run_id:
+            raise ValueError(f"{item_id} is not pinned to run {run_id} (its run is {item.run_id})")
+        fields: dict[str, object] = {
+            "state": "queued",
+            "not_before": None,
+            "last_error": reason[:2000],
+        }
+        if item.state == "failed":
+            fields["pending_report"] = "requeued"
+        return self._transition(
+            item_id,
+            now,
+            ("failed", "queued"),
+            lambda it: (
+                f"{item_id} is {it.state}; only a failed or queued item can be granted rounds"
+            ),
+            **fields,
+        )
 
     def mark_cancelled(self, item_id: str, reason: str, now: float) -> None:
         """Operator cancel: terminal for the daemon, unlike ``mark_failed``

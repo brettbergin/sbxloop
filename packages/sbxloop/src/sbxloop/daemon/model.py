@@ -60,6 +60,10 @@ class WorkItem(BaseModel):
     pending_report: PendingReport | None = None
     requested_by: str | None = None
     repo: str | None = None
+    # Earliest dispatch time for a queued item, when one applies: the retry
+    # backoff of an exhausted run waiting to resume its own PR (#523). None
+    # means the ordinary rules (attempt backoff; pinned resumes go first).
+    not_before: float | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -157,6 +161,8 @@ NoticeKind = Literal[
     "item.requeue_unpinned",
     "run.resuming",
     "run.resume_budget_exhausted",
+    "run.exhausted",
+    "run.rounds_granted",
     "run.done",
     "run.failed",
     "run.abandoned",
@@ -179,6 +185,7 @@ TERMINAL_NOTICE_KINDS: frozenset[str] = frozenset(
     {
         "run.done",
         "run.failed",
+        "run.exhausted",
         "run.abandoned",
         "run.blocked",
         "run.cancelled",

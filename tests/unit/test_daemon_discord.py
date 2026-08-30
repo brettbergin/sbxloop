@@ -200,6 +200,7 @@ class FakeLoop:
         self.cancel_calls: list[tuple[str | None, bool]] = []
         self.retried: list[tuple[str, str | None]] = []
         self.hold_calls: list[tuple[str, str | None, str | None]] = []
+        self.granted: list[tuple[str, int, str | None]] = []
 
     @property
     def paused(self) -> bool:
@@ -257,6 +258,12 @@ class FakeLoop:
 
     def requeue_item(self, item_id: str) -> WorkItem:
         return self.dstore.requeue(item_id, 1.0)
+
+    def grant_rounds(self, run_id: str, rounds: int, by: str | None = None) -> WorkItem:
+        self.granted.append((run_id, rounds, by))
+        if run_id == "r_unknown":
+            raise ValueError(f"unknown run {run_id}")
+        return WorkItem(item_id="gh:issue:9", source_key="9", title="Nine", run_id=run_id)
 
 
 def make_bridge(

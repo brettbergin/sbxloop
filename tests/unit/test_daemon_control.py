@@ -20,6 +20,7 @@ from sbxloop.cli.app import app
 from sbxloop.config import Config
 from sbxloop.daemon.control import (
     CTL_SUBDIR,
+    ITEM_COMMANDS,
     CommandReply,
     ControlClient,
     ControlServer,
@@ -592,3 +593,32 @@ class TestHolds:
         del status["holds"]
         floop.status = lambda: status  # type: ignore[method-assign]
         assert "holds: operator" in plain(dispatch(floop, "status").text)
+
+
+class TestGrantRounds:
+    """`grant-rounds <run> <n>` (#523) through the dispatcher."""
+
+    def test_grant_rounds_reaches_the_loop_with_the_operator(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "grant-rounds r_abc 2", by="brett")
+        assert reply.ok and floop.granted == [("r_abc", 2, "brett")]
+        assert "granted `r_abc` 2 more fix round(s)" in reply.text and "gh:issue:9" in reply.text
+        assert "grant-rounds" in ITEM_COMMANDS, "talks to the source: off Discord's event loop"
+
+    def test_grant_rounds_validates_its_arguments(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        for cmd in (
+            "grant-rounds",
+            "grant-rounds r_abc",
+            "grant-rounds r_abc two",
+            "grant-rounds r_abc 0",
+            "grant-rounds r_abc 2 extra",
+        ):
+            reply = dispatch(floop, cmd)
+            assert not reply.ok and "usage: grant-rounds" in reply.text, cmd
+        assert floop.granted == []
+
+    def test_grant_rounds_reports_the_loops_refusal(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "grant-rounds r_unknown 1")
+        assert not reply.ok and reply.text == "grant-rounds failed: unknown run r_unknown"

@@ -86,7 +86,9 @@ CREATE TABLE IF NOT EXISTS runs (
     ci_rounds  INTEGER NOT NULL DEFAULT 0,
     update_attempts INTEGER NOT NULL DEFAULT 0,
     update_head TEXT,
-    last_verdict TEXT
+    last_verdict TEXT,
+    exhausted  TEXT,
+    granted_rounds INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -167,6 +169,11 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ),
         ("update_head", "ALTER TABLE runs ADD COLUMN update_head TEXT"),
         ("last_verdict", "ALTER TABLE runs ADD COLUMN last_verdict TEXT"),
+        ("exhausted", "ALTER TABLE runs ADD COLUMN exhausted TEXT"),
+        (
+            "granted_rounds",
+            "ALTER TABLE runs ADD COLUMN granted_rounds INTEGER NOT NULL DEFAULT 0",
+        ),
     ),
     "phase_attempts": (
         ("input_tokens", "ALTER TABLE phase_attempts ADD COLUMN input_tokens INTEGER"),
@@ -269,6 +276,40 @@ class StateStore:
             if cursor.rowcount == 0:
                 raise StateError(f"unknown run {run_id}")
             self._conn.commit()
+
+    def set_run_exhausted(self, run_id: str, kind: str | None) -> None:
+        """Record which fix-round budget the run ran out of (``None`` clears
+        it). Set by the engine when a round exhaustion ends the run; read by
+        the daemon to tell "stopped one round short" from "broke" (#523)."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET exhausted = ?, updated_at = ? WHERE run_id = ?",
+                (kind, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+
+    def grant_rounds(self, run_id: str, rounds: int) -> int:
+        """Extend this run's fix-round budgets by ``rounds`` and clear its
+        exhaustion mark, so a resume gets real further rounds instead of
+        re-exhausting at the first request for changes. Returns the total
+        granted so far."""
+        if rounds < 1:
+            raise StateError(f"rounds to grant must be positive, not {rounds}")
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET granted_rounds = granted_rounds + ?, exhausted = NULL, "
+                "updated_at = ? WHERE run_id = ?",
+                (rounds, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT granted_rounds AS n FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return int(row["n"])
 
     def touch_run(self, run_id: str) -> None:
         """Refresh ``updated_at`` without changing anything else — the
@@ -425,6 +466,8 @@ class StateStore:
             update_attempts=int(row["update_attempts"] or 0),
             update_head=row["update_head"],
             last_verdict=row["last_verdict"],
+            exhausted=row["exhausted"],
+            granted_rounds=int(row["granted_rounds"] or 0),
         )
 
     def non_terminal_runs(self) -> list[RunRecord]:

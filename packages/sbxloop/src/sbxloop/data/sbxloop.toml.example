@@ -140,6 +140,7 @@ secret_strategy = "proxy"
 # deliver_draft = true
 # max_review_rounds = 3      # times the review may request changes
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
+# retry_rounds = 2           # daemon: an exhausted run resumes its own PR once with this many more; 0 = hand to a human
 # ci_poll_interval_s = 60
 # ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI"
 # ci_timeout_s = 3600        # per wait; exceeding it ends the run blocked
