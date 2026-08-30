@@ -210,25 +210,25 @@ letting in-VM tooling fail confusingly on a full disk.
 
 ## CLI reference
 
-| Command                                         | What it does                                                                                                                                                                                                                                                     |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                   |
-| `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to Discord. Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`. |
-| `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                              |
-| `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as Discord's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                               |
-| `sbxloop resume RUN`                            | Re-provision sandboxes and continue a checkpointed run under its persisted config — at the task graph, or at the pipeline stage it stopped in (the retry path for a failed delivery or a `blocked` landing).                                                     |
-| `sbxloop cancel RUN`                            | Cancel an in-flight run.                                                                                                                                                                                                                                         |
-| `sbxloop status [RUN]`                          | List runs, or show one run's task/phase detail.                                                                                                                                                                                                                  |
-| `sbxloop logs RUN`                              | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                             |
-| `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                       |
-| `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                   |
-| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints).                                                                                                                                                  |
-| `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                              |
-| `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                      |
-| `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                               |
-| `sbxloop gc`                                    | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                  |
-| `sbxloop secrets list\|clean\|rotate`           | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                         |
-| `sbxloop config show\|policy`                   | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                                        |
+| Command                                         | What it does                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                                                      |
+| `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to chat (Discord or Slack). Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--slack-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`. |
+| `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                                                                 |
+| `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as chat's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                                                                     |
+| `sbxloop resume RUN`                            | Re-provision sandboxes and continue a checkpointed run under its persisted config — at the task graph, or at the pipeline stage it stopped in (the retry path for a failed delivery or a `blocked` landing).                                                                                        |
+| `sbxloop cancel RUN`                            | Cancel an in-flight run.                                                                                                                                                                                                                                                                            |
+| `sbxloop status [RUN]`                          | List runs, or show one run's task/phase detail.                                                                                                                                                                                                                                                     |
+| `sbxloop logs RUN`                              | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                                                                |
+| `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                                                          |
+| `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                                                      |
+| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints).                                                                                                                                                                                     |
+| `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                                                                 |
+| `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                                                         |
+| `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                                                                  |
+| `sbxloop gc`                                    | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                                                     |
+| `sbxloop secrets list\|clean\|rotate`           | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                                                            |
+| `sbxloop config show\|policy`                   | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                                                                           |
 
 ## Network egress: least privilege, by plan
 
@@ -319,7 +319,7 @@ as **one** engine run — task graph, gate, draft PR, review, fix rounds, CI,
 merge — and settles the outcome on the issue. One labeled issue is one run
 is one pull request. There is no other work source, and the daemon **never
 files work of its own**: only a human labelling an issue — directly, or by
-asking the Discord concierge, which files the issue *with* the label —
+asking the chat concierge, which files the issue *with* the label —
 starts a run.
 
 The labels are the state machine, and every transition is visible on the
@@ -496,11 +496,15 @@ warning and a `sbxloop doctor` row to make that edit unhurried
 migrated, and the old lanes' issues and labels are closed by hand;
 [docs/deploy.md → 1.0 cutover](docs/deploy.md#10-cutover) has the steps.
 
-### Discord: chronology out, steering in
+### Chat: chronology out, steering in — Discord or Slack
 
-With `pip install 'sbxloop[discord]'`, `DISCORD_BOT_TOKEN` in the
-environment, and `[discord] channel_id` set, a gateway bot posts a headline
-card per run in the control channel (source issue, run id, branch, PR,
+The daemon's human channel is one chat service, chosen by `[chat] backend = "discord" | "slack"` — or inferred from whichever of `[discord]` / `[slack]`
+carries a `channel_id`; configuring both without choosing is a config error,
+and neither means the daemon runs headless (`sbxloop daemon ctl` only).
+Everything in this section works the same on both: Discord is described
+first, the Slack differences follow. With `pip install 'sbxloop[discord]'`,
+`DISCORD_BOT_TOKEN` in the environment, and `[discord] channel_id` set, a
+gateway bot posts a headline card per run in the control channel (source issue, run id, branch, PR,
 task tally — colour follows the state) and streams that run's
 chronology into a thread under it, in Discord's own formatting: agent
 messages as Markdown with persona attribution, split at paragraph and
@@ -649,8 +653,33 @@ Bot setup, once: create an application in the Discord Developer Portal, add
 a bot, enable the **Message Content** privileged intent, copy the token, and
 invite the bot to your server with View Channel, Send Messages, Create
 Public Threads, Send Messages in Threads, Add Reactions, and Read Message
-History. Discord is observability, never a dependency: if it is down, the
+History. Chat is observability, never a dependency: if it is down, the
 daemon logs and carries on.
+
+**Slack instead.** `pip install 'sbxloop[slack]'`, set `[slack] channel_id = "C…"` (the channel's *id*, from its details pane — not its name) and put
+`SLACK_BOT_TOKEN` (`xoxb-…`, the Web API) and `SLACK_APP_TOKEN` (`xapp-…`,
+the Socket Mode connection) in the environment / `.env` — never in
+`sbxloop.toml`; they are read from the environment only and never logged.
+The app runs in **Socket Mode**, so it dials out and needs no public URL or
+request signing — what a daemon on a home server needs. Create the app once
+at api.slack.com/apps (from scratch): under *Socket Mode* enable it and
+generate an app-level token with `connections:write`; under *OAuth &
+Permissions* add the bot scopes `chat:write`, `channels:history`,
+`channels:read`, `groups:history`, `groups:read`, `reactions:write`,
+`users:read` and `app_mentions:read`; under *Event Subscriptions* subscribe
+the bot to `message.channels`, `message.groups` and `app_mention`; install
+the app to the workspace and `/invite @your-app` into the control channel.
+On Slack's shapes: the run thread is the reply thread under the headline
+message (its `ts` is the thread id; `thread_per_run = false` posts everything
+top-level), cards are coloured attachments (`[slack] embeds`), link unfurls
+are off on every post and edit, reactions use Slack's emoji names, agent
+prose is entity-escaped so it can never `<!channel>` anyone, and Slack has
+no "reply to a message" outside threads, so the concierge and steering are
+@mention-only there (`<@app>` in the control channel or in a run's thread).
+`sbxloop doctor` shows one `chat bridge (slack)` row: extra installed, both
+tokens present. Switching backends is a config change plus a daemon
+restart; runs recorded under the other backend keep their thread rows but
+are not re-posted.
 
 ## Artifacts
 

@@ -181,6 +181,7 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "project_gate": "- gate rule",
     },
     "concierge": {
+        "chat_name": "Discord",
         "command_prefix": "!sbx",
         "repo": "owner/repo",
         "model": "auto",

@@ -647,32 +647,45 @@ def collect_checks(
             )
         )
 
-    # daemon's Discord bridge (only when configured)
-    if config.discord.enabled:
+    # daemon's chat bridge (only when a backend is configured)
+    backend = config.chat_backend
+    if backend is not None:
         problems: list[str] = []
-        try:
-            import discord as _discordpy  # noqa: F401
-        except ImportError:
-            problems.append("discord.py missing (pip install 'sbxloop[discord]')")
-        if not env.get("DISCORD_BOT_TOKEN"):
-            problems.append("DISCORD_BOT_TOKEN not set")
+        settings = config.chat_settings
+        assert settings is not None
+        if backend == "discord":
+            try:
+                import discord as _discordpy  # noqa: F401
+            except ImportError:
+                problems.append("discord.py missing (pip install 'sbxloop[discord]')")
+            if not env.get("DISCORD_BOT_TOKEN"):
+                problems.append("DISCORD_BOT_TOKEN not set")
+            ready = "extra installed, token present"
+        else:
+            try:
+                import slack_sdk as _slack_sdk  # noqa: F401
+            except ImportError:
+                problems.append("slack_sdk missing (pip install 'sbxloop[slack]')")
+            for name in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
+                if not env.get(name):
+                    problems.append(f"{name} not set")
+            ready = "extra installed, tokens present"
         checks.append(
             Check(
-                "discord bridge",
+                f"chat bridge ({backend})",
                 not problems,
-                f"channel {config.discord.channel_id}: "
-                + ("; ".join(problems) if problems else "extra installed, token present"),
+                f"channel {settings.channel_ref}: " + ("; ".join(problems) if problems else ready),
                 hard=False,
             )
         )
         # ...and its concierge: an agent session on the daemon host's behalf,
         # so the agent token must be here (the run pair needs it too, but a
-        # Discord-only operator may not have noticed).
+        # chat-only operator may not have noticed).
         if config.concierge.enabled:
             has_token = bool(env.get("COPILOT_GITHUB_TOKEN"))
             checks.append(
                 Check(
-                    "discord concierge",
+                    "chat concierge",
                     has_token,
                     f"model {config.concierge.model or config.model}, "
                     f"{config.concierge.timeout_s:.0f}s per message: "

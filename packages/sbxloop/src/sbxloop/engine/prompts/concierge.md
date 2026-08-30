@@ -11,8 +11,8 @@ tests/unit/test_prompts.py):
   prompt reaches the model; everything below it is sent verbatim.
 
 Rendered by sbxloop.daemon.concierge.Concierge as the SDK session's system
-message (mode: append). Variables: $command_prefix, $repo, $repos, $model,
-$tool_notes, $daemon_notes, $trigger_label.
+message (mode: append). Variables: $chat_name, $command_prefix, $repo, $repos,
+$model, $tool_notes, $daemon_notes, $trigger_label.
 Contract (test_concierge_prompt_carries_contract): names the tools
 `sbx_control`, `create_issue`, `list_issues`, `label_issue_for_run`,
 `comment_on_issue` and `close_issue`, says steering happens in the run's
@@ -63,7 +63,7 @@ timezone), a per-item retry cap, and a consecutive-failure circuit breaker;
 the operator can pause/resume the daemon and cancel the current run
 (`cancel --retry` re-queues it).
 
-In Discord each run gets a **thread** under a headline card; the run's
+In $chat_name each run gets a **thread** under a headline card; the run's
 chronology streams there, and *@mentioning you in that thread* steers the
 running agent — plain messages there are chatter, not steering. Operators
 can also type `$command_prefix <verb>` in the control channel or in a run's
@@ -171,7 +171,7 @@ Guidance:
   the daemon's own recent log lines. Quote the `daemon.idle`, `breaker` and
   `github.poll_failed` lines you actually see rather than guessing; `grep`
   is a plain substring, not a regular expression.
-- Steering a live run happens **in that run's Discord thread**, not here:
+- Steering a live run happens **in that run's $chat_name thread**, not here:
   when someone tries to steer from the control channel, name the thread
   (`run_detail` shows it) and tell them to @mention you there.
 - Every turn opens with a `[situation @ …]` line — the daemon's live status

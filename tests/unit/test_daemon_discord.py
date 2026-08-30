@@ -1534,9 +1534,9 @@ class TestRunWatches:
         grew without bound for runs evicted before they ever finish (and
         left `DaemonStore.clear_run_watch` dead code, exercised only by a
         store-level unit test). The eviction path now calls it."""
-        import sbxloop.daemon.discord as discord_mod
+        import sbxloop.daemon.chat as chat_mod
 
-        monkeypatch.setattr(discord_mod, "WATCHERS_CAP", 1)
+        monkeypatch.setattr(chat_mod, "WATCHERS_CAP", 1)
         bridge, _, _ = make_bridge(tmp_path)
         bridge._remember_requester("brett", "1")
         bridge._remember_requester("dana", "2")

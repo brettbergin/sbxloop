@@ -141,7 +141,7 @@ def day_window(now: float, tz: str) -> tuple[float, float]:
 
 
 class Frontend(Protocol):
-    """What a human-facing channel (Discord) sees of the loop's lifecycle.
+    """What a human-facing channel (Discord or Slack) sees of the loop's lifecycle.
     Every call is best-effort: the loop never depends on a frontend."""
 
     def daemon_notice(self, notice: DaemonNotice) -> None: ...

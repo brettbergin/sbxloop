@@ -253,12 +253,21 @@ secret_strategy = "proxy"
 # `sbxloop status`/`logs`/`gc` need SBXLOOP_STATE_DIR pointed there.
 # state_dir = "~/.local/state/sbxloop/my-project"
 
+# [chat]
+# Which service carries the daemon's human channel — the run headline cards,
+# the per-run thread streaming each run's chronology, `!sbx` operator commands,
+# @mention steering of a live run and the concierge. Exactly one of [discord]
+# / [slack] is active: name it here, or leave `backend` unset and the one
+# section with a channel_id is used (both set without a choice is an error).
+# No channel_id anywhere = headless: no chronology, `sbxloop daemon ctl` only.
+# backend = "discord"              # "discord" | "slack"
+
 # [discord]
-# The daemon's human channel: a gateway bot posts each run's chronology
-# (agent messages, tool lines, issue/PR links) into a thread under a control
-# channel and relays replies typed in the thread to the running agent as
-# steering. Needs `pip install 'sbxloop[discord]'` and DISCORD_BOT_TOKEN in
-# the environment / .env (never here). Anyone who can post in the channel can
+# The Discord backend: a gateway bot posts each run's chronology (agent
+# messages, tool lines, issue/PR links) into a thread under a control channel
+# and relays @mentions typed in the thread to the running agent as steering.
+# Needs `pip install 'sbxloop[discord]'` and DISCORD_BOT_TOKEN in the
+# environment / .env (never here). Anyone who can post in the channel can
 # steer — restrict the channel. Unset channel_id = Discord off.
 # channel_id = 123456789012345678
 # command_prefix = "!sbx"          # !sbx status|pause|resume|cancel|queue
@@ -277,13 +286,32 @@ secret_strategy = "proxy"
 # tool_output_lines = 0            # tail output lines echoed for a successful call (0 = none)
 # tool_fail_output_lines = 20      # head+tail output lines echoed for a failed call
 
+# [slack]
+# The Slack backend: the same channel, threads, commands and steering over a
+# Socket Mode app (the app dials out — no public URL). Needs
+# `pip install 'sbxloop[slack]'` plus SLACK_BOT_TOKEN (xoxb-…) and
+# SLACK_APP_TOKEN (xapp-…) in the environment / .env (never here); the README
+# lists the app scopes and event subscriptions. Same knobs as [discord];
+# `embeds` renders the cards as coloured attachments. Unset channel_id =
+# Slack off. Use the channel's *id* (channel details → copy ID), not #name.
+# channel_id = "C0123ABCDEF"
+# command_prefix = "!sbx"
+# thread_per_run = true
+# chronology_level = "normal"
+# max_message_chars = 1900
+# embeds = true
+# status_line = true
+# tool_batch_lines = 8
+# tool_output_lines = 0
+# tool_fail_output_lines = 20
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue
 # new work in plain language. Runs as a Copilot session in a long-lived
 # agent sandbox and reaches the daemon only through host tools; needs
 # COPILOT_GITHUB_TOKEN on the daemon host. Acts with the same authority as
-# !sbx. Effective only when [discord] is enabled.
+# !sbx. Effective only when a [chat] backend ([discord] or [slack]) is on.
 # enabled = true
 # model = ""                       # empty = the top-level model
 # timeout_s = 180                  # one message's wall-clock budget

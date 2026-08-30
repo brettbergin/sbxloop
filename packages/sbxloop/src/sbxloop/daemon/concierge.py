@@ -1,6 +1,6 @@
 """Concierge: the control channel's agent.
 
-The daemon's Discord bridge relays chronology out and steering in; the
+The daemon's chat bridge relays chronology out and steering in; the
 concierge is the agent people *talk to* in the control channel itself.
 It knows how to operate sbxloop — every ``!sbx`` verb, through the same
 :func:`sbxloop.daemon.control.dispatch` the commands use — how to queue new
@@ -15,7 +15,7 @@ message after message (``resume_session_id`` persisted in ``daemon_state``),
 so the conversation has memory; after ``[concierge] session_turns`` a
 fresh session starts so context does not grow forever.
 
-Transport-agnostic: no Discord import. The bridge calls
+Transport-agnostic: no Discord or Slack import. The bridge calls
 :meth:`Concierge.submit_turn` and renders the reply; other channels could
 do the same.
 
@@ -44,7 +44,7 @@ from sbxloop.cli.tui import format_event
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch, plain
 from sbxloop.daemon.loop import day_window
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
@@ -102,8 +102,10 @@ CLOSE_REASONS = ("completed", "not_planned")
 #: ``_tool_handler``). A transport's ``on_watch`` callback receives this same
 #: tagged string as its ``requester`` and must strip it back off before
 #: looking a requester up by the untagged form it was remembered under —
-#: see ``DiscordBridge.on_watch``.
+#: see ``ChatBridge.on_watch``.
 VIA_CONCIERGE_SUFFIX = " (via concierge)"
+#: How the prompt names the chat service, by `[chat] backend`.
+CHAT_NAMES: dict[str, str] = {"discord": "Discord", "slack": "Slack"}
 
 
 class ConciergeReply(NamedTuple):
@@ -201,14 +203,20 @@ class Concierge:
         clock: Callable[[], float] = time.time,
         versions: VersionProbe | None = None,
         on_watch: Callable[[str, str], str | None] | None = None,
+        thread_link: Callable[[ChatThread], str] | None = None,
     ) -> None:
         self.config = config
+        # The active chat backend's section (prefix, threading) and its proper
+        # name for the prompt; a config with no chat at all (tests, a headless
+        # daemon) reads Discord's defaults so every string still renders.
+        self._chat = config.chat_settings or config.discord
+        self._chat_name = CHAT_NAMES.get(config.chat_backend or "", "chat")
         self.loop = loop
         self.dstore = dstore
         self._store_factory = store_factory
         self._store: StateStore | None = None
         self.github = github if config.concierge.github_tools else None
-        # The Discord user id of whoever is speaking in the current turn, so
+        # The chat user id of whoever is speaking in the current turn, so
         # an issue they ask for records them as its requester. Turns run one
         # at a time on the executor, so one slot is enough.
         self._turn_author_id: str | None = None
@@ -222,6 +230,9 @@ class Concierge:
         # Transport seam: the bridge hands in a callback that records who wants
         # a ping when a run finishes. None means this transport cannot notify.
         self._on_watch = on_watch
+        # ...and how it spells a pointer to a run's thread (Discord's `<#id>`,
+        # a Slack permalink); None renders the Discord form.
+        self._thread_link = thread_link
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sbxloop-concierge")
         self._pending = 0
         self._state_lock = threading.Lock()
@@ -481,13 +492,14 @@ class Concierge:
             "every run carries its issue to a merged pull request (review, fix rounds, "
             f"CI and the merge are stages of the run); a run that cannot land ends "
             f"`blocked` with the `{daemon.blocked_label}` label for a human",
-            "Discord: one thread per run"
-            if self.config.discord.thread_per_run
-            else "Discord: runs post in the control channel",
+            f"{self._chat_name}: one thread per run"
+            if self._chat.thread_per_run
+            else f"{self._chat_name}: runs post in the control channel",
         ]
         return render(
             "concierge",
-            command_prefix=self.config.discord.command_prefix,
+            chat_name=self._chat_name,
+            command_prefix=self._chat.command_prefix,
             repo=self._repo_label(),
             repos=bullet_list(self._repo_lines()) or "(no GitHub repository configured)",
             model=self.config.concierge.model or self.config.model,
@@ -559,7 +571,7 @@ class Concierge:
         )
 
     def _build_tools(self) -> list[HostTool]:
-        prefix = self.config.discord.command_prefix
+        prefix = self._chat.command_prefix
         tools = [
             HostTool(
                 HostToolSpec(
@@ -601,7 +613,7 @@ class Concierge:
                     description=(
                         "Everything known about one run: outcome, state, tasks, its pull "
                         "request, fix rounds spent, why it stopped, standing guidance, its "
-                        "work item and the Discord thread where it can be steered."
+                        "work item and the chat thread where it can be steered."
                     ),
                     parameters=_schema({"run_id": {"type": "string"}}, ["run_id"]),
                 ),
@@ -933,6 +945,11 @@ class Concierge:
             )
         return tools
 
+    def _link(self, thread: ChatThread) -> str:
+        if self._thread_link is not None:
+            return self._thread_link(thread)
+        return f"<#{thread.thread_id}>"
+
     # tool implementations — each returns text for the model
 
     def _tool_sbx_control(self, args: dict[str, Any], by: str) -> str:
@@ -940,7 +957,7 @@ class Concierge:
         if not command:
             return "usage: sbx_control(command) — e.g. status, pause, cancel --retry, queue"
         reply = dispatch(
-            self.loop, command, prefix=self.config.discord.command_prefix, by=by, via="concierge"
+            self.loop, command, prefix=self._chat.command_prefix, by=by, via="concierge"
         )
         text = plain(reply.text)
         if reply.status is not None:
@@ -984,7 +1001,7 @@ class Concierge:
         item_id = self.dstore.item_for_run(run_id)
         item_id = normalize_item_id(item_id) if item_id else item_id
         item = self.dstore.get(item_id) if item_id else None
-        thread = self.dstore.discord_thread(run_id)
+        thread = self.dstore.chat_thread(run_id)
         lines = [
             f"run {run.run_id}: state={run.state}, created {_age(self.clock() - run.created_at)} "
             f"ago, updated {_age(self.clock() - run.updated_at)} ago",
@@ -1013,8 +1030,8 @@ class Concierge:
             lines.append("this run is LIVE right now")
         if thread is not None:
             lines.append(
-                f"Discord thread: <#{thread.thread_id}> — steering messages go there, "
-                "not in the control channel"
+                f"{self._chat_name} thread: {self._link(thread)} — steering messages go "
+                "there, not in the control channel"
             )
         return "\n".join(lines)
 
@@ -1101,9 +1118,9 @@ class Concierge:
             lines.append(f"body: {_one_line(item.body, 600)}")
         lines.append(f"runs: {', '.join(runs) if runs else '(none yet)'}")
         if runs:
-            thread = self.dstore.discord_thread(runs[-1])
+            thread = self.dstore.chat_thread(runs[-1])
             if thread is not None:
-                lines.append(f"latest run's Discord thread: <#{thread.thread_id}>")
+                lines.append(f"latest run's {self._chat_name} thread: {self._link(thread)}")
         return "\n".join(lines)
 
     def _tool_version_status(self, args: dict[str, Any], by: str) -> str:

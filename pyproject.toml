@@ -57,9 +57,9 @@ warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
-# Optional extras: the host SDK ([copilot]) and the daemon's Discord bridge
-# ([discord]) are deferred imports that resolve only when installed.
-module = ["copilot", "copilot.*", "discord", "discord.*"]
+# Optional extras: the host SDK ([copilot]) and the daemon's chat bridges
+# ([discord], [slack]) are deferred imports that resolve only when installed.
+module = ["copilot", "copilot.*", "discord", "discord.*", "slack_sdk", "slack_sdk.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

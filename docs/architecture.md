@@ -699,6 +699,40 @@ what the Discord bridge does.
 
 See [worker-protocol.md](worker-protocol.md) for the host↔worker contract.
 
+### Chat backends
+
+The human channel is factored as one service-agnostic bridge and two thin
+transports. `sbxloop.daemon.chat.ChatBridge` owns everything a reader of a
+run thread sees and everything an operator types — the non-blocking bus
+subscription and its pump, coalescing, the tool digest and status line edited
+in place, steer notes, run watches (persisted in `daemon_run_watches`),
+concierge turns and `!sbx` commands — against a small set of abstract seams:
+build/run/close a client, normalise an inbound message into `chat.Inbound`
+(content, surface id, author, mentions), send / edit / react / open a thread,
+and spell a user mention or a thread pointer. `daemon/discord.py`
+(`DiscordBridge`) is those seams over discord.py: gateway client, `<#id>`
+thread pointers, `AllowedMentions.none()`, embeds, `suppress_embeds`.
+`daemon/slack.py` (`SlackBridge`) is the same seams over slack_sdk's Socket
+Mode client: a run thread is the reply thread under the headline (`thread_id`
+= the headline's `ts`), a message handle is `(channel, ts)` so re-attaching
+after a restart costs no fetch, `chat.update` edits, `reactions.add` by emoji
+name, and a permalink thread pointer. `daemon/slack_format.py` re-dialects
+the Discord-flavoured Markdown every renderer produces into mrkdwn *at the
+send seam* (`**bold**` → `*bold*`, `[t](u)` → `<u|t>`, fence language tags
+dropped, `&<>` entity-escaped outside Slack's own control sequences, user
+mentions escaped unless the send asked for them) and turns an `EmbedSpec`
+into one coloured attachment — nothing upstream knows there is a second
+service. Routing (`daemon/chat_routing.py`) is one pure function over text
+ids with a per-service mention pattern, so the "command / concierge / steer /
+ignore" rules are provably identical on both. Threads persist in
+`daemon_chat_threads` with TEXT ids (a pre-Slack `daemon_discord_threads`
+table is folded in on first open — Slack's `ts` would not survive INTEGER
+affinity). `[chat] backend` selects the transport (`config.chat_backend` /
+`config.chat_settings`; inferred from the one configured section, an error
+when both are set without a choice, headless when neither is), and
+`chat.build_bridge` imports only the chosen module, so a Discord deployment
+never loads slack_sdk and vice versa.
+
 ### Tool calls in a run thread
 
 A watcher reads a run thread to see what the agents are *executing*, so tool

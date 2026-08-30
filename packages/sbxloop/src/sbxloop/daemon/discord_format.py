@@ -1,11 +1,14 @@
-"""Pure Discord formatting for the daemon bridge — no discord.py import.
+"""Pure Discord-flavoured formatting for the daemon's chat bridges — no
+discord.py import.
 
-Everything the bridge says is shaped here, as data: ``Chunk`` (a message
+Everything a bridge says is shaped here, as data: ``Chunk`` (a message
 part with a text body and/or an ``EmbedSpec``) and a few pure helpers. The
-transport (``daemon/discord.py``) only decides *where* and *when* to send;
-it converts ``EmbedSpec`` into a ``discord.Embed`` at the send seam. Keeping
-this layer free of the optional extra means the exact output is unit-tested
-on every CI matrix entry, not only where ``sbxloop[discord]`` is installed.
+transports (``daemon/discord.py``, ``daemon/slack.py``) only decide *where*
+and *when* to send; Discord converts ``EmbedSpec`` into a ``discord.Embed``
+at its send seam, Slack re-dialects the Markdown and turns the spec into a
+coloured attachment (``daemon/slack_format.py``). Keeping this layer free of
+the optional extras means the exact output is unit-tested on every CI
+matrix entry, not only where ``sbxloop[discord]`` is installed.
 
 Discord's Markdown subset is the target: ``**bold**``, ```` `code` ````,
 fenced blocks with a language, ``> quotes``, masked links ``[text](url)``,
@@ -1921,9 +1924,16 @@ def items_lines(items: list[WorkItem], limit: int = 20) -> str:
 NOTICE_LEVEL_MARKER = {"warning": "⚠ ", "error": "🛑 "}
 
 
-def daemon_notice(notice: DaemonNotice | str, *, thread_id: int | None = None) -> str:
+def daemon_notice(
+    notice: DaemonNotice | str,
+    *,
+    thread_id: int | str | None = None,
+    thread_ref: str | None = None,
+) -> str:
     """A control-channel notice: URLs masked, a level marker for anything
-    above info, optional pointer to the run's thread."""
+    above info, optional pointer to the run's thread — ``thread_ref`` is
+    the backend's own rendering of that pointer (the bridge's
+    ``thread_link``); ``thread_id`` is the Discord ``<#id>`` shorthand."""
     if isinstance(notice, DaemonNotice):
         prefix = NOTICE_LEVEL_MARKER.get(notice.level, "")
         text = notice.text
@@ -1932,7 +1942,9 @@ def daemon_notice(notice: DaemonNotice | str, *, thread_id: int | None = None) -
     else:
         text = str(notice)
     out = no_unfurl(text)
-    if thread_id:
+    if thread_ref:
+        out += f" · {thread_ref}"
+    elif thread_id:
         out += f" · <#{thread_id}>"
     return out
 

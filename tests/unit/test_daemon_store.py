@@ -270,8 +270,51 @@ class TestLedgerAndThreads:
         assert store.discord_thread("r1") == (11, 22, 33, None)
         store.set_discord_status_id("r1", 44)
         assert store.discord_thread("r1").status_id == 44  # type: ignore[union-attr]
-        assert store.run_for_thread(22) == "r1"
+        # ...and the generic text view of the same row
+        assert store.chat_thread("r1") == ("11", "22", "33", "44", "discord")
+        assert store.run_for_thread("22") == "r1" and store.run_for_thread(22) == "r1"
         assert store.run_for_thread(99) is None
+
+    def test_chat_thread_keeps_slack_timestamps_exact(self, tmp_path: Path) -> None:
+        """Slack ids are message timestamps; INTEGER affinity would have
+        rounded "1724968573.123456" into a REAL and broken every lookup."""
+        store = DaemonStore(tmp_path / "state.db")
+        ts = "1724968573.123456"
+        store.record_chat_thread("r1", "C0123ABCDEF", ts, ts, backend="slack")
+        store.set_chat_status_id("r1", "1724968574.000100")
+        assert store.chat_thread("r1") == ("C0123ABCDEF", ts, ts, "1724968574.000100", "slack")
+        assert store.run_for_thread(ts) == "r1"
+        assert store.run_for_thread("1724968573.123457") is None
+
+    def test_pre_slack_discord_threads_table_is_migrated(self, tmp_path: Path) -> None:
+        """A store written before [chat] existed carries the rows in
+        ``daemon_discord_threads`` with INTEGER ids; opening it folds them
+        into ``daemon_chat_threads`` once and drops the old table."""
+        import sqlite3
+
+        path = tmp_path / "state.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE daemon_discord_threads (
+                run_id TEXT PRIMARY KEY, channel_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL, headline_id INTEGER, status_id INTEGER);
+            INSERT INTO daemon_discord_threads VALUES ('r1', 42, 4242, 100, NULL);
+            INSERT INTO daemon_discord_threads VALUES ('r2', 42, 4343, 101, 102);
+            """
+        )
+        conn.commit()
+        conn.close()
+        store = DaemonStore(path)
+        assert store.discord_thread("r1") == (42, 4242, 100, None)
+        assert store.chat_thread("r2") == ("42", "4343", "101", "102", "discord")
+        assert store.run_for_thread(4343) == "r2"
+        tables = {
+            r[0] for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "daemon_discord_threads" not in tables
+        # Reopening is a no-op.
+        assert DaemonStore(path).chat_thread("r1") is not None
 
     def test_coexists_with_statestore_on_one_db(self, tmp_path: Path) -> None:
         db = tmp_path / "state.db"

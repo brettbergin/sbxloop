@@ -52,7 +52,8 @@ daemon host and takes **no** checkout — it installs from PyPI and needs nothin
     boundary.
 05. **Upgrades** by installing both local wheels together. The host wheel pins
     `sbxloop-worker==X` exactly, and naming the local worker wheel satisfies that pin without
-    the index being consulted for it at all. `[discord]` is required for the daemon's bridge.
+    the index being consulted for it at all. `[discord,slack]` installs both chat extras so
+    `[chat] backend` is a config change on the host, not a reinstall.
     Everything else (pydantic, discord.py) still resolves from PyPI, which is fine — those are
     not racing a just-published version.
 06. **Restarts**, after `systemctl --user reset-failed` — without that, a previously
