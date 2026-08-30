@@ -1548,6 +1548,10 @@ class TestPipeline:
         assert "hello.txt" in fake.pr_kwargs["body"]
         commits = [p for m, p, _ in fake.raw_calls if m == "POST" and p.endswith("/git/commits")]
         assert len(commits) == 2
+        # Round 1 creates the branch; round 2 finds it and force-moves it
+        # without a doomed create in between (#518).
+        creates = [p for m, p, _ in fake.raw_calls if m == "POST" and p.endswith("/git/refs")]
+        assert len(creates) == 1
         patches = [p for m, p, _ in fake.raw_calls if m == "PATCH"]
         assert patches == [f"/repos/o/r/git/refs/heads/sbxloop/{result.run_id}"]
 

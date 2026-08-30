@@ -8,6 +8,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A fix-round re-delivery no longer fails the branch create before
+  force-moving it** (#518). The delivery branch is a pure function of the
+  run id, so on every round after the first `deliver` blind-POSTed
+  `/git/refs`, took the guaranteed 422 "Reference already exists", and
+  only then force-moved the branch — one doomed API call (~3 s through the
+  github sandbox), a `worker.error` panel in the run's Discord chronology
+  and a `worker.job_done error=` per *healthy* re-delivery (field run
+  `rfxja288b`, rounds 2 and 3), with a hint that misdescribed it as "a
+  prior attempt". `_point_branch` now asks first (`ref_lookup`, the miss
+  travels as data): a missing ref is created with one call as before, an
+  existing one goes straight to the force-move, and
+  `deliver.branch_force_moved` says what it superseded (`from=<old sha> to=<new sha> round=N`; the manual `sbxloop deliver <run>` path has no
+  round to report). The 422 catch is kept only for the race where the ref
+  appears between the lookup and the create.
+
 - **A repository that keeps failing to poll is backed off and suspended on
   its own, not warned about every tick forever** (#516).
   `MultiRepoIssueSource` swallowed a per-repository poll failure so the
