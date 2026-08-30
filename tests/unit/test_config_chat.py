@@ -106,6 +106,11 @@ class TestSlackSection:
             SlackConfig(channel_id="#sbxloop")
         with pytest.raises(ValueError, match="channel's id"):
             SlackConfig(channel_id="general")
+        # a user id or a DM is well-formed but not a channel
+        with pytest.raises(ValueError, match="not a user id"):
+            SlackConfig(channel_id="U0123ABCDEF")
+        with pytest.raises(ValueError, match="not a user id"):
+            SlackConfig(channel_id="D0123ABCDEF")
         assert SlackConfig(channel_id="  C0123ABCDEF ").channel_id == "C0123ABCDEF"
         assert SlackConfig(channel_id="G0123ABCDEF").enabled
         assert SlackConfig(channel_id="").channel_id is None

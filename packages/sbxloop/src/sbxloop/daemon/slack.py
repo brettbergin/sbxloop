@@ -341,7 +341,10 @@ class SlackBridge(ChatBridge):
 
     def _report_channel_error(self, exc: Exception) -> bool:
         """True when ``exc`` says the control channel is unreachable — a
-        configuration problem, reported once with the fix."""
+        configuration problem, reported once with the fix. The bridge is
+        not degraded by it: every later send tries again, so posting
+        resumes the moment the app is invited (what was queued meanwhile
+        is lost, not replayed)."""
         error = _api_error(exc)
         if error not in _CHANNEL_ERRORS:
             return False
@@ -352,18 +355,22 @@ class SlackBridge(ChatBridge):
                 channel=self.slack.channel_id,
                 error=error,
                 hint="check [slack] channel_id (channel details → copy the ID) and invite "
-                "the app to the channel (/invite @app); chronology is off until the daemon "
-                "restarts",
+                "the app to the channel (/invite @app); posting resumes as soon as the "
+                "channel is reachable, but what was sent until then is dropped",
             )
         return True
 
     async def _edit(self, message: Any, text: str, *, embed: EmbedSpec | None = None) -> None:
-        """``chat.update`` with the same text and card conversion as a send.
-        Errors propagate: callers log them with their own context."""
+        """``chat.update`` with the same text and card conversion as a send,
+        and the same unfurl flags: an edit that introduces a link would
+        otherwise grow a preview the original post never had. Errors
+        propagate: callers log them with their own context."""
         kwargs: dict[str, Any] = {
             "channel": message.channel,
             "ts": message.ts,
             "text": to_mrkdwn(_clip(text, self.slack.max_message_chars)),
+            "unfurl_links": False,
+            "unfurl_media": False,
         }
         if embed is not None and self.slack.embeds:
             kwargs["attachments"] = [embed_attachment(embed)]

@@ -493,7 +493,22 @@ class TestFailures:
         finally:
             bridge.close()
         assert caplog.text.count("slack.channel_unreachable") == 1
-        assert "/invite" in caplog.text
+        assert "/invite" in caplog.text and "posting resumes" in caplog.text
+
+    def test_posting_resumes_once_the_channel_is_reachable(self, tmp_path: Path) -> None:
+        """The channel error is a one-time log line, not a degraded state:
+        the next send after the app is invited goes through."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            client.web.fail_post = FakeApiError("not_in_channel")
+            bridge.daemon_notice(DaemonNotice("daemon.started", "lost"))
+            assert wait_for(lambda: bridge._channel_error_logged)
+            client.web.fail_post = None
+            bridge.daemon_notice(DaemonNotice("daemon.started", "back"))
+            assert wait_for(lambda: any("back" in p["text"] for p in client.web.posted))
+            assert not any("lost" in p["text"] for p in client.web.posted)
+        finally:
+            bridge.close()
 
     def test_attachment_rejected_falls_back_to_text(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
@@ -583,6 +598,8 @@ class TestSeams:
             (edit,) = client.web.updated
             assert edit["channel"] == CHANNEL and edit["ts"] == "1.9"
             assert edit["text"] == "*done* <https://x/1>"
+            # an edit never grows a preview the post did not have
+            assert edit["unfurl_links"] is False and edit["unfurl_media"] is False
             assert edit["attachments"][0]["color"] == "#000001"
         finally:
             bridge.close()

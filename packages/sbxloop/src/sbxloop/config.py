@@ -849,7 +849,9 @@ class DiscordConfig(ChatBridgeConfig):
         return "" if self.channel_id is None else str(self.channel_id)
 
 
-_SLACK_CHANNEL_RE = re.compile(r"^[A-Z][A-Z0-9]{3,}$")
+# A conversation id: C… (a channel, public or private) or the legacy G…
+# (private group). Not U… (a user), D… (a DM) or a #name.
+_SLACK_CHANNEL_RE = re.compile(r"^[CG][A-Z0-9]{4,}$")
 
 
 class SlackConfig(ChatBridgeConfig):
@@ -876,8 +878,8 @@ class SlackConfig(ChatBridgeConfig):
             return None
         if not _SLACK_CHANNEL_RE.match(text):
             raise ValueError(
-                f"[slack] channel_id must be the channel's id (e.g. C0123ABCDEF, from the "
-                f"channel details pane), not {text!r}"
+                f"[slack] channel_id must be the channel's id — C… (or legacy G…) as shown "
+                f"in the channel details pane, not a user id, a DM or a #name: got {text!r}"
             )
         return text
 
