@@ -147,8 +147,14 @@ bounded by `[budgets]` (defaults: 2 revisions and 1 replan per task, 20
 tasks, 2 h wall clock, 30 min per job); the fix loop by `[landing]` —
 `max_review_rounds` (default 3) for verdicts that request changes,
 `max_ci_rounds` (default 2) for the mechanical failures: a red gate, red CI,
-a base conflict, a human requesting changes on the PR. Exhausting a task's
-budget fails the *task*; its dependents are skipped and the run finishes
+a base conflict, a human requesting changes on the PR. A run past either
+budget is one round short, not broken — its branch is green and its PR is
+open — so under the daemon the item's retry **resumes that same run** with
+`retry_rounds` (default 2) more, once, instead of planning from scratch and
+opening a second PR; a second exhaustion hands it to a human, and
+`sbxloop daemon ctl grant-rounds <run> <n>` (or `!sbx grant-rounds`, or
+asking the concierge for "two more rounds") resumes it at once with more.
+Exhausting a task's budget fails the *task*; its dependents are skipped and the run finishes
 `failed` before anything is delivered. One deliberate exception: when
 revisions are exhausted by *verify-command* failures, the task spends a
 replan first when budget remains — the builder cannot edit verify commands,
@@ -502,7 +508,7 @@ Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>` in the control channel drive the daemon
+when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|grant-rounds <run> <n>` in the control channel drive the daemon
 itself. Pause is a set of **named holds**: a bare `pause`/`resume` acts on the
 operator's hold, the deploy pipeline holds `deploy-<run id>` while it waits for
 the daemon to go idle, and the daemon idles while any hold stands — so an
@@ -819,6 +825,7 @@ a repository:
 deliver_draft = true            # the PR opens as a draft; un-drafted once review and CI pass
 max_review_rounds = 3           # how many times the review may request changes
 max_ci_rounds = 2               # rounds for the mechanical failures: red gate, red CI, conflict, human objection
+retry_rounds = 2                # daemon: an exhausted run resumes its own PR once with this many more; 0 hands it to a human
 ci_poll_interval_s = 60         # how often the delivered head's check runs are polled
 ci_settle_s = 90                # "no check runs yet" must persist this long to mean "this repo has no CI"
 ci_timeout_s = 3600             # per wait, not charged to max_wall_clock_s; exceeding it ends the run blocked
@@ -1058,33 +1065,33 @@ that follow you rather than the checkout. `sbxloop init` writes a commented
 starter file — the same `sbxloop.toml.example` committed at the repo root; `sbxloop config show` prints every resolved value and where it
 came from. The notable knobs:
 
-| Key                                                       | Default            | Meaning                                                                                                                                                                        |
-| --------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `model`                                                   | `auto`             | Copilot model id (`--model` overrides per run).                                                                                                                                |
-| `state_dir`                                               | `~/.sbxloop`       | Runs, workspaces, artifacts, SQLite state, event logs.                                                                                                                         |
-| `keep_sandboxes` / `keep_on_failure`                      | `false`            | Sandbox retention for debugging (see above).                                                                                                                                   |
-| `secret_strategy`                                         | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                                                                                                |
-| `[sandbox] template`                                      | unset              | Baked template ref from `sbxloop bake`.                                                                                                                                        |
-| `[sandbox] workspace`                                     | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                                                                                        |
-| `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                        |
-| `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                               |
-| `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                     |
-| `[sandbox] languages`                                     | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                                                                                                     |
-| `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                               |
-| `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public` beside it.                               |
-| `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`. |
-| `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                        |
-| `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                            |
-| `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                |
-| `[daemon] trigger_label` … `blocked_label`                | `sbxloop:run` …    | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`.                                                                    |
-| `[daemon] max_runs_per_day`                               | `12`               | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there.                                                                   |
-| `[daemon] run_cap_timezone`                               | `UTC`              | IANA timezone defining the run cap's day boundary.                                                                                                                             |
-| `[daemon] max_attempts_per_item` / `max_resumes_per_item` | `2` / `2`          | Per-item retry and resume caps; `retry_backoff_s`, `max_consecutive_failures`, `breaker_cooldown_s` beside them.                                                               |
-| `[daemon] run_stale_after_s`                              | `21600`            | With no run executing, non-terminal runs idle this long are reconciled to a terminal state (`0` disables).                                                                     |
-| `[daemon] prune_runs_after_days`                          | `14`               | Run-directory retention, swept on start and daily (`0` disables).                                                                                                              |
-| `[daemon] workspace_isolation`                            | `clone`            | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).                                                                               |
-| `[daemon] refresh_workspace`                              | `true`             | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                                                                                                |
-| `[daemon] state_dir`                                      | unset              | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above).                                                                          |
+| Key                                                       | Default            | Meaning                                                                                                                                                                                        |
+| --------------------------------------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                                                   | `auto`             | Copilot model id (`--model` overrides per run).                                                                                                                                                |
+| `state_dir`                                               | `~/.sbxloop`       | Runs, workspaces, artifacts, SQLite state, event logs.                                                                                                                                         |
+| `keep_sandboxes` / `keep_on_failure`                      | `false`            | Sandbox retention for debugging (see above).                                                                                                                                                   |
+| `secret_strategy`                                         | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                                                                                                                |
+| `[sandbox] template`                                      | unset              | Baked template ref from `sbxloop bake`.                                                                                                                                                        |
+| `[sandbox] workspace`                                     | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                                                                                                        |
+| `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                                        |
+| `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                                               |
+| `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                     |
+| `[sandbox] languages`                                     | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                                                                                                                     |
+| `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                               |
+| `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public` beside it.                                               |
+| `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`. |
+| `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                        |
+| `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                            |
+| `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                                |
+| `[daemon] trigger_label` … `blocked_label`                | `sbxloop:run` …    | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`.                                                                                    |
+| `[daemon] max_runs_per_day`                               | `12`               | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there.                                                                                   |
+| `[daemon] run_cap_timezone`                               | `UTC`              | IANA timezone defining the run cap's day boundary.                                                                                                                                             |
+| `[daemon] max_attempts_per_item` / `max_resumes_per_item` | `2` / `2`          | Per-item retry and resume caps; `retry_backoff_s`, `max_consecutive_failures`, `breaker_cooldown_s` beside them.                                                                               |
+| `[daemon] run_stale_after_s`                              | `21600`            | With no run executing, non-terminal runs idle this long are reconciled to a terminal state (`0` disables).                                                                                     |
+| `[daemon] prune_runs_after_days`                          | `14`               | Run-directory retention, swept on start and daily (`0` disables).                                                                                                                              |
+| `[daemon] workspace_isolation`                            | `clone`            | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).                                                                                               |
+| `[daemon] refresh_workspace`                              | `true`             | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                                                                                                                |
+| `[daemon] state_dir`                                      | unset              | Absolute daemon state location; unset resolves to `$XDG_STATE_HOME/sbxloop/<runner-dir>` (see above).                                                                                          |
 
 sbxloop does not size the sandbox: `sbx create` is called without CPU or
 memory flags, so the microVM is whatever size sbx gives every sandbox.

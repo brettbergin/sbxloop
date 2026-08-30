@@ -8,6 +8,25 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A run that exhausts its fix-round budget resumes its own PR instead of
+  starting over** (#523). Exhausting `max_review_rounds` / `max_ci_rounds`
+  used to be an ordinary failed attempt: the item's retry was a fresh
+  decompose/build on a new branch with a second PR, while the failed run's
+  branch sat green one round from mergeable. The engine now records which
+  budget ran out (`runs.exhausted`); under the daemon the first exhaustion
+  grants `[landing] retry_rounds` (default 2) more rounds and schedules a
+  resume of the same run after the retry backoff — no attempt spent, no
+  breaker count, no resume-budget slot — and a second exhaustion hands the
+  item over with the run still pinned. `sbxloop daemon ctl grant-rounds <run> <n>` (also `!sbx grant-rounds`, and the concierge understands "give
+  rXXXX two more rounds") grants more and resumes at once, skipping the
+  backoff; `sbxloop resume --grant-rounds N` is the CLI equivalent, and a
+  bare resume of an exhausted run is refused with that hint rather than
+  re-exhausting after one wasted review. The `run.exhausted` notice says
+  which budget ran out and what happens next. State: `runs` gains
+  `exhausted` and `granted_rounds`, `daemon_work_items` gains `not_before`
+  (a scheduled retry's earliest dispatch); both migrate in place and are
+  tested from raw pre-upgrade databases.
+
 - **A deploy never restarts the daemon under a live run** (#534). The deploy
   pipeline's drain was capped at 20 minutes and then restarted anyway; with
   the loop merging its own PRs every merge deploys, and the next queued item
@@ -17,6 +36,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   the only bound, and a timeout installs nothing), and a claim in progress
   counts as busy — `ctl status` reports `current: claiming <item>` — so a
   restart is never timed into the window that orphaned #527 (#530).
+
 - **Pause is a set of named holds.** `ctl pause --hold NAME` / `ctl resume --hold NAME` (and `!sbx` likewise) take and release a named hold; a bare
   `pause`/`resume` acts on the operator's hold; `resume --all` clears every
   hold. The daemon idles while any hold stands, `status` lists them, and the

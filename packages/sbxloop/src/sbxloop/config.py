@@ -615,6 +615,12 @@ class LandingConfig(_ConfigModel):
     deliver_draft: bool = True
     max_review_rounds: int = Field(default=3, ge=0)
     max_ci_rounds: int = Field(default=2, ge=0)
+    # A run that exhausts either budget is one round short, not broken: its
+    # branch is green and its PR is open. Under the daemon the item's retry
+    # resumes that same run with this many more rounds — once — instead of
+    # planning from scratch and opening a second PR (#523). 0 hands an
+    # exhausted run straight to a human (`ctl grant-rounds` still works).
+    retry_rounds: int = Field(default=2, ge=0)
     ci_poll_interval_s: float = Field(default=60.0, gt=0)
     ci_settle_s: float = Field(default=90.0, ge=0)
     ci_timeout_s: float = Field(default=3600.0, gt=0)

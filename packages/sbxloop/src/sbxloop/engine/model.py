@@ -262,6 +262,13 @@ class RunRecord(_Model):
     update_attempts: int = 0
     update_head: str | None = None
     last_verdict: str | None = None
+    # Which fix-round budget the run ran out of (`review` / `ci`), set when a
+    # round exhaustion ends the run and cleared by `grant_rounds` — so the
+    # daemon can tell a run that stopped one round short from one that broke
+    # (#523). `granted_rounds` extends both `[landing]` budgets for this run:
+    # the daemon grants `retry_rounds` once, an operator grants more.
+    exhausted: str | None = None
+    granted_rounds: int = 0
 
 
 class RunResult(_Model):
@@ -280,6 +287,8 @@ class RunResult(_Model):
     pr_number: int | None = None
     pr_url: str | None = None
     reason: str | None = None
+    # The fix-round budget that ran out, when that is why the run failed.
+    exhausted: str | None = None
 
     @property
     def succeeded(self) -> bool:

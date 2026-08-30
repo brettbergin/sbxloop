@@ -636,11 +636,24 @@ def resume(
         bool,
         typer.Option("--chat/--no-chat", help="Interactive chat (see `sbxloop run --help`)."),
     ] = True,
+    grant_rounds: Annotated[
+        int,
+        typer.Option(
+            "--grant-rounds",
+            min=0,
+            help="Give a run that exhausted its fix rounds this many more before resuming.",
+        ),
+    ] = 0,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
     config = load_config()
     engine = LoopEngine(config)
     try:
+        if grant_rounds:
+            total = engine.store.grant_rounds(run_id, grant_rounds)
+            console.print(
+                f"run {run_id}: {grant_rounds} more fix round(s) granted ({total} in all)"
+            )
         result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.resume(run_id))
     except SbxloopError as exc:
         console.print(f"[bold red]resume failed:[/] {exc}")
@@ -1963,7 +1976,7 @@ def daemon_ctl(
         typer.Argument(
             help="status | pause [--hold NAME] | resume [--hold NAME|--all] | cancel "
             "[--retry] | queue | items | abandon <item> [reason] | retry <item> | "
-            "requeue <item> (the Discord !sbx verbs)."
+            "requeue <item> | grant-rounds <run> <n> (the Discord !sbx verbs)."
         ),
     ],
     timeout: Annotated[

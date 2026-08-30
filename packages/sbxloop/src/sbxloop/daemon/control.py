@@ -51,11 +51,12 @@ COMMANDS: tuple[str, ...] = (
     "abandon <item> [reason]",
     "retry <item>",
     "requeue <item>",
+    "grant-rounds <run> <n>",
 )
 # Verbs that may talk to the source (GitHub through the ops sandbox —
 # seconds, not milliseconds); a surface with an event loop to protect runs
 # these off it.
-ITEM_COMMANDS: frozenset[str] = frozenset({"abandon", "retry", "requeue"})
+ITEM_COMMANDS: frozenset[str] = frozenset({"abandon", "retry", "requeue", "grant-rounds"})
 
 CTL_SUBDIR = Path("daemon") / "ctl"
 _REQUEST_SUFFIX = ".json"
@@ -227,9 +228,27 @@ def _dispatch(
         return CommandReply(queue_lines(loop.dstore.queued()))
     if word == "items":
         return CommandReply(items_lines(loop.dstore.items()))
+    if word == "grant-rounds":
+        return _grant_rounds(loop, args, by)
     if word in ITEM_COMMANDS:
         return _item_command(loop, word, args, by)
     return CommandReply(usage(prefix), ok=False, known=False)
+
+
+def _grant_rounds(loop: Any, args: list[str], by: str | None) -> CommandReply:
+    """``grant-rounds <run> <n>`` (#523): more fix rounds for a run that
+    exhausted its budget, resumed on its own PR right away."""
+    if len(args) != 2 or not args[1].isdigit() or int(args[1]) < 1:
+        return CommandReply("usage: grant-rounds <run_id> <rounds ≥ 1>", ok=False)
+    run_id, rounds = args[0], int(args[1])
+    try:
+        item = loop.grant_rounds(run_id, rounds, by)
+    except (KeyError, ValueError) as exc:
+        return CommandReply(f"grant-rounds failed: {exc.args[0] if exc.args else exc}", ok=False)
+    return CommandReply(
+        f"granted {code(run_id)} {rounds} more fix round(s); {code(item.item_id)} resumes it "
+        "on its own PR at the next tick."
+    )
 
 
 def _hold_arg(

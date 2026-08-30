@@ -791,3 +791,124 @@ class TestRepoScoping:
             row = store.get(left)
             assert row is not None and row.repo is None
         assert store.attribute_repoless([]) == 0
+
+
+def _pre_not_before_db(tmp_path: Path) -> Path:
+    """A state.db in the multi-repo shape from before scheduled retries
+    (#523): `daemon_work_items` has `repo` but no `not_before`."""
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, "
+        "source_key TEXT NOT NULL, title TEXT NOT NULL, "
+        "body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', "
+        "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
+        "claimed INTEGER NOT NULL DEFAULT 0, run_id TEXT, last_error TEXT, "
+        "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+        "pending_report TEXT, requested_by TEXT, repo TEXT NOT NULL DEFAULT '', "
+        "UNIQUE(source_key, repo))"
+    )
+    conn.execute(
+        "CREATE TABLE daemon_requesters (source_key TEXT NOT NULL, "
+        "requester_id TEXT NOT NULL, created_at REAL NOT NULL, "
+        "repo TEXT NOT NULL DEFAULT '', PRIMARY KEY (source_key, repo))"
+    )
+    conn.execute(
+        "INSERT INTO daemon_work_items (item_id, source_key, title, state, attempts, claimed, "
+        "run_id, created_at, updated_at, repo) VALUES "
+        "('gh:o/r:issue:3', '3', 'Three', 'queued', 1, 1, 'r_old', 1.0, 2.0, 'o/r')"
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+class TestScheduledRetries:
+    """`not_before` (#523): an exhausted run's item waits its own clock,
+    pinned to the run it will resume."""
+
+    def test_not_before_gates_dispatch_even_for_a_pinned_run(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claimed("gh:issue:7", now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_exhausted("gh:issue:7", "one round short", now=3.0, not_before=103.0)
+        got = store.get("gh:issue:7")
+        assert got is not None and got.state == "queued" and got.run_id == "r1"
+        assert got.not_before == 103.0 and got.attempts == 1
+        assert got.last_error == "one round short"
+        # Pinned runs skip the attempt backoff, but not their own clock.
+        assert store.next_queued(now=50.0, backoff_s=0.0) is None
+        assert store.next_queued(now=103.0, backoff_s=0.0) is not None
+        # Resuming clears the clock.
+        store.mark_resuming("gh:issue:7", "r1", now=103.0)
+        got = store.get("gh:issue:7")
+        assert got is not None and got.state == "running" and got.not_before is None
+
+    def test_a_scheduled_item_does_not_block_the_queue(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claimed("gh:issue:7", now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_exhausted("gh:issue:7", "x", now=3.0, not_before=500.0)
+        store.upsert_new(item(source_key="8", item_id="gh:issue:8"), now=4.0)
+        nxt = store.next_queued(now=10.0, backoff_s=0.0)
+        assert nxt is not None and nxt.item_id == "gh:issue:8"
+
+    def test_resume_exhausted_from_failed_owes_a_requeued_report(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claimed("gh:issue:7", now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_failed("gh:issue:7", "exhausted again", now=3.0, requeue=False)
+        fresh = store.resume_exhausted("gh:issue:7", "r1", 4.0, "2 more granted by brett")
+        assert fresh.state == "queued" and fresh.run_id == "r1" and fresh.not_before is None
+        assert fresh.pending_report == "requeued" and fresh.last_error == "2 more granted by brett"
+        assert fresh.attempts == 1
+
+    def test_resume_exhausted_from_backoff_owes_nothing(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claimed("gh:issue:7", now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_exhausted("gh:issue:7", "x", now=3.0, not_before=500.0)
+        fresh = store.resume_exhausted("gh:issue:7", "r1", 4.0, "granted")
+        assert fresh.state == "queued" and fresh.not_before is None
+        assert fresh.pending_report is None
+
+    def test_resume_exhausted_refuses_a_different_or_running_run(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claimed("gh:issue:7", now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        with pytest.raises(ValueError, match="not pinned to run r2"):
+            store.resume_exhausted("gh:issue:7", "r2", 3.0, "x")
+        with pytest.raises(ValueError, match="is running"):
+            store.resume_exhausted("gh:issue:7", "r1", 3.0, "x")
+
+    def test_other_transitions_clear_the_clock(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claimed("gh:issue:7", now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_exhausted("gh:issue:7", "x", now=3.0, not_before=500.0)
+        store.mark_failed("gh:issue:7", "gave up", now=4.0, requeue=True)
+        got = store.get("gh:issue:7")
+        assert got is not None and got.not_before is None and got.run_id is None
+
+    def test_pre_scheduled_retry_database_migrates_in_place(self, tmp_path: Path) -> None:
+        """A raw store from before `not_before` opens, gains the column, and
+        its pinned rows dispatch exactly as they did (no clock = no wait)."""
+        db = _pre_not_before_db(tmp_path)
+        store = DaemonStore(db)
+        got = store.get("gh:o/r:issue:3")
+        assert got is not None and got.not_before is None and got.run_id == "r_old"
+        nxt = store.next_queued(now=2.5, backoff_s=1000.0)
+        assert nxt is not None and nxt.item_id == "gh:o/r:issue:3"
+        store.mark_exhausted("gh:o/r:issue:3", "x", now=3.0, not_before=900.0)
+        assert store.next_queued(now=10.0, backoff_s=0.0) is None
+        # Reopening does not re-apply the ALTER.
+        store.close()
+        again = DaemonStore(db)
+        got = again.get("gh:o/r:issue:3")
+        assert got is not None and got.not_before == 900.0

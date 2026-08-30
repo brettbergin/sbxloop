@@ -214,8 +214,14 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
 Two round budgets bound the fix loop: `[landing] max_review_rounds` for
 verdicts that request changes, `max_ci_rounds` for the mechanical failures
 (a red gate, red CI, a base conflict, a human requesting changes on the PR).
-Past either the run ends `failed` with the PR still a draft — nothing
-re-picks it unless a human re-labels the issue. There is no per-task
+Past either the run ends `failed` with the PR still a draft and the budget
+that ran out recorded on the run (`runs.exhausted`). That run is one round
+short, not broken, so the daemon does not start over: the item's retry
+resumes the *same* run — same branch, same PR, review history intact — with
+`[landing] retry_rounds` more rounds, once, after the retry backoff; a
+second exhaustion hands the item to a human with the run still pinned, and
+`ctl grant-rounds <run> <n>` continues it on demand (#523). `retry <item>`
+remains the way to ask for a fresh plan. There is no per-task
 critic: the former SCRUTINIZE/VALIDATE stages audited task completion and
 rubber-stamped it (6/6 pass, 5/5 accept in the measured baseline) while
 diff-level defects leaked to the PR; one adversarial pass over the

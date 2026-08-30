@@ -595,6 +595,61 @@ class TestPipelineColumns:
         # reopening does not re-apply the ALTERs
         assert StateStore(db).get_run("old").pr_number == 1
 
+    def test_pre_granted_rounds_database_migrates_in_place(self, tmp_path: Path) -> None:
+        """A state.db with the pipeline columns but from before #523 opens,
+        gains `exhausted` / `granted_rounds`, and its rows read as never
+        exhausted, nothing granted."""
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
+            " state TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}',"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL,"
+            " workspace TEXT, mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT,"
+            " user_guidance TEXT NOT NULL DEFAULT '[]', reason TEXT, stage TEXT,"
+            " pr_number INTEGER, pr_url TEXT, pr_node_id TEXT, branch TEXT, head_sha TEXT,"
+            " review_rounds INTEGER NOT NULL DEFAULT 0, ci_rounds INTEGER NOT NULL DEFAULT 0,"
+            " update_attempts INTEGER NOT NULL DEFAULT 0, update_head TEXT, last_verdict TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO runs (run_id, outcome, state, created_at, updated_at, stage,"
+            " review_rounds, reason) VALUES ('old', 'legacy', 'failed', 1.0, 2.0, 'reviewing',"
+            " 4, 'review fix rounds exhausted (3 allowed by [landing] review_rounds): x')"
+        )
+        conn.commit()
+        conn.close()
+
+        store = StateStore(db)
+        run = store.get_run("old")
+        assert run.exhausted is None and run.granted_rounds == 0 and run.review_rounds == 4
+        store.set_run_exhausted("old", "review")
+        assert store.get_run("old").exhausted == "review"
+        assert store.grant_rounds("old", 2) == 2
+        run = StateStore(db).get_run("old")
+        assert run.granted_rounds == 2 and run.exhausted is None, "a grant clears the mark"
+
+
+class TestGrantRounds:
+    def test_grant_accumulates_and_clears_exhaustion(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        store.set_run_exhausted("r1", "ci")
+        assert store.get_run("r1").exhausted == "ci"
+        assert store.grant_rounds("r1", 1) == 1
+        assert store.grant_rounds("r1", 2) == 3
+        run = store.get_run("r1")
+        assert run.granted_rounds == 3 and run.exhausted is None
+        store.set_run_exhausted("r1", None)
+        assert store.get_run("r1").exhausted is None
+
+    def test_grant_validates(self, store: StateStore) -> None:
+        store.create_run("r1", "x")
+        with pytest.raises(StateError, match="positive"):
+            store.grant_rounds("r1", 0)
+        with pytest.raises(StateError, match="unknown run"):
+            store.grant_rounds("nope", 1)
+        with pytest.raises(StateError, match="unknown run"):
+            store.set_run_exhausted("nope", "review")
+
 
 class TestWriterSerialization:
     """One connection is shared by every caller (``check_same_thread=False``),

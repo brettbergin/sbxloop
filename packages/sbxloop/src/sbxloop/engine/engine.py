@@ -19,7 +19,12 @@ Failure semantics:
   decomposer-authored verify commands, so only a fresh session's fresh
   approach can unstick work that disagrees with where a check looks.
 - Round exhaustion (``[landing] max_review_rounds`` / ``max_ci_rounds``)
-  ends the run ``failed`` with the PR left open as a draft.
+  ends the run ``failed`` with the PR left open as a draft and the budget
+  that ran out recorded on the run (``runs.exhausted``). The run is one
+  round short, not broken: ``grant_rounds`` extends its budgets and a
+  ``resume()`` then continues on the same branch and PR with the review
+  history intact (#523) — the daemon does this once by itself
+  (``[landing] retry_rounds``), an operator as often as they like.
 - GitHub refusing to finish the PR — a protection rule, a draft that will
   not clear, CI that never reports — ends the run ``blocked``: nothing a
   further round would change, a human has to look, and the run resumes at
@@ -320,6 +325,14 @@ class LoopEngine:
         run = self.store.get_run(run_id)
         if run.state not in RESUMABLE_RUN_STATES:
             raise StateError(f"run {run_id} is {run.state}; only unfinished runs can resume")
+        if run.exhausted is not None:
+            # Resuming as-is would spend a whole review round only to
+            # re-exhaust at the first request for changes.
+            raise StateError(
+                f"run {run_id} exhausted its {run.exhausted} fix rounds; grant more first "
+                f"(`sbxloop resume {run_id} --grant-rounds N`, or `sbxloop daemon ctl "
+                f"grant-rounds {run_id} N` under the daemon)"
+            )
         self._refuse_if_pruned(run_id)
         stage = run.stage or run.state
         if run.state in TERMINAL_RUN_STATES:
@@ -574,10 +587,12 @@ class LoopEngine:
             reason=reason,
             pr=run.pr_number,
             url=run.pr_url,
+            exhausted=run.exhausted,
         )
         return RunResult(
             run_id=run_id,
             state=state,
+            exhausted=run.exhausted,
             tasks=tasks,
             workspace=pair.workspace,
             mounted=pair.mounted,
@@ -1726,15 +1741,27 @@ class LoopEngine:
         # Held for the reconciliation that follows the re-delivery: the
         # human hears back on their own thread, not only in a build report.
         p.pending_human = tuple(human)
-        counter, limit = (
+        counter, configured = (
             ("review_rounds", self.config.landing.max_review_rounds)
             if kind == "review"
             else ("ci_rounds", self.config.landing.max_ci_rounds)
         )
-        spent = self.store.bump_run_counter(run_id, counter)
-        if spent > limit:
-            return f"{kind} fix rounds exhausted ({limit} allowed by [landing] {counter}): {why}"
         run = self.store.get_run(run_id)
+        # Rounds granted after an exhaustion (by the daemon's retry or an
+        # operator) extend the configured budget for this run only. The
+        # counter is rounds actually spent, so it is checked before it is
+        # bumped: a grant of N is then N real further rounds.
+        limit = configured + run.granted_rounds
+        already = run.review_rounds if counter == "review_rounds" else run.ci_rounds
+        if already >= limit:
+            budget_kind = "review" if kind == "review" else "ci"
+            self.store.set_run_exhausted(run_id, budget_kind)
+            granted = f" + {run.granted_rounds} granted" if run.granted_rounds else ""
+            return (
+                f"{kind} fix rounds exhausted ({configured} allowed by [landing] "
+                f"{counter}{granted}): {why}"
+            )
+        spent = self.store.bump_run_counter(run_id, counter)
         tasks = self.store.get_tasks(run_id)
         round_no = 1 + sum(1 for t in tasks if is_fix_task(t.spec.id))
         verify_commands = [
