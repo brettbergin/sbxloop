@@ -72,6 +72,15 @@ def test_decompose_demands_an_upgrade_path_task_for_persisted_state() -> None:
     assert "If the outcome alters no persisted state, say nothing" in text
 
 
+def test_decompose_treats_the_symptom_as_the_spec() -> None:
+    """#535: an issue filed symptom-first is planned against the symptom;
+    the requested mechanism is a hint the decomposer may overrule."""
+    text = render("decompose", outcome="x", max_tasks="3", project_gate="- gate rule")
+    assert "**Symptom (as observed)** section, the symptom is\nthe specification" in text
+    assert "**Requested change** section is the mechanism they asked for — a hint" in text
+    assert "would not change what they saw, plan the change\nthat does" in text
+
+
 def test_decompose_warns_against_config_overriding_verify_paths() -> None:
     """#387: `uv run mypy packages` overrides the `files` pinned in
     pyproject.toml, drags in the hatchling build hook and can never pass,
@@ -209,6 +218,12 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
     # #524: an ask that touches persisted state files with a migration section
     assert "**Migration of existing state** section" in text
+    # #535: symptom-first filing; a fix named with no symptom gets one question
+    assert "The issue\n  is **symptom-first**" in text
+    assert "**A fix-shaped ask with no symptom is\n  genuinely ambiguous**" in text
+    assert "What are you seeing that you want gone or changed?" in text
+    assert '"remove the Discord embeds" → ask' in text
+    assert "written **against the symptom**" in text
     assert "raw pre-change database" in text
 
 
@@ -255,6 +270,9 @@ def test_review_prompt_carries_contract() -> None:
     # #524: round 1 reviews the plan too — a persisted-state change with no
     # upgrade-path task is a blocking finding on the plan.
     assert "review the **plan** as well as the diff" in text
+    # #535: the PR is judged against the symptom, not the requested mechanism.
+    assert "judge the pull\nrequest against the symptom, not the mechanism" in text
+    assert "`request_changes` on the plan" in text and "PR #525" in text
     # #517: out-of-scope notes are a first-class output, never a finding.
     assert "## Out of scope, but real: follow-ups" in text
     assert '"followups":' in text and "never\npromote one to a finding" in text

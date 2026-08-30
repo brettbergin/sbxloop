@@ -6,6 +6,26 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **The concierge files symptom-first issues and asks before filing a fix
+  with no symptom** (#535). #519 was filed as the mechanism the person
+  named ("remove the Discord embeds"); the loop implemented exactly that
+  (PR #525), and it was wrong — they were seeing link-preview unfurls — so
+  it was reverted: one run, two releases, two deploys. `create_issue` now
+  takes `symptom` (the person's own words), `requested_change` (a hint),
+  `goal` and `acceptance_criteria`, and composes the body in that order
+  with criteria written against the symptom; a call with a requested
+  change and no symptom is refused with the one question to ask ("What are
+  you seeing that you want gone or changed?"). The concierge prompt says a
+  fix-shaped ask with no observed symptom is genuinely ambiguous — one
+  question, then file — with the #519 conversation as the worked example;
+  the decomposer treats a Symptom section as the spec and the requested
+  change as a hint it may overrule; the reviewer judges the PR against the
+  symptom in round 1, and a PR that implements the mechanism without
+  removing the symptom is `request_changes` on the plan. Plain `body`
+  filing still works.
+
 ### Added
 
 - **Follow-up issues from a landed run** (#517). The reviewer's out-of-scope

@@ -1664,3 +1664,99 @@ class TestMultiRepo:
         turn(concierge)
         specs = {t.name: t.description for t in client.jobs[0].host_tools}
         assert "owner/one" in specs["list_issues"] and "owner/two" in specs["list_issues"]
+
+
+class TestSymptomFirstIssues:
+    """#535: `create_issue` is symptom-first — the body leads with what the
+    person saw, criteria are written against it, and a fix-shaped ask with
+    no symptom is refused with the question to ask."""
+
+    def test_compose_structured_body(self) -> None:
+        from sbxloop.daemon.concierge import compose_issue_body
+
+        body = compose_issue_body(
+            {
+                "symptom": "grey GitHub preview cards appear\nunder every bridge message",
+                "requested_change": "remove the embeds",
+                "goal": "Bridge messages should not drag a link preview under them.",
+                "acceptance_criteria": [
+                    "no link-preview card appears under a bridge message",
+                    "the bridge's own status cards still render",
+                ],
+                "body": "Seen in #sbxloop since the 1.0 deploy.",
+            }
+        )
+        assert body.startswith(
+            "## Symptom (as observed)\n\n"
+            "grey GitHub preview cards appear under every bridge message"
+        )
+        assert (
+            "## Requested change\n\nremove the embeds\n\n_The mechanism the person asked for"
+            in body
+        )
+        assert "## Goal\n\nBridge messages should not drag a link preview under them." in body
+        assert (
+            "## Acceptance criteria\n\n- [ ] no link-preview card appears under a bridge message\n"
+            "- [ ] the bridge's own status cards still render" in body
+        )
+        assert body.endswith("Seen in #sbxloop since the 1.0 deploy.")
+        assert body.index("## Symptom") < body.index("## Requested change") < body.index("## Goal")
+
+    def test_a_fix_shaped_ask_without_a_symptom_is_refused_with_the_question(self) -> None:
+        from sbxloop.daemon.concierge import compose_issue_body
+
+        with pytest.raises(ValueError, match="symptom is required") as exc:
+            compose_issue_body({"requested_change": "remove the embeds", "goal": "cleaner"})
+        assert "What are you seeing that you want gone or changed?" in str(exc.value)
+        with pytest.raises(ValueError, match="acceptance_criteria is required"):
+            compose_issue_body({"symptom": "cards everywhere", "goal": "no cards"})
+
+    def test_a_plain_body_still_files_as_is(self) -> None:
+        from sbxloop.daemon.concierge import compose_issue_body
+
+        assert compose_issue_body({"body": "Wrap fetch()."}) == "Wrap fetch()."
+        assert compose_issue_body({}) == ""
+
+    def test_the_tool_files_the_symptom_first_body(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "create_issue",
+                            {
+                                "title": "Suppress link-preview unfurls under bridge messages",
+                                "symptom": "grey GitHub preview cards under every message",
+                                "requested_change": "remove the embeds",
+                                "goal": "no unfurls, keep our own cards",
+                                "acceptance_criteria": ["no preview card appears"],
+                            },
+                        ),
+                        (
+                            "create_issue",
+                            {
+                                "title": "Remove the Discord embeds",
+                                "requested_change": "remove the embeds",
+                                "goal": "cleaner channel",
+                                "acceptance_criteria": ["embeds removed"],
+                            },
+                        ),
+                    ],
+                    "text": "Filed #41; and I need to ask about the second.",
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "remove the Discord embeds", author="Discord user `ana`")
+        filed, refused = client.responses
+        assert filed.ok and filed.text.startswith("created and queued issue #41")
+        (_, title, body, labels) = github.created[0]
+        assert title.startswith("Suppress link-preview unfurls") and labels == ["sbxloop:run"]
+        assert body.startswith("## Symptom (as observed)\n\ngrey GitHub preview cards")
+        assert "- [ ] no preview card appears" in body
+        assert "Filed by Discord user `ana`" in body
+        assert not refused.ok or "symptom is required" in refused.text
+        assert "What are you seeing that you want gone or changed?" in refused.text
+        assert len(github.created) == 1, "the fix-shaped ask was not filed"

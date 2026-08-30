@@ -570,7 +570,18 @@ bug into work in **one hop**: `create_issue` files the issue in the
 configured repo with a self-contained title and body *and* the
 `sbxloop:run` label, and the daemon claims it on its next poll. There is
 no triage lane in between — which is why the concierge writes a body a
-fresh clone can act on, and why the channel is the access boundary.
+fresh clone can act on, and why the channel is the access boundary. That
+body is **symptom-first**: what the person observes today in their own
+words, the change they asked for as a hint, the concierge's restatement of
+the goal, and acceptance criteria written against the symptom — because the
+loop optimises hard for the words in the issue, and an issue that names a
+mechanism gets exactly that mechanism (#519 asked for "the embeds" removed
+and meant Discord's link unfurls). A fix-shaped ask with no observed
+symptom is the one thing the concierge asks about before filing: "what are
+you seeing that you want gone?" — one question, then the issue. The
+decomposer plans against the symptom and the reviewer judges the PR against
+it, so a change that implements the mechanism without curing the symptom is
+sent back in round 1.
 "What's open?" lists the repository's open issues and which are queued or
 running.
 Ask what a run cost and it reports that run's input/output tokens per

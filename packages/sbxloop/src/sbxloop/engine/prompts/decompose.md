@@ -30,6 +30,9 @@ Section rules:
   persisted-state rule ("upgrade path for existing state", the row states /
   id forms enumeration, and the raw pre-change database verify) must stay
   (test_decompose_demands_an_upgrade_path_task_for_persisted_state, #524).
+  The symptom-is-the-spec paragraph ("Symptom (as observed)", "Requested
+  change", "a hint") must stay (test_decompose_treats_the_symptom_as_the_spec,
+  #535).
 -->
 
 # Decompose an outcome into a task graph
@@ -41,6 +44,15 @@ of concrete, independently verifiable tasks.
 ## Outcome
 
 $outcome
+
+If the outcome carries a **Symptom (as observed)** section, the symptom is
+the specification: the work is done when what the person saw is gone (or
+present), and every acceptance criterion you write is a check on that. A
+**Requested change** section is the mechanism they asked for — a hint. If
+implementing it faithfully would not change what they saw, plan the change
+that does, and say so in the task description. A plan that removes the
+embeds when the person is seeing link-preview unfurls has done the wrong
+thing correctly.
 
 ## Rules
 
