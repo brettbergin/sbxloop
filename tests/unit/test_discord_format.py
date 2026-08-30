@@ -30,7 +30,6 @@ from sbxloop.daemon.discord_format import (
     headline_embed,
     headline_text,
     items_lines,
-    mask_urls,
     no_unfurl,
     output_excerpt,
     queue_lines,
@@ -745,9 +744,9 @@ class TestEmbeds:
         )
 
     def test_daemon_notice_masks_urls(self) -> None:
-        assert mask_urls("PR https://x/pull/9 done") == "PR <https://x/pull/9> done"
+        assert no_unfurl("PR https://x/pull/9 done") == "PR <https://x/pull/9> done"
         assert (
-            mask_urls("already <https://x> and [t](https://y)")
+            no_unfurl("already <https://x> and [t](https://y)")
             == "already <https://x> and [t](https://y)"
         )
         assert daemon_notice("✅ gh:issue:8 done · PR https://x/pull/9", thread_id=77) == (
@@ -1389,6 +1388,22 @@ class TestNoUnfurl:
     def test_leaves_inline_code(self) -> None:
         text = "curl `https://example.com/a` please"
         assert no_unfurl(text) == text
+
+    def test_code_spans_are_byte_identical(self) -> None:
+        text = (
+            "```sh\ncurl -sS https://example.com/install.sh | sh\n```\n"
+            "inline `curl https://example.com/a` too"
+        )
+        assert no_unfurl(text) == text
+        assert no_unfurl(no_unfurl(text)) == text
+
+    def test_idempotent_on_bracketed_and_link_targets(self) -> None:
+        text = "<https://example.com/a> [run](https://example.com/b) https://example.com/c"
+        once = no_unfurl(text)
+        assert (
+            once == "<https://example.com/a> [run](https://example.com/b) <https://example.com/c>"
+        )
+        assert no_unfurl(once) == once
 
     def test_leaves_fenced_code(self) -> None:
         text = "before\n```sh\ncurl https://example.com/a\n```\nafter https://example.com/b"

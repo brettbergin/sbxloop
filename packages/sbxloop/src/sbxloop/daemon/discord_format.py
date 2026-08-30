@@ -9,7 +9,10 @@ on every CI matrix entry, not only where ``sbxloop[discord]`` is installed.
 
 Discord's Markdown subset is the target: ``**bold**``, ```` `code` ````,
 fenced blocks with a language, ``> quotes``, masked links ``[text](url)``,
-and ``<url>`` to suppress unfurling. Agent prose is never escaped — the
+and ``<url>`` to suppress unfurling. Bare-URL bracketing has exactly one
+implementation, :func:`no_unfurl`, and it always skips inline and fenced
+code spans so a fenced command line containing a URL is never altered.
+Agent prose is never escaped — the
 bridge sends every message with mentions disabled instead, so a stray
 ``@everyone`` in model output cannot ping anyone.
 
@@ -147,14 +150,13 @@ def nolink(url: str) -> str:
     return f"<{url}>"
 
 
-def mask_urls(text: str) -> str:
-    """Wrap bare URLs in ``<>`` so notices do not sprout link previews."""
-    return _URL_RE.sub(lambda m: f"<{m.group(0)}>", text)
-
-
 def no_unfurl(text: str) -> str:
     """``text`` with bare http/https URLs wrapped in ``<>`` so Discord
     renders no link preview.
+
+    The single URL-bracketing helper in this module: bracketing *always*
+    skips inline and fenced code spans, so a fenced command line carrying a
+    URL is never corrupted.
 
     The fallback for messages that legitimately carry one of the bridge's
     own embeds, where the ``SUPPRESS_EMBEDS`` message flag cannot be used
@@ -1929,7 +1931,7 @@ def daemon_notice(notice: DaemonNotice | str, *, thread_id: int | None = None) -
             text = prefix + text
     else:
         text = str(notice)
-    out = mask_urls(text)
+    out = no_unfurl(text)
     if thread_id:
         out += f" · <#{thread_id}>"
     return out
@@ -1961,7 +1963,6 @@ __all__ = [
     "items_lines",
     "line",
     "link",
-    "mask_urls",
     "no_unfurl",
     "nolink",
     "output_excerpt",
