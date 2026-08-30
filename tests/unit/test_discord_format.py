@@ -31,6 +31,7 @@ from sbxloop.daemon.discord_format import (
     headline_text,
     items_lines,
     mask_urls,
+    no_unfurl,
     output_excerpt,
     queue_lines,
     repetitive_streak,
@@ -1368,3 +1369,29 @@ class TestSteerProgressStages:
         p.observe(ev("run.state", state="building"))
         p.observe(ev("task.end", task_id="fix-1", state="done"))
         assert p.render() == "⏳ steer queued; answered at the next checkpoint"
+
+
+class TestNoUnfurl:
+    """Bare URLs get angle brackets; everything already safe is untouched."""
+
+    def test_wraps_bare_urls(self) -> None:
+        out = no_unfurl("see https://example.com/x and http://a.b/c now")
+        assert out == "see <https://example.com/x> and <http://a.b/c> now"
+
+    def test_is_idempotent(self) -> None:
+        once = no_unfurl("run at https://example.com/run/1")
+        assert no_unfurl(once) == once
+
+    def test_leaves_bracketed_and_masked_links(self) -> None:
+        text = "<https://example.com/a> and [run](https://example.com/b)"
+        assert no_unfurl(text) == text
+
+    def test_leaves_inline_code(self) -> None:
+        text = "curl `https://example.com/a` please"
+        assert no_unfurl(text) == text
+
+    def test_leaves_fenced_code(self) -> None:
+        text = "before\n```sh\ncurl https://example.com/a\n```\nafter https://example.com/b"
+        assert no_unfurl(text) == (
+            "before\n```sh\ncurl https://example.com/a\n```\nafter <https://example.com/b>"
+        )

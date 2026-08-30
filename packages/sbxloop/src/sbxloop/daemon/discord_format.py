@@ -109,6 +109,8 @@ STAGE_MARKER = {
 
 _FENCE_RE = re.compile(r"^\s*(```|~~~)\s*([\w+#.-]*)")
 _URL_RE = re.compile(r"(?<![<(\[])https?://[^\s<>()\[\]]+")
+# Fenced blocks first, then inline spans (longest run of backticks wins).
+_CODE_SPAN_RE = re.compile(r"```.*?```|```.*\Z|``.*?``|`[^`\n]*`", re.DOTALL)
 
 
 # -- primitives ---------------------------------------------------------------------------
@@ -148,6 +150,37 @@ def nolink(url: str) -> str:
 def mask_urls(text: str) -> str:
     """Wrap bare URLs in ``<>`` so notices do not sprout link previews."""
     return _URL_RE.sub(lambda m: f"<{m.group(0)}>", text)
+
+
+def no_unfurl(text: str) -> str:
+    """``text`` with bare http/https URLs wrapped in ``<>`` so Discord
+    renders no link preview.
+
+    The fallback for messages that legitimately carry one of the bridge's
+    own embeds, where the ``SUPPRESS_EMBEDS`` message flag cannot be used
+    (it would hide that embed too). URLs that are already angle-bracketed,
+    already a markdown link target (``](…)``) or inside an inline/fenced
+    code span are left exactly as they are, so the helper is idempotent.
+    """
+    out: list[str] = []
+    for segment, is_code in _code_segments(str(text)):
+        out.append(segment if is_code else _URL_RE.sub(lambda m: f"<{m.group(0)}>", segment))
+    return "".join(out)
+
+
+def _code_segments(text: str) -> list[tuple[str, bool]]:
+    """``text`` split into ``(segment, is_code)`` runs — fenced blocks and
+    inline code spans are code, everything else is prose."""
+    parts: list[tuple[str, bool]] = []
+    pos = 0
+    for match in _CODE_SPAN_RE.finditer(text):
+        if match.start() > pos:
+            parts.append((text[pos : match.start()], False))
+        parts.append((match.group(0), True))
+        pos = match.end()
+    if pos < len(text):
+        parts.append((text[pos:], False))
+    return parts
 
 
 def code(text: object) -> str:
@@ -235,7 +268,6 @@ class Chunk:
     embed: EmbedSpec | None = None
     kind: str = "line"
     flush: bool = False
-    suppress_embeds: bool = False
 
 
 def line(text: str, *, flush: bool = False) -> Chunk:
@@ -1930,6 +1962,7 @@ __all__ = [
     "line",
     "link",
     "mask_urls",
+    "no_unfurl",
     "nolink",
     "output_excerpt",
     "queue_lines",
