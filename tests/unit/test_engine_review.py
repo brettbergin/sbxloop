@@ -106,7 +106,9 @@ class TestReviewBody:
     def test_summary_unanchored_findings_and_provenance(self) -> None:
         verdict = approve(finding(line=None, body="README is stale", severity="minor"))
         body = review_body(verdict, run_id="r1abc", round=2)
-        assert body.startswith("looked for the four; clean")
+        assert body.startswith(
+            "**Review verdict: approve** (round 2)\n\nlooked for the four; clean"
+        )
         assert "Findings without a line anchor:\n- `src/app.py` [minor] README is stale" in body
         assert body.endswith("<sub>sbxloop review round 2 of run `r1abc`</sub>")
         assert "further inline comment" not in body
@@ -115,6 +117,22 @@ class TestReviewBody:
         verdict = approve(*[finding(line=i + 1) for i in range(MAX_INLINE_COMMENTS + 3)])
         body = review_body(verdict, run_id="r1", round=1)
         assert f"3 further inline comment(s) were not posted (cap {MAX_INLINE_COMMENTS})" in body
+
+    def test_in_body_names_exactly_the_findings_without_a_thread(self) -> None:
+        """#513: the single-identity review knows per anchor which findings
+        got a thread; the top-level comment carries the verdict in words,
+        the summary and only the rest."""
+        threaded = finding()
+        refused = finding(path="src/gone.py", line=99, body="anchored outside the diff")
+        verdict = request_changes(threaded, refused)
+        body = review_body(verdict, run_id="r1", round=3, in_body=[refused])
+        assert body.startswith("**Review verdict: changes requested** (round 3)\n\none real defect")
+        assert "Findings without a thread of their own:\n- `src/gone.py:99` [major]" in body
+        assert "src/app.py:12" not in body
+        assert body.endswith("<sub>sbxloop review round 3 of run `r1`</sub>")
+        assert "Findings without a thread" not in review_body(
+            verdict, run_id="r1", round=3, in_body=[]
+        )
 
 
 class TestRefutedAnchors:
@@ -441,7 +459,7 @@ def test_review_body_unanchored_lists_every_finding() -> None:
         ],
     )
     body = review_body(verdict, run_id="r1", round=2, anchored=False)
-    assert body.startswith("fine")
+    assert body.startswith("**Review verdict: approve** (round 2)\n\nfine")
     assert "Findings:\n- `a.py:3` [nit] anchored nit\n- `b.py` [minor] unanchored" in body
     assert body.endswith("<sub>sbxloop review round 2 of run `r1`</sub>")
     # the anchored shape lists only what has no inline comment

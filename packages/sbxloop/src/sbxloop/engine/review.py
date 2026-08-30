@@ -277,18 +277,44 @@ def split_carried(
     return body_verdict, ordered
 
 
-def review_body(verdict: ReviewVerdict, *, run_id: str, round: int, anchored: bool = True) -> str:
-    """The review body posted to the PR: the reviewer's summary, any finding
-    that had no line to anchor an inline comment to, the overflow the
-    comment cap dropped, and provenance.
+VERDICT_LABEL: dict[str, str] = {"approve": "approve", "request_changes": "changes requested"}
+
+
+def verdict_line(verdict: ReviewVerdict, *, round: int) -> str:
+    """The standing verdict, said in words: a ``COMMENT`` review or a PR
+    comment carries no review state a human can see, so the body says it."""
+    return f"**Review verdict: {VERDICT_LABEL[verdict.verdict]}** (round {round})"
+
+
+def review_body(
+    verdict: ReviewVerdict,
+    *,
+    run_id: str,
+    round: int,
+    anchored: bool = True,
+    in_body: Sequence[ReviewFinding] | None = None,
+) -> str:
+    """The review body posted to the PR: the verdict in words, the
+    reviewer's summary, any finding that had no line to anchor an inline
+    comment to, the overflow the comment cap dropped, and provenance.
 
     ``anchored=False`` renders *every* finding into the body instead — the
     shape for a review posted without inline comments, which is what a
     reviewer that anchored a finding to a line outside the diff gets
     (GitHub 422s the whole review otherwise, and losing the findings over
-    an anchor would be the worst outcome).
+    an anchor would be the worst outcome). ``in_body`` names exactly the
+    findings that got no thread of their own — the single-identity review
+    (#513), which posts findings one comment at a time and knows per anchor
+    which ones GitHub refused.
     """
-    parts = [verdict.summary.strip()]
+    parts = [verdict_line(verdict, round=round), verdict.summary.strip()]
+    if in_body is not None:
+        if in_body:
+            parts.append(
+                "Findings without a thread of their own:\n" + "\n".join(f.render() for f in in_body)
+            )
+        parts.append(f"<sub>sbxloop review round {round} of run `{run_id}`</sub>")
+        return "\n\n".join(parts)
     if not anchored:
         if verdict.findings:
             parts.append("Findings:\n" + "\n".join(f.render() for f in verdict.findings))

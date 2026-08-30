@@ -126,7 +126,13 @@ from sbxloop.errors import (
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gc import workspace_pruned
-from sbxloop.gh.ops import FailedCheck, GithubOps, PostedFinding
+from sbxloop.gh.ops import (
+    FailedCheck,
+    GithubOps,
+    PostedFinding,
+    ReviewComment,
+    SubmittedReview,
+)
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter
@@ -169,6 +175,10 @@ class Pipeline:
     # The loop's own GitHub identity, read once and only when landing asks
     # (to tell a human's review objection from its own posted review).
     login: str | None = None
+    # Whether the PR's author is that identity (#513): then GitHub refuses
+    # REQUEST_CHANGES/APPROVE and the review is posted as PR comments
+    # instead. Decided once per drive, on the first review round.
+    self_review: bool | None = None
     # When the latest delivery happened, for the "no check runs yet" settle
     # window; None on a resume (the wait then settles from its own start).
     delivered_at: float | None = None
@@ -1273,15 +1283,20 @@ class LoopEngine:
         comments = posting.comments()
         try:
             try:
-                submitted = ops.pr_review_create(
-                    repo,
-                    run.pr_number,
-                    verdict.event,
-                    review_body(posting, run_id=run_id, round=round_no),
-                    comments,
-                )
+                if self._self_review(p, run.pr_number):
+                    submitted = self._post_review_as_comments(
+                        p, run.pr_number, run.head_sha, posting, comments, round_no
+                    )
+                else:
+                    submitted = ops.pr_review_create(
+                        repo,
+                        run.pr_number,
+                        verdict.event,
+                        review_body(posting, run_id=run_id, round=round_no),
+                        comments,
+                    )
             except GithubOpsError:
-                if not comments:
+                if not comments or p.self_review:
                     raise
                 # A finding anchored to a line outside the diff makes GitHub
                 # refuse the whole review (422), in both the requested event
@@ -1366,6 +1381,63 @@ class LoopEngine:
             summary=" ".join(verdict.summary.split())[:300],
         )
         return verdict
+
+    def _self_review(self, p: Pipeline, number: int) -> bool:
+        """Is the loop reviewing a PR it authored? (#513)
+
+        One token opens the PR and reviews it, so the answer is yes on
+        every daemon run today; a second, reviewer-only identity would make
+        it no. GitHub refuses ``REQUEST_CHANGES`` and ``APPROVE`` from a
+        PR's own author, so asking is two doomed calls per round. Decided
+        once per drive from the PR's author; unknown reads as no, which
+        keeps the review-feature path (and its COMMENT fallback).
+        """
+        if p.self_review is None:
+            assert p.ops is not None and p.repo is not None
+            author = ""
+            try:
+                user = p.ops.pr_get(p.repo, number).get("user")
+                author = str(user.get("login") or "") if isinstance(user, dict) else ""
+            except GithubOpsError:
+                log.warning("review.author_lookup_failed", run=p.run_id, pr=number, exc_info=True)
+            login = self._login(p)
+            p.self_review = bool(author) and author == login
+            if p.self_review:
+                log.info(
+                    "review.self_review",
+                    run=p.run_id,
+                    pr=number,
+                    login=login,
+                    hint="the loop authored this PR; GitHub refuses REQUEST_CHANGES/APPROVE "
+                    "from an author, so the review is posted as PR comments — one thread "
+                    "per finding, the verdict in a top-level comment",
+                )
+        return bool(p.self_review)
+
+    def _post_review_as_comments(
+        self,
+        p: Pipeline,
+        number: int,
+        head_sha: str | None,
+        posting: ReviewVerdict,
+        comments: Sequence[ReviewComment],
+        round_no: int,
+    ) -> SubmittedReview:
+        """The single-identity review (#513): each anchored finding as its
+        own review comment (a resolvable thread), then the verdict and every
+        finding that got no thread — no line, over the cap, or an anchor
+        GitHub refused — in one top-level PR comment."""
+        ops, repo, run_id = p.ops, p.repo, p.run_id
+        assert ops is not None and repo is not None
+        posted: tuple[PostedFinding, ...] = ()
+        if comments and head_sha:
+            posted = ops.pr_review_comments_create(repo, number, comments, commit_id=head_sha)
+        threaded = {rec.anchor for rec in posted if rec.comment_id is not None}
+        in_body = [f for f in posting.findings if f.anchor not in threaded]
+        url = ops.pr_issue_comment(
+            repo, number, review_body(posting, run_id=run_id, round=round_no, in_body=in_body)
+        )
+        return SubmittedReview(url, "COMMENT", None, posted)
 
     def _threads_for(self, run_id: str, anchors: Sequence[str]) -> list[PostedRecord]:
         """The thread identity earlier rounds recorded for these anchors."""
