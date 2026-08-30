@@ -2000,3 +2000,35 @@ class TestRepoLinesHealth:
             "owner/other — enabled" in resp.text
             and "backing off after 3 poll failure(s)" in resp.text
         )
+
+
+class TestChoiceQuestions:
+    """#564: a clarifying question with enumerable answers travels as a spec."""
+
+    def test_valid_spec_is_stripped_and_carried(self, tmp_path: Path) -> None:
+        text = (
+            "Close #12?\n\n```sbx-choices\n"
+            '{"prompt": "Close #12?", "choices": ['
+            '{"value": "yes", "label": "Yes, close it"}, "No"]}'
+            "\n```"
+        )
+        concierge, _, _, _, _ = make(tmp_path, [{"text": text}])
+        reply = turn(concierge, "close 12")
+        assert reply.ok and reply.text == "Close #12?"
+        assert "sbx-choices" not in reply.text
+        assert reply.question is not None
+        assert reply.question.prompt == "Close #12?"
+        assert reply.question.values == ("yes", "No")
+
+    def test_malformed_spec_falls_back_to_prose(self, tmp_path: Path) -> None:
+        text = "Which one?\n\n```sbx-choices\n{not json at all\n```"
+        concierge, _, _, _, _ = make(tmp_path, [{"text": text}])
+        reply = turn(concierge, "which?")
+        assert reply.ok and reply.question is None
+        assert reply.text == "Which one?"
+
+    def test_ordinary_reply_has_no_question(self, tmp_path: Path) -> None:
+        concierge, _, _, _, _ = make(tmp_path, [{"text": "two runs today"}])
+        reply = turn(concierge, "status?")
+        assert reply == ConciergeReply("two runs today")
+        assert reply.question is None

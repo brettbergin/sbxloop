@@ -19,7 +19,15 @@ import os
 from typing import Any, ClassVar
 
 from sbxloop.config import ChatBackend, Config, DiscordConfig
-from sbxloop.daemon.chat import ChatBridge, Inbound, _ConciergeTurn, _NoTyping, _Pending
+from sbxloop.daemon.chat import (
+    CHOICE_QUESTION_TTL_S,
+    ChatBridge,
+    Inbound,
+    _ConciergeTurn,
+    _NoTyping,
+    _Pending,
+)
+from sbxloop.daemon.chat_choices import ChoiceQuestion, render_prose
 from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE
 from sbxloop.daemon.concierge import Concierge
 from sbxloop.daemon.discord_format import (
@@ -125,6 +133,7 @@ class DiscordBridge(ChatBridge):
             reply_to_bot=not author_is_bot and self._is_reply_to_bot(message),
             channel=getattr(message, "channel", None),
             raw=message,
+            reply_to_id=_reference_id(message),
         )
 
     def _is_reply_to_bot(self, message: Any) -> bool:
@@ -270,6 +279,76 @@ class DiscordBridge(ChatBridge):
             )
             return None
 
+    async def _send_choices(
+        self,
+        target: Any,
+        text: str,
+        question: ChoiceQuestion,
+        *,
+        reply_to: Any = None,
+    ) -> Any:
+        """Post a clarifying question with one clickable button per choice.
+
+        The message body is always the same numbered prose the base seam
+        posts, so every failure mode here — discord.py without component
+        support, a send Discord rejects because of the view, a view that
+        times out, a click that arrives after the bridge deadline — leaves
+        a question that is still answerable by typing. Nothing about the
+        typed path changes: the buttons are an extra way in, not the only
+        one.
+        """
+        body = render_prose(question)
+        if text and text.strip() and text.strip() != question.prompt.strip():
+            body = f"{text.strip()}\n\n{body}"
+        view = _build_choice_view(self, question, timeout=self._question_ttl_s)
+        if view is None:
+            # No component support on this host: prose, exactly as before.
+            return await self._send(target, body, reply_to=reply_to)
+
+        kwargs: dict[str, Any] = {"view": view, "suppress_embeds": True}
+        if reply_to is not None:
+            kwargs["reference"] = reply_to
+            kwargs["mention_author"] = False
+        mentions = _allowed_mentions_none()
+        if mentions is not None:
+            kwargs["allowed_mentions"] = mentions
+        content = _clip(body, self.discord.max_message_chars)
+        posted = None
+        failure: BaseException | None = None
+        try:
+            posted = await target.send(content, **kwargs)
+        except Exception as exc:
+            failure = exc
+            if "reference" in kwargs:
+                kwargs.pop("reference")
+                kwargs.pop("mention_author", None)
+                try:
+                    posted = await target.send(content, **kwargs)
+                    failure = None
+                except Exception as retry_exc:
+                    failure = retry_exc
+                    posted = None
+        if posted is None:
+            log.warning(
+                "discord.choices_view_send_failed",
+                target=getattr(target, "id", None),
+                choices=len(question.choices),
+                action="falling back to free-text prose",
+                error=str(failure) if failure is not None else None,
+                # The traceback must be taken from the caught exception: by
+                # here `sys.exc_info()` is cleared, so `exc_info=True` would
+                # log "NoneType: None" instead of why the send failed.
+                exc_info=failure,
+            )
+            return await self._send(target, body, reply_to=reply_to)
+        bind = getattr(view, "bind", None)
+        if bind is not None:
+            try:
+                bind(posted)
+            except Exception:  # pragma: no cover - defensive
+                log.debug("discord.choices_bind_failed", exc_info=True)
+        return posted
+
     async def _edit(self, message: Any, text: str, *, embed: EmbedSpec | None = None) -> None:
         """Edit a message we posted, re-asserting unfurl suppression.
 
@@ -367,6 +446,29 @@ def _typing_context(channel: Any) -> Any:
     return _NoTyping()
 
 
+def _reference_id(message: Any) -> str | None:
+    """The id of the message this one is a reply to, or None.
+
+    discord.py exposes it on ``message.reference.message_id`` even when the
+    referenced message itself was not resolved, which is precisely the case
+    that matters: an answer to a clarifying question must be matched to the
+    question it replies to, not to whichever question was posted last.
+    """
+    reference = getattr(message, "reference", None)
+    mid = getattr(reference, "message_id", None)
+    if mid is None:
+        resolved = getattr(reference, "resolved", None) or getattr(
+            reference, "cached_message", None
+        )
+        mid = getattr(resolved, "id", None)
+    if mid is None:
+        return None
+    try:
+        return str(int(mid))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return str(mid)
+
+
 def _author_id(message: Any) -> str | None:
     """The author's numeric Discord id, which is what an ``<@id>`` mention
     needs; `_author_name` stays the display/attribution form (backticked, so
@@ -385,6 +487,171 @@ def _author_name(message: Any) -> str:
     author = getattr(message, "author", None)
     name = getattr(author, "name", None) or getattr(author, "display_name", None)
     return f"Discord user `{name}`" if name else "a Discord operator"
+
+
+# -- clarifying-question components (#564) ----------------------------------------------
+
+
+EXPIRED_CLICK_NOTE = (
+    "That question has expired (or was already answered) — just type your answer "
+    "in the channel and I'll pick it up."
+)
+TIMED_OUT_NOTE = "_These buttons expired — you can still answer by typing._"
+
+
+class _ChoiceHandler:
+    """The transport-free half of a choice view.
+
+    Holds everything the button callbacks need so the discord.py View is a
+    thin shell: whether or not the extra is installed, the click and timeout
+    behaviour is the same object and is directly testable.
+    """
+
+    def __init__(self, bridge: Any, question: ChoiceQuestion, body: str = "") -> None:
+        self.bridge = bridge
+        self.question = question
+        self.body = body
+        self.message: Any = None
+        self.answered = False
+
+    def bind(self, message: Any) -> None:
+        self.message = message
+        if not self.body:
+            self.body = str(getattr(message, "content", "") or "")
+
+    def _message_id(self) -> str:
+        if self.message is None:
+            return ""
+        try:
+            return str(self.bridge._message_id(self.message))
+        except Exception:  # pragma: no cover - defensive
+            return ""
+
+    async def on_click(self, interaction: Any, value: str) -> None:
+        """A user clicked a choice. Anyone may click — the asker is not the
+        only person who can unblock the bot — but who clicked is recorded.
+        A click on a question the bridge no longer holds (expired, or
+        already answered) is answered ephemerally with the typed route
+        rather than raising or leaving the clicker with a dead button."""
+        author = _interaction_author(interaction)
+        user = getattr(interaction, "user", None)
+        author_name = getattr(user, "name", None) or getattr(user, "display_name", None)
+        uid = getattr(user, "id", None)
+        message_id = self._message_id()
+        accepted = False
+        if message_id:
+            try:
+                accepted = bool(
+                    self.bridge._answer_choice(
+                        message_id,
+                        value,
+                        author,
+                        author_id=str(uid) if uid is not None else None,
+                        author_name=str(author_name) if author_name else None,
+                    )
+                )
+            except Exception:
+                log.warning("discord.choice_answer_failed", value=value, exc_info=True)
+                accepted = False
+        if accepted:
+            self.answered = True
+            await _ack_interaction(interaction, f"Got it — **{value}**.")
+            await self._disable(f"{self.body}\n\n_Answered: **{value}** (by {author})._")
+            return
+        log.info("discord.choice_click_expired", value=value, by=author)
+        await _ack_interaction(interaction, EXPIRED_CLICK_NOTE)
+
+    async def on_timeout(self) -> None:
+        """The view's deadline matches the bridge's: when it passes, grey
+        the buttons out and say plainly that typing still works."""
+        if self.answered:
+            return
+        await self._disable(f"{self.body}\n\n{TIMED_OUT_NOTE}")
+
+    async def _disable(self, text: str) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=_clip(text, DISCORD_MAX_MESSAGE), view=None)
+        except TypeError:
+            try:
+                await self.message.edit(content=_clip(text, DISCORD_MAX_MESSAGE))
+            except Exception:
+                log.debug("discord.choices_disable_failed", exc_info=True)
+        except Exception:
+            log.debug("discord.choices_disable_failed", exc_info=True)
+
+
+async def _ack_interaction(interaction: Any, note: str) -> None:
+    """Acknowledge a component interaction; never raise. Discord requires a
+    response within three seconds or the click shows as failed, but a failed
+    acknowledgement must not lose the answer we already recorded."""
+    response = getattr(interaction, "response", None)
+    if response is None:
+        return
+    attempts: tuple[tuple[str, Any], ...] = (
+        ("send_message", lambda: response.send_message(note, ephemeral=True)),
+        ("defer", lambda: response.defer()),
+    )
+    for name, attempt in attempts:
+        try:
+            await attempt()
+            return
+        except Exception:
+            # An ephemeral note is nicer, but a bare defer still clears the
+            # click; either failing only costs the acknowledgement, never the
+            # answer, so try the next one rather than raising into discord.py.
+            log.debug("discord.interaction_ack_attempt_failed", how=name, exc_info=True)
+    log.debug("discord.interaction_ack_failed")
+
+
+def _interaction_author(interaction: Any) -> str:
+    user = getattr(interaction, "user", None)
+    name = getattr(user, "name", None) or getattr(user, "display_name", None)
+    return f"Discord user `{name}`" if name else "a Discord user"
+
+
+def _build_choice_view(
+    bridge: Any, question: ChoiceQuestion, *, timeout: float = CHOICE_QUESTION_TTL_S
+) -> Any:
+    """A discord.py View of one button per choice, or None when this host's
+    discord.py has no component support (the caller posts prose instead)."""
+    try:
+        import discord as discordpy
+
+        view_cls = discordpy.ui.View
+        button_cls = discordpy.ui.Button
+        style = discordpy.ButtonStyle.secondary
+    except (ImportError, AttributeError):
+        return None
+
+    handler = _ChoiceHandler(bridge, question)
+
+    class _ChoiceView(view_cls):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            super().__init__(timeout=timeout)
+            self.handler = handler
+
+        def bind(self, message: Any) -> None:
+            handler.bind(message)
+
+        async def on_timeout(self) -> None:
+            await handler.on_timeout()
+
+    try:
+        view = _ChoiceView()
+        for choice in question.choices:
+            button = button_cls(label=_clip(choice.label, 80), style=style, row=0)
+
+            def _callback(interaction: Any, value: str = choice.value) -> Any:
+                return handler.on_click(interaction, value)
+
+            button.callback = _callback
+            view.add_item(button)
+    except Exception:
+        log.warning("discord.choice_view_unavailable", exc_info=True)
+        return None
+    return view
 
 
 # -- discord.py adapters (the only place the optional extra is touched) ------------------

@@ -50,10 +50,11 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sbxloop.config import ChatBackend, ChatBridgeConfig, Config
+from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion, match_free_text, render_prose
 from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message
 from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
@@ -115,6 +116,13 @@ REQUESTER_ID_CAP = 200
 WATCHERS_CAP = 200
 # The concierge's "🛠 …" tool-note line is edited at most this often.
 CONCIERGE_NOTE_EDIT_MIN_S = 1.5
+# How long an outstanding clarifying question stays answerable through the
+# registry. After that it is dropped; the question stays in the channel and
+# a typed answer is still handled as ordinary prose.
+CHOICE_QUESTION_TTL_S = 900.0
+# Outstanding questions are bounded: a daemon that never gets an answer must
+# not accumulate them forever.
+CHOICE_QUESTION_CAP = 64
 # A run thread's title (Discord names threads; Slack has no such thing).
 THREAD_NAME_MAX = 90
 
@@ -160,6 +168,10 @@ class Inbound:
     reply_to_bot: bool
     channel: Any
     raw: Any
+    # The id of the message this one replies to, when the transport knows it.
+    # A clarifying question is matched to its answer by this reference before
+    # anything falls back to guessing.
+    reply_to_id: str | None = None
 
 
 class _Pending:
@@ -199,6 +211,30 @@ class _ConciergeTurn:
         if self.failed:
             text += f" ⚠ {self.failed} failed"
         return text
+
+
+class _OutstandingQuestion:
+    """One posted clarifying question awaiting an answer — a click or a
+    typed reply. In memory only: nothing is persisted, and losing it
+    (restart, expiry) only means the answer is read as ordinary prose."""
+
+    def __init__(
+        self,
+        question: ChoiceQuestion,
+        msg: Inbound,
+        channel: Any,
+        channel_id: str | None,
+        deadline: float,
+    ) -> None:
+        self.question = question
+        self.msg = msg  # the asking user's message: attribution + reply target
+        self.channel = channel
+        self.channel_id = channel_id
+        self.deadline = deadline
+
+    @property
+    def asker_id(self) -> str | None:
+        return self.msg.author_id
 
 
 class _NoTyping:
@@ -299,6 +335,12 @@ class ChatBridge(ABC):
         self._facts: dict[str, dict[str, Any]] = {}
         # Counters behind the end-of-run summary card, the thread's last post.
         self._runstats: dict[str, RunStats] = {}
+        # Clarifying questions posted with clickable choices and not yet
+        # answered: posted message id -> _OutstandingQuestion. In memory
+        # only (no store, no schema), bounded and deadlined, and consulted
+        # by the inbound path so a typed answer works exactly as before.
+        self._questions: dict[str, _OutstandingQuestion] = {}
+        self._question_ttl_s = CHOICE_QUESTION_TTL_S
 
     # -- transport seams (one implementation per service) -------------------------
 
@@ -352,6 +394,27 @@ class ChatBridge(ABC):
     ) -> Any:
         """The single send seam: clip, disable mentions unless asked,
         convert the card, fall back to text; never raise — return None."""
+
+    async def _send_choices(
+        self,
+        target: Any,
+        text: str,
+        question: ChoiceQuestion,
+        *,
+        reply_to: Any = None,
+    ) -> Any:
+        """Post a clarifying question whose answers are enumerable.
+
+        The base implementation is the floor every backend gets: a numbered
+        prose rendering through :meth:`_send`, so a service without
+        interactive components is unaffected and the question stays
+        answerable by typing. Backends with components override this and
+        keep the same prose in the message body as a fallback.
+        """
+        body = render_prose(question)
+        if text and text.strip() and text.strip() != question.prompt.strip():
+            body = f"{text.strip()}\n\n{body}"
+        return await self._send(target, body, reply_to=reply_to)
 
     @abstractmethod
     async def _edit(self, message: Any, text: str, *, embed: EmbedSpec | None = None) -> None:
@@ -581,7 +644,7 @@ class ChatBridge(ABC):
         if route.kind == "command":
             self._schedule(self._command(msg, route.text))
         elif route.kind == "concierge":
-            self._schedule(self._concierge_turn(msg, route.text))
+            self._schedule(self._concierge_turn(msg, self._choice_from_typed(msg, route.text)))
         elif route.kind == "steer":
             self._steer(msg, route.text)
 
@@ -880,11 +943,230 @@ class ChatBridge(ABC):
             )
             return
         text = reply.text or "(the concierge had nothing to say)"
+        question = getattr(reply, "question", None)
+        if question is not None:
+            await self._post_choice_question(msg, text, question)
+            await self._react(msg.raw, "✅")
+            return
         first = True
         for chunk in split_markdown(text, self.chat.max_message_chars):
             await self._send(channel, chunk, reply_to=msg.raw if first else None)
             first = False
         await self._react(msg.raw, "✅")
+
+    # -- clarifying questions with enumerable answers (#564) --------------------------
+
+    async def _post_choice_question(
+        self, msg: Inbound, text: str, question: ChoiceQuestion
+    ) -> None:
+        """Post the question through the choice seam and remember it, so a
+        click *or* a typed reply resolves to the same answer.
+
+        A long prose preamble is split the same way any other reply is: only
+        the tail that fits alongside the rendered question rides with the
+        components, so nothing is silently clipped away."""
+        preamble, leading = self._split_choice_preamble(text, question)
+        first = True
+        for chunk in leading:
+            await self._send(msg.channel, chunk, reply_to=msg.raw if first else None)
+            first = False
+        posted = await self._send_choices(
+            msg.channel, preamble, question, reply_to=msg.raw if first else None
+        )
+        if posted is None:
+            # The interactive post failed: prose is already the fallback in
+            # the base seam, so all we lose is the click. Say the question
+            # anyway rather than leaving the user with nothing.
+            await self._send(msg.channel, render_prose(question), reply_to=msg.raw)
+            self.log.warning("chat.choices_post_failed", choices=len(question.choices))
+            return
+        try:
+            message_id = self._message_id(posted)
+        except Exception:  # pragma: no cover - a transport that cannot id its post
+            self.log.debug("chat.choices_no_message_id", exc_info=True)
+            return
+        if not message_id:
+            self.log.debug("chat.choices_no_message_id")
+            return
+        self._register_question(message_id, question, msg)
+
+    def _split_choice_preamble(self, text: str, question: ChoiceQuestion) -> tuple[str, list[str]]:
+        """Return the preamble to post with the components, plus any leading
+        chunks to post before it.
+
+        The rendered question must always survive whole — it is what makes
+        the answer clickable — so when the prose preamble would push the
+        message past the transport's limit the prose goes out first, split
+        the ordinary way, and the question is posted on its own."""
+        body = (text or "").strip()
+        if not body or body == question.prompt.strip():
+            return "", []
+        limit = self.chat.max_message_chars
+        rendered = render_prose(question)
+        if len(body) + len(rendered) + 2 <= limit:
+            return body, []
+        return "", list(split_markdown(body, limit))
+
+    def _register_question(self, message_id: str, question: ChoiceQuestion, msg: Inbound) -> None:
+        deadline = time.monotonic() + self._question_ttl_s
+        with self._lock:
+            self._expire_questions_locked()
+            self._questions[message_id] = _OutstandingQuestion(
+                question, msg, msg.channel, msg.channel_id, deadline
+            )
+            while len(self._questions) > CHOICE_QUESTION_CAP:
+                # Drop whichever live question expires soonest, explicitly,
+                # rather than relying on insertion order: a re-registered
+                # entry keeps its original slot, and the entry just added
+                # must be evictable like any other.
+                oldest = min(self._questions, key=lambda mid: self._questions[mid].deadline)
+                self._questions.pop(oldest, None)
+        self.log.info(
+            "chat.choices_posted",
+            message=message_id,
+            choices=len(question.choices),
+            ttl_s=self._question_ttl_s,
+        )
+
+    def _expire_questions_locked(self) -> None:
+        """Drop questions past their deadline. Cheap, called on the paths
+        that already hold the lock — no timer, no thread ever waits."""
+        now = time.monotonic()
+        stale = [mid for mid, q in self._questions.items() if q.deadline <= now]
+        for mid in stale:
+            self._questions.pop(mid, None)
+        if stale:
+            self.log.info("chat.choices_expired", messages=stale)
+
+    def _outstanding(self, message_id: str | None = None) -> _OutstandingQuestion | None:
+        """The live question for ``message_id``. With no id, the single live
+        question if there is exactly one — never a guess between several,
+        because rewriting a reply into the wrong question's choice is worse
+        than passing the prose through. Expired entries are never returned."""
+        with self._lock:
+            self._expire_questions_locked()
+            if message_id is not None:
+                return self._questions.get(message_id)
+            if len(self._questions) == 1:
+                return next(iter(self._questions.values()))
+            return None
+
+    def _question_for_reply(self, msg: Inbound) -> tuple[str, _OutstandingQuestion] | None:
+        """Which outstanding question is this typed message answering?
+
+        In order: the question whose posted message it explicitly replies to;
+        then, in this channel, the single live question this same person was
+        asked. Anything else is ambiguous — two questions outstanding, or a
+        question asked of somebody else — and gets no match at all, so the
+        prose reaches the concierge untouched, exactly as before #564.
+        """
+        with self._lock:
+            self._expire_questions_locked()
+            if msg.reply_to_id:
+                entry = self._questions.get(msg.reply_to_id)
+                if entry is not None:
+                    return msg.reply_to_id, entry
+                # An explicit reply that names no live question is an answer
+                # to something else; do not fall back to guessing.
+                return None
+            mine = [
+                (mid, entry)
+                for mid, entry in self._questions.items()
+                if (entry.channel_id is None or entry.channel_id == msg.channel_id)
+                and entry.asker_id is not None
+                and entry.asker_id == msg.author_id
+            ]
+            if len(mine) == 1:
+                return mine[0]
+            if mine:
+                return None
+            live = [
+                (mid, entry)
+                for mid, entry in self._questions.items()
+                if entry.channel_id is None or entry.channel_id == msg.channel_id
+            ]
+            # No question was asked of this speaker: only an unambiguous
+            # single outstanding question in the channel may be matched, and
+            # only when nobody else's question is competing with it.
+            if len(live) == 1 and len(self._questions) == 1 and live[0][1].asker_id is None:
+                return live[0]
+            return None
+
+    def _resolve_choice(
+        self, message_id: str, value: str
+    ) -> tuple[_OutstandingQuestion, str] | None:
+        """Pop the question and turn a selection into the answer text."""
+        with self._lock:
+            self._expire_questions_locked()
+            entry = self._questions.get(message_id)
+            if entry is None:
+                return None
+            for choice in entry.question.choices:
+                if choice.value == value:
+                    self._questions.pop(message_id, None)
+                    return entry, choice_answer(choice)
+        return None
+
+    def _answer_choice(
+        self,
+        message_id: str,
+        value: str,
+        author: str | None = None,
+        *,
+        author_id: str | None = None,
+        author_name: str | None = None,
+    ) -> bool:
+        """A user clicked a choice: feed it back as if they had typed it.
+
+        Anyone may click, not just the asker, so the turn is attributed to
+        whoever actually clicked — ``author_name``/``author_id`` replace the
+        asker's on the ``Inbound`` handed to the concierge, which is what
+        decides the attribution line and the recorded ``requester_id``.
+
+        Returns False when the question is unknown or expired — the caller
+        tells the user to answer in words; nothing here blocks or waits.
+        """
+        resolved = self._resolve_choice(message_id, value)
+        if resolved is None:
+            self.log.info("chat.choice_unknown", message=message_id, value=value)
+            return False
+        entry, answer = resolved
+        self.log.info(
+            "chat.choice_selected", message=message_id, value=value, by=author or "unknown"
+        )
+        msg = entry.msg
+        if author_name or author_id:
+            msg = replace(
+                msg,
+                author_name=author_name or msg.author_name,
+                author_id=author_id or msg.author_id,
+            )
+        self._schedule(self._concierge_turn(msg, answer))
+        return True
+
+    def _choice_from_typed(self, msg: Inbound, text: str) -> str:
+        """A typed reply to an outstanding question: if it names one of the
+        choices, answer with that choice; otherwise pass the prose through
+        unchanged, exactly as before this feature existed.
+
+        The question is chosen by what the message is answering — the message
+        it replies to, or the single question this speaker was asked — never
+        by recency, so a "1"/"yes" meant for one question can never be
+        delivered as a different question's answer."""
+        matched = self._question_for_reply(msg)
+        if matched is None:
+            return text
+        message_id, entry = matched
+        value = match_free_text(entry.question, text)
+        if value is None:
+            return text
+        for choice in entry.question.choices:
+            if choice.value == value:
+                with self._lock:
+                    self._questions.pop(message_id, None)
+                self.log.info("chat.choice_typed", message=message_id, value=value)
+                return choice_answer(choice)
+        return text
 
     async def _concierge_tool_note(
         self, turn: _ConciergeTurn, name: str, args: dict[str, Any], response: HostToolResponse
@@ -1608,6 +1890,12 @@ class ChatBridge(ABC):
             await self._edit(msg, text, embed=embed)
         except Exception:
             self.log.warning("chat.headline_edit_failed", run=run_id, exc_info=True)
+
+
+def choice_answer(choice: Choice) -> str:
+    """The text a selected choice sends to the concierge — identical to what
+    a user typing that option's value would send."""
+    return choice.value
 
 
 def _tool_call_summary(name: str, args: dict[str, Any]) -> str:

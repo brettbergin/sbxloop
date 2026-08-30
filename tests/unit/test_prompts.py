@@ -224,6 +224,11 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "**A fix-shaped ask with no symptom is\n  genuinely ambiguous**" in text
     assert "What are you seeing that you want gone or changed?" in text
     assert '"remove the Discord embeds" → ask' in text
+    # #564: enumerable clarifying answers become clickable choices; open-ended
+    # questions stay free text
+    assert "sbx-choices" in text
+    assert "**Open-ended questions stay free text: no block at all.**" in text
+    assert "stays free\n  text unless you can enumerate real candidate symptoms" in text
     assert "written **against the symptom**" in text
     assert "raw pre-change database" in text
 

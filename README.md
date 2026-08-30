@@ -594,6 +594,37 @@ you seeing that you want gone?" — one question, then the issue. The
 decomposer plans against the symptom and the reviewer judges the PR against
 it, so a change that implements the mechanism without curing the symptom is
 sent back in round 1.
+
+**Clarifying questions you answer by clicking.** When the concierge needs
+one more thing from you *and* the plausible answers are enumerable — "is
+this about the wording, the layout, or the timing?", "close #12 as a
+duplicate, or as completed?" — it posts the question with a **button per
+answer**, so unblocking the bot is one click rather than a typed reply.
+Clicking is the whole answer: the daemon feeds the selected option back
+into the conversation exactly as if you had typed it, so the outcome is
+identical either way, and the message is edited to record which option was
+chosen and by whom.
+
+Typing still works, always. The buttons are an extra way in, never the only
+one: the same numbered options stay in the message body, so "2", "the
+layout", or an answer in your own words is understood just as it was before
+— and an answer that names none of the options is passed through to the
+concierge as ordinary prose, unchanged.
+
+Not every question gets buttons. When the answers are **not** enumerable —
+"paste the traceback you saw", "what should the new title be?" — the
+concierge asks free text and the message carries no components, rather than
+forcing you into an unsuitable set of choices.
+
+The interactive message degrades safely. An outstanding question stays
+clickable for 15 minutes; after that the buttons are greyed out with a note
+that typing still works, and a click that arrives late (or on a question
+already answered, or after a daemon restart, which forgets them — nothing
+is persisted) gets a private nudge to answer in the channel instead. The
+bot never waits on a click: a Discord that rejects the components, or a
+host without them, simply gets the plain numbered question. Backends
+without interactive components — Slack today — always get that prose
+rendering, so nothing about them changes.
 "What's open?" lists the repository's open issues and which are queued or
 running.
 Ask what a run cost and it reports that run's input/output tokens per
