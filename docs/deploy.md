@@ -9,12 +9,19 @@ own releases.
 
 ```
 merge to main → Release (tag + PyPI, ~4 min) → Deploy to db (self-hosted runner)
-                                                 ├─ pause + drain the in-flight run
+                                                 ├─ take a named pause hold (deploy-<run id>)
+                                                 ├─ wait — no cap — for the in-flight run to finish
                                                  ├─ pip install the exact released version
                                                  ├─ systemctl --user restart sbxloop-daemon
                                                  ├─ health check, or roll back
-                                                 └─ restore pause state + tell Discord
+                                                 └─ restore the other holds + tell Discord
 ```
+
+**A deploy never restarts the daemon under a live run** (#534). Since 1.0 the loop merges its
+own PRs, every merge deploys, and the next queued item is usually already running when the
+deploy lands; a capped drain that "restarts anyway" killed in-flight tasks and spent the
+item's resume budget for nothing of its own doing. The wait has no cap short of the job's
+`timeout-minutes` (8 h), and a timeout installs nothing.
 
 `.github/workflows/deploy.yml` is the whole pipeline. It runs on a self-hosted runner on the
 daemon host and takes **no** checkout — it installs from PyPI and needs nothing from the tree.
@@ -32,11 +39,17 @@ daemon host and takes **no** checkout — it installs from PyPI and needs nothin
     `max-age=600`, so for up to ten minutes pip can be served an index page that predates
     the upload. Two deploys died exactly there: v0.7.17 on `sbxloop`, then v0.7.18 on
     `sbxloop-worker`, which is a separate project with its own independently cached page.
-04. **Pauses and drains.** `daemon ctl pause` stops new claims; it then polls `ctl status`
-    every 15 s for up to 20 minutes until `current: idle`. The 15 s floor is deliberate —
-    `status()` mutates the circuit breaker (#309). On timeout it restarts anyway: cancellation
-    is honored at the next task boundary and an interrupted run resumes, it just spends one of
-    the item's resume-budget slots.
+04. **Takes a hold and waits for idle.** `daemon ctl pause --hold deploy-<run id>` stops new
+    claims without touching the operator's own pause (pause is a set of named holds — each
+    side releases only its own). It then polls `ctl status` every 15 s until `current: idle`,
+    **with no cap**: `claiming <item>` counts as busy, so a restart is never timed into the
+    window between the claim comment landing on the issue and the claim being persisted
+    (#530). The 15 s floor is deliberate — `status()` mutates the circuit breaker (#309). A
+    daemon that answers nothing for five minutes straight has nothing to drain and the job
+    proceeds to the restart. The Discord announcement says whether the restart is immediate
+    or deferred behind a run. To make a deploy go now, `ctl cancel` the run (it stays
+    resumable; `cancel --retry` re-queues it fresh) — the deploy proceeds at the next task
+    boundary.
 05. **Upgrades** by installing both local wheels together. The host wheel pins
     `sbxloop-worker==X` exactly, and naming the local worker wheel satisfies that pin without
     the index being consulted for it at all. `[discord]` is required for the daemon's bridge.
@@ -49,12 +62,19 @@ daemon host and takes **no** checkout — it installs from PyPI and needs nothin
     up), then a 45 s settle to prove it is not crash-looping.
 08. **Rolls back** to the previously installed version on any failed check, restarts, and fails
     the job loudly. Rollback installs from PyPI: the previous version has been published for a
-    while, so its index page is long since warm and there is no race to lose.
-09. **Restores the pause state** it recorded at the start. This is required, not cosmetic:
-    pause is in-memory only (#308), so *every* restart otherwise comes back claiming work
-    autonomously. It runs after a rollback too — whatever version is live, operator intent
-    survives.
-10. **Reports to Discord** in the control channel, using the bot already there.
+    while, so its index page is long since warm and there is no race to lose. It only runs
+    once the upgrade step has — a failure before that (wheels, the wait) changed nothing on
+    the host, and a rollback restart would be the needless restart this pipeline exists to
+    avoid.
+09. **Restores the other holds.** Holds are in-memory only (#308), so *every* restart comes
+    back claiming work; the job snapshots the standing holds immediately before the restart
+    (not at the start of the job — an operator who paused *during* the wait must still be
+    paused afterwards) and re-takes every one but its own. It runs after a rollback too —
+    whatever version is live, operator intent survives. The deploy's own hold is released on
+    `always()`, so a job that timed out waiting leaves the daemon exactly as it found it.
+10. **Reports to Discord** in the control channel, using the bot already there — including
+    how long it waited for the daemon to go idle, and whether a failure happened before
+    anything was installed.
 
 ## Relationship to `version_status`
 

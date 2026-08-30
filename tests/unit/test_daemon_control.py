@@ -132,15 +132,29 @@ class TestDispatch:
             text = dispatch(floop, word).text
             assert "gh:issue:7" in text and not _re.search(r"gh:\d", text)
 
-    def test_verbs_are_case_insensitive_and_take_no_extra_args(self, tmp_path: Path) -> None:
+    def test_verbs_are_case_insensitive(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))
-        assert dispatch(floop, "PAUSE now please").ok and floop.paused
+        assert dispatch(floop, "PAUSE").ok and floop.paused
+        assert dispatch(floop, "Resume").ok and not floop.paused
+
+    def test_pause_and_resume_reject_stray_arguments(self, tmp_path: Path) -> None:
+        """A mistyped `--hold` must not quietly become the operator's bare
+        pause/resume: `resume --al` releasing the wrong hold is exactly the
+        surprise named holds exist to prevent (#534)."""
+        floop = FakeLoop(_dstore(tmp_path))
+        for cmd in ("pause now please", "pause --hodl x", "pause --hold", "resume --al"):
+            reply = dispatch(floop, cmd)
+            assert not reply.ok and "usage:" in reply.text, cmd
+        assert not floop.paused and floop.hold_calls == []
 
     def test_unknown_verb_returns_usage_with_the_callers_prefix(self, tmp_path: Path) -> None:
         reply = dispatch(FakeLoop(_dstore(tmp_path)), "bogus", prefix="sbxloop daemon ctl")
         assert not reply.ok and not reply.known
         assert reply.text == usage("sbxloop daemon ctl")
-        assert "sbxloop daemon ctl status|pause|resume|cancel [--retry]|queue|items|" in reply.text
+        assert (
+            "sbxloop daemon ctl status|pause [--hold NAME]|resume [--hold NAME|--all]|"
+            "cancel [--retry]|queue|items|" in reply.text
+        )
 
     def test_cancel_rejects_unknown_arguments(self, tmp_path: Path) -> None:
         # A typo (`--rety`) must not silently become a terminal no-retry
@@ -206,7 +220,7 @@ class TestControlQueue:
         entered = threading.Event()
         release = threading.Event()
 
-        def slow_pause() -> None:
+        def slow_pause(*_args: Any, **_kwargs: Any) -> list[str]:
             entered.set()
             release.wait(5)
             floop.paused = True
@@ -446,7 +460,7 @@ class TestDaemonCtlCommand:
         state_dir = daemon_state(workdir)
         floop = FakeLoop(_dstore(state_dir))
         release = threading.Event()
-        floop.pause = lambda: release.wait(5)  # type: ignore[method-assign]
+        floop.pause = lambda *a, **k: release.wait(5)  # type: ignore[method-assign]
         server = ControlServer(floop, state_dir, poll_s=0.02)
         server.start()
         try:
@@ -525,3 +539,56 @@ class TestCommandAudit:
             dispatch(FakeLoop(_dstore(tmp_path)), "bogus", by="x")
         (record,) = [r for r in caplog.records if "operator.command" in r.getMessage()]
         assert "'ok': False" in record.getMessage() and "'known': False" in record.getMessage()
+
+
+class TestHolds:
+    """`pause --hold NAME` / `resume --hold NAME|--all` (#534) through the
+    dispatcher, and the status lines the deploy pipeline greps."""
+
+    def test_named_holds_reach_the_loop_with_the_operator(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "pause --hold deploy-9", by="github-actions")
+        assert reply.ok and "hold `deploy-9`" in reply.text and floop.holds == {"deploy-9"}
+        assert floop.hold_calls[-1] == ("pause", "deploy-9", "github-actions")
+        assert dispatch(floop, "pause", by="brett").ok
+        assert floop.hold_calls[-1] == ("pause", "operator", "brett")
+        reply = dispatch(floop, "resume --hold deploy-9", by="github-actions")
+        assert reply.ok and "still paused by `operator`" in reply.text
+        assert floop.holds == {"operator"}
+        assert dispatch(floop, "resume").text == "resumed." and not floop.paused
+        floop.holds = {"a", "b"}
+        assert dispatch(floop, "resume --all").text == "resumed."
+        assert floop.hold_calls[-1] == ("unpause", None, None) and floop.holds == set()
+
+    def test_invalid_hold_name_is_refused(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+
+        def strict_pause(hold: str = "operator", *, by: str | None = None) -> list[str]:
+            from sbxloop.daemon.holds import hold_name
+
+            floop.holds.add(hold_name(hold))
+            return sorted(floop.holds)
+
+        floop.pause = strict_pause  # type: ignore[method-assign]
+        reply = dispatch(floop, "pause --hold bad`name")
+        assert not reply.ok and "invalid hold name" in reply.text and not floop.paused
+
+    def test_status_lines_carry_holds_and_the_claim_in_progress(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        text = plain(dispatch(floop, "status").text)
+        assert "current: idle" in text and "holds: none" in text
+        floop.holds = {"operator", "deploy-1"}
+        floop.claiming = "gh:issue:5"
+        text = plain(dispatch(floop, "status").text)
+        assert "current: claiming gh:issue:5" in text
+        assert "paused: True" in text and "holds: deploy-1, operator" in text
+
+    def test_status_from_a_loop_without_holds_still_reads(self, tmp_path: Path) -> None:
+        """A status dict from a fake (or older loop) that only knows the
+        boolean: paused implies the operator's hold."""
+        floop = FakeLoop(_dstore(tmp_path))
+        floop.holds = {"operator"}
+        status = floop.status()
+        del status["holds"]
+        floop.status = lambda: status  # type: ignore[method-assign]
+        assert "holds: operator" in plain(dispatch(floop, "status").text)

@@ -136,6 +136,8 @@ class TickResult(NamedTuple):
 NoticeKind = Literal[
     "daemon.started",
     "daemon.stopped",
+    "daemon.paused",
+    "daemon.resumed",
     "daemon.daily_cap",
     "daemon.gc",
     "daemon.state_archived",

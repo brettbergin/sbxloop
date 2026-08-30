@@ -6,6 +6,29 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A deploy never restarts the daemon under a live run** (#534). The deploy
+  pipeline's drain was capped at 20 minutes and then restarted anyway; with
+  the loop merging its own PRs every merge deploys, and the next queued item
+  is usually already running when the deploy lands, so runs were being
+  interrupted mid-task and charged a resume-budget slot for it. The drain now
+  waits for `current: idle` without a cap (the job's 8 h `timeout-minutes` is
+  the only bound, and a timeout installs nothing), and a claim in progress
+  counts as busy — `ctl status` reports `current: claiming <item>` — so a
+  restart is never timed into the window that orphaned #527 (#530).
+- **Pause is a set of named holds.** `ctl pause --hold NAME` / `ctl resume --hold NAME` (and `!sbx` likewise) take and release a named hold; a bare
+  `pause`/`resume` acts on the operator's hold; `resume --all` clears every
+  hold. The daemon idles while any hold stands, `status` lists them, and the
+  transitions are narrated in Discord (`daemon.paused` / `daemon.resumed`,
+  naming the hold and who took it). The deploy holds `deploy-<run id>`,
+  snapshots the *other* holds immediately before the restart and re-takes
+  them afterwards, and releases its own on `always()` — so an operator pause
+  survives a deploy, including one issued while the deploy was already
+  waiting (the two pause/restore races seen on 2026-08-29). Rollback now runs
+  only once the upgrade step has, and the Discord deploy notices say whether
+  the restart was deferred behind a run and how long it waited.
+
 ### Added
 
 - **`sbxloop.toml.example` at the repository root** (#527), covering every

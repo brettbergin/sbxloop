@@ -502,8 +502,12 @@ Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause|resume|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>` in the control channel drive the daemon
-itself. `!sbx cancel` stops the current run at its next boundary and settles
+when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>` in the control channel drive the daemon
+itself. Pause is a set of **named holds**: a bare `pause`/`resume` acts on the
+operator's hold, the deploy pipeline holds `deploy-<run id>` while it waits for
+the daemon to go idle, and the daemon idles while any hold stands — so an
+operator pause survives a deploy and `resume --all` is the override for a hold
+whose owner never released it. `!sbx cancel` stops the current run at its next boundary and settles
 the item as **cancelled** — attributed to you on the source, no automatic
 retry, no breaker count — while the run stays resumable (`sbxloop resume RUN`
 on the daemon host); `!sbx cancel --retry` re-queues it for a fresh run

@@ -1934,7 +1934,7 @@ class TestStaleRunReconciliation:
 
     def test_sweep_runs_while_paused(self, tmp_path: Path) -> None:
         h = self._stale_harness(tmp_path)
-        h.loop._paused = True
+        h.loop.pause()
         h.store.create_run("r_stale", "x")
         h.store.set_run_state("r_stale", "decomposing")
         self._age(h, "r_stale", h.clock.t - 99999.0)
@@ -2135,3 +2135,195 @@ class TestPerRepoWorkspaceRefresh:
         # Refused outright, not attempted: a fetch against the foreign origin
         # would have surfaced as a refresh-failed warning instead.
         assert not any("workspace refresh" in t for t in front.seen)
+
+
+class TestPauseHolds:
+    """Pause is a set of named holds (#534): the operator's pause and a
+    deploy's hold coexist, each side releases only its own, and the daemon
+    idles while any hold stands."""
+
+    def test_bare_pause_and_resume_act_on_the_operator_hold(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        assert not h.loop.paused and h.loop.holds == []
+        assert h.loop.pause() == ["operator"]
+        assert h.loop.paused and h.loop.status()["holds"] == ["operator"]
+        assert h.loop.tick().idle_kind == "paused"
+        assert h.loop.unpause() == []
+        assert not h.loop.paused and h.loop.tick().idle_kind == "no_work"
+
+    def test_each_side_releases_only_its_own_hold(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.loop.pause()  # the operator
+        assert h.loop.pause("deploy-1") == ["deploy-1", "operator"]
+        # The deploy releasing its hold does not resume a daemon the operator paused.
+        assert h.loop.unpause("deploy-1") == ["operator"]
+        assert h.loop.paused and h.loop.tick().idle_kind == "paused"
+        # And the operator's bare resume does not release a deploy's hold.
+        h.loop.pause("deploy-2")
+        assert h.loop.unpause() == ["deploy-2"]
+        assert h.loop.paused
+        # Releasing a hold nobody holds is a no-op, not an error.
+        assert h.loop.unpause("deploy-1") == ["deploy-2"]
+        # `resume --all` is the override for a hold whose owner died.
+        assert h.loop.unpause(None) == []
+        assert not h.loop.paused
+
+    def test_hold_names_are_validated(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        for bad in ("", "has space", "-leading", "a" * 65, "x`y`"):
+            with pytest.raises(ValueError):
+                h.loop.pause(bad)
+        assert h.loop.holds == []
+
+    def test_transitions_are_narrated_once(self, tmp_path: Path) -> None:
+        """Discord sees who is holding the daemon and when a hold goes, but
+        a repeated `pause` of the same hold is not a second notice."""
+        h = Harness(tmp_path)
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        h.loop.pause("deploy-7", by="github-actions")
+        h.loop.pause("deploy-7", by="github-actions")
+        h.loop.pause(by="brett")
+        h.loop.unpause("deploy-7")
+        h.loop.unpause("deploy-7")  # already released: silent
+        h.loop.unpause()
+        kinds = [(n.kind, n.text) for n in front.notices]
+        assert [k for k, _ in kinds] == [
+            "daemon.paused",
+            "daemon.paused",
+            "daemon.resumed",
+            "daemon.resumed",
+        ]
+        assert kinds[0][1] == "paused by deploy-7 (github-actions); holds: deploy-7"
+        assert kinds[1][1] == "paused by operator (brett); holds: deploy-7, operator"
+        assert kinds[2][1] == "hold released: deploy-7; still paused by operator"
+        assert kinds[3][1] == "hold released: operator; claiming again"
+
+    def test_status_reports_the_claim_in_progress(self, tmp_path: Path) -> None:
+        """A claim is not a run, but it is not idle either (#530): the deploy
+        pipeline reads `claiming <item>` as busy and waits."""
+        h = Harness(tmp_path)
+        h.source.items = [gh_item()]
+        seen: list[tuple[str | None, str]] = []
+        real_claim = h.source.claim
+
+        def claim(item: WorkItem) -> bool:
+            from sbxloop.daemon.control import dispatch
+
+            status = h.loop.status()
+            seen.append((status["claiming"], dispatch(h.loop, "status").text))
+            return real_claim(item)
+
+        h.source.claim = claim  # type: ignore[method-assign]
+        assert h.loop.status()["claiming"] is None
+        assert h.loop.tick().outcome == "done"
+        assert seen[0][0] == "gh:issue:1"
+        assert "**current:** claiming gh:issue:1" in seen[0][1]
+        assert h.loop.status()["claiming"] is None
+
+    def test_claiming_is_cleared_when_the_claim_fails(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item()]
+        h.source.claim_ok = False
+        assert h.loop.tick().outcome == "failed"
+        assert h.loop.status()["claiming"] is None
+
+
+class TestDeployChoreography:
+    """The deploy pipeline's steps (`.github/workflows/deploy.yml`), played
+    against the loop: take a hold, wait for idle, snapshot the *other*
+    holds right before the restart, restart (holds are in-memory: a fresh
+    loop has none), re-take the snapshot, release the deploy's own hold.
+    Covers the two 2026-08-29 pause/restore races (#534): an operator pause
+    issued before the deploy (18:36) and during its wait (21:10) both
+    survive it."""
+
+    HOLD = "deploy-123"
+
+    def _status(self, loop: DaemonLoop) -> dict[str, Any]:
+        from sbxloop.daemon.control import dispatch
+
+        reply = dispatch(loop, "status")
+        assert reply.status is not None
+        lines = {
+            line.split(":**", 1)[0].strip("*"): line.split(":**", 1)[1].strip()
+            for line in reply.text.splitlines()
+            if ":**" in line
+        }
+        return {"text": lines, "raw": reply.status}
+
+    def _deploy(self, h: Harness, *, operator_pauses_during_wait: bool = False) -> DaemonLoop:
+        from sbxloop.daemon.control import dispatch
+
+        loop = h.loop
+        # Take the deploy hold.
+        assert dispatch(loop, f"pause --hold {self.HOLD}", by="github-actions").ok
+        # Wait for idle: a run in flight shows on `current:`; the hold stops
+        # the next claim, so once idle it stays idle.
+        while self._status(loop)["text"]["current"] != "idle":
+            loop.tick()
+        if operator_pauses_during_wait:
+            assert dispatch(loop, "pause", by="brett").ok
+        # Snapshot the holds immediately before the restart, minus our own.
+        holds = self._status(loop)["text"]["holds"]
+        keep = [x.strip() for x in holds.split(",") if x.strip() not in ("none", self.HOLD)]
+        # Restart: a new process has no holds at all.
+        again = DaemonLoop(
+            h.config,
+            store=h.store,
+            dstore=h.dstore,
+            source=h.source,
+            runner=h.runner,
+            clock=h.clock,
+        )
+        for hold in keep:
+            assert dispatch(again, f"pause --hold {hold}", by="github-actions").ok
+        # Release our hold: already gone with the restart; a no-op.
+        assert dispatch(again, f"resume --hold {self.HOLD}", by="github-actions").ok
+        return again
+
+    def test_deploy_waits_out_the_run_and_the_daemon_claims_again(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item("1"), gh_item("2")]
+        assert h.loop.tick().outcome == "done"  # run 1 in flight… and done (scripted runner)
+        again = self._deploy(h)
+        assert again.holds == [] and not again.paused
+        assert again.tick().outcome == "done"  # gh:issue:2 was not claimed under the hold
+        assert [c for c in h.source.calls if c[0] == "claim"] == [
+            ("claim", "gh:issue:1"),
+            ("claim", "gh:issue:2"),
+        ]
+
+    def test_operator_pause_before_the_deploy_survives_it(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item("1")]
+        h.loop.pause(by="brett")
+        again = self._deploy(h)
+        assert again.holds == ["operator"] and again.paused
+        assert again.tick().idle_kind == "paused"
+        assert [c for c in h.source.calls if c[0] == "claim"] == []
+
+    def test_operator_pause_during_the_wait_survives_it(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item("1")]
+        again = self._deploy(h, operator_pauses_during_wait=True)
+        assert again.holds == ["operator"] and again.paused
+        assert again.tick().idle_kind == "paused"
+
+    def test_a_deploy_that_never_restarts_leaves_the_daemon_as_it_was(self, tmp_path: Path) -> None:
+        """Timed out waiting, or failed before the upgrade: the `always()`
+        release step is the only thing that runs, and it must not resume a
+        daemon the operator paused."""
+        from sbxloop.daemon.control import dispatch
+
+        h = Harness(tmp_path)
+        h.loop.pause(by="brett")
+        dispatch(h.loop, f"pause --hold {self.HOLD}")
+        reply = dispatch(h.loop, f"resume --hold {self.HOLD}")
+        assert reply.ok and "still paused by `operator`" in reply.text
+        assert h.loop.holds == ["operator"]
+        # And without an operator pause the release resumes claiming.
+        h.loop.unpause()
+        dispatch(h.loop, f"pause --hold {self.HOLD}")
+        assert dispatch(h.loop, f"resume --hold {self.HOLD}").text == "resumed."
+        assert not h.loop.paused
