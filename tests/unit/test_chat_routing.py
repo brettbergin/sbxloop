@@ -1,8 +1,13 @@
-"""route_message: every inbound-message rule, without a Discord client."""
+"""route_message: every inbound-message rule, without a chat client."""
 
 from __future__ import annotations
 
-from sbxloop.daemon.discord_routing import Route, route_message, strip_mentions
+from sbxloop.daemon.chat_routing import (
+    SLACK_MENTION_RE,
+    Route,
+    route_message,
+    strip_mentions,
+)
 
 BOT = 777
 CONTROL = 42
@@ -131,3 +136,67 @@ def test_strip_mentions() -> None:
     assert strip_mentions("<@1>  hi <@!1> there  <@2>", 1) == "hi there <@2>"
     assert strip_mentions("<@1> hi <@2>", None) == "hi"
     assert strip_mentions("no mentions", 1) == "no mentions"
+
+
+class TestSlackDialect:
+    """The same rules over Slack's ids and mention spelling: string ids,
+    ``<@U…>`` with an optional ``|name`` label."""
+
+    def test_mentions_are_stripped_and_routed(self) -> None:
+        facts = {
+            "author_is_bot": False,
+            "reply_to_bot": False,
+            "control_channel_id": "C0123ABCDEF",
+            "prefix": "!sbx",
+            "bot_user_id": "UBOT",
+            "mention_re": SLACK_MENTION_RE,
+        }
+        assert route_message(
+            content="<@UBOT> what's running?",
+            channel_id="C0123ABCDEF",
+            mentioned_ids={"UBOT"},
+            is_run_thread=False,
+            **facts,
+        ) == Route("concierge", "what's running?")
+        assert route_message(
+            content="<@UBOT|sbxloop> focus on tests",
+            channel_id="1724968573.123456",
+            mentioned_ids={"UBOT"},
+            is_run_thread=True,
+            **facts,
+        ) == Route("steer", "focus on tests")
+        # someone else's mention is kept, and without ours it is chatter
+        assert route_message(
+            content="<@UOTHER> look at this",
+            channel_id="1724968573.123456",
+            mentioned_ids={"UOTHER"},
+            is_run_thread=True,
+            **facts,
+        ) == Route("ignore", "")
+        assert route_message(
+            content="!sbx status",
+            channel_id="1724968573.123456",
+            mentioned_ids=set(),
+            is_run_thread=True,
+            **facts,
+        ) == Route("command", "status")
+
+    def test_strip_mentions_slack(self) -> None:
+        assert (
+            strip_mentions("<@UBOT|sbxloop> hi <@UOTHER>", "UBOT", mention_re=SLACK_MENTION_RE)
+            == "hi <@UOTHER>"
+        )
+        assert strip_mentions("<@U1> <@U2>", None, mention_re=SLACK_MENTION_RE) == ""
+
+    def test_int_and_str_ids_compare_as_text(self) -> None:
+        assert route_message(
+            content="!sbx queue",
+            channel_id="42",
+            author_is_bot=False,
+            mentioned_ids=set(),
+            reply_to_bot=False,
+            control_channel_id=42,
+            prefix="!sbx",
+            bot_user_id=777,
+            is_run_thread=False,
+        ) == Route("command", "queue")

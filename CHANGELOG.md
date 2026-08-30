@@ -6,6 +6,27 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Slack as an alternative chat backend** (#532). The daemon's human
+  channel — headline cards, a thread per run streaming its chronology,
+  `!sbx` operator commands in the control channel and in run threads,
+  @mention steering of a live run, watch/outcome pings and the concierge
+  — now runs on Discord *or* Slack, chosen by `[chat] backend = "discord" | "slack"` in `sbxloop.toml` (inferred from whichever of `[discord]` /
+  `[slack]` carries a `channel_id`; both without a choice, or a named
+  backend without its section, fail at load with a clear error; neither
+  means headless as before). The Discord bridge is refactored behind
+  `sbxloop.daemon.chat.ChatBridge` — the service-agnostic pump, rendering,
+  steering, watches and commands — with `DiscordBridge` and the new
+  `SlackBridge` (Socket Mode via the `sbxloop[slack]` extra;
+  `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` from the environment only, never
+  logged) as its two transports; Discord behaves exactly as before.
+  Threads persist in `daemon_chat_threads` (text ids — Slack's message
+  `ts` would not survive INTEGER affinity); an existing
+  `daemon_discord_threads` table is folded in on first open. `sbxloop daemon --slack-channel`, a `chat bridge (slack)` doctor row, the
+  `sbxloop.toml.example` / `.env.example` entries and the README's Slack
+  app setup (scopes, events, Socket Mode) document it.
+
 ### Fixed
 
 - **Filing follow-up issues no longer errors when the follow-up label

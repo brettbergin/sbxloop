@@ -26,11 +26,13 @@ import sbxloop
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import (
+    ChatConfig,
     Config,
     DaemonConfig,
     DiscordConfig,
     GithubConfig,
     RepoConfig,
+    SlackConfig,
     load_config,
     load_config_with_sources,
     load_dotenv_file,
@@ -1466,7 +1468,15 @@ def daemon(
     ] = None,
     discord_channel: Annotated[
         int | None,
-        typer.Option("--discord-channel", help="Discord control channel id (enables the bridge)."),
+        typer.Option(
+            "--discord-channel", help="Discord control channel id (selects the Discord bridge)."
+        ),
+    ] = None,
+    slack_channel: Annotated[
+        str | None,
+        typer.Option(
+            "--slack-channel", help="Slack control channel id, C…, (selects the Slack bridge)."
+        ),
     ] = None,
     once: Annotated[
         bool, typer.Option("--once", help="Recover, run one tick, exit (cron / smoke tests).")
@@ -1488,15 +1498,16 @@ def daemon(
 ) -> None:
     """Run the always-on outer loop: claim labeled GitHub issues, run each
     one through to a merged pull request, report back on the issue, and
-    mirror the chronology to Discord. Subcommands inspect and steer
+    mirror the chronology to the chat backend (Discord or Slack).
+    Subcommands inspect and steer
     individual work items; `sbxloop daemon ctl CMD` talks to the running
     daemon instead."""
     if ctx.invoked_subcommand is not None:
         return
     from sbxloop.daemon.agentbox import DaemonAgent
+    from sbxloop.daemon.chat import ChatBridge, build_bridge
     from sbxloop.daemon.concierge import Concierge
     from sbxloop.daemon.control import ControlServer
-    from sbxloop.daemon.discord import DiscordBridge
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.logsink import event_log_subscriber
     from sbxloop.daemon.loop import DaemonLoop
@@ -1540,11 +1551,37 @@ def daemon(
                 {**config.github.model_dump(), "repos": [], "repo": repo}
             )
             config = config.model_copy(update={"github": github_cfg})
+        if discord_channel is not None and slack_channel is not None:
+            raise ValidationError.from_exception_data(
+                "daemon",
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("chat",),
+                        "input": None,
+                        "ctx": {
+                            "error": "--discord-channel and --slack-channel are exclusive: "
+                            "the daemon has one chat backend"
+                        },
+                    }
+                ],
+            )
         if discord_channel is not None:
             discord_cfg = DiscordConfig.model_validate(
                 {**config.discord.model_dump(), "channel_id": discord_channel}
             )
-            config = config.model_copy(update={"discord": discord_cfg})
+            # The option names the backend too: a Slack section in the file
+            # must not make the switch ambiguous.
+            config = config.model_copy(
+                update={"discord": discord_cfg, "chat": ChatConfig(backend="discord")}
+            )
+        if slack_channel is not None:
+            slack_cfg = SlackConfig.model_validate(
+                {**config.slack.model_dump(), "channel_id": slack_channel}
+            )
+            config = config.model_copy(
+                update={"slack": slack_cfg, "chat": ChatConfig(backend="slack")}
+            )
     except ValidationError as exc:
         # Before the pipeline is configured with the daemon's own settings:
         # the WARNING-level default from the app callback carries this.
@@ -1700,9 +1737,9 @@ def daemon(
         max_review_rounds=config.landing.max_review_rounds,
         max_ci_rounds=config.landing.max_ci_rounds,
         merge_method=config.landing.merge_method,
-        discord=("on" if config.discord.enabled else "off"),
-        discord_channel=config.discord.channel_id if config.discord.enabled else None,
-        concierge=("on" if config.discord.enabled and config.concierge.enabled else "off"),
+        chat=config.chat_backend or "off",
+        chat_channel=(config.chat_settings.channel_ref if config.chat_settings else None),
+        concierge=("on" if config.chat_backend and config.concierge.enabled else "off"),
         log_level=config.daemon.log_level,
         log_format=config.daemon.log_format,
         once=once,
@@ -1740,14 +1777,14 @@ def daemon(
     # One probe, shared: the startup drift check below warms its PyPI memo, so
     # the concierge's first `version_status` answers without a network call.
     versions = VersionProbe(sbx=sbx)
-    bridge: DiscordBridge | None = None
+    bridge: ChatBridge | None = None
     concierge: Concierge | None = None
-    if config.discord.enabled:
+    bridge = build_bridge(config, dstore, loop_ref=loop)
+    if bridge is not None:
         try:
-            bridge = DiscordBridge(config, dstore, loop_ref=loop)
             bridge.start()
         except SbxloopError as exc:
-            log.error("discord.bridge_failed", error=str(exc), exc_info=True)
+            log.error("chat.bridge_failed", backend=bridge.backend, error=str(exc), exc_info=True)
             raise typer.Exit(2) from exc
         loop.frontend = bridge
         if archived is not None:
@@ -1791,6 +1828,7 @@ def daemon(
                 bus=concierge_bus,
                 versions=versions,
                 on_watch=bridge.on_watch,
+                thread_link=bridge.thread_link,
             )
             bridge.concierge = concierge
             concierge.warm_up()
@@ -1851,7 +1889,7 @@ def daemon(
         log.debug("daemon.shutdown", step="control server")
         ctl.close()
         if bridge is not None:
-            log.debug("daemon.shutdown", step="discord bridge")
+            log.debug("daemon.shutdown", step="chat bridge")
             bridge.close()
         if concierge is not None:
             # Forgets the handle; the concierge sandbox itself is kept for

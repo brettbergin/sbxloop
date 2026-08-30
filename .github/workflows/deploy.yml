@@ -260,12 +260,13 @@ jobs:
           # Both wheels together, from the release: the host wheel pins
           # sbxloop-worker==VERSION exactly, and naming the local worker wheel
           # satisfies that pin without the index being consulted for it at all.
-          # [discord] is required — the daemon's bridge needs it. Everything
-          # else (pydantic, discord.py) still resolves from PyPI, which is fine:
+          # Both chat extras go in, so switching [chat] backend on the host is
+          # a config change, not a reinstall. Everything else (pydantic,
+          # discord.py, slack_sdk) still resolves from PyPI, which is fine:
           # those are not racing a just-published version.
           "${VENV_PIP}" install --upgrade \
             "${DIST}/sbxloop_worker-${VERSION}-py3-none-any.whl" \
-            "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord]"
+            "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord,slack]"
           "${VENV_SBXLOOP}" --version
 
       - name: Snapshot the holds to restore

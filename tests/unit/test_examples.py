@@ -301,6 +301,13 @@ def test_every_commented_key_is_a_real_config_key() -> None:
         elif section == "github":
             # `[github]` needs a repository before any other key is meaningful.
             doc = {"github": {"repo": "you/your-repo", **parsed}}
+        elif section == "chat":
+            # `[chat] backend` names a section that must carry a channel_id.
+            doc = {
+                "chat": parsed,
+                "discord": {"channel_id": 1},
+                "slack": {"channel_id": "C0123ABCDEF"},
+            }
         else:
             doc = {section: parsed}
         Config.model_validate(doc)

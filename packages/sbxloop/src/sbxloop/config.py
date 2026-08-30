@@ -7,7 +7,7 @@ built-in defaults.
 
 The user-level file is the lowest layer so a project can always override it;
 it exists for settings that follow the operator rather than the checkout
-(``model``, ``app_name``, ``[discord]``). It is located from the *env mapping*
+(``model``, ``app_name``, ``[discord]`` / ``[slack]``). It is located from the *env mapping*
 handed to the loader — never from ``os.environ`` behind the caller's back — so
 hermetic callers (tests, embedders passing ``env={}``) never read the real
 home directory.
@@ -783,28 +783,31 @@ class DaemonConfig(_ConfigModel):
 ChronologyLevel = Literal["quiet", "normal", "verbose"]
 
 
-class DiscordConfig(_ConfigModel):
-    """The daemon's human channel: a gateway bot posting each run's
-    chronology (agent messages, tool lines, issue/PR links) into a thread
-    under a control channel, and relaying replies typed in that thread to
-    the running agent as steering. Unset ``channel_id`` disables it. The bot
-    token comes from ``DISCORD_BOT_TOKEN`` in the environment / .env, never
-    from this file. Anyone who can post in the channel can steer — restrict
-    the channel accordingly."""
+ChatBackend = Literal["discord", "slack"]
+CHAT_BACKENDS: tuple[ChatBackend, ...] = ("discord", "slack")
 
-    channel_id: int | None = None
+
+class ChatBridgeConfig(_ConfigModel):
+    """The knobs every chat backend shares — how the daemon's human channel
+    renders a run, whatever service carries it. ``[discord]`` and
+    ``[slack]`` extend this with their own ``channel_id``; the bridge that
+    serves them (``sbxloop.daemon.chat.ChatBridge``) reads only these fields
+    plus ``channel_id`` and ``enabled``."""
+
     command_prefix: str = "!sbx"
     thread_per_run: bool = True
     # quiet: lifecycle + links + chat; normal: plus agent messages, with each
     # burst of tool calls digested into one line edited in place (#235:
     # streaming every call drowned the channel); verbose: every call.
     chronology_level: ChronologyLevel = "normal"
-    # Discord's hard cap is 2000; leave headroom for wrappers.
+    # Discord's hard cap is 2000 and Slack's block text cap is 3000; the
+    # renderer never exceeds 2000 either way, so one ceiling serves both.
     max_message_chars: int = Field(default=1900, ge=200, le=2000)
-    # Rich output: embed cards for the run headline, finished report and
-    # `!sbx status`; a per-run status message edited in place as tasks
-    # progress; at the verbose level, consecutive tool calls batched into
-    # one code block of at most tool_batch_lines.
+    # Rich output: embed cards (Discord) / coloured attachments (Slack) for
+    # the run headline, finished report and `!sbx status`; a per-run status
+    # message edited in place as tasks progress; at the verbose level,
+    # consecutive tool calls batched into one code block of at most
+    # tool_batch_lines.
     embeds: bool = True
     status_line: bool = True
     tool_batch_lines: int = Field(default=8, ge=1, le=40)
@@ -812,21 +815,100 @@ class DiscordConfig(_ConfigModel):
     # tail lines for a success (0 = none) and head+tail lines for a failure,
     # which gets the larger budget because that is what a watcher needs to
     # act. Both are upper bounds — the renderer additionally caps the body
-    # and clamps the message to Discord's 2000-character limit.
+    # and clamps the message to the 2000-character limit.
     tool_output_lines: int = Field(default=0, ge=0, le=20)
     tool_fail_output_lines: int = Field(default=20, ge=0, le=60)
+
+    @property
+    def enabled(self) -> bool:  # pragma: no cover - overridden
+        return False
+
+    @property
+    def channel_ref(self) -> str:
+        """The control channel id as text, for logs and the store."""
+        return ""
+
+
+class DiscordConfig(ChatBridgeConfig):
+    """The daemon's human channel on Discord: a gateway bot posting each
+    run's chronology (agent messages, tool lines, issue/PR links) into a
+    thread under a control channel, and relaying replies typed in that
+    thread to the running agent as steering. Unset ``channel_id`` disables
+    it. The bot token comes from ``DISCORD_BOT_TOKEN`` in the environment /
+    .env, never from this file. Anyone who can post in the channel can
+    steer — restrict the channel accordingly."""
+
+    channel_id: int | None = None
 
     @property
     def enabled(self) -> bool:
         return self.channel_id is not None
 
+    @property
+    def channel_ref(self) -> str:
+        return "" if self.channel_id is None else str(self.channel_id)
+
+
+# A conversation id: C… (a channel, public or private) or the legacy G…
+# (private group). Not U… (a user), D… (a DM) or a #name.
+_SLACK_CHANNEL_RE = re.compile(r"^[CG][A-Z0-9]{4,}$")
+
+
+class SlackConfig(ChatBridgeConfig):
+    """The same human channel on Slack: a Socket Mode app posting each run's
+    headline in a control channel and its chronology in the thread under
+    it; @mentioning the app in that thread steers the run. Unset
+    ``channel_id`` disables it. Both tokens come from the environment /
+    .env — ``SLACK_BOT_TOKEN`` (``xoxb-…``, the Web API) and
+    ``SLACK_APP_TOKEN`` (``xapp-…``, the Socket Mode connection) — never
+    from this file."""
+
+    # The channel *id* (``C0123ABCDEF``, from the channel's details pane),
+    # not its ``#name``: names are renamed, ids are not, and the store keys
+    # threads by it.
+    channel_id: str | None = None
+
+    @field_validator("channel_id", mode="before")
+    @classmethod
+    def _channel_id_is_an_id(cls, value: object) -> object:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if not _SLACK_CHANNEL_RE.match(text):
+            raise ValueError(
+                f"[slack] channel_id must be the channel's id — C… (or legacy G…) as shown "
+                f"in the channel details pane, not a user id, a DM or a #name: got {text!r}"
+            )
+        return text
+
+    @property
+    def enabled(self) -> bool:
+        return self.channel_id is not None
+
+    @property
+    def channel_ref(self) -> str:
+        return self.channel_id or ""
+
+
+class ChatConfig(_ConfigModel):
+    """Which service carries the daemon's human channel. ``backend`` names
+    the ``[discord]`` or ``[slack]`` section to use; when it is unset the
+    one section with a ``channel_id`` is used, and configuring both without
+    choosing is an error. Neither configured means the daemon runs headless
+    (no chronology, no steering, ``sbxloop daemon ctl`` only)."""
+
+    backend: ChatBackend | None = None
+
 
 class ConciergeConfig(_ConfigModel):
     """The control channel's agent: an LLM session that answers @mentions
-    in the Discord control channel, operates the daemon (every ``!sbx``
+    in the chat control channel, operates the daemon (every ``!sbx``
     verb), enqueues new work and explains runs, PRs and diffs. It runs in
     a long-lived agent-role sandbox and reaches the daemon only through
-    host tools. Effective only when ``[discord]`` is enabled; needs
+    host tools. Effective only when a chat backend (``[discord]`` or
+    ``[slack]``) is enabled; needs
     ``COPILOT_GITHUB_TOKEN`` on the daemon host like any agent session.
     It acts with the same authority as ``!sbx`` — anyone who can mention
     the bot can drive the daemon; restrict the channel accordingly."""
@@ -837,7 +919,7 @@ class ConciergeConfig(_ConfigModel):
     # One message's wall-clock budget (the whole tool loop).
     timeout_s: float = Field(default=180.0, ge=30, le=900)
     # Replies longer than this are clipped before being split into
-    # Discord messages.
+    # chat messages.
     max_reply_chars: int = Field(default=4000, ge=500, le=8000)
     # What one host tool may hand back to the model.
     max_tool_result_chars: int = Field(default=6000, ge=1000, le=20000)
@@ -922,7 +1004,9 @@ class Config(_ConfigModel):
     limits: Limits = Field(default_factory=Limits)
     landing: LandingConfig = Field(default_factory=LandingConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
+    chat: ChatConfig = Field(default_factory=ChatConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
 
     @field_validator("state_dir", mode="after")
@@ -931,6 +1015,49 @@ class Config(_ConfigModel):
         # `state_dir = "~/.sbxloop"` in TOML must mean the home directory,
         # not a literal "~" directory under the project.
         return value.expanduser()
+
+    @model_validator(mode="after")
+    def _chat_backend_is_consistent(self) -> Config:
+        """A named backend must have its section configured, and two
+        configured sections need a name — both are the operator's mistake
+        to fix, reported before the daemon starts rather than as a silently
+        headless loop."""
+        explicit = self.chat.backend
+        if explicit is not None:
+            section = self.chat_section(explicit)
+            if not section.enabled:
+                raise ValueError(
+                    f'[chat] backend = "{explicit}" but [{explicit}] channel_id is not set'
+                )
+        elif self.discord.enabled and self.slack.enabled:
+            raise ValueError(
+                "both [discord] and [slack] have a channel_id; pick one with "
+                '[chat] backend = "discord" | "slack"'
+            )
+        return self
+
+    def chat_section(self, backend: ChatBackend) -> DiscordConfig | SlackConfig:
+        return self.discord if backend == "discord" else self.slack
+
+    @property
+    def chat_backend(self) -> ChatBackend | None:
+        """The chat service carrying the daemon's human channel: the explicit
+        ``[chat] backend``, else the one section with a ``channel_id``, else
+        None (headless). Computed on read so a ``model_copy`` that sets a
+        channel (the CLI's ``--discord-channel`` / ``--slack-channel``)
+        is honoured without re-validating."""
+        if self.chat.backend is not None:
+            return self.chat.backend
+        for backend in CHAT_BACKENDS:
+            if self.chat_section(backend).enabled:
+                return backend
+        return None
+
+    @property
+    def chat_settings(self) -> DiscordConfig | SlackConfig | None:
+        """The active backend's section, or None when the daemon is headless."""
+        backend = self.chat_backend
+        return None if backend is None else self.chat_section(backend)
 
     def workspace_for_repo(self, repo: str | None) -> Path | None:
         """The host checkout runs for ``repo`` clone and refresh from.

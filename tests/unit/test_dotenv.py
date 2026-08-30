@@ -66,7 +66,14 @@ class TestEnvExample:
         assert set(values) == {"COPILOT_GITHUB_TOKEN", "GH_TOKEN"}
         # The optional credentials are documented, commented out.
         text = (REPO_ROOT / ".env.example").read_text()
-        for name in ("GITHUB_TOKEN", "DISCORD_BOT_TOKEN", "GH_TOKEN_TWO", "token_env"):
+        for name in (
+            "GITHUB_TOKEN",
+            "DISCORD_BOT_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+            "GH_TOKEN_TWO",
+            "token_env",
+        ):
             assert name in text
         assert all(not v for v in values.values())  # placeholders ship empty
 
@@ -77,11 +84,18 @@ class TestEnvExample:
 
     def test_example_names_every_credential_env_var_the_code_reads(self) -> None:
         from sbxloop.daemon.discord import TOKEN_ENV as DISCORD_TOKEN_ENV
+        from sbxloop.daemon.slack import APP_TOKEN_ENV, BOT_TOKEN_ENV
         from sbxloop.sbx.provision import GH_TOKEN_ENVS
         from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
 
         text = (REPO_ROOT / ".env.example").read_text()
-        for name in (COPILOT_TOKEN_ENV, DISCORD_TOKEN_ENV, *GH_TOKEN_ENVS):
+        for name in (
+            COPILOT_TOKEN_ENV,
+            DISCORD_TOKEN_ENV,
+            BOT_TOKEN_ENV,
+            APP_TOKEN_ENV,
+            *GH_TOKEN_ENVS,
+        ):
             assert name in text, f"{name} missing from .env.example"
 
     def test_example_commented_settings_are_valid_config(self, tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-"""DaemonStore: work items, the run ledger, requesters, Discord threads.
+"""DaemonStore: work items, the run ledger, requesters, chat threads.
 
 Lives in the same ``state.db`` as the engine's :class:`StateStore` (WAL
 mode allows the second connection) so ``sbxloop status``/``logs`` and the
@@ -130,28 +130,46 @@ CREATE INDEX IF NOT EXISTS idx_daemon_run_watches_run ON daemon_run_watches(run_
 -- Who asked for an issue through the concierge, keyed by the issue number
 -- it filed, so the work item that discovery later builds from that issue
 -- carries the requester — recorded here rather than in the public issue
--- body, which would expose a Discord user id.
+-- body, which would expose a chat user id.
 CREATE TABLE IF NOT EXISTS daemon_requesters {_REQUESTERS_BODY};
 
-CREATE TABLE IF NOT EXISTS daemon_discord_threads (
+-- Where each run lives on the chat backend (Discord or Slack), so a
+-- restart re-attaches. Ids are TEXT: Discord's are integer snowflakes,
+-- Slack's are message timestamps ("1724968573.123456") that INTEGER
+-- affinity would silently turn into a rounded REAL.
+CREATE TABLE IF NOT EXISTS daemon_chat_threads (
     run_id      TEXT PRIMARY KEY,
-    channel_id  INTEGER NOT NULL,
-    thread_id   INTEGER NOT NULL,
-    headline_id INTEGER,
-    status_id   INTEGER
+    backend     TEXT NOT NULL DEFAULT 'discord',
+    channel_id  TEXT NOT NULL,
+    thread_id   TEXT NOT NULL,
+    headline_id TEXT,
+    status_id   TEXT
 );
 
--- run_for_thread() runs per inbound Discord message in a non-control
+-- run_for_thread() runs per inbound chat message in a non-control
 -- channel; without this it scans a row per run the daemon has ever done.
-CREATE INDEX IF NOT EXISTS idx_discord_threads_thread
-    ON daemon_discord_threads(thread_id);
+CREATE INDEX IF NOT EXISTS idx_chat_threads_thread
+    ON daemon_chat_threads(thread_id);
 """
 
 TERMINAL_ITEM_STATES: frozenset[str] = frozenset({"done", "failed", "blocked", "cancelled"})
 
 
+class ChatThread(NamedTuple):
+    """Where a run lives on the chat backend (persisted so a restart
+    re-attaches). Ids are the backend's own text form: a Discord snowflake
+    as decimal digits, a Slack message ``ts``."""
+
+    channel_id: str
+    thread_id: str
+    headline_id: str | None
+    status_id: str | None
+    backend: str = "discord"
+
+
 class DiscordThread(NamedTuple):
-    """Where a run lives on Discord (persisted so a restart re-attaches)."""
+    """The Discord view of a :class:`ChatThread`: the same row with its
+    snowflakes as integers, which is what discord.py's lookups take."""
 
     channel_id: int
     thread_id: int
@@ -293,6 +311,7 @@ class DaemonStore:
         self._conn.executescript(_SCHEMA)
         self._migrate_repo_columns()
         self._migrate_added_columns()
+        self._migrate_discord_threads()
         self._conn.execute(
             "INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('schema_version', ?)",
             (SCHEMA_VERSION,),
@@ -377,6 +396,31 @@ class DaemonStore:
             self._conn.execute(ddl)
             self._conn.commit()
             log.info("store.migrated", table=table, added=column)
+
+    def _migrate_discord_threads(self) -> None:
+        """Fold a pre-Slack ``daemon_discord_threads`` table into
+        ``daemon_chat_threads``: same rows, ids cast to text, backend
+        ``discord``; the old table is dropped so this runs once. A row that
+        already exists in the new table (a store that was migrated and then
+        reopened by an older daemon which recreated the old table) is left
+        alone."""
+        if "daemon_discord_threads" not in _tables(self._conn):
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            moved = self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_chat_threads "
+                "(run_id, backend, channel_id, thread_id, headline_id, status_id) "
+                "SELECT run_id, 'discord', CAST(channel_id AS TEXT), CAST(thread_id AS TEXT), "
+                "CAST(headline_id AS TEXT), CAST(status_id AS TEXT) "
+                "FROM daemon_discord_threads"
+            ).rowcount
+            self._conn.execute("DROP TABLE daemon_discord_threads")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        log.info("store.migrated", table="daemon_chat_threads", moved=moved)
 
     def backfill_repo(self, repo: str | None) -> int:
         """Give repo-less rows the daemon's sole configured repository.
@@ -1218,46 +1262,84 @@ class DaemonStore:
             )
             self._conn.commit()
 
-    # -- discord threads -------------------------------------------------------
+    # -- chat threads ----------------------------------------------------------
 
-    def discord_thread(self, run_id: str) -> DiscordThread | None:
+    def chat_thread(self, run_id: str) -> ChatThread | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT channel_id, thread_id, headline_id, status_id FROM daemon_discord_threads "
-                "WHERE run_id = ?",
+                "SELECT backend, channel_id, thread_id, headline_id, status_id "
+                "FROM daemon_chat_threads WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
             if row is None:
                 return None
-            return DiscordThread(
-                int(row["channel_id"]), int(row["thread_id"]), row["headline_id"], row["status_id"]
+            return ChatThread(
+                str(row["channel_id"]),
+                str(row["thread_id"]),
+                _text_or_none(row["headline_id"]),
+                _text_or_none(row["status_id"]),
+                str(row["backend"] or "discord"),
             )
 
-    def set_discord_status_id(self, run_id: str, status_id: int | None) -> None:
+    def set_chat_status_id(self, run_id: str, status_id: str | None) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE daemon_discord_threads SET status_id = ? WHERE run_id = ?",
-                (status_id, run_id),
+                "UPDATE daemon_chat_threads SET status_id = ? WHERE run_id = ?",
+                (_text_or_none(status_id), run_id),
             )
             self._conn.commit()
 
-    def run_for_thread(self, thread_id: int) -> str | None:
+    def run_for_thread(self, thread_id: str | int) -> str | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT run_id FROM daemon_discord_threads WHERE thread_id = ?", (thread_id,)
+                "SELECT run_id FROM daemon_chat_threads WHERE thread_id = ?", (str(thread_id),)
             ).fetchone()
             return str(row["run_id"]) if row else None
+
+    def record_chat_thread(
+        self,
+        run_id: str,
+        channel_id: str,
+        thread_id: str,
+        headline_id: str | None,
+        *,
+        backend: str = "discord",
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO daemon_chat_threads "
+                "(run_id, backend, channel_id, thread_id, headline_id) VALUES (?, ?, ?, ?, ?)",
+                (run_id, backend, str(channel_id), str(thread_id), _text_or_none(headline_id)),
+            )
+            self._conn.commit()
+
+    # The Discord view of the same rows: snowflakes as integers. What the
+    # Discord bridge's tests and the concierge's Discord fixtures speak.
+
+    def discord_thread(self, run_id: str) -> DiscordThread | None:
+        known = self.chat_thread(run_id)
+        if known is None:
+            return None
+        return DiscordThread(
+            int(known.channel_id),
+            int(known.thread_id),
+            _int_or_none(known.headline_id),
+            _int_or_none(known.status_id),
+        )
+
+    def set_discord_status_id(self, run_id: str, status_id: int | None) -> None:
+        self.set_chat_status_id(run_id, None if status_id is None else str(status_id))
 
     def record_discord_thread(
         self, run_id: str, channel_id: int, thread_id: int, headline_id: int | None
     ) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO daemon_discord_threads "
-                "(run_id, channel_id, thread_id, headline_id) VALUES (?, ?, ?, ?)",
-                (run_id, channel_id, thread_id, headline_id),
-            )
-            self._conn.commit()
+        self.record_chat_thread(
+            run_id,
+            str(channel_id),
+            str(thread_id),
+            None if headline_id is None else str(headline_id),
+            backend="discord",
+        )
 
     # -- run watches -----------------------------------------------------------
 
@@ -1314,3 +1396,11 @@ class DaemonStore:
         with self._lock:
             self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
             self._conn.commit()
+
+
+def _text_or_none(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _int_or_none(value: str | None) -> int | None:
+    return None if value is None else int(value)

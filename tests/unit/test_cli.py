@@ -548,7 +548,7 @@ class TestDaemonCommand:
             "max_review_rounds=3",
             "max_ci_rounds=",
             "merge_method=",
-            "discord=off",
+            "chat=off",
             "log_level=INFO",
             "state_dir_reason=",
         ):
@@ -814,15 +814,15 @@ class TestDoctor:
 
         (workdir / "sbxloop.toml").write_text("[discord]\nchannel_id = 42\n")
         env = {"GH_TOKEN": "tok", "DISCORD_BOT_TOKEN": "tok"}
-        (row,) = [c for c in collect_checks(env) if c.name == "discord concierge"]
+        (row,) = [c for c in collect_checks(env) if c.name == "chat concierge"]
         assert not row.ok and not row.hard and "COPILOT_GITHUB_TOKEN not set" in row.detail
         env["COPILOT_GITHUB_TOKEN"] = "tok"
-        (row,) = [c for c in collect_checks(env) if c.name == "discord concierge"]
+        (row,) = [c for c in collect_checks(env) if c.name == "chat concierge"]
         assert row.ok and "180s per message" in row.detail
         (workdir / "sbxloop.toml").write_text(
             "[discord]\nchannel_id = 42\n[concierge]\nenabled = false\n"
         )
-        assert not [c for c in collect_checks(env) if c.name == "discord concierge"]
+        assert not [c for c in collect_checks(env) if c.name == "chat concierge"]
 
     def test_doctor_hints_at_legacy_relative_state_dir(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
