@@ -38,7 +38,7 @@ from pydantic import BaseModel
 from sbxloop.config import Config
 from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
 from sbxloop.engine.prompts import bullet_list, render
-from sbxloop.engine.review import RefutedGuard, ReviewVerdict
+from sbxloop.engine.review import ReviewGuard, ReviewVerdict
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
@@ -605,7 +605,7 @@ class PhaseRunner:
 
         ``history`` is the rendered earlier rounds and ``refuted`` the
         anchors of findings the fixer refuted in them — the reviewer is
-        told about both, and :class:`RefutedGuard` sends back, once, a
+        told about both, and :class:`ReviewGuard` sends back, once, a
         verdict that only re-raises refuted findings.
         """
         limit = self.config.landing.review_diff_max_chars
@@ -639,7 +639,7 @@ class PhaseRunner:
                 "project_gate": gate_rule(self.project_gate()),
             },
             permission_mode="read_only",
-            check=RefutedGuard(refuted).check,
+            check=ReviewGuard(refuted).check,
         )
         return verdict
 

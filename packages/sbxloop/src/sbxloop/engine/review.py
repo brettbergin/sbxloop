@@ -12,11 +12,20 @@ engine never reads it back from GitHub: **our verdict is authoritative**.
 Findings carry forward. Every round sees the earlier rounds' findings and
 what the fixer said about each — ``addressed`` or ``refuted: <reason>`` — and
 is told not to re-raise a refuted finding unless it can say specifically why
-the refutation is wrong. :class:`RefutedGuard` backs that rule mechanically:
+the refutation is wrong. :class:`ReviewGuard` backs that rule mechanically:
 a verdict whose every finding sits on a refuted anchor is sent back once
 with the history quoted. Together with the round budgets that is what stops
 a run arguing with itself; the old loop had no such memory and re-filed the
 same findings run after run.
+
+Findings carry their reproduction (#521). The reviewer reproduces a defect
+against the tree before filing it; that repro used to reach the fixer only
+as prose, and the fixer wrote tests for the *shape the finding named* — so
+rounds converged one adjacent case at a time (run rfxja288b: four real
+findings on one migration, one per round, the budget spent one line short).
+A blocking/major finding now carries a structured ``repro``, the fix brief
+makes it a regression test that must fail first, asks for the neighbourhood
+the same path sees, and shows the fixer the earlier rounds too.
 """
 
 from __future__ import annotations
@@ -56,12 +65,19 @@ class _Model(BaseModel):
 
 
 class ReviewFinding(_Model):
-    """One concrete problem the reviewer found, anchored to the diff."""
+    """One concrete problem the reviewer found, anchored to the diff.
+
+    ``repro`` is the reviewer's reproduction — the minimal setup, what
+    happens, what should happen — in a form the fixer can turn into a test
+    that fails on the current tree (#521). Asked for on every blocking or
+    major finding; a nit needs none.
+    """
 
     path: str
     line: int | None = Field(default=None, ge=1)
     body: str
     severity: Severity = "major"
+    repro: str = ""
 
     @property
     def anchor(self) -> str:
@@ -72,16 +88,28 @@ class ReviewFinding(_Model):
     def blocking(self) -> bool:
         return self.severity in BLOCKING_SEVERITIES
 
-    def render(self) -> str:
+    @property
+    def needs_repro(self) -> bool:
+        """A blocking/major finding filed without a reproduction."""
+        return self.blocking and not self.repro.strip()
+
+    def render(self, *, repro: bool = True) -> str:
         where = f"{self.path}:{self.line}" if self.line else self.path
-        return f"- `{where}` [{self.severity}] {self.body}"
+        text = f"- `{where}` [{self.severity}] {self.body}"
+        if repro and self.repro.strip():
+            steps = " ".join(self.repro.split())
+            text += f"\n  Repro: {steps}"
+        return text
 
     def comment(self) -> ReviewComment | None:
         """The inline comment this finding posts, or None when it has no
         line to anchor to (it is then listed in the review body)."""
         if self.line is None:
             return None
-        return ReviewComment(path=self.path, line=self.line, body=f"[{self.severity}] {self.body}")
+        body = f"[{self.severity}] {self.body}"
+        if self.repro.strip():
+            body += f"\n\n**Repro:** {' '.join(self.repro.split())}"
+        return ReviewComment(path=self.path, line=self.line, body=body)
 
 
 CarriedStatus = Literal["confirmed_fixed", "still_open"]
@@ -294,10 +322,31 @@ ReconcileStatus = Literal["addressed", "refuted", "unanswered"]
 
 
 class Reconciliation(NamedTuple):
-    """What the fixer said about one finding: its status and its own words."""
+    """What the fixer said about one finding: its status, its own words,
+    and — for an addressed finding — the regression test it named (#521)."""
 
     status: ReconcileStatus
     note: str
+    test: str = ""
+
+    @property
+    def text(self) -> str:
+        """The note with the named test appended — what a reply says."""
+        if not self.test:
+            return self.note
+        return f"{self.note} (test: `{self.test}`)" if self.note else f"test: `{self.test}`"
+
+
+# `addressed: <anchor> — what changed; test: tests/unit/test_x.py::test_y`
+_TEST_TAIL = re.compile(r"[;,(]?\s*\btest(?:s)?\s*:\s*(?P<test>[^;)]+)\)?\s*$", re.IGNORECASE)
+
+
+def split_test(note: str) -> tuple[str, str]:
+    """The ``test: <id>`` tail of a fixer's note, separated from the note."""
+    match = _TEST_TAIL.search(note)
+    if match is None:
+        return note.strip(" ."), ""
+    return note[: match.start()].strip(" .;,("), match.group("test").strip(" `'\".")
 
 
 def _note_after(line: str, *, path: str, anchor: str) -> str:
@@ -379,10 +428,8 @@ def reconcile_anchor(report: str, anchor: str) -> Reconciliation:
     for status, lines in (("refuted", refuted), ("addressed", addressed)):
         hit = next((line for line in lines if _names_path(line, path, lineno)), None)
         if hit is not None:
-            return Reconciliation(
-                status,  # type: ignore[arg-type]
-                _note_after(hit, path=path, anchor=anchor),
-            )
+            note, test = split_test(_note_after(hit, path=path, anchor=anchor))
+            return Reconciliation(status, note, test)  # type: ignore[arg-type]
     return Reconciliation("unanswered", "")
 
 
@@ -404,10 +451,8 @@ def reconcile(round: ReviewRound) -> dict[str, Reconciliation]:
         for status, lines in (("refuted", refuted_lines), ("addressed", addressed_lines)):
             hit = next((line for line in lines if _names(line, f)), None)
             if hit is not None:
-                out[f.anchor] = Reconciliation(
-                    status,  # type: ignore[arg-type]
-                    _note_after(hit, path=f.path, anchor=f.anchor),
-                )
+                note, test = split_test(_note_after(hit, path=f.path, anchor=f.anchor))
+                out[f.anchor] = Reconciliation(status, note, test)  # type: ignore[arg-type]
                 break
         else:
             out[f.anchor] = Reconciliation("unanswered", "")
@@ -452,14 +497,44 @@ def render_review_history(rounds: Sequence[ReviewRound]) -> str:
     return "\n\n".join(blocks)
 
 
-class RefutedGuard:
-    """Reject, once, a ``request_changes`` built entirely on refuted findings.
+def render_fix_history(rounds: Sequence[ReviewRound]) -> str:
+    """The earlier rounds as the *next fixer* should see them (#521).
 
-    Used as the ``check`` of the review phase's JSON acceptance. The first
-    such verdict goes back to the reviewer with the rule quoted; a second
-    one is accepted — the reviewer has now been told and insists, and a run
-    that fails on a disagreement about refutations would be worse than one
-    that spends a fix round on it.
+    A fixer is a fresh session with no memory of why the previous fixer
+    chose what it chose; without this, round 3's fixer re-derives — or
+    contradicts — round 2's decision. Per round: the findings, then each
+    one's fate in the fixer's own words (and the regression test it
+    named), which is the reconciliation the engine already computes, not
+    the raw report.
+    """
+    answered = [r for r in rounds if r.response.strip()]
+    if not answered:
+        return ""
+    blocks: list[str] = []
+    for entry in answered:
+        items = reconcile(entry)
+        lines: list[str] = []
+        for finding in entry.verdict.findings:
+            item = items.get(finding.anchor, Reconciliation("unanswered", ""))
+            fate = f"{item.status} — {item.text}" if item.text else str(item.status)
+            lines.append(f"{finding.render(repro=False)}\n  → {fate}")
+        blocks.append(
+            f"### Round {entry.round} — {entry.verdict.verdict}\n\n"
+            + ("\n".join(lines) or "- (no findings)")
+        )
+    return "\n\n".join(blocks)
+
+
+class ReviewGuard:
+    """Send a verdict back to the reviewer, once, for two shapes of defect.
+
+    Used as the ``check`` of the review phase's JSON acceptance. A
+    ``request_changes`` built entirely on refuted findings, or a blocking /
+    major finding filed without its ``repro`` (#521), goes back with the
+    rule quoted; the next verdict is accepted whatever it says — the
+    reviewer has now been told and insists, and a run that fails on that
+    disagreement would be worse than one that spends a fix round on it.
+    One trip in total: the acceptance path retries exactly once.
     """
 
     def __init__(self, refuted: set[str]) -> None:
@@ -467,10 +542,15 @@ class RefutedGuard:
         self.tripped = False
 
     def check(self, verdict: ReviewVerdict) -> None:
-        if verdict.verdict != "request_changes" or not self.refuted or self.tripped:
+        if self.tripped:
             return
         blocking = verdict.blocking
-        if blocking and all(f.anchor in self.refuted for f in blocking):
+        if (
+            verdict.verdict == "request_changes"
+            and self.refuted
+            and blocking
+            and all(f.anchor in self.refuted for f in blocking)
+        ):
             self.tripped = True
             anchors = ", ".join(sorted({f.anchor for f in blocking}))
             raise ValueError(
@@ -480,6 +560,21 @@ class RefutedGuard:
                 "that reason in the finding's body — otherwise drop it, and approve "
                 "if nothing else blocks."
             )
+        missing = [f.anchor for f in verdict.findings if f.needs_repro]
+        if missing:
+            self.tripped = True
+            raise ValueError(
+                "these blocking/major findings carry no `repro` "
+                f"({', '.join(missing)}). You reproduced each one before filing it: "
+                "put that reproduction in the finding's `repro` — the minimal setup, "
+                "what happens, what should happen — concrete enough to become a test "
+                "that fails on this tree. A finding you cannot reproduce is `minor` "
+                "at most."
+            )
+
+
+# The old name, kept for callers that predate the repro rule.
+RefutedGuard = ReviewGuard
 
 
 def _pr_label(pr_number: int | None) -> str:
@@ -496,6 +591,7 @@ def fix_brief(
     failed_checks: Sequence[FailedCheck] = (),
     objections: str = "",
     conflicts: Sequence[str] = (),
+    history: str = "",
 ) -> str:
     """What one fix round is for, concretely.
 
@@ -505,6 +601,14 @@ def fix_brief(
     fixer needs is quoted here — its sandbox holds no GitHub credential, so
     telling it to read the PR itself hands it a tool that cannot work.
     ``pr_number`` is None before the first delivery (a red gate).
+
+    Each finding's ``repro`` becomes a required regression test — written
+    first, failing on the current tree, then made to pass — and the brief
+    asks for the neighbourhood: the other inputs the same code path sees.
+    Both target the field pattern of fix rounds that settle exactly the
+    case the finding named and leave the adjacent one for the next round
+    (#521). ``history`` is the earlier rounds as :func:`render_fix_history`
+    renders them, so this fixer knows what its predecessors chose and why.
     """
     what = _pr_label(pr_number)
     parts = [
@@ -513,11 +617,36 @@ def fix_brief(
         "Change only what is needed to clear the problems below — do not "
         "restructure or redo the existing work, and do not start over.",
     ]
+    if history.strip():
+        parts.append(
+            "Earlier fix rounds on this pull request, with each finding's fate in "
+            "the previous fixer's words — build on those decisions rather than "
+            "re-deriving or silently reversing them:\n\n" + history.strip()
+        )
     if findings:
+        with_repro = [f for f in findings if f.repro.strip()]
         parts.append(
             "The review's findings:\n" + "\n".join(f.render() for f in findings) + "\n\n"
             "Address each one. A finding you believe is wrong may be refuted, "
             "but only with a specific reason."
+        )
+        if with_repro:
+            parts.append(
+                "Each finding's **Repro** is how the reviewer reproduced it against "
+                "this tree. Reproduce it first, as a test that fails on the current "
+                "tree, then make it pass — the test is the deliverable that proves "
+                "the finding is closed, and it stays in the suite. Build the test's "
+                "setup the way the repro describes it (a raw row, a stored value, a "
+                "malformed input), not through the code path under test: a test "
+                "that constructs its fixture with the very function being fixed "
+                "cannot see the bug."
+            )
+        parts.append(
+            "Before you finish, list the other inputs this same code path sees — "
+            "the row states, id forms, config shapes or error paths adjacent to "
+            "the one the finding names — and cover the ones your change affects. "
+            "Rounds are spent one finding at a time when a fix settles exactly the "
+            "named case and leaves its neighbour for the next review."
         )
     if failed_checks:
         blocks = []
@@ -545,7 +674,8 @@ def fix_brief(
         )
     parts.append(
         "End your summary with one line per finding or objection above, in the form "
-        "`addressed: <path:line> — what changed` or `refuted: <path:line> — why it "
+        "`addressed: <path:line> — what changed; test: <the regression test you added, "
+        "e.g. tests/test_x.py::test_y>` or `refuted: <path:line> — why it "
         "is not a problem`. The next review reads that list; a finding you refuted "
         "with a stated reason will not be raised again without a rebuttal."
     )

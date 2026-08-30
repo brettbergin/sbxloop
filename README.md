@@ -134,7 +134,10 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   round sees the earlier rounds' findings and the fixer's per-finding
   `addressed` / `refuted: <why>` list, and the next review may not re-raise
   a refuted finding without a rebuttal — the memory that stops a run arguing
-  with itself.
+  with itself. Every blocking/major finding carries the reviewer's `repro`;
+  the fix brief makes it a regression test that fails first, asks for the
+  adjacent cases the same code path sees, and shows the fixer what earlier
+  rounds decided — so rounds stop converging one case at a time.
 - **CI** — the delivered head's check runs are polled; red fetches the
   failing jobs' logs into the next fix brief. "No check runs yet" only
   counts as "no CI" once it has persisted for `ci_settle_s`.

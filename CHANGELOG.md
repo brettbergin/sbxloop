@@ -8,6 +8,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Fix rounds no longer converge one adjacent case at a time** (#521). Run
+  `rfxja288b` spent its whole review budget on one migration, one real
+  finding per round, each in the previous round's new lines, because the
+  reviewer's reproduction reached the fixer only as prose and the fixer
+  tested the shape the finding named. A `ReviewFinding` now carries the
+  reviewer's `repro` (required on blocking/major findings — `ReviewGuard`,
+  formerly `RefutedGuard`, sends back once a verdict missing one; the
+  prompt asks the reviewer to reproduce before filing and to name the
+  neighbours). The fix brief renders each repro as a regression test that
+  must fail on the current tree first — built the way the repro describes,
+  not through the code path under test — asks the fixer to list the other
+  inputs the same path sees, and shows the earlier rounds with each
+  finding's fate in the previous fixer's words (`render_fix_history`). The
+  fixer's `addressed:` line names the test it added (`; test: <id>`);
+  `reconcile()` records it (`Reconciliation.test`) and the thread reply and
+  the next fixer's history carry it. Repros also appear in the posted
+  inline comments and review body.
+
 - **A run that exhausts its fix-round budget resumes its own PR instead of
   starting over** (#523). Exhausting `max_review_rounds` / `max_ci_rounds`
   used to be an ordinary failed attempt: the item's retry was a fresh

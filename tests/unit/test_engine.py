@@ -100,6 +100,9 @@ FINDING = {
     "line": 1,
     "body": "hello.txt must greet with hello, not hi",
     "severity": "major",
+    # A blocking/major finding without a repro is sent back once (#521);
+    # the scripted reviewer carries one so the script consumes as written.
+    "repro": "cat hello.txt prints 'hi'; expected 'hello'",
 }
 
 
@@ -1429,6 +1432,7 @@ class TestPipeline:
                 "anchor": "hello.txt:1",
                 "status": "refuted",
                 "note": "the greeting is specified as hi",
+                "test": "",
             }
         ]
         t1 = [

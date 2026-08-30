@@ -121,7 +121,7 @@ def body_comment(
     )
     lines.append("")
     for anchor, item in entries:
-        note = " ".join(item.note.split()).strip()
+        note = " ".join(item.text.split()).strip()
         suffix = f" — {note}" if note else ""
         lines.append(f"- `{anchor}` — **{item.status}**{suffix}")
     lines.append("")
@@ -225,7 +225,7 @@ def reconcile_round(
             if record is not None:
                 record(anchor=rec.anchor, status=item.status, resolved=thread.is_resolved)
             continue
-        body = reply_body(item.status, item.note, head_sha=head_sha, run_id=run_id, round=round)
+        body = reply_body(item.status, item.text, head_sha=head_sha, run_id=run_id, round=round)
         try:
             ops.pr_comment_reply(repo, number, comment_id, body)
         except GithubOpsError:
@@ -454,7 +454,7 @@ def human_reply_body(
     claiming a fix — a fix round that did not speak to an objection is a
     fact the reviewer needs, not one to paper over.
     """
-    note = " ".join(item.note.split()).strip()
+    note = " ".join(item.text.split()).strip()
     if item.status == "addressed":
         where = f" in {head_sha[:12]}" if head_sha else ""
         text = f"**addressed{where}**" + (f": {note}" if note else ".")
@@ -620,7 +620,7 @@ def human_body_comment(
     lines.append("Answering the changes requested on this pull request:")
     lines.append("")
     for anchor, item in entries:
-        note = " ".join(item.note.split()).strip()
+        note = " ".join(item.text.split()).strip()
         suffix = f" — {note}" if note else ""
         lines.append(f"- `{anchor}` — **{item.status}**{suffix}")
     lines.append("")
