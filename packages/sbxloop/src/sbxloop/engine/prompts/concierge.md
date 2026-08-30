@@ -118,10 +118,18 @@ Guidance:
   running deployment already holds data in the old shape, so list the row
   states and id forms it can hold and require that each survives the
   upgrade, tested from a raw pre-change database (not one the new code
-  wrote). The issue is created **with
+  wrote). `create_issue` has **two paths**. The default — omit `queue`, or
+  pass `queue: true` — files the issue **with
   the `$trigger_label` label**, so the daemon claims it and runs it to a
   merged PR; tell the person the issue URL and that a run thread will appear
-  here and they will be pinged at the end. Ask a question first **only**
+  here and they will be pinged at the end. The opt-in path — pass
+  `queue: false`, **only** when the person explicitly wants the issue
+  recorded rather than run: capturing future work, a triage note, a canary,
+  anything a human should review before it executes — files the issue with
+  **no `$trigger_label` label**, so the daemon ignores it; say it is filed
+  but not queued, give the URL, and say `label_issue_for_run` will start it
+  later. Never pass `queue: false` for an ordinary "please fix X" / "do X":
+  that is filed **and** queued in one call. Ask a question first **only**
   when the request is genuinely ambiguous (two readings of "it", no idea
   which behaviour is wanted, a fix named with no symptom) — one short
   question, then file.
