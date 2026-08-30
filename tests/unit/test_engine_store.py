@@ -10,6 +10,7 @@ from sbxloop.engine.model import TaskRecord, TaskSpec
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
+from tests.fakes.legacy_db import engine_db, insert_run_row
 
 
 @pytest.fixture
@@ -569,21 +570,8 @@ class TestPipelineColumns:
     def test_pre_pipeline_database_migrates_in_place(self, tmp_path: Path) -> None:
         """A state.db from before the pipeline columns opens cleanly, gains
         them with their defaults, and its old rows stay readable."""
-        db = tmp_path / "state.db"
-        conn = sqlite3.connect(db)
-        conn.execute(
-            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
-            " state TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}',"
-            " created_at REAL NOT NULL, updated_at REAL NOT NULL,"
-            " workspace TEXT, mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT,"
-            " user_guidance TEXT NOT NULL DEFAULT '[]', reason TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO runs (run_id, outcome, state, created_at, updated_at)"
-            " VALUES ('old', 'legacy', 'completed', 1.0, 2.0)"
-        )
-        conn.commit()
-        conn.close()
+        db = engine_db(tmp_path, "pre_pipeline")
+        insert_run_row(db, run_id="old", outcome="legacy", state="completed", updated_at=2.0)
 
         store = StateStore(db)
         run = store.get_run("old")
@@ -599,25 +587,17 @@ class TestPipelineColumns:
         """A state.db with the pipeline columns but from before #523 opens,
         gains `exhausted` / `granted_rounds`, and its rows read as never
         exhausted, nothing granted."""
-        db = tmp_path / "state.db"
-        conn = sqlite3.connect(db)
-        conn.execute(
-            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
-            " state TEXT NOT NULL, config_json TEXT NOT NULL DEFAULT '{}',"
-            " created_at REAL NOT NULL, updated_at REAL NOT NULL,"
-            " workspace TEXT, mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT,"
-            " user_guidance TEXT NOT NULL DEFAULT '[]', reason TEXT, stage TEXT,"
-            " pr_number INTEGER, pr_url TEXT, pr_node_id TEXT, branch TEXT, head_sha TEXT,"
-            " review_rounds INTEGER NOT NULL DEFAULT 0, ci_rounds INTEGER NOT NULL DEFAULT 0,"
-            " update_attempts INTEGER NOT NULL DEFAULT 0, update_head TEXT, last_verdict TEXT)"
+        db = engine_db(tmp_path, "pre_granted_rounds")
+        insert_run_row(
+            db,
+            run_id="old",
+            outcome="legacy",
+            state="failed",
+            updated_at=2.0,
+            stage="reviewing",
+            review_rounds=4,
+            reason="review fix rounds exhausted (3 allowed by [landing] review_rounds): x",
         )
-        conn.execute(
-            "INSERT INTO runs (run_id, outcome, state, created_at, updated_at, stage,"
-            " review_rounds, reason) VALUES ('old', 'legacy', 'failed', 1.0, 2.0, 'reviewing',"
-            " 4, 'review fix rounds exhausted (3 allowed by [landing] review_rounds): x')"
-        )
-        conn.commit()
-        conn.close()
 
         store = StateStore(db)
         run = store.get_run("old")

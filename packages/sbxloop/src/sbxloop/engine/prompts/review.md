@@ -21,7 +21,8 @@ render()).
 Contract (test_review_prompt_carries_contract): the four lenses
 ("Concurrency and locking", "Failure ordering", "Input validation",
 "Cross-module interaction"), the phrases "read-only", "Do not modify",
-"refuted", "repro" and "ONLY the fenced JSON block", and the
+"refuted", "repro" and "ONLY the fenced JSON block", the round-1
+plan-coverage question ("upgrade path for existing state", #524), and the
 verdict/severity vocabulary must stay. The wrong-check / verify-suspect section with its
 config-override worked example must stay too
 (test_review_prompt_describes_the_wrong_check_shape).
@@ -43,6 +44,18 @@ $outcome
 ## The tasks the run built, with their acceptance criteria
 
 $tasks_summary
+
+In round 1, review the **plan** as well as the diff: if the change alters
+persisted state — a SQLite schema or the meaning of its rows, an id or key
+format, a config key the store echoes, a state-directory layout — then a
+deployed instance already holds data in the old shape, and one task must
+cover the **upgrade path for existing state**, with acceptance criteria
+that enumerate the row states and id forms it can hold and tests that
+start from a raw pre-change database. If the change needs that task and
+no task covers it, that is a `blocking` finding on the plan (anchor it to
+the schema or migration code), whatever the diff itself looks like: four
+daemon-killing bugs on one migration reached review one round at a time
+because the plan never named the path.
 
 ## The project's own gate
 
