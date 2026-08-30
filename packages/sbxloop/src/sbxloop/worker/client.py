@@ -27,7 +27,7 @@ import shlex
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import sbxloop
@@ -153,6 +153,7 @@ class WorkerClient:
         grace_s: float = 60.0,
         role: str | None = None,
         limits: Limits | None = None,
+        credential_refresh: Callable[[], None] | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.bus = bus or EventBus()
@@ -171,6 +172,11 @@ class WorkerClient:
         # through to the worker's heartbeat sampler.
         self.role = role
         self.limits = limits
+        # Invoked before each submit when set (github role under GitHub App
+        # auth): re-mints and rewrites the in-VM env file when the
+        # installation token nears expiry, so this job's worker process
+        # starts with a live credential. See Provisioner.gh_refresher.
+        self.credential_refresh = credential_refresh
         # job_id -> agent persona (planner, executor, ...) supplied at
         # submit(); stamped onto that job's agent.* events so the transcript
         # can say who is speaking (the worker doesn't know which phase it
@@ -647,6 +653,8 @@ class WorkerClient:
         time out. ``host_tools_dir`` is filled in here (per-job directory
         under TOOLS_DIR) unless the caller set it.
         """
+        if self.credential_refresh is not None:
+            self.credential_refresh()
         if bool(job.host_tools) != (tool_handler is not None):
             raise WorkerError(
                 "job.host_tools and tool_handler must be given together "

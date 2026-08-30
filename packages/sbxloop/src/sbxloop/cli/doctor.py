@@ -11,6 +11,7 @@ for the full suite and refreshes the version-keyed verdict cache.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import time
 from collections.abc import Callable
@@ -28,7 +29,7 @@ from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
-from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, GH_TOKEN_ENVS
+from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, gh_credential_status
 from sbxloop.sbx.prune import count_orphans
 from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
 from sbxloop.worker.wheel import resolve_worker_wheel
@@ -91,15 +92,11 @@ class RepoProbe:
 
 
 def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
-    """Whether this repository has a usable token, and where it came from."""
-    if entry.token_env:
-        if env.get(entry.token_env):
-            return True, f"token from {entry.token_env}"
-        return False, f"token_env {entry.token_env} is not set on the host"
-    for name in GH_TOKEN_ENVS:
-        if env.get(name):
-            return True, f"token from {name}"
-    return False, f"none of {'/'.join(GH_TOKEN_ENVS)} are set"
+    """Whether this repository has a usable credential, and which — a PAT
+    (its own ``token_env`` or the daemon-wide GH_TOKEN) or the GitHub App
+    installation (#568)."""
+    status = gh_credential_status(env, token_env=entry.token_env)
+    return status.ok, status.detail
 
 
 def daemon_repo_health(
@@ -567,22 +564,37 @@ def collect_checks(
             f"permission and export {COPILOT_TOKEN_ENV}",
         )
     )
-    # GH_TOKEN matters only when the GitHub integration is configured; an
-    # unconfigured integration is a valid (GitHub-less) setup, not a failure.
+    # A github credential matters only when the GitHub integration is
+    # configured; an unconfigured integration is a valid (GitHub-less)
+    # setup, not a failure. A PAT or GitHub App credentials both satisfy it;
+    # both at once, or a partial App set, is a named failure (#568).
     if config.github.enabled:
-        gh_set = any(env.get(name) for name in GH_TOKEN_ENVS)
+        cred = gh_credential_status(env)
         configured = ", ".join(r.repo for r in config.github.repo_list()) or str(config.github.repo)
         checks.append(
             Check(
-                "/".join(GH_TOKEN_ENVS),
-                gh_set,
-                f"set (github integration: {configured})"
-                if gh_set
-                else f"not set but github repositories {configured} are configured — "
-                "create a fine-grained PAT (issues:write, contents:read, ...) "
-                "and export GH_TOKEN",
+                "github credentials",
+                cred.ok,
+                f"{cred.detail} (github integration: {configured})"
+                if cred.ok
+                else f"{cred.detail} — github repositories {configured} are "
+                "configured: create a fine-grained PAT (issues:write, "
+                "contents:read, ...) and export GH_TOKEN, or set GITHUB_APP_ID, "
+                "GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY[_PATH]",
             )
         )
+        if cred.mode == "app" and cred.ok:
+            has_openssl = shutil.which("openssl") is not None
+            checks.append(
+                Check(
+                    "openssl (github app auth)",
+                    has_openssl,
+                    "found on PATH — App JWTs are signed with the host openssl"
+                    if has_openssl
+                    else "not found on PATH — GitHub App auth cannot sign its "
+                    "JWTs; install openssl or switch to a PAT",
+                )
+            )
         # One row per configured repository: a repo whose credentials or
         # probe fail must not hide the verdict for the others.
         report("checking configured repositories")

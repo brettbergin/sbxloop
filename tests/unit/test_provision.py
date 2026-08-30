@@ -1,6 +1,8 @@
 """Provisioner tests: specs, token split, policy, secrets, rollback."""
 
+import shutil
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -715,6 +717,9 @@ class TestSecretIdempotency:
         entry there, and re-set — never die."""
         provisioner = make_provisioner(fake_sbx, tmp_path)
         provisioner.ensure_pair("r1").cleanup()
+        # r1's probe cached "invisible-under-exec"; clear it so r2 takes the
+        # registration path whose collision recovery this test exercises.
+        shutil.rmtree(tmp_path / "state" / "conformance")
         pair = provisioner.ensure_pair("r2")  # must not raise
         try:
             state = self.secret_state(fake_sbx)
@@ -740,6 +745,11 @@ class TestSecretIdempotency:
         token value."""
         provisioner = make_provisioner(fake_sbx, tmp_path)
         provisioner.ensure_pair("r1").cleanup()
+        # r1's probe cached "invisible-under-exec", which would send the
+        # resume straight to the env file (see TestCachedProxyVerdictSkip's
+        # rotation test); clear it so this test keeps exercising the
+        # registration-collision replacement an unknown sbx version takes.
+        shutil.rmtree(tmp_path / "state" / "conformance")
         rotated = dict(TOKENS, GH_TOKEN="github_pat_rotated")
         provisioner2 = make_provisioner(fake_sbx, tmp_path, env=rotated)
         pair = provisioner2.ensure_pair("r1")
@@ -759,6 +769,9 @@ class TestSecretIdempotency:
         # cope with the collision without dying
         fake_sbx.script("secret rm", returncode=1, stderr="unknown command")
         first.cleanup()
+        # r1's probe cached "invisible-under-exec"; clear it so r2 takes the
+        # registration path this test exists to exercise.
+        shutil.rmtree(tmp_path / "state" / "conformance")
         import logging
 
         with caplog.at_level(logging.WARNING):
@@ -1093,3 +1106,266 @@ class TestConformanceRecording:
             assert pair.mounted
         finally:
             pair.cleanup()
+
+
+class TestGithubAppAuth:
+    """GitHub App installation credentials (#568): env-file delivery, the
+    PAT-vs-App decision, and the live-sandbox refresh hook."""
+
+    APP_ENV: ClassVar[dict[str, str]] = {
+        "COPILOT_GITHUB_TOKEN": "github_pat_copilot",
+        "GITHUB_APP_ID": "12345",
+        "GITHUB_APP_INSTALLATION_ID": "678",
+        "GITHUB_APP_PRIVATE_KEY": (
+            "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----"
+        ),
+    }
+
+    def stub_mint(
+        self, monkeypatch: pytest.MonkeyPatch, *, lifetime_s: float = 3600.0
+    ) -> list[str]:
+        """Never mint over the network in unit tests."""
+        import time as _time
+
+        from sbxloop.gh import appauth
+
+        minted: list[str] = []
+
+        def mint(creds: object, **kwargs: object) -> appauth.InstallationToken:
+            minted.append(f"ghs_minted{len(minted) + 1}")
+            return appauth.InstallationToken(minted[-1], _time.time() + lifetime_s)
+
+        monkeypatch.setattr(appauth, "mint_installation_token", mint)
+        return minted
+
+    def github_env_sh(self, fake_sbx: FakeSbx, name: str) -> str:
+        return (fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/env.sh").read_text()
+
+    def test_app_mode_writes_env_file_and_registers_no_service_secret(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        minted = self.stub_mint(monkeypatch)
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=self.APP_ENV, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert minted == ["ghs_minted1"]
+            env_sh = self.github_env_sh(fake_sbx, pair.github.name)
+            assert "export GH_TOKEN=ghs_minted1" in env_sh
+            assert "export GITHUB_TOKEN=ghs_minted1" in env_sh
+            # no sbx `github` service registration: each ~hourly token would
+            # only be ceremony — the env file is the delivery channel
+            service = [s for s in fake_sbx.secrets() if s["args"][0] == "set"]
+            assert service == []
+            announced = [e for e in events if e.type == "sandbox.github_app_auth"]
+            assert len(announced) == 1
+            assert announced[0].data["name"] == pair.github.name
+        finally:
+            pair.cleanup()
+
+    def test_conflict_with_pat_is_a_named_startup_error(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, env={**self.APP_ENV, "GH_TOKEN": "github_pat_user"}
+        )
+        with pytest.raises(ProvisionError, match="unset the PAT"):
+            provisioner.ensure_pair("r1")
+        assert fake_sbx.invocations("create") == []
+
+    def test_partial_app_credentials_fail_before_any_microvm(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        env = {"COPILOT_GITHUB_TOKEN": "github_pat_copilot", "GITHUB_APP_ID": "12345"}
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=env)
+        with pytest.raises(ProvisionError, match="incomplete GitHub App credentials"):
+            provisioner.ensure_pair("r1")
+        assert fake_sbx.invocations("create") == []
+
+    def test_missing_everything_names_both_credential_options(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, env={"COPILOT_GITHUB_TOKEN": "github_pat_copilot"}
+        )
+        with pytest.raises(ProvisionError, match="GitHub App"):
+            provisioner.ensure_pair("r1")
+
+    def test_repo_token_env_stays_an_explicit_pat_choice(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A [[github.repos]] token_env wins over ambient App credentials."""
+        from sbxloop.sbx.provision import GhPat
+
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repos": [{"repo": "owner/repo", "token_env": "GH_TOKEN_TWO"}]},
+            }
+        )
+        provisioner = make_provisioner(
+            fake_sbx,
+            tmp_path,
+            env={**self.APP_ENV, "GH_TOKEN_TWO": "github_pat_two"},
+            config=config,
+        )
+        cred = provisioner.gh_credential("owner/repo")
+        assert cred == GhPat("github_pat_two")
+
+    def test_refresher_rewrites_env_file_only_when_stale(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import time as _time
+
+        from sbxloop.gh.appauth import InstallationToken
+
+        minted = self.stub_mint(monkeypatch)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=self.APP_ENV)
+        sandbox = provisioner.ensure_github_only("boxg", tmp_path / "ws")
+        try:
+            refresher = provisioner.gh_refresher(sandbox, None)
+            assert refresher is not None
+            # fresh token: the hook is a no-op
+            refresher()
+            assert minted == ["ghs_minted1"]
+            assert "ghs_minted1" in self.github_env_sh(fake_sbx, "boxg")
+            # age the cached token into the refresh margin
+            source = provisioner._app_source
+            assert source is not None
+            source._token = InstallationToken("ghs_stale", _time.time() + 60.0)
+            refresher()
+            env_sh = self.github_env_sh(fake_sbx, "boxg")
+            assert "ghs_minted2" in env_sh
+            assert "ghs_stale" not in env_sh
+        finally:
+            sandbox.rm()
+
+    def test_refresher_is_none_for_pat(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        sandbox = provisioner.ensure_github_only("boxp", tmp_path / "ws")
+        try:
+            assert provisioner.gh_refresher(sandbox, None) is None
+        finally:
+            sandbox.rm()
+
+
+class TestCachedProxyVerdictSkip:
+    """A cached invisible/sentinel-under-exec conformance verdict sends
+    provisioning straight to the env file: no doomed registration, no
+    probe, no per-run warning (#568)."""
+
+    def seed_broken_verdict(self, tmp_path: Path, verdict: str = "invisible-under-exec") -> None:
+        from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, record_field_verdict
+
+        record_field_verdict(tmp_path / "state", "0.38.0", PROBE_SECRET_ENV_VISIBILITY, verdict)
+
+    def test_cached_broken_verdict_skips_registration_and_probe(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        self.seed_broken_verdict(tmp_path)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            # no secret registrations at all — both roles go env-file direct
+            assert fake_sbx.secrets() == []
+            for name in (pair.agent.name, pair.github.name):
+                env_sh = (fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/env.sh").read_text()
+                assert "export" in env_sh
+            fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+            assert len(fallback) == 2
+            assert all(e.data.get("cached") for e in fallback)
+            assert not [e for e in events if e.type == "sandbox.secret_probe_error"]
+        finally:
+            pair.cleanup()
+
+    def test_resume_under_cached_verdict_rotates_via_env_file(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """The guarantee the registration path gives a resumed run id (same
+        sandbox names, current token value) is preserved by the env-file
+        path: the file is simply rewritten with the fresh token."""
+        self.seed_broken_verdict(tmp_path)
+        make_provisioner(fake_sbx, tmp_path).ensure_pair("r1").cleanup()
+        rotated = dict(TOKENS, GH_TOKEN="github_pat_rotated")
+        pair = make_provisioner(fake_sbx, tmp_path, env=rotated).ensure_pair("r1")
+        try:
+            env_sh = (
+                fake_sbx.sandbox_fs(pair.github.name) / "home/agent/.sbxloop/env.sh"
+            ).read_text()
+            assert "github_pat_rotated" in env_sh
+            # no new registrations (r1 cleanup's best-effort rm calls are fine)
+            sets = [s for s in fake_sbx.secrets() if s["args"][0] in ("set", "set-custom")]
+            assert sets == []
+        finally:
+            pair.cleanup()
+
+    def test_unknown_version_probes_exactly_as_before(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No cached verdict: the register→probe path runs unchanged, so a
+        new sbx version still gets its one field probe per version."""
+        monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            service = [s for s in fake_sbx.secrets() if s["args"][0] == "set"]
+            assert len(service) == 1  # the github service secret registered
+            fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+            assert fallback and not any(e.data.get("cached") for e in fallback)
+        finally:
+            pair.cleanup()
+
+
+class TestGhCredentialStatus:
+    """The advisory twin of gh_credential, used by doctor rows."""
+
+    def test_pat(self) -> None:
+        from sbxloop.sbx.provision import gh_credential_status
+
+        status = gh_credential_status({"GH_TOKEN": "github_pat_x"})
+        assert (status.ok, status.mode) == (True, "pat")
+
+    def test_app(self) -> None:
+        from sbxloop.sbx.provision import gh_credential_status
+
+        status = gh_credential_status(TestGithubAppAuth.APP_ENV)
+        assert (status.ok, status.mode) == (True, "app")
+        assert "12345" in status.detail
+
+    def test_conflict(self) -> None:
+        from sbxloop.sbx.provision import gh_credential_status
+
+        status = gh_credential_status({**TestGithubAppAuth.APP_ENV, "GH_TOKEN": "github_pat_x"})
+        assert not status.ok
+        assert "both" in status.detail
+
+    def test_partial_app_set(self) -> None:
+        from sbxloop.sbx.provision import gh_credential_status
+
+        status = gh_credential_status({"GITHUB_APP_ID": "12345"})
+        assert not status.ok
+        assert "incomplete" in status.detail
+
+    def test_neither(self) -> None:
+        from sbxloop.sbx.provision import gh_credential_status
+
+        status = gh_credential_status({})
+        assert (status.ok, status.mode) == (False, "none")
+
+    def test_token_env_wins(self) -> None:
+        from sbxloop.sbx.provision import gh_credential_status
+
+        env = {**TestGithubAppAuth.APP_ENV, "GH_TOKEN_TWO": "github_pat_two"}
+        status = gh_credential_status(env, token_env="GH_TOKEN_TWO")
+        assert (status.ok, status.mode) == (True, "pat")
+        assert "GH_TOKEN_TWO" in status.detail
