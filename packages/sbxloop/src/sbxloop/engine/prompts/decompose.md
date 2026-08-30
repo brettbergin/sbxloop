@@ -26,7 +26,10 @@ Section rules:
   mitigation (test_decompose_carries_verify_authoring_rules). The
   config-override warning (explicit paths overriding a tool's configured
   file set, with the `uv run mypy packages` case) must stay too
-  (test_decompose_warns_against_config_overriding_verify_paths).
+  (test_decompose_warns_against_config_overriding_verify_paths). The
+  persisted-state rule ("upgrade path for existing state", the row states /
+  id forms enumeration, and the raw pre-change database verify) must stay
+  (test_decompose_demands_an_upgrade_path_task_for_persisted_state, #524).
 -->
 
 # Decompose an outcome into a task graph
@@ -104,6 +107,34 @@ $outcome
   no configured file set, or when the task is genuinely about that one path.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
+
+## Risk pass: what a deployed instance already holds
+
+Before you answer, ask of the outcome: **does it alter persisted state?** A
+SQLite schema or the meaning of its rows, an id or key format, a config key
+the store echoes, a state-directory layout, a file format read back later.
+If so, a running deployment already holds data in the *old* shape, and the
+change is not done until that data survives the upgrade. Add a dedicated
+task — **upgrade path for existing state** — that is not an implementation
+detail of another task:
+
+- Its `acceptance_criteria` **enumerate** the shapes a deployed instance
+  can hold: every row state (queued, claimed, running, resume-pending,
+  terminal), every id or key form (old and new), every config shape — and
+  say what each becomes after the upgrade. "The legacy form still resolves"
+  is not a criterion; "a `running` row with a bare `gh:7` id is re-keyed to
+  `gh:issue:7`, keeps its run pin, and settles when that run ends" is.
+- Its `verify_commands` run tests that **start from a raw pre-change
+  database** (or file, or directory) written in the old shape by hand —
+  never one produced by the new code, which normalises on write and so
+  cannot exercise a stored old value. Name the test module the task must
+  add or extend.
+- It depends on the task that makes the change and is planned alongside
+  it, not discovered by review. A change that alters persisted state and
+  has no such task is an incomplete plan.
+
+If the outcome alters no persisted state, say nothing — do not add the
+task.
 
 ## Response format
 

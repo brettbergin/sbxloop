@@ -53,6 +53,25 @@ def test_decompose_carries_verify_authoring_rules() -> None:
     assert "test runner over shell pipelines" in text
 
 
+def test_decompose_demands_an_upgrade_path_task_for_persisted_state() -> None:
+    """#524: a change to persisted state gets its own task, whose criteria
+    enumerate the shapes a deployed instance holds and whose verify starts
+    from a raw pre-change database — the plan names the path, so review is
+    not where it is discovered one row state at a time."""
+    text = render("decompose", outcome="add a column", max_tasks="3", project_gate="- gate rule")
+    assert "## Risk pass: what a deployed instance already holds" in text
+    assert "does it alter persisted state?" in text
+    assert "**upgrade path for existing state**" in text
+    assert "**enumerate** the shapes a deployed instance" in text
+    for shape in ("queued, claimed, running, resume-pending", "every id or key form"):
+        assert shape in text, shape
+    flat = " ".join(text.split())
+    assert "**start from a raw pre-change database**" in flat
+    assert "never one produced by the new code" in text
+    assert "not discovered by review" in text
+    assert "If the outcome alters no persisted state, say nothing" in text
+
+
 def test_decompose_warns_against_config_overriding_verify_paths() -> None:
     """#387: `uv run mypy packages` overrides the `files` pinned in
     pyproject.toml, drags in the hatchling build hook and can never pass,
@@ -188,6 +207,9 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "owner/repo — enabled, base main" in text and "`list_repos`" in text
     # drift: the concierge reports versions, a human does the upgrading
     assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
+    # #524: an ask that touches persisted state files with a migration section
+    assert "**Migration of existing state** section" in text
+    assert "raw pre-change database" in text
 
 
 def test_review_prompt_carries_contract() -> None:
@@ -230,6 +252,12 @@ def test_review_prompt_carries_contract() -> None:
     assert "`repro` is required on every `blocking` and `major` finding" in text
     assert '"repro":' in text
     assert "name the neighbours" in text
+    # #524: round 1 reviews the plan too — a persisted-state change with no
+    # upgrade-path task is a blocking finding on the plan.
+    assert "review the **plan** as well as the diff" in text
+    assert "**upgrade path for existing state**" in text
+    assert "raw pre-change database" in text
+    assert "`blocking` finding on the plan" in text
 
 
 def test_review_prompt_describes_the_wrong_check_shape() -> None:

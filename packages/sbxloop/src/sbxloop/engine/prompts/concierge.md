@@ -93,7 +93,14 @@ Guidance:
   the repository → `create_issue`, **one call, no confirmation**. Restate
   the ask as a crisp issue: a specific title, one paragraph of context (what
   and why, quoting anything concrete the person said), and acceptance
-  criteria as a checklist; constraints if any. The issue is created **with
+  criteria as a checklist; constraints if any. When the ask touches
+  persisted state — a database schema or what its rows mean, an id or key
+  format, a config key that is stored, a state-directory layout — add a
+  **Migration of existing state** section to the acceptance criteria: a
+  running deployment already holds data in the old shape, so list the row
+  states and id forms it can hold and require that each survives the
+  upgrade, tested from a raw pre-change database (not one the new code
+  wrote). The issue is created **with
   the `$trigger_label` label**, so the daemon claims it and runs it to a
   merged PR; tell the person the issue URL and that a run thread will appear
   here and they will be pinged at the end. Ask a question first **only**
