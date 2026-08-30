@@ -3,9 +3,15 @@ render — and the prompt/schema contract."""
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
 import pytest
 from pydantic import ValidationError
 
+from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.followups import (
     checklist_comment,
     collect_followups,
@@ -15,6 +21,18 @@ from sbxloop.engine.followups import (
     marker_key,
 )
 from sbxloop.engine.review import Followup, ReviewFinding, ReviewRound, ReviewVerdict, review_body
+from sbxloop.errors import GithubOpsError
+from tests.conftest import FakeSbx
+from tests.fakes.fake_github import FakeGithub
+from tests.fakes.github_errors import github_error
+from tests.unit.test_engine import (
+    FILES_BUILD,
+    FINDING,
+    Harness,
+    review,
+    task,
+    taskgraph,
+)
 
 
 def finding(path: str = "src/app.py", line: int | None = 12, **kw: object) -> ReviewFinding:
@@ -185,3 +203,171 @@ class TestRendering:
         assert 'Not filed as issues (`[landing] followups = "comment"`)' in listed
         assert "- [ ] **A** — a\n- [ ] **B**" in listed
         assert listed.endswith("<!-- sbxloop-followups run=r1 -->")
+
+
+class FakeOps:
+    """Just enough of GithubOps to watch the label calls (#556): the probe
+    goes through ``label_lookup`` (a 404 already turned into None by the
+    worker op), the creation through ``raw``."""
+
+    def __init__(
+        self,
+        *,
+        get: dict[str, Any] | None = None,
+        get_error: Exception | None = None,
+        post_error: Exception | None = None,
+    ) -> None:
+        self._get = get
+        self._get_error = get_error
+        self._post_error = post_error
+        self.calls: list[tuple[str, str]] = []
+
+    def label_lookup(self, repo: str, name: str) -> dict[str, Any] | None:
+        self.calls.append(("LOOKUP", f"/repos/{repo}/labels/{quote(name, safe='')}"))
+        if self._get_error is not None:
+            raise self._get_error
+        return self._get
+
+    def raw(self, method: str, path: str, body: object = None) -> object:
+        self.calls.append((method, path))
+        if self._post_error is not None:
+            raise self._post_error
+        return {"name": "x"}
+
+
+class TestEnsureLabel:
+    def test_existing_label_is_silent_success_without_a_post(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        ops = FakeOps(get={"name": "sbxloop follow-up"})
+        with caplog.at_level(logging.DEBUG):
+            LoopEngine._ensure_label(ops, "o/r", "sbxloop follow-up")  # type: ignore[arg-type]
+        assert ops.calls == [("LOOKUP", "/repos/o/r/labels/sbxloop%20follow-up")]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_missing_label_is_created(self) -> None:
+        ops = FakeOps(get=None)
+        LoopEngine._ensure_label(ops, "o/r", "followup")  # type: ignore[arg-type]
+        assert ops.calls == [
+            ("LOOKUP", "/repos/o/r/labels/followup"),
+            ("POST", "/repos/o/r/labels"),
+        ]
+
+    def test_lookup_failure_that_is_not_a_miss_warns_once_and_skips_the_post(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 403 (token without repo scope) or a 5xx is not "absent": the
+        POST behind it could only fail too, so it is never made."""
+        for status in (403, 500):
+            ops = FakeOps(get_error=GithubOpsError("nope", http_status=status))
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG):
+                LoopEngine._ensure_label(ops, "o/r", "followup")  # type: ignore[arg-type]
+            assert ops.calls == [("LOOKUP", "/repos/o/r/labels/followup")]
+            assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_already_exists_on_create_is_success(self, caplog: pytest.LogCaptureFixture) -> None:
+        ops = FakeOps(get=None, post_error=GithubOpsError("nope", http_status=422))
+        with caplog.at_level(logging.DEBUG):
+            LoopEngine._ensure_label(ops, "o/r", "followup")  # type: ignore[arg-type]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_unexpected_failure_warns_but_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        ops = FakeOps(get=None, post_error=GithubOpsError("boom", http_status=500))
+        with caplog.at_level(logging.DEBUG):
+            LoopEngine._ensure_label(ops, "o/r", "followup")  # type: ignore[arg-type]
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+@pytest.fixture
+def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
+    return Harness(fake_sbx, tmp_path, monkeypatch)
+
+
+FOLLOWUP_A = {
+    "title": "doctor boots one microVM per configured repo",
+    "body": "one per credential would do",
+    "path": "src/cli/doctor.py",
+}
+FOLLOWUP_B = {"title": "a permanently-404 repo warns every poll forever"}
+
+
+def followup_script() -> list[dict[str, Any]]:
+    """A run whose review leaves two notes out of scope and defers a nit."""
+    minor = {
+        "path": "hello.txt",
+        "line": 2,
+        "body": "the greeting is not documented",
+        "severity": "minor",
+    }
+    round_one = review("request_changes", "one problem, one nit", FINDING, minor)
+    round_one["json"]["followups"] = [FOLLOWUP_A]
+    fix = {"text": "Fixed.\n\naddressed: hello.txt:1 — hello\ndeferred: hello.txt:2 — docs later"}
+    round_two = review("approve", "fixed; the nit is deferred")
+    round_two["json"]["followups"] = [FOLLOWUP_B]
+    return [taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two]
+
+
+class RaceyLabelGithub(FakeGithub):
+    """The pre-check says the label is missing, creation says it exists."""
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        if method == "GET" and "/labels/" in path:
+            self.raw_calls.append((method, path, body))
+            raise github_error("label_missing_404")
+        return super().raw(method, path, body)
+
+
+class TestFilingWithExistingLabels:
+    """#556: a run files its out-of-scope follow-ups whatever labels the
+    repository already carries."""
+
+    def _run(self, harness: Harness, fake: FakeGithub) -> Any:
+        harness.script(followup_script())
+        return harness.pipeline(fake).start("ship hello")
+
+    @staticmethod
+    def _label_posts(fake: FakeGithub) -> list[tuple[str, str, Any]]:
+        return [c for c in fake.raw_calls if c[0] == "POST" and c[1].endswith("/labels")]
+
+    def test_files_followups_when_every_label_already_exists(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake = FakeGithub()
+        fake.labels_existing.add("sbxloop:follow-up")
+        with caplog.at_level(logging.DEBUG):
+            result = self._run(harness, fake)
+        assert result.state == "merged"
+        assert len(fake.issues_created) == 3
+        for _, _, labels in fake.issues_created:
+            assert labels == ["sbxloop:follow-up"]
+        assert self._label_posts(fake) == []
+        assert [
+            r for r in caplog.records if r.levelno >= logging.WARNING and "label" in r.getMessage()
+        ] == []
+
+    def test_absent_label_is_created_once(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        result = self._run(harness, fake)
+        assert result.state == "merged"
+        assert fake.labels_created == ["sbxloop:follow-up"]
+        assert len(self._label_posts(fake)) == 1
+        assert len(fake.issues_created) == 3
+        for _, _, labels in fake.issues_created:
+            assert labels == ["sbxloop:follow-up"]
+
+    def test_a_race_between_the_check_and_the_create_is_not_an_error(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake = RaceyLabelGithub()
+        fake.labels_existing.add("sbxloop:follow-up")
+        with caplog.at_level(logging.DEBUG):
+            result = self._run(harness, fake)
+        assert result.state == "merged"
+        assert len(self._label_posts(fake)) == 1
+        assert len(fake.issues_created) == 3
+        assert [
+            r for r in caplog.records if r.levelno >= logging.WARNING and "label" in r.getMessage()
+        ] == []

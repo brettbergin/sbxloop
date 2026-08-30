@@ -970,6 +970,20 @@ class GithubOps:
             raise GithubOpsError(f"ref.get returned no sha for {ref!r}: {data!r}")
         return str(sha)
 
+    def label_lookup(self, repo: str, name: str) -> dict[str, Any] | None:
+        """Probe one repository label: its data, or None when the repository
+        does not carry it.
+
+        Same rationale as :meth:`ref_lookup`: "no such label" is the routine
+        answer to an existence question (#556), so it travels as data rather
+        than as a failed job that would paint a red panel in the run's
+        chronology. Anything other than a 404 — a 403 from a token without
+        repo scope, a 5xx — still raises."""
+        data = self._op("label.get", {"repo": repo, "name": name, "allow_missing": True})
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"label.get returned a malformed result: {data!r}")
+        return None if data.get("missing") else data
+
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         data = self._op("search.issues", {"query": query, "per_page": per_page})
         return data if isinstance(data, list) else []

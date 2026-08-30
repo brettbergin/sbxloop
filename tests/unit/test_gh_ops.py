@@ -128,6 +128,28 @@ class TestGithubOpsFacade:
         with pytest.raises(GithubOpsError, match="HTTP 403"):
             ops.ref_lookup("o/r", "heads/main")
 
+    def test_label_lookup(self) -> None:
+        """#556: the follow-up label probe asks for the miss as data, so a
+        repository that lacks the label does not pay an error event."""
+        ops, client = make_ops({"label.get": {"name": "sbxloop:follow-up", "color": "c5def5"}})
+        assert ops.label_lookup("o/r", "sbxloop:follow-up") == {
+            "name": "sbxloop:follow-up",
+            "color": "c5def5",
+        }
+        assert client.jobs[0].params == {
+            "repo": "o/r",
+            "name": "sbxloop:follow-up",
+            "allow_missing": True,
+        }
+
+        ops, _ = make_ops({"label.get": {"missing": True, "http_status": 404}})
+        assert ops.label_lookup("o/r", "sbxloop:follow-up") is None
+
+        # a real failure (403 from a token without repo scope) still raises
+        ops, _ = make_ops({"label.get": "FAIL"})
+        with pytest.raises(GithubOpsError, match="HTTP 403"):
+            ops.label_lookup("o/r", "sbxloop:follow-up")
+
     def test_error_result_raises(self) -> None:
         ops, _ = make_ops({"issue.create": "FAIL"})
         with pytest.raises(GithubOpsError, match="HTTP 403") as info:

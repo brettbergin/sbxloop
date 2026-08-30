@@ -2258,9 +2258,32 @@ class LoopEngine:
 
     @staticmethod
     def _ensure_label(ops: GithubOps, repo: str, label: str) -> None:
-        """Create the follow-up label if the repository lacks it; an
-        existing one (422) is fine, and a refusal must not stop the filing —
-        GitHub accepts an issue whose label it cannot find."""
+        """Make sure the repository carries the follow-up label.
+
+        A label that already exists is an expected condition, not an error:
+        we look it up first and return silently when it is there, so the run
+        never records a failed creation call. The lookup goes through
+        ``label_lookup``, which answers a 404 as data rather than as a failed
+        worker job — the same treatment ``ref_lookup`` gives an absent branch
+        (#518), so a repository *without* the label does not pay a red panel
+        for asking. Only a genuinely missing label is POSTed, and the 422
+        catch still covers the race between the two calls. A refusal must not
+        stop the filing — GitHub accepts an issue whose label it cannot find.
+
+        This is the only place that creates a *repository* label; the other
+        ``/labels`` calls (engine issue filing, daemon sources/concierge)
+        attach or remove labels on an issue, where an existing label is
+        already the happy path."""
+        try:
+            existing = ops.label_lookup(repo, label)
+        except GithubOpsError as exc:
+            # Not a 404 — no repo scope, or GitHub is unwell. One warning,
+            # and no doomed POST behind it.
+            log.warning("run.followup_label_failed", repo=repo, label=label, error=str(exc))
+            return
+        if existing:
+            log.debug("run.followup_label_present", repo=repo, label=label)
+            return
         try:
             ops.raw(
                 "POST",
@@ -2268,8 +2291,12 @@ class LoopEngine:
                 {"name": label, "color": "c5def5", "description": "filed by sbxloop after a merge"},
             )
         except GithubOpsError as exc:
-            if "422" not in str(exc) and "already_exists" not in str(exc):
-                log.warning("run.followup_label_failed", repo=repo, label=label, error=str(exc))
+            text = str(exc)
+            exists = "already_exists" in text or "already exists" in text
+            if exc.http_status == 422 or exists:
+                log.debug("run.followup_label_present", repo=repo, label=label)
+                return
+            log.warning("run.followup_label_failed", repo=repo, label=label, error=text)
 
     def _login(self, p: Pipeline) -> str:
         """The loop's own GitHub login, read once per drive."""
