@@ -134,7 +134,10 @@ def repo_checks(
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         if probe is None:
-            notes.append("reachability unverified from the host (checked in the github sandbox)")
+            notes.append(
+                "reachability unverified from the host (checked in the github sandbox — "
+                "`sbxloop doctor --probe` boots one to ask)"
+            )
             rows.append(Check(name, True, "; ".join(notes), hard=False))
             continue
         try:
@@ -242,6 +245,13 @@ def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
     return tuple(f"{kind}:write" for kind in REQUIRED_REPO_PERMISSIONS)
 
 
+def credential_key(entry: RepoConfig) -> str:
+    """Which credential a repository's github box would be provisioned with:
+    its own ``token_env``, or ``""`` for the daemon-wide token. Repositories
+    sharing a key can share one sandbox (#515)."""
+    return entry.token_env or ""
+
+
 def sandbox_repo_probe(
     config: Config,
     cli: SbxCLI,
@@ -251,30 +261,43 @@ def sandbox_repo_probe(
     """A probe that asks GitHub itself, from a github-ops sandbox.
 
     The host deliberately never holds the PAT, so reachability and token
-    permissions cannot be checked here: one short-lived github-only sandbox
-    per repository — provisioned with exactly that repository's credentials,
-    the same way a run's is — does the ``repo.get``. ``boxes`` collects the
-    sandboxes so the caller can tear them down.
+    permissions cannot be checked here: a short-lived github-only sandbox
+    does the ``repo.get``. One sandbox **per distinct credential**, not per
+    repository (#515): the common deployment has every repository on the
+    daemon-wide token, and a doctor that booted a microVM per repository
+    scaled its wall clock with the repo count for nothing. ``boxes``
+    collects the sandboxes, keyed by credential, so the caller can tear
+    them down. A credential whose sandbox could not be provisioned answers
+    "unverified" for every repository on it, once — never re-provisioned.
     """
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.events import EventBus
 
     opened = boxes if boxes is not None else {}
+    unavailable: dict[str, str] = {}
 
     def probe(entry: RepoConfig) -> RepoProbe:
-        box = DaemonGithub(
-            config,
-            cli,
-            EventBus(),
-            worker_python=config.worker_python,
-            name=f"sbxloop-doctor-{entry.owner}-{entry.name}".lower()[:60],
-            repo=entry.repo,
-        )
-        opened[entry.repo] = box
+        key = credential_key(entry)
+        if key in unavailable:
+            raise RepoProbeUnavailable(unavailable[key])
+        box = opened.get(key)
+        if box is None:
+            box = DaemonGithub(
+                config,
+                cli,
+                EventBus(),
+                worker_python=config.worker_python,
+                name=f"sbxloop-doctor-{key or 'default'}".lower()[:60],
+                # Credentials are scoped by repository; the first repository
+                # on this credential names it, and every other one shares it.
+                repo=entry.repo,
+            )
+            opened[key] = box
         try:
             ops = box.ops()
         except Exception as exc:  # no sandbox: unverified, not a verdict
-            raise RepoProbeUnavailable(f"no github sandbox ({_clean(str(exc), 120)})") from exc
+            unavailable[key] = f"no github sandbox ({_clean(str(exc), 120)})"
+            raise RepoProbeUnavailable(unavailable[key]) from exc
         data = ops.repo_lookup(entry.repo)
         if data is None:
             creatable: bool | None = None
@@ -712,8 +735,15 @@ def run_doctor(
     *,
     deep: bool = False,
     fail_on_drift: bool = False,
+    probe: bool = False,
 ) -> bool:
     """Run the host checks and the conformance suite; return readiness.
+
+    ``probe`` asks GitHub itself about each configured repository from a
+    github-ops sandbox — one microVM per distinct credential (#515). Off
+    by default: the cheap doctor is what the deploy health step and a
+    curious operator reach for, and it must stay instant; ``--deep``
+    implies it, since that already boots a sandbox.
 
     ``fail_on_drift`` turns the conformance verdicts into a gate: any drift,
     probe error, unprobed seam, or a suite that could not run makes the
@@ -733,10 +763,14 @@ def run_doctor(
 
     # Reachability and token permissions are answered by GitHub, and the
     # host has no token — so the probe runs in a github-ops sandbox, one per
-    # repository, scoped to that repository's credentials. Torn down again
-    # before the table is printed.
+    # distinct credential. Only when asked (or under --deep): the default
+    # doctor provisions nothing. Torn down again before the table is printed.
     boxes: dict[str, DaemonGithub] = {}
-    probe_repo = sandbox_repo_probe(config, cli, boxes=boxes) if config.github.enabled else None
+    probe_repo = (
+        sandbox_repo_probe(config, cli, boxes=boxes)
+        if config.github.enabled and (probe or deep)
+        else None
+    )
     try:
         checks = collect_checks(env, cli=cli, progress=progress, probe_repo=probe_repo)
     finally:

@@ -2423,7 +2423,8 @@ class TestDoctorRepoChecks:
     def test_sandbox_probe_calls_repo_lookup_in_a_scoped_box(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """One github-ops box per repository, scoped to that repository."""
+        """One github-ops box per credential, scoped to the first repository
+        on it (every repository on that credential shares the box, #515)."""
         import sbxloop.daemon.github as daemon_github
         from sbxloop.cli.doctor import sandbox_repo_probe
 
@@ -2455,7 +2456,7 @@ class TestDoctorRepoChecks:
         assert result.reachable and not result.missing_permissions
         assert seen["scoped_to"] == "acme/alpha"
         assert seen["looked_up"] == "acme/alpha"
-        assert set(boxes) == {"acme/alpha"}
+        assert set(boxes) == {""}, "keyed by credential: the daemon-wide token"
 
     def test_missing_repo_fails_without_create_repo(self, workdir: Path) -> None:
         from sbxloop.cli.doctor import RepoProbe, repo_checks
@@ -2477,3 +2478,128 @@ class TestDoctorRepoChecks:
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         assert "github repo acme/alpha" in plain
         assert "github repo acme/beta" in plain
+
+
+class TestDoctorProbeCost:
+    """#515: the probe boots one github sandbox per distinct credential, and
+    only when asked — the default doctor provisions nothing."""
+
+    TOML = (
+        '[[github.repos]]\nrepo = "acme/alpha"\n\n'
+        '[[github.repos]]\nrepo = "acme/beta"\n\n'
+        '[[github.repos]]\nrepo = "acme/gamma"\ntoken_env = "GAMMA_TOKEN"\n'
+    )
+
+    class Box:
+        """A DaemonGithub stand-in: records how it was built, serves lookups."""
+
+        instances: ClassVar[list[Any]] = []
+        fail_names: ClassVar[set[str]] = set()
+
+        def __init__(self, config: Any, cli: Any, bus: Any, **kw: Any) -> None:
+            self.name = kw.get("name")
+            self.repo = kw.get("repo")
+            self.closed = False
+            self.lookups: list[str] = []
+            self.ops_calls = 0
+            type(self).instances.append(self)
+
+        def ops(self) -> Any:
+            self.ops_calls += 1
+            if self.name in type(self).fail_names:
+                raise RuntimeError("microVM would not boot")
+            box = self
+
+            class Ops:
+                def repo_lookup(self, repo: str) -> dict[str, Any]:
+                    box.lookups.append(repo)
+                    return {"permissions": {"push": True, "pull": True}}
+
+            return Ops()
+
+        def close(self) -> None:
+            self.closed = True
+
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.Box.instances = []
+        self.Box.fail_names = set()
+        import sbxloop.daemon.github as github_module
+
+        monkeypatch.setattr(github_module, "DaemonGithub", self.Box)
+
+    def _config(self, workdir: Path) -> Any:
+        from sbxloop.config import load_config
+
+        (workdir / "sbxloop.toml").write_text(self.TOML)
+        return load_config()
+
+    def test_one_sandbox_per_credential_not_per_repo(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbe, sandbox_repo_probe
+
+        config = self._config(workdir)
+        boxes: dict[str, Any] = {}
+        probe = sandbox_repo_probe(config, cli=None, boxes=boxes)  # type: ignore[arg-type]
+        results = [probe(entry) for entry in config.github.repo_list()]
+        assert all(isinstance(r, RepoProbe) and r.reachable for r in results)
+        assert sorted(boxes) == ["", "GAMMA_TOKEN"], "keyed by credential"
+        assert len(self.Box.instances) == 2
+        default, gamma = boxes[""], boxes["GAMMA_TOKEN"]
+        assert default.name == "sbxloop-doctor-default" and default.repo == "acme/alpha"
+        assert default.lookups == ["acme/alpha", "acme/beta"], "beta shares alpha's box"
+        assert gamma.name == "sbxloop-doctor-gamma_token" and gamma.lookups == ["acme/gamma"]
+
+    def test_a_credential_that_will_not_boot_answers_unverified_once(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbeUnavailable, repo_checks, sandbox_repo_probe
+
+        config = self._config(workdir)
+        self.Box.fail_names = {"sbxloop-doctor-default"}
+        boxes: dict[str, Any] = {}
+        probe = sandbox_repo_probe(config, cli=None, boxes=boxes)  # type: ignore[arg-type]
+        entries = config.github.repo_list()
+        with pytest.raises(RepoProbeUnavailable, match="microVM would not boot"):
+            probe(entries[0])
+        with pytest.raises(RepoProbeUnavailable):
+            probe(entries[1])
+        assert boxes[""].ops_calls == 1, "not re-provisioned for the second repo"
+        assert probe(entries[2]).reachable, "the other credential is unaffected"
+        rows = repo_checks(config, {"GH_TOKEN": "tok", "GAMMA_TOKEN": "g"}, probe=probe)
+        assert [(r.ok, r.hard) for r in rows] == [(True, False), (True, False), (True, True)]
+        assert "unverified" in rows[0].detail and "reachable" in rows[2].detail
+        # run_doctor's teardown closes every box it opened, boot or no boot.
+        for box in boxes.values():
+            box.close()
+        assert all(b.closed for b in self.Box.instances)
+
+    def test_default_doctor_provisions_nothing(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._config(workdir)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.setenv("GAMMA_TOKEN", "g")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert self.Box.instances == [], "no github sandbox without --probe"
+        assert "unverified" in result.output and "--probe" in result.output
+
+    def test_probe_and_deep_boot_one_box_per_credential(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._config(workdir)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.setenv("GAMMA_TOKEN", "g")
+        result = runner.invoke(app, ["doctor", "--probe"])
+        assert result.exit_code == 0, result.output
+        assert sorted(b.name for b in self.Box.instances) == [
+            "sbxloop-doctor-default",
+            "sbxloop-doctor-gamma_token",
+        ]
+        assert all(b.closed for b in self.Box.instances), "torn down before the table"
+        # The table folds the detail across lines with box borders between.
+        flat = re.sub(r"[\s│]+", " ", result.output)
+        assert "reachable, token has the required permissions" in flat
+        self.Box.instances = []
+        result = runner.invoke(app, ["doctor", "--deep"])
+        assert len(self.Box.instances) == 2, "--deep implies --probe"

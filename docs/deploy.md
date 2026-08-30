@@ -58,8 +58,9 @@ daemon host and takes **no** checkout — it installs from PyPI and needs nothin
 06. **Restarts**, after `systemctl --user reset-failed` — without that, a previously
     crash-looping unit sits `failed` and is not restartable (`StartLimitBurst=5` per 600 s).
 07. **Health-checks**: unit active, `--version` matches, `sbxloop doctor` exits 0 (never
-    `--deep`, which boots a microVM), `daemon ctl status` answers (exit 2 means no daemon came
-    up), then a 45 s settle to prove it is not crash-looping.
+    `--deep` or `--probe`, which boot microVMs — the default doctor boots nothing, whatever the
+    repository count), `daemon ctl status` answers (exit 2 means no daemon came up), then a
+    45 s settle to prove it is not crash-looping.
 08. **Rolls back** to the previously installed version on any failed check, restarts, and fails
     the job loudly. Rollback installs from PyPI: the previous version has been published for a
     while, so its index page is long since warm and there is no race to lose. It only runs

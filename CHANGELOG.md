@@ -8,6 +8,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **`sbxloop doctor` boots nothing by default, and at most one github
+  sandbox per credential when it probes** (#515). Multi-repo support (#511)
+  wired a reachability probe that provisioned one github-only microVM per
+  configured repository on every `doctor` invocation, so the deploy health
+  step's wall clock scaled with the repository count. Probing is now behind
+  `--probe` (implied by `--deep`); the default rows say "reachability
+  unverified from the host … `sbxloop doctor --probe` boots one to ask".
+  When it probes, repositories are grouped by credential (`token_env`, or
+  the daemon-wide token) and share one sandbox per group; a credential
+  whose sandbox will not boot answers "unverified" for every repository on
+  it without re-provisioning.
+
 - **The concierge files symptom-first issues and asks before filing a fix
   with no symptom** (#535). #519 was filed as the mechanism the person
   named ("remove the Discord embeds"); the loop implemented exactly that
