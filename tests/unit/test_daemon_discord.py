@@ -194,10 +194,25 @@ class FakeEngine:
 class FakeLoop:
     def __init__(self, dstore: DaemonStore) -> None:
         self.dstore = dstore
-        self.paused = False
+        self.holds: set[str] = set()
+        self.claiming: str | None = None
         self.cancelled = 0
         self.cancel_calls: list[tuple[str | None, bool]] = []
         self.retried: list[tuple[str, str | None]] = []
+        self.hold_calls: list[tuple[str, str | None, str | None]] = []
+
+    @property
+    def paused(self) -> bool:
+        return bool(self.holds)
+
+    @paused.setter
+    def paused(self, value: bool) -> None:
+        # Tests that predate named holds flip the flag directly: that is the
+        # operator's hold.
+        if value:
+            self.holds.add("operator")
+        else:
+            self.holds.clear()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -208,14 +223,23 @@ class FakeLoop:
             "run_cap_timezone": "UTC",
             "breaker_open": False,
             "paused": self.paused,
+            "holds": sorted(self.holds),
+            "claiming": self.claiming,
             "stopping": False,
         }
 
-    def pause(self) -> None:
-        self.paused = True
+    def pause(self, hold: str = "operator", *, by: str | None = None) -> list[str]:
+        self.hold_calls.append(("pause", hold, by))
+        self.holds.add(hold)
+        return sorted(self.holds)
 
-    def unpause(self) -> None:
-        self.paused = False
+    def unpause(self, hold: str | None = "operator", *, by: str | None = None) -> list[str]:
+        self.hold_calls.append(("unpause", hold, by))
+        if hold is None:
+            self.holds.clear()
+        else:
+            self.holds.discard(hold)
+        return sorted(self.holds)
 
     def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
         self.cancelled += 1

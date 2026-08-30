@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 
 from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
+from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
 from sbxloop.daemon.model import (
     DaemonNotice,
@@ -164,9 +165,17 @@ class DaemonLoop:
         self.install_workers = install_workers
         self._runner = runner or self._default_runner
         self._stop = threading.Event()
-        self._paused = False
+        # Pause is a set of named holds (#534): an operator's `pause` and a
+        # deploy's `pause --hold deploy-<id>` coexist, and each side releases
+        # only its own. The daemon idles while any hold stands.
+        self._holds: set[str] = set()
+        self._holds_lock = threading.Lock()
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
+        # The item whose claim is in progress: `status()` reports it so a
+        # restart is never timed into the window between the claim comment
+        # landing on the source and the claim being persisted (#530).
+        self._claiming: str | None = None
         self._cancel_request: CancelRequest | None = None
         # Breaker state lives in the store: a crash-restart loop must not
         # reset it (#254). These attributes are the write-through cache.
@@ -192,13 +201,60 @@ class DaemonLoop:
 
     @property
     def paused(self) -> bool:
-        return self._paused
+        with self._holds_lock:
+            return bool(self._holds)
 
-    def pause(self) -> None:
-        self._paused = True
+    @property
+    def holds(self) -> list[str]:
+        """The pause holds currently standing, sorted; empty when running."""
+        with self._holds_lock:
+            return sorted(self._holds)
 
-    def unpause(self) -> None:
-        self._paused = False
+    def pause(self, hold: str = OPERATOR_HOLD, *, by: str | None = None) -> list[str]:
+        """Take a named pause hold. Idempotent per name. Returns the holds
+        standing afterwards. The change is narrated once per transition —
+        a deploy's hold and an operator's pause both show up in the
+        chronology, so a paused daemon always says who is holding it."""
+        hold = hold_name(hold)
+        with self._holds_lock:
+            fresh = hold not in self._holds
+            self._holds.add(hold)
+            holds = sorted(self._holds)
+        if fresh:
+            self._notice(
+                "daemon.paused",
+                f"paused by {hold}" + (f" ({by})" if by else "") + f"; holds: {', '.join(holds)}",
+                hold=hold,
+                by=by,
+                holds=holds,
+            )
+        return holds
+
+    def unpause(self, hold: str | None = OPERATOR_HOLD, *, by: str | None = None) -> list[str]:
+        """Release one named hold (``None`` releases every hold — the
+        operator's override for a hold whose owner died without releasing
+        it). Returns the holds still standing; the daemon resumes claiming
+        only when that is empty."""
+        with self._holds_lock:
+            if hold is None:
+                released = sorted(self._holds)
+                self._holds.clear()
+            else:
+                hold = hold_name(hold)
+                released = [hold] if hold in self._holds else []
+                self._holds.discard(hold)
+            holds = sorted(self._holds)
+        if released:
+            self._notice(
+                "daemon.resumed",
+                f"hold released: {', '.join(released)}"
+                + (f" ({by})" if by else "")
+                + (f"; still paused by {', '.join(holds)}" if holds else "; claiming again"),
+                released=released,
+                by=by,
+                holds=holds,
+            )
+        return holds
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -476,7 +532,11 @@ class DaemonLoop:
             "max_runs_per_day": self.config.daemon.max_runs_per_day,
             "breaker_open": self._breaker_open(now),
             "consecutive_failures": self._consecutive_failures,
-            "paused": self._paused,
+            "paused": self.paused,
+            "holds": self.holds,
+            # The claim in progress, if any: not yet a run, but not idle
+            # either — a restart here orphans the issue (#530).
+            "claiming": self._claiming,
             "stopping": self._stop.is_set(),
         }
 
@@ -538,7 +598,7 @@ class DaemonLoop:
         # Liveness safety net for phantom active runs (#374); sweeps even while
         # paused, the very state the field report was filed from.
         self._reconcile_stale_runs(now)
-        if self._paused:
+        if self.paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
             return TickResult(idle_kind="breaker")
@@ -578,7 +638,14 @@ class DaemonLoop:
                 )
             return TickResult(discovered=discovered, idle_kind="no_work")
         if not item.claimed:
-            if not self.source.claim(item):
+            self._claiming = item.item_id
+            try:
+                claimed = self.source.claim(item)
+                if claimed:
+                    self.dstore.mark_claimed(item.item_id, now)
+            finally:
+                self._claiming = None
+            if not claimed:
                 self.dstore.mark_failed(item.item_id, "claim failed", now, requeue=False)
                 self._notice(
                     "item.claim_failed",
@@ -587,7 +654,6 @@ class DaemonLoop:
                     title=item.title,
                 )
                 return TickResult(discovered=discovered, dispatched=item.item_id, outcome="failed")
-            self.dstore.mark_claimed(item.item_id, now)
             log.info("item.claimed", item=item.item_id, title=item.title)
         if item.run_id is not None:
             outcome = self._resume(item, now)

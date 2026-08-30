@@ -2,9 +2,17 @@ name: Deploy to db
 
 # Deploys the release that Release just published to the daemon host (db), a
 # self-hosted runner. Merge to main -> Release tags + publishes to PyPI (~4 min)
-# -> this drains the daemon, upgrades it to that exact version, restarts the
-# service, health-checks it, and restores the operator's pause state. Any failed
-# check rolls back to the version that was running before.
+# -> this takes a named pause hold on the daemon, waits — without a cap — for
+# the run in flight to finish, upgrades to that exact version, restarts the
+# service, health-checks it, and restores every other hold. Any failed check
+# rolls back to the version that was running before.
+#
+# NEVER RESTART UNDER A LIVE RUN (#534): since 1.0 the loop merges its own
+# PRs, every merge deploys, and the next queued item is usually already
+# running when the deploy lands. A capped drain that "restarts anyway" killed
+# in-flight tasks and spent the item's resume budget for nothing of its own
+# doing. The only bound on the wait is this job's timeout-minutes; on timeout
+# nothing has been installed or restarted and the hold is released.
 #
 # SECURITY INVARIANT — DO NOT BREAK:
 #   No job carrying the `self-hosted` label may be reachable from a
@@ -26,7 +34,9 @@ on:
         required: false
         default: ""
 
-# Never cancel a deploy mid-restart; let a newer one queue behind it.
+# Never cancel a deploy mid-restart; let a newer one queue behind it. (GitHub
+# keeps at most one *pending* job per group: a third release cancels the
+# second's pending deploy and deploys itself, which is the right version.)
 concurrency:
   group: deploy-db
   cancel-in-progress: false
@@ -39,7 +49,11 @@ jobs:
     # A failed/cancelled Release has nothing to deploy.
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, db]
-    timeout-minutes: 60
+    # Bounds the idle wait. 1.0 runs take 14–180 min (#512 ran 182); the
+    # engine's own wall clock ([budgets] max_wall_clock_s, 2 h by default)
+    # does not cover CI and landing waits. A timeout here installs nothing:
+    # the hold is released and the daemon runs on as it was.
+    timeout-minutes: 480
 
     defaults:
       run:
@@ -61,6 +75,9 @@ jobs:
       WORKDIR: /home/bergs/sbxloop-work
       UNIT: sbxloop-daemon
       SECRETS_ENV: /home/bergs/.config/sbxloop/secrets.env
+      # This deploy's pause hold (#534). The operator's own `pause` is a
+      # separate hold: it survives the deploy, and we release only ours.
+      HOLD: deploy-${{ github.run_id }}
 
     steps:
       - name: Resolve the target version
@@ -113,16 +130,37 @@ jobs:
             echo "::notice::deploying ${current} -> ${{ steps.target.outputs.version }}"
           fi
 
+      - name: Take the deploy hold
+        id: hold
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # `ctl` resolves state_dir from the cwd, so it must run in WORKDIR.
+          cd "${WORKDIR}"
+          # Exit 2 = no daemon answered. Not fatal here: the wait below
+          # notices a daemon that never answers, and the health check is
+          # the thing that fails if it never comes up.
+          "${SBXLOOP}" daemon ctl pause --hold "${HOLD}" --timeout 30 || true
+          ctl_out="$("${SBXLOOP}" daemon ctl status --timeout 30 || true)"
+          echo "${ctl_out}"
+          current="$(grep -i '^current:' <<<"${ctl_out}" | sed 's/^current: *//' || true)"
+          echo "current=${current:-unknown}" >> "$GITHUB_OUTPUT"
+
       - name: Announce in Discord
         if: steps.installed.outputs.changed == 'true'
         env:
           VERSION: ${{ steps.target.outputs.version }}
           FROM: ${{ steps.installed.outputs.current }}
+          CURRENT: ${{ steps.hold.outputs.current }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         continue-on-error: true
         run: |
           set -euo pipefail
-          MSG="🚀 deploying sbxloop \`${FROM}\` → \`${VERSION}\` on \`db\` — [run](<${RUN_URL}>)"
+          if [ "${CURRENT}" = "idle" ] || [ "${CURRENT}" = "unknown" ]; then
+            MSG="🚀 deploying sbxloop \`${FROM}\` → \`${VERSION}\` on \`db\` — [run](<${RUN_URL}>)"
+          else
+            MSG="🚀 sbxloop \`${FROM}\` → \`${VERSION}\` staged on \`db\` — restart deferred until the daemon is idle (now: ${CURRENT}); hold \`${HOLD}\` — [run](<${RUN_URL}>)"
+          fi
           # Inlined rather than a script: this job has no checkout, so nothing
           # from the repo tree exists on the runner. Reuses the bot already in
           # the channel — no new webhook or repo secret to manage.
@@ -171,45 +209,48 @@ jobs:
           echo "::error::could not download the wheels for v${VERSION}"
           exit 1
 
-      - name: Record the daemon's pause state
-        id: state
-        if: steps.installed.outputs.changed == 'true'
-        run: |
-          set -euo pipefail
-          # `ctl` resolves state_dir from the cwd, so it must run in WORKDIR.
-          # Exit 2 = no daemon answered; treat that as "not paused" and let the
-          # health check below be the thing that fails.
-          ctl_out="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 30 || true)"
-          echo "${ctl_out}"
-          if grep -qi 'paused: true' <<<"${ctl_out}"; then
-            echo "paused=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::daemon is paused; the deploy will leave it paused."
-          else
-            echo "paused=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Pause and drain the in-flight run
+      - name: Wait for the daemon to go idle
+        id: drain
         if: steps.installed.outputs.changed == 'true'
         run: |
           set -euo pipefail
           cd "${WORKDIR}"
-          "${SBXLOOP}" daemon ctl pause --timeout 30 || true
+          # No cap (#534): a restart under a live run kills its in-flight task
+          # and spends a resume-budget slot the item did nothing to deserve.
+          # With the hold taken, nothing new is claimed, so once `current:`
+          # reads idle it stays idle. `claiming <item>` counts as busy: a
+          # restart in the claim window orphans the issue (#530).
           # Poll no faster than 15s: issue #309, status() mutates the circuit
           # breaker (it half-opens and decrements consecutive_failures).
-          for _ in $(seq 1 80); do   # 80 * 15s = 20 min
-            ctl_out="$("${SBXLOOP}" daemon ctl status --timeout 30 || true)"
-            if grep -qi '^current: idle' <<<"${ctl_out}"; then
-              echo "daemon is idle — safe to restart"
-              exit 0
+          # A daemon that answers nothing for 5 minutes straight has nothing
+          # to drain — the restart (and health check) is what fixes it.
+          waited=0
+          misses=0
+          while :; do
+            if ctl_out="$("${SBXLOOP}" daemon ctl status --timeout 30)"; then
+              misses=0
+              current="$(grep -i '^current:' <<<"${ctl_out}" | sed 's/^current: *//' || true)"
+              if [ "${current}" = "idle" ]; then
+                echo "daemon is idle after ${waited}s — safe to restart"
+                echo "waited_s=${waited}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "not idle (${current:-unknown}) — waiting (${waited}s so far)"
+            else
+              misses=$((misses + 1))
+              echo "no answer from the daemon (${misses}/20)"
+              if [ "${misses}" -ge 20 ]; then
+                echo "::warning::no daemon answered ctl status for 5 min — nothing to drain; restarting"
+                echo "waited_s=${waited}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
             fi
-            echo "run still in flight: $(grep -i '^current:' <<<"${ctl_out}" || echo unknown)"
             sleep 15
+            waited=$((waited + 15))
           done
-          # Not fatal: cancellation is honored at the next task boundary and an
-          # interrupted run is resumable, it just costs a resume-budget slot.
-          echo "::warning::run did not finish within 20 min — restarting anyway; the run will resume."
 
       - name: Upgrade
+        id: upgrade
         if: steps.installed.outputs.changed == 'true'
         env:
           VERSION: ${{ steps.target.outputs.version }}
@@ -226,6 +267,35 @@ jobs:
             "${DIST}/sbxloop_worker-${VERSION}-py3-none-any.whl" \
             "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord]"
           "${VENV_SBXLOOP}" --version
+
+      - name: Snapshot the holds to restore
+        id: state
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Holds are in-memory (#308), so the restart drops every one of
+          # them. Read them *now*, not at the start of the job: an operator
+          # who paused during the wait must still be paused afterwards.
+          # Ours is dropped from the list — the restart releases it.
+          ctl_out="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 30 || true)"
+          echo "${ctl_out}"
+          holds="$(grep -i '^holds:' <<<"${ctl_out}" | sed 's/^holds: *//' | tr ',' ' ' || true)"
+          if [ -z "${holds}" ] && grep -qi '^paused: true' <<<"${ctl_out}"; then
+            # A daemon from before named holds: its one boolean is the
+            # operator's hold. (Only the first deploy after the cutover.)
+            holds="operator"
+          fi
+          keep=""
+          for h in ${holds}; do
+            [ "${h}" = "none" ] && continue
+            [ "${h}" = "${HOLD}" ] && continue
+            keep="${keep} ${h}"
+          done
+          keep="${keep# }"
+          echo "holds=${keep}" >> "$GITHUB_OUTPUT"
+          if [ -n "${keep}" ]; then
+            echo "::notice::holds to restore after the restart: ${keep}"
+          fi
 
       - name: Restart the daemon
         if: steps.installed.outputs.changed == 'true'
@@ -277,7 +347,10 @@ jobs:
           echo "::notice::db is healthy on ${VERSION}"
 
       - name: Roll back
-        if: failure() && steps.installed.outputs.changed == 'true' && steps.state.outcome == 'success'
+        # Only once the upgrade ran: a failure before it (wheels, the wait)
+        # has changed nothing on the host, and a rollback restart would be
+        # exactly the needless restart this pipeline exists to avoid.
+        if: failure() && steps.installed.outputs.changed == 'true' && steps.upgrade.outcome != 'skipped'
         env:
           PREV: ${{ steps.installed.outputs.current }}
         run: |
@@ -293,23 +366,33 @@ jobs:
             && echo "rolled back to $("${VENV_SBXLOOP}" --version | awk '{print $2}')" \
             || echo "::error::ROLLBACK ALSO FAILED — db needs a human"
 
-      - name: Restore the daemon's pause state
+      - name: Restore the other holds
         # Runs after a rollback too: whatever version is live, the operator's
-        # intent must survive. Required because pause is in-memory only (#308),
-        # so the daemon always comes back claiming work.
+        # intent must survive. Required because holds are in-memory only
+        # (#308), so the daemon always comes back claiming work.
         if: always() && steps.installed.outputs.changed == 'true' && steps.state.outcome == 'success'
         env:
-          WAS_PAUSED: ${{ steps.state.outputs.paused }}
+          HOLDS: ${{ steps.state.outputs.holds }}
         run: |
           set -euo pipefail
           cd "${WORKDIR}"
           # Must run AFTER the restart: ControlServer refuses any request
           # stamped before the daemon started ("resend it").
-          if [ "${WAS_PAUSED}" = "true" ]; then
-            "${SBXLOOP}" daemon ctl pause --timeout 60 || echo "::warning::could not re-pause"
-          else
-            "${SBXLOOP}" daemon ctl resume --timeout 60 || echo "::warning::could not resume"
-          fi
+          for h in ${HOLDS}; do
+            "${SBXLOOP}" daemon ctl pause --hold "${h}" --timeout 60 \
+              || echo "::warning::could not restore hold ${h}"
+          done
+
+      - name: Release the deploy hold
+        # Whatever happened — timed out waiting, failed before the restart —
+        # our hold must not outlive the job. After a restart it is already
+        # gone (in-memory) and this is a no-op.
+        if: always() && steps.hold.outcome == 'success'
+        run: |
+          set -euo pipefail
+          cd "${WORKDIR}"
+          "${SBXLOOP}" daemon ctl resume --hold "${HOLD}" --timeout 60 \
+            || echo "::warning::could not release hold ${HOLD}"
           "${SBXLOOP}" daemon ctl status --timeout 60 || true
 
       - name: Clean up the downloaded wheels
@@ -322,12 +405,20 @@ jobs:
           VERSION: ${{ steps.target.outputs.version }}
           FROM: ${{ steps.installed.outputs.current }}
           RESULT: ${{ job.status }}
+          WAITED_S: ${{ steps.drain.outputs.waited_s }}
+          UPGRADED: ${{ steps.upgrade.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         continue-on-error: true
         run: |
           set -euo pipefail
+          waited=""
+          if [ "${WAITED_S:-0}" -gt 0 ] 2>/dev/null; then
+            waited=" after waiting $((WAITED_S / 60)) min for the daemon to go idle"
+          fi
           if [ "${RESULT}" = "success" ]; then
-            MSG="✅ \`db\` deployed sbxloop \`${VERSION}\` — [run](<${RUN_URL}>)"
+            MSG="✅ \`db\` restarted on sbxloop \`${VERSION}\`${waited} — [run](<${RUN_URL}>)"
+          elif [ "${UPGRADED}" = "skipped" ]; then
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`db\` **${RESULT}** before anything was installed — still on \`${FROM}\`, daemon untouched. [run](<${RUN_URL}>)"
           else
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`db\` **${RESULT}** — rolled back to \`${FROM}\`. [run](<${RUN_URL}>)"
           fi

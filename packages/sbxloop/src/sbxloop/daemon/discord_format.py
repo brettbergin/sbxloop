@@ -1776,8 +1776,19 @@ def summary_embed(
 
 def status_embed(status: dict[str, Any]) -> EmbedSpec:
     cur = status.get("current")
-    current = f"{code(cur['run_id'])} — {_one_line(cur.get('title') or '', 120)}" if cur else "idle"
+    if cur:
+        current = f"{code(cur['run_id'])} — {_one_line(cur.get('title') or '', 120)}"
+    elif status.get("claiming"):
+        current = f"claiming {code(str(status['claiming']))}"
+    else:
+        current = "idle"
     breaker = "open" if status.get("breaker_open") else "closed"
+    holds = list(status.get("holds") or [])
+    paused = (
+        "yes (" + ", ".join(code(h) for h in holds) + ")"
+        if holds
+        else ("yes" if status.get("paused") else "no")
+    )
     resumes = status.get("resumes_today", 0)
     tz = status.get("run_cap_timezone", "UTC")
     fields = (
@@ -1790,7 +1801,7 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
             True,
         ),
         ("Breaker", breaker, True),
-        ("Paused", "yes" if status.get("paused") else "no", True),
+        ("Paused", paused, True),
     )
     color = (
         COLOR_FAIL

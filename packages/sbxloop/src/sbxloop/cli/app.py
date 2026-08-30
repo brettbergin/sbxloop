@@ -1961,8 +1961,9 @@ def daemon_ctl(
     command: Annotated[
         list[str],
         typer.Argument(
-            help="status | pause | resume | cancel [--retry] | queue | items | abandon <item> "
-            "[reason] | retry <item> | requeue <item> (the Discord !sbx verbs)."
+            help="status | pause [--hold NAME] | resume [--hold NAME|--all] | cancel "
+            "[--retry] | queue | items | abandon <item> [reason] | retry <item> | "
+            "requeue <item> (the Discord !sbx verbs)."
         ),
     ],
     timeout: Annotated[

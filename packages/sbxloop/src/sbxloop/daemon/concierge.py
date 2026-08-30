@@ -494,10 +494,13 @@ class Concierge:
                     name="sbx_control",
                     description=(
                         f"Run one operator command exactly as `{prefix} <command>` would: "
-                        "status | pause | resume | cancel [--retry] | queue | items | "
-                        "abandon <item> [reason] | retry <item> | requeue <item>. Pass the "
-                        "command line without the prefix. Mutating commands take effect "
-                        "immediately."
+                        "status | pause [--hold NAME] | resume [--hold NAME|--all] | "
+                        "cancel [--retry] | queue | items | abandon <item> [reason] | "
+                        "retry <item> | requeue <item>. Pass the command line without the "
+                        "prefix. Mutating commands take effect immediately. Pause is a set "
+                        "of named holds: a bare pause/resume acts on the operator's hold, "
+                        "a deploy holds `deploy-<id>` while it waits for the daemon to go "
+                        "idle, and `resume --all` clears every hold."
                     ),
                     parameters=_schema({"command": {"type": "string"}}, ["command"]),
                 ),

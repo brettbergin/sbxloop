@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from sbxloop.daemon.discord_format import code, items_lines, queue_lines
+from sbxloop.daemon.holds import OPERATOR_HOLD
 from sbxloop.ghids import normalize_item_id
 from sbxloop.log import get_logger
 
@@ -42,8 +43,8 @@ log = get_logger(__name__)
 # them together instead of drifting.
 COMMANDS: tuple[str, ...] = (
     "status",
-    "pause",
-    "resume",
+    "pause [--hold NAME]",
+    "resume [--hold NAME|--all]",
     "cancel [--retry]",
     "queue",
     "items",
@@ -151,19 +152,52 @@ def _dispatch(
     if word == "status":
         s = loop.status()
         cur = s["current"]
+        claiming = s.get("claiming")
+        # `current:` is the line the deploy pipeline greps for idleness; a
+        # claim in progress is reported there too, so a restart is never
+        # timed into the claim window (#530).
+        if cur:
+            current = f"{cur['run_id']} — {cur['title']}"
+        elif claiming:
+            current = f"claiming {claiming}"
+        else:
+            current = "idle"
+        holds = list(s.get("holds") or ([OPERATOR_HOLD] if s["paused"] else []))
         lines = [
-            f"**current:** {cur['run_id']} — {cur['title']}" if cur else "**current:** idle",
+            f"**current:** {current}",
             f"**queued:** {s['queued']} · **runs today ({_tz(s)}):** "
             f"{s['runs_today']}/{s['max_runs_per_day']}, resets at 00:00 {_tz(s)}"
             f" (resumes {s.get('resumes_today', 0)})",
             f"**breaker:** {'open' if s['breaker_open'] else 'closed'} · **paused:** {s['paused']}",
+            f"**holds:** {', '.join(holds) if holds else 'none'}",
         ]
         return CommandReply("\n".join(lines), status=s)
     if word == "pause":
-        loop.pause()
-        return CommandReply("paused — the current run finishes; nothing new is claimed.")
+        hold, err = _hold_arg(args, word, prefix, allow_all=False)
+        if err is not None:
+            return err
+        try:
+            holds = loop.pause(hold or OPERATOR_HOLD, by=by)
+        except ValueError as exc:
+            return CommandReply(str(exc), ok=False)
+        return CommandReply(
+            f"paused (hold {code(hold or OPERATOR_HOLD)}) — the current run finishes; "
+            f"nothing new is claimed. holds: {', '.join(holds)}"
+        )
     if word in ("resume", "unpause"):
-        loop.unpause()
+        hold, err = _hold_arg(args, word, prefix, allow_all=True)
+        if err is not None:
+            return err
+        try:
+            holds = loop.unpause(None if hold == "--all" else (hold or OPERATOR_HOLD), by=by)
+        except ValueError as exc:
+            return CommandReply(str(exc), ok=False)
+        if holds:
+            return CommandReply(
+                f"released {code('every hold' if hold == '--all' else hold or OPERATOR_HOLD)}; "
+                f"still paused by {', '.join(code(h) for h in holds)} "
+                f"(`{prefix} resume --hold <name>` or `{prefix} resume --all`)."
+            )
         return CommandReply("resumed.")
     if word == "cancel":
         # Attributed to the operator: the item is settled as cancelled (no
@@ -196,6 +230,25 @@ def _dispatch(
     if word in ITEM_COMMANDS:
         return _item_command(loop, word, args, by)
     return CommandReply(usage(prefix), ok=False, known=False)
+
+
+def _hold_arg(
+    args: list[str], word: str, prefix: str, *, allow_all: bool
+) -> tuple[str | None, CommandReply | None]:
+    """Parse ``[--hold NAME]`` (and ``--all`` for resume). Returns the hold
+    name, ``"--all"``, or ``None`` for the operator's default hold — or a
+    not-ok reply for anything else, so a typo can never become a silent
+    bare pause/resume of the wrong hold."""
+    usage_line = f"usage: `{prefix} {word} [--hold NAME" + ("|--all]`" if allow_all else "]`")
+    if not args:
+        return None, None
+    if allow_all and args == ["--all"]:
+        return "--all", None
+    if args[0] == "--hold" and len(args) == 2:
+        return args[1], None
+    return None, CommandReply(
+        f"unknown {word} argument {code(' '.join(args))}; {usage_line}", ok=False
+    )
 
 
 def _item_command(loop: Any, word: str, args: list[str], by: str | None) -> CommandReply:
