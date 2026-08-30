@@ -42,6 +42,7 @@ from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
 from sbxloop.config import Config
+from sbxloop.daemon.chat_choices import ChoiceQuestion, parse_choice_question
 from sbxloop.daemon.control import dispatch, plain
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -112,6 +113,10 @@ class ConciergeReply(NamedTuple):
     text: str
     ok: bool = True
     error: str | None = None
+    #: Set when the reply carried a well-formed ``sbx-choices`` spec, so the
+    #: transport can offer clickable answers. ``None`` for ordinary prose —
+    #: including a malformed spec, which degrades to prose.
+    question: ChoiceQuestion | None = None
 
 
 class SessionHost(Protocol):
@@ -351,7 +356,11 @@ class Concierge:
             session=new_session,
             duration_s=round(time.monotonic() - started, 1),
         )
-        return ConciergeReply(_clip(output, self.config.concierge.max_reply_chars))
+        clean, question = parse_choice_question(output)
+        return ConciergeReply(
+            _clip(clean, self.config.concierge.max_reply_chars),
+            question=question,
+        )
 
     def _attempt(
         self,

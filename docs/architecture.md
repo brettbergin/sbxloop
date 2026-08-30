@@ -765,6 +765,38 @@ when both are set without a choice, headless when neither is), and
 `chat.build_bridge` imports only the chosen module, so a Discord deployment
 never loads slack_sdk and vice versa.
 
+**Clarifying questions with enumerable answers** (#564) are transport-free
+too. `daemon/chat_choices.py` knows nothing about any backend: it parses the
+fenced ```` ```sbx-choices ```` JSON block the concierge prompt teaches the agent to
+emit (2–5 options — Discord's action-row limit), strips it from the prose, and
+carries it on `ConciergeReply.question` as a `ChoiceQuestion`; a malformed or
+oversized spec simply yields `None`, so the reply degrades to ordinary prose.
+It also owns `render_prose` (the numbered fallback rendering) and
+`match_free_text` (mapping a typed "2" / "the layout" / an unambiguous prefix
+back onto a choice value). The bridge adds one seam, `_send_choices`, whose
+base implementation is the prose floor every backend gets — Slack is
+unaffected — and `DiscordBridge` overrides it with a `discord.ui.View` of one
+button per choice, keeping the same numbered prose in the message body so a
+send the API rejects, a discord.py without component support, or a host that
+never installed the extra all still leave a question answerable by typing.
+
+Outstanding questions live in a **bounded in-memory registry** on the bridge
+(posted message id → question, capped at 64, each with a 15-minute deadline
+that matches the view's timeout); nothing is persisted, so a restart just
+forgets them and the next typed answer is read as prose. A click resolves the
+choice, pops the entry, and schedules the ordinary concierge turn with the
+selected value as its text — byte-identical to what typing that option would
+have sent, which is why the click and typed paths cannot diverge. The inbound
+path consults the same registry before every concierge turn, so a typed reply
+that names an option is normalised the same way and one that names none is
+passed through untouched. A click on an expired or already-answered question
+is acknowledged ephemerally with "type your answer" rather than raising or
+hanging, and the timeout greys the buttons out with the same note.
+`tests/unit/test_daemon_clarify_end_to_end.py` (re-exported from
+`test_daemon_end_to_end.py`) drives the whole chain — real concierge, real
+bridge, stubbed `discord.ui` — and asserts the click-answered and
+typed-answered exchanges reach the model with identical prompts.
+
 ### Tool calls in a run thread
 
 A watcher reads a run thread to see what the agents are *executing*, so tool

@@ -121,14 +121,19 @@ class FakeMessage:
         self.reactions.append(emoji)
 
     async def edit(
-        self, *, content: str | None = None, embed: Any = None, suppress: bool | None = None
+        self,
+        *,
+        content: str | None = None,
+        embed: Any = None,
+        suppress: bool | None = None,
+        **extra: Any,
     ) -> None:
         if content is not None:
             self.content = content
         self.embed = embed
         self.suppress = suppress
         self.edit_kwargs = getattr(self, "edit_kwargs", [])
-        self.edit_kwargs.append({"content": content, "embed": embed, "suppress": suppress})
+        self.edit_kwargs.append({"content": content, "embed": embed, "suppress": suppress, **extra})
         self.edits = getattr(self, "edits", 0) + 1
 
     async def create_thread(self, name: str) -> FakeChannel:
@@ -2034,3 +2039,259 @@ class TestEmbedsArePreserved:
         status = thread.messages[known.status_id]
         assert status.embed is None
         assert getattr(status, "edit_kwargs", [{}])[-1].get("suppress") is True
+
+
+# -- clarifying questions with clickable choices (#564) ---------------------------------
+
+
+class StubButton:
+    def __init__(self, *, label: str, style: Any = None, row: int | None = None) -> None:
+        self.label = label
+        self.style = style
+        self.row = row
+        self.callback: Any = None
+        self.disabled = False
+
+
+class StubView:
+    """Stands in for discord.ui.View so the component path is exercised
+    without the optional extra (CI syncs without it)."""
+
+    def __init__(self, *, timeout: float | None = None) -> None:
+        self.timeout = timeout
+        self.children: list[StubButton] = []
+
+    def add_item(self, item: StubButton) -> None:
+        self.children.append(item)
+
+
+def stub_discord_module() -> Any:
+    import types
+
+    mod = types.ModuleType("discord")
+    ui = types.ModuleType("discord.ui")
+    ui.View = StubView
+    ui.Button = StubButton
+    mod.ui = ui
+    mod.ButtonStyle = type("ButtonStyle", (), {"secondary": "secondary"})
+    return mod
+
+
+@pytest.fixture
+def stub_discord(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import sys
+
+    mod = stub_discord_module()
+    monkeypatch.setitem(sys.modules, "discord", mod)
+    monkeypatch.setitem(sys.modules, "discord.ui", mod.ui)
+    return mod
+
+
+class StubResponse:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.messages: list[tuple[str, bool]] = []
+        self.deferred = 0
+        self.fail = fail
+
+    async def send_message(self, content: str, *, ephemeral: bool = False) -> None:
+        if self.fail:
+            raise RuntimeError("interaction already acknowledged")
+        self.messages.append((content, ephemeral))
+
+    async def defer(self) -> None:
+        self.deferred += 1
+
+
+class StubInteraction:
+    def __init__(self, name: str = "clicker", *, fail: bool = False) -> None:
+        self.user = FakeUser(9, name)
+        self.response = StubResponse(fail=fail)
+
+
+CHOICE_Q = None
+
+
+def _question() -> Any:
+    from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion
+
+    return ChoiceQuestion(
+        prompt="What do you want changed?",
+        choices=(
+            Choice(value="the wording", label="The wording"),
+            Choice(value="the layout", label="The layout"),
+        ),
+    )
+
+
+class TestChoiceComponents:
+    def test_buttons_are_attached_for_an_enumerable_question(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        question = _question()
+        posted = asyncio.run(bridge._send_choices(channel, "I need one more thing.", question))
+        assert posted is not None
+        view = channel.sent_kwargs[-1]["view"]
+        assert [b.label for b in view.children] == ["The wording", "The layout"]
+        assert all(b.row == 0 for b in view.children)
+        assert view.timeout == bridge._question_ttl_s
+        # the prose is still in the body, so typing works either way
+        assert "The wording" in channel.sent[-1]
+        assert channel.sent_kwargs[-1]["suppress_embeds"] is True
+        assert channel.sent_kwargs[-1]["allowed_mentions"] == "none"
+
+    def test_a_click_answers_through_answer_choice_with_no_typing(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        question = _question()
+        posted = asyncio.run(bridge._send_choices(channel, "", question))
+        answered: list[tuple[str, str, str | None]] = []
+        bridge._answer_choice = lambda mid, value, author=None, **kw: (  # type: ignore[method-assign]
+            answered.append((mid, value, author)) or True
+        )
+        view = channel.sent_kwargs[-1]["view"]
+        interaction = StubInteraction("brett")
+        asyncio.run(view.children[1].callback(interaction))
+        assert answered == [(str(posted.id), "the layout", "Discord user `brett`")]
+        assert interaction.response.messages and "the layout" in interaction.response.messages[0][0]
+        # the message is edited to record the answer and drop the buttons
+        assert posted.edit_kwargs[-1]["view"] is None
+        assert "the layout" in posted.edit_kwargs[-1]["content"]
+
+    def test_inbound_carries_the_replied_to_message_id(self, tmp_path: Path) -> None:
+        # #570 review: matching a typed answer to its question needs the
+        # reference id, not recency.
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        target = FakeMessage("QUESTION", channel, bot=True, mid=888)
+        reply = FakeMessage("1", channel, mid=889, reply_to=target)
+        # the gateway often gives only message_id, with nothing resolved
+        reply.reference = type("Ref", (), {"resolved": None, "message_id": 888})()
+        inbound = bridge._inbound(reply)
+        assert inbound is not None and inbound.reply_to_id == "888"
+        plain = bridge._inbound(FakeMessage("hi", channel, mid=890))
+        assert plain is not None and plain.reply_to_id is None
+
+    def test_a_click_reports_the_clicker_identity(self, tmp_path: Path, stub_discord: Any) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        asyncio.run(bridge._send_choices(channel, "", _question()))
+        seen: list[dict[str, Any]] = []
+        bridge._answer_choice = lambda mid, value, author=None, **kw: (  # type: ignore[method-assign]
+            seen.append({"author": author, **kw}) or True
+        )
+        view = channel.sent_kwargs[-1]["view"]
+        asyncio.run(view.children[0].callback(StubInteraction("dana")))
+        assert seen and seen[0]["author_name"] == "dana"
+        assert seen[0]["author_id"] is not None
+
+    def test_a_failed_view_send_logs_the_real_traceback(
+        self, tmp_path: Path, stub_discord: Any, caplog: Any
+    ) -> None:
+        # #570 review: the warning ran outside the `except`, so `exc_info=True`
+        # logged "NoneType: None" instead of why the send failed.
+        import logging
+
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        real_send = channel.send
+
+        async def send(text: str | None = None, **kwargs: Any) -> Any:
+            if "view" in kwargs:
+                raise RuntimeError("components not supported here")
+            return await real_send(text, **kwargs)
+
+        channel.send = send  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING, logger="sbxloop.daemon.discord"):
+            asyncio.run(bridge._send_choices(channel, "", _question()))
+        record = next(r for r in caplog.records if "choices_view_send_failed" in r.getMessage())
+        # structlog carries the caught exception through as the exc_info
+        # value; `exc_info=True` here would have rendered "NoneType: None"
+        # because sys.exc_info() is already cleared at this point.
+        payload = record.msg if isinstance(record.msg, dict) else {}
+        carried = payload.get("exc_info", record.exc_info)
+        if isinstance(carried, tuple):
+            carried = carried[1]
+        assert isinstance(carried, RuntimeError)
+        assert "components not supported here" in str(carried)
+
+    def test_a_view_rejecting_send_falls_back_to_prose(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        real_send = channel.send
+
+        async def send(text: str | None = None, **kwargs: Any) -> Any:
+            if "view" in kwargs:
+                raise RuntimeError("components not supported here")
+            return await real_send(text, **kwargs)
+
+        channel.send = send  # type: ignore[method-assign]
+        posted = asyncio.run(bridge._send_choices(channel, "", _question()))
+        assert posted is not None
+        assert "view" not in channel.sent_kwargs[-1]
+        assert "1. The wording" in channel.sent[-1]
+        assert "answer in your own words" in channel.sent[-1]
+
+    def test_components_unavailable_posts_prose(self, tmp_path: Path) -> None:
+        # no stub_discord fixture: discord.py has no ui.View on this host
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        posted = asyncio.run(bridge._send_choices(channel, "", _question()))
+        assert posted is not None
+        assert "view" not in channel.sent_kwargs[-1]
+        assert "1. The wording" in channel.sent[-1]
+
+    def test_a_click_after_expiry_is_answered_not_raised(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        asyncio.run(bridge._send_choices(channel, "", _question()))
+        view = channel.sent_kwargs[-1]["view"]
+        # nothing was ever registered, so the bridge does not know this id
+        interaction = StubInteraction()
+        asyncio.run(view.children[0].callback(interaction))
+        note, ephemeral = interaction.response.messages[0]
+        assert ephemeral and "type your answer" in note
+
+    def test_a_failing_acknowledgement_defers_instead_of_raising(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        asyncio.run(bridge._send_choices(channel, "", _question()))
+        view = channel.sent_kwargs[-1]["view"]
+        interaction = StubInteraction(fail=True)
+        asyncio.run(view.children[0].callback(interaction))
+        assert interaction.response.deferred == 1
+
+    def test_timeout_disables_the_buttons_and_says_typing_works(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        from sbxloop.daemon.discord import TIMED_OUT_NOTE
+
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        posted = asyncio.run(bridge._send_choices(channel, "", _question()))
+        view = channel.sent_kwargs[-1]["view"]
+        asyncio.run(view.on_timeout())
+        assert posted.edit_kwargs[-1]["view"] is None
+        assert TIMED_OUT_NOTE in posted.edit_kwargs[-1]["content"]
+
+    def test_answered_question_ignores_a_later_timeout(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        posted = asyncio.run(bridge._send_choices(channel, "", _question()))
+        bridge._answer_choice = lambda mid, value, author=None, **kw: True  # type: ignore[method-assign]
+        view = channel.sent_kwargs[-1]["view"]
+        asyncio.run(view.children[0].callback(StubInteraction()))
+        edits = len(posted.edit_kwargs)
+        asyncio.run(view.on_timeout())
+        assert len(posted.edit_kwargs) == edits
