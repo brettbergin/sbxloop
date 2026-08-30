@@ -8,6 +8,25 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A daemon killed mid-claim no longer orphans the issue** (#530). A
+  restart between "claim comment posted" and "claim persisted" left the
+  new process losing the claim race to its own dead predecessor and
+  terminal-failing the row — permanently, since `failed` is what discovery
+  dedups against (#527 was fixed by hand). Four changes, one per hole: the
+  claim comment carries `host=… pid=… started=…` and a claim from a dead
+  pid on this host, or older than `[daemon] claim_stale_after_s` (default
+  300 s) with no "Run … started" comment after it, is released and
+  reclaimed (`github.claim_reclaimed`); a claim that is not ours — lost
+  race, closed issue, trigger gone, GitHub down — leaves no row at all
+  (`DaemonStore.discard`), so the next poll re-creates it if the trigger
+  label is still there; the claim token is persisted
+  (`daemon_work_items.claim_token`) before the comment goes up, and
+  recovery settles a half-claim against the issue (`settle_claim`:
+  comment present → finish the label swap and dispatch; absent → claim
+  again), narrated as `recovery.claim_settled`; and SIGINT/SIGTERM are
+  held for the seconds a claim takes (`defer_signals`) and delivered after
+  it is persisted. The pre-#530 store shape is in the legacy-db fixture.
+
 - **Single-identity review posts PR comments, not a doomed review** (#513).
   One token opens the PR and reviews it, so every round POSTed
   `REQUEST_CHANGES`/`APPROVE`, took a 422 ("can not request changes on your

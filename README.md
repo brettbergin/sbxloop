@@ -312,7 +312,17 @@ starts a run.
 The labels are the state machine, and every transition is visible on the
 issue:
 
-- **Claim.** `sbxloop:run` → `sbxloop:in-progress`, plus a claim comment.
+- **Claim.** `sbxloop:run` → `sbxloop:in-progress`, plus a claim comment
+  (`<!-- sbxloop-claim <token> host=… pid=… started=… -->`) that doubles as
+  the lock between daemons. The token is persisted *before* the comment is
+  posted and SIGTERM is held until the claim is complete, so a process that
+  dies mid-claim leaves a row the next start settles against the issue —
+  finishing the claim if the comment landed, forgetting it if not. A claim
+  comment from a dead process (this host, dead pid; or older than
+  `[daemon] claim_stale_after_s` with no run started) is released and
+  reclaimed, and a claim that turns out not to be ours (another daemon won,
+  the issue closed, the label went away) leaves no row at all — the next
+  poll re-creates it if the trigger label is still there.
   The comment is the lock: GitHub has no compare-and-swap on labels, but a
   comment is created exactly once and ordered, so two daemons watching one
   repository cannot both take an issue. A `Run <id> started.` comment

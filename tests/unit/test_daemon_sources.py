@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 
@@ -115,9 +116,20 @@ def issue(number: int, *labels: str, state: str = "open") -> dict[str, Any]:
     }
 
 
+# The fixtures' comment timestamps are 2026-08-15T10:00:00Z; a source built
+# on the real clock would read every scripted rival as stale by age (#530).
+FIXTURE_NOW = 1786788000.0
+
+
 class TestGitHubSource:
     def make(self, ops: RecordingOps) -> GitHubIssueSource:
-        return GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        return GitHubIssueSource(
+            lambda: ops,  # type: ignore[arg-type]
+            "o/r",
+            LABELS,
+            host="db",
+            clock=lambda: FIXTURE_NOW,
+        )
 
     def test_poll_uses_the_one_trigger_label_query(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run"), "5": issue(5, "sbxloop:failed")})
@@ -608,3 +620,170 @@ class TestTypedItemIds:
         items = source.poll()
         assert [i.item_id for i in items] == ["gh:issue:12"]
         assert [i.source_key for i in items] == ["12"]
+
+
+class TestClaimStaleness:
+    """#530: a claim comment from a process that is gone is not a live
+    claim — it is released and the race judged among the live ones."""
+
+    NOW = 1_700_000_000.0  # 2023-11-14T22:13:20Z
+
+    def make(self, ops: RecordingOps, *, alive: bool = True, stale_after_s: float = 300.0):
+        return GitHubIssueSource(
+            lambda: ops,  # type: ignore[arg-type]
+            "o/r",
+            LABELS,
+            host="db",
+            pid=4242,
+            alive=lambda pid: alive,
+            clock=lambda: self.NOW,
+            stale_after_s=stale_after_s,
+        )
+
+    @staticmethod
+    def rival(
+        token: str, *, host: str = "db", pid: int = 99, started: str = "2023-11-14T22:13:00Z"
+    ) -> str:
+        return (
+            f"{CLAIM_MARKER}{token} host={host} pid={pid} started={started} -->\n"
+            "sbxloop daemon claimed this issue."
+        )
+
+    def test_the_claim_comment_carries_host_pid_and_start(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0].model_copy(update={"claim_token": "f" * 32})
+        assert self.make(ops).claim(item) is True
+        ((_, body),) = ops.comments
+        assert body.startswith(
+            f"{CLAIM_MARKER}{'f' * 32} host=db pid=4242 started=2023-11-14T22:13:20Z -->"
+        )
+
+    def test_a_dead_pid_on_this_host_is_reclaimed(self) -> None:
+        """The 2026-08-29 21:10Z sequence: the old process's comment sits
+        first; the new process would have conceded to its own predecessor."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.comment_rows.append(
+            {"id": 50, "body": self.rival("b" * 32, pid=99), "created_at": "2023-11-14T22:13:10Z"}
+        )
+        assert self.make(ops, alive=False).claim(item) is True
+        assert ops.deleted_comments == [50], "the stale claim is released, ours stands"
+        assert any("labels" in p and m == "POST" for m, p, _ in ops.raw_calls)
+
+    def test_a_live_pid_on_this_host_wins_the_race(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.comment_rows.append(
+            {"id": 50, "body": self.rival("b" * 32, pid=99), "created_at": "2023-11-14T22:13:10Z"}
+        )
+        assert self.make(ops, alive=True).claim(item) is False
+        assert ops.deleted_comments == [100], "ours is released, the rival's stands"
+
+    def test_an_old_claim_with_no_run_started_is_reclaimed_from_any_host(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.comment_rows.append(
+            {
+                "id": 50,
+                "body": self.rival("b" * 32, host="elsewhere", pid=7),
+                "created_at": "2023-11-14T21:00:00Z",  # over an hour ago
+            }
+        )
+        assert self.make(ops, alive=True).claim(item) is True
+        assert ops.deleted_comments == [50]
+
+    def test_an_old_claim_whose_run_started_is_live(self) -> None:
+        """A stuck run is recovery's problem on that host, not a free issue."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.comment_rows.append(
+            {
+                "id": 50,
+                "body": self.rival("b" * 32, host="elsewhere", pid=7),
+                "created_at": "2023-11-14T21:00:00Z",
+            }
+        )
+        ops.comment_rows.append(
+            {"id": 51, "body": "Run `rxyz` started.", "created_at": "2023-11-14T21:00:30Z"}
+        )
+        assert self.make(ops, alive=True).claim(item) is False
+        assert ops.deleted_comments == [100]
+
+    def test_a_recent_claim_from_another_host_is_live(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.comment_rows.append(
+            {
+                "id": 50,
+                "body": self.rival("b" * 32, host="elsewhere", pid=7),
+                "created_at": "2023-11-14T22:13:10Z",
+            }
+        )
+        assert self.make(ops, alive=True).claim(item) is False
+
+    def test_staleness_by_age_can_be_switched_off(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.comment_rows.append(
+            {
+                "id": 50,
+                "body": self.rival("b" * 32, host="elsewhere", pid=7),
+                "created_at": "2023-11-14T21:00:00Z",
+            }
+        )
+        assert self.make(ops, stale_after_s=0).claim(item) is False
+
+    def test_a_claim_comment_without_metadata_still_counts(self) -> None:
+        """Comments from before the metadata existed parse, and are judged
+        by age alone."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        old_form = f"{CLAIM_MARKER}{'b' * 32} -->\nclaimed (host `other`)."
+        ops.comment_rows.append({"id": 50, "body": old_form, "created_at": "2023-11-14T22:13:10Z"})
+        assert self.make(ops).claim(item) is False
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        ops.comment_rows.append({"id": 50, "body": old_form, "created_at": "2023-11-14T21:00:00Z"})
+        assert self.make(ops).claim(item) is True
+        assert ops.deleted_comments == [50]
+
+
+class TestSettleClaim:
+    """#530: recovery asks the source whether a half-claim's comment landed."""
+
+    def make(self, ops: RecordingOps) -> GitHubIssueSource:
+        return GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+
+    def test_comment_present_finishes_the_label_swap(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        token = "c" * 32
+        ops.comment_rows.append(
+            {
+                "id": 50,
+                "body": f"{CLAIM_MARKER}{token} host=db pid=1 started=x -->\nclaimed.",
+                "created_at": "2026-08-15T10:00:00Z",
+            }
+        )
+        item = gh(4, claim_token=token)
+        assert self.make(ops).settle_claim(item) is True
+        writes = [(m, unquote(p.rsplit("/", 1)[-1])) for m, p, _ in ops.raw_calls if "labels" in p]
+        assert ("POST", "labels") in writes and ("DELETE", "sbxloop:run") in writes
+
+    def test_comment_present_and_labels_already_swapped_changes_nothing(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+        token = "c" * 32
+        ops.comment_rows.append(
+            {"id": 50, "body": f"{CLAIM_MARKER}{token} -->", "created_at": "2026-08-15T10:00:00Z"}
+        )
+        assert self.make(ops).settle_claim(gh(4, claim_token=token)) is True
+        assert not any("labels" in p for _, p, _ in ops.raw_calls)
+
+    def test_comment_absent_means_nothing_reached_the_source(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        assert self.make(ops).settle_claim(gh(4, claim_token="c" * 32)) is False
+        assert self.make(ops).settle_claim(gh(4)) is False
+        assert not any("labels" in p for _, p, _ in ops.raw_calls)
+
+    def test_a_github_failure_reads_as_absent(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        ops.fail_on.add("GET")
+        assert self.make(ops).settle_claim(gh(4, claim_token="c" * 32)) is False

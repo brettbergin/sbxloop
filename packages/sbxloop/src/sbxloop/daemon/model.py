@@ -64,6 +64,11 @@ class WorkItem(BaseModel):
     # backoff of an exhausted run waiting to resume its own PR (#523). None
     # means the ordinary rules (attempt backoff; pinned resumes go first).
     not_before: float | None = None
+    # The token of the claim comment this daemon posted (or is about to
+    # post) for the item — persisted *before* the comment goes up (#530),
+    # so a process that dies between the two leaves a row recovery can
+    # settle: finish the claim if the comment landed, forget it if not.
+    claim_token: str | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -154,6 +159,7 @@ NoticeKind = Literal[
     "workspace.refresh_failed",
     "item.queued",
     "item.claim_failed",
+    "recovery.claim_settled",
     "item.abandoned",
     "item.requeued",
     "item.abandon_cancelling",

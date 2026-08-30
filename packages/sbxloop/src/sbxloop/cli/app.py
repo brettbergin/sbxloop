@@ -1653,6 +1653,7 @@ def daemon(
         config.github.enabled_repos(),
         labels,
         on_failure=github.note_failure,
+        stale_after_s=config.daemon.claim_stale_after_s,
     )
 
     # One line an operator can read back from the journal to know exactly

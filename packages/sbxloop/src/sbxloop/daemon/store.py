@@ -67,6 +67,9 @@ _WORK_ITEMS_BODY = """(
     -- Earliest dispatch time, when a retry is scheduled rather than backed
     -- off by attempt count (an exhausted run resuming its own PR, #523).
     not_before  REAL,
+    -- The claim comment's token, written before the comment is posted so
+    -- a half-claim survives the process that made it (#530).
+    claim_token TEXT,
     UNIQUE(source_key, repo)
 )"""
 
@@ -194,6 +197,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         requested_by=row["requested_by"],
         repo=row["repo"] or None,
         not_before=row["not_before"],
+        claim_token=row["claim_token"],
     )
 
 
@@ -358,6 +362,11 @@ class DaemonStore:
             "daemon_work_items",
             "not_before",
             "ALTER TABLE daemon_work_items ADD COLUMN not_before REAL",
+        ),
+        (
+            "daemon_work_items",
+            "claim_token",
+            "ALTER TABLE daemon_work_items ADD COLUMN claim_token TEXT",
         ),
     )
 
@@ -853,8 +862,48 @@ class DaemonStore:
             raise KeyError(f"unknown work item {item_id!r}")
         return item
 
+    def mark_claiming(self, item_id: str, token: str, now: float) -> None:
+        """The claim is about to be posted under ``token`` (#530). Written
+        first, so a process that dies after the comment lands and before
+        :meth:`mark_claimed` leaves a row :meth:`half_claimed` can settle."""
+        self._update(item_id, now, claim_token=token, claimed=0)
+
     def mark_claimed(self, item_id: str, now: float) -> None:
         self._update(item_id, now, claimed=1)
+
+    def clear_claim(self, item_id: str, now: float) -> None:
+        """The half-claim never reached the source: back to unclaimed, so
+        the next tick claims properly."""
+        self._update(item_id, now, claim_token=None, claimed=0)
+
+    def half_claimed(self) -> list[WorkItem]:
+        """Queued rows whose claim was started (token written) but never
+        completed — the shape a crash between comment and persist leaves."""
+        with self._lock:
+            return [
+                _row_to_item(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM daemon_work_items WHERE state = 'queued' "
+                    "AND claimed = 0 AND claim_token IS NOT NULL ORDER BY created_at, rowid"
+                )
+            ]
+
+    def discard(self, item_id: str) -> bool:
+        """Forget a queued item that is not ours to run — a claim another
+        daemon won, an issue that closed, a trigger label that went away.
+        Never a terminal state: ``failed`` is what discovery dedups against,
+        and it is what made a lost claim race permanent (#530). If the
+        trigger label comes back the next poll re-creates the row."""
+        where, ids = _id_match(item_id)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"DELETE FROM daemon_work_items WHERE {where} AND state = 'queued'",  # nosec B608
+                ids,
+            )
+            self._conn.commit()
+        dropped = cursor.rowcount == 1
+        log.debug("store.discard", item=normalize_item_id(item_id), dropped=dropped)
+        return dropped
 
     def mark_running(self, item_id: str, run_id: str, now: float) -> None:
         """Move to running, count the attempt, and open the ledger row —

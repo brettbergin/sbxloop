@@ -54,6 +54,14 @@ class FakeSource:
         self.calls.append(("claim", item.item_id))
         return self.claim_ok
 
+    # Half-claims recovery asks about (#530): token -> whether the claim
+    # comment landed on the source.
+    settle: dict[str, bool] = {}  # noqa: RUF012 - per-test scripting
+
+    def settle_claim(self, item: WorkItem) -> bool:
+        self.calls.append(("settle", item.item_id))
+        return bool(item.claim_token and self.settle.get(item.claim_token, False))
+
     def report_started(self, item: WorkItem, run_id: str) -> None:
         self.calls.append(("started", run_id))
 
@@ -250,13 +258,24 @@ class TestTick:
         # claim happened once: retries reuse the claimed item
         assert [c for c in h.source.calls if c[0] == "claim"] == [("claim", "gh:issue:1")]
 
-    def test_claim_failure_drops_the_item_without_running(self, tmp_path: Path) -> None:
+    def test_claim_failure_forgets_the_item_without_running(self, tmp_path: Path) -> None:
+        """A claim that is not ours — lost race, closed issue, label gone —
+        leaves no row at all (#530): a terminal `failed` row is what
+        discovery dedups against, which made a lost race permanent. The
+        next poll re-creates the row if the trigger label is still there."""
         h = Harness(tmp_path)
         h.source.items = [gh_item()]
         h.source.claim_ok = False
         assert h.loop.tick().outcome == "failed"
         assert h.runs == []
-        assert h.dstore.get("gh:issue:1").state == "failed"  # type: ignore[union-attr]
+        assert h.dstore.get("gh:issue:1") is None
+        # Still triggered on the source: rediscovered and claimed on the next poll.
+        h.source.claim_ok = True
+        assert h.loop.tick().outcome == "done"
+        assert [c for c in h.source.calls if c[0] == "claim"] == [
+            ("claim", "gh:issue:1"),
+            ("claim", "gh:issue:1"),
+        ]
 
     def test_an_engine_failure_at_delivery_is_a_failed_attempt(self, tmp_path: Path) -> None:
         """Delivery is a stage of the run now: an error there propagates
@@ -2525,3 +2544,114 @@ class TestExhaustedRuns:
         h.outcomes = ["merged"]
         assert again.tick().outcome == "done"
         assert h.runs[-1] == (run_id, True)
+
+
+class TestClaimProtocol:
+    """#530: the claim is persisted before its side effects, signals are
+    held while it runs, and a half-claim is settled on the next start."""
+
+    def test_the_token_is_persisted_before_the_source_is_asked(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item()]
+        seen: list[tuple[str | None, bool]] = []
+        real_claim = h.source.claim
+
+        def claim(item: WorkItem) -> bool:
+            row = h.dstore.get(item.item_id)
+            seen.append((item.claim_token, bool(row and row.claim_token == item.claim_token)))
+            return real_claim(item)
+
+        h.source.claim = claim  # type: ignore[method-assign]
+        assert h.loop.tick().outcome == "done"
+        (token, persisted) = seen[0]
+        assert token and len(token) == 32 and persisted
+        done = h.dstore.get("gh:issue:1")
+        assert done is not None and done.claimed and done.claim_token == token
+
+    def test_recovery_finishes_a_half_claim_whose_comment_landed(self, tmp_path: Path) -> None:
+        """The deploy-restart sequence of 2026-08-29 21:10Z: the old process
+        posted its claim comment and died before persisting the claim."""
+        h = Harness(tmp_path)
+        now = h.clock()
+        h.dstore.upsert_new(gh_item(), now=now)
+        h.dstore.mark_claiming("gh:issue:1", "a" * 32, now)  # ... then kill -9
+        h.source.settle = {"a" * 32: True}
+        front = RecordingFrontend()
+        again = DaemonLoop(
+            h.config,
+            store=h.store,
+            dstore=h.dstore,
+            source=h.source,
+            runner=h.runner,
+            clock=h.clock,
+            frontend=front,
+        )
+        again.recover()
+        row = h.dstore.get("gh:issue:1")
+        assert row is not None and row.claimed and row.state == "queued"
+        (notice,) = [n for n in front.notices if n.kind == "recovery.claim_settled"]
+        assert "the claim is finished" in notice.text
+        # Dispatches without claiming again — the claim is complete.
+        assert again.tick().outcome == "done"
+        assert [c for c in h.source.calls if c[0] in ("claim", "settle")] == [
+            ("settle", "gh:issue:1")
+        ]
+
+    def test_recovery_clears_a_half_claim_that_never_reached_the_source(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        now = h.clock()
+        h.dstore.upsert_new(gh_item(), now=now)
+        h.dstore.mark_claiming("gh:issue:1", "b" * 32, now)  # died before the POST
+        h.source.items = [gh_item()]
+        again = DaemonLoop(
+            h.config,
+            store=h.store,
+            dstore=h.dstore,
+            source=h.source,
+            runner=h.runner,
+            clock=h.clock,
+        )
+        again.recover()
+        row = h.dstore.get("gh:issue:1")
+        assert row is not None and not row.claimed and row.claim_token is None
+        # Claimed from scratch on the next tick, under a fresh token.
+        assert again.tick().outcome == "done"
+        assert [c for c in h.source.calls if c[0] in ("claim", "settle")] == [
+            ("settle", "gh:issue:1"),
+            ("claim", "gh:issue:1"),
+        ]
+        assert h.dstore.get("gh:issue:1").claim_token != "b" * 32  # type: ignore[union-attr]
+
+    def test_a_signal_during_the_claim_is_held_until_it_completes(self, tmp_path: Path) -> None:
+        """SIGTERM mid-claim used to unwind the tick between the comment and
+        the persist. It is now delivered after the claim is persisted."""
+        import os
+        import signal
+
+        from sbxloop.daemon.loop import defer_signals
+
+        h = Harness(tmp_path)
+        h.source.items = [gh_item()]
+        delivered: list[int] = []
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: delivered.append(signum))
+        try:
+            real_claim = h.source.claim
+
+            def claim(item: WorkItem) -> bool:
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)  # let the signal land while the claim is in flight
+                assert delivered == [], "the handler must not have run yet"
+                return real_claim(item)
+
+            h.source.claim = claim  # type: ignore[method-assign]
+            assert h.loop.tick().outcome == "done"
+            assert delivered == [signal.SIGTERM], "delivered once, after the claim"
+            assert h.dstore.get("gh:issue:1").claimed  # type: ignore[union-attr]
+            # Outside the block the handler is the one we installed.
+            with defer_signals():
+                pass
+            assert signal.getsignal(signal.SIGTERM) is not None
+        finally:
+            signal.signal(signal.SIGTERM, previous)

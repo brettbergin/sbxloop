@@ -886,3 +886,62 @@ class TestScheduledRetries:
         again = DaemonStore(db)
         got = again.get("gh:o/r:issue:3")
         assert got is not None and got.not_before == 900.0
+
+
+class TestClaimPersistence:
+    """#530: the claim token is written before the comment, a half-claim is
+    findable, and a claim that is not ours leaves no row."""
+
+    def test_claiming_then_claimed_keeps_the_token(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claiming("gh:issue:7", "a" * 32, now=2.0)
+        got = store.get("gh:issue:7")
+        assert got is not None and got.claim_token == "a" * 32 and not got.claimed
+        assert [i.item_id for i in store.half_claimed()] == ["gh:issue:7"]
+        store.mark_claimed("gh:issue:7", now=3.0)
+        got = store.get("gh:issue:7")
+        assert got is not None and got.claimed and got.claim_token == "a" * 32
+        assert store.half_claimed() == []
+
+    def test_clear_claim_forgets_the_token(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_claiming("gh:issue:7", "a" * 32, now=2.0)
+        store.clear_claim("gh:issue:7", now=3.0)
+        got = store.get("gh:issue:7")
+        assert got is not None and got.claim_token is None and not got.claimed
+        assert store.half_claimed() == []
+
+    def test_discard_removes_only_a_queued_row(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        assert store.discard("gh:issue:7") is True
+        assert store.get("gh:issue:7") is None
+        assert store.discard("gh:issue:7") is False
+        # Rediscovery re-creates it fresh.
+        assert store.upsert_new(item(), now=5.0) is True
+        store.mark_claimed("gh:issue:7", now=5.0)
+        store.mark_running("gh:issue:7", "r1", now=6.0)
+        assert store.discard("gh:issue:7") is False, "a running item is not discardable"
+        assert store.get("gh:issue:7") is not None
+
+    def test_pre_claim_token_database_migrates_in_place(self, tmp_path: Path) -> None:
+        db = daemon_db(tmp_path, "pre_claim_token")
+        insert_daemon_row(
+            db,
+            item_id="gh:o/r:issue:3",
+            source_key="3",
+            title="Three",
+            state="queued",
+            claimed=1,
+            repo="o/r",
+        )
+        store = DaemonStore(db)
+        got = store.get("gh:o/r:issue:3")
+        assert got is not None and got.claim_token is None and got.claimed
+        assert store.half_claimed() == [], "a completed claim from before the token is not half"
+        store.mark_claiming("gh:o/r:issue:3", "d" * 32, now=2.0)
+        store.close()
+        again = DaemonStore(db)
+        assert [i.claim_token for i in again.half_claimed()] == ["d" * 32]
