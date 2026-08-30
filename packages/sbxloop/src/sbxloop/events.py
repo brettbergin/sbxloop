@@ -189,6 +189,9 @@ class HostEventTypes:
     LAND_UNDRAFT = "land.undraft"
     LAND_UPDATE = "land.update"
     RUN_MERGED = "run.merged"
+    # Follow-up issues filed (or listed on the PR) after the merge (#517):
+    # `pr`, `mode`, `filed` [{number, url, title}], `listed` (titles).
+    RUN_FOLLOWUPS = "run.followups"
     RUN_BLOCKED = "run.blocked"
     # A non-terminal run closed out by daemon startup/staleness reconciliation.
     RUN_RECONCILED = "run.reconciled"

@@ -38,6 +38,7 @@ from sbxloop.gh.ops import (
     ChecksVerdict,
     FailedCheck,
     GithubOps,
+    IssueRef,
     MergeOutcome,
     PostedFinding,
     PrRef,
@@ -138,6 +139,11 @@ class FakeGithub(GithubOps):
         self.threads: list[ReviewThread] = []
         self.replies: list[tuple[int, str]] = []
         self.issue_comments: list[str] = []
+        # Follow-up issues filed after the merge (#517), and the labels the
+        # engine made sure exist; `existing_issues` seeds the label listing.
+        self.issues_created: list[tuple[str, str, list[str]]] = []
+        self.labels_created: list[str] = []
+        self.existing_issues: list[dict[str, Any]] = []
         self.resolved: list[str] = []
         self._comment_id = 0
         self._commits = 0
@@ -252,9 +258,21 @@ class FakeGithub(GithubOps):
             return list(self.comments_payload)
         if method == "GET" and "/pulls?state=open&head=" in path:
             return [dict(self.pr)] if self.pr_created else []
-        if method == "POST" and path.endswith("/labels"):
-            assert body is not None
+        if method == "POST" and path.endswith("/labels") and body and "labels" in body:
             return [{"name": name} for name in body["labels"]]
+        if method == "POST" and path.endswith("/labels"):
+            # Repository label creation (#517): an existing one is a 422.
+            assert body is not None
+            if body["name"] in self.labels_created:
+                raise GithubOpsError(
+                    "github op raw.api failed: GithubOpError: gh api POST "
+                    f"{path} failed (rc=1): Validation Failed: already_exists (HTTP 422)",
+                    http_status=422,
+                )
+            self.labels_created.append(str(body["name"]))
+            return {"name": body["name"]}
+        if method == "GET" and "/issues?labels=" in path:
+            return list(self.existing_issues)
         if method == "POST" and path.endswith("/pulls/" + str(self.number) + "/comments"):
             # One review comment, standalone (#513): a thread of its own.
             assert body is not None
@@ -279,6 +297,14 @@ class FakeGithub(GithubOps):
         raise AssertionError(f"FakeGithub: unexpected raw call {method} {path}")
 
     # -- the pull request ----------------------------------------------------
+
+    def issue_create(
+        self, repo: str, title: str, body: str = "", labels: list[str] | None = None
+    ) -> IssueRef:
+        self._maybe_fail("issue_create")
+        self.issues_created.append((title, body, list(labels or [])))
+        number = 900 + len(self.issues_created)
+        return IssueRef(number=number, url=f"https://github.com/{repo}/issues/{number}")
 
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:
         self._maybe_fail("pr_get")

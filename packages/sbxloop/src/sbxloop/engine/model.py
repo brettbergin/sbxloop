@@ -78,7 +78,7 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     }
 )
 
-Phase = Literal["decompose", "build", "verify", "gate", "review", "steer"]
+Phase = Literal["decompose", "build", "verify", "gate", "review", "steer", "followup"]
 
 # What a fix round is for. `review` rounds are charged to the review budget;
 # everything else — a red gate, red CI, a base conflict, a human objecting on
