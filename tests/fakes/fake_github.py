@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import quote, unquote
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import (
@@ -143,6 +144,9 @@ class FakeGithub(GithubOps):
         # engine made sure exist; `existing_issues` seeds the label listing.
         self.issues_created: list[tuple[str, str, list[str]]] = []
         self.labels_created: list[str] = []
+        # Labels the repository already carries before the run (#556): a
+        # single-label GET finds these, and creating one is a 422.
+        self.labels_existing: set[str] = set()
         self.existing_issues: list[dict[str, Any]] = []
         self.resolved: list[str] = []
         self._comment_id = 0
@@ -188,6 +192,18 @@ class FakeGithub(GithubOps):
         if branch.startswith("sbxloop/"):
             return self.head_sha if branch in self.branches else None
         return "base123"
+
+    def label_lookup(self, repo: str, name: str) -> dict[str, Any] | None:
+        """A repository label probe (#556): its data, or None when absent.
+        A 404 is an answer; any other failure still raises, as the real
+        ``label.get`` op does under ``allow_missing``."""
+        try:
+            data = self.raw("GET", f"/repos/{repo}/labels/{quote(name, safe='')}")
+        except GithubOpsError as exc:
+            if exc.http_status == 404:
+                return None
+            raise
+        return data if isinstance(data, dict) else None
 
     def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
         self.blob_batches.append(files)
@@ -266,10 +282,20 @@ class FakeGithub(GithubOps):
             return [dict(self.pr)] if self.pr_created else []
         if method == "POST" and path.endswith("/labels") and body and "labels" in body:
             return [{"name": name} for name in body["labels"]]
+        if method == "GET" and "/labels/" in path:
+            # A single label lookup (#556): present, or a 404 like gh's.
+            name = unquote(path.rsplit("/labels/", 1)[1])
+            if name in self.labels_existing or name in self.labels_created:
+                return {"name": name}
+            raise GithubOpsError(
+                "github op raw.api failed: GithubOpError: gh api GET "
+                f"{path} failed (rc=1): Not Found (HTTP 404)",
+                http_status=404,
+            )
         if method == "POST" and path.endswith("/labels"):
             # Repository label creation (#517): an existing one is a 422.
             assert body is not None
-            if body["name"] in self.labels_created:
+            if body["name"] in self.labels_created or body["name"] in self.labels_existing:
                 raise GithubOpsError(
                     "github op raw.api failed: GithubOpError: gh api POST "
                     f"{path} failed (rc=1): Validation Failed: already_exists (HTTP 422)",

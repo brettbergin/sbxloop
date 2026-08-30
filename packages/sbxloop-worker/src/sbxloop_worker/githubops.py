@@ -416,6 +416,28 @@ def _ref_get(t: Transport, p: dict[str, Any]) -> JsonValue:
     return {"ref": data.get("ref"), "sha": sha}
 
 
+def _label_get(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """Fetch one repository label by name; with ``allow_missing`` a 404 is
+    an *answer*.
+
+    Follow-up filing (#556) asks "does this label exist?" before creating
+    it, and either answer is routine. Only a 404 is swallowed: a 403 (token
+    without repo scope) or a 5xx is a real failure the caller must see
+    rather than follow with a doomed POST.
+    """
+    _require(p, "repo", "name")
+    name = urllib.parse.quote(str(p["name"]), safe="")
+    try:
+        data = t.request("GET", f"/repos/{p['repo']}/labels/{name}")
+    except GithubOpError as exc:
+        if p.get("allow_missing") and exc.http_status == 404:
+            return {"missing": True, "http_status": exc.http_status}
+        raise
+    if not isinstance(data, dict):
+        raise GithubOpError(f"GitHub returned no label object for {p['name']!r}: {data!r}")
+    return {"name": data.get("name"), "color": data.get("color")}
+
+
 def _search_issues(t: Transport, p: dict[str, Any]) -> JsonValue:
     _require(p, "query")
     query = urllib.parse.quote(str(p["query"]))
@@ -565,6 +587,7 @@ OPS: dict[str, OpImpl] = {
     "status.create": _status_create,
     "repo.get": _repo_get,
     "ref.get": _ref_get,
+    "label.get": _label_get,
     "search.issues": _search_issues,
     "raw.api": _raw_api,
     "checks.failed_logs": _checks_failed_logs,

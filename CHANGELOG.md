@@ -8,6 +8,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Filing follow-up issues no longer errors when the follow-up label
+  already exists** (#556). The run blind-POSTed `/repos/<repo>/labels`
+  before filing, so every repository that already carried
+  `[landing] followup_label` took a guaranteed 422 "already_exists" — an
+  error in the run's chronology for a routine condition. `_ensure_label`
+  now asks first through the new `label.get` worker op and its host-side
+  `GithubOps.label_lookup`, which — like `repo.get`/`ref.get` under
+  `allow_missing` (#222, #518) — answers an absent label as
+  `{"missing": true}` on an ok result, so the repository that *lacks* the
+  label creates it with one clean call and no `worker.error` panel either.
+  Only a 404 is a miss: a 403 from a token without repo scope, or a 5xx,
+  is one warning and no doomed POST behind it. The 422 catch on the create
+  is kept for the race where the label appears between the two calls, and
+  a label the run cannot create still does not stop the filing.
+
 - **A fix-round re-delivery no longer fails the branch create before
   force-moving it** (#518). The delivery branch is a pure function of the
   run id, so on every round after the first `deliver` blind-POSTed

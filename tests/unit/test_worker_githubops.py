@@ -16,7 +16,7 @@ import json
 import subprocess
 import urllib.error
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -130,6 +130,90 @@ class TestRefGet:
         t = ScriptedTransport({"/repos/o/r/git/ref/heads/main": {"message": "weird"}})
         with pytest.raises(GithubOpError, match="no object sha"):
             execute_op("ref.get", {"repo": "o/r", "ref": "heads/main"}, transport=t)
+
+
+class TestLabelGet:
+    """#556: the follow-up label probe. An absent label is the routine
+    answer to an existence question, so with ``allow_missing`` a 404 comes
+    back as data; a 403/5xx is a real failure and still raises."""
+
+    PATH = "/repos/o/r/labels/sbxloop%3Afollow-up"
+    PARAMS: ClassVar[dict[str, Any]] = {"repo": "o/r", "name": "sbxloop:follow-up"}
+
+    def test_present_label_passes_through(self) -> None:
+        t = ScriptedTransport({self.PATH: {"name": "sbxloop:follow-up", "color": "c5def5"}})
+        assert execute_op("label.get", {**self.PARAMS, "allow_missing": True}, transport=t) == {
+            "name": "sbxloop:follow-up",
+            "color": "c5def5",
+        }
+        assert t.calls == [("GET", self.PATH)]
+
+    def test_missing_is_data_only_when_asked(self) -> None:
+        t = ScriptedTransport({self.PATH: http_error(404, "Not Found")})
+        assert execute_op("label.get", {**self.PARAMS, "allow_missing": True}, transport=t) == {
+            "missing": True,
+            "http_status": 404,
+        }
+        with pytest.raises(GithubOpError, match="404"):
+            execute_op("label.get", dict(self.PARAMS), transport=t)
+
+    @pytest.mark.parametrize("status", [403, 500, 502])
+    def test_other_statuses_still_raise_with_allow_missing(self, status: int) -> None:
+        """A token without repo scope, or GitHub being unwell, is not
+        'the label is absent' — the caller must not fall through to a POST."""
+        t = ScriptedTransport({self.PATH: http_error(status)})
+        with pytest.raises(GithubOpError, match=str(status)):
+            execute_op("label.get", {**self.PARAMS, "allow_missing": True}, transport=t)
+
+    def test_malformed_response_raises(self) -> None:
+        t = ScriptedTransport({self.PATH: ["not", "a", "label"]})
+        with pytest.raises(GithubOpError, match="no label object"):
+            execute_op("label.get", dict(self.PARAMS), transport=t)
+
+
+class TestLabelProbeEmitsNoErrorEvent:
+    """The regression the #518 ref lookup fixed, for labels: a repository
+    that does not yet carry the follow-up label must not pay a worker
+    ``error`` event (a red panel in the run chronology) for asking."""
+
+    @staticmethod
+    def _run(tmp_path: Path, op: str, params: dict[str, Any]) -> tuple[Any, list[dict[str, Any]]]:
+        events_path = tmp_path / f"{op}-events.jsonl"
+        result_path = tmp_path / f"{op}-result.json"
+
+        class Missing:
+            def request(self, method: str, path: str, body: Any = None) -> Any:
+                raise GithubOpError(
+                    f"gh api GET {path} failed (rc=1): Not Found (HTTP 404)", http_status=404
+                )
+
+        job = JobRequest(job_id="j1", run_id="r1", kind="github.op", op=op, params=params)
+        runner = JobRunner(job, events_path, result_path, heartbeat_s=0)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(githubops, "select_transport", Missing)
+            result = runner.run()
+        events = [json.loads(line) for line in events_path.read_text().splitlines() if line]
+        return result, events
+
+    def test_absent_label_comes_back_as_data(self, tmp_path: Path) -> None:
+        result, events = self._run(
+            tmp_path,
+            "label.get",
+            {"repo": "o/r", "name": "sbxloop:follow-up", "allow_missing": True},
+        )
+        assert result.status == "ok"
+        assert result.output_json == {"missing": True, "http_status": 404}
+        assert [e for e in events if e.get("type") == "worker.error"] == []
+
+    def test_without_allow_missing_the_miss_is_still_an_error(self, tmp_path: Path) -> None:
+        """The old shape, pinned: a bare GET for an absent label is exactly
+        the ``worker.error`` panel this change removes."""
+        result, events = self._run(
+            tmp_path, "label.get", {"repo": "o/r", "name": "sbxloop:follow-up"}
+        )
+        assert result.status == "error"
+        assert result.error is not None and result.error.type == "GithubOpError"
+        assert [e for e in events if e.get("type") == "worker.error"]
 
 
 class TestGhCliTransport:
