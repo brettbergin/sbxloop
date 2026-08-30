@@ -134,7 +134,12 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   round sees the earlier rounds' findings and the fixer's per-finding
   `addressed` / `refuted: <why>` list, and the next review may not re-raise
   a refuted finding without a rebuttal — the memory that stops a run arguing
-  with itself. Every blocking/major finding carries the reviewer's `repro`;
+  with itself. Every finding of the round is in the brief — blocking ones to
+  address or refute, the rest to address, refute or `defer` to a follow-up —
+  and a finding the fixer says nothing about is *unanswered*: it is carried
+  into the next brief first, marked as such, and the reviewer keeps it at its
+  severity, so a nit cannot be dropped on the floor round after round. Every
+  blocking/major finding carries the reviewer's `repro`;
   the fix brief makes it a regression test that fails first, asks for the
   adjacent cases the same code path sees, and shows the fixer what earlier
   rounds decided — so rounds stop converging one case at a time.

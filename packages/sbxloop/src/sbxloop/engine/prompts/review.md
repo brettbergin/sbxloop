@@ -21,7 +21,7 @@ render()).
 Contract (test_review_prompt_carries_contract): the four lenses
 ("Concurrency and locking", "Failure ordering", "Input validation",
 "Cross-module interaction"), the phrases "read-only", "Do not modify",
-"refuted", "repro" and "ONLY the fenced JSON block", the round-1
+"refuted", "deferred", "UNANSWERED", "repro" and "ONLY the fenced JSON block", the round-1
 plan-coverage question ("upgrade path for existing state", #524), and the
 verdict/severity vocabulary must stay. The wrong-check / verify-suspect section with its
 config-override worked example must stay too
@@ -70,10 +70,16 @@ $prior_rounds
 
 A finding the fixer **addressed** is closed. A finding the fixer **refuted**
 with a stated reason is closed too, unless you can say specifically why the
-refutation is wrong — then say it in the finding's body. Do not re-raise a
-refuted finding otherwise, and in round 2 or later do not raise new nits on
-lines the fix round did not change: the point of a further round is the
-problems that are still there, not new opinions about old lines.
+refutation is wrong — then say it in the finding's body. A finding the fixer
+**deferred** with a reason is closed for this pull request: it becomes a
+follow-up, so do not re-raise it here. A finding marked **UNANSWERED** —
+neither addressed, refuted nor deferred — is not closed: silence is not
+closure. It stays a finding at its original severity; carry it in
+`confirmations` as `still_open` so the next fix round is made to answer it.
+Do not re-raise a refuted or deferred finding otherwise, and in round 2 or
+later do not raise new nits on lines the fix round did not change: the
+point of a further round is the problems that are still there, not new
+opinions about old lines.
 
 In round 2 or later, every finding an earlier round raised gets an explicit
 verdict from you — but **not as a finding and not in your summary**. Each

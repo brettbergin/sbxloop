@@ -182,6 +182,9 @@ class HostEventTypes:
     # `body_only`, `comment_url`).
     REVIEW_RECONCILED = "review.reconciled"
     FIX_ROUND = "fix.round"
+    # A fix round's report left findings with no addressed/refuted/deferred
+    # line (`round`, `task_id`, `anchors`); they ride into the next brief.
+    FIX_UNANSWERED = "fix.unanswered"
     CI_STATUS = "ci.status"
     LAND_UNDRAFT = "land.undraft"
     LAND_UPDATE = "land.update"

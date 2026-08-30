@@ -48,7 +48,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
@@ -76,6 +76,7 @@ from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
     FixKind,
+    RunRecord,
     RunResult,
     RunState,
     SteerVerdict,
@@ -93,6 +94,7 @@ from sbxloop.engine.phases import (
     verify_suspect_feedback,
 )
 from sbxloop.engine.reconcile import (
+    ReconcileOutcome,
     note_nonblocking,
     post_confirmations,
     reconcile_human,
@@ -100,19 +102,22 @@ from sbxloop.engine.reconcile import (
 )
 from sbxloop.engine.review import (
     CarriedVerdict,
+    Reconciliation,
     ReviewFinding,
     ReviewRound,
     ReviewVerdict,
+    closed_anchors,
     fix_brief,
     fix_task,
     is_fix_task,
     prior_findings,
     reconcile,
-    refuted_anchors,
+    reconcile_anchor,
     render_fix_history,
     render_review_history,
     review_body,
     split_carried,
+    unanswered_findings,
 )
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
@@ -868,8 +873,11 @@ class LoopEngine:
                 if verdict.verdict == "approve":
                     stage = "awaiting_ci"
                     continue
+                # Every finding rides into the brief (#522): blocking ones to
+                # be addressed or refuted, the rest to be answered — addressed,
+                # refuted or deferred — rather than silently dropped.
                 reason = self._fix_round(
-                    p, "review", "the review requested changes", findings=verdict.blocking
+                    p, "review", "the review requested changes", findings=verdict.findings
                 )
                 if reason is not None:
                     return "failed", reason
@@ -1263,7 +1271,7 @@ class LoopEngine:
             round=round_no,
             tasks=self.store.get_tasks(run_id),
             history=render_review_history(rounds),
-            refuted=refuted_anchors(rounds),
+            refuted=closed_anchors(rounds),
         )
         # Round n+1's word on a finding an earlier round raised belongs in
         # that finding's own thread, not restated in a fresh review body
@@ -1273,8 +1281,10 @@ class LoopEngine:
         posting, carried = split_carried(verdict, prior)
         # The run acts on the union: new findings plus the carried ones this
         # round says are still open, so "still open" keeps driving fix rounds.
+        # Read off ``posting``: a finding the reviewer re-filed on an old
+        # anchor is a carried still-open there, and only there (#522).
         verdict = posting.model_copy(
-            update={"findings": [*posting.findings, *verdict.carried_forward(prior)]}
+            update={"findings": [*posting.findings, *posting.carried_forward(prior)]}
         )
         posted_url = ""
         posted_event = ""
@@ -1610,21 +1620,70 @@ class LoopEngine:
             except GithubOpsError:
                 log.warning("review.reconcile_failed", run=run_id, pr=run.pr_number, exc_info=True)
                 continue
-            if not outcome.did_anything:
+            if outcome.did_anything:
+                self._emit_reconciled(run_id, run.pr_number, outcome)
+            self._reconcile_late_answers(p, run, round_, records, items)
+
+    def _reconcile_late_answers(
+        self,
+        p: Pipeline,
+        run: RunRecord,
+        round_: ReviewRound,
+        records: Sequence[PostedRecord],
+        items: Mapping[str, Reconciliation],
+    ) -> None:
+        """A finding round *k* left unanswered rides into later briefs (#522);
+        when a later round's report finally answers it, that answer belongs
+        on the round-*k* thread. Replied under the later round's marker and
+        record, so it is posted once and never mistaken for round *k*'s own
+        "not answered" reply."""
+        ops, repo, run_id = p.ops, p.repo, p.run_id
+        assert ops is not None and repo is not None and run.pr_number is not None
+        open_anchors = {a for a, item in items.items() if item.status == "unanswered"}
+        if not open_anchors:
+            return
+        for later in self._review_rounds(run_id):
+            if later.round <= round_.round or not later.response.strip() or not open_anchors:
                 continue
-            self.bus.emit(
-                HostEventTypes.REVIEW_RECONCILED,
-                run_id,
-                pr=run.pr_number,
-                round=outcome.round,
-                addressed=outcome.addressed,
-                refuted=outcome.refuted,
-                unanswered=outcome.unanswered,
-                replied=outcome.replied,
-                resolved=outcome.resolved,
-                body_only=outcome.body_only,
-                comment_url=outcome.comment_url or "",
-            )
+            late = {a: reconcile_anchor(later.response, a) for a in sorted(open_anchors)}
+            late = {a: item for a, item in late.items() if item.status != "unanswered"}
+            if not late:
+                continue
+            try:
+                outcome = reconcile_round(
+                    ops,
+                    repo,
+                    run.pr_number,
+                    run_id=run_id,
+                    round=later.round,
+                    head_sha=run.head_sha,
+                    posted=[r for r in records if r.anchor in late],
+                    items=late,
+                    done=self.store.reconciliations(run_id, later.round),
+                    record=partial(self._record_reconciliation, run_id, later.round),
+                )
+            except GithubOpsError:
+                log.warning("review.reconcile_failed", run=run_id, pr=run.pr_number, exc_info=True)
+                continue
+            open_anchors -= set(late)
+            if outcome.did_anything:
+                self._emit_reconciled(run_id, run.pr_number, outcome)
+
+    def _emit_reconciled(self, run_id: str, pr: int | None, outcome: ReconcileOutcome) -> None:
+        self.bus.emit(
+            HostEventTypes.REVIEW_RECONCILED,
+            run_id,
+            pr=pr,
+            round=outcome.round,
+            addressed=outcome.addressed,
+            refuted=outcome.refuted,
+            deferred=outcome.deferred,
+            unanswered=outcome.unanswered,
+            replied=outcome.replied,
+            resolved=outcome.resolved,
+            body_only=outcome.body_only,
+            comment_url=outcome.comment_url or "",
+        )
 
     def _stage_reconcile_human(self, p: Pipeline) -> None:
         """Answer the human objections the last fix round was seeded with.
@@ -1790,7 +1849,14 @@ class LoopEngine:
         open_round = next((r for r in reversed(rounds) if not r.response.strip()), None)
         if open_round is None:
             return None
-        items = reconcile(ReviewRound(open_round.round, open_round.verdict, report))
+        # The brief also carried the findings earlier rounds left unanswered
+        # (#522); this report is their answer too, or leaves them unanswered
+        # again — either way they are judged here, not forgotten.
+        carried = unanswered_findings([r for r in rounds if r is not open_round])
+        seen = {f.anchor for f in open_round.verdict.findings}
+        findings = [*open_round.verdict.findings, *[f for f in carried if f.anchor not in seen]]
+        verdict = open_round.verdict.model_copy(update={"findings": findings})
+        items = reconcile(ReviewRound(open_round.round, verdict, report))
         return [
             {"anchor": anchor, "status": item.status, "note": item.note, "test": item.test}
             for anchor, item in items.items()
@@ -1855,6 +1921,7 @@ class LoopEngine:
             conflicts = merged.conflicts
             if kind == "conflict" or conflicts:
                 why = f"{why}; {merged.message}"
+        rounds_so_far = self._review_rounds(run_id)
         spec = fix_task(
             round=round_no,
             pr_number=run.pr_number,
@@ -1868,8 +1935,10 @@ class LoopEngine:
                 objections=objections,
                 conflicts=conflicts,
                 # The fixer is a fresh session: hand it what its
-                # predecessors decided and why (#521).
-                history=render_fix_history(self._review_rounds(run_id)),
+                # predecessors decided and why (#521) — and what they left
+                # unanswered, which comes back until someone answers (#522).
+                history=render_fix_history(rounds_so_far),
+                unanswered=unanswered_findings(rounds_so_far),
             ),
             verify_commands=verify_commands,
             failed_checks=failed_checks,
@@ -2167,6 +2236,25 @@ class LoopEngine:
         reconciled = self._reconcile_fix(run_id, task, builder_report)
         if reconciled is not None:
             payload["reconciled"] = reconciled
+            unanswered = [r["anchor"] for r in reconciled if r["status"] == "unanswered"]
+            if unanswered:
+                # Loud, not fatal (#522): a round that says nothing about a
+                # finding is incomplete; the finding rides into the next brief.
+                log.warning(
+                    "fix.unanswered_findings",
+                    run=run_id,
+                    task=task.spec.id,
+                    anchors=unanswered,
+                    hint="the fix report has no addressed/refuted/deferred line for these; "
+                    "they are carried into the next fix round as unanswered",
+                )
+                self.bus.emit(
+                    HostEventTypes.FIX_UNANSWERED,
+                    run_id,
+                    round=sum(1 for t in self.store.get_tasks(run_id) if is_fix_task(t.spec.id)),
+                    task_id=task.spec.id,
+                    anchors=unanswered,
+                )
         self.store.record_phase(
             run_id,
             "build",
