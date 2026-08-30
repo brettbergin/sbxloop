@@ -714,6 +714,63 @@ class TestTools:
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #12")
         assert github.paths[-1] == "/repos/owner/repo/issues/12/labels"
 
+    def test_create_issue_can_file_without_queueing(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "create_issue",
+                            {"title": "Backlog: retries", "body": "Someday.", "queue": False},
+                        )
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "note this for the backlog", author="Discord user `ana`", author_id="777")
+        (filed,) = client.responses
+        assert filed.ok and filed.text.startswith("filed issue #41 https://gh/i/41")
+        assert "NOT queued" in filed.text and "label_issue_for_run" in filed.text
+        assert "queued issue" not in filed.text
+        (_repo, _title, _body, labels) = github.created[0]
+        assert labels == []
+        assert not any("/labels" in p for p in github.paths)
+        dstore.upsert_new(WorkItem(item_id="gh:issue:41", source_key="41", title="Backlog"), 1.0)
+        assert dstore.get("gh:issue:41").requested_by == "777"  # type: ignore[union-attr]
+
+    def test_create_issue_queues_when_queue_is_true_or_omitted(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("create_issue", {"title": "A", "body": "b", "queue": True}),
+                        ("create_issue", {"title": "B", "body": "b"}),
+                    ]
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "please fix it")
+        for response in client.responses:
+            assert response.text.startswith("created and queued issue #41")
+            assert "`sbxloop:run`" in response.text
+        assert [c[3] for c in github.created] == [["sbxloop:run"], ["sbxloop:run"]]
+
+    def test_create_issue_tool_description_covers_both_paths(self, tmp_path: Path) -> None:
+        concierge, client, _, _, _ = make(tmp_path, [{}], github=FakeGithub())
+        turn(concierge)
+        spec = next(t for t in client.jobs[0].host_tools if t.name == "create_issue")
+        assert "queue" in spec.parameters["properties"]
+        assert spec.parameters["properties"]["queue"]["type"] == "boolean"
+        assert "queue" not in spec.parameters.get("required", [])
+        assert "backlog" in spec.description.lower()
+        assert "label_issue_for_run" in spec.description
+
     def test_create_issue_without_an_author_id_records_no_requester(self, tmp_path: Path) -> None:
         github = FakeGithub()
         concierge, client, _, _, dstore = make(

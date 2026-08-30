@@ -815,7 +815,14 @@ class Concierge:
                             "your restatement; `acceptance_criteria` are checkable "
                             "statements written against the symptom, never the mechanism. "
                             "A fix-shaped ask with no symptom cannot be filed: ask what they "
-                            "are seeing first. `body` is optional extra context."
+                            "are seeing first. `body` is optional extra context. "
+                            "Pass `queue: false` ONLY when the person explicitly wants the "
+                            "issue recorded without running it — backlog capture, a triage "
+                            "note, a canary, anything a human should review before it "
+                            f"executes: the issue is filed with no `{trigger}` label, the "
+                            "daemon ignores it, and `label_issue_for_run` starts it later. "
+                            "Any ordinary 'please fix/do X' omits `queue` and is filed AND "
+                            "queued in that one call."
                         ),
                         parameters=_schema(
                             {
@@ -828,6 +835,7 @@ class Concierge:
                                     "items": {"type": "string"},
                                 },
                                 "body": {"type": "string"},
+                                "queue": {"type": "boolean"},
                                 "repo": {"type": "string"},
                             },
                             ["title", "symptom", "goal", "acceptance_criteria"],
@@ -1367,10 +1375,13 @@ class Concierge:
         if not title or not body:
             return "both title and body are required"
         trigger = self.config.daemon.trigger_label
+        queue = args.get("queue")
+        queued = True if queue is None else bool(queue)
+        labels = [trigger] if queued else []
         full_body = f"{body}\n\n---\nFiled by {by} via the sbxloop concierge\n"
         try:
             ref = self.github.call(
-                lambda ops: ops.issue_create(repo, title, full_body, labels=[trigger])
+                lambda ops: ops.issue_create(repo, title, full_body, labels=labels)
             )
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"creating the issue failed: {_one_line(str(exc), 300)}"
@@ -1381,7 +1392,19 @@ class Concierge:
             self.dstore.note_requester(
                 str(ref.number), self._turn_author_id, self.clock(), repo=repo
             )
-        log.info("concierge.issue_created", number=ref.number, by=by, title=title[:80])
+        log.info(
+            "concierge.issue_created",
+            number=ref.number,
+            by=by,
+            title=title[:80],
+            queued=queued,
+        )
+        if not queued:
+            return (
+                f"filed issue #{ref.number} {ref.url} — NOT queued: it has no "
+                f"`{trigger}` label, so the daemon will not claim it. Use "
+                "`label_issue_for_run` with that number to start it later."
+            )
         status = self.loop.status()
         note = ""
         if status.get("paused"):
