@@ -19,8 +19,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   prior attempt". `_point_branch` now asks first (`ref_lookup`, the miss
   travels as data): a missing ref is created with one call as before, an
   existing one goes straight to the force-move, and
-  `deliver.branch_force_moved` says what it superseded (`from=<old sha>
-  to=<new sha> round=N`; the manual `sbxloop deliver <run>` path has no
+  `deliver.branch_force_moved` says what it superseded (`from=<old sha> to=<new sha> round=N`; the manual `sbxloop deliver <run>` path has no
   round to report). The 422 catch is kept only for the race where the ref
   appears between the lookup and the create.
 
