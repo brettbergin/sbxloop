@@ -8,6 +8,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **A persistent Approve-merge button on Discord** for the merge gate. The
+  prompt carries a `discord.ui` button whose view is persistent
+  (`timeout=None` + a stable `custom_id` from the gate row) and re-armed
+  via `Client.add_view` on every (re)connect — a gate's button survives
+  restarts and never expires, unlike the concierge's clarifying-question
+  buttons (#570). A click runs `approve_merge` off the gateway loop and
+  answers ephemerally (approval, lost CAS, or refusal); a failed landing
+  re-opens the gate and the same button works again; resolution clears the
+  view. Every failure mode — no component support, a rejected send, a dead
+  view — falls back to the typed `!sbx merge`, which stays in the prompt
+  body on every backend.
+
 - **The opt-in merge gate — the one human touchpoint** (`[landing] merge_gate = "chat"`, default `"off"`). A run that clears every bar —
   review, CI, reconciliation — parks `gated` instead of merging: sandboxes
   freed, breaker reset, the daemon moves on, and an approval prompt lands

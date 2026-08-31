@@ -15,6 +15,8 @@ comes from ``DISCORD_BOT_TOKEN``.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import os
 from typing import Any, ClassVar
 
@@ -349,6 +351,73 @@ class DiscordBridge(ChatBridge):
                 log.debug("discord.choices_bind_failed", exc_info=True)
         return posted
 
+    async def _send_gate(self, target: Any, text: str, gate: Any) -> Any:
+        """The approval prompt with a persistent ✅ button on top of the
+        base prose — the typed command stays in the body, so every failure
+        mode (no component support, a rejected send, a dead view) leaves a
+        prompt that still works by typing."""
+        view = _build_gate_view(self, gate)
+        if view is None:
+            return await super()._send_gate(target, text, gate)
+        kwargs: dict[str, Any] = {"view": view, "suppress_embeds": True}
+        mentions = _allowed_mentions_users()
+        if mentions is not None:
+            kwargs["allowed_mentions"] = mentions
+        content = _clip(text, self.discord.max_message_chars)
+        try:
+            return await target.send(content, **kwargs)
+        except Exception:
+            log.warning(
+                "discord.gate_view_send_failed",
+                run=gate.run_id,
+                action="falling back to prose",
+                exc_info=True,
+            )
+            return await super()._send_gate(target, text, gate)
+
+    async def _finalize_gate_message(self, message: Any, text: str) -> None:
+        """A resolved gate clears its button along with the rewrite."""
+        try:
+            await message.edit(content=_clip(text, self.discord.max_message_chars), view=None)
+        except TypeError:
+            await super()._finalize_gate_message(message, text)
+
+    def _register_gate_views(self, client: Any) -> None:
+        """Re-arm the approve buttons for standing gates on (re)connect.
+
+        Persistent views (``timeout=None`` + a stable ``custom_id``) only
+        fire while the running client knows them — precisely the property
+        #570's choice views lack, and why those buttons die on restart.
+        ``approving`` gates are armed too: their click loses the CAS
+        politely now and works again the moment boot reconciliation puts
+        the gate back up."""
+        add_view = getattr(client, "add_view", None)
+        if add_view is None:
+            return
+        try:
+            gates = self.dstore.open_merge_gates()
+        except Exception:
+            log.warning("discord.gate_views_unavailable", exc_info=True)
+            return
+        armed = getattr(self, "_armed_gate_views", None)
+        if armed is None:
+            armed = set()
+            self._armed_gate_views = armed
+        for gate in gates:
+            if gate.custom_id in armed:
+                continue
+            view = _build_gate_view(self, gate)
+            if view is None:
+                return
+            try:
+                if gate.prompt_message_id:
+                    add_view(view, message_id=int(gate.prompt_message_id))
+                else:
+                    add_view(view)
+                armed.add(gate.custom_id)
+            except Exception:
+                log.warning("discord.gate_view_rearm_failed", run=gate.run_id, exc_info=True)
+
     async def _edit(self, message: Any, text: str, *, embed: EmbedSpec | None = None) -> None:
         """Edit a message we posted, re-asserting unfurl suppression.
 
@@ -415,6 +484,8 @@ class DiscordBridge(ChatBridge):
                 guilds=len(getattr(client, "guilds", ()) or ()),
                 channel=bridge.discord.channel_id,
             )
+            # Arm the merge-gate approve buttons before anything can click.
+            bridge._register_gate_views(client)
             bridge.mark_ready()
 
         async def on_disconnect() -> None:
@@ -609,6 +680,80 @@ def _interaction_author(interaction: Any) -> str:
     user = getattr(interaction, "user", None)
     name = getattr(user, "name", None) or getattr(user, "display_name", None)
     return f"Discord user `{name}`" if name else "a Discord user"
+
+
+GATE_CUSTOM_ID_PREFIX = "sbxgate:"
+
+
+class _GateHandler:
+    """The transport-free half of a merge-gate approve button.
+
+    A click is one call into ``DaemonLoop.approve_merge`` — store CAS plus
+    a spawned gh-ops landing thread — run off the gateway's event loop and
+    answered ephemerally with whatever the loop said (an approval, a lost
+    CAS, a refusal). The click never disables the view: a failed landing
+    re-opens the gate and the same button works again; resolution clears
+    it through ``_finalize_gate_message``."""
+
+    def __init__(self, bridge: Any, gate: Any) -> None:
+        self.bridge = bridge
+        self.gate = gate
+
+    async def on_click(self, interaction: Any) -> None:
+        author = _interaction_author(interaction)
+        loop_ref = getattr(self.bridge, "loop_ref", None)
+        if loop_ref is None:
+            await _ack_interaction(interaction, "daemon loop not attached")
+            return
+        try:
+            reply = await asyncio.get_event_loop().run_in_executor(
+                None, functools.partial(loop_ref.approve_merge, self.gate.run_id, by=author)
+            )
+        except (KeyError, ValueError) as exc:
+            reply = f"merge failed: {exc.args[0] if exc.args else exc}"
+        except Exception:
+            log.warning("discord.gate_click_failed", run=self.gate.run_id, exc_info=True)
+            reply = "something went wrong approving the merge — `!sbx merge` still works"
+        await _ack_interaction(interaction, str(reply))
+
+
+def _build_gate_view(bridge: Any, gate: Any) -> Any:
+    """A persistent one-button approve view, or None when this host's
+    discord.py has no component support (the caller posts prose instead).
+
+    Persistent means ``timeout=None`` and a stable ``custom_id`` (the gate
+    row's token), the two requirements ``Client.add_view`` re-arming has —
+    a gate's button survives restarts and never expires, unlike #570's
+    choice buttons."""
+    try:
+        import discord as discordpy
+
+        view_cls = discordpy.ui.View
+        button_cls = discordpy.ui.Button
+        style = discordpy.ButtonStyle.success
+    except (ImportError, AttributeError):
+        return None
+
+    handler = _GateHandler(bridge, gate)
+
+    class _GateView(view_cls):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            super().__init__(timeout=None)
+            self.handler = handler
+
+    try:
+        view = _GateView()
+        button = button_cls(
+            label="Approve merge",
+            style=style,
+            custom_id=f"{GATE_CUSTOM_ID_PREFIX}{gate.custom_id}"[:100],
+        )
+        button.callback = handler.on_click
+        view.add_item(button)
+    except Exception:
+        log.warning("discord.gate_view_unavailable", exc_info=True)
+        return None
+    return view
 
 
 def _build_choice_view(

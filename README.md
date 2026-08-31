@@ -528,10 +528,11 @@ thread — `🎉 gh:issue:9 merged (2/2 tasks done) · PR …`,
 `❌ gh:issue:4 failed (…); 1 attempt(s) left`, `🚧 gh:issue:7 blocked: … — a human needs to look` when an issue lands in `sbxloop:blocked`, `🛑 circuit breaker opened …` — with every URL masked so nothing sprouts a preview.
 With `[landing] merge_gate = "chat"` — the one opt-in human touchpoint — a
 run that clears every bar parks instead of merging: `⏸ ready to merge — waiting for your approval` lands in the run's thread @mentioning whoever
-asked for the work, and `!sbx merge <item>` (here or in the control
+asked for the work — with a persistent **Approve merge** button on
+Discord — and `!sbx merge <item>` (here or in the control
 channel; `sbxloop daemon ctl merge <item>` works headless) completes the
 landing, while `!sbx abandon <item>` declines and leaves the PR open. No
-deadline; the park and its prompt survive restarts.
+deadline; the park, its prompt and its button survive restarts.
 Mentions are otherwise always disabled, so model output can never ping the
 channel, and Discord's automatic link previews (unfurls) are suppressed on
 every send *and* every edit, so no message sprouts a grey preview card — the

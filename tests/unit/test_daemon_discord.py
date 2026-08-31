@@ -2295,3 +2295,190 @@ class TestChoiceComponents:
         edits = len(posted.edit_kwargs)
         asyncio.run(view.on_timeout())
         assert len(posted.edit_kwargs) == edits
+
+
+# -- the merge-gate approve button (PR: sbx/gate-button) --------------------------------
+
+
+def make_gate(
+    run_id: str = "r77",
+    *,
+    notify: tuple[str, ...] = ("1",),
+    custom: str = "tok77",
+    prompt_channel: str | None = None,
+    prompt_message: str | None = None,
+    state: str = "open",
+) -> Any:
+    from sbxloop.daemon.store import MergeGate
+
+    return MergeGate(
+        run_id=run_id,
+        item_id="gh:issue:7",
+        repo="o/r",
+        pr_number=9,
+        pr_url="https://x/pull/9",
+        branch=None,
+        notify_ids=notify,
+        custom_id=custom,
+        state=state,
+        prompt_channel_id=prompt_channel,
+        prompt_message_id=prompt_message,
+        created_at=1.0,
+        resolved_at=None,
+        resolved_by=None,
+        detail=None,
+    )
+
+
+class TestGatePrompt:
+    """The base-bridge prompt through the Discord transport (prose path —
+    CI runs without the discord.py extra, so the view falls back)."""
+
+    def test_prompt_posts_in_thread_with_mention_and_both_commands(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.client = client
+        item = WorkItem(item_id="gh:issue:7", source_key="7", title="Seven")
+        with bridge._lock:
+            bridge._items["r77"] = item
+        bridge.dstore.create_merge_gate(
+            "r77", "gh:issue:7", "o/r", 9, "https://x/pull/9", None, ["1"], "tok77", 1.0
+        )
+        asyncio.run(bridge._post_gate_prompt(make_gate()))
+        thread = client.channels[421]  # created under the headline in control(42)
+        prompt = thread.sent[-1]
+        assert "ready to merge" in prompt
+        assert "<@1>" in prompt
+        assert "!sbx merge gh:issue:7" in prompt
+        assert "abandon gh:issue:7" in prompt
+        stored = bridge.dstore.merge_gate_for("r77")
+        assert stored is not None
+        assert stored.prompt_channel_id == "421"
+        assert stored.prompt_message_id, "the prompt id is persisted for restarts"
+
+    def test_resolution_edits_the_prompt_in_place(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.client = client
+        control = client.channels[42]
+        msg = asyncio.run(control.send("⏸ prompt"))
+        bridge.dstore.create_merge_gate(
+            "r77", "gh:issue:7", "o/r", 9, "https://x/pull/9", None, ["1"], "tok77", 1.0
+        )
+        bridge.dstore.set_gate_prompt("r77", "42", str(msg.id))
+        gate = bridge.dstore.merge_gate_for("r77")
+        assert gate is not None
+        asyncio.run(bridge._update_gate_prompt(gate, "merged", "brett", "abc123def456"))
+        assert "approved by brett" in msg.content and "merged" in msg.content
+
+    def test_failed_approval_pings_a_fresh_line_and_keeps_the_prompt(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.client = client
+        control = client.channels[42]
+        msg = asyncio.run(control.send("⏸ prompt"))
+        thread = FakeChannel(client, 421, name="run thread")
+        client.channels[421] = thread
+        bridge.dstore.record_chat_thread("r77", "42", "421", None, backend="discord")
+        bridge.dstore.create_merge_gate(
+            "r77", "gh:issue:7", "o/r", 9, "https://x/pull/9", None, ["1"], "tok77", 1.0
+        )
+        bridge.dstore.set_gate_prompt("r77", "42", str(msg.id))
+        gate = bridge.dstore.merge_gate_for("r77")
+        assert gate is not None
+        asyncio.run(bridge._update_gate_prompt(gate, "failed", "brett", "CI went red"))
+        assert msg.content == "⏸ prompt", "the prompt is left standing"
+        line = thread.sent[-1]
+        assert "failed" in line and "CI went red" in line and "<@1>" in line
+
+
+class TestGateButtonHandler:
+    """The transport-free click half — directly testable without discord.py."""
+
+    def _interaction(self, name: str = "alice") -> Any:
+        class Resp:
+            def __init__(self) -> None:
+                self.sent: list[tuple[str, bool]] = []
+
+            async def send_message(self, note: str, ephemeral: bool = False) -> None:
+                self.sent.append((note, ephemeral))
+
+        class Interaction:
+            user = FakeUser(5, name)
+            response = Resp()
+
+        return Interaction()
+
+    def test_click_approves_with_attribution(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord import _GateHandler
+
+        bridge, _, floop = make_bridge(tmp_path)
+        calls: list[tuple[str, str | None]] = []
+
+        def approve_merge(target: str, by: str | None = None) -> str:
+            calls.append((target, by))
+            return "✅ approved — completing the landing"
+
+        floop.approve_merge = approve_merge  # type: ignore[attr-defined]
+        interaction = self._interaction()
+        asyncio.run(_GateHandler(bridge, make_gate()).on_click(interaction))
+        assert calls == [("r77", "Discord user `alice`")]
+        ((note, ephemeral),) = interaction.response.sent
+        assert "approved" in note and ephemeral
+
+    def test_a_refusal_answers_ephemerally(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord import _GateHandler
+
+        bridge, _, floop = make_bridge(tmp_path)
+
+        def approve_merge(target: str, by: str | None = None) -> str:
+            raise ValueError("no merge gate for 'r77'")
+
+        floop.approve_merge = approve_merge  # type: ignore[attr-defined]
+        interaction = self._interaction()
+        asyncio.run(_GateHandler(bridge, make_gate()).on_click(interaction))
+        ((note, _),) = interaction.response.sent
+        assert "merge failed" in note and "no merge gate" in note
+
+
+class TestGateViewRearm:
+    def test_ready_rearms_open_and_approving_gates_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.daemon import discord as bridge_module
+
+        bridge, client, _ = make_bridge(tmp_path)
+        built: list[str] = []
+        monkeypatch.setattr(
+            bridge_module,
+            "_build_gate_view",
+            lambda b, g: (built.append(g.run_id), object())[1],
+        )
+        armed: list[Any] = []
+        client.add_view = lambda view, message_id=None: armed.append(message_id)  # type: ignore[attr-defined]
+        bridge.dstore.create_merge_gate("r1", "gh:issue:1", "o/r", 9, "u", None, [], "t1", 1.0)
+        bridge.dstore.set_gate_prompt("r1", "42", "555")
+        bridge.dstore.create_merge_gate("r2", "gh:issue:2", "o/r", 9, "u", None, [], "t2", 1.0)
+        assert bridge.dstore.claim_merge_gate("r2")  # approving: armed anyway
+        bridge._register_gate_views(client)
+        assert sorted(built) == ["r1", "r2"]
+        assert sorted(armed, key=str) == [555, None] or sorted(armed, key=repr) == [None, 555]
+        # A reconnect must not double-register the same custom_ids.
+        bridge._register_gate_views(client)
+        assert len(built) == 2
+
+    def test_a_resolved_gate_is_not_armed(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        armed: list[Any] = []
+        client.add_view = lambda view, message_id=None: armed.append(message_id)  # type: ignore[attr-defined]
+        bridge.dstore.create_merge_gate("r1", "gh:issue:1", "o/r", 9, "u", None, [], "t1", 1.0)
+        bridge.dstore.resolve_merge_gate("r1", "merged", "b", 2.0)
+        bridge._register_gate_views(client)
+        assert armed == []
+
+    def test_no_component_support_arms_nothing_and_never_raises(self, tmp_path: Path) -> None:
+        """CI has no discord.py: _build_gate_view answers None and re-arming
+        walks away quietly — the prose prompt still works by typing."""
+        bridge, client, _ = make_bridge(tmp_path)
+        armed: list[Any] = []
+        client.add_view = lambda view, message_id=None: armed.append(message_id)  # type: ignore[attr-defined]
+        bridge.dstore.create_merge_gate("r1", "gh:issue:1", "o/r", 9, "u", None, [], "t1", 1.0)
+        bridge._register_gate_views(client)
+        assert armed == []
