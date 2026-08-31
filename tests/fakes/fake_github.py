@@ -124,6 +124,10 @@ class FakeGithub(GithubOps):
         # ``refuse_inline_comments`` which fails a whole review.
         self.refuse_anchors: set[str] = set()
         self.fail_once: dict[str, Exception] = {}
+        # Raised on every ``GET /user`` when set: models a GitHub App
+        # installation token, which cannot call the user-scoped endpoint
+        # (403 "Resource not accessible by integration", #581).
+        self.fail_user_lookup: Exception | None = None
         # What the engine asked for.
         self.reviews: list[tuple[ReviewEvent, str, list[ReviewComment]]] = []
         self.merges: list[tuple[int, str, str]] = []
@@ -250,6 +254,8 @@ class FakeGithub(GithubOps):
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
         if method == "GET" and path == "/user":
+            if self.fail_user_lookup is not None:
+                raise self.fail_user_lookup
             return {"login": self.user_login}
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree"}}

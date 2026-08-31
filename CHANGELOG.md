@@ -64,6 +64,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Runs no longer fail after delivering their PR when github-ops runs as
+  a GitHub App installation** (#581; field runs `r5ctmq7e8`, `rb20denz3`).
+  The engine read the loop's own login with `gh api GET /user` — a
+  user-token endpoint an installation token cannot call (403 "Resource
+  not accessible by integration"), so runs that had already opened a
+  working PR died on the identity lookup before review/CI/merge. The
+  login now falls back to the delivered PR's author (the same token
+  opened it, so the author *is* the loop's identity under both credential
+  shapes), and when even that is unreadable it degrades to unknown with a
+  plain warning instead of raising. `ensure_repository`'s create path
+  survives the same 403 by taking the organization route.
+
 - **`doctor` no longer fails every repository row under GitHub App auth**
   (#568 follow-up). `GET /repos/{repo}` reports user-centric permission
   booleans that are all `false` for an installation token — including
