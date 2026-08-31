@@ -297,6 +297,15 @@ def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
         return ()  # not reported (some app tokens) — do not invent a failure
     if perms.get("admin") or perms.get("maintain") or perms.get("push"):
         return ()
+    if not perms.get("pull"):
+        # Self-contradictory: the request that fetched this payload WAS a
+        # read, so booleans denying even `pull` describe some other
+        # identity, not the authenticated token. GitHub App installation
+        # tokens answer exactly this way (all five False, field-verified
+        # 2026-08-31) while holding full write — their capabilities live on
+        # the installation, not the user-centric repo payload. Do not
+        # invent a failure the first daemon write would disprove.
+        return ()
     return tuple(f"{kind}:write" for kind in REQUIRED_REPO_PERMISSIONS)
 
 

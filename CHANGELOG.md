@@ -64,6 +64,16 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **`doctor` no longer fails every repository row under GitHub App auth**
+  (#568 follow-up). `GET /repos/{repo}` reports user-centric permission
+  booleans that are all `false` for an installation token — including
+  `pull`, which the successful request itself disproves — while the real
+  capabilities live on the installation. The permission check now treats
+  a payload that denies even `pull` as not authoritative instead of
+  reporting `token missing issues:write, contents:write,
+  pull_requests:write` for a credential that holds all three (doctor-only;
+  nothing gated dispatch on it).
+
 - **Shape-mimicking sbx proxy placeholders are now recognized as
   sentinels everywhere** (#576 follow-up; field failure db 2026-08-31).
   sbx's *service*-secret placeholders mimic real token shapes

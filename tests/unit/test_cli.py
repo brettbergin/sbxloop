@@ -2417,6 +2417,14 @@ class TestDoctorRepoChecks:
         assert _missing_permissions({"permissions": {"push": True}}) == ()
         assert _missing_permissions({"permissions": {"admin": True}}) == ()
         assert _missing_permissions({}) == ()  # not reported: no invented failure
+        # Installation tokens answer all-False — including pull, which the
+        # successful GET itself disproves — while holding full write on the
+        # installation (field-verified 2026-08-31): not authoritative.
+        all_false = dict.fromkeys(("admin", "maintain", "push", "triage", "pull"), False)
+        assert _missing_permissions({"permissions": all_false}) == ()
+        # ...while a genuinely read-only token (pull works, push denied)
+        # still flags.
+        assert _missing_permissions({"permissions": {"pull": True, "push": False}}) != ()
         missing = _missing_permissions({"permissions": {"pull": True, "push": False}})
         assert "issues:write" in missing and "contents:write" in missing
 
