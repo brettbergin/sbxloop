@@ -499,10 +499,22 @@ failed to post used to merge with no review on the PR at all — and every
 inline thread must be reconciled. `landing.unreconciled_threads` splits the
 PR's threads by author: a loop thread counts as reconciled when it is
 resolved *or* carries a later loop reply (the refuted case), a human thread
-when it carries a loop reply at all. Anything left over is
-`Blocked("N review threads unreconciled: <anchors>")`, naming them, and a
-thread read that *fails* blocks too — "we could not tell" is not "there is
-nothing to answer".
+when it carries a loop reply at all. A human thread that lacks one is
+first *answered*, not waited on: no human asked for that wait, so landing
+replies itself ("noted — does not hold up the merge",
+`reconcile.acknowledge_human_threads`, emitted as `land.human_ack`; the
+thread is never resolved — closing it stays the human's call) and judges
+again on a fresh read. Whatever is still left over is
+`Blocked("N review threads unreconciled: <anchors>")`, naming them. A
+thread listing that fails is retried before "could not be read" blocks — a
+one-off 502 must not strand a run that cleared every other bar — and a
+review record that never posted is reposted as a marker-stamped PR comment
+before the record gate blocks. Classification needs the loop's real
+identity: under App auth that is `<app-slug>[bot]`, resolved on the host
+from the credential itself (one cached `GET /app`; the user-token-only
+`GET /user` is skipped), and an empty login refuses to classify — blocking
+with the identity failure rather than misreading the loop's own threads as
+a human's.
 
 ## Landing
 

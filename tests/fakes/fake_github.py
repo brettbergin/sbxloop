@@ -23,6 +23,8 @@ exactly as GitHub does. Everything else is a knob:
 - ``fail_once``: method name -> exception raised on that method's next
   call (then cleared), for interrupting a run mid-stage. The call is still
   recorded: GitHub was asked, it just did not answer.
+- ``fail_always``: method name -> exception raised on **every** call, for
+  persistent outages (checked after ``fail_once``).
 
 Any GithubOps method this fake does not model reaches ``_op`` and fails
 loudly rather than pretending.
@@ -124,6 +126,7 @@ class FakeGithub(GithubOps):
         # ``refuse_inline_comments`` which fails a whole review.
         self.refuse_anchors: set[str] = set()
         self.fail_once: dict[str, Exception] = {}
+        self.fail_always: dict[str, Exception] = {}
         # Raised on every ``GET /user`` when set: models a GitHub App
         # installation token, which cannot call the user-scoped endpoint
         # (403 "Resource not accessible by integration", #581).
@@ -164,6 +167,9 @@ class FakeGithub(GithubOps):
         exc = self.fail_once.pop(method, None)
         if exc is not None:
             raise exc
+        always = self.fail_always.get(method)
+        if always is not None:
+            raise always
 
     def _op(self, op: str, params: dict[str, Any], *, timeout_s: float | None = None) -> Any:
         raise AssertionError(f"FakeGithub does not model github op {op!r} ({params})")
@@ -282,6 +288,9 @@ class FakeGithub(GithubOps):
             return {"ref": path}
         if method == "GET" and path.endswith("/reviews"):
             return list(self.reviews_payload)
+        if method == "GET" and "/issues/" in path and path.endswith("/comments"):
+            # The PR-as-issue comment listing: what pr_issue_comment posted.
+            return [{"body": body} for body in self.issue_comments]
         if method == "GET" and path.endswith("/comments"):
             return list(self.comments_payload)
         if method == "GET" and "/pulls?state=open&head=" in path:

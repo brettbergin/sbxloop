@@ -102,6 +102,7 @@ from sbxloop.engine.phases import (
 )
 from sbxloop.engine.reconcile import (
     ReconcileOutcome,
+    acknowledge_human_threads,
     note_nonblocking,
     post_confirmations,
     reconcile_human,
@@ -187,6 +188,10 @@ class Pipeline:
     # The loop's own GitHub identity, read once and only when landing asks
     # (to tell a human's review objection from its own posted review).
     login: str | None = None
+    # App mode: ``<slug>[bot]``, resolved on the host from the credential
+    # itself (one cached GET /app per process); None under a PAT, where
+    # GET /user answers instead. See ``_login``.
+    bot_login: str | None = None
     # Whether the PR's author is that identity (#513): then GitHub refuses
     # REQUEST_CHANGES/APPROVE and the review is posted as PR comments
     # instead. Decided once per drive, on the first review round.
@@ -585,6 +590,11 @@ class LoopEngine:
                         ops=ops,
                         repo=repo_config.repo if ops is not None and repo_config else None,
                         repo_config=repo_config if ops is not None else None,
+                        bot_login=(
+                            provisioner.gh_bot_login(self.config.github.repo)
+                            if ops is not None
+                            else None
+                        ),
                     )
                     try:
                         state, reason = self._run_pipeline(pipeline, stage)
@@ -1848,6 +1858,47 @@ class LoopEngine:
             return bool(isinstance(review, dict) and review.get("url"))
         return True
 
+    def _repost_review_record(self, p: Pipeline, number: int) -> bool:
+        """Self-heal a review round whose record never reached GitHub (#503).
+
+        The review-posted gate exists so a merge never lacks a reviewable
+        record — a requirement the loop can satisfy itself, so stranding a
+        run on a transient 422/5xx would be a gate the loop erected. The
+        repost is a PR **comment**, not a review: re-submitting the review
+        would 422 again in the common self-review deployment (#513), and
+        the findings/threads were already posted or reconciled. Idempotent
+        by a run-scoped marker read back from the PR's comments, so a
+        resume never double-posts. False — the terminal ``Blocked`` — only
+        when the repost itself failed too: GitHub writes are then broadly
+        failing, and blocking with the truth is honest.
+        """
+        run_id, ops, repo = p.run_id, p.ops, p.repo
+        assert ops is not None and repo is not None
+        stamp = f"<!-- sbxloop:review-record run={run_id} -->"
+        try:
+            existing = ops.raw("GET", f"/repos/{repo}/issues/{number}/comments")
+        except GithubOpsError:
+            existing = []
+        for entry in existing if isinstance(existing, list) else []:
+            if isinstance(entry, dict) and stamp in str(entry.get("body") or ""):
+                return True
+        rounds = self._review_rounds(run_id)
+        if not rounds:
+            return False
+        last = rounds[-1]
+        body = (
+            f"**Review verdict: {last.verdict.verdict}** (round {last.round}) — "
+            "reposted record: the review itself could not be posted (#503).\n\n"
+            f"{last.verdict.summary}\n\n{stamp}"
+        )
+        try:
+            ops.pr_issue_comment(repo, number, body)
+        except GithubOpsError:
+            log.warning("review.repost_failed", run=run_id, pr=number, exc_info=True)
+            return False
+        log.info("review.record_reposted", run=run_id, pr=number, round=last.round)
+        return True
+
     def _reconcile_fix(
         self, run_id: str, task: TaskRecord, report: str
     ) -> list[dict[str, str]] | None:
@@ -2074,6 +2125,7 @@ class LoopEngine:
         def emit(type: str, **data: Any) -> None:
             self.bus.emit(type, run_id, **data)
 
+        login = self._login(p)
         outcome = land(
             ops,
             repo,
@@ -2081,14 +2133,17 @@ class LoopEngine:
             cfg=self.config.landing,
             branch=run.branch,
             node_id=run.pr_node_id,
-            login=self._login(p),
+            login=login,
             update=update,
             on_update=on_update,
             tick=partial(self._tick, p),
             emit=emit,
             clock=self.clock,
             answered=self.store.answered_objections(run_id),
-            review_posted=self._review_posted(run_id),
+            review_posted=self._review_posted(run_id) or self._repost_review_record(p, number),
+            ack=lambda threads: acknowledge_human_threads(
+                ops, repo, number, run_id=run_id, login=login, threads=threads
+            ),
         )
         if isinstance(outcome, Landed):
             log.info(
@@ -2306,16 +2361,21 @@ class LoopEngine:
     def _login(self, p: Pipeline) -> str:
         """The loop's own GitHub login, read once per drive.
 
-        ``GET /user`` is a user-token endpoint: a GitHub App installation
-        token gets 403 "Resource not accessible by integration" (#581),
-        and raising here failed runs that had already delivered a working
-        PR. The loop's identity is then the author of the PR it delivered
-        — the same token opened it — and when even that is unreadable the
-        login degrades to ``""`` (self-review reads as no, landing filters
-        nothing) with a plain log line instead of an exception.
+        Resolution order: the App's own ``<slug>[bot]`` when the host
+        resolved one (``Pipeline.bot_login`` — App mode skips ``GET
+        /user``, which an installation token cannot call: 403, #581); then
+        ``GET /user`` (PAT mode); then the author of the delivered PR (the
+        same token opened it); then ``""`` with a plain log line. The empty
+        degradation is **not** harmless for landing — classification would
+        call every loop thread a human's — so landing refuses to classify
+        with it (`_reconciliation_block`) instead of misclassifying.
         """
         if p.login is None:
             assert p.ops is not None
+            if p.bot_login:
+                p.login = p.bot_login
+                log.info("engine.login_app_identity", run=p.run_id, login=p.login)
+                return p.login
             try:
                 user = p.ops.raw("GET", "/user")
                 p.login = str(user.get("login", "")) if isinstance(user, dict) else ""

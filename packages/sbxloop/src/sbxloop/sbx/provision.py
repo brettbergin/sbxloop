@@ -390,6 +390,24 @@ class Provisioner:
         """
         return self.gh_credential(repo).token()
 
+    def gh_bot_login(self, repo: str | None = None) -> str | None:
+        """The login GitHub attributes the github sandbox's writes to, when
+        the credential alone can answer.
+
+        App mode answers ``<slug>[bot]`` (one cached ``GET /app`` per
+        process — the shared :class:`AppTokenSource` holds it); PAT mode
+        answers ``None``: a PAT's login comes from ``GET /user``, which the
+        engine already asks. Best-effort by design — a misconfigured
+        credential raises at provisioning time, not here.
+        """
+        try:
+            cred = self.gh_credential(repo)
+        except ProvisionError:
+            return None
+        if isinstance(cred, GhApp):
+            return cred.source.bot_login()
+        return None
+
     def _repo_entry(self, repo: str | None) -> RepoConfig | None:
         """The configured entry a sandbox is scoped to.
 

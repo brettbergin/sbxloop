@@ -13,11 +13,14 @@ from __future__ import annotations
 from collections.abc import Container
 from typing import Any
 
+import pytest
+
 from sbxloop.config import LandingConfig
 from sbxloop.engine.landing import Blocked, Landed, UpdateState, land, unreconciled_threads
+from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import ReviewThread, ThreadComment
-from tests.fakes.fake_github import FakeGithub
+from tests.fakes.fake_github import FakeGithub, human_review
 
 REPO = "o/r"
 LOGIN = "sbxloop-bot"
@@ -48,22 +51,20 @@ def run_land(fake: FakeGithub, **over: Any) -> Any:
         {"ci_poll_interval_s": 1.0, "ci_settle_s": 0, "ci_timeout_s": 600.0}
     )
     answered: Container[str] = frozenset()
-    return land(
-        fake,
-        REPO,
-        fake.number,
-        cfg=cfg,
-        branch=None,
-        node_id=str(fake.pr["node_id"]),
-        login=LOGIN,
-        update=UpdateState(),
-        on_update=lambda state: None,
-        tick=lambda waiting: None,
-        emit=lambda type, **data: None,
-        clock=_clock(),
-        answered=answered,
-        **over,
-    )
+    kwargs: dict[str, Any] = {
+        "cfg": cfg,
+        "branch": None,
+        "node_id": str(fake.pr["node_id"]),
+        "login": LOGIN,
+        "update": UpdateState(),
+        "on_update": lambda state: None,
+        "tick": lambda waiting: None,
+        "emit": lambda type, **data: None,
+        "clock": _clock(),
+        "answered": answered,
+    }
+    kwargs.update(over)
+    return land(fake, REPO, fake.number, **kwargs)
 
 
 def _clock() -> Any:
@@ -158,14 +159,6 @@ class TestMergeGate:
         assert outcome == Blocked("review record could not be posted")
         assert fake.merges == []
 
-    def test_unreadable_threads_block_rather_than_merge_blind(self) -> None:
-        fake = FakeGithub()
-        fake.fail_once["pr_review_threads"] = GithubOpsError("boom", http_status=502)
-        outcome = run_land(fake)
-        assert isinstance(outcome, Blocked)
-        assert "could not be read" in outcome.why
-        assert fake.merges == []
-
     def test_the_gate_runs_after_ci_and_mergeability(self) -> None:
         """An unreconciled PR that is also unmergeable is a conflict first:
         the fix round that resolves the conflict is what will reconcile."""
@@ -198,3 +191,112 @@ class TestMergeGate:
         )
         assert isinstance(outcome, Blocked)
         assert seen == [("land.unreconciled", {"pr": 7, "why": outcome.why})]
+
+
+def gate_ack(fake: FakeGithub, run_id: str = "rgate1234") -> Any:
+    """The real landing-time ack, bound the way the engine binds it."""
+    return lambda threads: acknowledge_human_threads(
+        fake, REPO, fake.number, run_id=run_id, login=LOGIN, threads=threads
+    )
+
+
+class TestThreadReadRetry:
+    """A transient listing failure self-heals; a persistent one blocks
+    with the attempt count — merging blind stays forbidden (#520)."""
+
+    def test_a_one_off_502_self_heals(self) -> None:
+        fake = FakeGithub()
+        fake.fail_once["pr_review_threads"] = GithubOpsError("boom", http_status=502)
+        assert isinstance(run_land(fake), Landed)
+
+    def test_a_persistent_failure_blocks_with_the_attempt_count(self) -> None:
+        fake = FakeGithub()
+        fake.fail_always["pr_review_threads"] = GithubOpsError("boom", http_status=502)
+        outcome = run_land(fake)
+        assert isinstance(outcome, Blocked)
+        assert "could not be read" in outcome.why
+        assert "3 attempts" in outcome.why
+        assert fake.merges == []
+
+    def test_the_gate_waits_one_tick_between_attempts(self) -> None:
+        fake = FakeGithub()
+        fake.fail_always["pr_review_threads"] = GithubOpsError("boom", http_status=502)
+        waits: list[str] = []
+        run_land(fake, tick=waits.append)
+        assert waits == ["threads", "threads"]
+
+
+class TestEmptyLoginGuard:
+    """#569 x #536: an empty login must never classify — it read every
+    loop thread as a human's and stranded reconciled App-auth runs."""
+
+    def test_unreconciled_threads_refuses_an_empty_login(self) -> None:
+        with pytest.raises(ValueError, match="loop's own login"):
+            unreconciled_threads([thread()], login="")
+
+    def test_threads_with_an_unknown_identity_block_with_the_real_reason(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread()]
+        outcome = run_land(fake, login="")
+        assert isinstance(outcome, Blocked)
+        assert "identity could not be resolved" in outcome.why
+        assert fake.merges == []
+
+    def test_no_threads_and_no_identity_still_merges(self) -> None:
+        """Identity only matters when there is something to classify."""
+        fake = FakeGithub()
+        assert isinstance(run_land(fake, login=""), Landed)
+
+    def test_standing_objections_with_an_unknown_identity_block_not_fix(self) -> None:
+        """These "objections" may be the loop's own words — a fix round on
+        them is budget burn, not autonomy."""
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "no")]
+        outcome = run_land(fake, login="")
+        assert isinstance(outcome, Blocked)
+        assert "identity could not be resolved" in outcome.why
+
+
+class TestHumanAck:
+    """Landing answers human threads nothing else in the pipeline would
+    ever speak to — the loop never waits on a human it never asked."""
+
+    def test_a_human_thread_is_answered_then_the_pr_merges(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread(comments=((HUMAN, "why this way?"),))]
+        outcome = run_land(fake, ack=gate_ack(fake))
+        assert isinstance(outcome, Landed)
+        assert fake.replies and "does not hold up the merge" in fake.replies[0][1]
+        assert fake.resolved == [], "a human's thread is never resolved"
+
+    def test_the_ack_reaches_the_event_stream(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread(comments=((HUMAN, "why?"),))]
+        seen: list[tuple[str, dict[str, Any]]] = []
+        run_land(fake, ack=gate_ack(fake), emit=lambda type, **data: seen.append((type, data)))
+        assert ("land.human_ack", {"pr": 7, "acked": 1}) in seen
+
+    def test_a_failed_ack_still_blocks_truthfully(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread(path="x.py", line=1, comments=((HUMAN, "no"),))]
+        fake.fail_always["pr_comment_reply"] = GithubOpsError("boom", http_status=502)
+        outcome = run_land(fake, ack=gate_ack(fake))
+        assert isinstance(outcome, Blocked)
+        assert outcome.why == "1 human review threads have no reply: x.py:1"
+        assert fake.merges == []
+
+    def test_without_an_ack_the_gate_stays_read_only(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread(path="x.py", line=1, comments=((HUMAN, "no"),))]
+        outcome = run_land(fake)
+        assert isinstance(outcome, Blocked)
+        assert fake.replies == []
+
+    def test_a_second_pass_posts_nothing_new(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread(comments=((HUMAN, "why?"),))]
+        assert isinstance(run_land(fake, ack=gate_ack(fake)), Landed)
+        posted = len(fake.replies)
+        fake.pr["merged"] = False  # run the landing pass again from the top
+        assert isinstance(run_land(fake, ack=gate_ack(fake)), Landed)
+        assert len(fake.replies) == posted

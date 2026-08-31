@@ -2661,3 +2661,67 @@ class TestDoctorRepoHealthRow:
         store.close()
         got = daemon_repo_health(config, sources, env)
         assert got == {"acme/alpha": {"suspended": True, "reason": "x"}}
+
+
+class TestDoctorBranchProtection:
+    """Approving-review branch protection 405s every loop merge: doctor
+    surfaces it as advice (human-out-of-the-loop doctrine)."""
+
+    def _config(self, toml: str, workdir: Path) -> Any:
+        from sbxloop.config import load_config
+
+        (workdir / "sbxloop.toml").write_text(toml)
+        return load_config()
+
+    def test_protection_adds_a_soft_advisory_row(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        rows = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=True, review_protected=True),
+        )
+        main, protection = rows
+        assert main.ok
+        assert protection.name == "github repo acme/alpha branch protection"
+        assert not protection.ok and not protection.hard
+        assert "HTTP 405" in protection.detail
+        assert "human-out-of-the-loop" in protection.detail
+
+    def test_unverifiable_protection_adds_no_row(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        (row,) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=True, review_protected=None),
+        )
+        assert row.ok
+
+    def test_requires_approving_reviews_reads_both_sources(self) -> None:
+        from sbxloop.cli.doctor import _requires_approving_reviews
+        from sbxloop.errors import GithubOpsError
+
+        class Ops:
+            def __init__(self, protection: Any, rules: Any) -> None:
+                self.protection, self.rules = protection, rules
+
+            def raw(self, method: str, path: str) -> Any:
+                answer = self.protection if path.endswith("/protection") else self.rules
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+
+        classic = Ops({"required_pull_request_reviews": {"required_approving_review_count": 1}}, [])
+        assert _requires_approving_reviews(classic, "o/r", "main") is True
+        unprotected = Ops(GithubOpsError("x", http_status=404), [])
+        assert _requires_approving_reviews(unprotected, "o/r", "main") is False
+        ruleset = Ops(
+            GithubOpsError("x", http_status=403),
+            [{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}],
+        )
+        assert _requires_approving_reviews(ruleset, "o/r", "main") is True
+        unknown = Ops(GithubOpsError("x", http_status=403), GithubOpsError("x", http_status=403))
+        assert _requires_approving_reviews(unknown, "o/r", "main") is None

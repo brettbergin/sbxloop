@@ -1520,3 +1520,59 @@ class TestMimicSentinels:
         provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
         pair = provisioner.ensure_pair("r1")
         pair.cleanup()
+
+
+class TestBotLoginResolution:
+    """`Provisioner.gh_bot_login` (#569 x #536): the write-attribution
+    identity, knowable from the credential alone only in App mode."""
+
+    def test_pat_mode_answers_none(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        assert make_provisioner(fake_sbx, tmp_path).gh_bot_login(None) is None
+
+    def test_app_mode_answers_the_bot_login(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.gh import appauth
+
+        monkeypatch.setattr(appauth, "fetch_app_slug", lambda creds, **kw: "sbxloop-app")
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        assert provisioner.gh_bot_login(None) == "sbxloop-app[bot]"
+        # cached on the shared source: a second ask fetches nothing new
+        assert provisioner.gh_bot_login(None) == "sbxloop-app[bot]"
+
+    def test_a_failed_slug_lookup_degrades_to_none(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.errors import GithubOpsError
+        from sbxloop.gh import appauth
+
+        def boom(creds: object, **kw: object) -> str:
+            raise GithubOpsError("nope")
+
+        monkeypatch.setattr(appauth, "fetch_app_slug", boom)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        assert provisioner.gh_bot_login(None) is None
+
+    def test_a_misconfigured_credential_answers_none_not_raise(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """PAT + App both set raises at provisioning time, not here."""
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, env={**TestGithubAppAuth.APP_ENV, "GH_TOKEN": "github_pat_x"}
+        )
+        assert provisioner.gh_bot_login(None) is None
+
+    def test_a_per_repo_token_env_stays_a_pat(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repos": [{"repo": "owner/repo", "token_env": "GH_TOKEN_TWO"}]},
+            }
+        )
+        provisioner = make_provisioner(
+            fake_sbx,
+            tmp_path,
+            env={**TestGithubAppAuth.APP_ENV, "GH_TOKEN_TWO": "github_pat_two"},
+            config=config,
+        )
+        assert provisioner.gh_bot_login("owner/repo") is None
