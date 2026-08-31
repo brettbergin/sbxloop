@@ -64,6 +64,25 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A stale sbx secret registration can no longer shadow env-file
+  credentials — GitHub App boxes were still acting as the retired PAT**
+  (#576). The daemon/doctor github sandboxes have stable names, `sbx rm`
+  leaves sandbox-scoped registrations behind, sbx stamps registered
+  secrets into the VM at create, and sbx 0.38 stamps exec environments
+  too — so after the App cutover the leftover `github` service
+  registration's shape-mimicking `gho_…` sentinel outranked the
+  installation token in `~/.sbxloop/env.sh` (the worker keeps
+  credential-shaped values; the egress proxy rewrote them with the old
+  PAT). Every write kept succeeding, silently, as the wrong identity.
+  Env-file provisioning now **purges registrations parked at the sandbox
+  name before `create`** (`sandbox.stale_registration_purged`), and
+  github boxes get a post-write shadow probe that fails provisioning
+  loudly (`sandbox.credential_shadowed`) when a credential-shaped
+  GH_TOKEN/GITHUB_TOKEN is still stamped (e.g. a global-scope
+  registration the purge must not touch), instead of running as the
+  wrong identity. Proxy-mode PAT provisioning is unchanged
+  (`set_secret_replacing` already replaces in place).
+
 - **Filing follow-up issues no longer errors when the follow-up label
   already exists** (#556). The run blind-POSTed `/repos/<repo>/labels`
   before filing, so every repository that already carried

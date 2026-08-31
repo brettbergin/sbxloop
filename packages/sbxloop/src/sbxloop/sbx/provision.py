@@ -119,6 +119,10 @@ MOUNT_SEARCH_MAXDEPTH = 4
 # sbx's proxy sentinel. 0 is a usable token, 1 is unset/empty.
 _SENTINEL_EXIT = 3
 
+# Shadow-probe exit code: the exec environment already carries a
+# credential-shaped github token that would win over the env file (#576).
+_SHADOW_EXIT = 3
+
 # Cached probe verdicts that mean the sbx proxy cannot feed exec'd workers:
 # under the ``proxy`` strategy, provisioning on an sbx version already known
 # to behave this way goes straight to the in-VM env file instead of
@@ -695,6 +699,10 @@ class Provisioner:
                 template=spec.template,
             )
             self.bus.emit("sandbox.provision_start", run_id, name=spec.name, role=spec.role)
+            if env_file_reasons[spec.role] is not None:
+                # sbx stamps *registered* secrets into the VM at create;
+                # purge leftovers parked at this name first (#576).
+                self._purge_stale_registrations(spec)
             self.cli.create(spec)
             log.debug(
                 "sandbox.created",
@@ -910,6 +918,10 @@ class Provisioner:
         registered_secret_rms: list[Callable[[], bool]] = []
         try:
             self.bus.emit("sandbox.provision_start", label, name=spec.name, role=spec.role)
+            if reason is not None:
+                # Stable-named boxes (the daemon's, doctor's) are exactly the
+                # ones that accumulate stale registrations (#576).
+                self._purge_stale_registrations(spec)
             self.cli.create(spec)
             created = Sandbox(self.cli, spec.name)
             self._apply_policy(spec)
@@ -1087,6 +1099,93 @@ class Provisioner:
             )
             log.info("sandbox.github_app_auth", run=run_id, sandbox=spec.name, detail=message)
             self.bus.emit("sandbox.github_app_auth", run_id, name=spec.name, message=message)
+        self._verify_env_file_unshadowed(run_id, spec, sandbox)
+
+    def _purge_stale_registrations(self, spec: SandboxSpec) -> None:
+        """Remove secret registrations parked at this sandbox's name (#576).
+
+        Env-file delivery registers nothing of its own — but ``sbx rm``
+        leaves sandbox-scoped registrations behind (rgn9ccjam), sbx stamps
+        whatever *is* registered into the VM at create, and on sbx builds
+        that stamp exec environments the leftover's shape-mimicking sentinel
+        shadows the env file: the worker keeps what looks like a real token
+        and the egress proxy rewrites it on the way out with the stale
+        value. Field failure (db, 2026-08-30): after the GitHub App
+        cutover, daemon ops were still attributed to the retired PAT held
+        by a ``github`` service registration at the daemon box's stable
+        name. Runs *before* ``create`` so the box never boots stamped;
+        "nothing to remove" is the common case and returns quietly. An
+        sbx-level removal failure propagates into a ProvisionError —
+        provisioning a box that might act as the wrong identity is worse
+        than not provisioning it.
+        """
+        for secret in spec.secrets:
+            if secret.kind == "service":
+                assert secret.service is not None
+                removed = self.cli.secret_rm(service=secret.service, sandbox=spec.name)
+            else:
+                assert secret.host is not None and secret.env is not None
+                removed = self._rm_custom(host=secret.host, env=secret.env, scope=spec.name)
+            if removed:
+                log.info(
+                    "sandbox.stale_registration_purged",
+                    sandbox=spec.name,
+                    kind=secret.kind,
+                    service=secret.service,
+                    env=secret.env,
+                )
+
+    def _verify_env_file_unshadowed(self, run_id: str, spec: SandboxSpec, sandbox: Sandbox) -> None:
+        """No foreign credential may outrank the env file on a github box.
+
+        After the purge nothing should be stamping GH_TOKEN/GITHUB_TOKEN
+        into exec environments at all — but a registration the purge cannot
+        touch (a *global*-scope ``github`` service secret, or an sbx build
+        that stamps from somewhere new) would still shadow the env file:
+        the worker keeps any credential-shaped value it finds (a
+        shape-mimicking ``gho_…`` proxy sentinel included) and the egress
+        proxy rewrites it with the stale secret. That failure mode is
+        silent — ops succeed, as the wrong identity — so it must be caught
+        here, loudly, at provision time (#576).
+
+        The value is classified in the shell and never read back. A plain
+        ``sbx-cs-…`` sentinel is fine (the worker overrides those); a clean
+        empty answer is the expected case. This is a guard behind the
+        purge, not the primary defense: a probe that cannot get a clean
+        answer logs and proceeds rather than failing provisioning.
+        """
+        if spec.role != "github":
+            return
+        probe = [
+            "sh",
+            "-lc",
+            'for v in "$GH_TOKEN" "$GITHUB_TOKEN"; do [ -n "$v" ] || continue; '
+            f'case "$v" in {shell_token_case()}) exit {_SHADOW_EXIT} ;; esac; done; exit 0',
+        ]
+        error = ""
+        for _attempt in range(2):
+            try:
+                result = sandbox.exec(probe)
+            except SbxError as exc:
+                error = str(exc)
+                continue
+            if result.returncode in (0, _SHADOW_EXIT):
+                break
+            error = f"probe exited {result.returncode}: {result.stderr.strip()}"
+        else:
+            log.warning("sandbox.shadow_probe_error", run=run_id, sandbox=spec.name, error=error)
+            return
+        if result.returncode == 0:
+            return
+        message = (
+            "exec environment already carries a credential-shaped GH_TOKEN/GITHUB_TOKEN "
+            "that would shadow the in-VM env file — a stale sbx secret registration "
+            "(possibly global scope) still stamps this box. Remove it "
+            f"(`sbx secret rm github --sandbox {spec.name} -f`, and check `sbx secret ls` "
+            "for a global github entry) and retry; refusing to run as the wrong identity"
+        )
+        self.bus.emit("sandbox.credential_shadowed", run_id, name=spec.name, message=message)
+        raise ProvisionError(f"{spec.name}: {message}")
 
     def _verify_secret_env(
         self, run_id: str, spec: SandboxSpec, sandbox: Sandbox, token: str

@@ -21,6 +21,15 @@ TOKENS = {"COPILOT_GITHUB_TOKEN": "github_pat_copilot", "GH_TOKEN": "github_pat_
 GITHUB_ENABLED = {"github": {"repo": "owner/repo"}}
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_github_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FakeSbx execs run on the host, so probe answers (secret visibility,
+    the #576 shadow probe) would vary with the developer's or CI's exported
+    tokens; every test here passes credentials explicitly via ``env=``."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def make_provisioner(
     fake_sbx: FakeSbx,
     tmp_path: Path,
@@ -251,8 +260,10 @@ class TestEnsurePair:
             assert "export GH_TOKEN=github_pat_user" in github_env
             assert "export GITHUB_TOKEN=github_pat_user" in github_env
             assert "COPILOT_GITHUB_TOKEN" not in github_env
-            # no sbx secret invocations under plain-env
-            assert fake_sbx.secrets() == []
+            # no sbx secret registrations under plain-env (the #576 purge's
+            # best-effort `secret rm` calls are expected)
+            sets = [s for s in fake_sbx.secrets() if s["args"][0] in ("set", "set-custom")]
+            assert sets == []
         finally:
             pair.cleanup()
 
@@ -335,6 +346,10 @@ class TestEnsurePair:
         state = json.loads((fake_sbx.state / "secrets-state.json").read_text())
         assert state["service"] == {}
         # a fresh attempt provisions without needing any collision recovery
+        # r1's agent probe cached "invisible-under-exec"; clear it so r2
+        # takes the registration path whose no-recovery property this
+        # asserts (the cached path is covered by TestCachedProxyVerdictSkip).
+        shutil.rmtree(tmp_path / "state" / "conformance")
         rm_calls_before = len(fake_sbx.invocations("secret rm"))
         pair = provisioner.ensure_pair("r2")
         assert len(fake_sbx.invocations("secret rm")) == rm_calls_before
@@ -1272,8 +1287,10 @@ class TestCachedProxyVerdictSkip:
         provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
         pair = provisioner.ensure_pair("r1")
         try:
-            # no secret registrations at all — both roles go env-file direct
-            assert fake_sbx.secrets() == []
+            # no secret registrations at all — both roles go env-file
+            # direct (the purge's best-effort `secret rm` calls are fine)
+            sets = [s for s in fake_sbx.secrets() if s["args"][0] in ("set", "set-custom")]
+            assert sets == []
             for name in (pair.agent.name, pair.github.name):
                 env_sh = (fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/env.sh").read_text()
                 assert "export" in env_sh
@@ -1369,3 +1386,94 @@ class TestGhCredentialStatus:
         status = gh_credential_status(env, token_env="GH_TOKEN_TWO")
         assert (status.ok, status.mode) == (True, "pat")
         assert "GH_TOKEN_TWO" in status.detail
+
+
+class TestPurgeStaleRegistrations:
+    """Env-file deliveries purge registrations parked at the sandbox name
+    BEFORE create, and a github box refuses to run shadowed (#576)."""
+
+    def stale_github_registration(self, fake_sbx: FakeSbx, scope: str) -> None:
+        SbxCLI(binary=str(fake_sbx.binary)).secret_set(
+            "github", sandbox=scope, token="github_pat_stale"
+        )
+
+    def indices(self, fake_sbx: FakeSbx, name: str) -> tuple[int | None, int]:
+        calls = fake_sbx.invocations()
+        rm = next(
+            (i for i, c in enumerate(calls) if c[:2] == ["secret", "rm"] and name in c),
+            None,
+        )
+        create = next(i for i, c in enumerate(calls) if c[0] == "create" and f"--name={name}" in c)
+        return rm, create
+
+    def test_app_mode_purges_stale_registration_before_create(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        TestGithubAppAuth().stub_mint(monkeypatch)
+        self.stale_github_registration(fake_sbx, "sbxloop-r1-github")
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            rm, create = self.indices(fake_sbx, "sbxloop-r1-github")
+            assert rm is not None and rm < create
+            import json
+
+            state_path = fake_sbx.state / "secrets-state.json"
+            state = json.loads(state_path.read_text())
+            assert "sbxloop-r1-github|github" not in state.get("service", {})
+        finally:
+            pair.cleanup()
+
+    def test_cached_verdict_mode_purges_too(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        TestCachedProxyVerdictSkip().seed_broken_verdict(tmp_path)
+        self.stale_github_registration(fake_sbx, "sbxloop-r1-github")
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            rm, create = self.indices(fake_sbx, "sbxloop-r1-github")
+            assert rm is not None and rm < create
+        finally:
+            pair.cleanup()
+
+    def test_proxy_mode_does_not_purge_before_create(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """The proxy path replaces in place (set_secret_replacing) after
+        create, exactly as before — no new rm ahead of it."""
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            rm, create = self.indices(fake_sbx, "sbxloop-r1-github")
+            assert rm is None or rm > create
+        finally:
+            pair.cleanup()
+
+    def test_shadowing_credential_fails_provisioning_loudly(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A credential-shaped GH_TOKEN visible to exec (a registration the
+        purge cannot reach, e.g. global scope) must refuse the box rather
+        than run as the wrong identity."""
+        TestGithubAppAuth().stub_mint(monkeypatch)
+        monkeypatch.setenv("GH_TOKEN", "gho_shape_mimicking_sentinel")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV, bus=bus)
+        with pytest.raises(ProvisionError, match="wrong identity"):
+            provisioner.ensure_pair("r1")
+        shadowed = [e for e in events if e.type == "sandbox.credential_shadowed"]
+        assert len(shadowed) == 1
+        # rollback ran: the half-provisioned pair is gone
+        assert fake_sbx.invocations("rm") != []
+
+    def test_plain_sbx_sentinel_is_not_a_shadow(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An sbx-cs- placeholder is overridden by the worker's env-file
+        load, so it must not trip the probe."""
+        TestGithubAppAuth().stub_mint(monkeypatch)
+        monkeypatch.setenv("GH_TOKEN", "sbx-cs-abcdef123456")
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        pair = provisioner.ensure_pair("r1")
+        pair.cleanup()
