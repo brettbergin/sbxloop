@@ -70,8 +70,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   `pull`, which the successful request itself disproves — while the real
   capabilities live on the installation. The permission check now treats
   a payload that denies even `pull` as not authoritative instead of
-  reporting `token missing issues:write, contents:write,
-  pull_requests:write` for a credential that holds all three (doctor-only;
+  reporting `token missing issues:write, contents:write, pull_requests:write` for a credential that holds all three (doctor-only;
   nothing gated dispatch on it).
 
 - **Shape-mimicking sbx proxy placeholders are now recognized as
