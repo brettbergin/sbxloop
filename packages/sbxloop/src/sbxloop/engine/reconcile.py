@@ -788,3 +788,75 @@ def note_nonblocking(
         body_only=body_only,
         skipped=skipped,
     )
+
+
+def ack_marker(run_id: str) -> str:
+    """The stamp a landing-time acknowledgement reply carries.
+
+    Distinct from the reconciled/confirmed/noted markers so the four kinds
+    of loop reply never mistake each other for a duplicate.
+    """
+    return f"<!-- sbxloop:acked run={run_id} -->"
+
+
+def ack_body(*, run_id: str) -> str:
+    """One reply on a human thread no fix round was asked to answer.
+
+    The comment arrived outside a standing changes-requested review — an
+    aside on a COMMENT or approving review, or a thread opened after its
+    author's objection was settled — so nothing else in the pipeline would
+    ever speak to it, and the merge gate (#520 step 5) refuses to merge
+    over an unanswered human. The reply *is* the not-silent part, and it
+    names the lever that actually stops a merge.
+    """
+    return (
+        "**noted** — this comment did not arrive with a changes-requested "
+        "review, so it does not hold up the merge; replying so it is not "
+        "merged over silently. To stop the merge, submit a review "
+        "requesting changes.\n\n" + ack_marker(run_id)
+    )
+
+
+def acknowledge_human_threads(
+    ops: GithubOps,
+    repo: str,
+    number: int,
+    *,
+    run_id: str,
+    login: str,
+    threads: Sequence[ReviewThread],
+) -> int:
+    """Reply once in each human thread that has no loop reply yet.
+
+    A human's thread is **never resolved** here — closing it is theirs to
+    do, the same invariant :func:`reconcile_human` holds. Idempotent by
+    the live thread itself: a thread already carrying a loop reply, or
+    this run's ack marker, is skipped, so a resumed landing pass never
+    double-posts. Rootless threads (no readable comment id) are skipped
+    too. Returns how many replies actually landed; per-thread failures are
+    logged and left for the gate, which re-reads the threads and blocks
+    truthfully on whatever is still unanswered.
+    """
+    stamp = ack_marker(run_id)
+    replied = 0
+    for thread in threads:
+        if not thread.comments or thread.comments[0].login == login:
+            continue
+        if thread.has_reply_from(login) or thread.has_reply_marked(stamp):
+            continue
+        comment_id = thread.root_comment_id
+        if comment_id is None:
+            continue
+        try:
+            ops.pr_comment_reply(repo, number, comment_id, ack_body(run_id=run_id))
+        except GithubOpsError:
+            log.warning(
+                "land.human_ack_failed",
+                run=run_id,
+                pr=number,
+                anchor=thread.anchor,
+                exc_info=True,
+            )
+            continue
+        replied += 1
+    return replied

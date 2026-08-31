@@ -48,6 +48,22 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **Landing never waits on a human it never asked.** A human inline
+  thread outside a standing changes-requested review — an aside on a
+  COMMENT or approving review — used to block the merge forever: nothing
+  in the pipeline replied to it and the #520 gate refused to merge over
+  it. Landing now answers it itself with one marker-stamped "noted — does
+  not hold up the merge" reply (`land.human_ack` event; the thread is
+  never resolved, it stays the human's), a failed thread listing is
+  retried before "could not be read" blocks, and a review round whose
+  record never reached GitHub (#503) reposts it as a marker-stamped PR
+  comment instead of stranding the run behind the review-record gate. A
+  standing changes-requested review still blocks after its objections are
+  answered — a human's voluntary override, not a gate the loop erected.
+  `sbxloop doctor --probe` now flags a delivery base that requires
+  approving reviews: the loop cannot approve its own PR, so every merge
+  there answers 405.
+
 - **Provisioning skips the doomed proxy-secret dance on a known sbx
   version** (#568). The register→probe→auto-downgrade sequence (and its
   per-run `sandbox.secret_env_fallback` *warning*) ran on every provision,
@@ -63,6 +79,17 @@ All notable changes to sbxloop are documented here. The project adheres to
   env file, so registering each one with sbx would be pure ceremony.
 
 ### Fixed
+
+- **App-auth runs no longer strand behind "N human review threads have
+  no reply"** (#569 x #536). Under a GitHub App installation token
+  `GET /user` 403s, and the loop's login could degrade to `""` — which
+  made `unreconciled_threads` classify every loop-authored thread as a
+  human's and every reconciled PR end `blocked`. The loop's identity now
+  comes from the credential itself (`<app-slug>[bot]`, one cached
+  `GET /app` per process; App mode skips the doomed `GET /user`
+  entirely), with the delivered PR's author as the fallback, and landing
+  refuses to classify with an empty login — blocking with the real reason
+  in the vanishing case where every identity source is dead.
 
 - **Runs no longer fail after delivering their PR when github-ops runs as
   a GitHub App installation** (#581; field runs `r5ctmq7e8`, `rb20denz3`).

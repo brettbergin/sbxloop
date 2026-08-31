@@ -1555,17 +1555,19 @@ class TestPipeline:
         patches = [p for m, p, _ in fake.raw_calls if m == "PATCH"]
         assert patches == [f"/repos/o/r/git/refs/heads/sbxloop/{result.run_id}"]
 
-    def test_a_refused_review_post_blocks_the_merge(self, harness: Harness) -> None:
-        """#503, now gated: the review 422'd, so there is no review record on
-        the PR — the verdict still counts in the run, but the loop refuses to
-        merge a pull request nobody can read a review on (#520 step 5)."""
+    def test_a_refused_review_post_reposts_the_record_and_merges(self, harness: Harness) -> None:
+        """#503, self-healed: the review 422'd, so there is no review record
+        on the PR — the requirement stands (#520 step 5), but the loop can
+        satisfy it itself, so landing reposts the verdict as a
+        marker-stamped PR comment and merges instead of stranding the run.
+        A repost that *also* fails still blocks — see
+        TestReviewRecordRepost."""
         fake = FakeGithub()
         fake.fail_once["pr_review_create"] = GithubOpsError("reviews closed", http_status=422)
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
         result = harness.pipeline(fake).start("ship hello")
-        assert result.state == "blocked"
-        assert result.reason == "review record could not be posted"
-        assert fake.merges == []
+        assert result.state == "merged", result.reason
+        assert any("sbxloop:review-record" in c for c in fake.issue_comments)
         (verdict,) = self._events(harness, HostEventTypes.REVIEW_VERDICT)
         assert verdict.data["verdict"] == "approve" and verdict.data["url"] == ""
 
@@ -2726,3 +2728,82 @@ class TestReviewPostFallback:
         assert comments == []
         assert "Findings:" in body and "`hello.txt:1` [nit] stale docstring" in body
         assert "fine" in body
+
+
+class TestAppIdentityLanding:
+    """#569 x #536 regression: under App auth the loop's identity comes
+    from the credential itself, and landing never classifies with ""."""
+
+    def _loop_thread(self, fake: FakeGithub) -> None:
+        from sbxloop.gh.ops import ReviewThread, ThreadComment
+
+        fake.threads = [
+            ReviewThread(
+                node_id="PRRT_1",
+                is_resolved=True,
+                path="a.py",
+                line=1,
+                comments=(ThreadComment(1, fake.user_login, "[minor] naming"),),
+            )
+        ]
+
+    def test_app_identity_skips_get_user_and_owns_its_threads(self, harness: Harness) -> None:
+        """The field failure: with login degraded to "", the loop's own
+        resolved thread read as "a human thread with no reply" and the run
+        ended blocked. The host-resolved bot login classifies it right —
+        and the doomed ``GET /user`` is never even asked."""
+        from sbxloop.sbx.provision import Provisioner
+
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        fake.pr["user"] = None  # even the PR author is unreadable
+        self._loop_thread(fake)
+        harness.monkeypatch.setattr(
+            Provisioner, "gh_bot_login", lambda self, repo=None: "sbxloop-bot"
+        )
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged", result.reason
+        assert ("GET", "/user", None) not in fake.raw_calls
+
+    def test_every_identity_source_dead_blocks_with_the_truth(self, harness: Harness) -> None:
+        """No bot login, GET /user 403s, the PR author is unreadable, and a
+        thread exists: the run blocks naming the identity failure — never
+        "human review threads have no reply"."""
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        fake.pr["user"] = None
+        self._loop_thread(fake)
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "blocked"
+        assert "identity could not be resolved" in str(result.reason)
+
+
+class TestReviewRecordRepost:
+    """#503 self-heal: a review whose post failed reposts its record as a
+    PR comment instead of stranding the run behind the review_posted
+    gate — a gate the loop can satisfy itself is not a gate."""
+
+    def test_a_failed_review_post_self_heals_and_merges(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_always["pr_review_create"] = GithubOpsError(
+            "gh: Unprocessable Entity (HTTP 422)", http_status=422
+        )
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged", result.reason
+        records = [c for c in fake.issue_comments if "sbxloop:review-record" in c]
+        assert len(records) == 1
+        assert "Review verdict: approve" in records[0]
+
+    def test_a_repost_that_also_fails_blocks_honestly(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_always["pr_review_create"] = GithubOpsError(
+            "gh: Unprocessable Entity (HTTP 422)", http_status=422
+        )
+        fake.fail_always["pr_issue_comment"] = GithubOpsError("boom", http_status=502)
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "blocked"
+        assert "review record could not be posted" in str(result.reason)

@@ -23,6 +23,7 @@ from sbxloop.gh.appauth import (
     InstallationToken,
     app_credentials,
     app_jwt,
+    fetch_app_slug,
     mint_installation_token,
 )
 
@@ -258,3 +259,76 @@ class TestAppTokenSource:
         assert source.refresh_due()
         assert source.current() == "ghs_2"
         assert minted == [0.0, 3001.0]
+
+
+class TestBotLogin:
+    """The App's own ``<slug>[bot]`` identity (#569 x #536): resolved on
+    the host so landing can tell the loop's threads from a human's."""
+
+    def creds(self, rsa_key: Path) -> AppCredentials:
+        return AppCredentials("12345", "678", rsa_key.read_text())
+
+    def test_fetch_app_slug_authenticates_with_the_jwt(
+        self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        def fake_urlopen(request: Any, timeout: float) -> _Resp:
+            seen["url"] = request.full_url
+            seen["auth"] = request.get_header("Authorization")
+            seen["method"] = request.get_method()
+            return _Resp({"slug": "sbxloop-app"})
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        assert fetch_app_slug(self.creds(rsa_key), now=1000.0) == "sbxloop-app"
+        assert seen["url"].endswith("/app")
+        assert seen["method"] == "GET"
+        assert str(seen["auth"]).startswith("Bearer ")
+
+    def test_http_error_names_the_app(self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(request: Any, timeout: float) -> _Resp:
+            raise urllib.error.HTTPError(
+                request.full_url, 401, "Unauthorized", None, io.BytesIO(b"{}")
+            )
+
+        monkeypatch.setattr("urllib.request.urlopen", boom)
+        with pytest.raises(GithubOpsError, match="App lookup") as exc:
+            fetch_app_slug(self.creds(rsa_key))
+        assert exc.value.http_status == 401
+
+    def test_a_missing_slug_field_is_an_error(
+        self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: _Resp({"name": "x"}))
+        with pytest.raises(GithubOpsError, match="no slug"):
+            fetch_app_slug(self.creds(rsa_key))
+
+    def test_bot_login_fetches_once_and_caches(self) -> None:
+        fetched: list[int] = []
+
+        def fetch(creds: AppCredentials) -> str:
+            fetched.append(1)
+            return "sbxloop-app"
+
+        source = AppTokenSource(
+            AppCredentials("1", "2", "-----BEGIN PRIVATE KEY-----"), fetch=fetch
+        )
+        assert source.bot_login() == "sbxloop-app[bot]"
+        assert source.bot_login() == "sbxloop-app[bot]"
+        assert fetched == [1]
+
+    def test_a_failed_lookup_is_cached_none(self) -> None:
+        """The engine has its own fallbacks; retrying a dead lookup every
+        run would add latency, not identity."""
+        calls: list[int] = []
+
+        def fetch(creds: AppCredentials) -> str:
+            calls.append(1)
+            raise GithubOpsError("nope")
+
+        source = AppTokenSource(
+            AppCredentials("1", "2", "-----BEGIN PRIVATE KEY-----"), fetch=fetch
+        )
+        assert source.bot_login() is None
+        assert source.bot_login() is None
+        assert calls == [1]

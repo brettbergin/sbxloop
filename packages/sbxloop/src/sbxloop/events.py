@@ -188,6 +188,9 @@ class HostEventTypes:
     CI_STATUS = "ci.status"
     LAND_UNDRAFT = "land.undraft"
     LAND_UPDATE = "land.update"
+    # Landing answered human threads nothing else in the pipeline would
+    # ever speak to (`pr`, `acked`) — the reply is the not-silent part.
+    LAND_HUMAN_ACK = "land.human_ack"
     RUN_MERGED = "run.merged"
     # Follow-up issues filed (or listed on the PR) after the merge (#517):
     # `pr`, `mode`, `filed` [{number, url, title}], `listed` (titles).

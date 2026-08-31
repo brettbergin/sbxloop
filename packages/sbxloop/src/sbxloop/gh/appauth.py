@@ -10,10 +10,11 @@ the in-VM env file; the private key stays on the host, so the credential
 domains stay exactly as narrow as they are with a PAT (the sandbox holds a
 scoped, expiring token instead of a personal one).
 
-This is the one host→GitHub call in the whole system, and it is the
-credential-minting plane, not the ops plane: every repository operation
-still runs inside the github-ops sandbox. Installation tokens attributed
-by GitHub to the app (``<app-name>[bot]``), not to a person.
+The token mint — plus a one-time ``GET /app`` slug lookup — are the only
+host→GitHub calls in the whole system, and they are the credential-minting
+plane, not the ops plane: every repository operation still runs inside the
+github-ops sandbox. Installation tokens are attributed by GitHub to the app
+(``<app-slug>[bot]``, see :func:`fetch_app_slug`), not to a person.
 
 Signing uses the host ``openssl`` binary (RS256 is PKCS#1 v1.5 over
 SHA-256, which ``openssl dgst -sha256 -sign`` produces exactly), so no
@@ -257,6 +258,55 @@ def mint_installation_token(
     return InstallationToken(value=value, expires_at=expires_at)
 
 
+def fetch_app_slug(
+    creds: AppCredentials,
+    *,
+    now: float | None = None,
+    api_url: str = _API_URL,
+) -> str:
+    """The App's own slug, from ``GET /app`` with its JWT.
+
+    GitHub attributes installation-token writes to ``<slug>[bot]`` — the
+    login landing needs to tell the loop's own review threads from a
+    human's. ``GET /user`` cannot answer for an installation token (403,
+    #581); this endpoint can, and it authenticates with the same JWT the
+    mint uses.
+    """
+    started = time.time() if now is None else now
+    token_jwt = app_jwt(creds, now=started)
+    url = f"{api_url}/app"
+    if not url.startswith("https://"):
+        raise GithubOpsError(f"refusing non-HTTPS GitHub API url {api_url!r}")
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token_jwt}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "sbxloop",
+        },
+    )
+    try:
+        with urllib.request.urlopen(  # nosec B310 - https enforced above
+            request, timeout=_MINT_TIMEOUT_S
+        ) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")[:300]
+        raise GithubOpsError(
+            f"GitHub refused the App lookup ({exc.code}) for app {creds.app_id}: {body} "
+            "— check the app id and that the private key belongs to this App",
+            http_status=exc.code,
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise GithubOpsError(f"could not reach {api_url} to look up the App: {exc}") from exc
+    slug = data.get("slug") if isinstance(data, dict) else None
+    if not isinstance(slug, str) or not slug:
+        raise GithubOpsError(f"GitHub's App payload carried no slug field for app {creds.app_id}")
+    return slug
+
+
 class AppTokenSource:
     """Cached installation tokens, re-minted inside the refresh margin.
 
@@ -272,13 +322,19 @@ class AppTokenSource:
         clock: Callable[[], float] = time.time,
         mint: Callable[[AppCredentials], InstallationToken] | None = None,
         margin_s: float = REFRESH_MARGIN_S,
+        fetch: Callable[[AppCredentials], str] | None = None,
     ) -> None:
         self.creds = creds
         self._clock = clock
         self._mint = mint or (lambda c: mint_installation_token(c, now=clock()))
+        self._fetch = fetch or (lambda c: fetch_app_slug(c, now=clock()))
         self._margin_s = margin_s
         self._lock = threading.Lock()
         self._token: InstallationToken | None = None
+        # The identity GitHub attributes this installation's writes to,
+        # fetched once per process; ``False`` means "not asked yet".
+        self._bot_login: str | None = None
+        self._bot_login_known = False
 
     def _stale(self, token: InstallationToken | None) -> bool:
         return token is None or self._clock() >= token.expires_at - self._margin_s
@@ -296,3 +352,25 @@ class AppTokenSource:
             token = self._token
             assert token is not None  # _stale(None) is True, so it was just minted
             return token.value
+
+    def bot_login(self) -> str | None:
+        """The login GitHub attributes this installation's writes to
+        (``<slug>[bot]``), or ``None`` when the slug lookup failed.
+
+        Fetched once per process and cached — a failure is cached too: the
+        engine has its own fallbacks (the delivered PR's author), and
+        retrying a dead lookup every run would add latency, not identity.
+        """
+        with self._lock:
+            if not self._bot_login_known:
+                self._bot_login_known = True
+                try:
+                    self._bot_login = f"{self._fetch(self.creds)}[bot]"
+                except GithubOpsError as exc:
+                    log.warning(
+                        "github.app_slug_lookup_failed",
+                        app_id=self.creds.app_id,
+                        error=str(exc),
+                    )
+                    self._bot_login = None
+            return self._bot_login

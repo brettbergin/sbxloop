@@ -366,3 +366,50 @@ class TestApproveCarryingABlockingSeverityFinding:
         assert (loop_open, human_open) == ([], [])
         bodies = [c.body for t in fake.threads for c in t.comments]
         assert any("not held against the merge" in b and "`major`" in b for b in bodies)
+
+
+class TestHumanCommentThreadDoesNotStrandTheRun:
+    """A human aside outside any changes-requested review — a question on
+    a COMMENT review, say — used to block the merge forever: no stage ever
+    replied to it and the #520 gate refused to merge over it. Landing now
+    answers it itself (the reply is the not-silent part) and merges."""
+
+    @pytest.fixture
+    def run(self, harness: Harness) -> tuple[Harness, FakeGithub, RunResult]:
+        from sbxloop.gh.ops import ReviewThread, ThreadComment
+
+        fake = FakeGithub()
+        fake.threads = [
+            ReviewThread(
+                node_id="PRRT_H1",
+                is_resolved=False,
+                path="hello.txt",
+                line=1,
+                comments=(ThreadComment(991, "brettbergin", "why this way?"),),
+            )
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, review_round("approve", "fine")])
+        result = harness.pipeline(fake).start("write hello.txt")
+        return harness, fake, result
+
+    def test_the_run_merges(self, run: tuple[Harness, FakeGithub, RunResult]) -> None:
+        _, fake, result = run
+        assert result.state == "merged", result.reason
+        assert fake.merges
+
+    def test_the_human_thread_got_a_reply_and_stays_open(
+        self, run: tuple[Harness, FakeGithub, RunResult]
+    ) -> None:
+        _, fake, _ = run
+        (thread,) = [t for t in fake.threads if t.node_id == "PRRT_H1"]
+        replies = [c for c in thread.comments[1:] if c.login == fake.user_login]
+        assert replies and "does not hold up the merge" in replies[0].body
+        assert not thread.is_resolved
+        assert "PRRT_H1" not in fake.resolved
+
+    def test_the_ack_reaches_the_event_stream(
+        self, run: tuple[Harness, FakeGithub, RunResult]
+    ) -> None:
+        harness, _, _ = run
+        acks = [e.data for e in harness.events if e.type == HostEventTypes.LAND_HUMAN_ACK]
+        assert acks == [{"pr": 7, "acked": 1}]

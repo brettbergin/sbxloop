@@ -40,6 +40,21 @@ Waiting = str
 Tick = Callable[[Waiting], None]
 Emit = Callable[..., None]
 
+# How the landing-time acknowledgement of human threads is injected: the
+# engine binds run identity and ops; landing hands over the threads that
+# still lack a loop reply and learns how many replies landed.
+Ack = Callable[[Sequence[ReviewThread]], int]
+
+# A thread listing that fails is retried this many times (one `tick`
+# apart) before the gate gives up; a code constant, not a config key —
+# there is nothing for an operator to tune about a transient 5xx.
+THREAD_READ_ATTEMPTS = 3
+
+_IDENTITY_WHY = (
+    "the loop's own GitHub identity could not be resolved, so its review "
+    "threads cannot be told from a human's"
+)
+
 
 class Landed(NamedTuple):
     sha: str
@@ -254,7 +269,14 @@ def unreconciled_threads(
     never required to be resolved: closing a human's thread is theirs to do.
 
     Threads with no comments at all cannot be spoken to and are ignored.
+
+    ``login`` must be the loop's real identity. An empty login would
+    classify every loop thread as a human's (and ``has_reply_from("")``
+    can never match), which is exactly the field failure that stranded
+    App-auth runs — so it is refused rather than guessed at.
     """
+    if not login:
+        raise ValueError("cannot classify review threads without the loop's own login")
     loop_open: list[str] = []
     human_open: list[str] = []
     for thread in threads:
@@ -272,24 +294,86 @@ def unreconciled_threads(
     return loop_open, human_open
 
 
-def _reconciliation_block(ops: GithubOps, repo: str, number: int, *, login: str) -> Blocked | None:
+def _read_threads(
+    ops: GithubOps, repo: str, number: int, *, tick: Tick
+) -> list[ReviewThread] | None:
+    """The PR's inline threads, retried through transient failures.
+
+    ``None`` when GitHub would not answer in :data:`THREAD_READ_ATTEMPTS`
+    attempts — a one-off 502 must not strand a run that cleared every
+    other bar, but a persistently unreadable PR still blocks: "we could
+    not tell" is not "there is nothing to answer".
+    """
+    for attempt in range(1, THREAD_READ_ATTEMPTS + 1):
+        try:
+            return list(ops.pr_review_threads(repo, number))
+        except GithubOpsError as exc:
+            log.warning(
+                "land.threads_unreadable",
+                repo=repo,
+                pr=number,
+                attempt=attempt,
+                error=str(exc),
+            )
+            if attempt < THREAD_READ_ATTEMPTS:
+                tick("threads")
+    return None
+
+
+def _reconciliation_block(
+    ops: GithubOps,
+    repo: str,
+    number: int,
+    *,
+    login: str,
+    tick: Tick,
+    emit: Emit,
+    ack: Ack | None = None,
+) -> Blocked | None:
     """The merge gate of #520 step 5: a pull request does not merge while a
     review finding on it is still unanswered.
 
     Returns ``None`` when every thread is reconciled (including the trivial
     case of a PR with no inline threads at all), a :class:`Blocked` naming
-    the offending threads otherwise. A thread read that fails also blocks:
-    "we could not tell" is not "there is nothing to answer", and merging on
+    the offending threads otherwise. Reads are retried
+    (:func:`_read_threads`) before "could not be read" blocks; merging on
     an unread PR is precisely the silent merge this gate exists to stop.
+
+    A human thread with no loop reply is first **answered**, not waited
+    on: no human asked for this wait, so the loop replies itself (``ack``,
+    bound by the engine to
+    :func:`sbxloop.engine.reconcile.acknowledge_human_threads`) and judges
+    again on a fresh read. A standing changes-requested review never
+    reaches here — ``land()`` hands over on it first — so an ack only ever
+    answers non-blocking commenters.
     """
-    try:
-        threads = ops.pr_review_threads(repo, number)
-    except GithubOpsError as exc:
-        log.warning("land.threads_unreadable", repo=repo, pr=number, error=str(exc))
+    threads = _read_threads(ops, repo, number, tick=tick)
+    if threads is None:
         return Blocked(
-            "its review threads could not be read, so reconciliation cannot be confirmed"
+            "its review threads could not be read, so reconciliation cannot "
+            f"be confirmed (after {THREAD_READ_ATTEMPTS} attempts)"
         )
+    if not threads:
+        return None
+    if not login:
+        # With threads present, an unknown identity can neither honour the
+        # gate nor safely answer for it: classification would call every
+        # loop thread a human's — the App-auth field failure this guard
+        # replaces with the truth.
+        return Blocked(_IDENTITY_WHY)
     loop_open, human_open = unreconciled_threads(threads, login=login)
+    if human_open and ack is not None:
+        pending = [
+            t
+            for t in threads
+            if t.comments and t.comments[0].login != login and not t.has_reply_from(login)
+        ]
+        acked = ack(pending)
+        if acked:
+            emit("land.human_ack", pr=number, acked=acked)
+        reread = _read_threads(ops, repo, number, tick=tick)
+        if reread is not None:
+            loop_open, human_open = unreconciled_threads(reread, login=login)
     if loop_open:
         return Blocked(f"{len(loop_open)} review threads unreconciled: {', '.join(loop_open)}")
     if human_open:
@@ -315,6 +399,7 @@ def land(
     clock: Callable[[], float] = time.monotonic,
     answered: Container[str] = frozenset(),
     review_posted: bool = True,
+    ack: Ack | None = None,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
@@ -328,6 +413,10 @@ def land(
     ``review_posted`` is whether the round that approved this PR actually
     got its review onto GitHub. False blocks the merge: a run whose review
     post failed would otherwise merge with no reviewable record at all.
+
+    ``ack`` answers human threads that nothing else in the pipeline would
+    ever speak to (see :func:`_reconciliation_block`); ``None`` keeps the
+    gate read-only.
     """
     started = clock()
     while True:
@@ -349,6 +438,12 @@ def land(
             continue
         head = _head_sha(pr)
         standing = human_objections(ops, repo, number, login=login)
+        if standing and not login:
+            # An unknown identity cannot exclude the loop's own reviews
+            # (landing.py's `login` filter), so these "objections" may be
+            # our own words: a fix round on them is budget burn, not
+            # autonomy. Hand over with the truth instead.
+            return Blocked(_IDENTITY_WHY)
         unanswered = [o for o in standing if o.key not in answered]
         if standing and unanswered:
             return NeedsFix(
@@ -362,6 +457,9 @@ def land(
             # been answered in this run. Only the reviewer can dismiss their
             # own review, so spending another full fix pass on the same
             # words would be pure repeat work (#520): say so and hand over.
+            # Doctrine: a human's standing review is a voluntary override
+            # the loop respects — not a gate the loop erected. Do not
+            # "fix" this into waiting quietly or dismissing their review.
             emit("land.human_answered", pr=number, objections=len(standing))
             return Blocked(
                 f"a reviewer's changes-requested review is still standing after "
@@ -411,7 +509,9 @@ def land(
         # merge silently.
         if not review_posted:
             return Blocked("review record could not be posted")
-        blocked = _reconciliation_block(ops, repo, number, login=login)
+        blocked = _reconciliation_block(
+            ops, repo, number, login=login, tick=tick, emit=emit, ack=ack
+        )
         if blocked is not None:
             emit("land.unreconciled", pr=number, why=blocked.why)
             return blocked

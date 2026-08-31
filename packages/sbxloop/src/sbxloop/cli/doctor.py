@@ -25,7 +25,7 @@ from rich.table import Table
 import sbxloop
 from sbxloop.config import Config, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
@@ -89,6 +89,9 @@ class RepoProbe:
     detail: str = ""
     missing_permissions: tuple[str, ...] = ()
     creatable: bool | None = None
+    # Whether the delivery base requires approving reviews to merge — the
+    # repo config that 405s every loop merge. None = unverifiable.
+    review_protected: bool | None = None
 
 
 def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
@@ -218,6 +221,18 @@ def repo_checks(
             continue
         notes.append(result.detail or "reachable, token has the required permissions")
         rows.append(Check(name, True, "; ".join(notes)))
+        if result.review_protected:
+            rows.append(
+                Check(
+                    f"{name} branch protection",
+                    False,
+                    "the delivery base requires approving reviews — the loop cannot "
+                    "approve its own pull request, so every merge is refused "
+                    "(HTTP 405) and runs end blocked; drop the required-review rule "
+                    "(incompatible with human-out-of-the-loop operation)",
+                    hard=False,
+                )
+            )
     return rows
 
 
@@ -309,6 +324,51 @@ def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
     return tuple(f"{kind}:write" for kind in REQUIRED_REPO_PERMISSIONS)
 
 
+def _requires_approving_reviews(ops: Any, repo: str, base: str) -> bool | None:
+    """Whether ``base`` requires approving reviews to merge.
+
+    That protection is the one repository setting incompatible with
+    human-out-of-the-loop operation: the loop cannot approve its own pull
+    request, so GitHub answers every merge with a 405 and the run ends
+    blocked. Read from classic branch protection and from rulesets, both
+    best-effort; ``None`` when GitHub would not say (a token without admin
+    on classic protection, say) — unverifiable is not a verdict.
+    """
+    known = False
+    try:
+        protection = ops.raw("GET", f"/repos/{repo}/branches/{base}/protection")
+        known = True
+        reviews = (
+            protection.get("required_pull_request_reviews")
+            if isinstance(protection, dict)
+            else None
+        )
+        count = reviews.get("required_approving_review_count") if isinstance(reviews, dict) else 0
+        if int(count or 0) > 0:
+            return True
+    except GithubOpsError as exc:
+        if exc.http_status == 404:
+            known = True  # explicitly unprotected — an answer, not a failure
+    except Exception:  # nosec B110 - advisory probe; never a doctor crash
+        pass
+    try:
+        rules = ops.raw("GET", f"/repos/{repo}/rules/branches/{base}")
+        if isinstance(rules, list):
+            known = True
+            for rule in rules:
+                if not isinstance(rule, dict) or rule.get("type") != "pull_request":
+                    continue
+                params = rule.get("parameters")
+                count = (
+                    params.get("required_approving_review_count") if isinstance(params, dict) else 0
+                )
+                if int(count or 0) > 0:
+                    return True
+    except Exception:  # nosec B110 - advisory probe; never a doctor crash
+        pass
+    return False if known else None
+
+
 def credential_key(entry: RepoConfig) -> str:
     """Which credential a repository's github box would be provisioned with:
     its own ``token_env``, or ``""`` for the daemon-wide token. Repositories
@@ -373,10 +433,12 @@ def sandbox_repo_probe(
                 reachable=False, detail="not found with this token", creatable=creatable
             )
         missing = _missing_permissions(data)
+        base = entry.deliver_base or str(data.get("default_branch") or "")
         return RepoProbe(
             reachable=True,
             detail="reachable, token has the required permissions" if not missing else "reachable",
             missing_permissions=missing,
+            review_protected=_requires_approving_reviews(ops, entry.repo, base) if base else None,
         )
 
     return probe

@@ -16,10 +16,16 @@ from __future__ import annotations
 import pytest
 
 from sbxloop.engine.landing import HumanObjection
-from sbxloop.engine.reconcile import marker, reconcile_human
+from sbxloop.engine.reconcile import (
+    ack_body,
+    ack_marker,
+    acknowledge_human_threads,
+    marker,
+    reconcile_human,
+)
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ReviewComment
+from sbxloop.gh.ops import ReviewComment, ReviewThread, ThreadComment
 from tests.fakes.fake_github import FakeGithub
 
 REPO = "o/r"
@@ -172,3 +178,73 @@ class TestStoreRecord:
         store.record_human_reply(RUN, "human:comment:91", "addressed")
         assert len(store.answered_objections(RUN)) == 2
         assert store.reconciliations(RUN, 1) == {}
+
+
+def ack_thread(*comments: tuple[str, str], node: str = "PRRT_9") -> ReviewThread:
+    return ReviewThread(
+        node_id=node,
+        is_resolved=False,
+        path="a.py",
+        line=3,
+        comments=tuple(
+            ThreadComment(index + 1, login, body) for index, (login, body) in enumerate(comments)
+        ),
+    )
+
+
+class TestAcknowledgeHumanThreads:
+    """The landing-time ack: answer a human aside, never resolve their
+    thread, never double-post — the loop never waits on a human it never
+    asked."""
+
+    LOGIN = "sbxloop-bot"
+
+    def ack(self, gh: FakeGithub, threads: list[ReviewThread]) -> int:
+        return acknowledge_human_threads(
+            gh, REPO, PR, run_id=RUN, login=self.LOGIN, threads=threads
+        )
+
+    def test_replies_with_the_marker_and_the_override_lever(self) -> None:
+        gh = FakeGithub()
+        assert self.ack(gh, [ack_thread(("alice", "why this way?"))]) == 1
+        ((comment_id, body),) = gh.replies
+        assert comment_id == 1
+        assert "does not hold up the merge" in body
+        assert "requesting changes" in body
+        assert ack_marker(RUN) in body
+
+    def test_never_resolves_a_human_thread(self) -> None:
+        gh = FakeGithub()
+        self.ack(gh, [ack_thread(("alice", "why?"))])
+        assert gh.resolved == []
+
+    def test_skips_a_thread_the_loop_already_answered(self) -> None:
+        gh = FakeGithub()
+        answered = ack_thread(("alice", "why?"), (self.LOGIN, "**addressed**: because"))
+        assert self.ack(gh, [answered]) == 0
+        assert gh.replies == []
+
+    def test_skips_a_marker_stamped_thread(self) -> None:
+        """A reply another identity posted for this run still counts: the
+        marker, not the login, is the resume-safe idempotency key."""
+        gh = FakeGithub()
+        stamped = ack_thread(("alice", "why?"), ("other-bot", ack_body(run_id=RUN)))
+        assert self.ack(gh, [stamped]) == 0
+
+    def test_skips_loop_threads_and_rootless_threads(self) -> None:
+        gh = FakeGithub()
+        own = ack_thread((self.LOGIN, "[minor] naming"))
+        rootless = ReviewThread(
+            node_id="PRRT_X",
+            is_resolved=False,
+            path="b.py",
+            line=None,
+            comments=(ThreadComment(None, "alice", "hm"),),
+        )
+        assert self.ack(gh, [own, rootless]) == 0
+        assert gh.replies == []
+
+    def test_a_failed_reply_is_not_counted(self) -> None:
+        gh = FakeGithub()
+        gh.fail_always["pr_comment_reply"] = GithubOpsError("boom", http_status=502)
+        assert self.ack(gh, [ack_thread(("alice", "why?"))]) == 0
