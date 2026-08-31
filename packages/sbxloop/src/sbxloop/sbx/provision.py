@@ -82,7 +82,7 @@ from sbxloop.sbx.secretstate import (
     service_rm_candidates,
     set_secret_replacing,
 )
-from sbxloop_worker.secrets import shell_token_case
+from sbxloop_worker.secrets import shell_sentinel_case, shell_token_case
 
 log = get_logger(__name__)
 
@@ -1160,7 +1160,10 @@ class Provisioner:
             "sh",
             "-lc",
             'for v in "$GH_TOKEN" "$GITHUB_TOKEN"; do [ -n "$v" ] || continue; '
-            f'case "$v" in {shell_token_case()}) exit {_SHADOW_EXIT} ;; esac; done; exit 0',
+            # a proxy placeholder (either shape) is not a shadow: the worker
+            # overrides sentinels, so the env file still wins.
+            f'case "$v" in {shell_sentinel_case()}) : ;; '
+            f"{shell_token_case()}) exit {_SHADOW_EXIT} ;; esac; done; exit 0",
         ]
         error = ""
         for _attempt in range(2):
@@ -1227,7 +1230,10 @@ class Provisioner:
             "sh",
             "-lc",
             f'v="${{{env_name}}}"; [ -n "$v" ] || exit 1; '
-            f'case "$v" in {shell_token_case()}) exit 0 ;; *) exit {_SENTINEL_EXIT} ;; esac',
+            # sentinel shapes FIRST: the service-secret mimic matches the
+            # token prefixes too and must never classify as usable.
+            f'case "$v" in {shell_sentinel_case()}) exit {_SENTINEL_EXIT} ;; '
+            f"{shell_token_case()}) exit 0 ;; *) exit {_SENTINEL_EXIT} ;; esac",
         ]
         clean = (0, 1, _SENTINEL_EXIT)
         error = ""
