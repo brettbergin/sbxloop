@@ -176,6 +176,27 @@ CREATE TABLE IF NOT EXISTS daemon_merge_gates (
 );
 CREATE INDEX IF NOT EXISTS idx_merge_gates_state ON daemon_merge_gates(state);
 CREATE INDEX IF NOT EXISTS idx_merge_gates_item  ON daemon_merge_gates(item_id);
+
+-- A filing-blocking clarifying question with the concierge's own fallback
+-- (ask, never block): if the asker never answers, the bridge tells the
+-- concierge to proceed on the stated assumption instead of dropping the
+-- goal. Persisted so a daemon restart only delays the auto-file.
+CREATE TABLE IF NOT EXISTS daemon_pending_clarifications (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend           TEXT NOT NULL DEFAULT 'discord',
+    channel_id        TEXT,
+    prompt_message_id TEXT,
+    asker_id          TEXT,
+    asker_name        TEXT,
+    question          TEXT NOT NULL,
+    assumption        TEXT NOT NULL,
+    deadline          REAL NOT NULL,
+    created_at        REAL NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'open',
+    resolved_at       REAL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_clarify_due
+    ON daemon_pending_clarifications(state, deadline);
 """
 
 TERMINAL_ITEM_STATES: frozenset[str] = frozenset({"done", "failed", "blocked", "cancelled"})
@@ -223,6 +244,27 @@ def _row_to_gate(row: sqlite3.Row) -> MergeGate:
         resolved_by=row["resolved_by"],
         detail=row["detail"],
     )
+
+
+# Open filing-blocking questions are bounded: a daemon nobody answers must
+# not accumulate them forever (the question itself still posts; only the
+# auto-file fallback is shed).
+PENDING_CLARIFICATION_CAP = 32
+
+
+class PendingClarification(NamedTuple):
+    """One filing-blocking ask awaiting its answer (or its deadline)."""
+
+    id: int
+    backend: str
+    channel_id: str | None
+    asker_id: str | None
+    asker_name: str | None
+    question: str
+    assumption: str
+    deadline: float
+    created_at: float
+    state: str
 
 
 class ChatThread(NamedTuple):
@@ -1274,6 +1316,124 @@ class DaemonStore:
                     (key, value),
                 )
             self._conn.commit()
+
+    # -- pending clarifications (ask, never block) ----------------------------
+
+    @staticmethod
+    def _clarification(row: sqlite3.Row) -> PendingClarification:
+        return PendingClarification(
+            id=int(row["id"]),
+            backend=str(row["backend"]),
+            channel_id=None if row["channel_id"] is None else str(row["channel_id"]),
+            asker_id=None if row["asker_id"] is None else str(row["asker_id"]),
+            asker_name=None if row["asker_name"] is None else str(row["asker_name"]),
+            question=str(row["question"]),
+            assumption=str(row["assumption"]),
+            deadline=float(row["deadline"]),
+            created_at=float(row["created_at"]),
+            state=str(row["state"]),
+        )
+
+    def create_pending_clarification(
+        self,
+        *,
+        backend: str,
+        channel_id: str | None,
+        asker_id: str | None,
+        asker_name: str | None,
+        question: str,
+        assumption: str,
+        deadline: float,
+        now: float,
+    ) -> int | None:
+        """Persist one filing-blocking ask's fallback; None over the cap
+        (the question still posts — only the auto-file is shed)."""
+        with self._lock:
+            open_count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_pending_clarifications WHERE state = 'open'"
+            ).fetchone()["n"]
+            if int(open_count) >= PENDING_CLARIFICATION_CAP:
+                log.warning("store.clarification_cap", cap=PENDING_CLARIFICATION_CAP)
+                return None
+            cur = self._conn.execute(
+                "INSERT INTO daemon_pending_clarifications "
+                "(backend, channel_id, asker_id, asker_name, question, assumption, "
+                "deadline, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    backend,
+                    _text_or_none(channel_id),
+                    _text_or_none(asker_id),
+                    _text_or_none(asker_name),
+                    question,
+                    assumption,
+                    deadline,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def take_due_clarifications(self, now: float) -> list[PendingClarification]:
+        """Claim every open ask past its deadline (CAS ``open`` -> ``firing``
+        per row), so two sweepers — or a sweep racing a restart — never fire
+        the same ask twice."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM daemon_pending_clarifications "
+                "WHERE state = 'open' AND deadline <= ? ORDER BY deadline",
+                (now,),
+            ).fetchall()
+            taken: list[PendingClarification] = []
+            for row in rows:
+                cur = self._conn.execute(
+                    "UPDATE daemon_pending_clarifications SET state = 'firing' "
+                    "WHERE id = ? AND state = 'open'",
+                    (int(row["id"]),),
+                )
+                if cur.rowcount == 1:
+                    taken.append(self._clarification(row))
+            self._conn.commit()
+            return taken
+
+    def resolve_pending_clarification(self, clar_id: int, state: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_pending_clarifications SET state = ?, resolved_at = ? WHERE id = ?",
+                (state, now, clar_id),
+            )
+            self._conn.commit()
+
+    def resolve_open_clarifications_for(
+        self, asker_id: str, channel_id: str | None, now: float
+    ) -> int:
+        """Any engagement from the asker settles their open asks (scoped to
+        the surface it happened on when that is known): the concierge
+        handles the actual words in-session, so the fallback stands down."""
+        with self._lock:
+            if channel_id:
+                cur = self._conn.execute(
+                    "UPDATE daemon_pending_clarifications "
+                    "SET state = 'answered', resolved_at = ? "
+                    "WHERE state = 'open' AND asker_id = ? "
+                    "AND (channel_id IS NULL OR channel_id = ?)",
+                    (now, asker_id, str(channel_id)),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE daemon_pending_clarifications "
+                    "SET state = 'answered', resolved_at = ? "
+                    "WHERE state = 'open' AND asker_id = ?",
+                    (now, asker_id),
+                )
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def open_clarifications(self) -> list[PendingClarification]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM daemon_pending_clarifications WHERE state = 'open' ORDER BY deadline"
+            ).fetchall()
+            return [self._clarification(row) for row in rows]
 
     def values_with_prefix(self, prefix: str) -> dict[str, str]:
         """Every ``daemon_state`` value whose key starts with ``prefix``."""

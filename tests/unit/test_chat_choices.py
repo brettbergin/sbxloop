@@ -152,3 +152,70 @@ def test_match_free_text_resolves(reply: str, expected: str) -> None:
 )
 def test_match_free_text_returns_none(reply: str) -> None:
     assert match_free_text(question(), reply) is None
+
+
+class TestPendingFiling:
+    """The ``sbx-pending`` marker (ask, never block): a filing-blocking
+    question's fallback rides in the same reply as the question."""
+
+    def test_a_well_formed_block_parses_and_is_stripped(self) -> None:
+        from sbxloop.daemon.chat_choices import parse_pending_filing
+
+        text = (
+            "What are you seeing?\n\n"
+            "```sbx-pending\n"
+            '{"question": "What are you seeing?", "assumption": "grey cards everywhere"}\n'
+            "```"
+        )
+        clean, pending = parse_pending_filing(text)
+        assert clean == "What are you seeing?"
+        assert pending is not None
+        assert pending.question == "What are you seeing?"
+        assert pending.assumption == "grey cards everywhere"
+
+    def test_the_question_defaults_to_the_prose(self) -> None:
+        from sbxloop.daemon.chat_choices import parse_pending_filing
+
+        clean, pending = parse_pending_filing(
+            'Which one?\n```sbx-pending\n{"assumption": "the first"}\n```'
+        )
+        assert clean == "Which one?"
+        assert pending is not None and pending.question == "Which one?"
+
+    def test_malformed_json_degrades_to_prose_and_still_strips(self) -> None:
+        from sbxloop.daemon.chat_choices import parse_pending_filing
+
+        clean, pending = parse_pending_filing("Hm.\n```sbx-pending\nnot json\n```")
+        assert clean == "Hm."
+        assert pending is None
+
+    def test_an_empty_assumption_is_no_fallback(self) -> None:
+        """A guess the concierge could not state is not a guess the daemon
+        may file — the old free-text-only behaviour simply is not armed."""
+        from sbxloop.daemon.chat_choices import parse_pending_filing
+
+        clean, pending = parse_pending_filing(
+            'Q?\n```sbx-pending\n{"question": "Q?", "assumption": "  "}\n```'
+        )
+        assert clean == "Q?" and pending is None
+
+    def test_it_coexists_with_an_sbx_choices_block(self) -> None:
+        """Enumerable answers send both blocks: choices for the click,
+        pending for the fallback. The two parsers are independent."""
+        from sbxloop.daemon.chat_choices import parse_choice_question, parse_pending_filing
+
+        text = (
+            "Pick one.\n"
+            '```sbx-choices\n{"choices": ["a", "b"]}\n```\n'
+            '```sbx-pending\n{"question": "Pick one.", "assumption": "a"}\n```'
+        )
+        clean, question = parse_choice_question(text)
+        clean, pending = parse_pending_filing(clean)
+        assert clean == "Pick one."
+        assert question is not None and question.values == ("a", "b")
+        assert pending is not None and pending.assumption == "a"
+
+    def test_no_block_means_no_fallback(self) -> None:
+        from sbxloop.daemon.chat_choices import parse_pending_filing
+
+        assert parse_pending_filing("just prose") == ("just prose", None)

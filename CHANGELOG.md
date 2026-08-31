@@ -91,6 +91,21 @@ All notable changes to sbxloop are documented here. The project adheres to
   approving reviews: the loop cannot approve its own PR, so every merge
   there answers 405.
 
+- **Intake asks, but never blocks.** The concierge still asks its one
+  clarifying question before filing a fix-shaped request with no symptom
+  (#535) — but an unanswered question no longer parks the goal forever.
+  Every filing-blocking ask now @mentions the requester and carries the
+  concierge's own best guess (a fenced `sbx-pending` block, persisted in a
+  new `daemon_pending_clarifications` table so a restart only delays the
+  fallback), and after `[concierge] clarify_ttl_s` (default 15 minutes,
+  now also the clickable-choice TTL) the bridge announces the assumption
+  and drives one nudge turn that files the issue with a *Symptom
+  (assumed)* section — loudly, in the channel, never in silence. Any reply
+  from the asker settles the wait; a `close_issue` confirmation never
+  proceeds on silence. The bridge also records the asker as the filed
+  issue's requester again (`submit_turn` was never handed the author id),
+  so finish pings reach whoever asked.
+
 - **Provisioning skips the doomed proxy-secret dance on a known sbx
   version** (#568). The register→probe→auto-downgrade sequence (and its
   per-run `sandbox.secret_env_fallback` *warning*) ran on every provision,

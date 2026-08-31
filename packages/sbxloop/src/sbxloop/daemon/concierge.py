@@ -42,7 +42,12 @@ from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
 from sbxloop.config import Config
-from sbxloop.daemon.chat_choices import ChoiceQuestion, parse_choice_question
+from sbxloop.daemon.chat_choices import (
+    ChoiceQuestion,
+    PendingFiling,
+    parse_choice_question,
+    parse_pending_filing,
+)
 from sbxloop.daemon.control import dispatch, plain
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -117,6 +122,11 @@ class ConciergeReply(NamedTuple):
     #: transport can offer clickable answers. ``None`` for ordinary prose —
     #: including a malformed spec, which degrades to prose.
     question: ChoiceQuestion | None = None
+    #: Set when the reply carried an ``sbx-pending`` spec: this reply asks a
+    #: filing-blocking question, and if it is never answered the bridge
+    #: tells the concierge to proceed on the stated assumption instead of
+    #: dropping the goal (ask, never block).
+    pending: PendingFiling | None = None
 
 
 class SessionHost(Protocol):
@@ -156,22 +166,25 @@ def compose_issue_body(args: Mapping[str, Any]) -> str:
     issue) still files as is.
     """
     symptom = " ".join(str(args.get("symptom") or "").split()).strip()
+    assumption = " ".join(str(args.get("assumption") or "").split()).strip()
     requested = " ".join(str(args.get("requested_change") or "").split()).strip()
     goal = " ".join(str(args.get("goal") or "").split()).strip()
     raw = args.get("acceptance_criteria") or []
     criteria = [" ".join(str(c).split()).strip() for c in (raw if isinstance(raw, list) else [raw])]
     criteria = [c for c in criteria if c]
     extra = str(args.get("body") or "").strip()
-    structured = bool(symptom or requested or goal or criteria)
+    structured = bool(symptom or assumption or requested or goal or criteria)
     if not structured:
         return extra
-    if not symptom:
+    if not symptom and not assumption:
         raise ValueError(
             "symptom is required: what is the person seeing (or missing) today, in their "
             "own words? A request that names only a mechanism ('remove X', 'replace X "
             "with Y') cannot be filed until that is known — ask them one question: "
             '"What are you seeing that you want gone or changed? A pasted line or a '
-            'screenshot is ideal."'
+            'screenshot is ideal." State your own best guess in the same message (an '
+            "sbx-pending block); if they never answer you will be told to proceed, and "
+            "then you file immediately with assumption=<that guess> — never wait forever"
         )
     if not criteria:
         raise ValueError(
@@ -179,7 +192,14 @@ def compose_issue_body(args: Mapping[str, Any]) -> str:
             "against the symptom (what will no longer be seen, or will be), not the "
             "mechanism"
         )
-    parts = [f"## Symptom (as observed)\n\n{symptom}"]
+    if symptom:
+        parts = [f"## Symptom (as observed)\n\n{symptom}"]
+    else:
+        parts = [
+            f"## Symptom (assumed)\n\n{assumption}\n\n_Assumed by the concierge: the "
+            "requester did not answer the clarifying question, so treat this as "
+            "unconfirmed and prefer evidence found in the repository._"
+        ]
     if requested:
         parts.append(
             f"## Requested change\n\n{requested}\n\n_The mechanism the person asked for — "
@@ -357,9 +377,11 @@ class Concierge:
             duration_s=round(time.monotonic() - started, 1),
         )
         clean, question = parse_choice_question(output)
+        clean, pending = parse_pending_filing(clean)
         return ConciergeReply(
             _clip(clean, self.config.concierge.max_reply_chars),
             question=question,
+            pending=pending,
         )
 
     def _attempt(
@@ -836,7 +858,10 @@ class Concierge:
                             "your restatement; `acceptance_criteria` are checkable "
                             "statements written against the symptom, never the mechanism. "
                             "A fix-shaped ask with no symptom cannot be filed: ask what they "
-                            "are seeing first. `body` is optional extra context. "
+                            "are seeing first — and pass `assumption` in place of `symptom` "
+                            "ONLY when you were told to proceed after your clarifying "
+                            "question went unanswered (the issue then carries a "
+                            "'Symptom (assumed)' section). `body` is optional extra context. "
                             "Pass `queue: false` ONLY when the person explicitly wants the "
                             "issue recorded without running it — backlog capture, a triage "
                             "note, a canary, anything a human should review before it "
@@ -849,6 +874,7 @@ class Concierge:
                             {
                                 "title": {"type": "string", "maxLength": 200},
                                 "symptom": {"type": "string"},
+                                "assumption": {"type": "string"},
                                 "requested_change": {"type": "string"},
                                 "goal": {"type": "string"},
                                 "acceptance_criteria": {
@@ -859,7 +885,7 @@ class Concierge:
                                 "queue": {"type": "boolean"},
                                 "repo": {"type": "string"},
                             },
-                            ["title", "symptom", "goal", "acceptance_criteria"],
+                            ["title", "goal", "acceptance_criteria"],
                         ),
                     ),
                     self._tool_create_issue,

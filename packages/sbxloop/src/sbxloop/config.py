@@ -957,6 +957,11 @@ class ConciergeConfig(_ConfigModel):
     # them, label an existing one for a run, and close one. Closing is the
     # one act that waits for the person's explicit say-so.
     create_issues: bool = True
+    # A filing-blocking clarifying question waits at most this long for the
+    # asker; then the concierge is told to proceed and the issue files with
+    # its stated assumption — no goal is ever silently dropped. Also the
+    # clickable-choice TTL, so buttons and the auto-file expire in step.
+    clarify_ttl_s: float = Field(default=900.0, ge=60, le=86400)
 
 
 USER_CONFIG_SUBPATH = Path("sbxloop") / "sbxloop.toml"

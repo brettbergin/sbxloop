@@ -585,3 +585,20 @@ class TestMergeGateConfig:
     def test_gated_label_joins_the_distinctness_check(self) -> None:
         with pytest.raises(ValidationError, match="distinct"):
             Config.model_validate({"daemon": {"gated_label": "sbxloop:blocked"}})
+
+
+def test_concierge_clarify_ttl_default_and_env_override(tmp_path: Path) -> None:
+    """Ask, never block: one knob times the clickable choices and the
+    auto-file sweep together."""
+    assert load_config(cwd=tmp_path, env={}).concierge.clarify_ttl_s == 900.0
+    config = load_config(cwd=tmp_path, env={"SBXLOOP_CONCIERGE__CLARIFY_TTL_S": "120"})
+    assert config.concierge.clarify_ttl_s == 120.0
+
+
+def test_concierge_clarify_ttl_bounds() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Config.model_validate({"concierge": {"clarify_ttl_s": 10}})
+    with pytest.raises(ValidationError):
+        Config.model_validate({"concierge": {"clarify_ttl_s": 100_000}})

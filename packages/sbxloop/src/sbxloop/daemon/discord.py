@@ -288,6 +288,7 @@ class DiscordBridge(ChatBridge):
         question: ChoiceQuestion,
         *,
         reply_to: Any = None,
+        mention_users: bool = False,
     ) -> Any:
         """Post a clarifying question with one clickable button per choice.
 
@@ -305,13 +306,13 @@ class DiscordBridge(ChatBridge):
         view = _build_choice_view(self, question, timeout=self._question_ttl_s)
         if view is None:
             # No component support on this host: prose, exactly as before.
-            return await self._send(target, body, reply_to=reply_to)
+            return await self._send(target, body, reply_to=reply_to, mention_users=mention_users)
 
         kwargs: dict[str, Any] = {"view": view, "suppress_embeds": True}
         if reply_to is not None:
             kwargs["reference"] = reply_to
             kwargs["mention_author"] = False
-        mentions = _allowed_mentions_none()
+        mentions = _allowed_mentions_users() if mention_users else _allowed_mentions_none()
         if mentions is not None:
             kwargs["allowed_mentions"] = mentions
         content = _clip(body, self.discord.max_message_chars)
@@ -342,7 +343,7 @@ class DiscordBridge(ChatBridge):
                 # log "NoneType: None" instead of why the send failed.
                 exc_info=failure,
             )
-            return await self._send(target, body, reply_to=reply_to)
+            return await self._send(target, body, reply_to=reply_to, mention_users=mention_users)
         bind = getattr(view, "bind", None)
         if bind is not None:
             try:
