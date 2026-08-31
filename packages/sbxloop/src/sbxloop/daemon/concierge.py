@@ -883,7 +883,6 @@ class Concierge:
                         ),
                         parameters=_schema(
                             {
-                                "all": {"type": "boolean"},
                                 "label": {"type": "string"},
                                 "queued": {"type": "boolean"},
                                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},

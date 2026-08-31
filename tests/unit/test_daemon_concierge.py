@@ -825,6 +825,36 @@ class TestTools:
         (listing,) = client.responses
         assert "no queued open issues in" in listing.text
 
+    def test_list_issues_declares_only_parameters_it_honors(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
+        turn(concierge)
+        spec = next(t for t in client.jobs[0].host_tools if t.name == "list_issues")
+        assert set(spec.parameters["properties"]) == {"label", "queued", "limit", "repo"}
+
+    def test_list_issues_ignores_a_stray_all_argument(self, tmp_path: Path) -> None:
+        github = FakeGithub(
+            {
+                "/issues?": [
+                    {
+                        "number": 7,
+                        "title": "Backlog capture",
+                        "labels": [],
+                        "created_at": "2026-08-01T00:00:00Z",
+                        "user": {"login": "ana"},
+                        "comments": 0,
+                        "html_url": "https://gh/i/7",
+                    }
+                ]
+            }
+        )
+        concierge, client, *_ = make(
+            tmp_path, [{"calls": [("list_issues", {"all": True})]}], github=github
+        )
+        turn(concierge, "everything?")
+        (listing,) = client.responses
+        assert listing.ok and "#7 Backlog capture" in listing.text
+        assert "state=open" in github.paths[0]
+
     def test_create_issue_files_and_queues_in_one_hop(self, tmp_path: Path) -> None:
         github = FakeGithub()
         concierge, client, _, _, dstore = make(
