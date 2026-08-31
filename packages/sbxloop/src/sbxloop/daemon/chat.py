@@ -54,7 +54,13 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sbxloop.config import ChatBackend, ChatBridgeConfig, Config
-from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion, match_free_text, render_prose
+from sbxloop.daemon.chat_choices import (
+    Choice,
+    ChoiceQuestion,
+    PendingFiling,
+    match_free_text,
+    render_prose,
+)
 from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message
 from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
@@ -81,7 +87,7 @@ from sbxloop.daemon.discord_format import (
     summary_text,
 )
 from sbxloop.daemon.model import TERMINAL_NOTICE_KINDS, DaemonNotice, RunReport, WorkItem
-from sbxloop.daemon.store import ChatThread, DaemonStore, MergeGate
+from sbxloop.daemon.store import ChatThread, DaemonStore, MergeGate, PendingClarification
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.ghids import normalize_item_id
@@ -123,6 +129,20 @@ CHOICE_QUESTION_TTL_S = 900.0
 # Outstanding questions are bounded: a daemon that never gets an answer must
 # not accumulate them forever.
 CHOICE_QUESTION_CAP = 64
+# Expired filing-blocking asks are swept at most this often (ask, never
+# block: the sweep is what turns an unanswered question into a filing).
+CLARIFY_SWEEP_MAX_S = 30.0
+# What the sweeper tells the concierge when an ask expires: file NOW on the
+# stated assumption, never re-ask. The asker's identity rides on the
+# synthetic turn so the filed issue still records its requester.
+CLARIFY_TIMEOUT_NUDGE = (
+    "[system] The requester has not answered your clarifying question "
+    "({question!r}) within {minutes:g} minutes. Proceed now on your stated "
+    "assumption: call create_issue immediately with assumption={assumption!r}, "
+    "write the acceptance criteria against that assumption, note in the issue "
+    "body that it was filed on an unconfirmed assumption after no reply, and "
+    "tell the channel what you assumed. Do not ask again and do not wait."
+)
 # A run thread's title (Discord names threads; Slack has no such thing).
 THREAD_NAME_MAX = 90
 
@@ -340,7 +360,9 @@ class ChatBridge(ABC):
         # only (no store, no schema), bounded and deadlined, and consulted
         # by the inbound path so a typed answer works exactly as before.
         self._questions: dict[str, _OutstandingQuestion] = {}
-        self._question_ttl_s = CHOICE_QUESTION_TTL_S
+        # One knob times the whole ask: the clickable choices, the typed
+        # match window and the auto-file sweep expire together.
+        self._question_ttl_s = float(config.concierge.clarify_ttl_s)
 
     # -- transport seams (one implementation per service) -------------------------
 
@@ -402,6 +424,7 @@ class ChatBridge(ABC):
         question: ChoiceQuestion,
         *,
         reply_to: Any = None,
+        mention_users: bool = False,
     ) -> Any:
         """Post a clarifying question whose answers are enumerable.
 
@@ -410,11 +433,12 @@ class ChatBridge(ABC):
         interactive components is unaffected and the question stays
         answerable by typing. Backends with components override this and
         keep the same prose in the message body as a fallback.
+        ``mention_users`` lets the ask actually ping its asker.
         """
         body = render_prose(question)
         if text and text.strip() and text.strip() != question.prompt.strip():
             body = f"{text.strip()}\n\n{body}"
-        return await self._send(target, body, reply_to=reply_to)
+        return await self._send(target, body, reply_to=reply_to, mention_users=mention_users)
 
     @abstractmethod
     async def _edit(self, message: Any, text: str, *, embed: EmbedSpec | None = None) -> None:
@@ -535,6 +559,7 @@ class ChatBridge(ABC):
     async def _amain(self) -> None:
         assert self._stop_evt is not None
         pump = asyncio.ensure_future(self._pump())
+        sweeper = asyncio.ensure_future(self._clarify_sweeper())
         gateway = asyncio.ensure_future(self._run_client())
         stopper = asyncio.ensure_future(self._stop_evt.wait())
         try:
@@ -569,6 +594,7 @@ class ChatBridge(ABC):
                     )
         finally:
             pump.cancel()
+            sweeper.cancel()
             stopper.cancel()
             try:
                 await self._close_client()
@@ -576,7 +602,7 @@ class ChatBridge(ABC):
                 self.log.debug("chat.client_close_failed", exc_info=True)
             if not gateway.done():
                 gateway.cancel()
-            await asyncio.gather(pump, stopper, gateway, return_exceptions=True)
+            await asyncio.gather(pump, sweeper, stopper, gateway, return_exceptions=True)
 
     # -- Frontend protocol (called from daemon threads) --------------------------
 
@@ -912,9 +938,18 @@ class ChatBridge(ABC):
 
     # -- concierge (the control channel's agent) --------------------------------------
 
-    async def _concierge_turn(self, msg: Inbound, text: str) -> None:
+    async def _concierge_turn(self, msg: Inbound, text: str, *, nudge: bool = False) -> None:
         channel = msg.channel
         prefix = self.chat.command_prefix
+        if not nudge and msg.author_id:
+            # Any engagement from the asker settles their open asks: the
+            # concierge handles the actual words in-session, so the
+            # auto-file fallback stands down.
+            settled = self.dstore.resolve_open_clarifications_for(
+                msg.author_id, msg.channel_id, time.time()
+            )
+            if settled:
+                self.log.info("chat.clarify_answered", by=msg.author_id, rows=settled)
         if self.concierge is None:
             await self._send(
                 channel,
@@ -937,7 +972,14 @@ class ChatBridge(ABC):
         self.log.info("chat.concierge_turn", by=author, chars=len(text))
         try:
             async with self._typing(channel):
-                future = self.concierge.submit_turn(text, author=author, on_tool=on_tool)
+                future = self.concierge.submit_turn(
+                    # author_id is what records the requester on a filed
+                    # issue, so the run's finish can ping them.
+                    text,
+                    author=author,
+                    author_id=msg.author_id,
+                    on_tool=on_tool,
+                )
                 reply = await asyncio.wrap_future(future)
         except asyncio.CancelledError:
             raise
@@ -948,9 +990,11 @@ class ChatBridge(ABC):
             await self._send(channel, f"⚠ concierge: {_one_line(str(exc), 300)}", reply_to=msg.raw)
             return
         await self._finish_concierge_note(turn)
-        await self._post_concierge_reply(msg, reply)
+        await self._post_concierge_reply(msg, reply, nudge=nudge)
 
-    async def _post_concierge_reply(self, msg: Inbound, reply: ConciergeReply) -> None:
+    async def _post_concierge_reply(
+        self, msg: Inbound, reply: ConciergeReply, *, nudge: bool = False
+    ) -> None:
         channel = msg.channel
         if not reply.ok:
             await self._react(msg.raw, "⚠")
@@ -960,20 +1004,37 @@ class ChatBridge(ABC):
             return
         text = reply.text or "(the concierge had nothing to say)"
         question = getattr(reply, "question", None)
+        pending = getattr(reply, "pending", None)
+        # An ask pings the person it waits on — a question nobody notices is
+        # a goal silently parked. A nudge-driven turn never arms a new
+        # fallback: it exists to end one.
+        mention = self.mention_user(msg.author_id) if msg.author_id else ""
+        asking = question is not None or pending is not None
+        if asking and mention and not text.startswith(mention):
+            text = f"{mention} {text}"
+        if pending is not None and not nudge:
+            self._register_pending_filing(msg, pending)
         if question is not None:
-            await self._post_choice_question(msg, text, question)
+            await self._post_choice_question(
+                msg, text, question, mention_users=asking and bool(mention)
+            )
             await self._react(msg.raw, "✅")
             return
         first = True
         for chunk in split_markdown(text, self.chat.max_message_chars):
-            await self._send(channel, chunk, reply_to=msg.raw if first else None)
+            await self._send(
+                channel,
+                chunk,
+                reply_to=msg.raw if first else None,
+                mention_users=first and asking and bool(mention),
+            )
             first = False
         await self._react(msg.raw, "✅")
 
     # -- clarifying questions with enumerable answers (#564) --------------------------
 
     async def _post_choice_question(
-        self, msg: Inbound, text: str, question: ChoiceQuestion
+        self, msg: Inbound, text: str, question: ChoiceQuestion, *, mention_users: bool = False
     ) -> None:
         """Post the question through the choice seam and remember it, so a
         click *or* a typed reply resolves to the same answer.
@@ -984,10 +1045,19 @@ class ChatBridge(ABC):
         preamble, leading = self._split_choice_preamble(text, question)
         first = True
         for chunk in leading:
-            await self._send(msg.channel, chunk, reply_to=msg.raw if first else None)
+            await self._send(
+                msg.channel,
+                chunk,
+                reply_to=msg.raw if first else None,
+                mention_users=first and mention_users,
+            )
             first = False
         posted = await self._send_choices(
-            msg.channel, preamble, question, reply_to=msg.raw if first else None
+            msg.channel,
+            preamble,
+            question,
+            reply_to=msg.raw if first else None,
+            mention_users=mention_users,
         )
         if posted is None:
             # The interactive post failed: prose is already the fallback in
@@ -1042,6 +1112,99 @@ class ChatBridge(ABC):
             message=message_id,
             choices=len(question.choices),
             ttl_s=self._question_ttl_s,
+        )
+
+    def _register_pending_filing(self, msg: Inbound, pending: PendingFiling) -> None:
+        """Persist a filing-blocking ask's fallback: if the asker never
+        answers, the sweeper tells the concierge to proceed on the stated
+        assumption — a restart delays the auto-file at worst, never drops
+        the goal."""
+        now = time.time()
+        row_id = self.dstore.create_pending_clarification(
+            backend=self.backend,
+            channel_id=msg.channel_id,
+            asker_id=msg.author_id,
+            asker_name=msg.author_name,
+            question=pending.question,
+            assumption=pending.assumption,
+            deadline=now + self._question_ttl_s,
+            now=now,
+        )
+        if row_id is None:
+            self.log.warning("chat.clarify_cap", question=pending.question[:80])
+            return
+        self.log.info(
+            "chat.clarify_pending", id=row_id, asker=msg.author_id, ttl_s=self._question_ttl_s
+        )
+
+    async def _clarify_sweeper(self) -> None:
+        """Turn unanswered filing-blocking asks into filings (ask, never
+        block). Runs beside the pump for the life of the bridge."""
+        interval = max(5.0, min(CLARIFY_SWEEP_MAX_S, self._question_ttl_s / 4))
+        while True:
+            try:
+                await self._sweep_clarifications_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.log.warning("chat.clarify_sweep_failed", exc_info=True)
+            await asyncio.sleep(interval)
+
+    async def _sweep_clarifications_once(self, now: float | None = None) -> None:
+        """One sweep: claim (CAS) and fire every ask past its deadline.
+        ``now`` is injectable so tests drive expiry without waiting."""
+        due = self.dstore.take_due_clarifications(time.time() if now is None else now)
+        for row in due:
+            try:
+                await self._fire_clarification(row)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.log.warning("chat.clarify_fire_failed", id=row.id, exc_info=True)
+            finally:
+                self.dstore.resolve_pending_clarification(row.id, "expired", time.time())
+
+    async def _fire_clarification(self, row: PendingClarification) -> None:
+        """One expired ask: announce the assumption (pinging the asker) and
+        drive one nudge turn that files with it. The concierge's own reply
+        lands in the channel, so the outcome is loud either way — the goal
+        is never dropped in silence."""
+        minutes = self._question_ttl_s / 60.0
+        channel = None
+        if row.channel_id and row.channel_id != self.chat.channel_ref:
+            channel = await self._thread_handle(row.channel_id)
+        if channel is None:
+            channel = await self._control_channel()
+        if channel is None:
+            self.log.warning("chat.clarify_unreachable", id=row.id)
+            return
+        mention = f"{self.mention_user(row.asker_id)} " if row.asker_id else ""
+        await self._send(
+            channel,
+            f"{mention}no reply in {minutes:g}m — proceeding with the assumption: {row.assumption}",
+            mention_users=bool(row.asker_id),
+        )
+        if self.concierge is None:
+            return
+        self.log.info("chat.clarify_expired", id=row.id, asker=row.asker_id)
+        msg = Inbound(
+            content="",
+            channel_id=row.channel_id,
+            message_id="",
+            author_id=row.asker_id,
+            author_name=row.asker_name,
+            author_is_bot=False,
+            mentioned_ids=frozenset(),
+            reply_to_bot=False,
+            channel=channel,
+            raw=None,
+        )
+        await self._concierge_turn(
+            msg,
+            CLARIFY_TIMEOUT_NUDGE.format(
+                question=row.question, minutes=minutes, assumption=row.assumption
+            ),
+            nudge=True,
         )
 
     def _expire_questions_locked(self) -> None:
@@ -1940,6 +2103,8 @@ class ChatBridge(ABC):
             await self._send(channel, text, embed=embed, mention_users=mentions)
 
     async def _react(self, message: Any, emoji: str) -> None:
+        if message is None:  # a synthetic turn (clarify nudge) has no message
+            return
         try:
             await self._add_reaction(message, emoji)
         except Exception:

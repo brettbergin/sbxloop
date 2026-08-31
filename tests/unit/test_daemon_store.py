@@ -988,3 +988,98 @@ class TestClaimPersistence:
         store.close()
         again = DaemonStore(db)
         assert [i.claim_token for i in again.half_claimed()] == ["d" * 32]
+
+
+class TestPendingClarifications:
+    """The persisted half of ask-never-block: a filing-blocking question's
+    fallback survives a restart and fires exactly once."""
+
+    def _create(self, store: DaemonStore, *, asker: str = "u1", deadline: float = 100.0) -> int:
+        row_id = store.create_pending_clarification(
+            backend="discord",
+            channel_id="42",
+            asker_id=asker,
+            asker_name="brett",
+            question="What are you seeing?",
+            assumption="grey cards",
+            deadline=deadline,
+            now=50.0,
+        )
+        assert row_id is not None
+        return row_id
+
+    def test_create_and_read_back(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        self._create(store)
+        (row,) = store.open_clarifications()
+        assert row.asker_id == "u1" and row.assumption == "grey cards"
+        assert row.state == "open" and row.deadline == 100.0
+
+    def test_take_due_is_a_cas_and_fires_once(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        self._create(store, deadline=100.0)
+        self._create(store, asker="u2", deadline=999.0)
+        taken = store.take_due_clarifications(now=200.0)
+        assert [r.asker_id for r in taken] == ["u1"], "only the due row is claimed"
+        assert store.take_due_clarifications(now=200.0) == [], "a second sweep gets nothing"
+
+    def test_any_engagement_from_the_asker_resolves_their_rows(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        self._create(store, asker="u1")
+        self._create(store, asker="u2")
+        assert store.resolve_open_clarifications_for("u1", "42", now=60.0) == 1
+        askers = [r.asker_id for r in store.open_clarifications()]
+        assert askers == ["u2"], "another asker's question stays armed"
+
+    def test_resolution_is_scoped_to_the_surface_when_known(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        self._create(store, asker="u1")  # channel 42
+        assert store.resolve_open_clarifications_for("u1", "77", now=60.0) == 0
+        assert store.resolve_open_clarifications_for("u1", None, now=60.0) == 1
+
+    def test_open_rows_are_capped(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.store import PENDING_CLARIFICATION_CAP
+
+        store = DaemonStore(tmp_path / "state.db")
+        for i in range(PENDING_CLARIFICATION_CAP):
+            self._create(store, asker=f"u{i}")
+        over = store.create_pending_clarification(
+            backend="discord",
+            channel_id="42",
+            asker_id="late",
+            asker_name=None,
+            question="q",
+            assumption="a",
+            deadline=100.0,
+            now=50.0,
+        )
+        assert over is None
+        assert len(store.open_clarifications()) == PENDING_CLARIFICATION_CAP
+
+    def test_a_raw_pre_change_database_upgrades_in_place(self, tmp_path: Path) -> None:
+        """The table auto-creates on open; rows an older daemon wrote are
+        untouched (the house migration rule: start from a raw pre-change
+        database, never one the new code wrote)."""
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            # The pre-change shape, verbatim (no daemon_pending_clarifications
+            # table; notably no `kind` column, which the store reads as the
+            # pre-1.0 signature and refuses).
+            "CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, "
+            "source_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, "
+            "body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', "
+            "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
+            "claimed INTEGER NOT NULL DEFAULT 0, run_id TEXT, last_error TEXT, "
+            "created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+            "pending_report TEXT, requested_by TEXT);"
+            "CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT);"
+            "INSERT INTO daemon_state (key, value) VALUES ('k', 'v');"
+        )
+        conn.commit()
+        conn.close()
+        store = DaemonStore(db)
+        assert store.open_clarifications() == []
+        self._create(store)
+        assert len(store.open_clarifications()) == 1
+        assert store.get_value("k") == "v", "pre-change rows are intact"

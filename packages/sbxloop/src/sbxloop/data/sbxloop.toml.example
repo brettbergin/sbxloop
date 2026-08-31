@@ -328,3 +328,6 @@ secret_strategy = "proxy"
 # github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
 # create_issues = true             # file (queued at once)/list/comment/label/close issues
 #                                  # (a close needs your yes)
+# clarify_ttl_s = 900              # a filing-blocking clarifying question waits this
+#                                  # long (also the clickable-choice TTL); then the
+#                                  # issue files on the concierge's stated assumption

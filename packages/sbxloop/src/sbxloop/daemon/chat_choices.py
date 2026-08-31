@@ -15,10 +15,13 @@ __all__ = [
     "MARKER_LANG",
     "MAX_CHOICES",
     "MIN_CHOICES",
+    "PENDING_LANG",
     "Choice",
     "ChoiceQuestion",
+    "PendingFiling",
     "match_free_text",
     "parse_choice_question",
+    "parse_pending_filing",
     "render_prose",
 ]
 
@@ -29,6 +32,17 @@ MAX_CHOICES = 5
 
 _BLOCK_RE = re.compile(
     r"^[ \t]*```[ \t]*" + re.escape(MARKER_LANG) + r"[ \t]*\r?\n(.*?)\r?\n?^[ \t]*```[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+# A filing-blocking question's fallback (ask, never block): the concierge
+# states its own best guess alongside the question, and if the asker never
+# answers the daemon tells it to proceed on that guess instead of dropping
+# the goal.
+PENDING_LANG = "sbx-pending"
+
+_PENDING_RE = re.compile(
+    r"^[ \t]*```[ \t]*" + re.escape(PENDING_LANG) + r"[ \t]*\r?\n(.*?)\r?\n?^[ \t]*```[ \t]*$",
     re.DOTALL | re.MULTILINE,
 )
 
@@ -184,3 +198,52 @@ def match_free_text(question: ChoiceQuestion, reply: str) -> str | None:
     if len(prefix_hits) == 1:
         return prefix_hits[0].value
     return None
+
+
+@dataclass(frozen=True)
+class PendingFiling:
+    """What happens when a filing-blocking question is never answered.
+
+    ``question`` is what was asked; ``assumption`` is the concierge's own
+    best guess, filed as a *Symptom (assumed)* when the wait expires.
+    """
+
+    question: str
+    assumption: str
+
+
+def parse_pending_filing(text: str) -> tuple[str, PendingFiling | None]:
+    """Split a reply into its prose and an optional pending-filing spec.
+
+    The marker is a fenced ```sbx-pending JSON block holding ``question``
+    and ``assumption``. It is always stripped from the returned text; a
+    malformed spec — or one with no usable assumption — yields None so the
+    reply is posted as ordinary prose (and the old wait-forever behaviour
+    is simply not armed). It may ride alongside an ``sbx-choices`` block;
+    the two parsers are independent.
+    """
+    if not text:
+        return text, None
+    match = _PENDING_RE.search(text)
+    if match is None:
+        return text, None
+    clean = (text[: match.start()] + text[match.end() :]).strip()
+    body = match.group(1).strip()
+    if not body:
+        return clean, None
+    try:
+        spec = json.loads(body)
+    except (ValueError, TypeError):
+        return clean, None
+    if not isinstance(spec, dict):
+        return clean, None
+    assumption = spec.get("assumption")
+    if not isinstance(assumption, str) or not assumption.strip():
+        return clean, None
+    question = spec.get("question")
+    if not isinstance(question, str) or not question.strip():
+        question = clean
+    return clean, PendingFiling(
+        question=" ".join(question.split()).strip(),
+        assumption=" ".join(assumption.split()).strip(),
+    )

@@ -2083,3 +2083,100 @@ class TestChoiceQuestions:
         reply = turn(concierge, "status?")
         assert reply == ConciergeReply("two runs today")
         assert reply.question is None
+
+
+class TestAssumedFiling:
+    """Ask, never block: an unanswered clarifying question files on the
+    concierge's stated assumption instead of parking the goal forever."""
+
+    def test_an_assumption_files_with_an_assumed_symptom_section(self) -> None:
+        from sbxloop.daemon.concierge import compose_issue_body
+
+        body = compose_issue_body(
+            {
+                "assumption": "grey GitHub preview cards under every message",
+                "requested_change": "remove the embeds",
+                "goal": "no unfurls",
+                "acceptance_criteria": ["no preview card appears"],
+            }
+        )
+        assert body.startswith("## Symptom (assumed)\n\ngrey GitHub preview cards")
+        assert "unconfirmed" in body
+        assert "did not answer the clarifying question" in body
+        assert "- [ ] no preview card appears" in body
+
+    def test_a_real_symptom_wins_over_an_assumption(self) -> None:
+        from sbxloop.daemon.concierge import compose_issue_body
+
+        body = compose_issue_body(
+            {
+                "symptom": "cards everywhere",
+                "assumption": "stale guess",
+                "goal": "g",
+                "acceptance_criteria": ["c"],
+            }
+        )
+        assert body.startswith("## Symptom (as observed)\n\ncards everywhere")
+        assert "stale guess" not in body
+
+    def test_neither_symptom_nor_assumption_still_refuses(self) -> None:
+        """The backstop that forces the ask stays; only the wait-forever
+        failure mode is gone."""
+        from sbxloop.daemon.concierge import compose_issue_body
+
+        with pytest.raises(ValueError, match="symptom is required") as exc:
+            compose_issue_body({"requested_change": "remove the embeds", "goal": "cleaner"})
+        assert "What are you seeing that you want gone or changed?" in str(exc.value)
+        assert "never wait forever" in str(exc.value)
+
+    def test_the_reply_carries_the_pending_filing(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.chat_choices import PendingFiling
+
+        concierge, _client, _, _, _ = make(
+            tmp_path,
+            [
+                {
+                    "text": (
+                        "What are you seeing?\n"
+                        "```sbx-pending\n"
+                        '{"question": "What are you seeing?", '
+                        '"assumption": "grey cards under messages"}\n'
+                        "```"
+                    )
+                }
+            ],
+        )
+        reply = turn(concierge, "remove the embeds")
+        assert reply.text == "What are you seeing?"
+        assert reply.pending == PendingFiling(
+            question="What are you seeing?", assumption="grey cards under messages"
+        )
+
+    def test_the_tool_files_the_assumed_body(self, tmp_path: Path) -> None:
+        github = FakeGithub()
+        concierge, client, _, _, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "create_issue",
+                            {
+                                "title": "Suppress link-preview unfurls",
+                                "assumption": "grey preview cards under every message",
+                                "requested_change": "remove the embeds",
+                                "goal": "no unfurls",
+                                "acceptance_criteria": ["no preview card appears"],
+                            },
+                        ),
+                    ],
+                    "text": "Filed on the assumption.",
+                }
+            ],
+            github=github,
+        )
+        turn(concierge, "[system] proceed on your assumption")
+        (filed,) = client.responses
+        assert filed.ok and filed.text.startswith("created and queued issue")
+        (_, _title, body, _labels) = github.created[0]
+        assert body.startswith("## Symptom (assumed)\n\ngrey preview cards")

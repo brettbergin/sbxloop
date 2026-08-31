@@ -66,6 +66,9 @@ def _adapters_without_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(bridge_module, "_to_embed", lambda spec: None)
     monkeypatch.setattr(bridge_module, "_allowed_mentions_none", lambda: "none")
+    # An ask now pings its asker (ask, never block), so the mention-allowing
+    # variant is reached too and needs the same stub.
+    monkeypatch.setattr(bridge_module, "_allowed_mentions_users", lambda: "users")
 
 
 @pytest.fixture

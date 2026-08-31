@@ -320,12 +320,15 @@ class FakeConcierge:
         self.gate = threading.Event()
         self.gate.set()
 
-    def submit_turn(self, text: str, *, author: str, on_tool: Any = None) -> Any:
+    def submit_turn(
+        self, text: str, *, author: str, author_id: str | None = None, on_tool: Any = None
+    ) -> Any:
         import concurrent.futures
 
         from sbxloop_worker.protocol import HostToolResponse
 
         self.turns.append((text, author))
+        self.author_ids = [*getattr(self, "author_ids", []), author_id]
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
         def run() -> None:

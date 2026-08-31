@@ -231,6 +231,15 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "stays free\n  text unless you can enumerate real candidate symptoms" in text
     assert "written **against the symptom**" in text
     assert "raw pre-change database" in text
+    # ask, never block: a filing-blocking question arms an sbx-pending
+    # fallback; an unanswered ask files on the stated assumption, and a
+    # close confirmation never proceeds on silence
+    flat = " ".join(text.split())
+    assert "sbx-pending" in text
+    assert "State your **own best guess in the same message**" in flat
+    assert "*Symptom (assumed)* section" in flat
+    assert "You never wait forever and no request is ever dropped." in flat
+    assert "a close never proceeds on silence" in flat
 
 
 def test_review_prompt_carries_contract() -> None:
