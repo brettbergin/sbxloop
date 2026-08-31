@@ -977,6 +977,16 @@ class TestTools:
         assert "backlog" in spec.description.lower()
         assert "label_issue_for_run" in spec.description
 
+    def test_list_issues_description_leads_with_the_all_capability(self, tmp_path: Path) -> None:
+        concierge, client, _, _, _ = make(tmp_path, [{}], github=FakeGithub())
+        turn(concierge)
+        spec = next(t for t in client.jobs[0].host_tools if t.name == "list_issues")
+        assert not spec.description.startswith("Open issues in")
+        assert "Open issues in" not in spec.description
+        first_sentence = spec.description.split(". ")[0]
+        assert "all: true" in first_sentence
+        assert "all" in spec.parameters["properties"]
+
     def test_create_issue_without_an_author_id_records_no_requester(self, tmp_path: Path) -> None:
         github = FakeGithub()
         concierge, client, _, _, dstore = make(

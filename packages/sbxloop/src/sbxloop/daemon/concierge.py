@@ -896,15 +896,15 @@ class Concierge:
                     HostToolSpec(
                         name="list_issues",
                         description=(
-                            f"Open issues in {self._repo_label()}, newest activity "
+                            f"Issues in {self._repo_label()} (open only unless "
+                            "all: true, which includes closed ones too), newest activity "
                             "first, each flagged QUEUED / RUNNING / FAILED / BLOCKED from the "
                             "daemon's labels, or NOT QUEUED when it carries none of them (filed "
                             "for the backlog, waiting on a person); label narrows to one label; "
                             "queued narrows by queue state — true lists only issues the daemon "
                             "has queued or is running, false lists only the backlog (issues "
-                            "carrying none of the daemon's state labels), omit it for all; "
-                            "open issues only by default — pass all: true to include closed "
-                            "ones too. Each line: number, "
+                            "carrying none of the daemon's state labels), omit it for all. "
+                            "Each line: number, "
                             "title, labels, age, author, comments, url. Queue only what the "
                             "person names, with label_issue_for_run."
                         ),
