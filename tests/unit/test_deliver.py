@@ -314,9 +314,21 @@ class MissingRepoOps(StubOps):
             return None
         return {"default_branch": "main"}
 
+    # Models a GitHub App installation token when set: ``GET /user`` is
+    # user-scoped and answers 403 "Resource not accessible by integration"
+    # (#581).
+    user_forbidden = False
+
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         if method == "GET" and path == "/user":
             self.raw_calls.append((method, path, body))
+            if self.user_forbidden:
+                raise GithubOpsError(
+                    "github op raw.api failed: GithubOpError: gh api GET /user "
+                    "failed (rc=1): gh: Resource not accessible by integration "
+                    "(HTTP 403)",
+                    http_status=403,
+                )
             return {"login": self.login}
         if method == "POST" and (path == "/user/repos" or path.startswith("/orgs/")):
             self.raw_calls.append((method, path, body))
@@ -349,6 +361,16 @@ class TestEnsureRepository:
 
     def test_missing_repo_created_under_org(self) -> None:
         ops = MissingRepoOps(login="me")
+        assert ensure_repository(ops, "acme/proj", create=True) is True  # type: ignore[arg-type]
+        posts = [call for call in ops.raw_calls if call[0] == "POST"]
+        assert posts and posts[0][1] == "/orgs/acme/repos"
+
+    def test_creation_without_a_readable_identity_uses_the_org_route(self) -> None:
+        """#581: a GitHub App installation token cannot call ``GET /user``.
+        Creation then goes the organization route instead of failing on
+        the identity lookup."""
+        ops = MissingRepoOps()
+        ops.user_forbidden = True
         assert ensure_repository(ops, "acme/proj", create=True) is True  # type: ignore[arg-type]
         posts = [call for call in ops.raw_calls if call[0] == "POST"]
         assert posts and posts[0][1] == "/orgs/acme/repos"

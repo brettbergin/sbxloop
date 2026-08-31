@@ -118,7 +118,22 @@ def ensure_repository(
             "sbxloop create it"
         )
     owner, name = repo.split("/", 1)
-    user = ops.raw("GET", "/user")
+    try:
+        user = ops.raw("GET", "/user")
+    except GithubOpsError as exc:
+        # ``GET /user`` needs a user token — a GitHub App installation
+        # token gets 403 "Resource not accessible by integration" (#581).
+        # Without a readable login, ``POST /user/repos`` (same constraint)
+        # could not work either, so the org route is the only one left —
+        # and for an org-owned target it is also the right one.
+        log.warning(
+            "deliver.identity_unavailable",
+            repo=repo,
+            http_status=exc.http_status,
+            error=str(exc),
+            hint="creating via the organization route",
+        )
+        user = {}
     login = str(user.get("login", "")) if isinstance(user, dict) else ""
     body = {"name": name, "private": not public, "auto_init": True}
     if login.lower() == owner.lower():

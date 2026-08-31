@@ -2304,12 +2304,51 @@ class LoopEngine:
             log.warning("run.followup_label_failed", repo=repo, label=label, error=text)
 
     def _login(self, p: Pipeline) -> str:
-        """The loop's own GitHub login, read once per drive."""
+        """The loop's own GitHub login, read once per drive.
+
+        ``GET /user`` is a user-token endpoint: a GitHub App installation
+        token gets 403 "Resource not accessible by integration" (#581),
+        and raising here failed runs that had already delivered a working
+        PR. The loop's identity is then the author of the PR it delivered
+        — the same token opened it — and when even that is unreadable the
+        login degrades to ``""`` (self-review reads as no, landing filters
+        nothing) with a plain log line instead of an exception.
+        """
         if p.login is None:
             assert p.ops is not None
-            user = p.ops.raw("GET", "/user")
-            p.login = str(user.get("login", "")) if isinstance(user, dict) else ""
+            try:
+                user = p.ops.raw("GET", "/user")
+                p.login = str(user.get("login", "")) if isinstance(user, dict) else ""
+            except GithubOpsError as exc:
+                p.login = self._login_from_pr(p)
+                log.warning(
+                    "engine.login_lookup_failed",
+                    run=p.run_id,
+                    http_status=exc.http_status,
+                    fallback=p.login or "(unknown)",
+                    error=str(exc),
+                    hint="GET /user needs a user token — a GitHub App "
+                    "installation token cannot call it; using the delivered "
+                    "PR's author as the loop's identity",
+                )
         return p.login
+
+    def _login_from_pr(self, p: Pipeline) -> str:
+        """The delivered PR's author, as the loop's identity (#581): the
+        loop's own github-ops token opened that PR, so its author *is* this
+        identity — under a PAT and an App installation token alike."""
+        assert p.ops is not None and p.repo is not None
+        number = self.store.get_run(p.run_id).pr_number
+        if number is None:
+            return ""
+        try:
+            user = p.ops.pr_get(p.repo, number).get("user")
+        except GithubOpsError:
+            log.warning(
+                "engine.login_pr_author_lookup_failed", run=p.run_id, pr=number, exc_info=True
+            )
+            return ""
+        return str(user.get("login") or "") if isinstance(user, dict) else ""
 
     def _tick(self, p: Pipeline, waiting: str) -> None:
         """One wait interval between GitHub polls: honour cancellation,

@@ -2247,6 +2247,47 @@ class TestPipeline:
         assert result.state == "merged"
         assert self._events(harness, HostEventTypes.FIX_ROUND) == []
 
+    def test_an_installation_token_403_on_get_user_does_not_fail_the_run(
+        self, harness: Harness
+    ) -> None:
+        """#581: ``GET /user`` is a user-token endpoint; a GitHub App
+        installation token gets 403 "Resource not accessible by
+        integration". The loop's identity falls back to the delivered PR's
+        author — the same token opened it — and the run lands instead of
+        failing after having delivered its work (field runs r5ctmq7e8,
+        rb20denz3)."""
+        fake = FakeGithub(self_review=True)
+        fake.fail_user_lookup = GithubOpsError(
+            "github op raw.api failed: GithubOpError: gh api GET /user failed "
+            "(rc=1): gh: Resource not accessible by integration (HTTP 403)",
+            http_status=403,
+        )
+        # The loop's own standing CHANGES_REQUESTED: only the identity
+        # fallback (login = PR author = the bot) keeps it from being read
+        # as a human objection and spending a fix round.
+        fake.reviews_payload = [human_review("sbxloop-bot", "CHANGES_REQUESTED", "round 1")]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged"
+        assert ("GET", "/user", None) in fake.raw_calls  # the direct lookup was tried first
+        assert self._events(harness, HostEventTypes.FIX_ROUND) == []
+
+    def test_an_unreadable_identity_logs_and_continues(self, harness: Harness) -> None:
+        """#581: when even the PR author is unreadable the login degrades
+        to "" — the run proceeds (self-review reads as no, nothing is
+        filtered) rather than raising on an identity it never needed to
+        deliver the work."""
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError(
+            "github op raw.api failed: GithubOpError: gh api GET /user failed "
+            "(rc=1): gh: Resource not accessible by integration (HTTP 403)",
+            http_status=403,
+        )
+        fake.pr["user"] = None  # no readable author either
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged"
+
     def test_a_pr_closed_by_a_human_fails_the_run(self, harness: Harness) -> None:
         fake = FakeGithub()
         fake.pr["state"] = "closed"
