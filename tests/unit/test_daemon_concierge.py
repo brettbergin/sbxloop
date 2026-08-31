@@ -802,6 +802,57 @@ class TestTools:
         assert "4 open issue(s)" in everything.text
         assert "NOT QUEUED" in everything.text
 
+    def test_list_issues_all_parameter_controls_the_requested_state(self, tmp_path: Path) -> None:
+        issues = [
+            {
+                "number": 7,
+                "title": "Backlog capture",
+                "labels": [],
+                "created_at": "2026-08-01T00:00:00Z",
+                "user": {"login": "ana"},
+                "comments": 0,
+                "html_url": "https://gh/i/7",
+            },
+            {
+                "number": 8,
+                "title": "Closed one",
+                "state": "closed",
+                "labels": [{"name": "sbxloop:run"}],
+                "created_at": "2026-08-01T00:00:00Z",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/8",
+            },
+        ]
+        github = FakeGithub({"/issues?": issues})
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {"calls": [("list_issues", {})]},
+                {"calls": [("list_issues", {"all": True})]},
+                {"calls": [("list_issues", {"all": False})]},
+                {"calls": [("list_issues", {"all": True, "queued": False})]},
+            ],
+            github=github,
+        )
+        for prompt in ("default?", "all?", "not all?", "all backlog?"):
+            turn(concierge, prompt)
+        default, everything, explicit_open, backlog = client.responses
+
+        def numbers(text: str) -> set[str]:
+            return {line.split()[1] for line in text.splitlines() if line.startswith("- #")}
+
+        assert "state=open" in github.paths[0] and "state=all" not in github.paths[0]
+        assert "state=all" in github.paths[1]
+        assert "state=open" in github.paths[2] and "state=all" not in github.paths[2]
+        assert "state=all" in github.paths[3]
+        assert numbers(default.text) == {"#7", "#8"}
+        assert "#8 Closed one" in everything.text
+        assert "open+closed issue(s)" in everything.text
+        assert explicit_open.ok
+        assert numbers(backlog.text) == {"#7"}
+        assert "not-queued open+closed issue(s)" in backlog.text
+
     def test_list_issues_names_the_empty_subset(self, tmp_path: Path) -> None:
         github = FakeGithub(
             {

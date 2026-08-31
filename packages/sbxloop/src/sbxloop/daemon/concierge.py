@@ -876,8 +876,9 @@ class Concierge:
                             "for the backlog, waiting on a person); label narrows to one label; "
                             "queued narrows by queue state — true lists only issues the daemon "
                             "has queued or is running, false lists only the backlog (issues "
-                            "carrying none of the daemon's state labels), omit it for all. "
-                            "Each line: number, "
+                            "carrying none of the daemon's state labels), omit it for all; "
+                            "open issues only by default — pass all: true to include closed "
+                            "ones too. Each line: number, "
                             "title, labels, age, author, comments, url. Queue only what the "
                             "person names, with label_issue_for_run."
                         ),
@@ -1458,7 +1459,10 @@ class Concierge:
         daemon = self.config.daemon
         limit = _int_arg(args, "limit", 20, 1, 50)
         label = str(args.get("label") or "").strip()
-        query = f"state=open&per_page={limit}&sort=updated&direction=desc"
+        include_all = bool(args.get("all"))
+        state = "all" if include_all else "open"
+        openness = "open+closed" if include_all else "open"
+        query = f"state={state}&per_page={limit}&sort=updated&direction=desc"
         if label:
             query += f"&labels={quote(label, safe='')}"
         try:
@@ -1489,10 +1493,12 @@ class Concierge:
             issues = [d for d in issues if _keep(d)]
             subset = " queued" if want_queued else " not-queued"
         if not issues:
-            return f"no{subset} open issues in {repo}" + (f" with label `{label}`" if label else "")
+            return f"no{subset} {openness} issues in {repo}" + (
+                f" with label `{label}`" if label else ""
+            )
         now = self.clock()
         lines = [
-            f"{len(issues)}{subset} open issue(s) in {repo}"
+            f"{len(issues)}{subset} {openness} issue(s) in {repo}"
             + (f" with `{label}`" if label else "")
             + f" (newest activity first, max {limit}):"
         ]
