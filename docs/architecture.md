@@ -546,7 +546,21 @@ mergeability, and only then the merge:
    is genuinely fixable.
 4. **Reconciled?** Every review thread on the PR must be answered, and the
    approving review must actually have posted — see the section above.
-5. **Merge**, sending the head sha the loop actually judged. A push that
+5. **The opt-in merge gate** (`[landing] merge_gate = "chat"`) — the one
+   permissible human touchpoint, and only here, with every other bar
+   cleared: the run returns `Gated` and parks instead of merging. The
+   daemon persists the gate (`daemon_merge_gates`), frees the sandboxes,
+   resets the breaker, labels the issue `sbxloop:awaiting-merge`, posts the
+   approval prompt into the run's chat thread (@mentioning whoever asked
+   for the work) and moves on. One approval — `!sbx merge <item>` on any
+   backend, `sbxloop daemon ctl merge <item>` headless — re-runs this same
+   `land()` with gh ops alone (no sandbox, no engine): update if behind,
+   re-checked CI, the same reconciliation gate, so a review left during
+   the park is honoured, never merged over. A failed approval puts the
+   gate back up; an approval interrupted by a restart re-opens at boot; a
+   double-approve loses a store CAS instead of double-merging; `!sbx abandon <item>` declines and dismisses the gate. `"off"` (the default)
+   skips straight to the merge.
+6. **Merge**, sending the head sha the loop actually judged. A push that
    landed since loses the race with a 409 rather than being merged over.
 
 Two answers come back as *data* rather than as exceptions, and the difference

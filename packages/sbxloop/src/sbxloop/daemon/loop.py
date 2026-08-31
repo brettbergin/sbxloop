@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 
 from sbxloop import hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
+from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
 from sbxloop.daemon.model import (
@@ -53,8 +54,17 @@ from sbxloop.daemon.model import (
     WorkItem,
 )
 from sbxloop.daemon.sources import WorkSource
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import DaemonStore, MergeGate
 from sbxloop.engine.engine import LoopEngine
+from sbxloop.engine.landing import (
+    Blocked,
+    Closed,
+    Landed,
+    NeedsFix,
+    UpdateState,
+    land,
+    resolve_login,
+)
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
@@ -62,6 +72,7 @@ from sbxloop.engine.model import (
     RunResult,
     RunState,
 )
+from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     ProvisionError,
@@ -149,6 +160,16 @@ class Frontend(Protocol):
         self, item: WorkItem, run_id: str, engine: LoopEngine, bus: EventBus
     ) -> None: ...
     def run_finished(self, item: WorkItem, report: RunReport) -> None: ...
+    def merge_gate_opened(self, item: WorkItem, run_id: str, gate: MergeGate) -> None: ...
+    def merge_gate_resolved(
+        self,
+        item: WorkItem,
+        run_id: str,
+        gate: MergeGate,
+        outcome: str,
+        by: str | None,
+        detail: str | None = None,
+    ) -> None: ...
 
 
 class CancelRequest(NamedTuple):
@@ -191,6 +212,7 @@ class DaemonLoop:
         runner: Runner | None = None,
         clock: Callable[[], float] = time.time,
         frontend: Frontend | None = None,
+        github: DaemonGithub | None = None,
         worker_python: str | None = None,
         install_workers: bool | None = None,
     ) -> None:
@@ -201,6 +223,9 @@ class DaemonLoop:
         self.sbx = sbx
         self.clock = clock
         self.frontend = frontend
+        # The daemon's own gh-ops box: what the gate-approve path merges
+        # with. None only in tests that never approve.
+        self.github = github
         # Engine construction knobs (tests/e2e point these at the host
         # interpreter and skip the install ladder, like the CLI does).
         self.worker_python = worker_python
@@ -331,7 +356,19 @@ class DaemonLoop:
         item_id = normalize_item_id(item_id)
         why = reason or "abandoned by operator"
         now = self.clock()
+        before = self.dstore.get(item_id)
         fresh = self.dstore.abandon(item_id, why, now)
+        if before is not None and before.state == "gated" and before.run_id is not None:
+            gate = self.dstore.merge_gate_for(before.run_id)
+            if gate is not None and gate.state in ("open", "approving"):
+                self.dstore.resolve_merge_gate(before.run_id, "dismissed", why, now)
+                self._frontend_gate_resolved(fresh, before.run_id, gate, "dismissed", None, why)
+                self._notice(
+                    "gate.dismissed",
+                    f"🚪 {item_id}: merge gate dismissed ({why}); the PR stays open",
+                    item=item_id,
+                    run=before.run_id,
+                )
         if self._cancel_if_current(item_id):
             self._notice(
                 "item.abandon_cancelling",
@@ -456,7 +493,7 @@ class DaemonLoop:
         kind = item.pending_report
         if kind is None:
             return
-        if kind in ("merged", "blocked"):
+        if kind in ("merged", "blocked", "gated"):
             if self._report_outcome(item, kind):
                 self.dstore.take_pending_report(item.item_id)
             return
@@ -495,6 +532,8 @@ class DaemonLoop:
                 log.debug("report.no_run_record", item=item.item_id, run=item.run_id)
         if kind == "merged":
             delivered = self.source.report_merged(item, pr_number, pr_url)
+        elif kind == "gated":
+            delivered = self.source.report_gated(item, pr_number, pr_url)
         else:
             reason = item.last_error or "GitHub would not let the loop finish the pull request"
             delivered = self.source.report_blocked(item, reason, pr_number, pr_url)
@@ -1237,6 +1276,8 @@ class DaemonLoop:
         now = self.clock()
         report = self._report(run_id, result)
         state = result.state if result is not None else None
+        if state == "gated":
+            return self._settle_gated(item, run_id, report, now)
         # Without a repository there is nothing to land: the engine ends
         # `completed` after its gate, and that is the whole job.
         landed = state == "merged" or (state == "completed" and not self.config.github.enabled)
@@ -1385,6 +1426,271 @@ class DaemonLoop:
         self.source.report_cancelled(item, report)
         self._frontend_finished(item, report)
         return "cancelled"
+
+    def _settle_gated(
+        self, item: WorkItem, run_id: str, report: RunReport, now: float
+    ) -> TickOutcome:
+        """The run cleared every bar and ``[landing] merge_gate`` parked it:
+        free the machinery, persist the gate, tell the humans, move on.
+
+        Not a failure — the breaker resets — and not done: the item waits
+        in ``gated`` (invisible to dispatch) until ``approve_merge`` lands
+        the PR or ``abandon`` dismisses the gate. The gate row is the
+        durable state a restart re-arms prompts from; the watcher snapshot
+        happens here, before the finish path drains the watch registry."""
+        self.dstore.finish_ledger(run_id, "gated", now)
+        if self._consecutive_failures:
+            log.info("breaker.reset", after_failures=self._consecutive_failures)
+        self._set_breaker(None, 0)
+        notify: list[str] = []
+        for who in [item.requested_by, *self.dstore.run_watchers(run_id)]:
+            if who and who not in notify:
+                notify.append(who)
+        try:
+            record = self.store.get_run(run_id)
+        except SbxloopError:
+            record = None
+        pr_number = record.pr_number if record is not None else None
+        pr_url = (record.pr_url if record is not None else None) or ""
+        if pr_number is None and report.pr is not None:
+            pr_number, pr_url = report.pr
+        if pr_number is None:
+            # A gate without a PR cannot be approved; hand over instead of
+            # parking dead. Should be unreachable — Gated comes after deliver.
+            log.error("gate.no_pr", run=run_id, item=item.item_id)
+            self.dstore.mark_blocked(item.item_id, "run ended gated without a PR", now)
+            fresh = self.dstore.get(item.item_id) or item
+            self._deliver_report(fresh)
+            self._frontend_finished(item, report)
+            return "blocked"
+        self.dstore.create_merge_gate(
+            run_id,
+            item.item_id,
+            item.repo or self.config.github.repo or "",
+            pr_number,
+            pr_url,
+            record.branch if record is not None else report.branch,
+            notify,
+            uuid.uuid4().hex,
+            now,
+        )
+        self.dstore.mark_gated(item.item_id, now)
+        fresh = self.dstore.get(item.item_id) or item
+        self._deliver_report(fresh)
+        self._frontend_finished(item, report)
+        gate = self.dstore.merge_gate_for(run_id)
+        if gate is not None:
+            self._frontend_gate_opened(item, run_id, gate)
+        self._notice(
+            "run.gated",
+            f"⏸ {item.item_id} ready to merge — waiting for approval · PR #{pr_number} — "
+            f"approve in the run's thread or `!sbx merge {item.item_id}` (no deadline)",
+            item=item.item_id,
+            run=run_id,
+            url=pr_url or None,
+            pr=pr_number,
+        )
+        return "gated"
+
+    def approve_merge(self, target: str, by: str | None = None) -> str:
+        """One human approval for a parked merge (``[landing] merge_gate``).
+
+        Fast and event-loop-safe: resolve the gate, win (or lose) the CAS,
+        spawn the gh-ops-only landing thread, answer in prose. Refusals
+        raise ``ValueError`` with the reason."""
+        gate = self.dstore.merge_gate_for(target.strip())
+        if gate is None:
+            raise ValueError(f"no merge gate for {target!r} — nothing is awaiting approval")
+        if gate.state == "merged":
+            raise ValueError(f"{gate.item_id} already merged (PR #{gate.pr_number})")
+        if gate.state == "dismissed":
+            raise ValueError(
+                f"{gate.item_id}'s merge gate was dismissed; `retry {gate.item_id}` "
+                "runs the item again from scratch"
+            )
+        if self.github is None:
+            raise ValueError("this daemon has no github handle to merge with")
+        if not self.dstore.claim_merge_gate(gate.run_id):
+            return f"{gate.item_id} is already being merged — hold on."
+        who = by or "operator"
+        threading.Thread(
+            target=self._complete_landing,
+            args=(gate, who),
+            daemon=True,
+            name=f"sbxloop-merge-{gate.run_id}",
+        ).start()
+        return (
+            f"✅ approved by {who} — completing the landing of PR #{gate.pr_number} "
+            "(update if behind → checks → merge); I'll report in the run's thread."
+        )
+
+    def _merge_tick(self, waiting: str) -> None:
+        """The approve thread's wait between GitHub polls: bounded sleeps,
+        cut short only by daemon shutdown (the boot reconcile then puts the
+        gate back up)."""
+        if self._stop.is_set():
+            raise RunCancelledError("daemon stopping — approve again after the restart")
+        time.sleep(min(self.config.landing.ci_poll_interval_s, 30.0))
+
+    def _complete_landing(self, gate: MergeGate, by: str) -> None:
+        """Finish a parked landing with gh ops alone — no sandbox pair, no
+        engine. ``land()`` re-runs every bar (undraft, objections, CI,
+        update-branch, reconciliation) against the live PR, so a review or
+        comment left during the park is honoured, never merged over."""
+        run_id, item_id = gate.run_id, gate.item_id
+        self._notice(
+            "gate.approved",
+            f"✅ merge of {item_id} approved by {by} — completing the landing",
+            item=item_id,
+            run=run_id,
+            url=gate.pr_url or None,
+            by=by,
+        )
+        assert self.github is not None  # approve_merge refused without one
+        try:
+            ops = self.github.ops()
+            login = resolve_login(
+                ops,
+                gate.repo,
+                gate.pr_number,
+                bot_login=self.github.provisioner.gh_bot_login(gate.repo),
+            )
+            outcome = land(
+                ops,
+                gate.repo,
+                gate.pr_number,
+                cfg=self.config.landing,
+                branch=gate.branch,
+                node_id=None,
+                login=login,
+                update=UpdateState(),
+                on_update=lambda state: None,
+                tick=self._merge_tick,
+                emit=lambda type, **data: log.info(type, run=run_id, **data),
+                answered=self.store.answered_objections(run_id),
+                review_posted=True,
+                ack=lambda threads: acknowledge_human_threads(
+                    ops, gate.repo, gate.pr_number, run_id=run_id, login=login, threads=threads
+                ),
+            )
+        except RunCancelledError as exc:
+            self.dstore.reopen_merge_gate(run_id, str(exc))
+            return
+        except Exception as exc:
+            self.github.note_failure(exc)
+            self.dstore.reopen_merge_gate(run_id, f"approval failed: {exc}")
+            item = self.dstore.get(item_id)
+            if item is not None:
+                self._frontend_gate_resolved(item, run_id, gate, "failed", by, str(exc))
+            self._notice(
+                "gate.merge_failed",
+                f"⚠ approving {item_id} did not land: {exc} — the gate is back up; "
+                "fix and approve again",
+                level="warning",
+                item=item_id,
+                run=run_id,
+            )
+            return
+        now = self.clock()
+        item = self.dstore.get(item_id)
+        if isinstance(outcome, Landed):
+            try:
+                self.store.reconcile_run(run_id, "merged", f"merge approved by {by}")
+            except SbxloopError:
+                log.warning("gate.record_update_failed", run=run_id, exc_info=True)
+            self.dstore.resolve_merge_gate(run_id, "merged", by, now)
+            self.dstore.mark_done(item_id, now, pending_report="merged")
+            self.dstore.finish_ledger(run_id, "done", now)
+            fresh = self.dstore.get(item_id)
+            if fresh is not None:
+                self._deliver_report(fresh)
+            if item is not None:
+                self._frontend_gate_resolved(item, run_id, gate, "merged", by, outcome.sha)
+            self._notice(
+                "run.done",
+                f"🎉 {item_id} merged after approval by {by} · PR #{gate.pr_number}",
+                item=item_id,
+                run=run_id,
+                url=gate.pr_url or None,
+                pr=gate.pr_number,
+                by=by,
+            )
+        elif isinstance(outcome, Closed):
+            self.dstore.resolve_merge_gate(
+                run_id, "dismissed", by, now, detail="PR closed unmerged while parked"
+            )
+            try:
+                self.dstore.abandon(item_id, "PR closed unmerged while parked", now)
+            except ValueError:
+                log.warning("gate.abandon_failed", item=item_id, exc_info=True)
+            fresh = self.dstore.get(item_id)
+            if fresh is not None:
+                self._deliver_report(fresh)
+            if item is not None:
+                self._frontend_gate_resolved(
+                    item, run_id, gate, "dismissed", by, "PR closed unmerged"
+                )
+            self._notice(
+                "gate.dismissed",
+                f"🚪 {item_id}: its PR was closed unmerged while parked; gate dismissed",
+                item=item_id,
+                run=run_id,
+            )
+        else:
+            why = outcome.why if isinstance(outcome, Blocked | NeedsFix) else str(outcome)
+            self.dstore.reopen_merge_gate(run_id, why)
+            if item is not None:
+                self._frontend_gate_resolved(item, run_id, gate, "failed", by, why)
+            self._notice(
+                "gate.merge_failed",
+                f"⚠ approving {item_id} did not land: {why} — the gate is back up; "
+                "fix and approve again",
+                level="warning",
+                item=item_id,
+                run=run_id,
+            )
+
+    def _reconcile_gates(self) -> None:
+        """An ``approving`` gate at boot is an approval a dead process took
+        and never finished: put the gate back up and say so — the click or
+        command works again. (`land()` is idempotent against a PR that did
+        merge: the next approval sees ``merged`` and settles ``Landed``.)"""
+        for gate in self.dstore.open_merge_gates():
+            if gate.state != "approving":
+                continue
+            self.dstore.reopen_merge_gate(
+                gate.run_id, "approval interrupted by a restart — approve again"
+            )
+            self._notice(
+                "gate.merge_failed",
+                f"⚠ {gate.item_id}: a merge approval was interrupted by a restart — "
+                "the gate is back up; approve again",
+                level="warning",
+                item=gate.item_id,
+                run=gate.run_id,
+            )
+
+    def _frontend_gate_opened(self, item: WorkItem, run_id: str, gate: MergeGate) -> None:
+        if self.frontend is not None:
+            try:
+                self.frontend.merge_gate_opened(item, run_id, gate)
+            except Exception:
+                log.warning("frontend.gate_opened_failed", run=run_id, exc_info=True)
+
+    def _frontend_gate_resolved(
+        self,
+        item: WorkItem,
+        run_id: str,
+        gate: MergeGate,
+        outcome: str,
+        by: str | None,
+        detail: str | None = None,
+    ) -> None:
+        if self.frontend is not None:
+            try:
+                self.frontend.merge_gate_resolved(item, run_id, gate, outcome, by, detail)
+            except Exception:
+                log.warning("frontend.gate_resolved_failed", run=run_id, exc_info=True)
 
     def _set_breaker(self, opened_at: float | None, consecutive_failures: int) -> None:
         self._breaker_opened_at = opened_at
@@ -1730,6 +2036,7 @@ class DaemonLoop:
         Finishes with :meth:`_reconcile_orphan_runs`, which closes any run
         row a dead process left non-terminal (#374)."""
         self._settle_half_claims()
+        self._reconcile_gates()
         for item in self.dstore.running_items():
             now = self.clock()
             if item.run_id is None:
@@ -1752,7 +2059,7 @@ class DaemonLoop:
                     reason="run record missing; starting over",
                 )
                 continue
-            if record.state in ("merged", "blocked", "completed"):
+            if record.state in ("merged", "blocked", "completed", "gated"):
                 self._notice(
                     "recovery.settling",
                     f"recovery: {item.run_id} had ended {record.state}; settling {item.item_id}",

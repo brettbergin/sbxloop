@@ -192,6 +192,10 @@ class HostEventTypes:
     # ever speak to (`pr`, `acked`) — the reply is the not-silent part.
     LAND_HUMAN_ACK = "land.human_ack"
     RUN_MERGED = "run.merged"
+    # The opt-in merge gate parked the run: every bar cleared, the merge
+    # awaiting one human approval (`pr`, `url`, `sha`, `review_rounds`,
+    # `ci_rounds`).
+    RUN_GATED = "run.gated"
     # Follow-up issues filed (or listed on the PR) after the merge (#517):
     # `pr`, `mode`, `filed` [{number, url, title}], `listed` (titles).
     RUN_FOLLOWUPS = "run.followups"

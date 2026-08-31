@@ -61,6 +61,15 @@ class Landed(NamedTuple):
     by_human: bool = False
 
 
+class Gated(NamedTuple):
+    """The opt-in merge gate (``[landing] merge_gate``): every bar cleared,
+    the merge withheld for one human approval. ``head`` is the sha the
+    loop judged — a record, not a contract: the approve path re-runs
+    ``land()`` and re-judges the live PR."""
+
+    head: str
+
+
 class Blocked(NamedTuple):
     why: str
 
@@ -96,7 +105,7 @@ class Closed(NamedTuple):
     why: str
 
 
-LandingOutcome = Landed | Blocked | NeedsFix | Closed
+LandingOutcome = Landed | Gated | Blocked | NeedsFix | Closed
 
 
 class CiTimeout(Exception):
@@ -166,6 +175,44 @@ def poll_checks(
                 f"CI did not report within ci_timeout_s={cfg.ci_timeout_s:g}s: {verdict.summary()}"
             )
         tick("ci")
+
+
+def resolve_login(
+    ops: GithubOps, repo: str, pr_number: int | None, *, bot_login: str | None = None
+) -> str:
+    """The loop's own GitHub login, from whatever source can answer.
+
+    Resolution order: the App's ``<slug>[bot]`` when the host resolved one
+    (an installation token cannot call ``GET /user`` — 403, #581); ``GET
+    /user`` (PAT mode); the author of the delivered PR (the same token
+    opened it); ``""`` — which landing then refuses to classify threads
+    with (:func:`_reconciliation_block`). The engine caches the answer per
+    drive (``LoopEngine._login``); the daemon's gate-approve path calls it
+    fresh.
+    """
+    if bot_login:
+        return bot_login
+    try:
+        user = ops.raw("GET", "/user")
+        return str(user.get("login", "")) if isinstance(user, dict) else ""
+    except GithubOpsError as exc:
+        log.warning(
+            "land.login_lookup_failed",
+            repo=repo,
+            pr=pr_number,
+            http_status=exc.http_status,
+            error=str(exc),
+            hint="GET /user needs a user token — a GitHub App installation "
+            "token cannot call it; falling back to the delivered PR's author",
+        )
+    if pr_number is None:
+        return ""
+    try:
+        user = ops.pr_get(repo, pr_number).get("user")
+    except GithubOpsError:
+        log.warning("land.login_pr_author_lookup_failed", repo=repo, pr=pr_number, exc_info=True)
+        return ""
+    return str(user.get("login") or "") if isinstance(user, dict) else ""
 
 
 def human_objection(ops: GithubOps, repo: str, number: int, *, login: str) -> bool:
@@ -400,6 +447,7 @@ def land(
     answered: Container[str] = frozenset(),
     review_posted: bool = True,
     ack: Ack | None = None,
+    gate: bool = False,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
@@ -417,6 +465,10 @@ def land(
     ``ack`` answers human threads that nothing else in the pipeline would
     ever speak to (see :func:`_reconciliation_block`); ``None`` keeps the
     gate read-only.
+
+    ``gate`` is the opt-in merge gate: True returns :class:`Gated` where
+    the merge would have happened — after every other bar — so the caller
+    parks the run for one human approval instead of merging.
     """
     started = clock()
     while True:
@@ -515,6 +567,11 @@ def land(
         if blocked is not None:
             emit("land.unreconciled", pr=number, why=blocked.why)
             return blocked
+        if gate:
+            # The one permissible human gate, and only ever here: everything
+            # a human could be waiting on is already settled.
+            emit("land.gated", pr=number, head=head)
+            return Gated(head)
         outcome = ops.pr_merge(repo, number, method=cfg.merge_method, sha=head)
         if outcome.stale:
             # The head moved between the read that judged it and the merge;

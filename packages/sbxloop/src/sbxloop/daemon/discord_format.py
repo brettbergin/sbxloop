@@ -95,6 +95,7 @@ STATE_MARKER = {
     "failed": "❌",
     "blocked": "🚧",
     "cancelled": "⏹",
+    "gated": "⏸",
 }
 STATE_COLOR = {
     "merged": COLOR_OK,
@@ -102,6 +103,7 @@ STATE_COLOR = {
     "failed": COLOR_FAIL,
     "blocked": COLOR_WARN,
     "cancelled": COLOR_DIM,
+    "gated": COLOR_WARN,
 }
 # How a post-build stage reads in the chronology when the run enters it.
 STAGE_MARKER = {
@@ -1318,6 +1320,15 @@ def format_for_discord(
         return [
             line(f"🚀 PR #{data.get('pr')} updated from its base (attempt {data.get('attempt')})")
         ]
+    if t == HostEventTypes.RUN_GATED:
+        label = f"#{data.get('pr')}"
+        return [
+            line(
+                f"⏸ **ready to merge** PR {link(label, data.get('url'))} — parked by "
+                "`[landing] merge_gate`, waiting for human approval",
+                flush=True,
+            )
+        ]
     if t == HostEventTypes.RUN_MERGED:
         label = f"#{data.get('pr')}"
         who = " (by a human)" if data.get("by_human") else ""
@@ -1898,6 +1909,7 @@ ITEM_STATE_MARKER = {
     "failed": "❌",
     "blocked": "🚧",
     "cancelled": "⏹",
+    "gated": "⏸",
 }
 
 

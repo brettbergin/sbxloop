@@ -444,9 +444,18 @@ class TestRunStates:
         assert not set(PIPELINE_STAGES) & TERMINAL_RUN_STATES
 
     def test_terminal_states(self) -> None:
-        assert {"merged", "completed", "failed", "blocked", "cancelled"} == TERMINAL_RUN_STATES
+        assert {
+            "merged",
+            "completed",
+            "failed",
+            "blocked",
+            "cancelled",
+            "gated",
+        } == TERMINAL_RUN_STATES
         # A finished run is finished; a stopped one may be picked up again.
-        assert {"merged", "completed"}.isdisjoint(RESUMABLE_RUN_STATES)
+        # `gated` is finished too: the approve path lands the PR with gh ops
+        # alone, never by resuming an engine.
+        assert {"merged", "completed", "gated"}.isdisjoint(RESUMABLE_RUN_STATES)
         assert {"failed", "blocked", "cancelled"} <= RESUMABLE_RUN_STATES
         assert {"created", "provisioning", "decomposing", "building"} <= RESUMABLE_RUN_STATES
 

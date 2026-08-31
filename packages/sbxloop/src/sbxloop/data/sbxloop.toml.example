@@ -134,9 +134,14 @@ secret_strategy = "proxy"
 # [landing]
 # What happens after the tasks are built: the PR opens as a draft, the run
 # reviews its own diff, spends bounded fix rounds on what the review, CI or
-# the base branch object to, un-drafts and merges. Merging is not optional —
+# the base branch object to, un-drafts and merges. Merging is the default —
 # a run that cannot land its PR ends `blocked` with the PR left open for a
 # human. On a repo whose merges publish, every merged run is a release.
+# merge_gate is the ONE opt-in human touchpoint: "chat" parks a run that
+# cleared every bar (`gated`) and asks for one approval in the run's chat
+# thread — `!sbx merge <item>` or `sbxloop daemon ctl merge <item>` lands
+# it; `!sbx abandon <item>` declines. No deadline; survives restarts.
+# merge_gate = "off"         # off | chat
 # deliver_draft = true
 # max_review_rounds = 3      # times the review may request changes
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
@@ -221,6 +226,7 @@ secret_strategy = "proxy"
 # failed_label = "sbxloop:failed"
 # completed_label = "sbxloop:completed"  # applied when the PR merges
 # blocked_label = "sbxloop:blocked"      # the loop could not land the PR; a human looks
+# gated_label = "sbxloop:awaiting-merge"  # parked by merge_gate; awaiting approval
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # max_attempts_per_item = 2

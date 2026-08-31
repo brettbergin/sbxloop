@@ -1686,6 +1686,7 @@ def daemon(
         config.daemon.failed_label,
         config.daemon.completed_label,
         config.daemon.blocked_label,
+        config.daemon.gated_label,
     )
     # Every enabled configured repository is polled; the daemon-wide
     # guardrails below (run cap, retry cap, breaker, one-run-at-a-time)
@@ -1737,6 +1738,7 @@ def daemon(
         max_review_rounds=config.landing.max_review_rounds,
         max_ci_rounds=config.landing.max_ci_rounds,
         merge_method=config.landing.merge_method,
+        merge_gate=config.landing.merge_gate,
         chat=config.chat_backend or "off",
         chat_channel=(config.chat_settings.channel_ref if config.chat_settings else None),
         concierge=("on" if config.chat_backend and config.concierge.enabled else "off"),
@@ -1771,7 +1773,7 @@ def daemon(
             github.close()
         raise typer.Exit(code)
 
-    loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx)
+    loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx, github=github)
     if isinstance(source, MultiRepoIssueSource):
         source.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so

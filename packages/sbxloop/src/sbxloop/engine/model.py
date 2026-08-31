@@ -30,6 +30,7 @@ RunState = Literal[
     "failed",
     "blocked",
     "cancelled",
+    "gated",
 ]
 
 # The post-build stages in order. `runs.stage` records the last non-terminal
@@ -62,8 +63,12 @@ TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
 # liveness and resumable once the cause is fixed. `failed` and `cancelled`
 # are terminal for reporting (nothing is in flight, so `list_runs` must not
 # show them as active) yet an operator may still `sbxloop resume` them.
+# `gated` is the opt-in merge gate (`[landing] merge_gate`): the run
+# cleared every bar and parked awaiting one human approval; the daemon's
+# approve path completes the landing with gh ops alone — no engine is
+# resurrected — so the state is terminal and deliberately NOT resumable.
 TERMINAL_RUN_STATES: frozenset[str] = frozenset(
-    {"merged", "completed", "failed", "blocked", "cancelled"}
+    {"merged", "completed", "failed", "blocked", "cancelled", "gated"}
 )
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {

@@ -71,12 +71,14 @@ from sbxloop.engine.landing import (
     Blocked,
     CiTimeout,
     Closed,
+    Gated,
     HumanObjection,
     Landed,
     NeedsFix,
     UpdateState,
     land,
     poll_checks,
+    resolve_login,
 )
 from sbxloop.engine.model import (
     PIPELINE_STAGES,
@@ -608,7 +610,7 @@ class LoopEngine:
                     # gets diagnosed in-sandbox; decide keep before pair exit.
                     self._keep_on_failure(run_id, pair)
                     raise
-                if state not in ("merged", "completed"):
+                if state not in ("merged", "completed", "gated"):
                     self._keep_on_failure(run_id, pair)
         except SbxloopError:
             # State is already persisted; the exception is the kill signal.
@@ -927,6 +929,10 @@ class LoopEngine:
                 outcome = self._stage_land(p)
                 if isinstance(outcome, Landed):
                     return "merged", None
+                if isinstance(outcome, Gated):
+                    return "gated", (
+                        "parked by [landing] merge_gate — ready to merge, awaiting human approval"
+                    )
                 if isinstance(outcome, Blocked):
                     return "blocked", outcome.why
                 if isinstance(outcome, Closed):
@@ -2109,7 +2115,7 @@ class LoopEngine:
             )
         return None
 
-    def _stage_land(self, p: Pipeline) -> Landed | Blocked | NeedsFix | Closed:
+    def _stage_land(self, p: Pipeline) -> Landed | Gated | Blocked | NeedsFix | Closed:
         run_id, ops, repo = p.run_id, p.ops, p.repo
         assert ops is not None and repo is not None
         self._set_run_state(run_id, "landing")
@@ -2144,6 +2150,7 @@ class LoopEngine:
             ack=lambda threads: acknowledge_human_threads(
                 ops, repo, number, run_id=run_id, login=login, threads=threads
             ),
+            gate=self.config.landing.merge_gate == "chat",
         )
         if isinstance(outcome, Landed):
             log.info(
@@ -2160,6 +2167,22 @@ class LoopEngine:
                 ci_rounds=run.ci_rounds,
             )
             # Only now (#517): a run that failed or was blocked files nothing.
+            self._file_followups(p, run)
+        elif isinstance(outcome, Gated):
+            log.info("run.gated", run=run_id, pr=number, head=outcome.head)
+            self.bus.emit(
+                HostEventTypes.RUN_GATED,
+                run_id,
+                pr=number,
+                url=run.pr_url,
+                sha=outcome.head,
+                review_rounds=run.review_rounds,
+                ci_rounds=run.ci_rounds,
+            )
+            # The approve path is gh-ops-only — no engine, no sandbox — so
+            # the follow-ups are filed now, while the machinery that builds
+            # them is alive. Gate is not blocked: every bar was cleared, and
+            # follow-ups carry the follow-up label, never the trigger label.
             self._file_followups(p, run)
         elif isinstance(outcome, Blocked):
             log.warning("run.blocked", run=run_id, pr=number, why=outcome.why)
@@ -2371,44 +2394,11 @@ class LoopEngine:
         with it (`_reconciliation_block`) instead of misclassifying.
         """
         if p.login is None:
-            assert p.ops is not None
-            if p.bot_login:
-                p.login = p.bot_login
-                log.info("engine.login_app_identity", run=p.run_id, login=p.login)
-                return p.login
-            try:
-                user = p.ops.raw("GET", "/user")
-                p.login = str(user.get("login", "")) if isinstance(user, dict) else ""
-            except GithubOpsError as exc:
-                p.login = self._login_from_pr(p)
-                log.warning(
-                    "engine.login_lookup_failed",
-                    run=p.run_id,
-                    http_status=exc.http_status,
-                    fallback=p.login or "(unknown)",
-                    error=str(exc),
-                    hint="GET /user needs a user token — a GitHub App "
-                    "installation token cannot call it; using the delivered "
-                    "PR's author as the loop's identity",
-                )
+            assert p.ops is not None and p.repo is not None
+            number = self.store.get_run(p.run_id).pr_number
+            p.login = resolve_login(p.ops, p.repo, number, bot_login=p.bot_login)
+            log.info("engine.login_resolved", run=p.run_id, login=p.login or "(unknown)")
         return p.login
-
-    def _login_from_pr(self, p: Pipeline) -> str:
-        """The delivered PR's author, as the loop's identity (#581): the
-        loop's own github-ops token opened that PR, so its author *is* this
-        identity — under a PAT and an App installation token alike."""
-        assert p.ops is not None and p.repo is not None
-        number = self.store.get_run(p.run_id).pr_number
-        if number is None:
-            return ""
-        try:
-            user = p.ops.pr_get(p.repo, number).get("user")
-        except GithubOpsError:
-            log.warning(
-                "engine.login_pr_author_lookup_failed", run=p.run_id, pr=number, exc_info=True
-            )
-            return ""
-        return str(user.get("login") or "") if isinstance(user, dict) else ""
 
     def _tick(self, p: Pipeline, waiting: str) -> None:
         """One wait interval between GitHub polls: honour cancellation,

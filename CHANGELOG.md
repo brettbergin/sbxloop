@@ -8,6 +8,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **The opt-in merge gate — the one human touchpoint** (`[landing] merge_gate = "chat"`, default `"off"`). A run that clears every bar —
+  review, CI, reconciliation — parks `gated` instead of merging: sandboxes
+  freed, breaker reset, the daemon moves on, and an approval prompt lands
+  in the run's chat thread @mentioning whoever asked for the work. One
+  approval — `!sbx merge <item>` in chat (any backend), `sbxloop daemon ctl merge <item>` on the host — completes the landing with gh ops
+  alone (update if behind, re-checked CI, the same reconciliation gate,
+  merge, then the ordinary merged settle); `!sbx abandon <item>` declines
+  and dismisses the gate. No deadline; the park survives restarts (a new
+  `daemon_merge_gates` table is the durable state, interrupted approvals
+  re-open at boot), a double-approve loses a CAS instead of double-merging,
+  and the issue carries `[daemon] gated_label` (`sbxloop:awaiting-merge`)
+  plus a how-to comment while parked. New `run.gated` chronology and
+  `gate.approved` / `gate.merge_failed` / `gate.dismissed` notices tell the
+  story in the thread.
+
 - **GitHub App installation auth as an alternative to a PAT** (#568). With
   `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and
   `GITHUB_APP_PRIVATE_KEY[_PATH]` configured (env / `.env`, like the PATs),

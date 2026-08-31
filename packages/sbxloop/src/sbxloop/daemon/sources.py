@@ -105,6 +105,7 @@ class WorkSource(Protocol):
     def report_blocked(
         self, item: WorkItem, reason: str, pr_number: int | None, pr_url: str
     ) -> bool: ...
+    def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool: ...
 
 
 def _cancel_lines(report: RunReport) -> list[str]:
@@ -132,11 +133,12 @@ def _pr_ref(pr_number: int | None, pr_url: str) -> str:
 
 
 class GitHubLabels:
-    """The five lifecycle labels. ``trigger`` puts an issue in the queue;
+    """The six lifecycle labels. ``trigger`` puts an issue in the queue;
     ``in_progress`` is the claim marker; ``completed`` is the durable
     "sbxloop did this" mark applied when the PR merges; ``failed`` and
     ``blocked`` say the loop gave up or was refused, and both leave the
-    issue open for a human."""
+    issue open for a human; ``gated`` marks a run parked behind the opt-in
+    merge gate — ready to merge, awaiting one approval."""
 
     def __init__(
         self,
@@ -145,12 +147,14 @@ class GitHubLabels:
         failed: str,
         completed: str = "sbxloop:completed",
         blocked: str = "sbxloop:blocked",
+        gated: str = "sbxloop:awaiting-merge",
     ) -> None:
         self.trigger = trigger
         self.in_progress = in_progress
         self.failed = failed
         self.completed = completed
         self.blocked = blocked
+        self.gated = gated
 
 
 class GitHubIssueSource:
@@ -565,6 +569,7 @@ class GitHubIssueSource:
                 ops, n, f"{_pr_ref(pr_number, pr_url)} was merged — work completed by sbxloop."
             )
             self._remove_label(ops, n, self.labels.in_progress)
+            self._remove_label(ops, n, self.labels.gated)
             self._add_label(ops, n, self.labels.completed)
             # Blind PATCH, no state pre-read: the PR body's `Closes #N` may
             # have closed the issue already, and re-closing a closed issue
@@ -597,6 +602,29 @@ class GitHubIssueSource:
             return True
 
         return bool(self._guard("blocked report", go))
+
+    def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
+        """The run parked behind the opt-in merge gate ([landing]
+        merge_gate): ready to merge, awaiting one human approval. The issue
+        stays open and in progress — nothing failed, and the work is not
+        done until the merge lands."""
+
+        def go(ops: GithubOps) -> bool:
+            n = item.source_key
+            self._comment(
+                ops,
+                n,
+                f"{_pr_ref(pr_number, pr_url)} is ready and green — sbxloop is parked "
+                "awaiting merge approval (`[landing] merge_gate`). Approve from the "
+                f"run's chat thread, with `!sbx merge {item.item_id}` in chat, or with "
+                f"`sbxloop daemon ctl merge {item.item_id}` on the daemon host; "
+                f"`!sbx abandon {item.item_id}` declines and leaves the PR open. "
+                "There is no deadline.",
+            )
+            self._add_label(ops, n, self.labels.gated)
+            return True
+
+        return bool(self._guard("gated report", go))
 
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
         self._guard(
@@ -958,6 +986,9 @@ class MultiRepoIssueSource:
     ) -> bool:
         return self.for_item(item).report_blocked(item, reason, pr_number, pr_url)
 
+    def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
+        return self.for_item(item).report_gated(item, pr_number, pr_url)
+
 
 def build_github_source(
     ops: Callable[[], GithubOps],
@@ -1018,4 +1049,5 @@ def _repo_labels(labels: GitHubLabels, entry: RepoConfig) -> GitHubLabels:
         labels.failed,
         labels.completed,
         labels.blocked,
+        labels.gated,
     )

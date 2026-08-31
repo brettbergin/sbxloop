@@ -171,7 +171,7 @@ class Harness:
                 reason=reason,
                 exhausted="review",
             )
-        if kind in ("merged", "blocked"):
+        if kind in ("merged", "blocked", "gated"):
             self.store.set_run_pr(
                 run_id, number=9, url=PR_URL, branch=f"sbxloop/{run_id}", head_sha="abc"
             )

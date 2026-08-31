@@ -16,7 +16,15 @@ from typing import Any
 import pytest
 
 from sbxloop.config import LandingConfig
-from sbxloop.engine.landing import Blocked, Landed, UpdateState, land, unreconciled_threads
+from sbxloop.engine.landing import (
+    Blocked,
+    Gated,
+    Landed,
+    UpdateState,
+    land,
+    resolve_login,
+    unreconciled_threads,
+)
 from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import ReviewThread, ThreadComment
@@ -300,3 +308,63 @@ class TestHumanAck:
         fake.pr["merged"] = False  # run the landing pass again from the top
         assert isinstance(run_land(fake, ack=gate_ack(fake)), Landed)
         assert len(fake.replies) == posted
+
+
+class TestOptInMergeGate:
+    """`land(gate=True)` — the one permissible human gate, and only after
+    every other bar."""
+
+    def test_gate_on_parks_instead_of_merging(self) -> None:
+        fake = FakeGithub()
+        outcome = run_land(fake, gate=True)
+        assert isinstance(outcome, Gated)
+        assert outcome.head == "commit0"
+        assert fake.merges == []
+
+    def test_gate_off_merges_as_before(self) -> None:
+        assert isinstance(run_land(FakeGithub()), Landed)
+
+    def test_the_gate_runs_after_the_reconciliation_gate(self) -> None:
+        """An unreconciled thread blocks; it never parks as approvable."""
+        fake = FakeGithub()
+        fake.threads = [thread(path="x.py", line=1)]
+        outcome = run_land(fake, gate=True)
+        assert isinstance(outcome, Blocked)
+
+    def test_the_gate_still_updates_a_behind_branch_first(self) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "behind"
+        outcome = run_land(fake, gate=True)
+        assert isinstance(outcome, Gated)
+        assert fake.updates, "update-branch ran before the park"
+
+    def test_a_standing_human_objection_still_outranks_the_gate(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "no", id=41)]
+        outcome = run_land(fake, gate=True)
+        assert outcome.__class__.__name__ == "NeedsFix"
+
+
+class TestResolveLogin:
+    """The shared identity resolver (engine drive + daemon approve path)."""
+
+    def test_a_bot_login_short_circuits_everything(self) -> None:
+        fake = FakeGithub()
+        assert resolve_login(fake, REPO, 7, bot_login="app[bot]") == "app[bot]"
+        assert fake.raw_calls == [], "no doomed GET /user under App auth"
+
+    def test_pat_mode_asks_get_user(self) -> None:
+        fake = FakeGithub()
+        assert resolve_login(fake, REPO, 7) == fake.user_login
+
+    def test_a_403_falls_back_to_the_pr_author(self) -> None:
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        assert resolve_login(fake, REPO, 7) == fake.pr_author
+
+    def test_every_source_dead_degrades_to_empty(self) -> None:
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        fake.pr["user"] = None
+        assert resolve_login(fake, REPO, 7) == ""
+        assert resolve_login(fake, REPO, None) == ""
