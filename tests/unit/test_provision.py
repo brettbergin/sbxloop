@@ -1477,3 +1477,46 @@ class TestPurgeStaleRegistrations:
         provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
         pair = provisioner.ensure_pair("r1")
         pair.cleanup()
+
+
+class TestMimicSentinels:
+    """sbx's shape-mimicking service placeholders (gho_sbxproxymanaged…)
+    classify as sentinels in both probes (#576 follow-up)."""
+
+    MIMIC = "gho_sbxproxymanagedAbc123"
+
+    def test_visibility_probe_treats_mimic_as_sentinel(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Proxy strategy + a mimic visible under exec: that is the
+        sentinel outcome — fall back to the env file and cache
+        sentinel-under-exec, never 'visible' (db cached the wrong verdict
+        for 18h on exactly this)."""
+        from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, load_verdicts
+
+        monkeypatch.setenv("GH_TOKEN", self.MIMIC)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", self.MIMIC)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+            assert fallback, "mimic sentinel must trigger the env-file fallback"
+            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "sentinel-under-exec"
+        finally:
+            pair.cleanup()
+
+    def test_shadow_probe_ignores_mimic(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """App mode on a template that stamps the mimic: the worker
+        overrides sentinels, so this is not a shadow — provisioning must
+        proceed."""
+        TestGithubAppAuth().stub_mint(monkeypatch)
+        monkeypatch.setenv("GH_TOKEN", self.MIMIC)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        pair = provisioner.ensure_pair("r1")
+        pair.cleanup()

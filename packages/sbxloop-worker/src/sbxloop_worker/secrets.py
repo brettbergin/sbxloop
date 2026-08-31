@@ -20,25 +20,44 @@ import re
 # github_pat_ fine-grained.
 GITHUB_TOKEN_PREFIXES = ("gho_", "ghu_", "ghp_", "ghs_", "github_pat_")
 
-# sbx's proxy placeholder. Narrow on purpose: it is the one value we will
-# override an existing environment variable for.
+# sbx's proxy placeholders — the values we will override an existing
+# environment variable for. ``sbx-cs-…`` is the custom-secret shape;
+# *service* secrets use shape-mimicking placeholders instead
+# (``gho_sbxproxymanaged…``, docker/sbx-releases #231), which pass every
+# prefix check by design — the marker substring is the only tell. Field
+# failure (db, 2026-08-31): a template-attached ``github`` slot stamped the
+# mimic into exec environments, this predicate called it a real token, the
+# env file lost, and every github op 401'd (or, while a stale registration
+# still backed the proxy, ran as the wrong identity — #576).
 SBX_SENTINEL_PREFIX = "sbx-cs-"
+SBX_SENTINEL_MARKER = "sbxproxymanaged"
 
 
 def looks_like_github_token(value: str) -> bool:
-    """Would a GitHub client accept this as a credential?"""
-    return value.startswith(GITHUB_TOKEN_PREFIXES)
+    """Would a GitHub client accept this as a credential?
+
+    A shape-mimicking proxy placeholder is not one, however hard it tries.
+    """
+    return value.startswith(GITHUB_TOKEN_PREFIXES) and not is_sbx_sentinel(value)
 
 
 def is_sbx_sentinel(value: str) -> bool:
-    """Is this sbx's proxy placeholder rather than a real secret?"""
-    return value.startswith(SBX_SENTINEL_PREFIX)
+    """Is this an sbx proxy placeholder (either shape) rather than a real
+    secret?"""
+    return value.startswith(SBX_SENTINEL_PREFIX) or SBX_SENTINEL_MARKER in value
 
 
 def shell_token_case() -> str:
     """The `case` pattern a probe uses to classify a value inside the VM,
-    kept in step with :data:`GITHUB_TOKEN_PREFIXES`."""
+    kept in step with :data:`GITHUB_TOKEN_PREFIXES`. Shape-mimicking
+    sentinels match these prefixes too — probes must test
+    :func:`shell_sentinel_case` FIRST."""
     return "|".join(f"{prefix}*" for prefix in GITHUB_TOKEN_PREFIXES)
+
+
+def shell_sentinel_case() -> str:
+    """The `case` pattern matching sbx proxy placeholders, both shapes."""
+    return f"{SBX_SENTINEL_PREFIX}*|*{SBX_SENTINEL_MARKER}*"
 
 
 # --- Redaction of free text -------------------------------------------------

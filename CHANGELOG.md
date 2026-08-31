@@ -64,6 +64,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Shape-mimicking sbx proxy placeholders are now recognized as
+  sentinels everywhere** (#576 follow-up; field failure db 2026-08-31).
+  sbx's *service*-secret placeholders mimic real token shapes
+  (`gho_sbxproxymanaged…`, docker/sbx-releases #231) — and sbx 0.38's
+  shell-docker template attaches a `github` secret slot to every sandbox,
+  stamping that mimic into exec environments regardless of registrations.
+  The worker's sentinel detector only knew `sbx-cs-…`, so the mimic beat
+  the env file's real token (daemon github ops 401'd once the stale
+  registration behind the proxy was purged; before that they silently ran
+  as the wrong identity), and the secret-visibility probe classified the
+  mimic as a usable credential — caching a wrong `visible-under-exec`
+  verdict. `is_sbx_sentinel` now also matches the `sbxproxymanaged`
+  marker, `looks_like_github_token` excludes sentinels, and both
+  provisioning probes (secret visibility, the #576 shadow probe) test the
+  sentinel shapes first — so the env file wins in the worker, GitHub App
+  installation tokens work on template-stamped boxes, and the shadow
+  probe no longer refuses a box for a placeholder the worker overrides.
+
 - **A stale sbx secret registration can no longer shadow env-file
   credentials — GitHub App boxes were still acting as the retired PAT**
   (#576). The daemon/doctor github sandboxes have stable names, `sbx rm`
