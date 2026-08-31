@@ -575,6 +575,11 @@ class Budgets(_ConfigModel):
 # one line per issue rather than carrying every fix round separately.
 MergeMethod = Literal["squash", "merge", "rebase"]
 
+# The one opt-in human touchpoint in an otherwise human-out-of-the-loop
+# run: "chat" parks a run that cleared every bar and asks for one approval
+# in the run's chat thread before merging; "off" merges unattended.
+MergeGate = Literal["off", "chat"]
+
 
 class LandingConfig(_ConfigModel):
     """What happens to a run's work after its tasks are built: the pull
@@ -585,11 +590,22 @@ class LandingConfig(_ConfigModel):
 
     The PR opens as a draft and is taken out of draft only once the review
     approves and CI is green, so a watching human sees "draft" mean
-    "sbxloop is still working on this". Merging is not optional: a run that
-    cannot land its PR ends ``blocked`` with the PR left open for a human,
-    never ``done`` with an unmerged PR. On a repository whose merges publish
-    (sbxloop's own does), every merged run is therefore an unattended
-    release.
+    "sbxloop is still working on this". Merging is the default and a run
+    never ends ``done`` with an unmerged PR: one that cannot land ends
+    ``blocked`` with the PR left open for a human. On a repository whose
+    merges publish (sbxloop's own does), every merged run is therefore an
+    unattended release.
+
+    ``merge_gate`` is the ONE opt-in human touchpoint of the pipeline:
+    ``"chat"`` makes a run that cleared every bar — review, CI,
+    reconciliation — park ``gated`` instead of merging, with an approval
+    prompt in the run's chat thread (the platform comes from ``[chat]
+    backend``). A click on the prompt, ``!sbx merge <item>`` in chat, or
+    ``sbxloop daemon ctl merge <item>`` on the host completes the landing:
+    update-branch if behind, re-checked CI, the same reconciliation gate,
+    then the merge — gh-ops only, no sandbox. There is no deadline; the
+    park survives daemon restarts, and the daemon moves on to other work
+    while it stands. ``"off"`` (the default) merges unattended as before.
 
     Two round budgets bound the fix loop. ``max_review_rounds`` is how many
     times the review may request changes before the run gives up;
@@ -613,6 +629,8 @@ class LandingConfig(_ConfigModel):
     """
 
     deliver_draft: bool = True
+    # The opt-in merge gate; see the docstring. Off = fully unattended.
+    merge_gate: MergeGate = "off"
     max_review_rounds: int = Field(default=3, ge=0)
     max_ci_rounds: int = Field(default=2, ge=0)
     # A run that exhausts either budget is one round short, not broken: its
@@ -691,6 +709,9 @@ class DaemonConfig(_ConfigModel):
     # The run cleared its own bar but GitHub would not finish the PR; it is
     # left open, out of the loop's hands, for a human.
     blocked_label: str = "sbxloop:blocked"
+    # The run parked behind the opt-in merge gate ([landing] merge_gate):
+    # ready to merge, awaiting one human approval in chat (or `ctl merge`).
+    gated_label: str = "sbxloop:awaiting-merge"
     max_runs_per_day: int = 12
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
@@ -756,6 +777,7 @@ class DaemonConfig(_ConfigModel):
             self.failed_label,
             self.completed_label,
             self.blocked_label,
+            self.gated_label,
         ]
         if any(not label.strip() for label in labels):
             raise ValueError("daemon labels must be non-empty")

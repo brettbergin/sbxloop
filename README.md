@@ -526,7 +526,13 @@ refused egress called out; and a finished report card (the headline turns
 settled is a one-line notice in the control channel, pointing at the run's
 thread — `🎉 gh:issue:9 merged (2/2 tasks done) · PR …`,
 `❌ gh:issue:4 failed (…); 1 attempt(s) left`, `🚧 gh:issue:7 blocked: … — a human needs to look` when an issue lands in `sbxloop:blocked`, `🛑 circuit breaker opened …` — with every URL masked so nothing sprouts a preview.
-Mentions are always disabled, so model output can never ping the
+With `[landing] merge_gate = "chat"` — the one opt-in human touchpoint — a
+run that clears every bar parks instead of merging: `⏸ ready to merge — waiting for your approval` lands in the run's thread @mentioning whoever
+asked for the work, and `!sbx merge <item>` (here or in the control
+channel; `sbxloop daemon ctl merge <item>` works headless) completes the
+landing, while `!sbx abandon <item>` declines and leaves the PR open. No
+deadline; the park and its prompt survive restarts.
+Mentions are otherwise always disabled, so model output can never ping the
 channel, and Discord's automatic link previews (unfurls) are suppressed on
 every send *and* every edit, so no message sprouts a grey preview card — the
 bridge's own embed cards still render. `[discord] embeds` (set `false` to

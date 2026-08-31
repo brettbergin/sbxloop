@@ -26,6 +26,7 @@ the deliberate "fresh state" of the cutover.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -150,9 +151,78 @@ CREATE TABLE IF NOT EXISTS daemon_chat_threads (
 -- channel; without this it scans a row per run the daemon has ever done.
 CREATE INDEX IF NOT EXISTS idx_chat_threads_thread
     ON daemon_chat_threads(thread_id);
+
+-- The opt-in merge gate ([landing] merge_gate): a run that cleared every
+-- bar, parked awaiting one human approval. The row is the durable state —
+-- prompts and buttons are re-armed from it after a restart. notify_ids is
+-- a JSON list of chat user ids to @mention; custom_id is the stable token
+-- a persistent Discord button carries.
+CREATE TABLE IF NOT EXISTS daemon_merge_gates (
+    run_id            TEXT PRIMARY KEY,
+    item_id           TEXT NOT NULL,
+    repo              TEXT NOT NULL,
+    pr_number         INTEGER NOT NULL,
+    pr_url            TEXT NOT NULL DEFAULT '',
+    branch            TEXT,
+    notify_ids        TEXT NOT NULL DEFAULT '[]',
+    custom_id         TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'open',
+    prompt_channel_id TEXT,
+    prompt_message_id TEXT,
+    created_at        REAL NOT NULL,
+    resolved_at       REAL,
+    resolved_by       TEXT,
+    detail            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_merge_gates_state ON daemon_merge_gates(state);
+CREATE INDEX IF NOT EXISTS idx_merge_gates_item  ON daemon_merge_gates(item_id);
 """
 
 TERMINAL_ITEM_STATES: frozenset[str] = frozenset({"done", "failed", "blocked", "cancelled"})
+
+
+class MergeGate(NamedTuple):
+    """One parked merge awaiting approval (``[landing] merge_gate``)."""
+
+    run_id: str
+    item_id: str
+    repo: str
+    pr_number: int
+    pr_url: str
+    branch: str | None
+    notify_ids: tuple[str, ...]
+    custom_id: str
+    state: str  # open | approving | merged | dismissed
+    prompt_channel_id: str | None
+    prompt_message_id: str | None
+    created_at: float
+    resolved_at: float | None
+    resolved_by: str | None
+    detail: str | None
+
+
+def _row_to_gate(row: sqlite3.Row) -> MergeGate:
+    try:
+        notify = tuple(str(v) for v in json.loads(row["notify_ids"] or "[]"))
+    except ValueError:
+        notify = ()
+    return MergeGate(
+        run_id=row["run_id"],
+        item_id=normalize_item_id(str(row["item_id"])),
+        repo=row["repo"],
+        pr_number=int(row["pr_number"]),
+        pr_url=row["pr_url"] or "",
+        branch=row["branch"],
+        notify_ids=notify,
+        custom_id=row["custom_id"],
+        state=row["state"],
+        prompt_channel_id=row["prompt_channel_id"],
+        prompt_message_id=row["prompt_message_id"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+        resolved_by=row["resolved_by"],
+        detail=row["detail"],
+    )
 
 
 class ChatThread(NamedTuple):
@@ -772,7 +842,7 @@ class DaemonStore:
     # -- operator controls (#229) ------------------------------------------------
 
     def abandon(self, item_id: str, reason: str, now: float) -> WorkItem:
-        """Operator abandon: queued/running/blocked → failed. ``run_id`` is
+        """Operator abandon: queued/running/blocked/gated → failed. ``run_id`` is
         kept so the ledger and ``sbxloop logs`` still tie the item to the run
         that made the operator give up on it; the loop treats "abandoned
         while pinned to my run" as its cue to cancel that run. The source is
@@ -782,7 +852,7 @@ class DaemonStore:
         return self._transition(
             item_id,
             now,
-            ("queued", "running", "blocked"),
+            ("queued", "running", "blocked", "gated"),
             lambda item: f"{item_id} is already {item.state}",
             state="failed",
             last_error=reason[:2000],
@@ -1018,6 +1088,13 @@ class DaemonStore:
             item_id, now, state="blocked", last_error=reason[:2000], pending_report="blocked"
         )
 
+    def mark_gated(self, item_id: str, now: float) -> None:
+        """The run parked behind the opt-in merge gate: a waiting state, not
+        a terminal one — the run stays pinned, dispatch never sees it, and
+        ``approve_merge`` or ``abandon`` resolves it. The source is owed the
+        park announcement (label + how-to comment)."""
+        self._update(item_id, now, state="gated", last_error=None, pending_report="gated")
+
     def mark_failed(self, item_id: str, error: str, now: float, *, requeue: bool) -> None:
         # A requeued item must not keep its run pinned: queued + run_id
         # means "resume this run", and a failed run is dispatched fresh. A
@@ -1224,6 +1301,123 @@ class DaemonStore:
                 "SELECT item_id FROM daemon_runs WHERE run_id = ?", (run_id,)
             ).fetchone()
             return None if row is None else normalize_item_id(str(row["item_id"]))
+
+    # -- merge gates ([landing] merge_gate) --------------------------------------
+
+    def create_merge_gate(
+        self,
+        run_id: str,
+        item_id: str,
+        repo: str,
+        pr_number: int,
+        pr_url: str,
+        branch: str | None,
+        notify_ids: Sequence[str],
+        custom_id: str,
+        now: float,
+    ) -> None:
+        """Persist a parked merge. ``INSERT OR IGNORE``: a recovery
+        re-settle of the same run must not clobber the standing gate (or a
+        decision already taken on it)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_merge_gates "
+                "(run_id, item_id, repo, pr_number, pr_url, branch, notify_ids, "
+                "custom_id, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                (
+                    run_id,
+                    normalize_item_id(item_id),
+                    repo,
+                    pr_number,
+                    pr_url,
+                    branch,
+                    json.dumps(list(notify_ids)),
+                    custom_id,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        log.info("store.merge_gate_created", run=run_id, item=item_id, pr=pr_number)
+
+    def merge_gate_for(self, target: str) -> MergeGate | None:
+        """The gate for a run id or an item id (either spelling)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM daemon_merge_gates WHERE run_id = ?", (target,)
+            ).fetchone()
+            if row is None:
+                where, ids = _id_match(target)
+                row = self._conn.execute(
+                    f"SELECT * FROM daemon_merge_gates WHERE {where} "  # nosec B608
+                    "ORDER BY created_at DESC LIMIT 1",
+                    ids,
+                ).fetchone()
+            return _row_to_gate(row) if row else None
+
+    def open_merge_gates(self) -> list[MergeGate]:
+        """Gates a restart must re-arm: standing (open) and interrupted
+        mid-approval (approving)."""
+        with self._lock:
+            return [
+                _row_to_gate(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM daemon_merge_gates WHERE state IN ('open', 'approving') "
+                    "ORDER BY created_at"
+                )
+            ]
+
+    def claim_merge_gate(self, run_id: str) -> bool:
+        """CAS ``open → approving``: exactly one click/command wins; a
+        double-click loses here instead of double-merging."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE daemon_merge_gates SET state = 'approving' "
+                "WHERE run_id = ? AND state = 'open'",
+                (run_id,),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def reopen_merge_gate(self, run_id: str, detail: str | None = None) -> None:
+        """A failed or interrupted approval puts the gate back up; the
+        prompt (and button) work again."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_merge_gates SET state = 'open', detail = ? "
+                "WHERE run_id = ? AND state IN ('open', 'approving')",
+                (detail, run_id),
+            )
+            self._conn.commit()
+        log.info("store.merge_gate_reopened", run=run_id, detail=detail)
+
+    def resolve_merge_gate(
+        self,
+        run_id: str,
+        state: str,
+        by: str | None,
+        now: float,
+        detail: str | None = None,
+    ) -> None:
+        """Close the gate: ``merged`` (approved and landed) or ``dismissed``
+        (abandoned / PR closed)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_merge_gates SET state = ?, resolved_at = ?, resolved_by = ?, "
+                "detail = ? WHERE run_id = ?",
+                (state, now, by, detail, run_id),
+            )
+            self._conn.commit()
+        log.info("store.merge_gate_resolved", run=run_id, state=state, by=by)
+
+    def set_gate_prompt(self, run_id: str, channel_id: str | None, message_id: str | None) -> None:
+        """Where the prompt lives, so a restart can find/refresh it."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_merge_gates SET prompt_channel_id = ?, prompt_message_id = ? "
+                "WHERE run_id = ?",
+                (_text_or_none(channel_id), _text_or_none(message_id), run_id),
+            )
+            self._conn.commit()
 
     # -- circuit breaker ---------------------------------------------------------
 

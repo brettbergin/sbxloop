@@ -81,7 +81,7 @@ from sbxloop.daemon.discord_format import (
     summary_text,
 )
 from sbxloop.daemon.model import TERMINAL_NOTICE_KINDS, DaemonNotice, RunReport, WorkItem
-from sbxloop.daemon.store import ChatThread, DaemonStore
+from sbxloop.daemon.store import ChatThread, DaemonStore, MergeGate
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.ghids import normalize_item_id
@@ -600,6 +600,22 @@ class ChatBridge(ABC):
                     watchers.append(item.requested_by)
                 self._persist_watch(run_id, item.requested_by)
         self._enqueue(run_id, None)  # sentinel: ensure thread + headline
+
+    def merge_gate_opened(self, item: WorkItem, run_id: str, gate: MergeGate) -> None:
+        with self._lock:
+            self._items.setdefault(run_id, item)
+        self._enqueue(run_id, ("__gate_open__", gate))
+
+    def merge_gate_resolved(
+        self,
+        item: WorkItem,
+        run_id: str,
+        gate: MergeGate,
+        outcome: str,
+        by: str | None,
+        detail: str | None = None,
+    ) -> None:
+        self._enqueue(run_id, ("__gate_done__", gate, outcome, by, detail))
 
     def run_finished(self, item: WorkItem, report: RunReport) -> None:
         with self._lock:
@@ -1296,6 +1312,16 @@ class ChatBridge(ABC):
                         buffer = await self._flush_all(buffer_run, buffer)
                     await self._finish(payload)
                     continue
+                if isinstance(payload, tuple) and payload and payload[0] == "__gate_open__":
+                    if buffer_run:
+                        buffer = await self._flush_all(buffer_run, buffer)
+                    await self._post_gate_prompt(payload[1])
+                    continue
+                if isinstance(payload, tuple) and payload and payload[0] == "__gate_done__":
+                    if buffer_run:
+                        buffer = await self._flush_all(buffer_run, buffer)
+                    await self._update_gate_prompt(payload[1], payload[2], payload[3], payload[4])
+                    continue
                 event: Event = payload
                 if event.type == HostEventTypes.CHAT_MESSAGE:
                     await self._steer_picked_up(event)
@@ -1529,6 +1555,123 @@ class ChatBridge(ABC):
             await send_group()
             await self._send(thread, chunk.text, embed=chunk.embed)
         await send_group()
+
+    def _gate_prompt_text(self, gate: MergeGate) -> str:
+        """The approval prompt: who it pings, what stands ready, and the
+        typed commands that work on every backend (a component backend adds
+        its button on top, never instead)."""
+        mentions = " ".join(self.mention_user(uid) for uid in gate.notify_ids)
+        item = normalize_item_id(gate.item_id)
+        prefix = self.chat.command_prefix
+        head = "⏸ **ready to merge — waiting for your approval**"
+        lines = [
+            f"{mentions} {head}" if mentions else head,
+            f"PR #{gate.pr_number}"
+            + (f" <{gate.pr_url}>" if gate.pr_url else "")
+            + " is green, reviewed and reconciled.",
+            f"✅ approve: `{prefix} merge {item}` — here or in the control channel",
+            f"🚫 decline: `{prefix} abandon {item} [reason]` — the PR stays open for you",
+            "no deadline — it waits until someone acts",
+        ]
+        return "\n".join(lines)
+
+    async def _send_gate(self, target: Any, text: str, gate: MergeGate) -> Any:
+        """Post the approval prompt. The base is prose + the typed command,
+        which every backend answers; a backend with interactive components
+        overrides this to attach a persistent approve button and keeps this
+        prose as the fallback."""
+        return await self._send(target, text, mention_users=True)
+
+    async def _finalize_gate_message(self, message: Any, text: str) -> None:
+        """Rewrite the prompt once the gate is resolved; component backends
+        override to also clear their button."""
+        await self._edit(message, text)
+
+    async def _gate_prompt_message(self, gate: MergeGate) -> Any:
+        """The live prompt message, or None when it cannot be fetched."""
+        if not gate.prompt_channel_id or not gate.prompt_message_id:
+            return None
+        try:
+            channel = await self._thread_handle(gate.prompt_channel_id)
+            if channel is None:
+                return None
+            return await self._fetch_message(channel, gate.prompt_message_id)
+        except Exception:
+            self.log.debug("chat.gate_prompt_lost", run=gate.run_id, exc_info=True)
+            return None
+
+    async def _post_gate_prompt(self, gate: MergeGate) -> None:
+        """The gate's approval ask, in the run's thread, pinging whoever
+        asked for the work. The message id is persisted so a restart can
+        find (or replace) the prompt."""
+        thread = await self._ensure_thread(gate.run_id)
+        target = thread if thread is not None else await self._control_channel()
+        if target is None:
+            return
+        posted = await self._send_gate(target, self._gate_prompt_text(gate), gate)
+        if posted is None:
+            return
+        try:
+            self.dstore.set_gate_prompt(
+                gate.run_id, self._handle_id(target), self._message_id(posted)
+            )
+        except Exception:
+            self.log.debug("chat.gate_prompt_record_failed", run=gate.run_id, exc_info=True)
+
+    async def _update_gate_prompt(
+        self, gate: MergeGate, outcome: str, by: str | None, detail: str | None
+    ) -> None:
+        """Close the loop on the prompt: a final outcome rewrites it (and a
+        component backend clears its button); a failed approval leaves the
+        prompt working and says so on a fresh line, pinging the same
+        people."""
+        who = by or "an operator"
+        fresh = self.dstore.merge_gate_for(gate.run_id) or gate
+        if outcome == "merged":
+            text = f"✅ approved by {who} — merged" + (f" `{str(detail)[:12]}`" if detail else "")
+        elif outcome == "dismissed":
+            text = "🚫 merge gate dismissed" + (
+                f" — {_one_line(str(detail), 200)}" if detail else ""
+            )
+        else:
+            mentions = " ".join(self.mention_user(uid) for uid in fresh.notify_ids)
+            text = (
+                "⚠ approval by "
+                + str(who)
+                + " failed: "
+                + _one_line(str(detail or "see the log"), 300)
+                + " — the prompt above still works; fix and approve again"
+            )
+            if mentions:
+                text = f"{mentions} {text}"
+        if outcome in ("merged", "dismissed"):
+            message = await self._gate_prompt_message(fresh)
+            if message is not None:
+                try:
+                    await self._finalize_gate_message(message, text)
+                    return
+                except Exception:
+                    self.log.debug("chat.gate_prompt_edit_failed", run=gate.run_id, exc_info=True)
+        thread = await self._ensure_thread(gate.run_id)
+        if thread is not None:
+            await self._send(thread, text, mention_users=outcome not in ("merged", "dismissed"))
+
+    async def _reattach_gates(self) -> None:
+        """Standing gates survive a restart in the store; make sure each
+        still has a live prompt. Runs once per process, after the gateway
+        is first ready."""
+        try:
+            gates = self.dstore.open_merge_gates()
+        except Exception:
+            self.log.warning("chat.gate_reattach_failed", exc_info=True)
+            return
+        for gate in gates:
+            if gate.state != "open":
+                continue
+            if await self._gate_prompt_message(gate) is not None:
+                continue
+            self.log.info("chat.gate_prompt_reposting", run=gate.run_id)
+            await self._post_gate_prompt(gate)
 
     async def _daemon_notice(self, notice: DaemonNotice) -> None:
         """Route a notice: a run-scoped one goes into that run's thread when
@@ -1778,6 +1921,9 @@ class ChatBridge(ABC):
     def mark_ready(self) -> None:
         """Called from the client's ready handler (any thread)."""
         self._gateway_ready.set()
+        if not getattr(self, "_gates_reattached", False):
+            self._gates_reattached = True
+            self._schedule(self._reattach_gates())
 
     def _schedule(self, coro: Any) -> None:
         if self._aloop is not None:

@@ -2807,3 +2807,26 @@ class TestReviewRecordRepost:
         result = harness.pipeline(fake).start("land it")
         assert result.state == "blocked"
         assert "review record could not be posted" in str(result.reason)
+
+
+class TestMergeGateRun:
+    """[landing] merge_gate = "chat" at the engine level: the run ends
+    `gated` with everything cleared and nothing merged."""
+
+    def test_a_gate_on_run_parks_and_frees_sandboxes(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake, landing={"merge_gate": "chat"}).start("gate it")
+        assert result.state == "gated"
+        assert fake.merges == []
+        assert harness.sandboxes_left() == [], "a gated run is a success; the pair is freed"
+        gated = [e for e in harness.events if e.type == HostEventTypes.RUN_GATED]
+        assert gated and gated[0].data["pr"] == 7
+        assert "merge_gate" in str(result.reason)
+
+    def test_gate_off_merges_byte_identically(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("ship it")
+        assert result.state == "merged"
+        assert fake.merges

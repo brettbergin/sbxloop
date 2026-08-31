@@ -2,6 +2,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError
 
 from sbxloop.config import Config, load_config, load_config_with_sources
 from sbxloop.errors import ConfigError
@@ -564,3 +565,23 @@ def test_merging_is_not_optional(tmp_path: Path) -> None:
     assert not hasattr(config.daemon, "auto_merge")
     assert not hasattr(config.landing, "auto_merge")
     assert config.landing.merge_method == "squash"
+
+
+class TestMergeGateConfig:
+    """[landing] merge_gate — the one opt-in human touchpoint."""
+
+    def test_defaults_off(self) -> None:
+        config = Config.model_validate({})
+        assert config.landing.merge_gate == "off"
+        assert config.daemon.gated_label == "sbxloop:awaiting-merge"
+
+    def test_chat_is_the_only_other_value(self) -> None:
+        assert Config.model_validate({"landing": {"merge_gate": "chat"}}).landing.merge_gate == (
+            "chat"
+        )
+        with pytest.raises(ValidationError):
+            Config.model_validate({"landing": {"merge_gate": "github"}})
+
+    def test_gated_label_joins_the_distinctness_check(self) -> None:
+        with pytest.raises(ValidationError, match="distinct"):
+            Config.model_validate({"daemon": {"gated_label": "sbxloop:blocked"}})

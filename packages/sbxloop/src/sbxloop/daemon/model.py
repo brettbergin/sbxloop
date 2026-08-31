@@ -15,13 +15,19 @@ from sbxloop.ghids import normalize_item_id
 # itself stays resumable from the CLI. ``blocked`` is the run having cleared
 # its own bar and GitHub refusing to finish the PR — terminal for the daemon
 # (a human has to look), retryable by hand. ``failed`` covers both the
-# attempt budget running out and an operator abandoning the item.
-ItemState = Literal["queued", "running", "done", "failed", "blocked", "cancelled"]
+# attempt budget running out and an operator abandoning the item. ``gated``
+# is the opt-in merge gate (``[landing] merge_gate``): the run cleared every
+# bar and parked awaiting one merge approval — a *waiting* state, not a
+# terminal one (never superseded by rediscovery, invisible to dispatch),
+# resolved by ``approve_merge`` or ``abandon``.
+ItemState = Literal["queued", "running", "done", "failed", "blocked", "cancelled", "gated"]
 # A decision the source has not been told about yet. ``abandoned`` /
 # ``requeued`` are operator decisions from another process (the row-only
 # CLI cannot report); ``merged`` / ``blocked`` are the run's own outcome,
 # owed until the issue close / label actually landed on GitHub.
-PendingReport = Literal["abandoned", "requeued", "merged", "blocked"]
+# ``gated`` is the park announcement: the issue gets the awaiting-merge
+# label and the how-to-approve comment.
+PendingReport = Literal["abandoned", "requeued", "merged", "blocked", "gated"]
 
 
 class WorkItem(BaseModel):
@@ -114,6 +120,7 @@ TickOutcome = Literal[
     "retry",
     "failed",
     "blocked",
+    "gated",
     "interrupted",
     "cancelled",
     "requeued",
@@ -176,8 +183,12 @@ NoticeKind = Literal[
     "run.failed",
     "run.abandoned",
     "run.blocked",
+    "run.gated",
     "run.cancelled",
     "run.requeued",
+    "gate.approved",
+    "gate.merge_failed",
+    "gate.dismissed",
     "recovery.requeued",
     "recovery.settling",
     "recovery.resume_pending",
@@ -197,6 +208,7 @@ TERMINAL_NOTICE_KINDS: frozenset[str] = frozenset(
         "run.exhausted",
         "run.abandoned",
         "run.blocked",
+        "run.gated",
         "run.cancelled",
         "run.requeued",
         "item.abandoned",
