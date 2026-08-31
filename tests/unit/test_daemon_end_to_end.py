@@ -3,8 +3,8 @@ and a fake engine that narrates the pipeline the real one runs.
 
 The other end-to-end path — a concierge exchange over the Discord bridge, where
 a clarifying question is answered by *clicking* a choice rather than typing
-(#564) — lives in :mod:`tests.unit.test_daemon_clarify_end_to_end`, which is
-imported here so the two stay discoverable together.
+(#564) — lives in :mod:`tests.unit.test_daemon_clarify_end_to_end`, a sibling
+module to read alongside this one.
 """
 
 from __future__ import annotations
@@ -18,17 +18,9 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunResult
 from sbxloop.engine.store import StateStore
 from sbxloop.events import EventBus, HostEventTypes
-from tests.unit import test_daemon_clarify_end_to_end as clarify_e2e
 from tests.unit.test_daemon_loop import PR_URL, FakeSource, RecordingFrontend, gh_item
 
 PIPELINE = ("gating", "delivering", "reviewing", "fixing", "awaiting_ci", "landing")
-
-# The clickable-clarifying-question exchange is a first-class end-to-end case:
-# re-export it (with the fixtures it needs, which pytest resolves against the
-# *collecting* module) so running this file runs that exchange too.
-_adapters_without_the_extra = clarify_e2e._adapters_without_the_extra
-stub_components = clarify_e2e.stub_components
-TestClarifyingQuestionEndToEnd = clarify_e2e.TestClarifyingQuestionEndToEnd
 
 
 class FakeEngineRunner:
