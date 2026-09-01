@@ -43,8 +43,10 @@ class TestUpsert:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
         store.mark_done("gh:issue:7", now=2.0)
-        # identical re-discovery of a done item is NOT new work
-        assert store.upsert_new(item(), now=3.0) is False
+        # identical re-discovery of a done item re-queues it (#600): the
+        # issue is only polled while it carries the trigger label.
+        assert store.upsert_new(item(), now=3.0) is True
+        store.mark_done("gh:issue:7", now=3.5)
         # edited content is
         assert store.upsert_new(item(body="do MORE things"), now=4.0) is True
         got = store.get("gh:issue:7")
@@ -54,8 +56,159 @@ class TestUpsert:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item(), now=1.0)
         store.mark_blocked("gh:issue:7", "405", now=2.0)
-        assert store.upsert_new(item(), now=3.0) is False
+        assert store.upsert_new(item(), now=3.0) is True  # re-queued (#600)
+        store.mark_blocked("gh:issue:7", "405", now=3.5)
         assert store.upsert_new(item(body="edited"), now=4.0) is True
+
+    def test_unchanged_terminal_row_is_requeued_by_the_label(self, tmp_path: Path) -> None:
+        """#600: re-adding `sbxloop:run` to an unchanged issue whose last
+        attempt is finished restarts it — the label is never inert."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_failed("gh:issue:7", "boom", now=3.0, requeue=False)
+        assert store.upsert_new(item(), now=4.0) is True
+        got = store.get("gh:issue:7")
+        assert got is not None
+        assert (got.state, got.claimed, got.run_id, got.last_error) == ("queued", False, None, None)
+        assert got.attempts == 0 and got.updated_at == 4.0
+
+    @pytest.mark.parametrize("terminal", ["done", "failed", "blocked", "cancelled"])
+    def test_every_terminal_state_is_requeued_unchanged(
+        self, tmp_path: Path, terminal: str
+    ) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.set_state("gh:issue:7", terminal, now=2.0)  # type: ignore[arg-type]
+        assert store.upsert_new(item(), now=3.0) is True
+        got = store.get("gh:issue:7")
+        assert got is not None and got.state == "queued"
+
+    @pytest.mark.parametrize(
+        "prepare",
+        [
+            pytest.param(lambda st: None, id="queued"),
+            pytest.param(lambda st: st.mark_claimed("gh:issue:7", 2.0), id="claimed"),
+            pytest.param(lambda st: st.mark_running("gh:issue:7", "r1", 2.0), id="running"),
+            pytest.param(
+                lambda st: (
+                    st.mark_running("gh:issue:7", "r1", 2.0),
+                    st.mark_resume_pending("gh:issue:7", 2.5),
+                ),
+                id="resume-pending",
+            ),
+        ],
+    )
+    def test_live_rows_still_dedup(self, tmp_path: Path, prepare: object) -> None:
+        """A live item is never reset by a poll — that would double-dispatch."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        prepare(store)  # type: ignore[operator]
+        before = store.get("gh:issue:7")
+        assert store.upsert_new(item(), now=9.0) is False
+        assert store.get("gh:issue:7") == before
+
+    def test_requeue_by_label_keeps_the_prior_branch_and_pr(self, tmp_path: Path) -> None:
+        """The restart must continue the branch the cancelled attempt
+        pushed, not redo it (#600)."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.record_prior_attempt("gh:issue:7", run_id="r1", branch="sbxloop/gh-7", pr_number=42)
+        store.mark_cancelled("gh:issue:7", "cancelled by b", now=3.0)
+        assert store.upsert_new(item(), now=4.0) is True
+        prior = store.prior_attempt("gh:issue:7")
+        assert prior is not None
+        assert (prior.run_id, prior.branch, prior.pr_number) == ("r1", "sbxloop/gh-7", 42)
+
+    def test_discarding_the_requeued_row_keeps_the_prior_branch_and_pr(
+        self, tmp_path: Path
+    ) -> None:
+        """The loop discards a queued row on every unsuccessful claim (another
+        daemon won, GitHub was down) and relies on the next poll to re-create
+        it. That re-created row must still offer the previous attempt's
+        branch and PR — otherwise the restart silently starts from scratch
+        and abandons the pushed work (#600)."""
+        store = DaemonStore(tmp_path / "state.db")
+        repo_item = item(repo="o/r", item_id="gh:issue:7")
+        store.upsert_new(repo_item, now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.record_prior_attempt("gh:issue:7", run_id="r1", branch="sbxloop/r1", pr_number=9)
+        store.mark_cancelled("gh:issue:7", "cancelled", now=3.0)
+        assert store.upsert_new(repo_item, now=4.0) is True
+
+        assert store.discard("gh:issue:7") is True  # the lost-claim path
+        assert store.upsert_new(repo_item, now=5.0) is True
+        prior = store.prior_attempt("gh:issue:7")
+        assert prior is not None
+        assert (prior.run_id, prior.branch, prior.pr_number) == ("r1", "sbxloop/r1", 9)
+
+    def test_dropping_a_repoless_row_keeps_the_prior_branch_and_pr(self, tmp_path: Path) -> None:
+        """``drop_repoless`` deletes rows for discovery to re-create
+        repo-qualified; the prior attempt must survive that too (#600)."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)  # repo-less, as a legacy row is
+        store.record_prior_attempt("gh:issue:7", run_id="r1", branch="sbxloop/r1", pr_number=9)
+        assert store.drop_repoless() == 1
+        assert store.get("gh:issue:7") is None
+
+        assert store.upsert_new(item(repo="o/r", item_id="gh:o/r:issue:7"), now=2.0) is True
+        prior = store.prior_attempt("gh:o/r:issue:7")
+        assert prior is not None
+        assert (prior.run_id, prior.branch, prior.pr_number) == ("r1", "sbxloop/r1", 9)
+
+    def test_an_edited_issue_still_continues_the_prior_branch(self, tmp_path: Path) -> None:
+        """Superseding a terminal row deletes it and INSERTs a fresh one. The
+        work the last attempt pushed is still on origin, so the new run
+        continues it rather than opening a second branch (#600)."""
+        store = DaemonStore(tmp_path / "state.db")
+        repo_item = item(repo="o/r", item_id="gh:issue:7")
+        store.upsert_new(repo_item, now=1.0)
+        store.record_prior_attempt("gh:issue:7", run_id="r1", branch="sbxloop/r1", pr_number=9)
+        store.mark_failed("gh:issue:7", "boom", now=2.0, requeue=False)
+        assert store.upsert_new(item(repo="o/r", item_id="gh:issue:7", body="edited"), 3.0) is True
+        prior = store.prior_attempt("gh:issue:7")
+        assert prior is not None and prior.branch == "sbxloop/r1"
+
+    def test_a_re_created_row_for_an_untouched_issue_offers_nothing(self, tmp_path: Path) -> None:
+        """No previous attempt means no offer: a first-ever claim must not
+        invent one from another issue's history."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(repo="o/r", item_id="gh:issue:7"), now=1.0)
+        store.record_prior_attempt("gh:issue:7", run_id="r1", branch="sbxloop/r1", pr_number=9)
+        assert store.upsert_new(item("8", repo="o/r", item_id="gh:issue:8"), now=2.0) is True
+        assert store.prior_attempt("gh:issue:8") is None
+
+    def test_prior_attempt_is_per_repository(self, tmp_path: Path) -> None:
+        """The same issue number in two repositories is two work items with
+        two branches; one must never be offered for the other."""
+        store = DaemonStore(tmp_path / "state.db")
+        a = item(repo="o/a", item_id="gh:o/a:issue:7")
+        b = item(repo="o/b", item_id="gh:o/b:issue:7")
+        store.upsert_new(a, now=1.0)
+        store.upsert_new(b, now=1.0)
+        store.record_prior_attempt("gh:o/a:issue:7", run_id="ra", branch="sbxloop/ra")
+        store.discard("gh:o/b:issue:7")
+        assert store.upsert_new(b, now=2.0) is True
+        assert store.prior_attempt("gh:o/b:issue:7") is None
+        assert store.discard("gh:o/a:issue:7") is True
+        assert store.upsert_new(a, now=3.0) is True
+        prior = store.prior_attempt("gh:o/a:issue:7")
+        assert prior is not None and prior.branch == "sbxloop/ra"
+
+    def test_prior_attempt_is_none_without_pushed_work(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        assert store.prior_attempt("gh:issue:7") is None
+        assert store.prior_attempt("gh:issue:404") is None
+
+    def test_changed_terminal_row_is_still_superseded(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_cancelled("gh:issue:7", "by hand", now=2.0)
+        assert store.upsert_new(item(body="edited"), now=3.0) is True
+        got = store.get("gh:issue:7")
+        assert got is not None and got.state == "queued" and got.body == "edited"
 
     def test_running_row_never_superseded(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
@@ -139,7 +292,11 @@ class TestQueueAndAttempts:
         got = store.get("gh:issue:7")
         assert got is not None and got.state == "cancelled" and got.last_error == "cancelled by op"
         assert store.next_queued(now=1e9, backoff_s=1) is None  # never auto-retried
-        assert store.upsert_new(item(), now=4.0) is False  # re-discovery dedups like done
+        # Re-discovery restarts it (#600); put it back so the operator
+        # paths below are exercised from the cancelled state.
+        assert store.upsert_new(item(), now=4.0) is True
+        store.mark_running("gh:issue:7", "r1", now=4.2)
+        store.mark_cancelled("gh:issue:7", "cancelled by op", now=4.5)
         with pytest.raises(ValueError, match="use retry"):
             store.requeue("gh:issue:7", now=5.0)  # requeue is for running/queued items
         store.retry("gh:issue:7", now=5.0, reason="re-queued by op")
@@ -988,6 +1145,49 @@ class TestClaimPersistence:
         store.close()
         again = DaemonStore(db)
         assert [i.claim_token for i in again.half_claimed()] == ["d" * 32]
+
+    def test_pre_prior_attempt_database_migrates_and_restarts_by_label(
+        self, tmp_path: Path
+    ) -> None:
+        """#600: a store written before the prior-attempt columns opens,
+        keeps its rows (including a cancelled row pinned to an old run) and
+        can be restarted by re-adding the trigger label — no repair."""
+        db = daemon_db(tmp_path, "pre_prior_attempt")
+        insert_daemon_row(
+            db,
+            item_id="gh:o/r:issue:3",
+            source_key="3",
+            title="Three",
+            body="do the thing",
+            state="cancelled",
+            claimed=1,
+            run_id="r_old",
+            attempts=2,
+            last_error="cancelled by b",
+            repo="o/r",
+        )
+        store = DaemonStore(db)
+        got = store.get("gh:o/r:issue:3")
+        assert got is not None and got.state == "cancelled" and got.run_id == "r_old"
+        assert store.prior_attempt("gh:o/r:issue:3") is None
+        rediscovered = item(
+            "3",
+            item_id="gh:o/r:issue:3",
+            title="Three",
+            body="do the thing",
+            repo="o/r",
+        )
+        assert store.upsert_new(rediscovered, now=9.0) is True
+        fresh = store.get("gh:o/r:issue:3")
+        assert fresh is not None
+        assert (fresh.state, fresh.claimed, fresh.run_id, fresh.attempts) == (
+            "queued",
+            False,
+            None,
+            0,
+        )
+        prior = store.prior_attempt("gh:o/r:issue:3")
+        assert prior is not None and prior.run_id == "r_old"
 
 
 class TestPendingClarifications:

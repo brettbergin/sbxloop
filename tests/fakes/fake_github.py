@@ -156,6 +156,9 @@ class FakeGithub(GithubOps):
         self.pr_kwargs: dict[str, Any] = {}
         self.blob_batches: list[list[dict[str, str]]] = []
         self.branches: set[str] = set()
+        # Branches with no merge base against the base branch (#600): the
+        # compare endpoint 404s for them, as GitHub does.
+        self.unrelated_branches: set[str] = set()
         self.pr_created = False
         self.pr_create_calls = 0
         self.threads: list[ReviewThread] = []
@@ -358,6 +361,17 @@ class FakeGithub(GithubOps):
             return list(self.comments_payload)
         if method == "GET" and "/pulls?state=open&head=" in path:
             return [dict(self.pr)] if self.pr_created else []
+        if method == "GET" and "/compare/" in path:
+            # `base...head`: unrelated histories have no merge base, which
+            # GitHub reports as a 404 rather than a comparison.
+            head = path.rsplit("...", 1)[1]
+            if head in self.unrelated_branches:
+                raise GithubOpsError(
+                    "github op raw.api failed: GithubOpError: gh api GET "
+                    f"{path} failed (rc=1): Not Found (HTTP 404)",
+                    http_status=404,
+                )
+            return {"merge_base_commit": {"sha": "base123"}}
         if method == "POST" and path.endswith("/labels") and body and "labels" in body:
             return [{"name": name} for name in body["labels"]]
         if method == "GET" and "/labels/" in path:

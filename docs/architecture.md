@@ -665,7 +665,10 @@ ours leaves no row, never a terminal one, #530), runs each as **one** engine run
 reports the outcome on the issue — closed with `sbxloop:completed` when the
 PR merged (the PR body's `Closes #N` closes it even if the daemon is down),
 `sbxloop:failed` when the run gave up (after the per-item attempt cap and
-its backoff), `sbxloop:blocked` when GitHub would not let the loop finish.
+its backoff), `sbxloop:blocked` when GitHub would not let the loop finish. Re-adding
+`sbxloop:run` to an issue whose attempt finished re-queues it on the next
+poll even if the issue text is unchanged, and the new run resumes the
+branch and PR the previous attempt pushed to origin (#600).
 It never files work of its own: only a human labelling an issue — directly,
 or by asking the Discord concierge, which files the issue *with* the label —
 starts a run. Everything else the daemon does is a guardrail or a

@@ -52,6 +52,12 @@ class FakeSource:
 
     def claim(self, item: WorkItem) -> bool:
         self.calls.append(("claim", item.item_id))
+        if self.claim_ok:
+            # The real source swaps the trigger label for in-progress, so a
+            # claimed issue stops matching discovery until a human re-adds
+            # the label (#600). Without that, every later poll would look
+            # like a human asking to restart the item.
+            self.items = [i for i in self.items if i.item_id != item.item_id]
         return self.claim_ok
 
     # Half-claims recovery asks about (#530): token -> whether the claim

@@ -171,6 +171,16 @@ class ChatMessage(NamedTuple):
 
 
 @dataclass
+class PriorArtifacts:
+    """What a previous attempt at this work item pushed to origin (#600):
+    the branch it delivered on and the pull request it opened. Offered to
+    :meth:`LoopEngine.start`; adopted only if GitHub still has them."""
+
+    branch: str | None = None
+    pr_number: int | None = None
+
+
+@dataclass
 class Pipeline:
     """Everything one run's stages share while its sandbox pair is alive."""
 
@@ -206,6 +216,16 @@ class Pipeline:
     # Human objections a `NeedsFix("human")` round is answering, held until
     # the fix re-delivers so the reply can name the sha that carries it.
     pending_human: tuple[HumanObjection, ...] = ()
+    # The head commit of a previous attempt's branch this run adopted
+    # (#600). The first delivery parents on it, so that attempt's commits
+    # stay in the branch's history instead of being force-moved away.
+    prior_head: str | None = None
+    # The adopted branch itself, pinned before the first delivery so no new
+    # branch name is generated; None for an ordinary run.
+    branch: str | None = None
+    # The previous attempt's still-open pull request, reattached to rather
+    # than opening a second one for the same head.
+    prior_pr: int | None = None
 
 
 class LoopEngine:
@@ -283,6 +303,9 @@ class LoopEngine:
         # is the difference between "this session is one turn old" and "this
         # session belonged to a VM that no longer exists".
         self._live_sessions: set[str] = set()
+        # A restart's offer of the previous attempt's pushed branch/PR
+        # (#600); empty for an ordinary run and for a resume.
+        self._prior = PriorArtifacts()
         for hook in hooks:
             self.bus.attach_hook(hook)
         self.bus.subscribe(self._persist_event)
@@ -311,11 +334,19 @@ class LoopEngine:
         run_id: str | None = None,
         tasks: Sequence[TaskSpec] | None = None,
         repo: str | None = None,
+        prior_branch: str | None = None,
+        prior_pr: int | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
         ``tasks`` pre-seeds the task graph and so skips DECOMPOSE — for work
         that is *already* decomposed. A normal run passes nothing.
+
+        ``prior_branch``/``prior_pr`` are what a previous attempt at this
+        work item left on the GitHub origin (#600). A restart offers them
+        here; the run adopts them once GitHub confirms the branch is still
+        there and still related to the base branch, and otherwise starts
+        fresh with a logged reason. Nothing here can fail the run.
 
         ``repo`` is the ``owner/name`` this run belongs to — the repository
         its work item came from. It narrows the engine's GitHub config to
@@ -329,6 +360,7 @@ class LoopEngine:
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=outcome, seeded=len(tasks or ()))
+        self._prior = PriorArtifacts(branch=prior_branch, pr_number=prior_pr)
         return self._drive(run_id, outcome)
 
     def _select_repo(self, repo: str | None) -> None:
@@ -513,13 +545,19 @@ class LoopEngine:
         self._waited_s = 0.0
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
         self._set_run_state(run_id, "provisioning")
-        provisioner = Provisioner(self.sbx, self.config, self.bus)
+        # A restart pins its clone to the branch the previous attempt pushed
+        # BEFORE the workspace is cut (#600), so the agent starts from that
+        # work, the review diff describes it, and the delivered tree is the
+        # one the agent actually built. Pinning after provisioning would
+        # only change where the result lands.
+        provisioner = Provisioner(self.sbx, self._provision_config(), self.bus)
         # A resumed run's workspace is pinned from the runs table — never
         # recomputed from config, which would silently relocate it (#60).
         # The run's repository (its config was narrowed to it in
         # _select_repo) scopes the github sandbox's token and remote.
         pair = provisioner.ensure_pair(run_id, workspace, self.config.github.repo)
         assert pair.workspace is not None
+        self._confirm_prior_checkout(run_id, pair)
         if workspace is not None and pair.workspace != workspace:
             raise StateError(
                 f"run {run_id} workspace mismatch: the run recorded {workspace} "
@@ -607,6 +645,7 @@ class LoopEngine:
                         ),
                     )
                     try:
+                        self._adopt_prior_artifacts(pipeline)
                         state, reason = self._run_pipeline(pipeline, stage)
                     finally:
                         # Harvest even when a stage raised: the sandbox is
@@ -868,6 +907,164 @@ class LoopEngine:
         )
         if created:
             self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=entry.repo, created=True)
+
+    def _provision_config(self) -> Config:
+        """The config provisioning sees: a restart's offered branch pinned
+        as ``sandbox.continue_branch`` so the run's clone is cut from the
+        previous attempt's work rather than from the base branch (#600).
+
+        The pin is *optional* — unlike a resume, a restart has published
+        nothing of its own, so a branch that is gone from origin is a fresh
+        start with a logged reason, not a failed provision.
+        """
+        branch = self._prior.branch
+        if not branch:
+            return self.config
+        sandbox = self.config.sandbox.model_copy(
+            update={"continue_branch": branch, "continue_branch_optional": True}
+        )
+        return self.config.model_copy(update={"sandbox": sandbox})
+
+    def _confirm_prior_checkout(self, run_id: str, pair: SandboxPair) -> None:
+        """Keep the branch offer only if the workspace really landed on it.
+
+        Provisioning may have fallen back to a fresh cut (the branch was
+        deleted on origin, the checkout could not fetch it) or reused an
+        existing clone. Adopting the branch for *delivery* in that case is
+        exactly the union-tree bug this pinning exists to remove: the run
+        would push a tree diffed against base onto a branch whose history
+        it never contained. Dropping the offer here makes the workspace,
+        the review diff and the delivered tree describe one history.
+        """
+        branch = self._prior.branch
+        if not branch:
+            return
+        workspace = pair.workspace
+        if workspace is None or hostgit.repo_toplevel(workspace) is None:
+            # Not a git checkout at all (an in-place plain directory): there
+            # was no branch to pin and delivery is a snapshot, so the offer
+            # is still just "land it on that branch, keeping its history".
+            return
+        actual = hostgit.current_branch(workspace)
+        if actual == branch:
+            return
+        log.info(
+            "engine.prior_branch_unusable",
+            run=run_id,
+            branch=branch,
+            reason=(
+                f"the run workspace is on {actual or 'no branch'}, not the offered "
+                "branch; starting fresh from the base branch"
+            ),
+        )
+        self._prior = PriorArtifacts()
+
+    def _adopt_prior_artifacts(self, p: Pipeline) -> None:
+        """Continue on what a previous attempt at this item pushed (#600).
+
+        A restart offers the branch (and PR) of the attempt before it. This
+        confirms with GitHub that the branch is still on origin and still
+        related to the base branch — a shared merge base — and only then
+        pins the run to it: the delivery lands on that branch, parented on
+        its head, so the earlier commits stay in the history, and the open
+        pull request for that head is refreshed rather than a second one
+        opened.
+
+        Anything unusable — no branch, an unrelated/force-diverged branch,
+        a PR that is closed or merged, a GitHub call that fails — is a
+        fresh start with one ``engine.prior_branch_unusable`` line carrying
+        the reason. This never raises: a restart that cannot reuse work is
+        still a perfectly good run.
+        """
+        prior, ops, repo = self._prior, p.ops, p.repo
+        if prior.branch is None:
+            return
+        branch = prior.branch
+        if ops is None or repo is None:
+            self._prior_unusable(p, branch, "the run has no GitHub repository")
+            return
+        base = p.repo_config.deliver_base if p.repo_config else self.config.github.deliver_base
+        try:
+            if base is None:
+                base = str(ops.repo_get(repo).get("default_branch") or "main")
+            head_sha = ops.ref_lookup(repo, f"heads/{branch}")
+            if head_sha is None:
+                self._prior_unusable(p, branch, "the branch is no longer on origin")
+                return
+            if not self._shares_merge_base(ops, repo, base, branch):
+                self._prior_unusable(
+                    p, branch, f"the branch has no merge base with {base} (unrelated history)"
+                )
+                return
+            pr_number = self._prior_open_pr(ops, repo, branch, prior.pr_number)
+        except (GithubOpsError, SbxloopError) as exc:
+            self._prior_unusable(p, branch, f"GitHub could not confirm it: {exc}")
+            return
+        p.branch, p.prior_head, p.prior_pr = branch, head_sha, pr_number
+        log.info(
+            "engine.prior_branch_reused",
+            run=p.run_id,
+            repo=repo,
+            branch=branch,
+            head=head_sha[:12],
+            pr=pr_number,
+            base=base,
+        )
+        self.bus.emit(
+            HostEventTypes.RUN_DELIVER,
+            p.run_id,
+            repo=repo,
+            branch=branch,
+            head_sha=head_sha,
+            pr=pr_number,
+            reused=True,
+            message=f"continuing the previous attempt's branch {branch}",
+        )
+
+    def _prior_unusable(self, p: Pipeline, branch: str, reason: str) -> None:
+        """Say once, structured, why a restart is starting fresh (#600)."""
+        log.info(
+            "engine.prior_branch_unusable",
+            run=p.run_id,
+            repo=p.repo,
+            branch=branch,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _shares_merge_base(ops: GithubOps, repo: str, base: str, branch: str) -> bool:
+        """Whether ``branch`` and ``base`` have a common ancestor — the test
+        for "this branch is still about this repository's current line of
+        work". A comparison GitHub cannot make (404 on unrelated histories)
+        answers no rather than raising."""
+        try:
+            data = ops.raw("GET", f"/repos/{repo}/compare/{base}...{branch}")
+        except GithubOpsError as exc:
+            if exc.http_status == 404:
+                return False
+            raise
+        if not isinstance(data, dict):
+            return False
+        merge_base = data.get("merge_base_commit")
+        return bool(isinstance(merge_base, dict) and merge_base.get("sha"))
+
+    @staticmethod
+    def _prior_open_pr(ops: GithubOps, repo: str, branch: str, recorded: int | None) -> int | None:
+        """The open pull request for ``branch``, or None when there is none
+        to reattach to (it was closed or merged, so the restart opens a
+        fresh one on the same branch)."""
+        owner = repo.split("/", 1)[0]
+        pulls = ops.raw("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}")
+        if isinstance(pulls, list):
+            for pull in pulls:
+                if isinstance(pull, dict) and pull.get("number"):
+                    return int(pull["number"])
+        if recorded is None:
+            return None
+        data = ops.pr_get(repo, recorded)
+        if data.get("state") == "open" and not data.get("merged"):
+            return recorded
+        return None
 
     # -- the pipeline ------------------------------------------------------
 
@@ -1218,7 +1415,11 @@ class LoopEngine:
         if source is None:
             raise StateError(f"run {run_id} has no artifacts directory to deliver")
         gh, landing = self.config.github, self.config.landing
-        branch = run.branch or branch_name(run_id)
+        branch = run.branch or p.branch or branch_name(run_id)
+        # Only the first delivery of an adopted branch continues its
+        # history; once this run has delivered, later rounds force-move
+        # onto their own head as they always did.
+        parent = p.prior_head if run.branch is None else None
         round_no = 1 + sum(1 for t in self.store.get_tasks(run_id) if is_fix_task(t.spec.id))
         started = time.monotonic()
         log.info(
@@ -1240,8 +1441,9 @@ class LoopEngine:
             exclude=self.config.artifacts.exclude,
             branch=branch,
             closes=gh.deliver_closes,
-            pr_number=run.pr_number,
+            pr_number=run.pr_number if run.pr_number is not None else p.prior_pr,
             round_no=round_no,
+            parent=parent,
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
@@ -1254,7 +1456,7 @@ class LoopEngine:
             head_sha=head_sha,
             node_id=str(data["node_id"]) if data.get("node_id") else None,
         )
-        if run.pr_number is None:
+        if run.pr_number is None and p.prior_pr is None:
             self._label_pr(p, pr.number)
         p.delivered_at = self.clock()
         log.info(

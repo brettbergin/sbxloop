@@ -8,6 +8,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Re-adding the trigger label restarts an issue** (#600). Applying
+  `sbxloop:run` again to an issue whose last attempt finished (done,
+  failed, blocked or cancelled) now re-queues it on the next poll whether
+  or not the issue text changed — the label is never silently inert, and
+  an operator `!sbx retry` is no longer the only way back in. The
+  re-queued item keeps what the previous attempt pushed to origin (its run
+  id, branch and PR, in the new `prior_run_id` / `prior_branch` /
+  `prior_pr_number` columns, added in place on open) so the restart
+  continues that branch instead of redoing it; with nothing usable on
+  origin the run simply starts fresh. Live items (queued, claimed,
+  running, resume-pending) still dedup, so a poll never double-dispatches.
+
 - **An optional Claude agent backend** (#533). `[agent] backend = "claude"`
   runs every agent persona through the Claude Agent SDK (the Claude Code
   harness) instead of the Copilot SDK, which stays the default with

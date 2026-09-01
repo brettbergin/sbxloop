@@ -384,17 +384,30 @@ issue:
   the item has attempts left (`max_attempts_per_item`, default 2;
   `retry_backoff_s` × the attempt number), then abandons it:
   `in-progress` → **`sbxloop:failed`**, with re-trigger instructions
-  (remove `failed`, re-add `run`). Any PR stays a draft.
+  (just re-add `run`; the claim clears `failed` itself). Any PR stays a
+  draft.
 - **`blocked`** — the run cleared its own bar and GitHub would not let it
   finish: a protection rule wanting an approval the loop's identity cannot
   give, CI that never reported, an update-branch budget spent. The PR is
   left **open and out of draft** — one click from done — the issue stays
   open with **`sbxloop:blocked`** and a comment saying why, and the item
   neither retries nor counts toward the breaker, because nothing another
-  attempt would change. Merge or fix by hand and close the issue, or
-  `!sbx retry <item>` once the cause is dealt with.
+  attempt would change. Merge or fix by hand and close the issue, or re-add
+  `sbxloop:run` once the cause is dealt with — that restarts it on the same
+  branch and PR (`!sbx retry <item>` restarts from scratch instead).
 - **cancelled** — `!sbx cancel` settles the item as cancelled, attributed
   to whoever asked, with no automatic retry; the run stays resumable.
+
+**Restarting an issue: re-add the trigger label.** Re-applying
+`sbxloop:run` to an issue whose last attempt finished — done, failed,
+blocked or cancelled — re-queues it on the next poll whether or not the
+issue text changed; the label is never silently inert. The restarted run
+continues from whatever the previous attempt pushed to the GitHub origin:
+the same branch and, if one was opened, the same (draft) PR, so its commits
+are kept rather than redone. When nothing usable is on origin — no branch,
+or a branch unrelated to the current base — the run simply starts fresh and
+logs why. `!sbx retry <item>` remains the way to ask for a clean restart
+from scratch.
 
 Everything else the daemon does is a guardrail or a recovery. It is
 **fully autonomous** — a label alone starts a run *and merges the result* —

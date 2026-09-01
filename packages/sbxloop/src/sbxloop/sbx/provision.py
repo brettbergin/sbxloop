@@ -39,6 +39,7 @@ from __future__ import annotations
 import os
 import secrets
 import shlex
+import shutil
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -673,31 +674,57 @@ class Provisioner:
                 "PATH to clone it from its remote"
             )
         url = f"https://github.com/{repo}"
-        branch = self.config.sandbox.continue_branch or branch_name(run_id)
+        continue_branch = self.config.sandbox.continue_branch
+        branch = continue_branch or branch_name(run_id)
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
-            sha = hostgit.clone_from_remote(
-                url, clone_dir, branch, existing=bool(self.config.sandbox.continue_branch)
-            )
+            sha = hostgit.clone_from_remote(url, clone_dir, branch, existing=bool(continue_branch))
         except ProvisionError as exc:
+            if continue_branch and self.config.sandbox.continue_branch_optional:
+                # The offered branch is not on the remote any more: start
+                # fresh rather than fail the run (#600).
+                branch = self._fresh_after_missing_continue(run_id, continue_branch, exc, clone_dir)
+                sha = hostgit.clone_from_remote(url, clone_dir, branch)
+                self._emit_clone(run_id, url, clone_dir, sha, branch)
+                return clone_dir
             raise ProvisionError(
                 f"no workspace is configured for {repo}, and cloning it from "
                 f"{url} failed: {exc}. The host holds no git credential, so this "
                 "path only works for a public repository; configure a workspace "
                 "for this repository in its [[github.repos]] entry (see #46)"
             ) from exc
+        self._emit_clone(run_id, url, clone_dir, sha, branch)
+        return clone_dir
+
+    def _fresh_after_missing_continue(
+        self, run_id: str, branch: str, exc: Exception, clone_dir: Path
+    ) -> str:
+        """Say once why a restart could not continue the branch it was
+        offered, clear the half-made clone, and name the fresh branch to
+        use instead (#600)."""
+        log.info(
+            "workspace.continue_branch_unusable",
+            run=run_id,
+            branch=branch,
+            reason=str(exc),
+            fallback="starting fresh from the base branch",
+        )
+        if clone_dir.exists():
+            shutil.rmtree(clone_dir, ignore_errors=True)
+        return branch_name(run_id)
+
+    def _emit_clone(self, run_id: str, source: str, clone_dir: Path, sha: str, branch: str) -> None:
         self.bus.emit(
             "sandbox.workspace_clone",
             run_id,
-            source=url,
+            source=source,
             target=str(clone_dir),
             commit=sha,
             branch=branch,
             dirty=False,
             reused=False,
-            message=f"cloned {url} at {sha[:12]} onto branch {branch}",
+            message=f"cloned {source} at {sha[:12]} onto branch {branch}",
         )
-        return clone_dir
 
     def _clone_workspace(self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool) -> Path:
         branch = branch_name(run_id)
@@ -719,15 +746,27 @@ class Provisioner:
             return clone_dir
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         existing = self.config.sandbox.continue_branch
+        sha: str | None = None
+        message = ""
         if existing:
             # A fix round continues its own pull request: start from what
             # that branch actually has, so the delivery updates the PR
             # instead of replacing it with work rebuilt from the default
             # branch.
-            branch = existing
-            sha = hostgit.clone_existing_branch(source, clone_dir, branch)
-            message = f"cloned {source} at {sha[:12]} continuing branch {branch}"
-        else:
+            try:
+                sha = hostgit.clone_existing_branch(source, clone_dir, existing)
+            except ProvisionError as exc:
+                if not self.config.sandbox.continue_branch_optional:
+                    raise
+                # A restart offered a branch that is no longer fetchable
+                # (deleted on origin, never fetched here): a fresh start is
+                # correct here — unlike a resume, this run has no published
+                # work of its own to destroy (#600).
+                self._fresh_after_missing_continue(run_id, existing, exc, clone_dir)
+            else:
+                branch = existing
+                message = f"cloned {source} at {sha[:12]} continuing branch {branch}"
+        if sha is None:
             sha = hostgit.clone_for_run(source, clone_dir, branch)
             message = f"cloned {source} at {sha[:12]} onto branch {branch}"
         if dirty:

@@ -893,3 +893,61 @@ class TestRedeliveryOntoAKnownPr:
             source_dir=make_workspace(tmp_path),
         )
         assert pr == PrRef(number=12, url="https://github.com/o/r/pull/12")
+
+
+class TestContinuedHistory:
+    """A restart that adopts a previous attempt's branch (#600) parents on
+    that branch's head — but its tree is still the run's own workspace,
+    diffed against base. Building the tree on the prior head's tree instead
+    would deliver the union of the previous attempt's whole tree and this
+    run's base-relative changes: a tree neither the agent built nor the
+    reviewer diffed, keeping every file the previous attempt got wrong."""
+
+    def test_parent_keeps_history_without_inheriting_the_prior_tree(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        git("init", "-b", "main", cwd=source)
+        git("config", "user.email", "t@e.st", cwd=source)
+        git("config", "user.name", "t", cwd=source)
+        (source / "keep.txt").write_text("keep\n")
+        git("add", ".", cwd=source)
+        git("commit", "-m", "init", cwd=source)
+        base_sha = git("rev-parse", "HEAD", cwd=source)
+        clone = tmp_path / "clone"
+        hostgit.clone_for_run(source, clone, "sbxloop/rnew")
+        # What a restarted run's fresh base-cut clone looks like.
+        (clone / "new.txt").write_text("new\n")
+
+        class KnownBaseOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                if ref.startswith("heads/sbxloop/"):
+                    return "PRIORHEAD"
+                return base_sha
+
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                if method == "GET" and "/git/commits/" in path:
+                    self.raw_calls.append((method, path, body))
+                    sha = path.rsplit("/", 1)[-1]
+                    return {"tree": {"sha": f"TREE_OF_{sha}"}}
+                return super().raw(method, path, body)
+
+        ops = KnownBaseOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="rnew",
+            outcome="o",
+            source_dir=clone,
+            base="main",
+            branch="sbxloop/prev",
+            parent="PRIORHEAD",
+        )
+        (tree_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/trees")]
+        assert tree_body is not None
+        # The tree is layered on BASE's tree, not the previous attempt's.
+        assert tree_body["base_tree"] == f"TREE_OF_{base_sha}"
+        assert [e["path"] for e in tree_body["tree"]] == ["new.txt"]
+        # The prior commit is still the parent, so its history survives.
+        (commit_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/commits")]
+        assert commit_body is not None and commit_body["parents"] == ["PRIORHEAD"]

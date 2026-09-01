@@ -180,6 +180,7 @@ def deliver_workspace(
     closes: int | None = None,
     pr_number: int | None = None,
     round_no: int | None = None,
+    parent: str | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
@@ -191,6 +192,17 @@ def deliver_workspace(
     create is confirmed by looking the branch's open PR up (see the module
     notes). ``round_no`` is the delivery round when the caller counts them
     (the engine's fix rounds); it only decorates the force-move event.
+
+    ``parent`` is the commit the new one descends from when the caller is
+    *continuing* published history — a restarted run adopting the branch a
+    previous attempt pushed (#600). It changes only the new commit's
+    *parent*, never the tree it is layered onto: the entry list is always a
+    diff against ``base``, so the tree must be built on ``base``'s tree or
+    the result would be the union of the previous attempt's tree and this
+    run's base-relative changes — a tree neither the agent built nor the
+    reviewer diffed. With ``parent`` the earlier commits stay reachable
+    from the branch instead of being force-moved away, while the tree is
+    still exactly what this run's workspace holds.
 
     ``closes`` is the issue this delivery resolves; it becomes a
     ``Closes #N`` line in the PR body, so GitHub links issue and PR and
@@ -222,6 +234,9 @@ def deliver_workspace(
         base_sha = _base_commit_sha(ops, repo, base)
         if base_sha is None:
             raise DeliveryError(f"base branch {base!r} of {repo} still missing after bootstrap")
+    # Always the base branch's tree: the entry list is a diff against
+    # `base` (see `parent` above), so layering it on any other tree would
+    # deliver something no one built or reviewed (#600).
     base_tree = _commit_tree_sha(ops, repo, base_sha)
 
     if plan is None:
@@ -265,7 +280,7 @@ def deliver_workspace(
             {
                 "message": f"sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}",
                 "tree": tree,
-                "parents": [base_sha],
+                "parents": [parent or base_sha],
             },
         ),
         f"commit for {repo}",

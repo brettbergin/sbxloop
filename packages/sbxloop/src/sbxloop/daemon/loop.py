@@ -1275,6 +1275,7 @@ class DaemonLoop:
         """
         now = self.clock()
         report = self._report(run_id, result)
+        self._remember_pushed_work(item, report)
         state = result.state if result is not None else None
         if state == "gated":
             return self._settle_gated(item, run_id, report, now)
@@ -1379,11 +1380,23 @@ class DaemonLoop:
             )
         return outcome
 
+    def _remember_pushed_work(self, item: WorkItem, report: RunReport) -> None:
+        """Record the branch/PR this attempt pushed to origin, so restarting
+        the item by re-applying the trigger label continues that work rather
+        than redoing it (#600)."""
+        pr_number = report.pr[0] if report.pr else None
+        if not report.branch and pr_number is None:
+            return
+        self.dstore.record_prior_attempt(
+            item.item_id, run_id=report.run_id, branch=report.branch, pr_number=pr_number
+        )
+
     def _settle_cancelled(self, item: WorkItem, run_id: str, cancel: CancelRequest) -> TickOutcome:
         now = self.clock()
         report = self._report(run_id, None)._replace(
             state="cancelled", cancelled_by=cancel.requester, requeued=cancel.retry
         )
+        self._remember_pushed_work(item, report)
         reason = f"cancelled by {cancel.requester}" + (" (retry)" if cancel.retry else "")
         # The engine state store (state.db) and the daemon store are separate
         # connections, so the run row and the item row cannot share one
@@ -1873,7 +1886,17 @@ class DaemonLoop:
         engine = handle.engine
         if resume:
             return engine.resume(run_id)
-        return engine.start(self.outcome_text(item), run_id=run_id, repo=self._item_repo(item))
+        # A restart by re-applied label continues the previous attempt's
+        # pushed branch and PR where they are still usable (#600); the
+        # engine confirms that with GitHub and falls back to a fresh start.
+        prior = self.dstore.prior_attempt(item.item_id)
+        return engine.start(
+            self.outcome_text(item),
+            run_id=run_id,
+            repo=self._item_repo(item),
+            prior_branch=prior.branch if prior else None,
+            prior_pr=prior.pr_number if prior else None,
+        )
 
     # -- reporting -----------------------------------------------------------------------
 

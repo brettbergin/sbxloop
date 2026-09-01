@@ -33,7 +33,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.errors import DaemonError
@@ -71,6 +71,12 @@ _WORK_ITEMS_BODY = """(
     -- The claim comment's token, written before the comment is posted so
     -- a half-claim survives the process that made it (#530).
     claim_token TEXT,
+    -- What the previous attempt left on the GitHub origin (#600): the run
+    -- it ran under, the branch it pushed and the PR it opened, kept across
+    -- a re-queue so a restart continues that work instead of redoing it.
+    prior_run_id    TEXT,
+    prior_branch    TEXT,
+    prior_pr_number INTEGER,
     UNIQUE(source_key, repo)
 )"""
 
@@ -133,6 +139,24 @@ CREATE INDEX IF NOT EXISTS idx_daemon_run_watches_run ON daemon_run_watches(run_
 -- carries the requester — recorded here rather than in the public issue
 -- body, which would expose a chat user id.
 CREATE TABLE IF NOT EXISTS daemon_requesters {_REQUESTERS_BODY};
+
+-- What the last attempt at an issue pushed to the GitHub origin, kept
+-- OUTSIDE the work-item row (#600). The item row is deleted on every path
+-- that is not a finish — a lost claim race, a trigger label that went away
+-- (:meth:`DaemonStore.discard`), a repo-less row discovery will re-create
+-- (:meth:`DaemonStore.drop_repoless`) — and taking the branch/PR down with
+-- it would make the very next poll start the restart from scratch. Keyed
+-- by (issue, repository) rather than item_id so it survives an item row
+-- being re-created under a normalised id.
+CREATE TABLE IF NOT EXISTS daemon_prior_attempts (
+    source_key  TEXT NOT NULL,
+    repo        TEXT NOT NULL DEFAULT '',
+    run_id      TEXT,
+    branch      TEXT,
+    pr_number   INTEGER,
+    updated_at  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (source_key, repo)
+);
 
 -- Where each run lives on the chat backend (Discord or Slack), so a
 -- restart re-attaches. Ids are TEXT: Discord's are integer snowflakes,
@@ -199,7 +223,20 @@ CREATE INDEX IF NOT EXISTS idx_pending_clarify_due
     ON daemon_pending_clarifications(state, deadline);
 """
 
+# States from which nothing more happens on its own. A row in one of
+# these is *finished*: re-adding the trigger label to its issue re-queues
+# it (#600). ``gated`` is deliberately absent — a parked merge is still
+# live work awaiting one human approval.
 TERMINAL_ITEM_STATES: frozenset[str] = frozenset({"done", "failed", "blocked", "cancelled"})
+
+
+class PriorAttempt(NamedTuple):
+    """What a previous attempt left on the GitHub origin, so a restart can
+    continue on it instead of starting from nothing (#600)."""
+
+    run_id: str | None
+    branch: str | None
+    pr_number: int | None
 
 
 class MergeGate(NamedTuple):
@@ -309,6 +346,15 @@ def _id_match(item_id: str) -> tuple[str, tuple[str, str]]:
     return ("item_id IN (?, ?)", _id_variants(item_id))
 
 
+def _col(row: sqlite3.Row, name: str) -> Any:
+    """A column that may be absent from a row selected before its migration
+    ran (a raw pre-#600 database read by an older SELECT)."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
 def _row_to_item(row: sqlite3.Row) -> WorkItem:
     return WorkItem(
         item_id=row["item_id"],
@@ -328,6 +374,9 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         repo=row["repo"] or None,
         not_before=row["not_before"],
         claim_token=row["claim_token"],
+        prior_run_id=_col(row, "prior_run_id"),
+        prior_branch=_col(row, "prior_branch"),
+        prior_pr_number=_col(row, "prior_pr_number"),
     )
 
 
@@ -498,6 +547,21 @@ class DaemonStore:
             "daemon_work_items",
             "claim_token",
             "ALTER TABLE daemon_work_items ADD COLUMN claim_token TEXT",
+        ),
+        (
+            "daemon_work_items",
+            "prior_run_id",
+            "ALTER TABLE daemon_work_items ADD COLUMN prior_run_id TEXT",
+        ),
+        (
+            "daemon_work_items",
+            "prior_branch",
+            "ALTER TABLE daemon_work_items ADD COLUMN prior_branch TEXT",
+        ),
+        (
+            "daemon_work_items",
+            "prior_pr_number",
+            "ALTER TABLE daemon_work_items ADD COLUMN prior_pr_number INTEGER",
         ),
     )
 
@@ -695,12 +759,27 @@ class DaemonStore:
     # -- work items ----------------------------------------------------------
 
     def upsert_new(self, item: WorkItem, now: float) -> bool:
-        """Record a discovered item; True if it was not already known.
+        """Record a discovered item; True if it is work to dispatch now.
 
-        A finished row with the same issue is superseded when the content
-        changed — re-triggering an edited issue is a new work item. The
-        requester the concierge recorded for the issue, if any, is copied
-        onto the item.
+        Discovery only ever hands us issues that *carry the trigger label*,
+        so seeing one is a human asking for a run (#600). What happens to an
+        existing row depends on where that row stands:
+
+        * finished (:data:`TERMINAL_ITEM_STATES`) and the content changed —
+          superseded: re-triggering an edited issue is a new work item;
+        * finished and the content is unchanged — **re-queued in place**:
+          state back to ``queued``, unclaimed, no pinned run, no stale
+          error, attempts reset. Re-adding the label used to be silently
+          inert here, which left an operator ``!sbx retry`` as the only way
+          back in (issue #596). What the finished attempt pushed to origin
+          is not lost: its run id, branch and PR are carried onto the
+          re-queued row (``prior_*``, read back with :meth:`prior_attempt`)
+          so the restart continues that branch instead of redoing it;
+        * live (queued, claimed, running, resume-pending, gated) — left
+          exactly as it is, so a poll never double-dispatches it.
+
+        The requester the concierge recorded for the issue, if any, is
+        copied onto the item.
         """
         with self._lock:
             repo = item.repo or ""
@@ -740,8 +819,11 @@ class DaemonStore:
             if row is not None:
                 terminal = row["state"] in TERMINAL_ITEM_STATES
                 changed = (row["title"], row["body"]) != (item.title, item.body)
-                if not (terminal and changed):
+                if not terminal:
                     return False
+                if not changed:
+                    self._requeue_terminal_row(str(row["item_id"]), str(row["state"]), now)
+                    return True
                 log.debug(
                     "store.item_superseded",
                     item=row["item_id"],
@@ -772,13 +854,22 @@ class DaemonStore:
                 if item.requested_by
                 else (str(requester["requester_id"]) if requester is not None else None)
             )
+            # A row created here is not necessarily a first-ever attempt:
+            # every non-finish path deletes the row (a lost claim race, a
+            # trigger label that went away, a repo-less row discovery
+            # re-creates, a superseded terminal row), so the branch and PR
+            # the last attempt pushed are recovered from the durable side
+            # table — and failing that from the run history — instead of
+            # being lost with the row (#600).
+            item_id = normalize_item_id(item.item_id)
+            prior = self._recover_prior(item.source_key, repo, item_id)
             self._conn.execute(
                 "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
                 "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by, "
-                "repo) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?)",
+                "repo, prior_run_id, prior_branch, prior_pr_number) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    normalize_item_id(item.item_id),
+                    item_id,
                     item.source_key,
                     item.title,
                     item.body,
@@ -787,10 +878,264 @@ class DaemonStore:
                     now,
                     requested_by,
                     repo,
+                    prior.run_id if prior else None,
+                    prior.branch if prior else None,
+                    prior.pr_number if prior else None,
                 ),
             )
             self._conn.commit()
+            if prior is not None:
+                log.info(
+                    "store.prior_attempt_recovered",
+                    item=item_id,
+                    prior_run=prior.run_id,
+                    prior_branch=prior.branch,
+                    prior_pr=prior.pr_number,
+                    reason="work item row was re-created; prior pushed work carried onto it",
+                )
             return True
+
+    # -- prior attempts (durable across row deletion) -------------------------
+
+    def _read_prior_side(self, source_key: str, repo: str) -> PriorAttempt | None:
+        """The recorded prior attempt for (issue, repository) from the side
+        table, with the pre-multi-repo ``repo = ''`` row as a fallback.
+        Called with the lock held."""
+        row = self._conn.execute(
+            "SELECT run_id, branch, pr_number FROM daemon_prior_attempts "
+            "WHERE source_key = ? AND repo IN (?, '') ORDER BY repo = ? DESC LIMIT 1",
+            (source_key, repo, repo),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["run_id"] is None and row["branch"] is None and row["pr_number"] is None:
+            return None
+        pr = row["pr_number"]
+        return PriorAttempt(
+            run_id=row["run_id"],
+            branch=row["branch"],
+            pr_number=int(pr) if pr is not None else None,
+        )
+
+    def _write_prior_side(
+        self,
+        source_key: str,
+        repo: str,
+        *,
+        run_id: str | None,
+        branch: str | None,
+        pr_number: int | None,
+    ) -> None:
+        """Remember the prior attempt outside the work-item row, so deleting
+        that row (discard, drop_repoless, supersede) cannot take it with it.
+        Fields left None keep whatever is already recorded. Called with the
+        lock held."""
+        if run_id is None and branch is None and pr_number is None:
+            return
+        self._conn.execute(
+            "INSERT INTO daemon_prior_attempts (source_key, repo, run_id, branch, pr_number, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, 0) ON CONFLICT(source_key, repo) DO UPDATE SET "
+            "run_id = COALESCE(excluded.run_id, daemon_prior_attempts.run_id), "
+            "branch = COALESCE(excluded.branch, daemon_prior_attempts.branch), "
+            "pr_number = COALESCE(excluded.pr_number, daemon_prior_attempts.pr_number)",
+            (source_key, repo, run_id, branch, pr_number),
+        )
+
+    def _recover_prior(self, source_key: str, repo: str, item_id: str) -> PriorAttempt | None:
+        """What a re-created row's item last pushed to origin: the side
+        table first, then the engine's own run history for the same issue —
+        the recovery :meth:`_requeue_terminal_row` does for a row written
+        before the ``prior_*`` columns existed. Called with the lock held."""
+        prior = self._read_prior_side(source_key, repo)
+        run_id = prior.run_id if prior else None
+        branch = prior.branch if prior else None
+        pr_number = prior.pr_number if prior else None
+        if run_id is None:
+            runs = self._conn.execute(
+                "SELECT run_id FROM daemon_runs WHERE item_id IN (?, ?) "
+                "ORDER BY started_at DESC LIMIT 1",
+                _id_variants(item_id),
+            ).fetchone()
+            run_id = str(runs["run_id"]) if runs else None
+        if run_id is None:
+            return prior
+        branch, pr_number = self._fill_artifacts(run_id, branch, pr_number)
+        return PriorAttempt(run_id=run_id, branch=branch, pr_number=pr_number)
+
+    def _fill_artifacts(
+        self, run_id: str, branch: str | None, pr_number: int | None
+    ) -> tuple[str | None, int | None]:
+        """Fill in whatever branch/PR is missing for ``run_id`` from the
+        engine's run record and the merge-gate row. Called with the lock
+        held."""
+        if branch is None or pr_number is None:
+            recorded = self._run_artifacts(run_id)
+            if recorded is not None:
+                branch = branch or recorded[0]
+                pr_number = pr_number if pr_number is not None else recorded[1]
+        if branch is None or pr_number is None:
+            gate = self._conn.execute(
+                "SELECT branch, pr_number FROM daemon_merge_gates WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if gate is not None:
+                branch = branch or gate["branch"]
+                pr_number = pr_number if pr_number is not None else gate["pr_number"]
+        return branch, int(pr_number) if pr_number is not None else None
+
+    def _requeue_terminal_row(self, item_id: str, previous_state: str, now: float) -> None:
+        """Put a finished row back in the queue because a human re-applied
+        the trigger label (#600). Called with the lock held.
+
+        The row keeps its identity, history and requester; only the
+        dispatch bookkeeping is reset. Whatever the finished attempt left
+        on origin is preserved in the ``prior_*`` columns — its own run id
+        if it had one, otherwise the last run it was ever dispatched under
+        — and an already recorded prior attempt is never overwritten with
+        nothing.
+        """
+        prior_run = self._conn.execute(
+            "SELECT source_key, repo, run_id, prior_run_id, prior_branch, prior_pr_number "
+            "FROM daemon_work_items WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+        source_key = str(prior_run["source_key"]) if prior_run else ""
+        repo = str(prior_run["repo"] or "") if prior_run else ""
+        # The side table is the durable copy: a row that was discarded and
+        # re-created has no prior_* of its own to read (#600).
+        side = self._read_prior_side(source_key, repo) if source_key else None
+        run_id = (
+            (prior_run["run_id"] if prior_run else None)
+            or (prior_run["prior_run_id"] if prior_run else None)
+            or (side.run_id if side else None)
+        )
+        if run_id is None:
+            runs = self._conn.execute(
+                "SELECT run_id FROM daemon_runs WHERE item_id IN (?, ?) "
+                "ORDER BY started_at DESC LIMIT 1",
+                _id_variants(item_id),
+            ).fetchone()
+            run_id = str(runs["run_id"]) if runs else None
+        branch = (prior_run["prior_branch"] if prior_run else None) or (
+            side.branch if side else None
+        )
+        pr_number = prior_run["prior_pr_number"] if prior_run else None
+        if pr_number is None and side is not None:
+            pr_number = side.pr_number
+        if run_id is not None:
+            # A row written before the prior_* columns existed has nothing
+            # recorded, so what the attempt pushed is recovered from the
+            # engine's own run record in the same state.db (#600).
+            branch, pr_number = self._fill_artifacts(run_id, branch, pr_number)
+        if source_key:
+            self._write_prior_side(
+                source_key, repo, run_id=run_id, branch=branch, pr_number=pr_number
+            )
+        self._conn.execute(
+            "UPDATE daemon_work_items SET state = 'queued', claimed = 0, run_id = NULL, "
+            "last_error = NULL, attempts = 0, not_before = NULL, claim_token = NULL, "
+            "pending_report = NULL, prior_run_id = ?, prior_branch = ?, prior_pr_number = ?, "
+            "updated_at = ? WHERE item_id = ?",
+            (run_id, branch, pr_number, now, item_id),
+        )
+        self._conn.commit()
+        log.info(
+            "store.item_requeued_by_label",
+            item=item_id,
+            previous_state=previous_state,
+            prior_run=run_id,
+            prior_branch=branch,
+            prior_pr=pr_number,
+            reason="trigger label re-applied to an unchanged issue",
+        )
+
+    def _run_artifacts(self, run_id: str) -> tuple[str | None, int | None] | None:
+        """The branch and PR the engine recorded for ``run_id`` in the
+        shared ``state.db``, or None when there is nothing to read: no
+        ``runs`` table (a daemon store without an engine history yet), a
+        pre-1.0 ``runs`` shape with no PR columns, or no such run. Never
+        raises — a restart with no recoverable artifact just starts fresh.
+        """
+        if "runs" not in _tables(self._conn):
+            return None
+        columns = _columns(self._conn, "runs")
+        if "branch" not in columns and "pr_number" not in columns:
+            return None
+        select = ", ".join(c for c in ("branch", "pr_number") if c in columns)
+        try:
+            row = self._conn.execute(
+                f"SELECT {select} FROM runs WHERE run_id = ?",  # nosec B608 - literals above
+                (run_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        branch = _col(row, "branch")
+        pr = _col(row, "pr_number")
+        return (str(branch) if branch else None, int(pr) if pr is not None else None)
+
+    def prior_attempt(self, item_id: str) -> PriorAttempt | None:
+        """What the item's previous attempt left on origin, if anything
+        (#600): the run id, the branch it pushed and the PR it opened. None
+        when the item has no recorded prior attempt."""
+        where, ids = _id_match(item_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT prior_run_id, prior_branch, prior_pr_number "  # nosec B608 - literal above
+                f"FROM daemon_work_items WHERE {where} LIMIT 1",
+                ids,
+            ).fetchone()
+        if row is None:
+            return None
+        if row["prior_run_id"] is None and row["prior_branch"] is None:
+            return None
+        pr = row["prior_pr_number"]
+        return PriorAttempt(
+            run_id=row["prior_run_id"],
+            branch=row["prior_branch"],
+            pr_number=int(pr) if pr is not None else None,
+        )
+
+    def record_prior_attempt(
+        self,
+        item_id: str,
+        *,
+        run_id: str | None = None,
+        branch: str | None = None,
+        pr_number: int | None = None,
+    ) -> None:
+        """Remember the branch/PR this attempt pushed to origin, so a later
+        restart of the item can continue on it (#600). Fields left None keep
+        whatever is already recorded.
+
+        Written twice: onto the work-item row (what this item reads back
+        directly) and into ``daemon_prior_attempts``, which outlives the row
+        — every path that is not a finish deletes the row, and a restart
+        that lost the branch with it would rebuild the work from scratch."""
+        where, ids = _id_match(item_id)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_work_items SET "  # nosec B608 - literal above
+                "prior_run_id = COALESCE(?, prior_run_id), "
+                "prior_branch = COALESCE(?, prior_branch), "
+                f"prior_pr_number = COALESCE(?, prior_pr_number) WHERE {where}",
+                (run_id, branch, pr_number, *ids),
+            )
+            row = self._conn.execute(
+                f"SELECT source_key, repo FROM daemon_work_items WHERE {where} "  # nosec B608
+                "LIMIT 1",
+                ids,
+            ).fetchone()
+            if row is not None:
+                self._write_prior_side(
+                    str(row["source_key"]),
+                    str(row["repo"] or ""),
+                    run_id=run_id,
+                    branch=branch,
+                    pr_number=pr_number,
+                )
+            self._conn.commit()
 
     def note_requester(
         self, source_key: str, requester_id: str, now: float, repo: str | None = None
