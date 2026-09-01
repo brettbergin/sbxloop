@@ -12,7 +12,7 @@ the host imports the exact same module, so drift is a validation error.
   jobs/<job_id>.json      # JobRequest, written by the host (sbx cp)
   events/<job_id>.jsonl   # Event stream, appended by the worker (fsync/line)
   results/<job_id>.json   # JobResult, written by the worker — AUTHORITATIVE
-  env.sh                  # plain-env secret strategy only
+  env.sh                  # env-file delivery tier only (see below)
   venv/                   # worker virtualenv (created at provision time)
 ```
 
@@ -30,6 +30,21 @@ the host imports the exact same module, so drift is a validation error.
 
 Worker exit codes: `0` result written (including error/timeout results),
 `64` usage error, `70` catastrophic (no result produced).
+
+## Credentials
+
+The worker takes credentials from its process environment first; the
+`--env-file` (`~/.sbxloop/env.sh`) is loaded underneath it (existing env
+wins, except over an sbx proxy sentinel). How they get there depends on the
+delivery tier provisioning chose (see docs/architecture.md):
+
+- **sbx secret proxy**: values never enter the VM at all.
+- **per-job stdin** (#592): the host pipes `export KEY=VALUE` lines into
+  the launch's stdin; the launch shell captures them into
+  `SBXLOOP_JOB_ENV` and the login shell evals them after its profile ran,
+  so the worker inherits them in memory — nothing at rest, nothing on any
+  argv, and no env.sh needed.
+- **env file**: the pre-#592 fallback; the worker loads it at startup.
 
 ## Job kinds
 

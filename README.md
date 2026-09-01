@@ -28,7 +28,8 @@ Both sandboxes run under sbx's **balanced network policy** (default-deny
 egress plus a curated allowlist), and tokens are injected through sbx's secret
 proxy — **credential values never enter the VM**; the host proxy substitutes
 them only on egress to their declared domains (where sbx's proxy cannot feed
-exec'd workers, a 0600 in-VM env file stands in — see
+exec'd workers, tokens are piped into each worker job over stdin — nothing at
+rest in the VM — with a 0600 in-VM env file as the last-resort fallback; see
 docs/architecture.md). Sandboxes are cattle: they are
 torn down at run end and re-provisioned on resume, while all durable state
 (workspace, SQLite checkpoints, event log) lives on the host.
@@ -1230,7 +1231,7 @@ came from. The notable knobs:
 | `model`                                                   | `auto`             | Copilot model id (`--model` overrides per run).                                                                                                                                                                                                        |
 | `state_dir`                                               | `~/.sbxloop`       | Runs, workspaces, artifacts, SQLite state, event logs.                                                                                                                                                                                                 |
 | `keep_sandboxes` / `keep_on_failure`                      | `false`            | Sandbox retention for debugging (see above).                                                                                                                                                                                                           |
-| `secret_strategy`                                         | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` writes an in-VM env file.                                                                                                                                                                        |
+| `secret_strategy`                                         | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` skips the sbx proxy — tokens are piped per job over worker stdin when this sbx supports it, else written to an in-VM env file.                                                                   |
 | `[sandbox] template`                                      | unset              | Baked template ref from `sbxloop bake`.                                                                                                                                                                                                                |
 | `[sandbox] workspace`                                     | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                                                                                                                                                                |
 | `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                                                                                                |

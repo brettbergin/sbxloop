@@ -173,14 +173,19 @@ class SbxCLI:
             raise self._error_for(result)
         return result
 
-    def popen(self, *args: str) -> subprocess.Popen[str]:
-        """Start a streaming sbx invocation (stdout piped, line-buffered)."""
+    def popen(self, *args: str, stdin_pipe: bool = False) -> subprocess.Popen[str]:
+        """Start a streaming sbx invocation (stdout piped, line-buffered).
+
+        ``stdin_pipe`` opens a writable stdin pipe the caller owns (write,
+        then close — per-job env delivery); the default stays DEVNULL so a
+        long-lived stream never holds the TTY.
+        """
         log.debug("sbx.popen", command=_command_of(args), argv=redacted_argv(self.argv(*args)))
         argv = self.argv(*args)
         try:
             return subprocess.Popen(  # nosec B603 - list argv, sbx CLI, no shell
                 argv,
-                stdin=subprocess.DEVNULL,  # long-lived: must not hold the TTY
+                stdin=subprocess.PIPE if stdin_pipe else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -219,14 +224,18 @@ class SbxCLI:
         cmd: Sequence[str],
         *,
         timeout: float | None = None,
+        stdin: str | None = None,
     ) -> ExecResult:
         """Run a command inside a sandbox; the inner exit code is returned,
         but recognizable sbx-level failures (missing sandbox, sandbox not
         running, daemon down) raise so callers never mistake infra trouble
         for the command's own answer. Unrecognized sbx failures still come
         back as a nonzero ExecResult — decision points that act on a nonzero
-        result must stay conservative about that ambiguity (#63)."""
-        result = self.run("exec", name, *cmd, timeout=timeout, check=False)
+        result must stay conservative about that ambiguity (#63).
+
+        ``stdin`` is piped to the in-sandbox command (per-job env delivery);
+        it never appears on the argv, in the ExecResult, or in logs."""
+        result = self.run("exec", name, *cmd, timeout=timeout, check=False, stdin=stdin)
         if not result.ok and _exec_failed_at_sbx_level(result.stderr):
             raise self._error_for(result)
         return result

@@ -13,10 +13,16 @@ The credential split is enforced here:
   integration is configured (``[github].repo``); otherwise runs have no
   GitHub capability and no GitHub credential is required.
 
-The ``plain-env`` fallback strategy writes tokens to ``~/.sbxloop/env.sh``
-inside the sandbox (weaker: the value is visible in the VM) for environments
-where the experimental ``set-custom`` proxy rewriting is unavailable. Under
-the default ``proxy`` strategy the env file is also chosen directly — no
+When the proxy cannot deliver, non-proxy delivery has two tiers, chosen by
+the ``exec-stdin-env`` field probe (#592, verdict cached per sbx version):
+**per-job stdin** — WorkerClient pipes each job's exports into the launch
+shell's stdin via :meth:`Provisioner.job_env`, so the value transits worker
+process memory only, never the sandbox filesystem — and, when this sbx does
+not pass exec stdin through, the ``~/.sbxloop/env.sh`` file inside the
+sandbox (weaker: the value is at rest in the VM). The ``plain-env``
+strategy selects non-proxy delivery explicitly, for environments where the
+experimental ``set-custom`` proxy rewriting is unavailable. Under the
+default ``proxy`` strategy non-proxy delivery is also chosen directly — no
 doomed registration, no probe, no per-run warning — when either
 
 - the conformance cache already knows this sbx version leaves proxy secrets
@@ -59,10 +65,14 @@ from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
+    PROBE_EXEC_STDIN_ENV,
     PROBE_SECRET_ENV_VISIBILITY,
     PROBE_WORKSPACE_MOUNT,
+    VERDICT_STDIN_DELIVERS,
+    VERDICT_STDIN_NO_DELIVERY,
     load_verdicts,
     record_field_verdict,
+    stdin_env_probe,
 )
 from sbxloop.sbx.models import SandboxRole, SandboxSpec, SecretSpec
 from sbxloop.sbx.pair import SandboxPair
@@ -1051,12 +1061,18 @@ class Provisioner:
         """Whether the conformance cache already says this sbx version's
         proxy secrets never reach exec'd workers — in which case the
         register→probe→downgrade dance (and its per-run warning) is skipped
-        and the env file is used directly. Unknown or unreadable answers
-        count as "not known broken", so a new sbx version is probed exactly
-        as before and the cache re-learns per version. Read fresh on every
-        provision (only the sbx version lookup is memoized): a long-lived
-        daemon whose first provision recorded the verdict benefits on its
-        next re-provision, not its next restart."""
+        and the non-proxy delivery is used directly. Unknown or unreadable
+        answers count as "not known broken", so a new sbx version is probed
+        exactly as before and the cache re-learns per version."""
+        verdict = self._cached_verdict(PROBE_SECRET_ENV_VISIBILITY)
+        return verdict is not None and verdict in _PROXY_BROKEN_VERDICTS
+
+    def _cached_verdict(self, probe_id: str) -> str | None:
+        """The conformance cache's verdict for this sbx version, or None.
+
+        Read fresh on every call (only the sbx version lookup is memoized):
+        a long-lived daemon whose first provision recorded a verdict
+        benefits on its next re-provision, not its next restart."""
         try:
             with self._probe_lock:
                 if not self._sbx_version_known:
@@ -1064,9 +1080,51 @@ class Provisioner:
                     self._sbx_version_known = True
                 version = self._sbx_version
         except SbxError:
-            return False  # undecided, not cached: probe as before
-        record = load_verdicts(self.config.state_dir, version).get(PROBE_SECRET_ENV_VISIBILITY)
-        return record is not None and record.verdict in _PROXY_BROKEN_VERDICTS
+            return None  # undecided, not cached: probe as before
+        record = load_verdicts(self.config.state_dir, version).get(probe_id)
+        return record.verdict if record is not None else None
+
+    def _stdin_env_supported(self, sandbox: Sandbox) -> bool:
+        """Whether per-job stdin env delivery works on this sbx (#592).
+
+        Answered from the version-keyed conformance cache when it can be;
+        otherwise one field probe against ``sandbox`` exercises the exact
+        launch shape WorkerClient uses and records the verdict. An sbx-level
+        error is retried once and then answers False *without* recording —
+        an infra blip must never cache "no stdin" (or worse, leave a version
+        marked capable that never was), it just costs this provision the
+        env-file path.
+        """
+        cached = self._cached_verdict(PROBE_EXEC_STDIN_ENV)
+        if cached == VERDICT_STDIN_DELIVERS:
+            return True
+        if cached == VERDICT_STDIN_NO_DELIVERY:
+            return False
+        nonce = secrets.token_hex(8)
+        cmd, payload, marker = stdin_env_probe(nonce)
+        error = ""
+        for _attempt in range(2):
+            try:
+                result = sandbox.exec(cmd, stdin=payload, timeout=60.0)
+            except SbxError as exc:
+                error = str(exc)
+                continue
+            break
+        else:
+            log.warning(
+                "sandbox.stdin_env_probe_error",
+                sandbox=sandbox.name,
+                error=error,
+                action="using the in-VM env file for this provision",
+            )
+            return False
+        delivered = result.ok and marker in result.stdout
+        self._record_probe(
+            PROBE_EXEC_STDIN_ENV,
+            VERDICT_STDIN_DELIVERS if delivered else VERDICT_STDIN_NO_DELIVERY,
+            f"observed while provisioning {sandbox.name}",
+        )
+        return delivered
 
     def _apply_env_file_only(
         self,
@@ -1076,22 +1134,31 @@ class Provisioner:
         token: str,
         reason: EnvFileReason,
     ) -> None:
-        """Deliver credentials via the in-VM env file, saying why.
+        """Deliver credentials without the sbx secret proxy, saying why.
 
-        ``strategy`` (explicit plain-env config) stays silent, exactly as
-        before. ``cached`` emits the same ``sandbox.secret_env_fallback``
-        event the probe-driven downgrade emits — the semantic is identical,
-        the decision just came from the conformance cache — but calmly
-        (info log, ``cached=True``) rather than as a per-run warning.
-        ``app`` announces the App identity once per sandbox.
+        Delivery itself is decided by :meth:`_deliver_env` (#592): per-job
+        stdin when this sbx version passes exec stdin through (nothing at
+        rest in the VM), the 0600 in-VM env file otherwise. ``strategy``
+        (explicit plain-env config) stays silent, exactly as before.
+        ``cached`` emits the same ``sandbox.secret_env_fallback`` event the
+        probe-driven downgrade emits — the semantic is identical, the
+        decision just came from the conformance cache — but calmly (info
+        log, ``cached=True``) rather than as a per-run warning. ``app``
+        announces the App identity once per sandbox.
         """
-        self._apply_plain_env(spec, sandbox, token)
+        delivery = self._deliver_env(spec, sandbox, token)
+        via_file = delivery == "env-file"
         env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
+        how = (
+            "using the in-VM env file directly"
+            if via_file
+            else "delivering it per job over the worker launch's stdin (nothing at rest in the VM)"
+        )
         if reason == "cached":
             message = (
                 f"{env_name}: sbx proxy secrets are invisible under exec on this sbx "
-                "version (cached conformance verdict) — using the in-VM env file "
-                'directly (secret_strategy="plain-env" silences this)'
+                f'version (cached conformance verdict) — {how} (secret_strategy="plain-env" '
+                "silences this)"
             )
             log.info(
                 "sandbox.secret_env_fallback",
@@ -1099,6 +1166,7 @@ class Provisioner:
                 sandbox=spec.name,
                 env=env_name,
                 cached=True,
+                delivery=delivery,
                 detail=message,
             )
             self.bus.emit(
@@ -1107,17 +1175,41 @@ class Provisioner:
                 name=spec.name,
                 env=env_name,
                 cached=True,
+                delivery=delivery,
                 message=message,
             )
         elif reason == "app":
+            refresh_home = "in the in-VM env file" if via_file else "on the host, per job"
             message = (
                 "github sandbox authenticates as a GitHub App installation; the host "
-                "mints short-lived installation tokens and refreshes them in the "
-                "in-VM env file"
+                f"mints short-lived installation tokens and refreshes them {refresh_home}"
             )
             log.info("sandbox.github_app_auth", run=run_id, sandbox=spec.name, detail=message)
-            self.bus.emit("sandbox.github_app_auth", run_id, name=spec.name, message=message)
-        self._verify_env_file_unshadowed(run_id, spec, sandbox)
+            self.bus.emit(
+                "sandbox.github_app_auth",
+                run_id,
+                name=spec.name,
+                delivery=delivery,
+                message=message,
+            )
+        if via_file:
+            # Only file delivery can lose to a stamped exec environment; a
+            # per-job eval runs after the login shell's profile and wins.
+            self._verify_env_file_unshadowed(run_id, spec, sandbox)
+
+    def _deliver_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> str:
+        """Choose and apply non-proxy credential delivery; returns the mode.
+
+        ``"stdin"``: this sbx version passes exec stdin through to the in-VM
+        launch shell (field-probed, verdict cached per version), so nothing
+        is written — every job's exports are piped fresh by WorkerClient
+        (see :meth:`job_env`) and the credential never touches the sandbox
+        filesystem. ``"env-file"``: today's 0600 in-VM env file, unchanged.
+        """
+        if self._stdin_env_supported(sandbox):
+            return "stdin"
+        self._apply_plain_env(spec, sandbox, token)
+        return "env-file"
 
     def _purge_stale_registrations(self, spec: SandboxSpec) -> None:
         """Remove secret registrations parked at this sandbox's name (#576).
@@ -1297,31 +1389,38 @@ class Provisioner:
         )
         if result.ok:
             return
-        # Auto-heal: fall back to the plain-env file for this sandbox. The
-        # token value becomes visible inside the microVM (which the agent
-        # already controls); egress remains bounded by the network policy.
+        # Auto-heal: fall back to non-proxy delivery for this sandbox —
+        # per-job stdin when this sbx passes it through (the value transits
+        # worker process memory only), the plain-env file otherwise (the
+        # value becomes visible inside the microVM, which the agent already
+        # controls). Egress remains bounded by the network policy either way.
         seen = (
             "sbx proxy secret is a sentinel under exec, which no GitHub client accepts"
             if sentinel
             else "sbx proxy secret invisible to exec"
         )
-        message = (
-            f'{env_name}: {seen} — using in-VM env file (secret_strategy="plain-env" silences this)'
+        delivery = self._deliver_env(spec, sandbox, token)
+        how = (
+            "using in-VM env file"
+            if delivery == "env-file"
+            else "delivering per job over the worker launch's stdin"
         )
+        message = f'{env_name}: {seen} — {how} (secret_strategy="plain-env" silences this)'
         # A security-relevant downgrade, not routine progress.
         log.warning(
             "sandbox.secret_env_fallback",
             run=run_id,
             sandbox=spec.name,
             env=env_name,
+            delivery=delivery,
             detail=message,
         )
-        self._apply_plain_env(spec, sandbox, token)
         self.bus.emit(
             "sandbox.secret_env_fallback",
             run_id,
             name=spec.name,
             env=env_name,
+            delivery=delivery,
             message=message,
         )
 
@@ -1447,16 +1546,22 @@ class Provisioner:
         """A hook keeping a live github sandbox's credential fresh (App mode).
 
         ``None`` for PAT credentials — nothing to refresh, zero per-job
-        overhead. For a GitHub App, the returned callable is what
-        WorkerClient invokes before each job: when the cached installation
-        token is inside its refresh margin it re-mints and rewrites the
-        in-VM env file, so the job's worker process (spawned per job; loads
-        the env file at startup) authenticates with a live token. This is
-        what lets a run — or the daemon's long-lived polling sandbox —
-        outlive the ~1 hour installation token lifetime (#568).
+        overhead — and under per-job stdin delivery (#592): there the token
+        never lives in the VM at all, and :meth:`job_env`'s provider calls
+        ``cred.token()`` per job, which re-mints inside the refresh margin
+        by itself. For a GitHub App on the env-file path, the returned
+        callable is what WorkerClient invokes before each job: when the
+        cached installation token is inside its refresh margin it re-mints
+        and rewrites the in-VM env file, so the job's worker process
+        (spawned per job; loads the env file at startup) authenticates with
+        a live token. This is what lets a run — or the daemon's long-lived
+        polling sandbox — outlive the ~1 hour installation token lifetime
+        (#568).
         """
         cred = self.gh_credential(repo)
         if not isinstance(cred, GhApp):
+            return None
+        if self._cached_verdict(PROBE_EXEC_STDIN_ENV) == VERDICT_STDIN_DELIVERS:
             return None
         persistent = self.github_repo_env(repo)
 
@@ -1468,3 +1573,49 @@ class Provisioner:
             log.info("github.app_token_refreshed", sandbox=sandbox.name)
 
         return refresh
+
+    def job_env(
+        self,
+        role: SandboxRole,
+        repo: str | None = None,
+        *,
+        sandbox: Sandbox | None = None,
+    ) -> Callable[[], dict[str, str]] | None:
+        """A per-job env provider for stdin delivery, or ``None`` (#592).
+
+        ``None`` means this sandbox's credentials arrive another way — the
+        sbx secret proxy, or the in-VM env file — and WorkerClient launches
+        jobs exactly as before. A provider is returned only when both hold:
+
+        - the sandbox's credentials do not go through the sbx proxy (the
+          same :meth:`_env_file_reason` decision provisioning made), and
+        - this sbx version passes exec stdin through to the launch shell
+          (the ``exec-stdin-env`` verdict, normally cached by the provision
+          that just ran; ``sandbox`` lets a caller reusing a long-lived box
+          across a wiped cache re-probe instead of silently losing auth).
+
+        The provider computes exports fresh per job — ``cred.token()``
+        re-mints an App installation token inside its refresh margin — so
+        rotating credentials need nothing rewritten anywhere.
+        """
+        gh_cred = self.gh_credential(repo) if role == "github" else None
+        if self._env_file_reason(role, gh_cred) is None:
+            return None
+        supported = (
+            self._stdin_env_supported(sandbox)
+            if sandbox is not None
+            else self._cached_verdict(PROBE_EXEC_STDIN_ENV) == VERDICT_STDIN_DELIVERS
+        )
+        if not supported:
+            return None
+        if role == "agent":
+            return lambda: {COPILOT_TOKEN_ENV: self.copilot_token()}
+        cred = gh_cred
+        assert cred is not None
+        persistent = self.github_repo_env(repo)
+
+        def provide() -> dict[str, str]:
+            token = cred.token()
+            return {**persistent, "GH_TOKEN": token, "GITHUB_TOKEN": token}
+
+        return provide

@@ -27,7 +27,7 @@ import shlex
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import sbxloop
@@ -41,6 +41,7 @@ from sbxloop.sbx.sandbox import (
     BAKE_MANIFEST,
     ENV_FILE,
     EVENTS_DIR,
+    JOB_ENV_VAR,
     JOBS_DIR,
     RESULTS_DIR,
     TOOLS_DIR,
@@ -154,6 +155,7 @@ class WorkerClient:
         role: str | None = None,
         limits: Limits | None = None,
         credential_refresh: Callable[[], None] | None = None,
+        job_env: Callable[[], Mapping[str, str]] | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.bus = bus or EventBus()
@@ -177,6 +179,12 @@ class WorkerClient:
         # installation token nears expiry, so this job's worker process
         # starts with a live credential. See Provisioner.gh_refresher.
         self.credential_refresh = credential_refresh
+        # Per-job stdin env delivery (#592): when set, each job's exports are
+        # computed fresh and piped into the launch shell's stdin, so
+        # credentials are never at rest on the sandbox filesystem. See
+        # Provisioner.job_env — None means the sandbox's credentials arrive
+        # another way (sbx secret proxy, or the env-file fallback).
+        self.job_env = job_env
         # job_id -> agent persona (planner, executor, ...) supplied at
         # submit(); stamped onto that job's agent.* events so the transcript
         # can say who is speaking (the worker doesn't know which phase it
@@ -720,7 +728,19 @@ class WorkerClient:
         # sbx injects secrets through the sandbox session/profile machinery;
         # a bare exec'd process may not see them. Run the worker under a
         # login shell so the sandbox environment is fully loaded.
-        wrapped = ["sh", "-lc", shlex.join(argv)]
+        payload = self._env_payload()
+        if payload is None:
+            wrapped = ["sh", "-lc", shlex.join(argv)]
+        else:
+            # Per-job stdin env delivery (#592): the login shell evals the
+            # delivered exports AFTER its profile ran, so they beat anything
+            # the profile stamped (a stale sbx sentinel included) and the
+            # values never touch the sandbox filesystem or any argv.
+            wrapped = [
+                "sh",
+                "-lc",
+                f'eval "${JOB_ENV_VAR}"; unset {JOB_ENV_VAR}; exec {shlex.join(argv)}',
+            ]
         deadline = time.monotonic() + job.timeout_s + self.grace_s
         started = time.monotonic()
         log.info(
@@ -734,10 +754,10 @@ class WorkerClient:
             cwd=job.cwd,
         )
         if self.transport == "poll":
-            self._run_poll(job, wrapped, events_path, result_path, deadline)
+            self._run_poll(job, wrapped, events_path, result_path, deadline, payload)
             diagnostics = ""
         else:
-            diagnostics = self._run_stream(job, wrapped, deadline)
+            diagnostics = self._run_stream(job, wrapped, deadline, payload)
         result = self._fetch_result(job, result_path, events_path, diagnostics)
         log.info(
             "worker.job_done",
@@ -751,12 +771,42 @@ class WorkerClient:
         )
         return result
 
+    def _env_payload(self) -> str | None:
+        """The `export KEY=VALUE` lines to pipe into this job's launch, or
+        None when no per-job env delivery is configured. Computed fresh per
+        job so a rotating credential (App installation tokens) is always
+        live without anything to rewrite in the VM."""
+        if self.job_env is None:
+            return None
+        exports = self.job_env()
+        if not exports:
+            return None
+        return "".join(
+            f"export {key}={shlex.quote(value)}\n" for key, value in sorted(exports.items())
+        )
+
     # -- stream transport --------------------------------------------------
 
-    def _run_stream(self, job: JobRequest, argv: list[str], deadline: float) -> str:
+    def _run_stream(
+        self, job: JobRequest, argv: list[str], deadline: float, payload: str | None = None
+    ) -> str:
         """Run the worker via a blocking exec; returns diagnostics (exit code
         + stderr tail) for the no-result failure path."""
-        proc = self.sandbox.exec_stream(argv)
+        if payload is None:
+            proc = self.sandbox.exec_stream(argv)
+        else:
+            # The outer plain shell captures ALL of stdin before the login
+            # shell (argv) starts, so the worker never contends for the pipe.
+            outer = f'{JOB_ENV_VAR}="$(cat)" exec {shlex.join(argv)}'
+            proc = self.sandbox.exec_stream(["sh", "-c", outer], stdin_pipe=True)
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(payload)
+                proc.stdin.close()
+            except OSError:
+                # A launch that died before reading its stdin surfaces
+                # through the normal no-result diagnostics below.
+                log.debug("worker.env_pipe_broken", job=job.job_id, sandbox=self.sandbox.name)
         lines: queue.Queue[str | None] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=50)
 
@@ -846,9 +896,21 @@ class WorkerClient:
         events_path: str,
         result_path: str,
         deadline: float,
+        payload: str | None = None,
     ) -> None:
         quoted = shlex.join(argv)
-        launch = self.sandbox.exec(["sh", "-c", f"nohup {quoted} >/dev/null 2>&1 & echo $!"])
+        if payload is None:
+            script = f"nohup {quoted} >/dev/null 2>&1 & echo $!"
+        else:
+            # The foreground `$(cat)` consumes ALL of stdin before nohup
+            # detaches (a prefix assignment on the `&` command would run the
+            # substitution in the async subshell and race the closing pipe);
+            # the env travels to the login shell by inheritance, never disk.
+            script = (
+                f'{JOB_ENV_VAR}="$(cat)"; export {JOB_ENV_VAR}; '
+                f"nohup {quoted} >/dev/null 2>&1 & echo $!"
+            )
+        launch = self.sandbox.exec(["sh", "-c", script], stdin=payload)
         if not launch.ok:
             log.warning(
                 "worker.launch_failed",

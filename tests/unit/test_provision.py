@@ -1576,3 +1576,113 @@ class TestBotLoginResolution:
             config=config,
         )
         assert provisioner.gh_bot_login("owner/repo") is None
+
+
+class TestStdinEnvDelivery:
+    """Per-job stdin secret delivery (#592): when the exec-stdin-env probe
+    passes, non-proxy credential delivery skips the in-VM env file entirely
+    and WorkerClient pipes exports per job via Provisioner.job_env."""
+
+    def _provision(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        *,
+        stdin_ok: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[Provisioner, list[Event]]:
+        if stdin_ok:
+            monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        # no cleanup: the assertions below inspect the fake sandbox fs, which
+        # `sbx rm` would delete; tmp_path reaps everything anyway
+        provisioner.ensure_pair("r1")
+        return provisioner, events
+
+    def _env_files(self, fake_sbx: FakeSbx) -> list[Path]:
+        return [
+            fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/env.sh"
+            for name in ("sbxloop-r1-agent", "sbxloop-r1-github")
+        ]
+
+    def test_fallback_delivers_via_stdin_when_probe_passes(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Proxy invisible + stdin passes through: the downgrade event still
+        fires, but no token value is ever written into the VM."""
+        _provisioner, events = self._provision(
+            fake_sbx, tmp_path, stdin_ok=True, monkeypatch=monkeypatch
+        )
+        fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+        assert sorted(e.data["env"] for e in fallback) == ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"]
+        assert all(e.data["delivery"] == "stdin" for e in fallback)
+        for env_file in self._env_files(fake_sbx):
+            if env_file.exists():
+                content = env_file.read_text()
+                assert all(token not in content for token in TOKENS.values())
+        # the verdict is cached for this sbx version
+        from sbxloop.sbx.conformance import PROBE_EXEC_STDIN_ENV, load_verdicts
+
+        record = load_verdicts(tmp_path / "state", "0.38.0").get(PROBE_EXEC_STDIN_ENV)
+        assert record is not None and record.verdict == "delivers"
+
+    def test_fallback_writes_env_file_when_probe_fails(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No stdin passthrough (the fake's default): exactly today's
+        env-file behavior, and job_env offers no provider."""
+        provisioner, events = self._provision(
+            fake_sbx, tmp_path, stdin_ok=False, monkeypatch=monkeypatch
+        )
+        fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
+        assert fallback and all(e.data["delivery"] == "env-file" for e in fallback)
+        agent_env = self._env_files(fake_sbx)[0]
+        assert agent_env.is_file()
+        assert TOKENS["COPILOT_GITHUB_TOKEN"] in agent_env.read_text()
+        assert provisioner.job_env("agent") is None
+        assert provisioner.job_env("github", "owner/repo") is None
+
+    def test_job_env_providers_after_stdin_provision(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provisioner, _ = self._provision(fake_sbx, tmp_path, stdin_ok=True, monkeypatch=monkeypatch)
+        agent = provisioner.job_env("agent")
+        assert agent is not None
+        assert agent() == {"COPILOT_GITHUB_TOKEN": TOKENS["COPILOT_GITHUB_TOKEN"]}
+        github = provisioner.job_env("github", "owner/repo")
+        assert github is not None
+        exports = github()
+        assert exports["GH_TOKEN"] == TOKENS["GH_TOKEN"]
+        assert exports["GITHUB_TOKEN"] == TOKENS["GH_TOKEN"]
+        assert exports["GH_REPO"] == "owner/repo"
+
+    def test_job_env_is_none_when_proxy_works(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A visible proxy secret keeps the token out of the VM entirely —
+        stdin delivery must not activate on top of it."""
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        # the shadow/visibility probes classify what the shell sees; export
+        # a token-shaped value so the proxy counts as working
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_visible")
+        monkeypatch.setenv("GH_TOKEN", "github_pat_visible")
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1")
+        assert provisioner.job_env("agent") is None
+        assert provisioner.job_env("github", "owner/repo") is None
+
+    def test_gh_refresher_is_none_under_stdin_delivery(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """App mode + stdin delivery: nothing in the VM to refresh — the
+        job_env provider re-mints per job through the token source."""
+        from sbxloop.sbx.conformance import VERDICT_STDIN_DELIVERS
+        from sbxloop.sbx.sandbox import Sandbox as _Sandbox
+
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        monkeypatch.setattr(provisioner, "_cached_verdict", lambda probe_id: VERDICT_STDIN_DELIVERS)
+        sandbox = _Sandbox(provisioner.cli, "sbxloop-r1-github")
+        assert provisioner.gh_refresher(sandbox, "owner/repo") is None

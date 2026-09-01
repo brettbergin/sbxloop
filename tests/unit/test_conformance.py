@@ -374,3 +374,46 @@ class TestCache:
         blocker = tmp_path / "state"
         blocker.write_text("a file where the state dir should be")
         record_field_verdict(blocker, "0.35.0", "a", "x")  # must not raise
+
+
+class TestExecStdinEnvProbe:
+    """Verdict logic for exec-stdin-env (#592) through a stub sandbox: does
+    stdin piped through `sbx exec` reach the in-VM launch shell?"""
+
+    class _StubSandbox:
+        def __init__(self, *, echo_env: bool, rc: int = 0, noise: str = "") -> None:
+            self.echo_env, self.rc, self.noise = echo_env, rc, noise
+
+        def exec(self, argv: list[str], *, stdin: str = "", **_: object) -> object:
+            from sbxloop.sbx.models import ExecResult
+
+            # A forwarding sbx delivers the payload; the marker comes back,
+            # possibly wrapped in login-profile chatter (self.noise).
+            out = ""
+            if self.echo_env and stdin:
+                value = stdin.strip().split("=", 1)[1]
+                out = f"{self.noise}{value}"
+            return ExecResult(argv=argv, returncode=self.rc, stdout=out, stderr="", duration_s=0.0)
+
+    def _run(self, sandbox: object) -> tuple[str, str]:
+        from sbxloop.sbx.conformance import ProbeContext, _probe_exec_stdin_env
+
+        ctx = ProbeContext(cli=None, sandbox=sandbox)  # type: ignore[arg-type]
+        return _probe_exec_stdin_env(ctx)
+
+    def test_forwarded_stdin_delivers(self) -> None:
+        verdict, _ = self._run(self._StubSandbox(echo_env=True))
+        assert verdict == "delivers"
+
+    def test_profile_chatter_around_the_marker_still_delivers(self) -> None:
+        verdict, _ = self._run(self._StubSandbox(echo_env=True, noise="nvm loaded\n"))
+        assert verdict == "delivers"
+
+    def test_swallowed_stdin_is_no_delivery(self) -> None:
+        verdict, detail = self._run(self._StubSandbox(echo_env=False))
+        assert verdict == "no-delivery"
+        assert "env file" in detail
+
+    def test_failing_launch_is_no_delivery(self) -> None:
+        verdict, _ = self._run(self._StubSandbox(echo_env=True, rc=1))
+        assert verdict == "no-delivery"

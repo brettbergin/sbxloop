@@ -8,6 +8,21 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Per-job stdin secret delivery** (#592). When sbx's proxy cannot feed
+  exec'd workers, credentials are no longer written at rest into the
+  sandbox as `~/.sbxloop/env.sh`: the host pipes each job's exports into
+  the worker launch's stdin, the login shell evals them *after* its
+  profile ran (so a stamped stale sentinel loses), and the value transits
+  worker process memory only — never the sandbox filesystem, never any
+  argv. Whether this sbx passes exec stdin through is a new field probe
+  (`exec-stdin-env`, cached per version, also a `doctor --deep` row); a
+  version that doesn't falls back to the 0600 env file exactly as before,
+  and `sandbox.secret_env_fallback` events now carry `delivery: "stdin" | "env-file"`. In App mode the per-job provider re-mints the
+  installation token inside its refresh margin by itself, so the hourly
+  in-VM env-file rewrite disappears on the stdin tier. The strategic fix
+  remains #46 (proxy-held secrets); this is the interim hardening under
+  today's `sbx exec` worker model.
+
 - **A persistent Approve-merge button on Discord** for the merge gate. The
   prompt carries a `discord.ui` button whose view is persistent
   (`timeout=None` + a stable `custom_id` from the gate row) and re-armed

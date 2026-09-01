@@ -541,6 +541,9 @@ class LoopEngine:
                         python=self.worker_python,
                         role="agent",
                         limits=self.config.limits,
+                        # Per-job stdin delivery when provisioning chose it;
+                        # None keeps the launch exactly as before (#592).
+                        job_env=provisioner.job_env("agent", sandbox=pair.agent),
                     )
                     github = (
                         WorkerClient(
@@ -551,9 +554,13 @@ class LoopEngine:
                             role="github",
                             limits=self.config.limits,
                             # App auth: keep the installation token fresh for
-                            # every github op; None under a PAT.
+                            # every github op; None under a PAT — and under
+                            # stdin delivery, where job_env re-mints per job.
                             credential_refresh=provisioner.gh_refresher(
                                 pair.github, self.config.github.repo
+                            ),
+                            job_env=provisioner.job_env(
+                                "github", self.config.github.repo, sandbox=pair.github
                             ),
                         )
                         if pair.github is not None
