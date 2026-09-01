@@ -155,6 +155,19 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A click on a clarifying question that lands before the posted message
+  id is resolved is now answered instead of being told the question
+  expired** (#573). `_post_choice_question` used to send the message with
+  its buttons attached and only afterwards resolve the message id and
+  register the question, so an interaction arriving in that window found
+  nothing outstanding and got the "expired — type your answer" ephemeral
+  note even though the question was brand new. The question is now
+  registered under a provisional key *before* the send, handed to the
+  view so a click can resolve through it, and rekeyed to the real message
+  id once the transport reports it (keeping the original deadline). A
+  transport that cannot report an id leaves the question answerable under
+  the provisional key rather than dropping it; a failed post drops it.
+
 - **App-auth runs no longer block on their own review threads — the
   REST/GraphQL identity split** (field runs r9t8hnv33, ry2t99za6,
   ra2k5bv6z). REST attributes an App as `sbxloop[bot]`; GraphQL reports
