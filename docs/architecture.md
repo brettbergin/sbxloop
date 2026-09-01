@@ -35,6 +35,63 @@ Two distributions ship from this repo in lockstep versions:
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
   host never installs the Copilot runtime.
 
+## Design principles
+
+Two properties are the load-bearing walls of sbxloop's security model. They are
+stated here as **invariants** — design principles that hold by construction —
+rather than as consequences a reader is expected to reconstruct from the rest of
+this document and [the worker protocol](worker-protocol.md).
+
+### 1. Host-initiated directionality
+
+Every host↔VM interaction is initiated by the host, via `sbx exec` and `sbx cp`.
+No VM can address the host or another VM.
+
+*Why it holds.* Sandboxes are provisioned with no inbound reachability and no
+route back: the host reaches in, never the reverse. The worker is a batch of
+one-shot processes the host starts and files the host reads and writes — there
+is nothing in the VM for anyone to connect to, and nothing in the VM that knows
+how to connect out to the orchestrator.
+
+*What it forbids.* In-VM listeners, sockets, daemons, or routes of any kind; any
+transport where the VM opens a connection to the host or waits to be dialed. The
+"no sockets, no servers" line in [docs/worker-protocol.md](worker-protocol.md) is
+not an implementation convenience — it is this security decision.
+
+*VM-originated requests do not violate it.* The concierge's host tools
+(`agent.session`) look like the VM calling the host, but they preserve the
+invariant exactly: the request is a **typed event appended to a log the host was
+already tailing**, and the response is a **file the host chooses to copy in**.
+The VM never initiates a connection and cannot compel a reply. The host's total
+attack surface from its least-trusted component is therefore "parse these
+versioned envelopes" — nothing more.
+
+### 2. Host mediation between the sandboxes
+
+The agent box and the github box never communicate. All traffic between them
+passes through the host.
+
+*Why it holds.* The model-driven side produces a tree; the host harvests that
+tree and then speaks to the credential-bearing side only in a closed vocabulary
+of typed `github.op` jobs. Neither box has an address for, or a route to, the
+other — the split is enforced by the same directionality invariant above.
+
+*What it forbids.* Any direct agent-box ↔ github-box channel: shared sockets,
+box-to-box networking, forwarded credentials, or a "convenience" pipe between
+the halves. The credential split is valuable because of what *stands between*
+the halves, not because the secret lives in a different VM. A direct channel
+would keep the ceremony while losing the control — a confused deputy with a
+private line to its credential.
+
+### Evaluating future proposals
+
+New transports, box-to-box channels, in-VM listeners, and tunnel-based
+alternatives are to be checked against these two principles explicitly, before
+their ergonomics are weighed. A proposal that requires the VM to be dialable, or
+that lets the two boxes talk directly, is rejected on these grounds regardless of
+how much plumbing it removes. See [docs/worker-protocol.md](worker-protocol.md)
+for the transport-level statement of the same rules.
+
 ## The security primitive: one run = two sandboxes
 
 Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`.
@@ -88,6 +145,12 @@ registration, no probe, one calm `sandbox.secret_env_fallback` event with
 `cached=true` — while an unknown (new) sbx version still registers and
 probes once, so an sbx release that fixes exec injection is picked up
 automatically (#568).
+
+Stated plainly: on current sbx the exec-visibility verdict is negative, so the
+non-proxy path is the common case, not an edge case — `proxy` names the
+strategy that is *attempted*, not the one that usually runs. Where per-job stdin
+is unavailable, that means the in-VM env file. Tracked operationally in #46;
+interim hardening in #592.
 
 ### GitHub App installation auth (#568)
 
