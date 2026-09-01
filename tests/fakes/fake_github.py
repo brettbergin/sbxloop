@@ -26,13 +26,23 @@ exactly as GitHub does. Everything else is a knob:
 - ``fail_always``: method name -> exception raised on **every** call, for
   persistent outages (checked after ``fail_once``).
 
+Failures are also ledgered. ``failed_jobs`` records one
+``(op, method, path, http_status)`` tuple per call this fake answers with a
+``GithubOpsError``, which in production is a *failed worker job*: a
+``worker.error`` event and a red chronology panel, not just a host-side
+exception (#559). An ``allow_missing`` probe (``label_lookup``, and the real
+``repo_lookup``/``ref_lookup``) resolves a miss as data and records nothing,
+so ``assert_no_failed_jobs()`` — or the ``failed_job_paths`` property — lets a
+test assert that a run's chronology carries no doomed calls.
+
 Any GithubOps method this fake does not model reaches ``_op`` and fails
 loudly rather than pretending.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -138,6 +148,10 @@ class FakeGithub(GithubOps):
         self.deleted_branches: list[str] = []
         self.ready_calls: list[str] = []
         self.raw_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        # Calls that would have failed a worker job: (op, method, path,
+        # http_status). See the module docstring.
+        self.failed_jobs: list[tuple[str, str, str, int | None]] = []
+        self._missing_ok = False
         self.checks_calls: list[str] = []
         self.pr_kwargs: dict[str, Any] = {}
         self.blob_batches: list[list[dict[str, str]]] = []
@@ -163,13 +177,45 @@ class FakeGithub(GithubOps):
 
     # -- plumbing ------------------------------------------------------------
 
+    @contextmanager
+    def _allow_missing(self) -> Iterator[None]:
+        """Answer a 404 inside as data, the way an ``allow_missing`` op does:
+        the probe is a resolved miss, not a failed worker job."""
+        previous = self._missing_ok
+        self._missing_ok = True
+        try:
+            yield
+        finally:
+            self._missing_ok = previous
+
+    def _record_failed_job(
+        self, op: str, method: str, path: str, exc: BaseException | None = None
+    ) -> None:
+        """Ledger one call whose non-2xx answer fails the worker job."""
+        status = getattr(exc, "http_status", None)
+        self.failed_jobs.append((op, method, path, status if isinstance(status, int) else None))
+
+    @property
+    def failed_job_paths(self) -> list[str]:
+        """The paths of the calls that would have failed a worker job."""
+        return [path for _, _, path, _ in self.failed_jobs]
+
+    def assert_no_failed_jobs(self) -> None:
+        """Raise unless the run's chronology is free of failed worker jobs."""
+        if self.failed_jobs:
+            calls = ", ".join(
+                f"{op} {method} {path}" + (f" (HTTP {status})" if status else "")
+                for op, method, path, status in self.failed_jobs
+            )
+            raise AssertionError(f"failed worker jobs recorded: {calls}")
+
     def _maybe_fail(self, method: str) -> None:
         exc = self.fail_once.pop(method, None)
+        if exc is None:
+            exc = self.fail_always.get(method)
         if exc is not None:
+            self._record_failed_job(method, "", method, exc)
             raise exc
-        always = self.fail_always.get(method)
-        if always is not None:
-            raise always
 
     def _op(self, op: str, params: dict[str, Any], *, timeout_s: float | None = None) -> Any:
         raise AssertionError(f"FakeGithub does not model github op {op!r} ({params})")
@@ -205,14 +251,16 @@ class FakeGithub(GithubOps):
 
     def label_lookup(self, repo: str, name: str) -> dict[str, Any] | None:
         """A repository label probe (#556): its data, or None when absent.
-        A 404 is an answer; any other failure still raises, as the real
-        ``label.get`` op does under ``allow_missing``."""
-        try:
-            data = self.raw("GET", f"/repos/{repo}/labels/{quote(name, safe='')}")
-        except GithubOpsError as exc:
-            if exc.http_status == 404:
-                return None
-            raise
+        A 404 is an answer — no failed worker job — while any other failure
+        still raises, as the real ``label.get`` op does under
+        ``allow_missing``."""
+        with self._allow_missing():
+            try:
+                data = self.raw("GET", f"/repos/{repo}/labels/{quote(name, safe='')}")
+            except GithubOpsError as exc:
+                if exc.http_status == 404:
+                    return None
+                raise
         return data if isinstance(data, dict) else None
 
     def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
@@ -245,22 +293,34 @@ class FakeGithub(GithubOps):
         self.pr_create_calls += 1
         self._maybe_fail("pr_create")
         if self.pr_created:
-            raise GithubOpsError(
+            raise self._failed(
+                "pr.create",
+                "POST",
+                f"/repos/{repo}/pulls",
+                422,
                 "github op pr.create failed: GithubOpError: gh api POST "
                 # The gh transport's field wording: no "already exists"
                 # prose, just the status (run r8tzse1qa).
                 f"/repos/{repo}/pulls failed (rc=1): gh: Validation Failed (HTTP 422)",
-                http_status=422,
             )
         self.pr_created = True
         self.pr["draft"] = draft
         return PrRef(number=self.number, url=str(self.pr["html_url"]))
+
+    def _failed(
+        self, op: str, method: str, path: str, status: int | None, message: str
+    ) -> GithubOpsError:
+        """Ledger a failed worker job and build the error to raise for it."""
+        exc = GithubOpsError(message, http_status=status)
+        self._record_failed_job(op, method, path, exc)
+        return exc
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
         if method == "GET" and path == "/user":
             if self.fail_user_lookup is not None:
+                self._record_failed_job("raw.api", method, path, self.fail_user_lookup)
                 raise self.fail_user_lookup
             return {"login": self.user_login}
         if method == "GET" and "/git/commits/" in path:
@@ -274,10 +334,13 @@ class FakeGithub(GithubOps):
             assert body is not None
             branch = str(body["ref"]).removeprefix("refs/heads/")
             if branch in self.branches:
-                raise GithubOpsError(
+                raise self._failed(
+                    "raw.api",
+                    method,
+                    path,
+                    422,
                     "github op raw.api failed: GithubOpError: gh api POST "
                     f"{path} failed (rc=1): Reference already exists (HTTP 422)",
-                    http_status=422,
                 )
             self.branches.add(branch)
             self._move_head(str(body["sha"]))
@@ -302,19 +365,27 @@ class FakeGithub(GithubOps):
             name = unquote(path.rsplit("/labels/", 1)[1])
             if name in self.labels_existing or name in self.labels_created:
                 return {"name": name}
-            raise GithubOpsError(
+            if self._missing_ok:
+                return None
+            raise self._failed(
+                "raw.api",
+                method,
+                path,
+                404,
                 "github op raw.api failed: GithubOpError: gh api GET "
                 f"{path} failed (rc=1): Not Found (HTTP 404)",
-                http_status=404,
             )
         if method == "POST" and path.endswith("/labels"):
             # Repository label creation (#517): an existing one is a 422.
             assert body is not None
             if body["name"] in self.labels_created or body["name"] in self.labels_existing:
-                raise GithubOpsError(
+                raise self._failed(
+                    "raw.api",
+                    method,
+                    path,
+                    422,
                     "github op raw.api failed: GithubOpError: gh api POST "
                     f"{path} failed (rc=1): Validation Failed: already_exists (HTTP 422)",
-                    http_status=422,
                 )
             self.labels_created.append(str(body["name"]))
             return {"name": body["name"]}
@@ -325,7 +396,9 @@ class FakeGithub(GithubOps):
             assert body is not None
             anchor = f"{body['path']}:{body['line']}"
             if anchor in self.refuse_anchors:
-                raise github_error("review_line_unresolved_422")
+                exc = github_error("review_line_unresolved_422")
+                self._record_failed_job("raw.api", method, path, exc)
+                raise exc
             assert body["commit_id"] == self.pr["head"]["sha"], "anchored to the delivered head"
             self._comment_id += 1
             self.threads.append(
@@ -384,11 +457,14 @@ class FakeGithub(GithubOps):
     ) -> SubmittedReview:
         self._maybe_fail("pr_review_create")
         if self.refuse_inline_comments and comments:
-            raise GithubOpsError(
+            raise self._failed(
+                "raw.api",
+                "POST",
+                f"/repos/{repo}/pulls/{number}/reviews",
+                422,
                 "github op raw.api failed: GithubOpError: gh api POST "
                 f"/repos/{repo}/pulls/{number}/reviews failed (rc=1): gh: "
                 "Unprocessable Entity (HTTP 422)",
-                http_status=422,
             )
         self.reviews.append((event, body, list(comments)))
         url = f"{self.pr['html_url']}#pullrequestreview-{len(self.reviews)}"

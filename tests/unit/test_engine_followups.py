@@ -344,6 +344,9 @@ class TestFilingWithExistingLabels:
         for _, _, labels in fake.issues_created:
             assert labels == ["sbxloop:follow-up"]
         assert self._label_posts(fake) == []
+        # Not merely "nothing raised": the run's chronology carries no
+        # failed worker job either (#559).
+        fake.assert_no_failed_jobs()
         assert [
             r for r in caplog.records if r.levelno >= logging.WARNING and "label" in r.getMessage()
         ] == []
@@ -354,6 +357,8 @@ class TestFilingWithExistingLabels:
         assert result.state == "merged"
         assert fake.labels_created == ["sbxloop:follow-up"]
         assert len(self._label_posts(fake)) == 1
+        # The lookup missed, but a resolved miss is data: no failed job.
+        assert fake.failed_jobs == []
         assert len(fake.issues_created) == 3
         for _, _, labels in fake.issues_created:
             assert labels == ["sbxloop:follow-up"]
