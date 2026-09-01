@@ -108,6 +108,12 @@ testable without the SDK.
 
 ## Transports
 
+Both transports are host-initiated by construction: the "no sockets, no servers"
+rule above is a security decision, not an implementation convenience. See
+[Design principles](architecture.md#design-principles) in the architecture doc —
+new transports must be evaluated against host-initiated directionality and host
+mediation between the sandboxes before anything else.
+
 - **stream** (default): one blocking `sbx exec` per job; the host parses
   stdout line-by-line onto its EventBus. Unparseable lines become
   `worker.stdout` events, never crashes.
