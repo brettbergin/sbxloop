@@ -682,7 +682,11 @@ class TestRedeliveryCollisions:
     `sbxloop deliver <run>` after a failed attempt (#223). Field run
     `rfxja288b` (#518) showed each such round paying a doomed refs POST —
     a `worker.error` panel per healthy re-delivery — before the force-move
-    that was the real operation; the ref is now looked up first."""
+    that was the real operation; the ref is now looked up first.
+
+    StubOps records calls but not failed worker jobs; the ledger assertion
+    that a healthy re-delivery leaves the chronology clean lives in
+    tests/test_fake_github_failed_jobs.py (#559)."""
 
     def test_fresh_branch_is_created_with_one_call(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
