@@ -72,6 +72,10 @@ secret_strategy = "proxy"
 # Continue existing work on this branch instead of starting fresh. Set by the
 # engine when a run is resumed after its clone was pruned; never by hand.
 # continue_branch = "sbxloop/some-run-id"
+# Whether a continue_branch that cannot be fetched is fatal. False (a resume)
+# fails the run; true (a restart continuing a previous attempt's pushed work)
+# logs why the branch was unusable and cuts a fresh one from base instead.
+# continue_branch_optional = false
 # Extra network allow rules applied to both sandboxes.
 # extra_allow_domains = []
 # Toolchains preinstalled in the agent sandbox. Empty = Python alone.

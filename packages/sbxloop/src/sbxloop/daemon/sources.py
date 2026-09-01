@@ -317,6 +317,7 @@ class GitHubIssueSource:
         number = item.source_key
         trigger = self.labels.trigger
         added_in_progress = False
+        stale: list[str] = []
         comment_id: int | None = None
         started = time.monotonic()
         log.debug("github.claim_start", item=item.item_id, repo=self.repo, trigger=trigger)
@@ -347,7 +348,7 @@ class GitHubIssueSource:
             # The daemon persisted the token before calling (#530), so a
             # crash between the comment and the persist is recoverable.
             token = item.claim_token or uuid.uuid4().hex
-            self._comment(ops, number, self._claim_body(token))
+            self._comment(ops, number, self._claim_body(token, item, names))
             claims = self._claims(ops, number, epoch)
             mine = next((c for c in claims if c.token == token), None)
             comment_id = mine.comment_id if mine else None
@@ -377,6 +378,20 @@ class GitHubIssueSource:
                 )
                 self._delete_comment_quietly(number, comment_id)
                 return False
+            # A restart-by-label (#600) arrives wearing the previous
+            # attempt's lifecycle label. Those describe a run that is over:
+            # clear the ones the GET actually showed, so the claim leaves
+            # the issue in the same shape a first-time claim does. The
+            # trigger swap keeps its ordering (in-progress on before the
+            # trigger comes off) — a crash between the two must never leave
+            # an issue that polling can no longer find.
+            stale = [
+                label
+                for label in (self.labels.failed, self.labels.blocked, self.labels.completed)
+                if label in names
+            ]
+            for label in stale:
+                self._remove_label(ops, number, label)
             self._add_labels(ops, number, [self.labels.in_progress, *self.extra_labels])
             added_in_progress = True
             self._remove_label(ops, number, trigger)
@@ -396,6 +411,11 @@ class GitHubIssueSource:
                     self._guard(
                         "claim rollback",
                         partial(self._remove_label, number=number, label=added),
+                    )
+                if stale:
+                    self._guard(
+                        "claim rollback",
+                        partial(self._add_labels, number=number, labels=stale),
                     )
             self._delete_comment_quietly(number, comment_id)
             return False
@@ -422,12 +442,52 @@ class GitHubIssueSource:
                     latest = max(latest, str(event.get("created_at") or ""))
         return latest
 
-    def _claim_body(self, token: str) -> str:
+    def _claim_body(
+        self, token: str, item: WorkItem | None = None, names: set[Any] | None = None
+    ) -> str:
+        """The claim comment: the hidden lock marker plus what a human needs
+        to read off the issue trail — that this is a claim, and (#600)
+        whether it is a restart driven by the trigger label being re-added
+        and what pushed work that restart continues."""
         started = datetime.fromtimestamp(self._clock(), tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return (
-            f"{CLAIM_MARKER}{token} host={self.host} pid={self.pid} started={started} -->\n"
-            f"sbxloop daemon claimed this issue (host `{self.host}`)."
+        lines = [
+            f"{CLAIM_MARKER}{token} host={self.host} pid={self.pid} started={started} -->",
+            f"sbxloop daemon claimed this issue (host `{self.host}`).",
+        ]
+        prior_labels = sorted(
+            str(n)
+            for n in (names or set())
+            if n in {self.labels.failed, self.labels.blocked, self.labels.completed}
         )
+        marks = ", ".join(f"`{n}`" for n in prior_labels)
+        # Only the *store* knows whether this issue was attempted before.
+        # A lifecycle label alone does not make a claim a restart: a human
+        # can hand-label an issue `sbxloop:failed` and calling its first-ever
+        # claim a restart would be a false trail. The labels only name what
+        # this claim cleared.
+        if item is not None and item.restarted:
+            lines.append(
+                f"Restarted by re-adding `{self.labels.trigger}`"
+                + (f" (clearing {marks} from the previous attempt)" if marks else "")
+                + "; the issue did not need to be edited."
+            )
+            lines.append(self._reuse_line(item))
+        elif marks:
+            lines.append(f"Cleared {marks} from an earlier lifecycle state.")
+        return "\n".join(lines)
+
+    def _reuse_line(self, item: WorkItem | None) -> str:
+        branch = item.prior_branch if item else None
+        pr = item.prior_pr_number if item else None
+        if branch and pr is not None:
+            return (
+                f"Continuing the work the previous attempt pushed: branch `{branch}` and PR #{pr}."
+            )
+        if branch:
+            return f"Continuing the work the previous attempt pushed: branch `{branch}`."
+        if pr is not None:
+            return f"Continuing the previous attempt's PR #{pr}."
+        return "No branch or PR from a previous attempt was recorded; starting fresh."
 
     def _claims(self, ops: GithubOps, number: str, epoch: str) -> list[ClaimComment]:
         """The claim comments of this trigger cycle, oldest first. Ordered by
@@ -584,8 +644,9 @@ class GitHubIssueSource:
     ) -> bool:
         """The run cleared its own bar but GitHub would not let it finish.
         The issue stays open, marked blocked, for a human: merge or fix the
-        PR by hand and close the issue, or ``!sbx retry`` it once whatever
-        refused has been dealt with."""
+        PR by hand and close the issue, or re-add the trigger label once
+        whatever refused has been dealt with (#600) — that restarts it on
+        this same branch and PR."""
 
         def go(ops: GithubOps) -> bool:
             n = item.source_key
@@ -595,9 +656,16 @@ class GitHubIssueSource:
                 f"sbxloop could not finish: {reason}\n\n{_pr_ref(pr_number, pr_url)} passed "
                 "the loop's own review and checks but GitHub would not let the loop land it. "
                 "A human needs to look: merge or fix it by hand and close this issue, or "
-                f"`!sbx retry {item.item_id}` once the cause is dealt with.",
+                f"re-add `{self.labels.trigger}` once the cause is dealt with — the issue "
+                f"does not need to be edited and `{self.labels.blocked}` does not need "
+                "removing by hand (the claim clears it), and the restart continues on this "
+                "branch and pull request.",
             )
             self._remove_label(ops, n, self.labels.in_progress)
+            # A trigger label still on the issue would make the human's
+            # re-add a no-op — GitHub fires no event for a label already
+            # there, which is how the label went inert (#596).
+            self._remove_label(ops, n, self.labels.trigger)
             self._add_label(ops, n, self.labels.blocked)
             return True
 
@@ -642,15 +710,18 @@ class GitHubIssueSource:
             self._comment(
                 ops,
                 n,
-                f"Abandoned after retries: {error}\n\nRe-trigger by removing "
-                f"`{self.labels.failed}` and re-adding `{self.labels.trigger}`.",
+                f"Abandoned after retries: {error}\n\nRe-add "
+                f"`{self.labels.trigger}` to run it again — the issue does not need to be "
+                f"edited and `{self.labels.failed}` does not need to be removed by hand "
+                "(the claim clears it), and the restart continues from any branch or "
+                "PR a previous attempt pushed.",
             )
             self._remove_label(ops, n, self.labels.in_progress)
-            if not item.claimed:
-                # Abandoned while still queued: the trigger label is what
-                # is on the issue, and left there it would keep the item
-                # polling as work (and make "re-add the trigger" a no-op).
-                self._remove_label(ops, n, self.labels.trigger)
+            # Always clear the trigger, claimed or not: left on the issue it
+            # keeps the item polling as work, and it makes the human's
+            # re-add a no-op — GitHub fires no event for a label already
+            # there, which is exactly how the label went inert (#596).
+            self._remove_label(ops, n, self.labels.trigger)
             self._add_label(ops, n, self.labels.failed)
 
         self._guard("abandon report", go)
@@ -661,18 +732,26 @@ class GitHubIssueSource:
             lines = _cancel_lines(report)
             if not report.requeued:
                 # Neither failed nor triggered: the human decides what
-                # happens next, so no label speaks for them. `!sbx retry`
-                # is the reliable way back: re-adding the trigger label to an
-                # unchanged issue is deduplicated by the store (same issue,
-                # same content), so say so instead of promising it.
+                # happens next, so no label speaks for them. Re-adding the
+                # trigger label is the self-service way back — the store
+                # re-queues a finished item whether or not the issue text
+                # changed (#600) and the restart continues on whatever
+                # branch/PR this attempt already pushed.
                 lines.append(
-                    f"To run it again from scratch: `!sbx retry {item.item_id}` in Discord "
-                    f"(re-adding `{self.labels.trigger}` only re-runs it if the issue was "
-                    "edited — an unchanged issue is deduplicated)."
+                    f"To continue it: re-add `{self.labels.trigger}` — the next poll picks "
+                    "the issue back up and resumes from the branch and PR this run already "
+                    f"pushed. `!sbx retry {item.item_id}` in Discord restarts it from scratch "
+                    "instead."
                 )
             self._comment(ops, n, "\n".join(lines))
             if not report.requeued:
                 self._remove_label(ops, n, self.labels.in_progress)
+                # A trigger label still on the issue (cancelled before the
+                # claim swap landed, or re-added mid-run) would make the
+                # human's re-add a no-op — GitHub does not re-fire an event
+                # for a label that is already there (#596). Clear it so the
+                # documented restart gesture actually works.
+                self._remove_label(ops, n, self.labels.trigger)
 
         self._guard("cancel report", go)
 

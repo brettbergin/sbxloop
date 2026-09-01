@@ -80,6 +80,25 @@ class RecordingOps:
         if method == "DELETE" and "/issues/comments/" in base:
             self.deleted_comments.append(int(base.rsplit("/", 1)[-1]))
             return {}
+        # Label writes actually move the labels, as GitHub does: a claimed
+        # issue no longer carries the trigger label and so drops out of
+        # discovery until a human re-adds it (#600).
+        if method == "POST" and base.endswith("/labels"):
+            number = base.rsplit("/", 2)[-2]
+            target = self.issues.get(number)
+            if target is not None:
+                names = {lb["name"] for lb in target.get("labels") or []}
+                names.update((body or {}).get("labels") or [])
+                target["labels"] = [{"name": n} for n in sorted(names)]
+            return {}
+        if method == "DELETE" and "/labels/" in base:
+            number, _, name = base.rpartition("/labels/")
+            number = number.rsplit("/", 1)[-1]
+            target = self.issues.get(number)
+            if target is not None:
+                gone = unquote(name)
+                target["labels"] = [lb for lb in target.get("labels") or [] if lb["name"] != gone]
+            return {}
         if method == "GET":
             number = base.rsplit("/", 1)[-1]
             return self.issues.get(number, {"state": "closed", "labels": []})
@@ -164,14 +183,23 @@ class TestGitHubSource:
             ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun"),
         ]
 
-    def test_claim_never_deletes_labels_it_did_not_see(self) -> None:
-        """No stale-label sweep: the only DELETE a claim issues is the
-        trigger swap. Anything else on the issue is a human's business."""
-        ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:blocked", "sbxloop:failed")})
+    def test_claim_clears_the_previous_attempts_lifecycle_labels(self) -> None:
+        """#600: a restart-by-label arrives wearing the last attempt's
+        failed/blocked/completed mark. Those describe a run that is over, so
+        the claim clears them and leaves the issue exactly as a first-time
+        claim would — in-progress and nothing else. Labels the daemon does
+        not own are still a human's business and stay put."""
+        ops = RecordingOps(
+            {"4": issue(4, "sbxloop:run", "sbxloop:blocked", "sbxloop:failed", "needs-design")}
+        )
         item = self.make(ops).poll()[0]
         assert self.make(ops).claim(item) is True
-        deletes = [p for m, p, _ in ops.raw_calls if m == "DELETE"]
-        assert deletes == ["/repos/o/r/issues/4/labels/sbxloop%3Arun"]
+        deletes = [unquote(p.rsplit("/", 1)[-1]) for m, p, _ in ops.raw_calls if m == "DELETE"]
+        assert deletes == ["sbxloop:failed", "sbxloop:blocked", "sbxloop:run"]
+        assert {lb["name"] for lb in ops.issues["4"]["labels"]} == {
+            "sbxloop:in-progress",
+            "needs-design",
+        }
 
     def test_claim_failure_after_adding_in_progress_rolls_it_back(self) -> None:
         """If removing the trigger fails, in-progress must come back off so
@@ -370,7 +398,11 @@ class TestGitHubSource:
             {"labels": ["sbxloop:blocked"]},
         ) in ops.raw_calls
         body = ops.comments[-1][1]
-        assert "protection rule" in body and "pull/9" in body and "!sbx retry gh:issue:4" in body
+        # The way back in is the trigger label, not an operator command
+        # (#600): re-adding it restarts the item on this same branch/PR.
+        assert "protection rule" in body and "pull/9" in body
+        assert "re-add `sbxloop:run`" in body and "!sbx retry" not in body
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun", None) in ops.raw_calls
 
     def test_report_blocked_failure_returns_false(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
@@ -385,9 +417,10 @@ class TestGitHubSource:
             "/repos/o/r/issues/4/labels",
             {"labels": ["sbxloop:failed"]},
         ) in ops.raw_calls
-        assert any("re-adding `sbxloop:run`" in body for _, body in ops.comments)
-        # Claimed: the trigger label already went with the claim; not touched.
-        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun", None) not in ops.raw_calls
+        assert any("Re-add `sbxloop:run`" in body for _, body in ops.comments)
+        # The trigger is cleared unconditionally so the human's re-add fires
+        # a fresh label event even if one was still on the issue (#596).
+        assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun", None) in ops.raw_calls
 
     def test_abandoned_while_unclaimed_drops_the_trigger_label(self) -> None:
         """#229: an operator abandons an item that was never claimed (still
@@ -787,3 +820,170 @@ class TestSettleClaim:
         ops = RecordingOps({"4": issue(4, "sbxloop:run")})
         ops.fail_on.add("GET")
         assert self.make(ops).settle_claim(gh(4, claim_token="c" * 32)) is False
+
+
+class TestRelabelRestartsDiscovery:
+    """#600: re-adding the trigger label to an unchanged issue is a
+    restart request — discovery re-finds it and the store re-queues it."""
+
+    def source(self, ops: RecordingOps) -> GitHubIssueSource:
+        return GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+
+    def store(self, tmp_path: Any) -> Any:
+        from sbxloop.daemon.store import DaemonStore
+
+        return DaemonStore(tmp_path / "state.db")
+
+    def test_unchanged_issue_relabelled_is_queued_again(self, tmp_path: Any) -> None:
+        ops = RecordingOps({"12": issue(12, "sbxloop:run")})
+        store = self.store(tmp_path)
+        (first,) = self.source(ops).poll()
+        assert store.upsert_new(first, now=1.0) is True
+        store.mark_running(first.item_id, "r1", now=2.0)
+        store.record_prior_attempt(first.item_id, run_id="r1", branch="sbxloop/gh-12", pr_number=7)
+        store.mark_cancelled(first.item_id, "cancelled by b", now=3.0)
+        # The human re-adds the label; the issue text is untouched.
+        (again,) = self.source(ops).poll()
+        assert again.title == first.title and again.body == first.body
+        assert store.upsert_new(again, now=4.0) is True
+        got = store.get(first.item_id)
+        assert got is not None and got.state == "queued" and not got.claimed
+        prior = store.prior_attempt(first.item_id)
+        assert prior is not None and prior.branch == "sbxloop/gh-12" and prior.pr_number == 7
+
+    def test_a_live_item_is_not_restarted_by_a_poll(self, tmp_path: Any) -> None:
+        ops = RecordingOps({"12": issue(12, "sbxloop:run")})
+        store = self.store(tmp_path)
+        (first,) = self.source(ops).poll()
+        store.upsert_new(first, now=1.0)
+        store.mark_running(first.item_id, "r1", now=2.0)
+        (again,) = self.source(ops).poll()
+        assert store.upsert_new(again, now=3.0) is False
+        got = store.get(first.item_id)
+        assert got is not None and got.state == "running" and got.run_id == "r1"
+
+    def test_an_edited_finished_issue_still_supersedes(self, tmp_path: Any) -> None:
+        ops = RecordingOps({"12": issue(12, "sbxloop:run")})
+        store = self.store(tmp_path)
+        (first,) = self.source(ops).poll()
+        store.upsert_new(first, now=1.0)
+        store.mark_done(first.item_id, now=2.0)
+        ops.issues["12"]["body"] = "please do it, differently"
+        (again,) = self.source(ops).poll()
+        assert store.upsert_new(again, now=3.0) is True
+        got = store.get(first.item_id)
+        assert got is not None and got.state == "queued"
+        assert got.body == "please do it, differently"
+
+    def test_the_cancel_comment_promises_a_label_restart(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        src.report_cancelled(gh(), report(state="cancelled", pr=None, cancelled_by="`b`"))
+        body = ops.comments[-1][1]
+        assert "re-add `sbxloop:run`" in body
+        assert "deduplicated" not in body and "only re-runs it if the issue was" not in body
+
+    def test_cancel_leaves_the_issue_ready_for_a_relabel(self) -> None:
+        """Nothing the cancel report leaves behind may block the restart:
+        no in-progress (it is the claim marker), no trigger label (a leftover
+        one makes re-adding it a no-op for the human)."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress", "sbxloop:run")})
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        src.report_cancelled(gh(), report(state="cancelled", pr=None, cancelled_by="`b`"))
+        assert {lb["name"] for lb in ops.issues["4"]["labels"]} == set()
+
+    def test_abandon_tells_the_human_to_just_re_add_the_trigger(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        src.report_abandoned(gh(claimed=True), "boom")
+        body = ops.comments[-1][1]
+        assert "Re-add `sbxloop:run`" in body
+        assert "removing" not in body  # no manual label surgery asked of the human
+
+    def test_a_previously_failed_issue_is_reclaimed_by_relabel(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:failed")})
+        item = (
+            self.source(ops)
+            .poll()[0]
+            .model_copy(
+                update={"prior_run_id": "r1", "prior_branch": "sbxloop/gh-4", "prior_pr_number": 9}
+            )
+        )
+        assert self.source(ops).claim(item) is True
+        assert {lb["name"] for lb in ops.issues["4"]["labels"]} == {"sbxloop:in-progress"}
+        body = ops.comments[-1][1]
+        assert "Restarted by re-adding `sbxloop:run`" in body
+        assert "`sbxloop:failed`" in body
+        assert "branch `sbxloop/gh-4` and PR #9" in body
+
+    def test_a_previously_cancelled_issue_is_reclaimed_by_relabel(self) -> None:
+        """A cancel leaves no lifecycle label at all — only the store knows
+        it is a restart, and the claim comment must still say so."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = (
+            self.source(ops)
+            .poll()[0]
+            .model_copy(update={"prior_run_id": "r1", "prior_branch": "sbxloop/gh-4"})
+        )
+        assert self.source(ops).claim(item) is True
+        assert {lb["name"] for lb in ops.issues["4"]["labels"]} == {"sbxloop:in-progress"}
+        body = ops.comments[-1][1]
+        assert "Restarted by re-adding `sbxloop:run`" in body
+        assert "branch `sbxloop/gh-4`" in body
+
+    def test_a_restart_with_nothing_on_origin_says_it_starts_fresh(self) -> None:
+        """A real restart (the store recorded an earlier run) that pushed
+        nothing to origin: still a restart, but honest that it starts over."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:blocked")})
+        item = self.source(ops).poll()[0].model_copy(update={"prior_run_id": "r1"})
+        assert self.source(ops).claim(item) is True
+        body = ops.comments[-1][1]
+        assert "Restarted by re-adding `sbxloop:run`" in body
+        assert "`sbxloop:blocked`" in body
+        assert "starting fresh" in body
+
+    def test_a_hand_labelled_issue_is_not_announced_as_a_restart(self) -> None:
+        """A human can hand-apply `sbxloop:failed` to an issue that was
+        never attempted. Its FIRST claim must not announce itself as a
+        restart — the store, not the label, is what knows about a previous
+        attempt. The label is only named as something this claim cleared.
+
+        The item is built the way discovery builds it (no prior_* at all),
+        not through the re-queue path that would set them."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:failed")})
+        item = self.source(ops).poll()[0]
+        assert item.restarted is False
+        assert self.source(ops).claim(item) is True
+        body = ops.comments[-1][1]
+        assert "Restarted by re-adding" not in body
+        assert "starting fresh" not in body
+        # the label it cleared is still reported, just not as a restart
+        assert "Cleared `sbxloop:failed`" in body
+        assert {lb["name"] for lb in ops.issues["4"]["labels"]} == {"sbxloop:in-progress"}
+
+    def test_a_first_claim_says_nothing_about_restarting(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.source(ops).poll()[0]
+        assert self.source(ops).claim(item) is True
+        assert "Restarted" not in ops.comments[-1][1]
+
+    def test_discovery_finds_an_issue_still_wearing_a_failed_label(self) -> None:
+        """The search must key on the trigger label alone: an issue whose
+        last attempt failed or was blocked still carries that mark when a
+        human re-adds the trigger, and excluding it would make the label
+        inert (#596)."""
+        ops = RecordingOps(
+            {
+                "4": issue(4, "sbxloop:run", "sbxloop:failed"),
+                "5": issue(5, "sbxloop:run", "sbxloop:blocked"),
+                "6": issue(6, "sbxloop:failed"),
+            }
+        )
+        items = self.source(ops).poll()
+        assert [i.item_id for i in items] == ["gh:issue:4", "gh:issue:5"]
+        assert "-label" not in ops.searches[0] and "sbxloop:failed" not in ops.searches[0]
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        src.report_cancelled(gh(), report(state="cancelled", pr=None, cancelled_by="`b`"))
+        body = ops.comments[-1][1]
+        assert "re-add `sbxloop:run`" in body
+        assert "deduplicated" not in body and "only re-runs it if the issue was" not in body

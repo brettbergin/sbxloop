@@ -17,6 +17,9 @@ Daemon store (``daemon_work_items`` and friends):
 - ``pre_scheduled_retry`` — before #523: ``repo`` and the
   ``(source_key, repo)`` key, but no ``not_before``.
 - ``pre_claim_token`` — before #530: ``not_before`` but no ``claim_token``.
+- ``pre_prior_attempt`` — before #600: ``claim_token`` but none of the
+  ``prior_run_id`` / ``prior_branch`` / ``prior_pr_number`` columns a
+  label-restart carries the previous attempt's pushed work in.
 
 Engine store (``runs`` / ``phase_attempts``):
 
@@ -77,11 +80,16 @@ _DAEMON_ITEMS_NOT_BEFORE = _DAEMON_ITEMS_REPO.replace(
     "repo TEXT NOT NULL DEFAULT '', ", "repo TEXT NOT NULL DEFAULT '', not_before REAL, "
 )
 
+_DAEMON_ITEMS_CLAIM_TOKEN = _DAEMON_ITEMS_NOT_BEFORE.replace(
+    "not_before REAL, ", "not_before REAL, claim_token TEXT, "
+)
+
 DAEMON_SHAPES: dict[DaemonShape, tuple[str, ...]] = {
     "pre_typed_ids": (_DAEMON_ITEMS_NO_REPO, _DAEMON_REQUESTERS_NO_REPO),
     "pre_multirepo": (_DAEMON_ITEMS_NO_REPO, _DAEMON_REQUESTERS_NO_REPO),
     "pre_scheduled_retry": (_DAEMON_ITEMS_REPO, _DAEMON_REQUESTERS_REPO),
     "pre_claim_token": (_DAEMON_ITEMS_NOT_BEFORE, _DAEMON_REQUESTERS_REPO),
+    "pre_prior_attempt": (_DAEMON_ITEMS_CLAIM_TOKEN, _DAEMON_REQUESTERS_REPO),
 }
 
 # Every state a work-item row can be in, with the bookkeeping a deployed

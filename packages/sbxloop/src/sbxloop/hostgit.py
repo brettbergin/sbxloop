@@ -728,3 +728,16 @@ def _describe(exc: Exception) -> str:
     if isinstance(stderr, str) and stderr.strip():
         return stderr.strip().splitlines()[-1]
     return str(exc)
+
+
+def current_branch(repo_path: Path) -> str | None:
+    """The branch a checkout is on, or None (detached HEAD, unborn HEAD, not
+    a repository). Used to tell whether a run's clone actually landed on the
+    branch it was pinned to (#600)."""
+    try:
+        with Repo(repo_path) as repo:
+            if repo.head.is_detached:
+                return None
+            return str(repo.active_branch.name)
+    except (InvalidGitRepositoryError, NoSuchPathError, TypeError, ValueError):
+        return None

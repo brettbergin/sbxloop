@@ -115,6 +115,14 @@ class SandboxConfig(_ConfigModel):
     # lands red.
     gate_command: str | None = None
     continue_branch: str | None = None
+    # Whether an absent ``continue_branch`` is survivable. False (a resume)
+    # keeps the refusal above. True is the restart-by-label path (#600):
+    # the branch a previous attempt pushed is an *offer*, and a run that
+    # cannot take it — the branch was deleted, the checkout cannot fetch it
+    # — starts fresh from the base branch with a logged reason instead of
+    # failing. Nothing is destroyed either way: a fresh start only ever
+    # delivers a tree diffed against base.
+    continue_branch_optional: bool = False
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
 

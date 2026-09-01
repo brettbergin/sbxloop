@@ -75,6 +75,17 @@ class WorkItem(BaseModel):
     # so a process that dies between the two leaves a row recovery can
     # settle: finish the claim if the comment landed, forget it if not.
     claim_token: str | None = None
+    # What a previous attempt left on the GitHub origin (#600), carried
+    # across a restart-by-label so the new run continues that branch/PR
+    # instead of redoing the work. All None for an item that never ran.
+    prior_run_id: str | None = None
+    prior_branch: str | None = None
+    prior_pr_number: int | None = None
+
+    @property
+    def restarted(self) -> bool:
+        """Whether this item is a previous attempt picked back up (#600)."""
+        return bool(self.prior_run_id or self.prior_branch or self.prior_pr_number)
 
     @field_validator("item_id")
     @classmethod
