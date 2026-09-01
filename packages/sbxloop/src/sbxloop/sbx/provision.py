@@ -86,6 +86,8 @@ from sbxloop.sbx.sandbox import (
     Sandbox,
 )
 from sbxloop.sbx.secretstate import (
+    ANTHROPIC_TOKEN_ENV,
+    ANTHROPIC_TOKEN_HOST,
     COPILOT_TOKEN_ENV,
     COPILOT_TOKEN_HOST,
     custom_rm_candidates,
@@ -98,8 +100,10 @@ log = get_logger(__name__)
 
 GH_TOKEN_ENVS = ("GH_TOKEN", "GITHUB_TOKEN")
 
-# Hosts the agent sandbox must be able to reach (doctor checks these).
+# Hosts the agent sandbox must be able to reach (doctor checks these),
+# per agent backend (#533).
 AGENT_TOKEN_HOSTS = ("api.githubcopilot.com", "api.github.com")
+CLAUDE_TOKEN_HOSTS = (ANTHROPIC_TOKEN_HOST,)
 
 AGENT_ALLOW_DOMAINS = (
     "api.githubcopilot.com",
@@ -317,10 +321,12 @@ class Provisioner:
             # never asks for a grant.
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
+                *self._agent_extra_allows(),
                 *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.config.policy.deny),
                 *extra,
             ],
-            secrets=[SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)],
+            secrets=[self._agent_secret_spec()],
+            persistent_env=self.agent_persistent_env(),
         )
         github = SandboxSpec(
             name=sandbox_name(run_id, "github"),
@@ -343,6 +349,57 @@ class Provisioner:
                 'with the "Copilot Requests" permission and export it.'
             )
         return token
+
+    # -- the agent backend's credential (#533) -----------------------------
+
+    def agent_backend(self) -> str:
+        """Which SDK the agent sandbox runs (``[agent] backend``)."""
+        return self.config.agent.backend
+
+    def agent_token_env(self) -> str:
+        """The env var carrying the agent sandbox's credential."""
+        return ANTHROPIC_TOKEN_ENV if self.agent_backend() == "claude" else COPILOT_TOKEN_ENV
+
+    def agent_token(self) -> str:
+        """The chosen agent backend's credential, read from the host env."""
+        if self.agent_backend() != "claude":
+            return self.copilot_token()
+        token = self.env.get(ANTHROPIC_TOKEN_ENV, "")
+        if not token:
+            raise ProvisionError(
+                f'{ANTHROPIC_TOKEN_ENV} is not set on the host but [agent] backend = "claude". '
+                "Create an Anthropic API key and export it, or switch back to "
+                'backend = "copilot".'
+            )
+        return token
+
+    def agent_token_hosts(self) -> tuple[str, ...]:
+        """Hosts the agent sandbox's credential path needs (doctor rows)."""
+        return CLAUDE_TOKEN_HOSTS if self.agent_backend() == "claude" else AGENT_TOKEN_HOSTS
+
+    def agent_persistent_env(self) -> dict[str, str]:
+        """Non-secret env the agent sandbox needs for the chosen backend.
+
+        The worker resolves its backend from ``SBXLOOP_WORKER_BACKEND``
+        (default copilot), so only the claude backend needs the selector
+        delivered. ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the
+        Claude Code CLI hermetic — no telemetry or auto-update calls to
+        hosts the balanced network policy would only refuse.
+        """
+        if self.agent_backend() != "claude":
+            return {}
+        return {
+            "SBXLOOP_WORKER_BACKEND": "claude",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        }
+
+    def _agent_secret_spec(self) -> SecretSpec:
+        if self.agent_backend() == "claude":
+            return SecretSpec(kind="custom", host=ANTHROPIC_TOKEN_HOST, env=ANTHROPIC_TOKEN_ENV)
+        return SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)
+
+    def _agent_extra_allows(self) -> tuple[str, ...]:
+        return (ANTHROPIC_TOKEN_HOST,) if self.agent_backend() == "claude" else ()
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to
@@ -698,7 +755,7 @@ class Provisioner:
         # Fail fast on missing credentials before creating any microVM. In
         # App mode this mints the first installation token here.
         gh_cred = self.gh_credential(repo) if github_enabled else None
-        tokens: dict[SandboxRole, str] = {"agent": self.copilot_token()}
+        tokens: dict[SandboxRole, str] = {"agent": self.agent_token()}
         if gh_cred is not None:
             tokens["github"] = gh_cred.token()
         # Decided once, before the parallel threads: a probe verdict recorded
@@ -870,10 +927,12 @@ class Provisioner:
             template=self.config.sandbox.template,
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
+                *self._agent_extra_allows(),
                 *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.config.policy.deny),
                 *self.config.sandbox.extra_allow_domains,
             ],
-            secrets=[SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)],
+            secrets=[self._agent_secret_spec()],
+            persistent_env=self.agent_persistent_env(),
         )
 
     def ensure_github_only(
@@ -920,7 +979,7 @@ class Provisioner:
         """Provision one agent-role sandbox (Copilot token only) outside a
         run's pair — the daemon's concierge box. Same discipline as
         :meth:`ensure_github_only`."""
-        token = self.copilot_token()
+        token = self.agent_token()
         spec = self.agent_only_spec(name, workspace)
         return self._ensure_single(
             spec,
@@ -1148,7 +1207,7 @@ class Provisioner:
         """
         delivery = self._deliver_env(spec, sandbox, token)
         via_file = delivery == "env-file"
-        env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
+        env_name = self.agent_token_env() if spec.role == "agent" else "GH_TOKEN"
         how = (
             "using the in-VM env file directly"
             if via_file
@@ -1332,7 +1391,7 @@ class Provisioner:
             # plain-env: the worker loads the env file itself; a shell
             # visibility check can never pass and would only produce noise.
             return
-        env_name = COPILOT_TOKEN_ENV if spec.role == "agent" else "GH_TOKEN"
+        env_name = self.agent_token_env() if spec.role == "agent" else "GH_TOKEN"
         # 0 = a usable credential, 1 = unset/empty, SENTINEL_EXIT = set but
         # not a credential (sbx's proxy placeholder). Classifying in the shell
         # keeps the value inside the VM - it is never read back out here.
@@ -1536,7 +1595,7 @@ class Provisioner:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""
         exports: dict[str, str] = dict(spec.persistent_env)
         if spec.role == "agent":
-            exports[COPILOT_TOKEN_ENV] = token
+            exports[self.agent_token_env()] = token
         else:
             exports["GH_TOKEN"] = token
             exports["GITHUB_TOKEN"] = token
@@ -1609,7 +1668,10 @@ class Provisioner:
         if not supported:
             return None
         if role == "agent":
-            return lambda: {COPILOT_TOKEN_ENV: self.copilot_token()}
+            return lambda: {
+                **self.agent_persistent_env(),
+                self.agent_token_env(): self.agent_token(),
+            }
         cred = gh_cred
         assert cred is not None
         persistent = self.github_repo_env(repo)

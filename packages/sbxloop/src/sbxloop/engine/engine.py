@@ -673,7 +673,10 @@ class LoopEngine:
         installs: list[Callable[[], None]] = [
             partial(
                 agent.install,
-                extras="copilot",
+                # The backend name doubles as the worker extra ([copilot] /
+                # [claude]); the claude extra also ensures the Claude Code
+                # CLI runtime (#533).
+                extras=self.config.agent.backend,
                 ensure_dev_tools=True,
                 languages=self.config.sandbox.effective_languages,
                 expect_prebaked=prebaked_expected,

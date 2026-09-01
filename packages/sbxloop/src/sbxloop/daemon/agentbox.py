@@ -198,7 +198,10 @@ class DaemonAgent:
             # sandbox and its registered secret.
             client = self._make_client(sandbox)
             if self.install_workers:
-                client.install(extras="copilot", expect_prebaked=bool(self.config.sandbox.template))
+                client.install(
+                    extras=self.config.agent.backend,
+                    expect_prebaked=bool(self.config.sandbox.template),
+                )
             clients.append(client)
 
         log.info(

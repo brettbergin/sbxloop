@@ -29,9 +29,9 @@ from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
-from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, gh_credential_status
+from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, CLAUDE_TOKEN_HOSTS, gh_credential_status
 from sbxloop.sbx.prune import count_orphans
-from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV
+from sbxloop.sbx.secretstate import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import (
     SDK_PERMISSION_KINDS,
@@ -510,8 +510,9 @@ def collect_checks(
                     )
                 )
 
-        # network policy reachable for the copilot hosts
-        for host in AGENT_TOKEN_HOSTS:
+        # network policy reachable for the chosen agent backend's hosts
+        agent_hosts = CLAUDE_TOKEN_HOSTS if config.agent.backend == "claude" else AGENT_TOKEN_HOSTS
+        for host in agent_hosts:
             report(f"checking network policy for {host}")
             try:
                 allowed = cli.policy_check(host)
@@ -624,17 +625,29 @@ def collect_checks(
                 )
             )
 
-    # tokens
-    checks.append(
-        Check(
-            COPILOT_TOKEN_ENV,
-            bool(env.get(COPILOT_TOKEN_ENV)),
-            "set"
-            if env.get(COPILOT_TOKEN_ENV)
-            else 'not set — create a fine-grained PAT with the "Copilot Requests" '
-            f"permission and export {COPILOT_TOKEN_ENV}",
+    # tokens — the agent credential row follows [agent] backend (#533)
+    if config.agent.backend == "claude":
+        checks.append(
+            Check(
+                f"{ANTHROPIC_TOKEN_ENV} (agent backend: claude)",
+                bool(env.get(ANTHROPIC_TOKEN_ENV)),
+                "set"
+                if env.get(ANTHROPIC_TOKEN_ENV)
+                else "not set — create an Anthropic API key and export "
+                f'{ANTHROPIC_TOKEN_ENV}, or switch [agent] backend back to "copilot"',
+            )
         )
-    )
+    else:
+        checks.append(
+            Check(
+                COPILOT_TOKEN_ENV,
+                bool(env.get(COPILOT_TOKEN_ENV)),
+                "set"
+                if env.get(COPILOT_TOKEN_ENV)
+                else 'not set — create a fine-grained PAT with the "Copilot Requests" '
+                f"permission and export {COPILOT_TOKEN_ENV}",
+            )
+        )
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;

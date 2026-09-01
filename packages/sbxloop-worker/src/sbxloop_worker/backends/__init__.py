@@ -47,4 +47,8 @@ def get_backend(name: str | None = None) -> AgentBackend:
         from sbxloop_worker.backends.copilot import CopilotBackend
 
         return CopilotBackend()
+    if resolved == "claude":
+        from sbxloop_worker.backends.claude import ClaudeBackend
+
+        return ClaudeBackend()
     raise BackendUnavailableError(f"unknown agent backend {resolved!r}")

@@ -18,6 +18,10 @@ dependencies = ["pydantic>=2.7"]
 
 [project.optional-dependencies]
 copilot = ["github-copilot-sdk>=1.0.8"]
+# The Claude Agent SDK spawns the Claude Code CLI, which is NOT bundled:
+# provisioning installs Node + @anthropic-ai/claude-code into the sandbox
+# when [agent] backend = "claude" is configured.
+claude = ["claude-agent-sdk>=0.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/brettbergin/sbxloop"

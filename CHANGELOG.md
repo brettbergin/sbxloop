@@ -8,6 +8,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **An optional Claude agent backend** (#533). `[agent] backend = "claude"`
+  runs every agent persona through the Claude Agent SDK (the Claude Code
+  harness) instead of the Copilot SDK, which stays the default with
+  unchanged behaviour. The agent sandbox then holds `ANTHROPIC_API_KEY`
+  alone — bound to `api.anthropic.com`, delivered by the same secret tiers
+  as every credential, redacted everywhere the Copilot token is — and
+  provisioning installs the runtime the SDK spawns (Node plus
+  `@anthropic-ai/claude-code`, probe-first) and keeps the CLI hermetic
+  (no telemetry/auto-update egress). Contract parity throughout: the same
+  `agent.*` event stream, the read-only critic barrier (allowlist with
+  default-deny on Claude's tool vocabulary), the tool-call governor,
+  session resume as an optimisation with fresh-session fallback, host
+  tools as an in-process MCP server, and token usage reported through the
+  existing `run_usage`/`usage_today` accounting. Invalid or missing
+  configuration fails fast: an unknown backend fails config loading; a
+  missing key fails before any microVM boots; `sbxloop doctor` shows the
+  backend-appropriate credential and egress rows.
+
 - **Per-job stdin secret delivery** (#592). When sbx's proxy cannot feed
   exec'd workers, credentials are no longer written at rest into the
   sandbox as `~/.sbxloop/env.sh`: the host pipes each job's exports into

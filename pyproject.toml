@@ -59,7 +59,16 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 [[tool.mypy.overrides]]
 # Optional extras: the host SDK ([copilot]) and the daemon's chat bridges
 # ([discord], [slack]) are deferred imports that resolve only when installed.
-module = ["copilot", "copilot.*", "discord", "discord.*", "slack_sdk", "slack_sdk.*"]
+module = [
+    "copilot",
+    "copilot.*",
+    "claude_agent_sdk",
+    "claude_agent_sdk.*",
+    "discord",
+    "discord.*",
+    "slack_sdk",
+    "slack_sdk.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

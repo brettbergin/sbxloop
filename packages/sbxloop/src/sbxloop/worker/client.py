@@ -251,6 +251,7 @@ class WorkerClient:
             self.prebaked = True
             if ensure_dev_tools and self._prebake_missing:
                 self._provision_toolchains(self._prebake_missing, timeout)
+            self._ensure_backend_runtime(extras, timeout)
             log.info(
                 "worker.installed",
                 sandbox=self.sandbox.name,
@@ -299,6 +300,8 @@ class WorkerClient:
             version=installed,
             duration_s=round(time.monotonic() - started, 1),
         )
+
+        self._ensure_backend_runtime(extras, timeout)
 
         # Entrypoint smoke check: importing the package proves nothing about
         # `python -m sbxloop_worker` actually executing under sbx exec. A run
@@ -459,6 +462,22 @@ class WorkerClient:
             git=verdict.get("git") is True,
         )
         return True
+
+    def _ensure_backend_runtime(self, extras: str, timeout: float) -> None:
+        """The chosen agent backend's in-sandbox runtime, probe-first (#533).
+
+        The claude extra's SDK spawns the Claude Code CLI, which the pip
+        package does not bundle: ensure Node (the javascript toolchain) and
+        then ``@anthropic-ai/claude-code``. Best-effort and loud, like every
+        other ensure — the backend itself fails with a clear
+        BackendUnavailableError if the CLI still is not on PATH.
+        """
+        if "claude" not in {part.strip() for part in extras.split(",")}:
+            return
+        selected = (*toolchains.resolve(["javascript"]), toolchains.CLAUDE_CODE)
+        missing = [tc for tc in selected if not self.sandbox.exec(["sh", "-c", tc.probe]).ok]
+        if missing:
+            self._provision_toolchains(missing, timeout)
 
     def _ensure_dev_tools(self, timeout: float, languages: Sequence[str] = ()) -> None:
         """Best-effort: make the sandbox dev-ready for the agent's own work.
