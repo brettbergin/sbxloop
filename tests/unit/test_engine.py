@@ -2830,3 +2830,29 @@ class TestMergeGateRun:
         result = harness.pipeline(fake).start("ship it")
         assert result.state == "merged"
         assert fake.merges
+
+
+class TestBotSuffixLanding:
+    """End to end under the REST/GraphQL identity split: REST attributes
+    the App as sbxloop[bot] (PR author, /user is 403), the fake's threads
+    carry the bare GraphQL spelling, and the run must still merge."""
+
+    def test_an_app_run_owns_its_bare_login_threads(self, harness: Harness) -> None:
+        from sbxloop.sbx.provision import Provisioner
+
+        fake = FakeGithub()
+        fake.user_login = "sbxloop"  # thread comments: GraphQL's bare spelling
+        fake.pr["user"] = {"login": "sbxloop[bot]"}  # REST attribution
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        harness.monkeypatch.setattr(
+            Provisioner, "gh_bot_login", lambda self, repo=None: "sbxloop[bot]"
+        )
+        harness.script(
+            [taskgraph(task("t1")), FILES_BUILD, review("approve", "noting one thing", FINDING)]
+        )
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged", result.reason
+        bodies = [c.body for t in fake.threads for c in t.comments]
+        assert not any("did not arrive with a changes-requested" in b for b in bodies), (
+            "the loop must not ack its own finding threads"
+        )

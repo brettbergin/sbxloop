@@ -30,7 +30,14 @@ from typing import Any, NamedTuple
 from sbxloop.config import LandingConfig
 from sbxloop.engine.model import FixKind
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ChecksVerdict, FailedCheck, GithubOps, ReviewThread, fold_reviews
+from sbxloop.gh.ops import (
+    ChecksVerdict,
+    FailedCheck,
+    GithubOps,
+    ReviewThread,
+    fold_reviews,
+    logins_match,
+)
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -225,7 +232,8 @@ def human_objection(ops: GithubOps, repo: str, number: int, *, login: str) -> bo
     others = [
         review
         for review in payload
-        if isinstance(review, dict) and str((review.get("user") or {}).get("login") or "") != login
+        if isinstance(review, dict)
+        and not logins_match(str((review.get("user") or {}).get("login") or ""), login)
     ]
     return fold_reviews(others) == "CHANGES_REQUESTED"
 
@@ -253,7 +261,7 @@ def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> l
         if not isinstance(review, dict):
             continue
         who = login_of(review)
-        if who == login:
+        if logins_match(who, login):
             continue
         state = str(review.get("state") or "").upper()
         if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
@@ -330,7 +338,9 @@ def unreconciled_threads(
         if not thread.comments:
             continue
         author = thread.comments[0].login
-        if author == login:
+        # GraphQL spells an App's login without the [bot] suffix REST uses;
+        # logins_match folds the two (the r9t8hnv33 field failure).
+        if logins_match(author, login):
             if thread.is_resolved or thread.has_reply_from(login):
                 continue
             loop_open.append(thread.anchor)
@@ -413,7 +423,9 @@ def _reconciliation_block(
         pending = [
             t
             for t in threads
-            if t.comments and t.comments[0].login != login and not t.has_reply_from(login)
+            if t.comments
+            and not logins_match(t.comments[0].login, login)
+            and not t.has_reply_from(login)
         ]
         acked = ack(pending)
         if acked:

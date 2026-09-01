@@ -244,6 +244,19 @@ class TestAcknowledgeHumanThreads:
         assert self.ack(gh, [own, rootless]) == 0
         assert gh.replies == []
 
+    def test_skips_the_loops_own_thread_across_the_bot_suffix(self) -> None:
+        """GraphQL spells the App bare; the resolved login carries [bot].
+        The ack pass must recognise its own thread either way (field
+        failure r9t8hnv33: it replied "noted — this comment did not arrive
+        with a changes-requested review" to its own findings)."""
+        gh = FakeGithub()
+        own = ack_thread(("sbxloop", "[minor] naming"))
+        replied = acknowledge_human_threads(
+            gh, REPO, PR, run_id=RUN, login="sbxloop[bot]", threads=[own]
+        )
+        assert replied == 0
+        assert gh.replies == []
+
     def test_a_failed_reply_is_not_counted(self) -> None:
         gh = FakeGithub()
         gh.fail_always["pr_comment_reply"] = GithubOpsError("boom", http_status=502)
