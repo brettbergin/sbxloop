@@ -666,7 +666,9 @@ host without them, simply gets the plain numbered question. Backends
 without interactive components — Slack today — always get that prose
 rendering, so nothing about them changes.
 "What's open?" lists the repository's open issues and which are queued or
-running.
+running; `queued: false` shows everything the daemon is not currently
+queued or running — the backlog plus issues that failed or are blocked and
+need a person — and a `state` argument narrows to one exact state.
 Ask what a run cost and it reports that run's input/output tokens per
 agent persona and totalled; "how much have we spent today?" totals the
 current calendar day in `run_cap_timezone` — the same day the run cap

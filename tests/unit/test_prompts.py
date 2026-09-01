@@ -200,7 +200,11 @@ def test_concierge_prompt_carries_contract() -> None:
     text = render("concierge", **RENDER_CONTEXTS["concierge"])
     assert text.startswith("# You are the sbxloop concierge")
     assert "`sbx_control`" in text and "`create_issue`" in text
-    assert "`enqueue_work`" not in text and "backlog" not in text and "inbox" not in text
+    # "backlog" is allowed only as the `list_issues` state value, never as a
+    # separate queue concept the concierge could file onto
+    assert "`enqueue_work`" not in text and "inbox" not in text
+    assert text.count("backlog") == text.count("`backlog`") + 1
+    assert "`backlog` (carrying" in text
     assert "thread" in text and "not here" in text
     assert "Never claim to have done something you did not do" in text
     assert "!sbx" in text  # the configured prefix reaches the model
@@ -209,6 +213,9 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "`create_issue`, **one call, no confirmation**" in text
     assert "`label_issue_for_run`" in text and "`list_issues`" in text
     assert "queue only what\n  the person names" in text
+    # `queued: false` is the exact complement, and `state` is offered
+    assert "exact complement" in text and "failed or are\n  blocked" in text
+    assert "`state` narrows to one exact" in text
     # triage's other half: a reply is direct, a close never is
     assert "`comment_on_issue`" in text and "`close_issue`" in text
     assert "pass **their own words** as `confirmation`" in text
