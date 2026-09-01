@@ -93,6 +93,26 @@ class PostedFinding(NamedTuple):
     thread_node_id: str | None = None
 
 
+def normalize_login(login: str) -> str:
+    """One canonical form for a GitHub identity.
+
+    GraphQL reports an App actor as its bare slug (``sbxloop``) while REST
+    attributes the same actor as ``sbxloop[bot]`` — the two spellings must
+    compare equal, or the loop misreads its own review threads as a
+    human's (field failure r9t8hnv33: fully reconciled PRs ended blocked
+    on "human review threads have no reply", with the loop ack-replying to
+    its own findings). Logins are case-insensitive on GitHub, so casefold
+    too.
+    """
+    return login.removesuffix("[bot]").casefold()
+
+
+def logins_match(a: str, b: str) -> bool:
+    """Whether two login spellings name the same identity. Two empty
+    logins never match: an unknown identity equals nobody."""
+    return bool(a) and bool(b) and normalize_login(a) == normalize_login(b)
+
+
 class ThreadComment(NamedTuple):
     """One comment inside a review thread."""
 
@@ -123,7 +143,7 @@ class ReviewThread(NamedTuple):
         return self.comments[0].comment_id if self.comments else None
 
     def has_reply_from(self, login: str) -> bool:
-        return any(c.login == login for c in self.comments[1:])
+        return any(logins_match(c.login, login) for c in self.comments[1:])
 
     def has_reply_marked(self, marker: str) -> bool:
         return any(marker in c.body for c in self.comments[1:])
@@ -258,7 +278,7 @@ def fold_reviews(payload: Any, *, login: str | None = None) -> str:
         if state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             continue
         who = str((review.get("user") or {}).get("login") or "")
-        if login is not None and who != login:
+        if login is not None and not logins_match(who, login):
             continue
         # A dismissed review no longer stands; recording it stops a later
         # entry-free fold from resurrecting the verdict it replaced.
@@ -507,7 +527,7 @@ class GithubOps:
             if not isinstance(review, dict):
                 continue
             login = login_of(review)
-            if exclude_login is not None and login == exclude_login:
+            if exclude_login is not None and logins_match(login, exclude_login):
                 continue
             state = str(review.get("state") or "").upper()
             if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
@@ -523,7 +543,7 @@ class GithubOps:
         for comment in comments if isinstance(comments, list) else []:
             if not isinstance(comment, dict):
                 continue
-            if exclude_login is not None and login_of(comment) == exclude_login:
+            if exclude_login is not None and logins_match(login_of(comment), exclude_login):
                 continue
             body = str(comment.get("body") or "").strip()
             if not body:

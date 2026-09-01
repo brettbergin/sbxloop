@@ -167,6 +167,30 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A click on a clarifying question that lands before the posted message
+  id is resolved is now answered instead of being told the question
+  expired** (#573). `_post_choice_question` used to send the message with
+  its buttons attached and only afterwards resolve the message id and
+  register the question, so an interaction arriving in that window found
+  nothing outstanding and got the "expired — type your answer" ephemeral
+  note even though the question was brand new. The question is now
+  registered under a provisional key *before* the send, handed to the
+  view so a click can resolve through it, and rekeyed to the real message
+  id once the transport reports it (keeping the original deadline). A
+  transport that cannot report an id leaves the question answerable under
+  the provisional key rather than dropping it; a failed post drops it.
+
+- **App-auth runs no longer block on their own review threads — the
+  REST/GraphQL identity split** (field runs r9t8hnv33, ry2t99za6,
+  ra2k5bv6z). REST attributes an App as `sbxloop[bot]`; GraphQL reports
+  the same actor as bare `sbxloop`. The resolved login carried the suffix
+  while `pr_review_threads` (GraphQL) did not, so every loop thread
+  classified as a human's: the loop ack-replied to its own findings and
+  fully reconciled PRs still ended blocked on "human review threads have
+  no reply". Identity comparisons now go through `logins_match` (strip a
+  trailing `[bot]`, casefold) at every thread/review/author site, so the
+  two spellings are one identity; an empty login still matches nobody.
+
 - **App-auth runs no longer strand behind "N human review threads have
   no reply"** (#569 x #536). Under a GitHub App installation token
   `GET /user` 403s, and the loop's login could degrade to `""` — which

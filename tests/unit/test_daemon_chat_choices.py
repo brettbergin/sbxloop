@@ -378,3 +378,107 @@ class TestEviction:
             assert "newest" in bridge._questions
         finally:
             bridge.close()
+
+
+class TestEarlyClick:
+    """A click that lands before the posted message id is known (#573)."""
+
+    def test_a_click_during_the_send_is_answered_not_refused(self, tmp_path: Path) -> None:
+        bridge, _client, concierge = run_question_turn(tmp_path)
+        try:
+            asker = next(iter(bridge._questions.values())).msg
+            bridge._questions.clear()
+            seen: dict[str, Any] = {}
+            real = bridge._send_choices
+
+            async def slow_send(*args: Any, **kwargs: Any) -> Any:
+                key = kwargs.get("pending_key")
+                assert key is not None
+                seen["key"] = key
+                # The click arrives while the send is still in flight.
+                seen["accepted"] = bridge._answer_choice(key, "the layout", "brett")
+                return await real(*args, **kwargs)
+
+            bridge._send_choices = slow_send  # type: ignore[method-assign]
+            run_coro(bridge, bridge._post_choice_question(asker, "", QUESTION))
+            assert seen["accepted"] is True
+            assert seen["key"].startswith("pending:")
+            assert wait_for(lambda: len(concierge.turns) == 2)
+            assert concierge.turns[1][0] == "the layout"
+            assert bridge._questions == {}
+        finally:
+            bridge.close()
+
+    def test_after_the_send_the_entry_is_keyed_by_message_id(self, tmp_path: Path) -> None:
+        bridge, _client, _c = run_question_turn(tmp_path)
+        try:
+            asker = next(iter(bridge._questions.values())).msg
+            bridge._questions.clear()
+            run_coro(bridge, bridge._post_choice_question(asker, "", QUESTION))
+            keys = list(bridge._questions)
+            assert len(keys) == 1
+            assert not keys[0].startswith("pending:")
+            assert keys[0].isdigit()
+        finally:
+            bridge.close()
+
+    def test_rekeying_keeps_the_original_deadline(self, tmp_path: Path) -> None:
+        bridge, _client, _c = run_question_turn(tmp_path)
+        try:
+            msg = next(iter(bridge._questions.values())).msg
+            bridge._questions.clear()
+            bridge._register_question("pending:x", QUESTION, msg)
+            deadline = bridge._questions["pending:x"].deadline
+            bridge._rekey_question("pending:x", "m9")
+            assert "pending:x" not in bridge._questions
+            assert bridge._questions["m9"].deadline == deadline
+        finally:
+            bridge.close()
+
+    def test_rekeying_an_answered_question_does_not_resurrect_it(self, tmp_path: Path) -> None:
+        bridge, _client, _c = run_question_turn(tmp_path)
+        try:
+            bridge._questions.clear()
+            bridge._rekey_question("pending:gone", "m9")
+            assert bridge._questions == {}
+        finally:
+            bridge.close()
+
+    def test_a_failed_send_leaves_no_orphan_entry(self, tmp_path: Path) -> None:
+        bridge, _client, _c = run_question_turn(tmp_path)
+        try:
+            asker = next(iter(bridge._questions.values())).msg
+            bridge._questions.clear()
+
+            async def failed_send(*args: Any, **kwargs: Any) -> Any:
+                return None
+
+            bridge._send_choices = failed_send  # type: ignore[method-assign]
+            run_coro(bridge, bridge._post_choice_question(asker, "", QUESTION))
+            assert bridge._questions == {}
+        finally:
+            bridge.close()
+
+    def test_no_message_id_keeps_the_question_answerable_by_the_pending_key(
+        self, tmp_path: Path
+    ) -> None:
+        bridge, _client, concierge = run_question_turn(tmp_path)
+        try:
+            asker = next(iter(bridge._questions.values())).msg
+            bridge._questions.clear()
+            keys: list[str] = []
+            real = bridge._send_choices
+
+            async def send(*args: Any, **kwargs: Any) -> Any:
+                keys.append(str(kwargs.get("pending_key")))
+                return await real(*args, **kwargs)
+
+            bridge._send_choices = send  # type: ignore[method-assign]
+            bridge._message_id = lambda message: ""  # type: ignore[method-assign]
+            run_coro(bridge, bridge._post_choice_question(asker, "", QUESTION))
+            assert list(bridge._questions) == keys
+            assert bridge._answer_choice(keys[0], "the wording", "brett") is True
+            assert wait_for(lambda: len(concierge.turns) == 2)
+            assert concierge.turns[1][0] == "the wording"
+        finally:
+            bridge.close()

@@ -147,6 +147,7 @@ from sbxloop.gh.ops import (
     PostedFinding,
     ReviewComment,
     SubmittedReview,
+    logins_match,
 )
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
@@ -1652,7 +1653,7 @@ class LoopEngine:
             except GithubOpsError:
                 log.warning("review.author_lookup_failed", run=p.run_id, pr=number, exc_info=True)
             login = self._login(p)
-            p.self_review = bool(author) and author == login
+            p.self_review = logins_match(author, login)
             if p.self_review:
                 log.info(
                     "review.self_review",

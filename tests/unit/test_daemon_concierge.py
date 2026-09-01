@@ -794,8 +794,9 @@ class TestTools:
         def numbers(text: str) -> set[str]:
             return {line.split()[1] for line in text.splitlines() if line.startswith("- #")}
 
-        assert numbers(backlog.text) == {"#7"}
+        assert numbers(backlog.text) == {"#7", "#10"}
         assert "not-queued open issue(s)" in backlog.text
+        assert "BLOCKED — needs a human" in backlog.text
         assert numbers(queued.text) == {"#8", "#9"}
         assert "queued open issue(s)" in queued.text
         assert numbers(everything.text) == {"#7", "#8", "#9", "#10"}
@@ -852,6 +853,167 @@ class TestTools:
         assert explicit_open.ok
         assert numbers(backlog.text) == {"#7"}
         assert "not-queued open+closed issue(s)" in backlog.text
+
+    def test_list_issues_queue_views_partition_every_issue(self, tmp_path: Path) -> None:
+        issues = [
+            {
+                "number": n,
+                "title": f"Issue {n}",
+                "labels": [{"name": name} for name in names],
+                "created_at": "2026-08-01T00:00:00Z",
+                "user": {"login": "ana"},
+                "comments": 0,
+                "html_url": f"https://gh/i/{n}",
+            }
+            for n, names in (
+                (7, []),
+                (8, ["sbxloop:run"]),
+                (9, ["sbxloop:in-progress"]),
+                (10, ["sbxloop:blocked"]),
+                (11, ["sbxloop:failed"]),
+                (12, ["sbxloop:failed", "sbxloop:run"]),
+            )
+        ]
+        github = FakeGithub({"/issues?": issues})
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {"calls": [("list_issues", {"queued": True})]},
+                {"calls": [("list_issues", {"queued": False})]},
+                {"calls": [("list_issues", {})]},
+                {"calls": [("list_issues", {"state": "failed"})]},
+                {"calls": [("list_issues", {"state": "backlog"})]},
+                {"calls": [("list_issues", {"state": "blocked"})]},
+                {"calls": [("list_issues", {"state": "running"})]},
+                {"calls": [("list_issues", {"state": "queued"})]},
+                {"calls": [("list_issues", {"queued": False, "state": "failed"})]},
+            ],
+            github=github,
+        )
+        for prompt in "abcdefghi":
+            turn(concierge, prompt)
+        (
+            queued,
+            not_queued,
+            everything,
+            failed,
+            backlog,
+            blocked,
+            running,
+            state_queued,
+            both,
+        ) = client.responses
+
+        def numbers(text: str) -> set[str]:
+            return {line.split()[1] for line in text.splitlines() if line.startswith("- #")}
+
+        assert numbers(queued.text) == {"#8", "#9", "#12"}
+        assert numbers(not_queued.text) == {"#7", "#10", "#11"}
+        assert not numbers(queued.text) & numbers(not_queued.text)
+        assert numbers(queued.text) | numbers(not_queued.text) == numbers(everything.text)
+        assert "FAILED before" in not_queued.text
+        assert "BLOCKED — needs a human" in not_queued.text
+        assert numbers(failed.text) == {"#11", "#12"}
+        assert "failed open issue(s)" in failed.text
+        assert numbers(backlog.text) == {"#7"}
+        assert numbers(blocked.text) == {"#10"}
+        assert numbers(running.text) == {"#9"}
+        assert numbers(state_queued.text) == {"#8", "#12"}
+        assert numbers(both.text) == {"#11"}
+
+    def test_list_issues_queued_subsets_and_state_enum_cover_the_fixture(
+        self, tmp_path: Path
+    ) -> None:
+        fixture: list[tuple[int, list[str]]] = [
+            (21, ["sbxloop:run"]),
+            (22, ["sbxloop:in-progress"]),
+            (23, ["sbxloop:failed"]),
+            (24, ["sbxloop:blocked"]),
+            (25, ["sbxloop:failed", "sbxloop:blocked"]),
+            (26, []),
+        ]
+        issues = [
+            {
+                "number": n,
+                "title": f"Issue {n}",
+                "labels": [{"name": name} for name in names],
+                "created_at": "2026-08-01T00:00:00Z",
+                "user": {"login": "ana"},
+                "comments": 0,
+                "html_url": f"https://gh/i/{n}",
+            }
+            for n, names in fixture
+        ]
+        all_numbers = {n for n, _ in fixture}
+        expected_queued = {
+            n for n, names in fixture if {"sbxloop:run", "sbxloop:in-progress"} & set(names)
+        }
+        expected_not_queued = all_numbers - expected_queued
+        github = FakeGithub({"/issues?": issues})
+        calls = [
+            {"calls": [("list_issues", {"queued": True})]},
+            {"calls": [("list_issues", {"queued": False})]},
+            {"calls": [("list_issues", {"state": "queued"})]},
+            {"calls": [("list_issues", {"state": "running"})]},
+            {"calls": [("list_issues", {"state": "failed"})]},
+            {"calls": [("list_issues", {"state": "blocked"})]},
+            {"calls": [("list_issues", {"state": "backlog"})]},
+        ]
+        concierge, client, *_ = make(tmp_path, calls, github=github)
+        for prompt in range(len(calls)):
+            turn(concierge, str(prompt))
+        (
+            queued,
+            not_queued,
+            state_queued,
+            state_running,
+            state_failed,
+            state_blocked,
+            state_backlog,
+        ) = client.responses
+
+        def numbers(text: str) -> set[int]:
+            return {
+                int(line.split()[1].lstrip("#"))
+                for line in text.splitlines()
+                if line.startswith("- #")
+            }
+
+        def line_for(text: str, number: int) -> str:
+            return next(line for line in text.splitlines() if line.startswith(f"- #{number} "))
+
+        assert numbers(queued.text) == expected_queued
+        assert numbers(not_queued.text) == expected_not_queued
+        assert {23, 24, 25, 26} <= numbers(not_queued.text)
+        assert not numbers(queued.text) & numbers(not_queued.text)
+        assert numbers(queued.text) | numbers(not_queued.text) == all_numbers
+
+        assert numbers(state_queued.text) == {n for n, names in fixture if "sbxloop:run" in names}
+        assert numbers(state_running.text) == {
+            n for n, names in fixture if "sbxloop:in-progress" in names
+        }
+        assert numbers(state_failed.text) == {
+            n for n, names in fixture if "sbxloop:failed" in names
+        }
+        assert numbers(state_blocked.text) == {
+            n for n, names in fixture if "sbxloop:blocked" in names
+        }
+        assert numbers(state_backlog.text) == {n for n, names in fixture if not names}
+
+        assert "FAILED before" in line_for(not_queued.text, 23)
+        assert "BLOCKED — needs a human" in line_for(not_queued.text, 24)
+        both_line = line_for(not_queued.text, 25)
+        assert "FAILED before" in both_line and "BLOCKED — needs a human" in both_line
+
+    def test_list_issues_exposes_a_state_enum(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
+        turn(concierge)
+        spec = next(t for t in client.jobs[0].host_tools if t.name == "list_issues")
+        enum = spec.parameters["properties"]["state"]["enum"]
+        assert {"queued", "running", "failed", "blocked", "backlog"} <= set(enum)
+        assert "state" not in spec.parameters.get("required", [])
+        assert "state" in spec.description
+        assert "carrying none of the daemon's state labels" not in spec.description
 
     def test_list_issues_names_the_empty_subset(self, tmp_path: Path) -> None:
         github = FakeGithub(
