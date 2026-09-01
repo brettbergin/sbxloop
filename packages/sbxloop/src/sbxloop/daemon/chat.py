@@ -48,6 +48,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -424,6 +425,7 @@ class ChatBridge(ABC):
         question: ChoiceQuestion,
         *,
         reply_to: Any = None,
+        pending_key: str | None = None,
         mention_users: bool = False,
     ) -> Any:
         """Post a clarifying question whose answers are enumerable.
@@ -433,6 +435,12 @@ class ChatBridge(ABC):
         interactive components is unaffected and the question stays
         answerable by typing. Backends with components override this and
         keep the same prose in the message body as a fallback.
+
+        ``pending_key`` is the provisional key the caller has already
+        registered the question under; a backend that builds an
+        interactive view should hand it to the view so a click arriving
+        before the posted message id is known still resolves.
+
         ``mention_users`` lets the ask actually ping its asker.
         """
         body = render_prose(question)
@@ -1039,6 +1047,11 @@ class ChatBridge(ABC):
         """Post the question through the choice seam and remember it, so a
         click *or* a typed reply resolves to the same answer.
 
+        The question is registered *before* the send, under a provisional
+        key the view is handed, and rekeyed to the posted message id once
+        the transport reports it — a click that lands the instant the
+        message does still finds the question outstanding (#573).
+
         A long prose preamble is split the same way any other reply is: only
         the tail that fits alongside the rendered question rides with the
         components, so nothing is silently clipped away."""
@@ -1052,17 +1065,24 @@ class ChatBridge(ABC):
                 mention_users=first and mention_users,
             )
             first = False
+        # Register before the send: a click can arrive the instant the
+        # message lands, which is before the send call returns here, so the
+        # question has to already be answerable under a key the view knows.
+        provisional = f"pending:{uuid.uuid4()}"
+        self._register_question(provisional, question, msg)
         posted = await self._send_choices(
             msg.channel,
             preamble,
             question,
             reply_to=msg.raw if first else None,
+            pending_key=provisional,
             mention_users=mention_users,
         )
         if posted is None:
             # The interactive post failed: prose is already the fallback in
             # the base seam, so all we lose is the click. Say the question
             # anyway rather than leaving the user with nothing.
+            self._drop_question(provisional)
             await self._send(msg.channel, render_prose(question), reply_to=msg.raw)
             self.log.warning("chat.choices_post_failed", choices=len(question.choices))
             return
@@ -1070,11 +1090,14 @@ class ChatBridge(ABC):
             message_id = self._message_id(posted)
         except Exception:  # pragma: no cover - a transport that cannot id its post
             self.log.debug("chat.choices_no_message_id", exc_info=True)
-            return
+            message_id = ""
         if not message_id:
-            self.log.debug("chat.choices_no_message_id")
+            # No id to key on: the post itself succeeded, so the view (which
+            # holds the provisional key) can still resolve a click. The entry
+            # stays under that key and expires on the usual deadline.
+            self.log.debug("chat.choices_no_message_id", pending=provisional)
             return
-        self._register_question(message_id, question, msg)
+        self._rekey_question(provisional, message_id)
 
     def _split_choice_preamble(self, text: str, question: ChoiceQuestion) -> tuple[str, list[str]]:
         """Return the preamble to post with the components, plus any leading
@@ -1113,6 +1136,26 @@ class ChatBridge(ABC):
             choices=len(question.choices),
             ttl_s=self._question_ttl_s,
         )
+
+    def _rekey_question(self, old_key: str, new_key: str) -> None:
+        """Move an outstanding question from its provisional key to the
+        posted message id, atomically and without touching its deadline —
+        the TTL runs from when the question was asked, not from when the
+        transport got round to reporting the id."""
+        if old_key == new_key:
+            return
+        with self._lock:
+            entry = self._questions.pop(old_key, None)
+            if entry is None:
+                # Answered, expired or evicted while the send was in flight.
+                return
+            self._questions[new_key] = entry
+        self.log.debug("chat.choices_rekeyed", pending=old_key, message=new_key)
+
+    def _drop_question(self, key: str) -> None:
+        """Forget an outstanding question that no click path can reach."""
+        with self._lock:
+            self._questions.pop(key, None)
 
     def _register_pending_filing(self, msg: Inbound, pending: PendingFiling) -> None:
         """Persist a filing-blocking ask's fallback: if the asker never

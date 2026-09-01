@@ -288,6 +288,7 @@ class DiscordBridge(ChatBridge):
         question: ChoiceQuestion,
         *,
         reply_to: Any = None,
+        pending_key: str | None = None,
         mention_users: bool = False,
     ) -> Any:
         """Post a clarifying question with one clickable button per choice.
@@ -303,7 +304,9 @@ class DiscordBridge(ChatBridge):
         body = render_prose(question)
         if text and text.strip() and text.strip() != question.prompt.strip():
             body = f"{text.strip()}\n\n{body}"
-        view = _build_choice_view(self, question, timeout=self._question_ttl_s)
+        view = _build_choice_view(
+            self, question, timeout=self._question_ttl_s, pending_key=pending_key
+        )
         if view is None:
             # No component support on this host: prose, exactly as before.
             return await self._send(target, body, reply_to=reply_to, mention_users=mention_users)
@@ -579,10 +582,20 @@ class _ChoiceHandler:
     behaviour is the same object and is directly testable.
     """
 
-    def __init__(self, bridge: Any, question: ChoiceQuestion, body: str = "") -> None:
+    def __init__(
+        self,
+        bridge: Any,
+        question: ChoiceQuestion,
+        body: str = "",
+        *,
+        pending_key: str | None = None,
+    ) -> None:
         self.bridge = bridge
         self.question = question
         self.body = body
+        # The key the bridge registered the question under before the send
+        # went out. A click that beats ``bind`` still resolves through it.
+        self.pending_key = pending_key
         self.message: Any = None
         self.answered = False
 
@@ -593,11 +606,12 @@ class _ChoiceHandler:
 
     def _message_id(self) -> str:
         if self.message is None:
-            return ""
+            return self.pending_key or ""
         try:
-            return str(self.bridge._message_id(self.message))
+            resolved = str(self.bridge._message_id(self.message))
         except Exception:  # pragma: no cover - defensive
-            return ""
+            resolved = ""
+        return resolved or (self.pending_key or "")
 
     async def on_click(self, interaction: Any, value: str) -> None:
         """A user clicked a choice. Anyone may click — the asker is not the
@@ -758,7 +772,11 @@ def _build_gate_view(bridge: Any, gate: Any) -> Any:
 
 
 def _build_choice_view(
-    bridge: Any, question: ChoiceQuestion, *, timeout: float = CHOICE_QUESTION_TTL_S
+    bridge: Any,
+    question: ChoiceQuestion,
+    *,
+    timeout: float = CHOICE_QUESTION_TTL_S,
+    pending_key: str | None = None,
 ) -> Any:
     """A discord.py View of one button per choice, or None when this host's
     discord.py has no component support (the caller posts prose instead)."""
@@ -771,7 +789,7 @@ def _build_choice_view(
     except (ImportError, AttributeError):
         return None
 
-    handler = _ChoiceHandler(bridge, question)
+    handler = _ChoiceHandler(bridge, question, pending_key=pending_key)
 
     class _ChoiceView(view_cls):  # type: ignore[misc, valid-type]
         def __init__(self) -> None:
@@ -826,14 +844,18 @@ def _allowed_mentions_users() -> Any:
     roles) — what a run-watch ping needs to actually reach the requester."""
     try:
         import discord as discordpy
-    except ImportError:
+
+        return discordpy.AllowedMentions(everyone=False, roles=False, users=True)
+    except (ImportError, AttributeError):
+        # No discord.py, or one without AllowedMentions: the send goes out
+        # with the transport's defaults rather than failing.
         return None
-    return discordpy.AllowedMentions(everyone=False, roles=False, users=True)
 
 
 def _allowed_mentions_none() -> Any:
     try:
         import discord as discordpy
-    except ImportError:
+
+        return discordpy.AllowedMentions.none()
+    except (ImportError, AttributeError):
         return None
-    return discordpy.AllowedMentions.none()

@@ -2299,6 +2299,91 @@ class TestChoiceComponents:
         asyncio.run(view.on_timeout())
         assert len(posted.edit_kwargs) == edits
 
+    def test_a_mentioning_choice_post_survives_a_discord_without_allowed_mentions(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        """A discord.py exposing components but no AllowedMentions must not
+        take the whole post down: the send goes out with defaults."""
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        posted = asyncio.run(bridge._send_choices(channel, "", _question(), mention_users=True))
+        assert posted is not None
+        assert "allowed_mentions" not in channel.sent_kwargs[-1]
+
+    def test_a_click_before_bind_resolves_through_the_pending_key(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        from sbxloop.daemon.discord import _build_choice_view
+
+        bridge, _client, _ = make_bridge(tmp_path)
+        seen: list[str] = []
+        bridge._answer_choice = lambda mid, value, author=None, **kw: (  # type: ignore[method-assign]
+            seen.append(mid) or True
+        )
+        view = _build_choice_view(bridge, _question(), pending_key="pending:abc")
+        # bind() has not run: the view only knows the provisional key
+        asyncio.run(view.children[0].callback(StubInteraction()))
+        assert seen == ["pending:abc"]
+
+    def test_the_pending_key_is_threaded_into_the_view(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        posted = asyncio.run(
+            bridge._send_choices(channel, "", _question(), pending_key="pending:xyz")
+        )
+        view = channel.sent_kwargs[-1]["view"]
+        assert view.handler.pending_key == "pending:xyz"
+        # once bound, the real message id wins
+        assert view.handler._message_id() == str(bridge._message_id(posted))
+
+    def test_a_click_while_the_send_is_in_flight_is_answered(
+        self, tmp_path: Path, stub_discord: Any
+    ) -> None:
+        """#573: the whole path — the click fires from inside `send`, before
+        `_post_choice_question` can learn the posted message id."""
+        from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion
+        from sbxloop.daemon.concierge import ConciergeReply
+
+        question = ChoiceQuestion(
+            prompt="What do you want changed?",
+            choices=(Choice(value="the wording", label="The wording"),),
+        )
+        concierge = FakeConcierge(
+            [ConciergeReply("I need one more thing.", question=question), ConciergeReply("done")]
+        )
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            channel = client.channels[42]
+            real_send = channel.send
+            interaction = StubInteraction("dana")
+
+            async def send(text: str | None = None, **kwargs: Any) -> Any:
+                view = kwargs.get("view")
+                if view is not None:
+                    # the click lands before this send has returned, so no
+                    # message id exists anywhere yet
+                    await view.children[0].callback(interaction)
+                return await real_send(text, **kwargs)
+
+            channel.send = send  # type: ignore[method-assign]
+            msg = FakeMessage(
+                f"<@{BOT_USER.id}> please file a thing", channel, mid=701, mentions=[BOT_USER]
+            )
+            channel.messages[701] = msg
+            bridge._handle_message(msg)
+            assert wait_for(lambda: len(concierge.turns) == 2)
+            assert concierge.turns[1][0] == "the wording"
+            note = interaction.response.messages[0][0]
+            assert "Got it" in note
+            assert "type your answer" not in note
+            # nothing left outstanding, provisional or otherwise
+            assert wait_for(lambda: bridge._questions == {})
+        finally:
+            bridge.close()
+
 
 # -- the merge-gate approve button (PR: sbx/gate-button) --------------------------------
 
