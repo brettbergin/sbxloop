@@ -346,6 +346,10 @@ def _tool_output_lines(data: Any) -> int | None:
 # ``kill $(cat server.pid)``). Nothing is broken — the agent can rephrase and
 # retry, and does — so counting these as tool failures would degrade a critic
 # every time it cleans up a server process (field failure retn41aa6).
+# Backend identity stamped onto agent events and usage samples, so chat
+# can name provider+model.
+BACKEND_NAME = "copilot"
+
 _REFUSAL_PREFIX = "Command not executed."
 
 
@@ -528,6 +532,7 @@ def usage_from_sdk_sample(data: Any) -> Usage:
     """
     return Usage(
         model=_sdk_field(data, "model"),
+        backend=BACKEND_NAME,
         input_tokens=_sdk_field(data, "input_tokens"),
         output_tokens=_sdk_field(data, "output_tokens"),
         cache_read_tokens=_sdk_field(data, "cache_read_tokens"),
@@ -622,6 +627,7 @@ class CopilotBackend:
                     EventTypes.AGENT_MESSAGE,
                     content=content,
                     model=getattr(data, "model", None) or model_slug,
+                    backend=BACKEND_NAME,
                 )
             elif type_name.startswith("ToolExecutionStart"):
                 tool = getattr(data, "tool_name", None) or getattr(data, "toolName", None)
@@ -665,6 +671,7 @@ class CopilotBackend:
                 if sample.model:
                     model_slug = sample.model
                 payload = sample.model_dump(exclude_none=True)
+                payload["backend"] = BACKEND_NAME
                 tools = available_tool_count(data)
                 if tools is not None:
                     payload["available_tools"] = tools
@@ -685,7 +692,7 @@ class CopilotBackend:
                     output_text=text,
                     output_json=output_json,
                     session_id=session_id,
-                    usage=usage if usage != Usage() else None,
+                    usage=usage.merged(Usage(backend=BACKEND_NAME)) if usage != Usage() else None,
                     turns=turns or None,
                     health=tracker.health(governor),
                 )

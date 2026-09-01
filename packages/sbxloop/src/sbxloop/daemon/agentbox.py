@@ -162,6 +162,7 @@ class DaemonAgent:
             transport=self.config.worker_transport,
             python=self.worker_python,
             role="agent",
+            backend=self.config.agent.backend,
             limits=self.config.limits,
             # The concierge box is long-lived and reused across daemon
             # restarts; passing the sandbox lets job_env re-probe stdin

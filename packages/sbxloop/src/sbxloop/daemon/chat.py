@@ -52,7 +52,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from sbxloop.config import ChatBackend, ChatBridgeConfig, Config
 from sbxloop.daemon.chat_choices import (
@@ -66,6 +66,8 @@ from sbxloop.daemon.chat_routing import DISCORD_MENTION_RE, route_message
 from sbxloop.daemon.concierge import VIA_CONCIERGE_SUFFIX
 from sbxloop.daemon.control import ITEM_COMMANDS, dispatch
 from sbxloop.daemon.discord_format import (
+    UNKNOWN_BACKEND,
+    UNKNOWN_MODEL,
     Chunk,
     EmbedSpec,
     RunStats,
@@ -75,6 +77,7 @@ from sbxloop.daemon.discord_format import (
     ToolDigest,
     _clip,
     _one_line,
+    agent_ident_from_config_json,
     code,
     daemon_notice,
     finish_embed,
@@ -256,6 +259,14 @@ class _OutstandingQuestion:
     @property
     def asker_id(self) -> str | None:
         return self.msg.author_id
+
+
+class AgentIdent(NamedTuple):
+    """Which agent served a run: the backend name and the model, both already
+    normalised to ``unknown`` rather than left empty."""
+
+    backend: str
+    model: str
 
 
 class _NoTyping:
@@ -2153,6 +2164,43 @@ class ChatBridge(ABC):
         except Exception:
             self.log.debug("chat.react_failed", emoji=emoji, exc_info=True)
 
+    def _agent_ident(self, run_id: str | None = None) -> AgentIdent:
+        """The agent backend + model to show for a run. A run whose engine
+        store recorded a config is described by THAT config, so a historical
+        run (or one started under a different backend) is not relabelled with
+        whatever the daemon is configured for now; anything unreadable or
+        predating the ``[agent] backend`` key reads as unknown."""
+        if run_id:
+            recorded = self._recorded_agent_ident(run_id)
+            if recorded is not None:
+                return recorded
+        backend = getattr(getattr(self.config, "agent", None), "backend", None)
+        model = getattr(self.config, "model", None)
+        return AgentIdent(str(backend or "") or UNKNOWN_BACKEND, str(model or "") or UNKNOWN_MODEL)
+
+    def _recorded_agent_ident(self, run_id: str) -> AgentIdent | None:
+        """The backend+model persisted with ``run_id``, or None when this
+        bridge has no engine store to ask (the common in-flight case)."""
+        engine = self._engine
+        store = getattr(engine, "store", None)
+        get_config = getattr(store, "get_run_config", None)
+        if get_config is None:
+            return None
+        try:
+            raw = get_config(run_id)
+        except Exception:
+            # An unknown run, a closed store, a store from another daemon:
+            # never let the headline fail over agent attribution.
+            self.log.debug("chat.agent_ident_unavailable", run=run_id, exc_info=True)
+            return None
+        fields = agent_ident_from_config_json(raw)
+        ident = AgentIdent(fields["backend"], fields["model"])
+        if ident.backend == UNKNOWN_BACKEND and ident.model == UNKNOWN_MODEL:
+            # Nothing was persisted at all (a pre-config-persistence row);
+            # the live config is a better guess than a doubly-unknown line.
+            return None
+        return ident
+
     async def _ensure_thread(self, run_id: str) -> Any:
         """The run's thread, creating headline + thread on first sight;
         re-attaches to a persisted thread after a daemon restart."""
@@ -2173,8 +2221,11 @@ class ChatBridge(ABC):
             channel = await self._control_channel()
             if channel is None:
                 return None
+            ident = self._agent_ident(run_id)
             headline = await self._send(
-                channel, headline_text(item, run_id), embed=headline_embed(item, run_id)
+                channel,
+                headline_text(item, run_id, backend=ident.backend, model=ident.model),
+                embed=headline_embed(item, run_id, backend=ident.backend, model=ident.model),
             )
             if headline is None:
                 return None
@@ -2214,13 +2265,16 @@ class ChatBridge(ABC):
         if item is None:
             return
         facts = self._facts.get(run_id, {})
+        ident = self._agent_ident(run_id)
         await self._edit_headline(
             run_id,
-            headline_text(item, run_id, state),
+            headline_text(item, run_id, state, backend=ident.backend, model=ident.model),
             embed=headline_embed(
                 item,
                 run_id,
                 state,
+                backend=ident.backend,
+                model=ident.model,
                 branch=facts.get("branch"),
                 pr=facts.get("pr"),
                 requested_by=item.requested_by,

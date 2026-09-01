@@ -411,6 +411,11 @@ and `usage_today` end their block with a fixed "spend: not reported by the
 agent backend" line, and any future backend figure must arrive with its unit
 established and be carried non-additively.
 
+Both reports name the agent as `backend · model` (#601) — each pair the run
+actually used — so a GPT model served through Copilot is distinguishable from
+a Claude model served from Claude. Usage events recorded before the backend
+was stamped onto them report `unknown` as the backend and still render.
+
 One knob remains:
 
 - `[budgets] max_parallel_tasks` runs independent tasks concurrently. The
@@ -874,6 +879,31 @@ affinity). `[chat] backend` selects the transport (`config.chat_backend` /
 when both are set without a choice, headless when neither is), and
 `chat.build_bridge` imports only the chosen module, so a Discord deployment
 never loads slack_sdk and vice versa.
+
+**Agent attribution names the backend, not just the model** (#601). A model
+reference alone does not say which provider served a run, so every place chat
+surfaces the model spells `backend · model` instead — `copilot · gpt-5`,
+`claude · claude-sonnet-4-5` — and a reader tells a GPT model offered through
+Copilot apart from a Claude model offered from Claude without leaving the
+channel. One helper, `discord_format.agent_model_label`, produces that pair
+for all three places the model is surfaced: the run headline (both the
+`content=` text and the embed card's **Agent** field), agent message
+attribution in a run thread (`**executor** · \`copilot · gpt-5\``), and the concierge's `run_usage`/`usage_today\` reports, whose model line lists each
+backend+model pair the run actually used. Because the label is built at the
+render seam and the Slack transport re-dialects the same rendered strings,
+a Slack deployment shows the identical pair — neither transport keeps the
+old model-only form.
+
+The backend shown for a run is the one **that run recorded**, read from its
+persisted `runs.config_json` (`[agent] backend`) rather than from whatever the
+daemon is configured for now, so re-rendering an old headline under a switched
+backend does not relabel it. Anything the label cannot establish reads as the
+literal `unknown`: a run recorded before this change (or before `[agent] backend` existed), a usage event that predates backend stamping, an
+unreadable or empty config row, or a backend name outside the known set. That
+fallback is total — `agent_model_label` never raises and never renders a blank
+or a placeholder — so historical runs still produce a readable line naming the
+model they did record, with `unknown` in the backend's place, and their usage
+reports still render.
 
 **Clarifying questions with enumerable answers** (#564) are transport-free
 too. `daemon/chat_choices.py` knows nothing about any backend: it parses the

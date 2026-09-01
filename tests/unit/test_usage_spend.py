@@ -82,6 +82,9 @@ class TestUsageCarriesOnlyTokenFields:
         token/model fields — there is nowhere for a spend figure to land."""
         assert set(Usage.model_fields) == {
             "model",
+            # Identity of the serving backend, so chat can say
+            # provider+model; not a counter and never money-shaped.
+            "backend",
             "input_tokens",
             "output_tokens",
             "cache_read_tokens",

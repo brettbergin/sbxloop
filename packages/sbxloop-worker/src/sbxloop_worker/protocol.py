@@ -38,6 +38,11 @@ class Usage(ProtocolModel):
     """Model/token usage reported by an agent backend for one job."""
 
     model: str | None = None
+    # Which agent backend served the run ("copilot", "claude", "echo"), so
+    # chat rendering can name provider+model instead of inferring the
+    # provider from the model slug. Optional: samples from an older worker
+    # simply carry None.
+    backend: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
@@ -46,8 +51,8 @@ class Usage(ProtocolModel):
     def merged(self, other: Usage) -> Usage:
         """Accumulate another usage sample into this one (None-safe sums).
 
-        Token counters are summed. ``model`` is not: it is last-wins, because
-        it is not a per-turn delta.
+        Token counters are summed. ``model`` and ``backend`` are not: they
+        are last-wins, because they are not per-turn deltas.
         """
 
         def add(a: int | None, b: int | None) -> int | None:
@@ -57,6 +62,7 @@ class Usage(ProtocolModel):
 
         return Usage(
             model=other.model or self.model,
+            backend=other.backend or self.backend,
             input_tokens=add(self.input_tokens, other.input_tokens),
             output_tokens=add(self.output_tokens, other.output_tokens),
             cache_read_tokens=add(self.cache_read_tokens, other.cache_read_tokens),

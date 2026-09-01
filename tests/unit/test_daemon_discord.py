@@ -67,7 +67,7 @@ class TestFormat:
             ev("agent.message", content="x" * 5000, agent="planner", model="claude-sonnet-5"),
             max_chars=1900,
         )
-        assert chunks and chunks[0].text.startswith("**planner** · `claude-sonnet-5`\n")
+        assert chunks and chunks[0].text.startswith("**planner** · `unknown · claude-sonnet-5`\n")
         assert all(len(c.text) <= 1900 for c in chunks)
         for t in ("agent.message_delta", "worker.heartbeat", "agent.usage", "sandbox.resources"):
             assert format_for_discord(ev(t, x=1)) == []

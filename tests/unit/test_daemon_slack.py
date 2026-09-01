@@ -18,6 +18,7 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.daemon.chat import build_bridge
 from sbxloop.daemon.discord import DiscordBridge
+from sbxloop.daemon.discord_format import agent_model_label, format_for_discord
 from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
 from sbxloop.daemon.slack import SlackBridge, SlackMessage, SlackTarget
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -601,5 +602,71 @@ class TestSeams:
             # an edit never grows a preview the post did not have
             assert edit["unfurl_links"] is False and edit["unfurl_media"] is False
             assert edit["attachments"][0]["color"] == "#000001"
+        finally:
+            bridge.close()
+
+
+class TestAgentBackendLabel:
+    """Slack renders through the same formatter as Discord, so the backend +
+    model label must come out identical on both transports (#601)."""
+
+    def test_agent_message_and_headline_name_backend_and_model(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            bridge.config = bridge.config.model_copy(
+                update={
+                    "model": "gpt-5",
+                    "agent": bridge.config.agent.model_copy(update={"backend": "copilot"}),
+                }
+            )
+            _, bus, _ = start_run(bridge)
+            headline = client.web.posted[0]
+            assert "copilot · gpt-5" in headline["text"]
+            assert "copilot · gpt-5" in str(headline["attachments"][0]["blocks"])
+            bus.publish(
+                ev("agent.message", content="hi", agent="builder", model="gpt-5", backend="copilot")
+            )
+            assert wait_for(
+                lambda: any(
+                    p.get("thread_ts") and "copilot · gpt-5" in p["text"] for p in client.web.posted
+                )
+            )
+            post = next(
+                p
+                for p in client.web.posted
+                if p.get("thread_ts") and "copilot · gpt-5" in p["text"]
+            )
+            assert "*builder*" in post["text"]
+            # the identical label the Discord path renders
+            assert agent_model_label("copilot", "gpt-5") == "copilot · gpt-5"
+            discord_chunks = format_for_discord(
+                ev("agent.message", content="hi", agent="builder", model="gpt-5", backend="copilot")
+            )
+            assert discord_chunks[0].text.startswith("**builder** · `copilot · gpt-5`")
+        finally:
+            bridge.close()
+
+    def test_claude_backend_and_missing_or_unknown_backend(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            _, bus, _ = start_run(bridge)
+            bus.publish(
+                ev(
+                    "agent.message",
+                    content="a",
+                    agent="builder",
+                    model="claude-sonnet-5",
+                    backend="claude",
+                )
+            )
+            # a historical event with no backend recorded at all
+            bus.publish(ev("agent.message", content="b", agent="builder", model="gpt-5"))
+            # ... and one with no model either
+            bus.publish(ev("agent.message", content="c", agent="builder"))
+            assert wait_for(lambda: sum(1 for p in client.web.posted if p.get("thread_ts")) >= 3)
+            texts = [p["text"] for p in client.web.posted if p.get("thread_ts")]
+            assert any("claude · claude-sonnet-5" in t for t in texts)
+            assert any("unknown · gpt-5" in t for t in texts)
+            assert any(t.strip().startswith("*builder*") and "·" not in t for t in texts)
         finally:
             bridge.close()

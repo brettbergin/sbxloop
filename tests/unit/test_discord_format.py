@@ -23,6 +23,7 @@ from sbxloop.daemon.discord_format import (
     ToolDigest,
     _clip,
     _fence_state,
+    agent_model_label,
     daemon_notice,
     finish_embed,
     finish_text,
@@ -186,9 +187,15 @@ class TestDecisionCards:
 class TestFormat:
     def test_agent_message_header_and_split(self) -> None:
         chunks = format_for_discord(
-            ev("agent.message", content="Hello **there**", agent="planner", model="claude-sonnet-5")
+            ev(
+                "agent.message",
+                content="Hello **there**",
+                agent="planner",
+                model="claude-sonnet-5",
+                backend="claude",
+            )
         )
-        assert texts(chunks) == ["**planner** · `claude-sonnet-5`\nHello **there**"]
+        assert texts(chunks) == ["**planner** · `claude · claude-sonnet-5`\nHello **there**"]
         assert chunks[0].kind == "block" and chunks[0].flush
         many = format_for_discord(
             ev("agent.message", content="para\n\n" * 400, agent="executor"), max_chars=500
@@ -1410,3 +1417,50 @@ class TestNoUnfurl:
         assert no_unfurl(text) == (
             "before\n```sh\ncurl https://example.com/a\n```\nafter <https://example.com/b>"
         )
+
+
+class TestAgentModelLabel:
+    def test_known_backends_pair_with_model(self) -> None:
+        assert agent_model_label("copilot", "gpt-5") == "copilot · gpt-5"
+        assert agent_model_label("claude", "claude-sonnet-5") == "claude · claude-sonnet-5"
+        assert agent_model_label("COPILOT", "gpt-5") == "copilot · gpt-5"
+
+    def test_missing_or_unknown_backend_reads_unknown(self) -> None:
+        for backend in (None, "", "   ", "wat"):
+            assert agent_model_label(backend, "gpt-5") == "unknown · gpt-5"
+
+    def test_missing_model_still_renders(self) -> None:
+        assert agent_model_label("copilot", None) == "copilot · unknown"
+        assert agent_model_label(None, None) == "unknown · unknown"
+
+    def test_agent_message_without_model_shows_backend(self) -> None:
+        chunks = format_for_discord(
+            ev("agent.message", content="hi", agent="planner", backend="copilot")
+        )
+        assert texts(chunks) == ["**planner** · `copilot · unknown`\nhi"]
+
+    def test_agent_message_historical_event_has_no_backend(self) -> None:
+        chunks = format_for_discord(ev("agent.message", content="hi", agent="p", model="gpt-5"))
+        assert texts(chunks) == ["**p** · `unknown · gpt-5`\nhi"]
+
+    def test_agent_message_without_model_or_backend_renders(self) -> None:
+        chunks = format_for_discord(ev("agent.message", content="hi", agent="p"))
+        assert texts(chunks) == ["**p**\nhi"]
+
+
+class TestHeadlineAgentField:
+    def test_headline_names_backend_and_model(self) -> None:
+        item = WorkItem(item_id="gh:issue:7", source_key="7", title="T")
+        card = headline_embed(item, "r1", backend="copilot", model="gpt-5", hostname="h")
+        assert ("Agent", "`copilot · gpt-5`", True) in card.fields
+        assert "`copilot · gpt-5`" in headline_text(item, "r1", backend="copilot", model="gpt-5")
+
+    def test_headline_unknown_backend(self) -> None:
+        item = WorkItem(item_id="gh:issue:7", source_key="7", title="T")
+        card = headline_embed(item, "r1", backend="", model="gpt-5", hostname="h")
+        assert ("Agent", "`unknown · gpt-5`", True) in card.fields
+
+    def test_headline_without_agent_info_is_unchanged(self) -> None:
+        item = WorkItem(item_id="gh:issue:7", source_key="7", title="T")
+        card = headline_embed(item, "r1", hostname="h")
+        assert not any(name == "Agent" for name, _v, _i in card.fields)

@@ -33,6 +33,10 @@ from sbxloop_worker.backends import BackendResult, EmitFn
 from sbxloop_worker.hosttools import request_tool, safe_call_id
 from sbxloop_worker.protocol import EventTypes, HostToolCall, JobRequest, SessionHealth, Usage
 
+# Backend identity stamped onto agent events and usage samples, so chat
+# can name provider+model.
+BACKEND_NAME = "echo"
+
 SCRIPT_ENV = "SBXLOOP_ECHO_SCRIPT"
 
 
@@ -50,13 +54,18 @@ class EchoBackend:
     def _echo(self, job: JobRequest, emit: EmitFn) -> BackendResult:
         assert job.prompt is not None
         text = f"echo: {job.prompt}"
-        emit(EventTypes.AGENT_MESSAGE, content=text, model="echo")
+        emit(EventTypes.AGENT_MESSAGE, content=text, model="echo", backend=BACKEND_NAME)
         output_json = {"echo": job.prompt} if job.expect == "json" else None
         return BackendResult(
             output_text=text,
             output_json=output_json,
             session_id=f"echo-{job.job_id}",
-            usage=Usage(model="echo", input_tokens=len(job.prompt.split()), output_tokens=2),
+            usage=Usage(
+                model="echo",
+                backend=BACKEND_NAME,
+                input_tokens=len(job.prompt.split()),
+                output_tokens=2,
+            ),
             turns=1,
         )
 
@@ -95,7 +104,7 @@ class EchoBackend:
         for tool_text in self._host_tool_calls(job, emit, response.get("host_tool_calls", [])):
             text = f"{text}\n{tool_text}" if text else tool_text
         if text:
-            emit(EventTypes.AGENT_MESSAGE, content=text, model="echo")
+            emit(EventTypes.AGENT_MESSAGE, content=text, model="echo", backend=BACKEND_NAME)
         output_json = response.get("json")
         if output_json is None and job.expect == "json":
             output_json = extract_json(text)
@@ -106,6 +115,7 @@ class EchoBackend:
             session_id=str(response.get("session_id", f"echo-{job.job_id}")),
             usage=Usage(
                 model="echo",
+                backend=BACKEND_NAME,
                 input_tokens=len(job.prompt.split()) if job.prompt else 0,
                 output_tokens=len(text.split()),
             ),

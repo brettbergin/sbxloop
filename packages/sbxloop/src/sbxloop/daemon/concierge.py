@@ -49,6 +49,7 @@ from sbxloop.daemon.chat_choices import (
     parse_pending_filing,
 )
 from sbxloop.daemon.control import dispatch, plain
+from sbxloop.daemon.discord_format import agent_model_label
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.versions import VersionProbe
@@ -1221,8 +1222,13 @@ class Concierge:
             turns[who] = turns.get(who, 0) + 1
             if event.job_id:
                 jobs.setdefault(who, set()).add(event.job_id)
-            if sample.model and sample.model not in models:
-                models.append(sample.model)
+            # Backend + model, so a GPT model served through Copilot reads
+            # differently from a Claude model served from Claude. Events that
+            # predate backend stamping render as `unknown`.
+            if sample.model or sample.backend:
+                label = agent_model_label(sample.backend, sample.model)
+                if label not in models:
+                    models.append(label)
             samples += 1
         return _RunUsage(
             total, by_agent, models, samples, turns, {k: len(v) for k, v in jobs.items()}
@@ -1857,6 +1863,7 @@ class _RunUsage(NamedTuple):
 
     @property
     def model_line(self) -> str:
+        """Backend + model pairs for the run, or a plain "not reported"."""
         return " + ".join(self.models) if self.models else "model not reported"
 
 
@@ -1871,6 +1878,7 @@ class _RunUsage(NamedTuple):
 # Discord as fact. `Usage` carries no such field at all now.
 _USAGE_FIELDS = (
     "model",
+    "backend",
     "input_tokens",
     "output_tokens",
     "cache_read_tokens",
