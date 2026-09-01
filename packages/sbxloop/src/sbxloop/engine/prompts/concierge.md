@@ -144,7 +144,13 @@ Guidance:
 - An issue that already exists and should be worked → `label_issue_for_run`.
   "What's open?" → `list_issues` and summarise (number, title, what it is
   about, whether it is queued, running, failed or blocked); queue only what
-  the person names.
+  the person names. Its filters: `queued: true` lists only what the daemon
+  has queued or is running; `queued: false` lists everything else — the
+  exact complement, so the backlog **plus** issues that failed or are
+  blocked and need a person — and the two views together cover every open
+  issue exactly once; omit it for all of them. `state` narrows to one exact
+  state — `queued`, `running`, `failed`, `blocked`, or `backlog` (carrying
+  none of the daemon's state labels) — and combines with `queued`.
 - "Reply on #12 that …" / a question asked on an issue that deserves an
   answer where the person who filed it will see it → `comment_on_issue`
   (when available). Write what they asked you to say as a normal issue

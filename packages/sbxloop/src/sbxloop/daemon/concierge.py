@@ -902,8 +902,12 @@ class Concierge:
                             "daemon's labels, or NOT QUEUED when it carries none of them (filed "
                             "for the backlog, waiting on a person); label narrows to one label; "
                             "queued narrows by queue state — true lists only issues the daemon "
-                            "has queued or is running, false lists only the backlog (issues "
-                            "carrying none of the daemon's state labels), omit it for all. "
+                            "has queued or is running, false lists everything else (the exact "
+                            "complement: backlog issues plus ones labelled only failed and/or "
+                            "blocked), omit it for all, so the two views together cover every "
+                            "issue exactly once. state narrows to one exact state: queued, "
+                            "running, failed, blocked, or backlog (none of the daemon's four "
+                            "state labels); state and queued can be combined and both apply. "
                             "Each line: number, "
                             "title, labels, age, author, comments, url. Queue only what the "
                             "person names, with label_issue_for_run."
@@ -913,6 +917,16 @@ class Concierge:
                                 "all": {"type": "boolean"},
                                 "label": {"type": "string"},
                                 "queued": {"type": "boolean"},
+                                "state": {
+                                    "type": "string",
+                                    "enum": [
+                                        "queued",
+                                        "running",
+                                        "failed",
+                                        "blocked",
+                                        "backlog",
+                                    ],
+                                },
                                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                                 "repo": {"type": "string"},
                             }
@@ -1499,25 +1513,38 @@ class Concierge:
             return json.dumps(data, default=str)[:2000]
         issues = [d for d in data if isinstance(d, dict) and "pull_request" not in d]
         queued_arg = args.get("queued")
-        subset = ""
+        state_arg = str(args.get("state") or "").strip().lower()
+        subset_parts: list[str] = []
+        state_labels = {
+            daemon.trigger_label,
+            daemon.in_progress_label,
+            daemon.failed_label,
+            daemon.blocked_label,
+        }
+        active_labels = {daemon.trigger_label, daemon.in_progress_label}
         if queued_arg is not None:
             want_queued = bool(queued_arg)
-            state_labels = {
-                daemon.trigger_label,
-                daemon.in_progress_label,
-                daemon.failed_label,
-                daemon.blocked_label,
-            }
-            active_labels = {daemon.trigger_label, daemon.in_progress_label}
 
-            def _keep(issue: dict[str, Any]) -> bool:
+            def _keep_queued(issue: dict[str, Any]) -> bool:
                 labels = set(_label_names(issue))
-                if want_queued:
-                    return bool(labels & active_labels)
-                return not (labels & state_labels)
+                return bool(labels & active_labels) is want_queued
 
-            issues = [d for d in issues if _keep(d)]
-            subset = " queued" if want_queued else " not-queued"
+            issues = [d for d in issues if _keep_queued(d)]
+            subset_parts.append("queued" if want_queued else "not-queued")
+        state_label_by_name = {
+            "queued": daemon.trigger_label,
+            "running": daemon.in_progress_label,
+            "failed": daemon.failed_label,
+            "blocked": daemon.blocked_label,
+        }
+        if state_arg == "backlog":
+            issues = [d for d in issues if not (set(_label_names(d)) & state_labels)]
+            subset_parts.append("backlog")
+        elif state_arg in state_label_by_name:
+            wanted = state_label_by_name[state_arg]
+            issues = [d for d in issues if wanted in _label_names(d)]
+            subset_parts.append(state_arg)
+        subset = "".join(f" {part}" for part in subset_parts)
         if not issues:
             return f"no{subset} {openness} issues in {repo}" + (
                 f" with label `{label}`" if label else ""
