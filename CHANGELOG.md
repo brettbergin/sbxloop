@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Chat names the agent backend next to its model** (#601). Discord and
+  Slack messages that surfaced only a model reference now read
+  `backend · model` (`copilot · gpt-5`, `claude · claude-sonnet-4-5`), so a
+  reader of a control channel or a run thread can tell a GPT model offered
+  through Copilot apart from a Claude model offered from Claude without
+  leaving chat. The pair appears everywhere the model was surfaced before —
+  run headline cards (text and embed), agent message attribution in a run
+  thread, and the concierge's `run_usage` / `usage_today` reports — and is
+  identical on both chat backends. The backend shown is the one the run
+  itself recorded, so re-rendering an old run under a switched backend does
+  not relabel it. Runs and usage events recorded before this change carry no
+  backend and render as `unknown` rather than a blank, a placeholder or an
+  error.
+
 - **Re-adding the trigger label restarts an issue** (#600). Applying
   `sbxloop:run` again to an issue whose last attempt finished (done,
   failed, blocked or cancelled) now re-queues it on the next poll whether

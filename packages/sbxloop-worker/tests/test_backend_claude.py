@@ -17,13 +17,21 @@ import pytest
 
 from sbxloop_worker.backends import BackendUnavailableError, get_backend
 from sbxloop_worker.backends.claude import (
+    BACKEND_NAME,
     ClaudeBackend,
     _auth_diagnostic,
     read_only_denial,
     unavailable_denial,
     usage_from_result,
 )
-from sbxloop_worker.protocol import Event, EventTypes, HostToolResponse, HostToolSpec, JobRequest
+from sbxloop_worker.protocol import (
+    Event,
+    EventTypes,
+    HostToolResponse,
+    HostToolSpec,
+    JobRequest,
+    Usage,
+)
 
 # -- the fake SDK -------------------------------------------------------------
 
@@ -456,6 +464,22 @@ class TestDecisionLogic:
         usage = usage_from_result(message, "m")
         assert (usage.input_tokens, usage.output_tokens) == (1, 2)
         assert (usage.cache_read_tokens, usage.cache_write_tokens) == (3, 4)
+        assert usage.backend == "claude"
+
+    def test_usage_names_the_serving_backend(self) -> None:
+        """Chat says backend+model, so a Claude sample must be self-describing
+        rather than inferred from the model slug."""
+        message = types.SimpleNamespace(usage=None)
+        usage = usage_from_result(message, "claude-opus-5")
+        assert (usage.backend, usage.model) == (BACKEND_NAME, "claude-opus-5")
+        assert BACKEND_NAME == "claude"
+
+    def test_backend_survives_merging_and_omission(self) -> None:
+        sample = usage_from_result(types.SimpleNamespace(usage=None), "claude-opus-5")
+        assert Usage().merged(sample).backend == "claude"
+        # A sample from an older worker carries no backend; merging keeps the
+        # known one rather than blanking it.
+        assert sample.merged(Usage(model="m")).backend == "claude"
 
     def test_auth_diagnostic_shapes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

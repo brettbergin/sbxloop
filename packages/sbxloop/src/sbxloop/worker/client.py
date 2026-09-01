@@ -153,6 +153,7 @@ class WorkerClient:
         poll_interval: float = 2.0,
         grace_s: float = 60.0,
         role: str | None = None,
+        backend: str | None = None,
         limits: Limits | None = None,
         credential_refresh: Callable[[], None] | None = None,
         job_env: Callable[[], Mapping[str, str]] | None = None,
@@ -173,6 +174,10 @@ class WorkerClient:
         # know which sandbox it lives in), and guardrail thresholds to pass
         # through to the worker's heartbeat sampler.
         self.role = role
+        # The host's configured agent backend, stamped onto agent.* events
+        # that arrive without one (an older worker), so chat can always name
+        # provider+model.
+        self.backend = backend
         self.limits = limits
         # Invoked before each submit when set (github role under GitHub App
         # auth): re-mints and rewrites the in-VM env file when the
@@ -897,8 +902,11 @@ class WorkerClient:
         ):
             event.data.setdefault("role", self.role)
         agent = self._job_agents.get(job.job_id)
-        if agent is not None and event.type.startswith("agent."):
-            event.data.setdefault("agent", agent)
+        if event.type.startswith("agent."):
+            if agent is not None:
+                event.data.setdefault("agent", agent)
+            if self.backend is not None:
+                event.data.setdefault("backend", self.backend)
         self.bus.publish(event)
         if event.type == EventTypes.AGENT_TOOL_REQUEST:
             broker = self._brokers.get(job.job_id)

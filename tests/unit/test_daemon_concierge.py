@@ -459,6 +459,63 @@ class TestTools:
         assert "spend: not reported" in resp.text
         assert "0.7500" not in resp.text
 
+    def test_run_usage_names_backend_and_model(self, tmp_path: Path) -> None:
+        """#601: the model alone does not say which provider served the run.
+        Every reported model is named with its backend, mixed backends are
+        both listed, and a sample with no backend reads as `unknown`."""
+        concierge, client, _, loop, dstore = make(
+            tmp_path, [{"calls": [("run_usage", {"run_id": "r1abcdefg"})]}]
+        )
+        store = self._seed_run(tmp_path, dstore, loop)
+        from sbxloop.events import Event
+
+        samples = (
+            {"backend": "copilot", "model": "gpt-5"},
+            {"backend": "copilot", "model": "gpt-5"},  # de-duplicated on the pair
+            {"backend": "claude", "model": "claude-sonnet-4.5"},
+            {"model": "legacy-model"},  # predates backend stamping
+        )
+        for extra in samples:
+            store.append_event(
+                Event.now(
+                    "agent.usage",
+                    "r1abcdefg",
+                    input_tokens=100,
+                    output_tokens=10,
+                    agent="executor",
+                    **extra,
+                )
+            )
+        turn(concierge, "what did r1abcdefg spend?")
+        (resp,) = client.responses
+        assert resp.ok
+        head = resp.text.splitlines()[0]
+        assert "copilot \u00b7 gpt-5" in head
+        assert "claude \u00b7 claude-sonnet-4.5" in head
+        # An older sample still renders a readable line, not a blank or a
+        # traceback.
+        assert "unknown \u00b7 legacy-model" in head
+        assert head.count("copilot \u00b7 gpt-5") == 1
+        assert "4 sample(s)" in head
+
+    def test_usage_today_names_backend_and_model(self, tmp_path: Path) -> None:
+        """The daily head line uses the same backend+model pairs."""
+        concierge, client, _, loop, dstore = make(tmp_path, [{"calls": [("usage_today", {})]}])
+        store = self._seed_run(tmp_path, dstore, loop)
+        from sbxloop.events import Event
+
+        for extra in ({"backend": "copilot", "model": "gpt-5"}, {"model": "legacy-model"}):
+            event = Event.now(
+                "agent.usage", "r1abcdefg", input_tokens=500, output_tokens=40, **extra
+            )
+            event.ts = 1_000_000.0
+            store.append_event(event)
+        turn(concierge, "how much have we spent today?")
+        (resp,) = client.responses
+        assert resp.ok
+        head = resp.text.splitlines()[0]
+        assert "copilot \u00b7 gpt-5" in head and "unknown \u00b7 legacy-model" in head
+
     def test_a_run_without_usage_events_says_not_recorded(self, tmp_path: Path) -> None:
         """Acceptance: runs predating usage reporting answer "not recorded",
         which is not the same claim as zero spend."""

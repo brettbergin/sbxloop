@@ -195,6 +195,21 @@ class TestUsage:
         merged = Usage().merged(Usage())
         assert merged == Usage()
 
+    def test_backend_is_optional_and_defaults_to_none(self) -> None:
+        """Payloads recorded before the backend field existed must still
+        validate under extra=forbid and render as "unknown", not fail."""
+        assert Usage().backend is None
+        assert Usage.model_validate({"model": "m", "input_tokens": 1}).backend is None
+
+    def test_merged_prefers_latest_backend_and_keeps_earlier_one(self) -> None:
+        assert Usage(backend="copilot").merged(Usage(backend="claude")).backend == "claude"
+        assert Usage(backend="copilot").merged(Usage(model="m")).backend == "copilot"
+        assert Usage().merged(Usage(backend="claude")).backend == "claude"
+
+    def test_backend_survives_json_roundtrip(self) -> None:
+        usage = Usage(model="m", backend="copilot", input_tokens=2)
+        assert Usage.model_validate(usage.model_dump(mode="json")) == usage
+
 
 class TestSessionHealth:
     def test_jobresult_roundtrip_with_health(self) -> None:

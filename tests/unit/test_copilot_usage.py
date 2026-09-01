@@ -17,7 +17,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sbxloop_worker.backends.copilot import available_tool_count, usage_from_sdk_sample
+from sbxloop_worker.backends.copilot import (
+    BACKEND_NAME,
+    available_tool_count,
+    usage_from_sdk_sample,
+)
 
 
 class TestUsageFromSdkSample:
@@ -80,3 +84,21 @@ class TestAvailableToolCount:
         # change shape on a bump; the diagnostic degrades, nothing breaks.
         assert available_tool_count(SimpleNamespace()) is None
         assert available_tool_count(SimpleNamespace(_available_tool_count="17")) is None
+
+
+class TestBackendStamp:
+    def test_sample_names_the_serving_backend(self) -> None:
+        """Chat renders backend+model, so the sample must say which backend
+        served it instead of leaving the reader to guess from the slug."""
+        usage = usage_from_sdk_sample(SimpleNamespace(model="gpt-5", input_tokens=1))
+        assert usage.backend == BACKEND_NAME == "copilot"
+
+    def test_backend_survives_merging(self) -> None:
+        merged = usage_from_sdk_sample(SimpleNamespace(model="gpt-5")).merged(
+            usage_from_sdk_sample(SimpleNamespace(model="gpt-5-mini"))
+        )
+        assert merged.backend == "copilot"
+        assert merged.model == "gpt-5-mini"
+
+    def test_empty_sample_still_names_the_backend(self) -> None:
+        assert usage_from_sdk_sample(SimpleNamespace()).backend == "copilot"

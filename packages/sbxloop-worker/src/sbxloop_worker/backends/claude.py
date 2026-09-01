@@ -59,6 +59,10 @@ from sbxloop_worker.secrets import is_sbx_sentinel
 
 # The in-process MCP server host tools are registered under; the SDK exposes
 # each tool to the model as ``mcp__<server>__<tool>``.
+# Backend identity stamped onto agent events and usage samples, so chat
+# can name provider+model.
+BACKEND_NAME = "claude"
+
 HOST_TOOL_SERVER = "sbxloop"
 _HOST_TOOL_PREFIX = f"mcp__{HOST_TOOL_SERVER}__"
 
@@ -185,6 +189,7 @@ def usage_from_result(message: Any, model: str | None) -> Usage:
     usage = getattr(message, "usage", None)
     return Usage(
         model=model,
+        backend=BACKEND_NAME,
         input_tokens=_usage_value(usage, "input_tokens"),
         output_tokens=_usage_value(usage, "output_tokens"),
         cache_read_tokens=_usage_value(usage, "cache_read_input_tokens"),
@@ -257,7 +262,9 @@ class ClaudeBackend:
             output_text=text,
             output_json=extract_json(text) if job.expect == "json" else None,
             session_id=state.session_id,
-            usage=state.usage if state.usage != Usage() else None,
+            usage=(
+                state.usage.merged(Usage(backend=BACKEND_NAME)) if state.usage != Usage() else None
+            ),
             turns=state.turns,
             health=state.tracker.health(state.governor),
         )
@@ -432,7 +439,12 @@ class _SessionState:
             text = getattr(block, "text", "") or ""
             if text:
                 self.final_text.append(text)
-                self.emit(EventTypes.AGENT_MESSAGE, content=text, model=self.model_slug)
+                self.emit(
+                    EventTypes.AGENT_MESSAGE,
+                    content=text,
+                    model=self.model_slug,
+                    backend=BACKEND_NAME,
+                )
         elif kind == "ToolUseBlock":
             tool = getattr(block, "name", None)
             call_id = getattr(block, "id", None)
@@ -473,4 +485,6 @@ class _SessionState:
         sample = usage_from_result(message, self.model_slug)
         if sample != Usage():
             self.usage = self.usage.merged(sample)
-            self.emit(EventTypes.AGENT_USAGE, **sample.model_dump(exclude_none=True))
+            payload = sample.model_dump(exclude_none=True)
+            payload["backend"] = BACKEND_NAME
+            self.emit(EventTypes.AGENT_USAGE, **payload)

@@ -579,6 +579,7 @@ class LoopEngine:
                         transport=self.config.worker_transport,
                         python=self.worker_python,
                         role="agent",
+                        backend=self.config.agent.backend,
                         limits=self.config.limits,
                         # Per-job stdin delivery when provisioning chose it;
                         # None keeps the launch exactly as before (#592).

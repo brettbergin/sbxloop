@@ -195,6 +195,63 @@ def code(text: object) -> str:
     return "`" + str(text if text is not None else "").replace("`", "'") + "`"
 
 
+#: What an agent backend is called when the run never recorded one — a
+#: historical run, or an event that predates backend stamping. Shown rather
+#: than left blank so a reader is never left guessing which provider ran.
+UNKNOWN_BACKEND = "unknown"
+#: Same, for a run whose events carried no model at all.
+UNKNOWN_MODEL = "unknown"
+#: The agent backends the config accepts (config.AgentConfig.backend). Kept
+#: literal here so this module stays importable without the config package.
+KNOWN_BACKENDS = ("copilot", "claude")
+
+
+def agent_model_label(backend: object, model: object) -> str:
+    """``"copilot · gpt-5"`` — the backend serving a run next to its model.
+
+    Never blank and never raises: a missing, empty or unrecognised backend
+    renders as ``unknown``, and a missing model as ``unknown`` too, so the
+    line always reads as a real backend/model pair rather than an empty
+    code span a reader cannot interpret.
+    """
+    try:
+        name = str(backend).strip() if backend is not None else ""
+    except Exception:  # pragma: no cover - str() on a hostile object
+        name = ""
+    try:
+        model_name = str(model).strip() if model is not None else ""
+    except Exception:  # pragma: no cover - str() on a hostile object
+        model_name = ""
+    name = name.lower() if name.lower() in KNOWN_BACKENDS else UNKNOWN_BACKEND
+    return f"{name} · {model_name or UNKNOWN_MODEL}"
+
+
+def agent_ident_from_config_json(raw: object) -> dict[str, str]:
+    """``{"backend": ..., "model": ...}`` from a persisted ``runs.config_json``.
+
+    Runs recorded before ``[agent] backend`` existed (and rows from before
+    config was persisted at all, which carry ``'{}'``) have no agent section
+    to read; those answer ``unknown`` rather than raising or borrowing the
+    daemon's *current* backend, which may not be the one that served the run.
+    """
+    data: object = None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+    elif isinstance(raw, dict):
+        data = raw
+    if not isinstance(data, dict):
+        data = {}
+    agent = data.get("agent")
+    backend = agent.get("backend") if isinstance(agent, dict) else None
+    return {
+        "backend": str(backend or "") or UNKNOWN_BACKEND,
+        "model": str(data.get("model") or "") or UNKNOWN_MODEL,
+    }
+
+
 # -- data model -----------------------------------------------------------------------------
 
 
@@ -1248,7 +1305,12 @@ def format_for_discord(
             return []
         who = str(data.get("agent") or "agent")
         model = data.get("model")
-        header = f"**{who}**" + (f" · {code(model)}" if model else "")
+        backend = data.get("backend")
+        # Backend + model together: a GPT model served through Copilot and a
+        # Claude model served from Claude are told apart in the channel.
+        header = f"**{who}**" + (
+            f" · {code(agent_model_label(backend, model))}" if (model or backend) else ""
+        )
         cont = f"**{who}** *(cont. {{i}}/{{n}})*"
         return [
             block(part) for part in split_markdown(content, max_chars, header=header, cont=cont)
@@ -1515,15 +1577,25 @@ def _item_code(item: WorkItem) -> str:
     return code(normalize_item_id(item.item_id))
 
 
-def headline_text(item: WorkItem, run_id: str, state: str | None = None) -> str:
+def headline_text(
+    item: WorkItem,
+    run_id: str,
+    state: str | None = None,
+    *,
+    backend: str | None = None,
+    model: str | None = None,
+) -> str:
     """The headline's content= text (notification preview / embed fallback)."""
     origin, _ = _origin(item)
     origin = link(origin, item.url) if item.url else origin
     marker = STATE_MARKER.get(state or "", "▶")
-    return (
+    text = (
         f"{marker} run {code(run_id)} — **{_one_line(item.title, 120)}** · "
         f"{_item_code(item)} · {origin}"
     )
+    if backend is not None or model is not None:
+        text += f" · {code(agent_model_label(backend, model))}"
+    return text
 
 
 def headline_embed(
@@ -1536,6 +1608,8 @@ def headline_embed(
     summary: str | None = None,
     requested_by: str | None = None,
     hostname: str | None = None,
+    backend: str | None = None,
+    model: str | None = None,
 ) -> EmbedSpec:
     origin, _kind = _origin(item)
     fields: list[tuple[str, str, bool]] = [
@@ -1544,6 +1618,9 @@ def headline_embed(
         ("Run", code(run_id), True),
         ("State", state or "running", True),
     ]
+    if backend is not None or model is not None:
+        # Which provider is serving the run, right on the card.
+        fields.append(("Agent", code(agent_model_label(backend, model)), True))
     if branch:
         fields.append(("Branch", code(branch), True))
     if pr:
@@ -1976,6 +2053,8 @@ __all__ = [
     "RunStats",
     "StatusLine",
     "ToolBatcher",
+    "agent_ident_from_config_json",
+    "agent_model_label",
     "block",
     "code",
     "daemon_notice",
