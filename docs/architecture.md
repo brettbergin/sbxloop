@@ -58,23 +58,36 @@ Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
 Field reality (sbx 0.35): that injection feeds only the interactive agent
 sessions sbx launches — never `sbx exec` processes — so provisioning
-verifies visibility and **auto-falls-back to an in-VM env file**
-(`~/.sbxloop/env.sh`, chmod 600) when the env is invisible, emitting a
-`sandbox.secret_env_fallback` event. The fallback fires only on a clean
-probe answer: an sbx-level failure during the probe is retried once and
-then fails provisioning loudly (`sandbox.secret_probe_error`) — an infra
-blip must never silently select the weaker strategy. In fallback mode the token value is
-visible inside its own microVM, but the credential *split* still holds
-(each sandbox only ever receives its own token) and egress remains bounded
-by the balanced network policy.
+verifies visibility and **auto-falls-back to non-proxy delivery** when the
+env is invisible, emitting a `sandbox.secret_env_fallback` event. The
+fallback fires only on a clean probe answer: an sbx-level failure during
+the probe is retried once and then fails provisioning loudly
+(`sandbox.secret_probe_error`) — an infra blip must never silently select
+the weaker strategy.
 
-Once that probe's verdict is in the version-keyed conformance cache,
+Non-proxy delivery itself has two tiers, chosen by a second field probe
+(`exec-stdin-env`, #592) whose verdict is cached per sbx version:
+
+- **per-job stdin** (preferred): when stdin piped through `sbx exec`
+  reaches the in-VM launch shell, each job's exports are piped fresh into
+  the worker launch — the login shell evals them *after* its profile ran
+  (so a stamped stale sentinel loses) and the credential transits worker
+  process memory only, never the sandbox filesystem or any argv. The
+  fallback event carries `delivery: "stdin"`.
+- **in-VM env file** (last resort): `~/.sbxloop/env.sh`, chmod 600,
+  exactly the pre-#592 behavior (`delivery: "env-file"`). Here the token
+  value is visible at rest inside its own microVM, but the credential
+  *split* still holds (each sandbox only ever receives its own token) and
+  egress remains bounded by the balanced network policy.
+
+Once those probes' verdicts are in the version-keyed conformance cache,
 provisioning stops re-living the doomed sequence: under `proxy`, a cached
 `invisible-under-exec` / `sentinel-under-exec` verdict for the running sbx
-version sends credentials straight to the env file — no registration, no
-probe, one calm `sandbox.secret_env_fallback` event with `cached=true` —
-while an unknown (new) sbx version still registers and probes once, so an
-sbx release that fixes exec injection is picked up automatically (#568).
+version sends credentials straight to the non-proxy tiers — no
+registration, no probe, one calm `sandbox.secret_env_fallback` event with
+`cached=true` — while an unknown (new) sbx version still registers and
+probes once, so an sbx release that fixes exec injection is picked up
+automatically (#568).
 
 ### GitHub App installation auth (#568)
 
@@ -85,17 +98,21 @@ App JWT with its `openssl` binary, exchanges it at
 `POST /app/installations/{id}/access_tokens` — the one host→GitHub call in
 the system, on the credential-minting plane, not the ops plane — and
 injects only the resulting ~1-hour `ghs_` installation token into the
-github-ops sandbox, always via the env file: each short-lived token would
-otherwise have to be re-registered with sbx every hour for no security
-gain. The private key never enters any VM, and GitHub attributes every
-operation to the app installation (`<app>[bot]`).
+github-ops sandbox, always via non-proxy delivery (per-job stdin, else the
+env file): each short-lived token would otherwise have to be re-registered
+with sbx every hour for no security gain. The private key never enters any
+VM, and GitHub attributes every operation to the app installation
+(`<app>[bot]`).
 
-Refresh is wired into the job path: `WorkerClient` runs
-`Provisioner.gh_refresher`'s hook before each github job; inside a
-10-minute expiry margin it re-mints and rewrites the env file, and since
-worker processes are spawned per job and load the env file at startup, the
-next job authenticates with the fresh token — covering both a run's pair
-and the daemon's long-lived polling sandbox. PAT and App credentials are
+Refresh is wired into the job path. Under per-job stdin delivery there is
+nothing in the VM to refresh: `Provisioner.job_env`'s provider re-reads
+the token source on every job, which re-mints inside the margin by itself.
+On the env-file tier, `WorkerClient` runs `Provisioner.gh_refresher`'s
+hook before each github job; inside a 10-minute expiry margin it re-mints
+and rewrites the env file, and since worker processes are spawned per job
+and load the env file at startup, the next job authenticates with the
+fresh token — covering both a run's pair and the daemon's long-lived
+polling sandbox. PAT and App credentials are
 mutually exclusive and a partial App set is refused, both validated before
 any microVM boots; a `[[github.repos]] token_env` remains an explicit
 per-repo PAT override.
@@ -105,9 +122,10 @@ a curated allowlist), with per-sandbox allow rules added for exactly the
 hosts each role needs. By default sbxloop shares the user's normal sbx
 application state (so `sbx login` and `sbx policy init balanced` apply
 directly); setting `app_name` in config opts into isolated sbx state, which
-then needs its own `sbx --app-name <name> login` and policy init. The `plain-env` fallback strategy (tokens
-written to `~/.sbxloop/env.sh` in-VM) exists for hosts where the experimental
-`set-custom` proxying is unavailable, and is documented as weaker.
+then needs its own `sbx --app-name <name> login` and policy init. The `plain-env` strategy skips the experimental
+`set-custom` proxying entirely and goes straight to the non-proxy delivery
+tiers above (per-job stdin when this sbx supports it, else the in-VM env
+file), for hosts where the proxying is unavailable.
 
 Beyond the static baseline, egress is **task-declared and grant-late**: the
 DECOMPOSE phase may declare extra domains a task needs during BUILD (each with

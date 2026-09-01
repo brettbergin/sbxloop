@@ -1448,3 +1448,92 @@ class TestCredentialRefresh:
     def test_no_hook_by_default(self, sandbox: Sandbox) -> None:
         client = make_client(sandbox, EventBus())
         assert client.credential_refresh is None
+
+
+class TestStdinEnvDelivery:
+    """Per-job stdin env delivery (#592): exports piped into the launch
+    shell's stdin reach the worker process's environment, with nothing at
+    rest in the sandbox filesystem and nothing on any argv."""
+
+    SECRET = "github_pat_stdin_delivered"
+
+    def _job(self, job_id: str = "j-env") -> JobRequest:
+        return JobRequest(
+            job_id=job_id,
+            run_id="r1",
+            kind="shell.check",
+            argv=["sh", "-c", "printenv SBXLOOP_DELIVERED"],
+        )
+
+    def _provider(self) -> dict[str, str]:
+        return {"SBXLOOP_DELIVERED": self.SECRET}
+
+    def _assert_delivered(self, sandbox: Sandbox, fake_sbx: FakeSbx, **kwargs: object) -> None:
+        result = make_client(sandbox, EventBus(), job_env=self._provider, **kwargs).submit(
+            self._job()
+        )
+        assert result.status == "ok"
+        assert result.exit_code == 0
+        assert result.output_text is not None
+        assert self.SECRET in result.output_text
+        # never at rest in the sandbox filesystem
+        fs = fake_sbx.sandbox_fs("boxa")
+        env_file = fs / "home/agent/.sbxloop/env.sh"
+        assert not env_file.exists()
+        # never on any argv (the value travels only over stdin)
+        for call in fake_sbx.invocations():
+            assert all(self.SECRET not in arg for arg in call)
+
+    def test_stream_delivers_env_to_worker_process(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        self._assert_delivered(sandbox, fake_sbx)
+
+    def test_poll_delivers_env_to_worker_process(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        self._assert_delivered(sandbox, fake_sbx, transport="poll", poll_interval=0.1)
+
+    def test_delivered_env_beats_profile_stamped_value(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The login shell evals the delivered exports AFTER its profile ran,
+        so a profile-stamped stale value (sbx sentinel included) loses."""
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        monkeypatch.setenv("SBX_FAKE_PROFILE", "export SBXLOOP_DELIVERED=sbx-cs-stale-sentinel")
+        self._assert_delivered(sandbox, fake_sbx)
+
+    def test_no_provider_keeps_launch_unchanged(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        make_client(sandbox, EventBus()).submit(agent_job())
+        worker_execs = [
+            c
+            for c in fake_sbx.invocations("exec")
+            if any("sbxloop_worker" in a for a in c) and "pkill" not in c
+        ]
+        assert worker_execs and worker_execs[0][2:4] == ["sh", "-lc"]
+        assert all("SBXLOOP_JOB_ENV" not in a for call in worker_execs for a in call)
+
+    def test_empty_provider_means_no_delivery(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        make_client(sandbox, EventBus(), job_env=dict).submit(agent_job())
+        assert all(
+            "SBXLOOP_JOB_ENV" not in a for call in fake_sbx.invocations("exec") for a in call
+        )
+
+    def test_provider_is_called_fresh_per_job(
+        self, sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rotating credential (App installation tokens) is re-read on
+        every job — nothing is cached in the client."""
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        calls: list[int] = []
+
+        def provider() -> dict[str, str]:
+            calls.append(1)
+            return {"SBXLOOP_DELIVERED": f"value-{len(calls)}"}
+
+        client = make_client(sandbox, EventBus(), job_env=provider)
+        client.submit(self._job("j-env1"))
+        client.submit(self._job("j-env2"))
+        assert len(calls) == 2

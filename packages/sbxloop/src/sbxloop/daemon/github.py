@@ -174,8 +174,10 @@ class DaemonGithub:
                 role="github",
                 limits=self.config.limits,
                 # App auth: this box lives for the daemon's whole lifetime,
-                # far past one installation token; None under a PAT.
+                # far past one installation token; None under a PAT — and
+                # under stdin delivery, where job_env re-mints per job.
                 credential_refresh=self.provisioner.gh_refresher(sandbox, self.repo),
+                job_env=self.provisioner.job_env("github", self.repo, sandbox=sandbox),
             )
             if self.install_workers:
                 client.install(extras="")

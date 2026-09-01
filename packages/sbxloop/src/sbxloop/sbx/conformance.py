@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import re
 import secrets as _secrets
+import shlex
 import shutil
 import tempfile
 import time
@@ -44,7 +45,7 @@ from sbxloop.errors import SbxError, SbxloopError, SbxNotFoundError
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
-from sbxloop.sbx.sandbox import Sandbox
+from sbxloop.sbx.sandbox import JOB_ENV_VAR, Sandbox
 from sbxloop.sbx.secretstate import SECRET_EXISTS_MARKERS, parsed_scope
 from sbxloop.toolchains import PYTHON_SERIES
 from sbxloop_worker.secrets import shell_token_case
@@ -63,6 +64,11 @@ PROBE_PAGE_SIZE = "page-size"
 PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"  # nosec B105 - probe name
 PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"  # nosec B105 - probe name
 PROBE_SECRET_VALUE_STDIN = "secret-value-stdin"  # nosec B105 - probe name
+PROBE_EXEC_STDIN_ENV = "exec-stdin-env"
+
+# The exec-stdin-env verdicts (importable so provisioning can't typo them).
+VERDICT_STDIN_DELIVERS = "delivers"
+VERDICT_STDIN_NO_DELIVERY = "no-delivery"
 
 VERDICT_ERROR = "error"
 VERDICT_UNPROBED = "unprobed"
@@ -334,6 +340,47 @@ def _probe_secret_env_visibility(ctx: ProbeContext) -> tuple[str, str]:
     return "invisible-under-exec", "custom secret env NOT visible to `sbx exec` processes"
 
 
+_STDIN_PROBE_ENV = "SBXLOOP_STDIN_PROBE_VALUE"
+
+
+def stdin_env_probe(nonce: str) -> tuple[list[str], str, str]:
+    """(cmd, stdin payload, expected marker) for exec-stdin-env (#592).
+
+    The exact launch shape per-job stdin env delivery uses: an outer plain
+    shell captures the whole of the exec's stdin into ``JOB_ENV_VAR``; the
+    inner *login* shell evals it after its profile ran (so delivered values
+    beat profile-stamped ones) and prints the probe variable back. Shared
+    with provisioning's field probe so both always exercise the shape the
+    WorkerClient really launches. Delivery is judged by the marker appearing
+    in stdout — never by equality, because a login profile is free to chat
+    on stdout around it.
+    """
+    marker = f"sbxloop-stdin-probe={nonce}"
+    inner = shlex.join(
+        [
+            "sh",
+            "-lc",
+            f'eval "${JOB_ENV_VAR}"; unset {JOB_ENV_VAR}; printf %s "${_STDIN_PROBE_ENV}"',
+        ]
+    )
+    cmd = ["sh", "-c", f'{JOB_ENV_VAR}="$(cat)" exec {inner}']
+    return cmd, f"export {_STDIN_PROBE_ENV}={marker}\n", marker
+
+
+def _probe_exec_stdin_env(ctx: ProbeContext) -> tuple[str, str]:
+    assert ctx.sandbox is not None
+    nonce = _secrets.token_hex(8)
+    cmd, payload, marker = stdin_env_probe(nonce)
+    result = ctx.sandbox.exec(cmd, stdin=payload, timeout=60.0)
+    if result.ok and marker in result.stdout:
+        return VERDICT_STDIN_DELIVERS, "stdin piped through `sbx exec` reaches the launch shell"
+    return (
+        VERDICT_STDIN_NO_DELIVERY,
+        f"rc={result.returncode}, stdout={result.stdout.strip()[:80]!r} — per-job env "
+        "delivery falls back to the in-VM env file",
+    )
+
+
 def _probe_secret_exists_error(ctx: ProbeContext) -> tuple[str, str]:
     assert ctx.sandbox is not None
     name = ctx.sandbox.name
@@ -466,6 +513,16 @@ CATALOG: tuple[Probe, ...] = (
         "out of the VM, while both 'invisible-under-exec' and 'sentinel-under-exec' fall "
         "back to the in-VM env file",
         run=_probe_secret_env_visibility,
+    ),
+    Probe(
+        id=PROBE_EXEC_STDIN_ENV,
+        summary="whether stdin piped through `sbx exec` reaches the in-VM launch shell",
+        tier="sandbox",
+        expected=None,  # both answers are handled; see _deliver_env in provisioning
+        depends="per-job stdin secret delivery (#592): 'delivers' keeps credentials off "
+        "the sandbox filesystem when the proxy cannot feed exec'd workers; 'no-delivery' "
+        "falls back to the 0600 in-VM env file exactly as before",
+        run=_probe_exec_stdin_env,
     ),
     Probe(
         id=PROBE_SECRET_EXISTS_ERROR,

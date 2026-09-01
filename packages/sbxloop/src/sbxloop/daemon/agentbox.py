@@ -163,6 +163,11 @@ class DaemonAgent:
             python=self.worker_python,
             role="agent",
             limits=self.config.limits,
+            # The concierge box is long-lived and reused across daemon
+            # restarts; passing the sandbox lets job_env re-probe stdin
+            # delivery when the conformance cache was wiped in between,
+            # instead of a reused box silently losing its credential (#592).
+            job_env=self.provisioner.job_env("agent", sandbox=sandbox),
         )
 
     def _ensure(self) -> WorkerClient:

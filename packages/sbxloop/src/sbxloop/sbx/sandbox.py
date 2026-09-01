@@ -24,6 +24,12 @@ EVENTS_DIR = f"{SBXLOOP_DIR}/events"
 # (``<TOOLS_DIR>/<job_id>/<call_id>.json``; see sbxloop.worker.hosttools).
 TOOLS_DIR = f"{SBXLOOP_DIR}/tools"
 ENV_FILE = f"{SBXLOOP_DIR}/env.sh"
+# Per-job env delivery (#592): the host pipes `export KEY=VALUE` lines into a
+# job launch's stdin; the launch shell captures them into this variable and
+# the inner login shell evals it AFTER its profile ran — so the delivered
+# values beat anything the profile stamped (a stale sbx sentinel included)
+# and the credential is never at rest on the sandbox filesystem.
+JOB_ENV_VAR = "SBXLOOP_JOB_ENV"
 VENV_DIR = f"{SBXLOOP_DIR}/venv"
 VENV_PYTHON = f"{VENV_DIR}/bin/python"
 # Written by `sbxloop bake` into the template; provisioning reads it to
@@ -41,12 +47,15 @@ class Sandbox:
     def __repr__(self) -> str:
         return f"Sandbox({self.name!r})"
 
-    def exec(self, cmd: Sequence[str], *, timeout: float | None = None) -> ExecResult:
-        return self.cli.exec(self.name, cmd, timeout=timeout)
+    def exec(
+        self, cmd: Sequence[str], *, timeout: float | None = None, stdin: str | None = None
+    ) -> ExecResult:
+        return self.cli.exec(self.name, cmd, timeout=timeout, stdin=stdin)
 
-    def exec_stream(self, cmd: Sequence[str]) -> subprocess.Popen[str]:
-        """Start a streaming exec; caller owns the returned process."""
-        return self.cli.popen("exec", self.name, *cmd)
+    def exec_stream(self, cmd: Sequence[str], *, stdin_pipe: bool = False) -> subprocess.Popen[str]:
+        """Start a streaming exec; caller owns the returned process (and its
+        stdin pipe, when ``stdin_pipe`` requests one: write, then close)."""
+        return self.cli.popen("exec", self.name, *cmd, stdin_pipe=stdin_pipe)
 
     def cp_in(self, host_path: Path, sb_path: str) -> None:
         self.cli.cp(str(host_path), f"{self.name}:{sb_path}")

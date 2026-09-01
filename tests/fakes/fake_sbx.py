@@ -252,7 +252,7 @@ def fake_pkill(fs: Path, args: list[str]) -> int:
     return 0 if killed else 1
 
 
-def cmd_exec(root: Path, args: list[str]) -> int:
+def cmd_exec(root: Path, args: list[str], stdin: str = "") -> int:
     args = [a for a in args if a not in ("-it", "-i", "-t")]
     if not args:
         print("usage: sbx exec SANDBOX CMD...", file=sys.stderr)
@@ -298,7 +298,19 @@ def cmd_exec(root: Path, args: list[str]) -> int:
     # makes the host's tar/cp model the guest they stand in for.
     env["COPYFILE_DISABLE"] = "1"
     try:
-        proc = subprocess.run(rewritten, cwd=home, env=env, check=False)
+        # Whether stdin piped through `sbx exec` reaches the in-VM process is
+        # an sbx semantic sbxloop field-probes (exec-stdin-env, #592). The
+        # fake stays conservative — stdin consumed, not forwarded — unless a
+        # test opts in, so both probe verdicts are exercisable.
+        forward = os.environ.get("SBX_FAKE_EXEC_STDIN")
+        proc = subprocess.run(
+            rewritten,
+            cwd=home,
+            env=env,
+            check=False,
+            input=stdin if forward else None,
+            text=True,
+        )
     except FileNotFoundError:
         # Model field-observed sbx behavior: exec launch errors (missing
         # binary) surface on STDOUT, not stderr.
@@ -547,7 +559,7 @@ def main() -> int:
         return cmd_create(root, rest)
     if command == "exec":
         fcntl.flock(lock, fcntl.LOCK_UN)
-        return cmd_exec(root, rest)
+        return cmd_exec(root, rest, stdin)
     if command == "cp":
         return cmd_cp(root, rest)
     if command == "ls":
