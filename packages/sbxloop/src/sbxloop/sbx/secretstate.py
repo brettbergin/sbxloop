@@ -47,6 +47,12 @@ COPILOT_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"  # nosec B105 - env var name, not a s
 # env to two hosts fails with "already exists".
 COPILOT_TOKEN_HOST = "api.github.com"  # nosec B105 - hostname, not a secret
 
+# The claude agent backend's credential (#533): an Anthropic API key, sent
+# directly to the API host by the Claude Code CLI the Claude Agent SDK
+# spawns.
+ANTHROPIC_TOKEN_ENV = "ANTHROPIC_API_KEY"  # nosec B105 - env var name, not a secret
+ANTHROPIC_TOKEN_HOST = "api.anthropic.com"  # nosec B105 - hostname, not a secret
+
 # Every sbxloop sandbox (and therefore every sandbox-scoped registration
 # sbxloop creates) is named with this prefix.
 SANDBOX_SCOPE_PREFIX = "sbxloop-"

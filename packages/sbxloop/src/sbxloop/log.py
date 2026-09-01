@@ -197,10 +197,12 @@ def redact_secrets(
 
 # Provider token shapes that are secrets wherever they appear, with no key
 # name to go on: GitHub's ``ghp_``/``gho_``/``ghu_``/``ghs_``/``ghr_`` and
-# the fine-grained ``github_pat_`` prefix.
+# the fine-grained ``github_pat_`` prefix, plus Anthropic API keys
+# (``sk-ant-``, the claude agent backend, #533).
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{8,}"),
 )
 
 _AUTH_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)((?:bearer|token|basic)\s+)?([^\s'\"]+)")

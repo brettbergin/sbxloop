@@ -19,10 +19,10 @@ Checkpointing, resume and artifact harvesting throughout.
 
 Every run gets an isolated microVM agent sandbox — plus, when the GitHub integration is configured, a second github-ops sandbox, so no single environment ever holds both credentials:
 
-| Sandbox                | Credential                                                                                                                                                                                  | Purpose                                                                                                                                                                   |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission)                                                                                                                    | Runs the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) agentic layer. All model calls and tool executions happen inside this VM.                            |
-| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: contents write, pull requests write, issues write) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth)) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set. |
+| Sandbox                | Credential                                                                                                                                                                                  | Purpose                                                                                                                                                                                     |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) — or `ANTHROPIC_API_KEY` with `[agent] backend = "claude"` ([Agent backends](#agent-backends-copilot-or-claude))   | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, or the Claude Agent SDK. All model calls and tool executions happen inside this VM. |
+| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: contents write, pull requests write, issues write) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth)) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set.                   |
 
 Both sandboxes run under sbx's **balanced network policy** (default-deny
 egress plus a curated allowlist), and tokens are injected through sbx's secret
@@ -37,6 +37,34 @@ exec-visibility verdict is negative, so that non-proxy / env-file fallback is th
 interim hardening proposed in #592). Sandboxes are cattle: they are
 torn down at run end and re-provisioned on resume, while all durable state
 (workspace, SQLite checkpoints, event log) lives on the host.
+
+### Agent backends: Copilot or Claude
+
+The SDK that runs the agent personas is configurable (#533) — Copilot stays
+the default with unchanged behaviour:
+
+```toml
+# sbxloop.toml
+[agent]
+backend = "claude"   # default: "copilot"
+```
+
+| backend   | host credential (agent sandbox only)                                         | in-sandbox runtime                                                                                                                   |
+| --------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `copilot` | `COPILOT_GITHUB_TOKEN` (PAT, *Copilot Requests*)                             | `github-copilot-sdk` (worker `[copilot]` extra; wheels bundle the Copilot CLI)                                                       |
+| `claude`  | `ANTHROPIC_API_KEY` ([console](https://console.anthropic.com/settings/keys)) | `claude-agent-sdk` (worker `[claude]` extra) + the Claude Code CLI, which provisioning installs (Node + `@anthropic-ai/claude-code`) |
+
+Everything else is backend-agnostic: the top-level `model` key names the
+model the chosen backend runs (`"auto"` lets it pick its default), every
+persona (decompose, build, review, fix, the concierge) runs the same, token
+usage is reported through the same `run_usage`/`usage_today` accounting, and
+the credential split holds — the agent sandbox carries the chosen agent
+credential and never a GitHub token. With the claude backend, provisioning
+also allows `api.anthropic.com` egress and keeps the CLI hermetic
+(telemetry/auto-update traffic disabled). Missing or invalid configuration
+fails fast: an unknown backend fails config loading, and a missing
+`ANTHROPIC_API_KEY` fails before any microVM boots. Re-run `sbxloop bake`
+after switching backends so a baked template carries the right runtime.
 
 ## Quickstart
 

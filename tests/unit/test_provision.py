@@ -1686,3 +1686,75 @@ class TestStdinEnvDelivery:
         monkeypatch.setattr(provisioner, "_cached_verdict", lambda probe_id: VERDICT_STDIN_DELIVERS)
         sandbox = _Sandbox(provisioner.cli, "sbxloop-r1-github")
         assert provisioner.gh_refresher(sandbox, "owner/repo") is None
+
+
+class TestClaudeAgentBackend:
+    """[agent] backend = "claude" (#533): credential, spec, and env plumbing."""
+
+    CLAUDE_ENV: ClassVar[dict[str, str]] = {
+        "ANTHROPIC_API_KEY": "sk-ant-claude-agent-key",
+        "GH_TOKEN": "github_pat_user",
+    }
+
+    def _provisioner(self, fake_sbx: FakeSbx, tmp_path: Path, **kwargs: object) -> Provisioner:
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "agent": {"backend": "claude"}, **GITHUB_ENABLED}
+        )
+        kwargs.setdefault("env", self.CLAUDE_ENV)
+        return make_provisioner(fake_sbx, tmp_path, config=config, **kwargs)  # type: ignore[arg-type]
+
+    def test_agent_spec_carries_anthropic_credential_and_egress(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        agent, _github = provisioner.build_specs("r1", tmp_path)
+        assert [(s.host, s.env) for s in agent.secrets] == [
+            ("api.anthropic.com", "ANTHROPIC_API_KEY")
+        ]
+        assert "api.anthropic.com" in agent.policy_allows
+        assert agent.persistent_env["SBXLOOP_WORKER_BACKEND"] == "claude"
+        assert agent.persistent_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+    def test_copilot_default_is_unchanged(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        agent, _github = provisioner.build_specs("r1", tmp_path)
+        assert [(s.host, s.env) for s in agent.secrets] == [
+            ("api.github.com", "COPILOT_GITHUB_TOKEN")
+        ]
+        assert "api.anthropic.com" not in agent.policy_allows
+        assert "SBXLOOP_WORKER_BACKEND" not in agent.persistent_env
+
+    def test_missing_anthropic_key_fails_fast(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path, env={"GH_TOKEN": "github_pat_user"})
+        with pytest.raises(ProvisionError, match="ANTHROPIC_API_KEY"):
+            provisioner.agent_token()
+
+    def test_invalid_backend_fails_config_loading(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="backend"):
+            Config.model_validate({"state_dir": str(tmp_path), "agent": {"backend": "gemini"}})
+
+    def test_job_env_delivers_anthropic_key_and_backend_selector(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under stdin delivery the agent provider carries the API key AND
+        the worker's backend selector, so a box with no env file still runs
+        the claude backend."""
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1")
+        provider = provisioner.job_env("agent")
+        assert provider is not None
+        exports = provider()
+        assert exports["ANTHROPIC_API_KEY"] == "sk-ant-claude-agent-key"
+        assert exports["SBXLOOP_WORKER_BACKEND"] == "claude"
+
+    def test_env_file_fallback_writes_anthropic_key(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1")
+        env_file = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        content = env_file.read_text()
+        assert "ANTHROPIC_API_KEY=sk-ant-claude-agent-key" in content
+        assert "SBXLOOP_WORKER_BACKEND=claude" in content
+        assert "COPILOT_GITHUB_TOKEN" not in content

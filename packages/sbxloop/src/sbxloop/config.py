@@ -1000,8 +1000,26 @@ def _expand_home(value: str, home: Path) -> str:
     return value
 
 
+class AgentConfig(_ConfigModel):
+    """Which SDK runs the agent personas inside the agent sandbox (#533).
+
+    ``copilot`` (the default, unchanged behaviour) runs the GitHub Copilot
+    SDK and needs ``COPILOT_GITHUB_TOKEN`` on the host. ``claude`` runs the
+    Claude Agent SDK — the Claude Code harness — and needs
+    ``ANTHROPIC_API_KEY`` on the host; provisioning installs Node and the
+    Claude Code CLI into the agent sandbox and allows ``api.anthropic.com``
+    egress. Either way the credential is injected into the agent sandbox
+    alone, and the top-level ``model`` key names the model the chosen
+    backend runs (``"auto"`` lets the backend pick its default).
+    An unknown value fails config loading with the accepted choices named.
+    """
+
+    backend: Literal["copilot", "claude"] = "copilot"
+
+
 class Config(_ConfigModel):
     model: str = "auto"
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     # sbx --app-name. Empty (the default) shares the user's normal sbx
     # application state, so their `sbx login` and `sbx policy init balanced`
     # apply directly. Setting a name isolates sbxloop state, but the isolated

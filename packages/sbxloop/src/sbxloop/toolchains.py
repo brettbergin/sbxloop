@@ -555,6 +555,21 @@ GIT = Toolchain(
 
 BASELINE_TOOLS: tuple[Toolchain, ...] = (GIT,)
 
+# The claude agent backend's in-sandbox runtime (#533): the Claude Agent SDK
+# spawns the Claude Code CLI, which is not bundled with the pip package. Not
+# a `[sandbox] languages` entry — it is a backend prerequisite the worker
+# install ensures when `[agent] backend = "claude"` — but shaped as a
+# Toolchain so the probe-first/batched-apt/loud-warning machinery applies.
+# Node comes first via the javascript toolchain (npm's global prefix is
+# /usr/local there, so the `npm i -g` below lands `claude` on PATH).
+CLAUDE_CODE = Toolchain(
+    name="claude-code",
+    wanted="claude (the Claude Code CLI)",
+    probe="command -v claude >/dev/null",
+    install_script="sudo -n npm install -g @anthropic-ai/claude-code",
+    requires=("javascript",),
+)
+
 # What a run provisions when `[sandbox] languages` is unset. Python has had
 # this head start since 0.4.0 and keeping it as the default means #140
 # changes nothing for existing runs; an explicit `languages` REPLACES it,

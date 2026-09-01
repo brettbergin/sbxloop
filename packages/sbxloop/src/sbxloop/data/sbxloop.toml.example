@@ -14,7 +14,8 @@
 # the key. Secrets never live here — they live in .env / the environment
 # (see .env.example).
 
-# Copilot model for agent sessions ("auto" lets the SDK choose).
+# Model for agent sessions, whichever [agent] backend runs them ("auto"
+# lets the chosen SDK pick its default).
 model = "auto"
 # Optional sbx --app-name isolating sbxloop's sandboxes/policies/secrets.
 # Empty shares your normal sbx state (your login + balanced policy apply).
@@ -38,6 +39,16 @@ secret_strategy = "proxy"
 # SBXLOOP_WORKER_PYTHON / SBXLOOP_INSTALL_WORKERS; leave these alone otherwise.
 # worker_python = "/home/agent/.sbxloop/venv/bin/python"
 # install_workers = true
+
+# [agent]
+# Which SDK runs the agent personas inside the agent sandbox (#533):
+# "copilot" (the default) runs the GitHub Copilot SDK and needs
+# COPILOT_GITHUB_TOKEN; "claude" runs the Claude Agent SDK (the Claude Code
+# harness) and needs ANTHROPIC_API_KEY — provisioning then installs Node and
+# the Claude Code CLI into the agent sandbox and allows api.anthropic.com
+# egress. Either way the credential is injected into the agent sandbox
+# alone, and the top-level `model` names the model the chosen backend runs.
+# backend = "copilot"
 
 # [sandbox]
 # Custom sandbox template reference (defaults to the sbx shell template).

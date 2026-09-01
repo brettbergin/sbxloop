@@ -1537,3 +1537,31 @@ class TestStdinEnvDelivery:
         client.submit(self._job("j-env1"))
         client.submit(self._job("j-env2"))
         assert len(calls) == 2
+
+
+class TestClaudeBackendRuntime:
+    """extras="claude" ensures the Claude Code CLI runtime (#533)."""
+
+    def test_missing_runtime_is_provisioned(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        # Probe-first: script both probes as missing so the ensure runs
+        # regardless of what the host machine has on PATH.
+        for toolchain in (*toolchains.resolve(["javascript"]), toolchains.CLAUDE_CODE):
+            fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=1)
+        # The node tarball install and the npm -g install both run in-sandbox;
+        # script them as successes so no real network is touched.
+        fake_sbx.script("exec boxa sh -c set -e", returncode=0)
+        fake_sbx.script("exec boxa sh -c sudo -n npm install -g @anthropic-ai/claude-code")
+        make_client(sandbox, EventBus())._ensure_backend_runtime("claude", timeout=60)
+        joined = [" ".join(call) for call in fake_sbx.invocations("exec")]
+        assert any("npm install -g @anthropic-ai/claude-code" in call for call in joined)
+
+    def test_present_runtime_needs_nothing(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        for toolchain in (*toolchains.resolve(["javascript"]), toolchains.CLAUDE_CODE):
+            fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=0)
+        make_client(sandbox, EventBus())._ensure_backend_runtime("claude", timeout=60)
+        joined = [" ".join(call) for call in fake_sbx.invocations("exec")]
+        assert not any("npm install" in call for call in joined)
+
+    def test_copilot_extras_skip_the_ensure(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        make_client(sandbox, EventBus())._ensure_backend_runtime("copilot", timeout=60)
+        assert fake_sbx.invocations("exec") == []

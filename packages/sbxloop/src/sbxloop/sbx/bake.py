@@ -126,9 +126,9 @@ def bake_template(
 
             report("installing the worker (full install ladder)")
             client = WorkerClient(sandbox)
-            client.install(extras="copilot", ensure_dev_tools=True)
+            client.install(extras=config.agent.backend, ensure_dev_tools=True)
 
-            if cache_runtime:
+            if cache_runtime and config.agent.backend == "copilot":
                 report("pre-caching the Copilot runtime")
                 runtime_cached = _cache_copilot_runtime(sandbox, client.python)
 
