@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 from ..errors import GithubOpsError
-from ..gh.ops import GithubOps, ReviewThread
+from ..gh.ops import GithubOps, ReviewThread, logins_match
 from ..log import get_logger
 from .review import (
     BLOCKING_SEVERITIES,
@@ -840,7 +840,7 @@ def acknowledge_human_threads(
     stamp = ack_marker(run_id)
     replied = 0
     for thread in threads:
-        if not thread.comments or thread.comments[0].login == login:
+        if not thread.comments or logins_match(thread.comments[0].login, login):
             continue
         if thread.has_reply_from(login) or thread.has_reply_marked(stamp):
             continue

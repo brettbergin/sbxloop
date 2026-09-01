@@ -155,6 +155,17 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **App-auth runs no longer block on their own review threads — the
+  REST/GraphQL identity split** (field runs r9t8hnv33, ry2t99za6,
+  ra2k5bv6z). REST attributes an App as `sbxloop[bot]`; GraphQL reports
+  the same actor as bare `sbxloop`. The resolved login carried the suffix
+  while `pr_review_threads` (GraphQL) did not, so every loop thread
+  classified as a human's: the loop ack-replied to its own findings and
+  fully reconciled PRs still ended blocked on "human review threads have
+  no reply". Identity comparisons now go through `logins_match` (strip a
+  trailing `[bot]`, casefold) at every thread/review/author site, so the
+  two spellings are one identity; an empty login still matches nobody.
+
 - **App-auth runs no longer strand behind "N human review threads have
   no reply"** (#569 x #536). Under a GitHub App installation token
   `GET /user` 403s, and the loop's login could degrade to `""` — which

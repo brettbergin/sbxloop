@@ -368,3 +368,61 @@ class TestResolveLogin:
         fake.pr["user"] = None
         assert resolve_login(fake, REPO, 7) == ""
         assert resolve_login(fake, REPO, None) == ""
+
+
+class TestBotSuffixIdentity:
+    """REST attributes the App as ``sbxloop[bot]``; GraphQL reports the
+    same actor as bare ``sbxloop``. Field failure r9t8hnv33 / ry2t99za6 /
+    ra2k5bv6z: with the resolved login carrying the suffix and the threads
+    read via GraphQL, every loop thread classified as a human's, the loop
+    ack-replied to its own findings, and reconciled PRs ended blocked on
+    "human review threads have no reply"."""
+
+    def test_logins_match_folds_the_suffix_and_case(self) -> None:
+        from sbxloop.gh.ops import logins_match
+
+        assert logins_match("sbxloop[bot]", "sbxloop")
+        assert logins_match("sbxloop", "sbxloop[bot]")
+        assert logins_match("SBXLoop[bot]", "sbxloop")
+        assert not logins_match("sbxloop", "other")
+        assert not logins_match("", "")
+        assert not logins_match("sbxloop", "")
+
+    def test_a_loop_thread_under_the_rest_login_is_loop_authored(self) -> None:
+        replied = thread(
+            comments=(("sbxloop", "[minor] leaks"), ("sbxloop", "**noted, not blocking**"))
+        )
+        assert unreconciled_threads([replied], login="sbxloop[bot]") == ([], [])
+
+    def test_has_reply_from_crosses_the_suffix(self) -> None:
+        answered = thread(comments=(("alice", "why?"), ("sbxloop", "**addressed**: done")))
+        assert answered.has_reply_from("sbxloop[bot]")
+
+    def test_the_pr_604_shape_merges_and_acks_nothing(self) -> None:
+        """The exact field shape: the loop's own resolved finding threads
+        (noted replies included), threads spelt bare by GraphQL, login
+        spelt with the suffix — must merge, and the ack pass must not
+        reply to the loop's own threads."""
+        fake = FakeGithub()
+        fake.threads = [
+            thread(
+                resolved=True,
+                comments=(("sbxloop", "[minor] x"), ("sbxloop", "**noted, not blocking**")),
+            ),
+            thread(
+                node_id="PRRT_2",
+                path="b.py",
+                line=4,
+                resolved=True,
+                comments=(("sbxloop", "[nit] y"), ("sbxloop", "**noted, not blocking**")),
+            ),
+        ]
+
+        def ack(threads: Any) -> int:
+            return acknowledge_human_threads(
+                fake, REPO, fake.number, run_id="rfix12345", login="sbxloop[bot]", threads=threads
+            )
+
+        outcome = run_land(fake, login="sbxloop[bot]", ack=ack)
+        assert isinstance(outcome, Landed)
+        assert fake.replies == [], "no ack lands on the loop's own threads"
