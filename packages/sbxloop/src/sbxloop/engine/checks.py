@@ -33,7 +33,7 @@ from typing import Any, NamedTuple
 
 from sbxloop.config import LandingConfig
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import CheckState, ChecksVerdict, GithubOps
+from sbxloop.gh.ops import CheckState, ChecksVerdict, GithubOps, approval_summary
 from sbxloop.gh.protection import BaseRequirements, read_base_requirements
 from sbxloop.log import get_logger
 
@@ -76,6 +76,10 @@ class CheckJudgment(NamedTuple):
     # Gating checks still to report (a declared context absent from the
     # head counts: GitHub waits for it too).
     pending: tuple[str, ...]
+    # Gating checks whose workflow a maintainer has not approved (#612):
+    # `pending` in state, but nothing the loop can wait out or fix — the
+    # pollers return on it at once and the landing hands over, named.
+    needs_approval: tuple[str, ...]
     # Reds a fix round targets: gating reds plus advisory regressions on
     # their first round.
     fix: tuple[str, ...]
@@ -116,6 +120,8 @@ class CheckJudgment(NamedTuple):
                 )
             return self.verdict.summary()
         if self.state == "pending":
+            if self.needs_approval:
+                return approval_summary(self.needs_approval)
             return f"{len(self.pending)} gating check(s) still to report: {', '.join(self.pending)}"
         if self.fix == self.verdict.failed:
             return self.verdict.summary()
@@ -134,6 +140,7 @@ class CheckJudgment(NamedTuple):
             "required": list(self.gating),
             "source": self.source,
             "pending": list(self.pending),
+            "needs_approval": list(self.needs_approval),
             "fix": list(self.fix),
             "regressions": list(self.regressions),
             "preexisting": list(self.preexisting),
@@ -171,7 +178,11 @@ def judge_checks(verdict: ChecksVerdict, policy: CheckPolicy = NO_POLICY) -> Che
     fresh = [n for n in regressions if n not in gating and n not in policy.advisory_spent]
     advisory = [n for n in regressions if n not in gating and n in policy.advisory_spent]
     fix = tuple(dict.fromkeys([*gating_red, *fresh]))
-    still_pending = tuple(n for n in gating if n in pending or n not in names)
+    # An unapproved workflow gates like a pending one — GitHub waits for
+    # it too — but is reported apart, so nobody waits on it (#612). A real
+    # red comes first: that round is worth spending whatever else waits.
+    approval = tuple(n for n in verdict.needs_approval if n in gating and n not in ignored)
+    still_pending = tuple(n for n in gating if n in pending or n in approval or n not in names)
 
     state: CheckState = "red" if fix else ("pending" if still_pending else "green")
     return CheckJudgment(
@@ -180,6 +191,7 @@ def judge_checks(verdict: ChecksVerdict, policy: CheckPolicy = NO_POLICY) -> Che
         gating=gating,
         source=source,
         pending=still_pending,
+        needs_approval=approval,
         fix=fix,
         regressions=tuple(regressions),
         preexisting=tuple(preexisting),

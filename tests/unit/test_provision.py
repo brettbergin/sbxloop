@@ -572,6 +572,25 @@ class TestWorkspaceIsolation:
     """Runs against a git-checkout workspace work in a per-run clone; the
     checkout's working tree and branches are never disturbed."""
 
+    def test_the_clone_branch_carries_the_operators_prefix(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """#621: `[github] branch_prefix` names the run branch everywhere it
+        is minted; the clone is the first place."""
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(tmp_path)
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        provisioner.config.github.branch_prefix = "bot/"
+        pair = provisioner.ensure_pair("r1")
+        try:
+            head = (pair.workspace / ".git" / "HEAD").read_text().strip()
+            assert head.endswith("refs/heads/bot/r1")
+            (event,) = clone_events(events)
+            assert event.data["branch"] == "bot/r1"
+        finally:
+            pair.cleanup()
+
     def test_auto_clones_git_workspace(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         from tests.unit.test_hostgit import make_repo
 

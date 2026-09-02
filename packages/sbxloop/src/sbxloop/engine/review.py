@@ -51,6 +51,17 @@ MAX_INLINE_COMMENTS = 25
 # knows.
 FIX_TASK_TITLE = "Make the pull request acceptable"
 FIX_TASK_PREFIX = "fix-"
+# Where a fix round leaves a new PR title (#621): under the workspace's
+# `.sbxloop/`, which delivery never ships, read by the engine before the
+# re-delivery. A red check that judges the title (a semantic-PR or
+# commitlint action) is otherwise incurable from inside the sandbox.
+PR_TITLE_FILE = ".sbxloop/pr-title"
+PR_TITLE_HINT = (
+    f"If a failing check judges the pull request's *title* rather than its code "
+    f"(a title lint, a conventional-commits or semantic-PR check), write the "
+    f"corrected title alone, on one line, to `{PR_TITLE_FILE}` under the workspace "
+    f"root; the loop retitles the pull request on re-delivery."
+)
 
 Severity = Literal["blocking", "major", "minor", "nit"]
 Verdict = Literal["approve", "request_changes"]
@@ -879,10 +890,11 @@ def fix_task(
         "every finding is addressed or refuted",
     ]
     criteria += [f"the `{check.name}` check passes" for check in failed_checks]
+    description = f"{brief}\n\n{PR_TITLE_HINT}" if failed_checks else brief
     return TaskSpec(
         id=f"{FIX_TASK_PREFIX}{round}",
         title=FIX_TASK_TITLE,
-        description=brief,
+        description=description,
         acceptance_criteria=criteria,
         verify_commands=list(dict.fromkeys(verify_commands)),
     )

@@ -269,7 +269,7 @@ class TestLandingSection:
         assert landing.ci_poll_interval_s == 60.0
         assert landing.ci_settle_s == 90.0
         assert landing.ci_timeout_s == 3600.0
-        assert landing.merge_method == "squash"
+        assert landing.merge_method == "auto"
         assert landing.delete_branch_on_merge is True
         assert landing.merge_update_attempts == 3
         assert landing.review_diff_max_chars == 150_000
@@ -564,7 +564,7 @@ def test_merging_is_not_optional(tmp_path: Path) -> None:
     config = load_config(cwd=tmp_path, env={})
     assert not hasattr(config.daemon, "auto_merge")
     assert not hasattr(config.landing, "auto_merge")
-    assert config.landing.merge_method == "squash"
+    assert config.landing.merge_method == "auto"
 
 
 class TestMergeGateConfig:

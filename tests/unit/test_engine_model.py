@@ -60,6 +60,20 @@ class TestTaskGraph:
             TaskGraph.model_validate({"tasks": [spec("t1", ["t2"]), spec("t2", ["t1"])]})
 
 
+class TestPlanTitle:
+    """#621: the decomposer may name the pull request; whitespace is folded
+    and an empty title is no title."""
+
+    def test_pr_title_is_optional_and_folded(self) -> None:
+        assert TaskGraph.model_validate({"tasks": [spec("t1")]}).pr_title is None
+        graph = TaskGraph.model_validate(
+            {"tasks": [spec("t1")], "pr_title": "  feat:\n  add   the thing "}
+        )
+        assert graph.pr_title == "feat: add the thing"
+        assert TaskGraph.model_validate({"tasks": [spec("t1")], "pr_title": " "}).pr_title is None
+        assert TaskGraph.model_validate({"tasks": [spec("t1")], "pr_title": None}).pr_title is None
+
+
 class TestTaskSpec:
     def test_task_spec_defaults(self) -> None:
         t = TaskSpec(id="t1", title="X")

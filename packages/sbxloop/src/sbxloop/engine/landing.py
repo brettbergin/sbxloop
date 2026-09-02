@@ -27,7 +27,7 @@ from collections.abc import Callable, Container, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from sbxloop.config import LandingConfig
+from sbxloop.config import MERGE_METHOD_ORDER, LandingConfig, MergeMethod
 from sbxloop.engine.checks import (
     NO_POLICY,
     CheckJudgment,
@@ -49,6 +49,7 @@ from sbxloop.gh.ops import (
     logins_match,
     raw_pages,
 )
+from sbxloop.gh.protection import BaseRequirements
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -198,7 +199,10 @@ def poll_checks(
                 **{k: v for k, v in checks.event().items() if k not in ("state", "pending")},
             )
             last = checks
-        if checks.state == "red":
+        if checks.state == "red" or checks.needs_approval:
+            # Red: known broken, nothing to wait for. Unapproved: a
+            # maintainer has to click before anything runs (#612), and no
+            # amount of polling is that click.
             return checks
         if checks.state == "green" and (
             verdict.total > 0 or clock() - settle_from >= cfg.ci_settle_s
@@ -564,6 +568,8 @@ def land(
     last_checks: CheckJudgment | None = None
     named: set[tuple[str, ...]] = set()
     bots_named: set[tuple[str, ...]] = set()
+    method: MergeMethod | None = None
+    blocked_at: str | None = None
     while True:
         if clock() - started >= cfg.ci_timeout_s:
             return Blocked(f"landing did not settle within ci_timeout_s={cfg.ci_timeout_s:g}s")
@@ -627,7 +633,14 @@ def land(
         if bot_reviewers and bot_reviewers not in bots_named:
             bots_named.add(bot_reviewers)
             emit("land.bot_standing", pr=number, reviewers=list(bot_reviewers))
-        checks = judge_checks(ops.pr_checks(repo, head), policy_for(head))
+        policy = policy_for(head)
+        checks = judge_checks(ops.pr_checks(repo, head), policy)
+        if checks.needs_approval and checks.state != "red":
+            # A workflow a maintainer has not approved (#612): no commit
+            # fixes it and no wait ends it. A real red still comes first —
+            # that round is worth spending whatever else waits.
+            emit("landing.checks", pr=number, head=head, **checks.event())
+            return Blocked(checks.summary())
         if checks.state == "pending":
             tick("ci")
             continue
@@ -672,6 +685,19 @@ def land(
             # re-delivery rebuilds the commit on the current base, so this
             # is genuinely fixable.
             return NeedsFix("conflict", "the pull request conflicts with its base branch")
+        if str(pr.get("mergeable_state") or "") == "blocked":
+            # Every check the loop judges is green, yet GitHub says the PR
+            # may not merge: the base's rules want something no round
+            # supplies (#620). Name it rather than PUT and parse a 405 —
+            # on the second read: the PR was read before its checks were,
+            # and a state computed while they were still pending is stale.
+            # `unstable` (a non-required check red) is mergeable and is
+            # merged over, consistent with the baseline judgment (#611).
+            if blocked_at != head:
+                blocked_at = head
+                tick("mergeability")
+                continue
+            return Blocked(blocked_reason(policy.requirements, cfg))
         # #520 step 5: the last gates before the merge are about the review
         # record itself. A run that could not post its approving review has
         # no review on the PR at all (#503), and a PR whose findings are
@@ -701,7 +727,15 @@ def land(
         if bot_reviewers and ("comment", *bot_reviewers) not in bots_named:
             bots_named.add(("comment", *bot_reviewers))
             _say(ops, repo, number, bot_review_comment(bot_reviewers))
-        outcome = ops.pr_merge(repo, number, method=cfg.merge_method, sha=head)
+        if method is None:
+            # Resolved once per landing, last of all (#620): an explicit
+            # method the repository refuses is a block, never a substitute.
+            allowed = allowed_merge_methods(_repo_payload(ops, repo))
+            method, why = resolve_merge_method(cfg.merge_method, allowed)
+            if method is None:
+                return Blocked(why)
+            emit("land.merge_method", pr=number, method=method, configured=cfg.merge_method)
+        outcome = ops.pr_merge(repo, number, method=method, sha=head)
         if outcome.stale:
             # The head moved between the read that judged it and the merge;
             # the next iteration judges the new head.
@@ -709,7 +743,9 @@ def land(
             tick("merge")
             continue
         if outcome.blocked:
-            return Blocked(outcome.reason)
+            # A bare 405 says "not mergeable" and nothing more. The base's
+            # rules say what (#620); GitHub's own words ride along.
+            return Blocked(blocked_reason(policy.requirements, cfg, detail=outcome.reason))
         if cfg.delete_branch_on_merge and branch:
             try:
                 ops.branch_delete(repo, branch)
@@ -718,6 +754,95 @@ def land(
                 # not a failure of the thing that just succeeded.
                 log.warning("land.branch_delete_failed", repo=repo, branch=branch, exc_info=True)
         return Landed(outcome.sha)
+
+
+# The repository payload's flag for each merge method (GitHub's names).
+MERGE_METHOD_FLAGS: dict[MergeMethod, str] = {
+    "squash": "allow_squash_merge",
+    "merge": "allow_merge_commit",
+    "rebase": "allow_rebase_merge",
+}
+
+
+def allowed_merge_methods(repo: dict[str, Any] | None) -> tuple[MergeMethod, ...] | None:
+    """The merge methods a repository payload allows, in the loop's order
+    of preference, or None when the payload does not say (#620) — a
+    partial payload, or a read that failed."""
+    if not isinstance(repo, dict):
+        return None
+    flags = {m: repo.get(MERGE_METHOD_FLAGS[m]) for m in MERGE_METHOD_ORDER}
+    if any(v is None for v in flags.values()):
+        return None
+    return tuple(m for m in MERGE_METHOD_ORDER if flags[m])
+
+
+def resolve_merge_method(
+    configured: MergeMethod, allowed: tuple[MergeMethod, ...] | None
+) -> tuple[MergeMethod | None, str]:
+    """The method to merge with, or None and why not (#620).
+
+    ``auto`` takes the first of squash → merge → rebase the repository
+    allows; when the repository could not be read it takes squash and
+    lets the merge answer. An explicit method the repository disallows
+    is a block, never a quiet substitute: the operator asked for a
+    history shape, and the loop must not write a different one.
+    """
+    if configured == "auto":
+        if allowed is None:
+            return "squash", "the repository's merge settings could not be read; trying squash"
+        if not allowed:
+            return None, (
+                "the repository allows no merge method at all (allow_squash_merge, "
+                "allow_merge_commit and allow_rebase_merge are all off); a merge queue "
+                "or a human has to land it"
+            )
+        return allowed[0], f"first allowed of {', '.join(MERGE_METHOD_ORDER)}"
+    if allowed is not None and configured not in allowed:
+        options = ", ".join(allowed) if allowed else "none"
+        return None, (
+            f'`[landing] merge_method = "{configured}"` is not allowed by the repository '
+            f"(it allows: {options}); change the setting or the repository's merge "
+            "options — the loop will not merge a different way than configured"
+        )
+    return configured, "as configured"
+
+
+def _repo_payload(ops: GithubOps, repo: str) -> dict[str, Any] | None:
+    try:
+        return ops.repo_get(repo)
+    except GithubOpsError:
+        log.warning("land.repo_unread", repo=repo, exc_info=True)
+        return None
+
+
+def blocked_reason(requirements: BaseRequirements, cfg: LandingConfig, *, detail: str = "") -> str:
+    """Why GitHub will not merge a PR whose checks are green (#620): what
+    the base's rules are known to want, else the usual suspects — and
+    the one knob that helps when a review is the bar."""
+    if requirements.requires_reviews:
+        why = (
+            "the base branch requires an approving review, which the loop cannot give "
+            "its own pull request"
+        )
+        if cfg.merge_gate != "chat":
+            why += ' — set `[landing] merge_gate = "chat"` to have a person approve from chat'
+    elif requirements.requires_reviews is None:
+        why = (
+            "GitHub reports the pull request as blocked with every check green, and the "
+            "base's protection could not be read; the usual causes are a required "
+            "review, a CODEOWNERS review, required conversation resolution, or a merge "
+            "queue"
+        )
+    else:
+        why = (
+            "GitHub reports the pull request as blocked with every check green; the "
+            "base's rules require something the loop cannot supply — a CODEOWNERS "
+            "review, required conversation resolution, a merge queue, or a check the "
+            "loop does not see"
+        )
+    if detail:
+        why += f" (GitHub: {detail})"
+    return why
 
 
 def bot_review_comment(reviewers: Sequence[str]) -> str:

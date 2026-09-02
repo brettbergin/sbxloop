@@ -608,6 +608,25 @@ class TestPipelineColumns:
         run = StateStore(db).get_run("old")
         assert run.granted_rounds == 2 and run.exhausted is None, "a grant clears the mark"
 
+    def test_run_title_round_trips(self, store: StateStore) -> None:
+        """The plan's PR title (#621) survives a resume and clears on None."""
+        store.create_run("r1", "x")
+        assert store.get_run("r1").pr_title is None
+        store.set_run_title("r1", "feat: the thing")
+        assert store.get_run("r1").pr_title == "feat: the thing"
+        store.set_run_title("r1", None)
+        assert store.get_run("r1").pr_title is None
+        with pytest.raises(StateError, match="unknown run"):
+            store.set_run_title("ghost", "t")
+
+    def test_pre_pr_title_database_migrates_in_place(self, tmp_path: Path) -> None:
+        db = engine_db(tmp_path, "pre_pr_title")
+        insert_run_row(db, run_id="old", outcome="legacy", state="blocked", updated_at=2.0)
+        store = StateStore(db)
+        assert store.get_run("old").pr_title is None
+        store.set_run_title("old", "t")
+        assert StateStore(db).get_run("old").pr_title == "t"
+
 
 class TestGrantRounds:
     def test_grant_accumulates_and_clears_exhaustion(self, store: StateStore) -> None:

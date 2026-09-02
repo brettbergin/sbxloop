@@ -2264,13 +2264,16 @@ class TestPipeline:
         engine = harness.pipeline(fake)
         result = engine.start("land it")
         assert result.state == "blocked"
-        assert result.reason == BLOCKED_405.reason
+        # The 405 is read through the base's protection (#620): the reason
+        # names what the rules want and keeps GitHub's words.
+        assert "the base's rules require something the loop cannot supply" in result.reason
+        assert result.reason.endswith(f"(GitHub: {BLOCKED_405.reason})")
         assert not result.succeeded
         (blocked,) = self._events(harness, HostEventTypes.RUN_BLOCKED)
-        assert blocked.data["pr"] == 7 and blocked.data["why"] == BLOCKED_405.reason
+        assert blocked.data["pr"] == 7 and blocked.data["why"] == result.reason
         run = engine.store.get_run(result.run_id)
         assert run.state == "blocked" and run.stage == "landing"
-        assert run.reason == BLOCKED_405.reason
+        assert run.reason == result.reason
         assert fake.deleted_branches == []
         assert "blocked" in RESUMABLE_RUN_STATES
 
@@ -3036,6 +3039,92 @@ class TestReviewPostFallback:
         assert comments == []
         assert "Findings:" in body and "`hello.txt:1` [nit] stale docstring" in body
         assert "fine" in body
+
+
+class TestNamingInThePipeline:
+    """#621 end to end: the plan's title names the PR through the operator's
+    template; a fix round can retitle; the branch carries the prefix."""
+
+    def test_the_plans_title_names_the_pr_through_the_template(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        plan = taskgraph(task("t1"))
+        plan["json"]["pr_title"] = "feat: add   hello"
+        harness.script([plan, FILES_BUILD, REVIEW_OK])
+        engine = harness.engine(
+            ops=fake,
+            github={"repo": fake.repo, "pr_title_template": "{title} [{run_id}]"},
+            landing=FAST_LANDING,
+        )
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == f"feat: add hello [{result.run_id}]"
+        assert engine.store.get_run(result.run_id).pr_title == "feat: add hello"
+
+    def test_without_a_plan_title_the_defaults_read_as_before(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == "sbxloop: write hello.txt"
+        assert fake.pr_kwargs["head"] == f"sbxloop/{result.run_id}"
+        (commit,) = [b for m, p, b in fake.raw_calls if p.endswith("/git/commits") and b]
+        assert commit["message"] == (
+            f"sbxloop run {result.run_id}: deliver artifacts\n\nOutcome: write hello.txt"
+        )
+
+    def test_the_branch_prefix_is_the_operators(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.engine(
+            ops=fake, github={"repo": fake.repo, "branch_prefix": "bot/"}, landing=FAST_LANDING
+        )
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["head"] == f"bot/{result.run_id}"
+        assert fake.deleted_branches == [f"bot/{result.run_id}"]
+        assert engine.store.get_run(result.run_id).branch == f"bot/{result.run_id}"
+
+    def test_a_fix_round_can_retitle_the_pr(self, harness: Harness) -> None:
+        """A red title-lint check is cured by the fixer writing the title to
+        `.sbxloop/pr-title`; re-delivery renames the PR, the file never
+        ships, and the new title sticks for the next round."""
+        fake = FakeGithub()
+        fake.checks = [ChecksVerdict("red", 1, (), ("title-lint",)), GREEN]
+        fake.failed_logs = [FailedCheck("title-lint", "failure", "no type prefix", "https://x")]
+        retitle = {
+            "text": "retitled",
+            "files": {".sbxloop/pr-title": "  fix:  the corrected\n title\n"},
+        }
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, retitle, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        fix = result.tasks[1].spec
+        assert ".sbxloop/pr-title" in fix.description
+        assert ("PATCH", "/repos/o/r/pulls/7", {"title": "sbxloop: fix: the corrected title"}) in (
+            fake.raw_calls
+        )
+        assert fake.pr["title"] == "sbxloop: fix: the corrected title"
+        delivered = [e["path"] for batch in fake.blob_batches for e in batch]
+        assert ".sbxloop/pr-title" not in delivered
+        assert engine.store.get_run(result.run_id).pr_title == "fix: the corrected title"
+
+
+class TestWorkflowApprovalInThePipeline:
+    """#612: a check waiting on a maintainer's approval ends the run
+    blocked and named — no round, no wait."""
+
+    def test_action_required_blocks_the_run_without_a_fix_round(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.checks = [ChecksVerdict("pending", 1, (), (), (), ("ci",))]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "blocked"
+        assert result.reason == "check ci needs a maintainer to approve the workflow run"
+        assert [t.spec.id for t in result.tasks] == ["t1"]
+        assert fake.merges == []
+        assert engine.store.get_run(result.run_id).ci_rounds == 0
 
 
 class TestAppIdentityLanding:

@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS runs (
     update_head TEXT,
     last_verdict TEXT,
     exhausted  TEXT,
-    granted_rounds INTEGER NOT NULL DEFAULT 0
+    granted_rounds INTEGER NOT NULL DEFAULT 0,
+    pr_title   TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -170,6 +171,7 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ("update_head", "ALTER TABLE runs ADD COLUMN update_head TEXT"),
         ("last_verdict", "ALTER TABLE runs ADD COLUMN last_verdict TEXT"),
         ("exhausted", "ALTER TABLE runs ADD COLUMN exhausted TEXT"),
+        ("pr_title", "ALTER TABLE runs ADD COLUMN pr_title TEXT"),
         (
             "granted_rounds",
             "ALTER TABLE runs ADD COLUMN granted_rounds INTEGER NOT NULL DEFAULT 0",
@@ -346,6 +348,17 @@ class StateStore:
                 raise StateError(f"unknown run {run_id}")
             self._conn.commit()
 
+    def set_run_title(self, run_id: str, title: str | None) -> None:
+        """The plan's own PR title (#621); None clears it."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET pr_title = ?, updated_at = ? WHERE run_id = ?",
+                (title, time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
+
     def set_run_head(self, run_id: str, head_sha: str) -> None:
         with self._lock:
             cursor = self._conn.execute(
@@ -461,6 +474,7 @@ class StateStore:
             pr_node_id=row["pr_node_id"],
             branch=row["branch"],
             head_sha=row["head_sha"],
+            pr_title=row["pr_title"],
             review_rounds=int(row["review_rounds"] or 0),
             ci_rounds=int(row["ci_rounds"] or 0),
             update_attempts=int(row["update_attempts"] or 0),

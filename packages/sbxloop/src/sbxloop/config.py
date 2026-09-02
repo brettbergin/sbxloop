@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import string
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -33,11 +34,13 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
 
 from sbxloop.errors import ConfigError
+from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
 
@@ -203,6 +206,50 @@ def _valid_repo(value: str) -> bool:
     return bool(_REPO_RE.fullmatch(value))
 
 
+# What a PR title / commit message template may interpolate (#621).
+# `{title}` is the model-authored title when the plan gave one, else the
+# outcome; the rest are the run's own facts.
+NAMING_FIELDS = frozenset({"title", "outcome", "run_id", "repo"})
+DEFAULT_PR_TITLE_TEMPLATE = "sbxloop: {title}"
+DEFAULT_COMMIT_MESSAGE_TEMPLATE = "sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}"
+# Bytes git refuses in a ref name, plus the sequences `git check-ref-format`
+# rejects; a prefix that fails here would fail every delivery's ref POST.
+_BAD_REF_CHARS = re.compile(r"[\s~^:?*\[\\\x00-\x1f\x7f]")
+
+
+def _check_template(value: str, key: str) -> str:
+    """Validate a naming template: only :data:`NAMING_FIELDS` placeholders,
+    and syntactically sound for :meth:`str.format`."""
+    try:
+        fields = [f for _, f, _, _ in string.Formatter().parse(value) if f is not None]
+    except ValueError as exc:
+        raise ValueError(f"{key} is not a valid template: {exc}") from exc
+    unknown = sorted({f for f in fields if f.split(".")[0].split("[")[0] not in NAMING_FIELDS})
+    if unknown:
+        raise ValueError(
+            f"{key} names unknown placeholder(s) {', '.join(unknown)}; "
+            f"available: {', '.join(sorted(NAMING_FIELDS))}"
+        )
+    if not value.strip():
+        raise ValueError(f"{key} must not be empty")
+    return value
+
+
+def _check_branch_prefix(value: str, key: str) -> str:
+    if not value:
+        raise ValueError(f"{key} must not be empty")
+    if (
+        _BAD_REF_CHARS.search(value)
+        or value.startswith("/")
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+        or value.endswith(".lock")
+    ):
+        raise ValueError(f"{key} {value!r} is not a valid git ref prefix")
+    return value
+
+
 class RepoConfig(_ConfigModel):
     """One repository sbxloop works with.
 
@@ -228,6 +275,10 @@ class RepoConfig(_ConfigModel):
     # to issues/PRs for this repository.
     trigger_label: str | None = None
     labels: list[str] = Field(default_factory=list)
+    # Per-repo naming (#621); None → the `[github]` value.
+    pr_title_template: str | None = None
+    commit_message_template: str | None = None
+    branch_prefix: str | None = None
 
     @field_validator("repo")
     @classmethod
@@ -235,6 +286,20 @@ class RepoConfig(_ConfigModel):
         if not _valid_repo(value):
             raise ValueError(f"github.repos[].repo must be owner/name, got {value!r}")
         return value
+
+    @field_validator("pr_title_template", "commit_message_template")
+    @classmethod
+    def _check_templates(cls, value: str | None, info: ValidationInfo) -> str | None:
+        return (
+            None if value is None else _check_template(value, f"github.repos[].{info.field_name}")
+        )
+
+    @field_validator("branch_prefix")
+    @classmethod
+    def _check_prefix(cls, value: str | None) -> str | None:
+        return (
+            None if value is None else _check_branch_prefix(value, "github.repos[].branch_prefix")
+        )
 
     @property
     def owner(self) -> str:
@@ -266,6 +331,15 @@ class GithubConfig(_ConfigModel):
     # body so GitHub links issue and PR and closes the issue on merge even
     # when the daemon is not running. Set per run by the daemon.
     deliver_closes: int | None = Field(default=None, ge=1)
+    # How the loop names what it publishes (#621). Templates interpolate
+    # `{title}` (the plan's own title, else the outcome), `{outcome}`,
+    # `{run_id}` and `{repo}`; the defaults reproduce what the loop always
+    # wrote. `branch_prefix` is what the run id is appended to — a ruleset
+    # that only admits `feature/*` branches wants it changed. Each is
+    # overridable per `[[github.repos]]` entry.
+    pr_title_template: str = DEFAULT_PR_TITLE_TEMPLATE
+    commit_message_template: str = DEFAULT_COMMIT_MESSAGE_TEMPLATE
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX
     # How many repositories were enabled in the *un-narrowed* config this was
     # derived from. `for_repo` cuts `repos` down to a single entry, so the
     # list length downstream says nothing about the deployment's shape; the
@@ -280,6 +354,16 @@ class GithubConfig(_ConfigModel):
         if value is not None and not _valid_repo(value):
             raise ValueError(f"github.repo must be owner/name, got {value!r}")
         return value
+
+    @field_validator("pr_title_template", "commit_message_template")
+    @classmethod
+    def _check_templates(cls, value: str, info: ValidationInfo) -> str:
+        return _check_template(value, f"github.{info.field_name}")
+
+    @field_validator("branch_prefix")
+    @classmethod
+    def _check_prefix(cls, value: str) -> str:
+        return _check_branch_prefix(value, "github.branch_prefix")
 
     @model_validator(mode="after")
     def _normalise_repos(self) -> GithubConfig:
@@ -381,8 +465,21 @@ class GithubConfig(_ConfigModel):
                 ),
                 "create_repo": entry.create_repo or self.create_repo,
                 "create_public": entry.create_public or self.create_public,
+                "pr_title_template": entry.pr_title_template or self.pr_title_template,
+                "commit_message_template": (
+                    entry.commit_message_template or self.commit_message_template
+                ),
+                "branch_prefix": entry.branch_prefix or self.branch_prefix,
             }
         )
+
+    def branch_prefix_for(self, repo: str | None = None) -> str:
+        """The branch prefix for ``repo``'s runs: the entry's own, else
+        `[github] branch_prefix` (#621)."""
+        entry = self.effective_repo(repo)
+        if entry is not None and entry.branch_prefix:
+            return entry.branch_prefix
+        return self.branch_prefix
 
     def for_repo(
         self, repo: str | None, *, workspace: Path | _Unset | None = _UNSET
@@ -589,10 +686,15 @@ class Budgets(_ConfigModel):
     max_parallel_tasks: int = Field(default=1, ge=1)
 
 
-# How a landed PR is written onto the base branch. Squash is the default:
-# one autonomous PR becomes one commit, so the base branch's history reads
-# one line per issue rather than carrying every fix round separately.
-MergeMethod = Literal["squash", "merge", "rebase"]
+# How a landed PR is written onto the base branch. "auto" (the default)
+# takes the first of squash → merge → rebase the repository allows (#620):
+# squash first because one autonomous PR then becomes one commit, so the
+# base branch's history reads one line per issue rather than carrying
+# every fix round separately. An explicit method the repository does not
+# allow is a block at landing and a doctor failure — never silently
+# another method.
+MergeMethod = Literal["auto", "squash", "merge", "rebase"]
+MERGE_METHOD_ORDER: tuple[MergeMethod, ...] = ("squash", "merge", "rebase")
 
 # The one opt-in human touchpoint in an otherwise human-out-of-the-loop
 # run: "chat" parks a run that cleared every bar and asks for one approval
@@ -678,7 +780,7 @@ class LandingConfig(_ConfigModel):
     ci_poll_interval_s: float = Field(default=60.0, gt=0)
     ci_settle_s: float = Field(default=90.0, ge=0)
     ci_timeout_s: float = Field(default=3600.0, gt=0)
-    merge_method: MergeMethod = "squash"
+    merge_method: MergeMethod = "auto"
     delete_branch_on_merge: bool = True
     merge_update_attempts: int = Field(default=3, ge=0)
     # The checks that gate the merge, when the operator would rather say

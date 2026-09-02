@@ -706,7 +706,7 @@ class Provisioner:
                 source=repo,
                 target=str(clone_dir),
                 commit=hostgit.head_commit(clone_dir),
-                branch=branch_name(run_id),
+                branch=self._branch_name(run_id, repo),
                 dirty=False,
                 reused=True,
                 message=f"reusing existing run clone at {clone_dir}",
@@ -719,7 +719,7 @@ class Provisioner:
             )
         url = f"https://github.com/{repo}"
         continue_branch = self.config.sandbox.continue_branch
-        branch = continue_branch or branch_name(run_id)
+        branch = continue_branch or self._branch_name(run_id, repo)
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
             sha = hostgit.clone_from_remote(url, clone_dir, branch, existing=bool(continue_branch))
@@ -755,7 +755,7 @@ class Provisioner:
         )
         if clone_dir.exists():
             shutil.rmtree(clone_dir, ignore_errors=True)
-        return branch_name(run_id)
+        return self._branch_name(run_id)
 
     def _emit_clone(self, run_id: str, source: str, clone_dir: Path, sha: str, branch: str) -> None:
         self.bus.emit(
@@ -770,8 +770,11 @@ class Provisioner:
             message=f"cloned {source} at {sha[:12]} onto branch {branch}",
         )
 
+    def _branch_name(self, run_id: str, repo: str | None = None) -> str:
+        return branch_name(run_id, self.config.github.branch_prefix_for(repo))
+
     def _clone_workspace(self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool) -> Path:
-        branch = branch_name(run_id)
+        branch = self._branch_name(run_id)
         if (clone_dir / ".git").exists():
             # A run that crashed after cloning but before the workspace pin
             # landed re-enters this path on resume; never re-clone over

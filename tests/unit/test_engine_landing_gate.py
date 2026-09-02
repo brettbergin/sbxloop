@@ -203,6 +203,7 @@ class TestMergeGate:
         )
         assert isinstance(outcome, Blocked)
         assert seen == [("land.unreconciled", {"pr": 7, "why": outcome.why})]
+        assert fake.merges == [], "no merge method is resolved for a PR that will not merge"
 
 
 def gate_ack(fake: FakeGithub, run_id: str = "rgate1234") -> Any:

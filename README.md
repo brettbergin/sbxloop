@@ -974,6 +974,19 @@ branch — force-moved, the open PR reused — so one run is one PR, and
 failed. The PR stays a draft until the review approves and CI is green, so a
 watching human reads "draft" as "sbxloop is still working on this".
 
+**Naming.** The branch, the PR title and the commit message are rendered
+from `[github]` templates — `branch_prefix` (default `sbxloop/`, the run id
+appended), `pr_title_template` (default `sbxloop: {title}`) and
+`commit_message_template` — with `{title}`, `{outcome}`, `{run_id}` and
+`{repo}` as placeholders; each can be overridden per `[[github.repos]]`
+entry, so a repository with a title lint, a commit lint or a branch ruleset
+gets names it accepts. `{title}` is the plan's own `pr_title`, written in
+the repository's commit style (the decomposer is shown the recent `git log`), falling back to the run's outcome. A fix round can retitle the PR
+by writing `.sbxloop/pr-title` in the workspace — the file is read, never
+delivered — so a red title-lint check is curable like any other; a
+re-delivery whose title changed renames the PR. A branch name the
+repository's rulesets refuse fails the delivery naming `branch_prefix`.
+
 **The review is the run's own.** A fresh read-only session reads the diff
 and returns a verdict; the run acts on that verdict whatever GitHub does
 with it. It is also posted to the PR for the record. **Single-identity
@@ -1020,13 +1033,29 @@ could not be read, counts as the PR's own. A base that declares no required
 checks gates on all of them. `required_checks` names the gating set
 explicitly; `ignore_checks` drops a check everywhere.
 
+**A workflow awaiting approval** — a check at `action_required`, which is
+how GitHub holds a first-time contributor's or a fork's workflow until a
+maintainer approves the run — is neither a failure nor something to wait
+out: the run ends `blocked` at once, naming the check and the approval it
+needs, with no fix round spent. A real red beside it is fixed first.
+
 **Branch protection.** "Require branches to be up to date" is handled: the
 landing stage calls update-branch (bounded by `merge_update_attempts`, each
 one API call) and re-judges the new head. A rule the loop cannot satisfy —
-most often a required approval its identity cannot give — comes back as a
-405 on merge, which no retry fixes, so the run ends `blocked` with the PR
-open and out of draft for a human. A 409 is a race with a push that landed
-since; the next poll re-judges.
+most often a required approval its identity cannot give — shows as a
+`blocked` mergeability once the checks are green, or as a 405 on merge,
+which no retry fixes; the run ends `blocked` with the PR open and out of
+draft for a human, and the reason is read from the base's protection: the
+approvals still required (and the `merge_gate = "chat"` pointer when a
+review is the gate), a CODEOWNERS review, the merge queue, unresolved
+conversations. A 409 is a race with a push that landed since; the next
+poll re-judges.
+
+**Merge method.** `merge_method = "auto"` (the default) takes the first of
+squash, merge, rebase that the repository's settings allow, resolved once
+per landing and logged. An explicit method the repository disallows is
+never swapped for another: `sbxloop doctor` says so on the repository row,
+and a run reaching the merge ends `blocked` naming it.
 
 The post-build stages are configured under `[landing]`, effective only with
 a repository:
@@ -1040,7 +1069,7 @@ retry_rounds = 2                # daemon: an exhausted run resumes its own PR on
 ci_poll_interval_s = 60         # how often the delivered head's check runs are polled
 ci_settle_s = 90                # "no check runs yet" must persist this long to mean "this repo has no CI"
 ci_timeout_s = 3600             # per wait, not charged to max_wall_clock_s; exceeding it ends the run blocked
-merge_method = "squash"         # squash | merge | rebase
+merge_method = "auto"           # auto | squash | merge | rebase — auto: the first the repository allows
 delete_branch_on_merge = true
 merge_update_attempts = 3       # update-branch calls when protection wants "up to date"; 0 disables
 required_checks = []            # the checks that gate the merge; empty = what the base's protection/rulesets declare, else all
@@ -1344,7 +1373,7 @@ came from. The notable knobs:
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
-| `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public` beside it.                                                                                                                                                                                                                   |
+| `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix` beside it.                                                                                                                                                  |
 | `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`, `ignore_reviewers`.                                                     |
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
 | `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                                                                                                                                                                                                |

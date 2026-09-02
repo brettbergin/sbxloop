@@ -32,6 +32,15 @@ def test_render_decompose() -> None:
     assert "$outcome" not in text
 
 
+def test_decompose_asks_for_a_pr_title_in_the_repos_style() -> None:
+    """#621: the plan names the pull request the way the repository names
+    its commits, read from the workspace's own history."""
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
+    assert "`pr_title`" in text
+    assert "git log --oneline" in text
+    assert '"pr_title"' in text, "the JSON example carries the key"
+
+
 def test_decompose_states_the_uv_project_convention() -> None:
     # #250: the decomposer writes ALL the verify commands, and the lint
     # holds them to the uv convention when a lockfile is present — so the

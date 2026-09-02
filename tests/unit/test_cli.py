@@ -2749,6 +2749,73 @@ class TestDoctorBranchProtection:
         )
         assert row.ok
 
+    def test_the_repo_row_says_how_the_loop_will_merge(self, workdir: Path) -> None:
+        """#620: `auto` resolves against what the repository allows; an
+        explicit method it refuses gets a soft failing row of its own."""
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        (row,) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=True, merge_methods=("merge", "rebase")),
+        )
+        assert row.ok and "merge method auto → merge" in row.detail
+
+        (row,) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=True, merge_methods=None),
+        )
+        assert row.ok and "merge settings not reported" in row.detail
+
+        config = self._config(
+            '[[github.repos]]\nrepo = "acme/alpha"\n[landing]\nmerge_method = "squash"\n', workdir
+        )
+        main, method = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=True, merge_methods=("merge",)),
+        )
+        assert main.ok and "merge method squash not allowed" in main.detail
+        assert method.name == "github repo acme/alpha merge method"
+        assert not method.ok and not method.hard
+        assert '`[landing] merge_method = "squash"`' in method.detail
+        assert "it allows: merge" in method.detail
+
+    def test_the_sandbox_probe_reads_the_merge_flags(self, workdir: Path) -> None:
+        from sbxloop.cli.doctor import sandbox_repo_probe
+
+        class Box:
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def ops(self) -> Any:
+                class Ops:
+                    def repo_lookup(self, repo: str) -> dict[str, Any]:
+                        return {
+                            "default_branch": "main",
+                            "allow_squash_merge": False,
+                            "allow_merge_commit": True,
+                            "allow_rebase_merge": False,
+                        }
+
+                    def raw(self, method: str, path: str) -> Any:
+                        from sbxloop.errors import GithubOpsError
+
+                        raise GithubOpsError("no protection", http_status=404)
+
+                return Ops()
+
+        import sbxloop.daemon.github as github_module
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(github_module, "DaemonGithub", Box)
+            config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            result = probe(config.github.repo_list()[0])
+        assert result.merge_methods == ("merge",)
+
     def test_requires_approving_reviews_reads_both_sources(self) -> None:
         from sbxloop.cli.doctor import _requires_approving_reviews
         from sbxloop.errors import GithubOpsError

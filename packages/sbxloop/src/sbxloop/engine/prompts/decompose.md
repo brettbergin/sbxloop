@@ -119,6 +119,13 @@ thing correctly.
   no configured file set, or when the task is genuinely about that one path.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
+- Also give `pr_title`: the one-line title of the pull request this work
+  becomes, written the way this repository writes its commit subjects —
+  read a few recent ones (`git log --oneline -15`) and match their
+  convention (a `type(scope):` prefix, sentence case, an imperative verb,
+  a length limit, whatever they do). Say what the change does, not that
+  it was automated. Leave it `null` when the workspace has no history to
+  learn from.
 
 ## Risk pass: what a deployed instance already holds
 
@@ -154,6 +161,7 @@ Respond with exactly one fenced JSON block:
 
 ```json
 {
+  "pr_title": "...",
   "tasks": [
     {
       "id": "t1",

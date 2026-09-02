@@ -29,6 +29,7 @@ Engine store (``runs`` / ``phase_attempts``):
 - ``pre_pipeline`` — before the 1.0 pipeline columns (``stage``, the PR
   fields, the round counters).
 - ``pre_granted_rounds`` — before #523: no ``exhausted`` / ``granted_rounds``.
+- ``pre_pr_title`` — before #621: no ``pr_title``.
 
 ``every_daemon_row`` writes one work item per (state x id form) a deployed
 daemon can hold, so an upgrade test can sweep the whole space instead of
@@ -208,6 +209,14 @@ ENGINE_SHAPES: dict[EngineShape, tuple[str, ...]] = {
         " pr_number INTEGER, pr_url TEXT, pr_node_id TEXT, branch TEXT, head_sha TEXT,"
         " review_rounds INTEGER NOT NULL DEFAULT 0, ci_rounds INTEGER NOT NULL DEFAULT 0,"
         " update_attempts INTEGER NOT NULL DEFAULT 0, update_head TEXT, last_verdict TEXT)",
+    ),
+    "pre_pr_title": (
+        _RUNS_BASE + ", workspace TEXT, mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT,"
+        " user_guidance TEXT NOT NULL DEFAULT '[]', reason TEXT, stage TEXT,"
+        " pr_number INTEGER, pr_url TEXT, pr_node_id TEXT, branch TEXT, head_sha TEXT,"
+        " review_rounds INTEGER NOT NULL DEFAULT 0, ci_rounds INTEGER NOT NULL DEFAULT 0,"
+        " update_attempts INTEGER NOT NULL DEFAULT 0, update_head TEXT, last_verdict TEXT,"
+        " exhausted TEXT, granted_rounds INTEGER NOT NULL DEFAULT 0)",
     ),
 }
 

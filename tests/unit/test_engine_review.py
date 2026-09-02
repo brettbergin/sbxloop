@@ -10,6 +10,7 @@ from sbxloop.engine.review import (
     FIX_TASK_PREFIX,
     FIX_TASK_TITLE,
     MAX_INLINE_COMMENTS,
+    PR_TITLE_FILE,
     ReviewFinding,
     ReviewGuard,
     ReviewRound,
@@ -457,7 +458,11 @@ class TestFixTask:
         )
         assert spec.id == f"{FIX_TASK_PREFIX}2" == "fix-2"
         assert spec.title == FIX_TASK_TITLE
-        assert spec.description == "fix it"
+        # A red check may be about the title, not the code (#621): the
+        # fixer is told where a corrected title goes — only when checks
+        # failed, so a review-only round reads as before.
+        assert spec.description.startswith("fix it\n\n")
+        assert PR_TITLE_FILE in spec.description
         assert spec.depends_on == []
         assert spec.verify_commands == ["uv run pytest -q", "make check"]
         assert spec.acceptance_criteria == [
@@ -469,6 +474,7 @@ class TestFixTask:
     def test_gate_round_criteria_name_the_gate(self) -> None:
         spec = fix_task(round=1, pr_number=None, brief="b", verify_commands=["make check"])
         assert spec.acceptance_criteria[0] == "the project gate passes"
+        assert spec.description == "b"
 
     def test_is_fix_task(self) -> None:
         assert is_fix_task("fix-1") and is_fix_task("fix-12")
