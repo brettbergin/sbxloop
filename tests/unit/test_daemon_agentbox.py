@@ -27,7 +27,12 @@ from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
 from tests.conftest import FakeSbx
 
-TOKENS = {"COPILOT_GITHUB_TOKEN": "github_pat_copilot"}
+# Both agent credentials: provisioning takes the one [agent] backend names,
+# and a box built for the other backend is what the reuse gate must catch.
+TOKENS = {
+    "COPILOT_GITHUB_TOKEN": "github_pat_copilot",
+    "ANTHROPIC_API_KEY": "sk-ant-test-key",
+}
 
 
 def make_agent(
@@ -38,10 +43,14 @@ def make_agent(
     install_workers: bool = False,
     bus: EventBus | None = None,
     clock=None,
+    backend: str | None = None,
 ) -> DaemonAgent:
     for key, value in TOKENS.items():
         monkeypatch.setenv(key, value)
-    config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+    settings: dict[str, object] = {"state_dir": str(tmp_path / "state")}
+    if backend is not None:
+        settings["agent"] = {"backend": backend}
+    config = Config.model_validate(settings)
     kwargs = {"clock": clock} if clock is not None else {}
     return DaemonAgent(
         config,
@@ -135,6 +144,71 @@ class TestLifecycle:
             agent.client()
         assert created_names(fake_sbx) == [stale.name, agent.name]
         assert fake_sbx.invocations("rm") != []
+
+    def test_reuse_requires_the_configured_agent_backend(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Switching [agent] backend must rebuild the box (#533).
+
+        The worker is installed with the backend's extra, so a box built
+        under copilot carries the Copilot SDK and no Claude Code CLI — while
+        reporting the very same worker version. The version probe alone
+        therefore kept it, and every concierge message then failed with
+        BackendUnavailableError until an operator removed it by hand.
+        """
+        stale = make_agent(fake_sbx, tmp_path, monkeypatch)
+        stale.client()
+        stale.close()
+        agent = make_agent(fake_sbx, tmp_path, monkeypatch, install_workers=True, backend="claude")
+        # The reuse probes are scripted to PASS — a matching version and a
+        # healthy entrypoint — so the only thing that can refuse this box is
+        # the backend probe. Each is consumed once, leaving the blanket
+        # answer below to govern the re-provision that follows.
+        fake_sbx.script(
+            f"exec {agent.name} {sys.executable} -c import sbxloop_worker",
+            stdout=f"{__version__}\n",
+            once=True,
+        )
+        fake_sbx.script(
+            f"exec {agent.name} {sys.executable} -m sbxloop_worker",
+            returncode=64,
+            once=True,
+        )
+        fake_sbx.script(
+            f"exec {agent.name} {sys.executable} -c import sys; from sbxloop_worker.backends",
+            returncode=1,
+            stderr="claude-agent-sdk is not installed; install sbxloop-worker[claude]",
+            once=True,
+        )
+        fake_sbx.script(f"exec {agent.name} python3 -m venv", once=True)
+        fake_sbx.script(f"exec {agent.name}", stdout=f"{__version__}\n")
+        with pytest.raises(DaemonError):
+            # As above: the blanket answer makes the re-install's entrypoint
+            # smoke return 0 (expected 64), so provisioning fails and rolls
+            # back — proving the box was rebuilt rather than reused.
+            agent.client()
+        assert created_names(fake_sbx) == [stale.name, agent.name]
+        assert fake_sbx.invocations("rm") != []
+
+    def test_reuse_is_kept_when_the_backend_still_matches(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The backend probe is a gate, not a second re-provision trigger: an
+        equipped box is still reused, with no new create."""
+        first = make_agent(fake_sbx, tmp_path, monkeypatch)
+        first.client()
+        first.close()
+        events: list[Event] = []
+        bus = EventBus()
+        bus.subscribe(events.append)
+        second = make_agent(fake_sbx, tmp_path, monkeypatch, install_workers=True, bus=bus)
+        fake_sbx.script(
+            f"exec {second.name} {sys.executable} -c import sys; from sbxloop_worker.backends",
+            returncode=0,
+        )
+        second.client()
+        assert created_names(fake_sbx) == [first.name]
+        assert [e.type for e in events] == ["sandbox.reused"]
 
     def test_remove_deletes_the_sandbox(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

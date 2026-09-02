@@ -80,6 +80,39 @@ All notable changes to sbxloop are documented here. The project adheres to
   run". A real red beside it is fixed first, and the approval is
   re-judged on the re-delivery.
 
+- **A backend switch no longer leaves a stale concierge sandbox behind**
+  (#533). The daemon's concierge box is deliberately reused across
+  restarts, and the reuse gate asked only whether the installed worker
+  matched this host. But the worker is installed with `[agent] backend`'s
+  extra, so a box built under copilot carries the Copilot SDK and no
+  Claude Code CLI while reporting the very same version: switching the
+  backend kept it, and every mention then failed with
+  `BackendUnavailableError` until an operator removed the sandbox by
+  hand. The gate now also asks whether the box is equipped for the
+  configured backend (`WorkerClient.backend_ready`), and re-provisions
+  when it is not. The question is answered by the worker's own
+  precondition, hoisted out of `run_session` into
+  `backends.ensure_available`, so there is no second host-side copy of
+  what each backend needs to drift.
+
+- **`sbxloop doctor`'s concierge row follows `[agent] backend`** (#533).
+  It named `COPILOT_GITHUB_TOKEN` unconditionally, so a claude-backend
+  host was told "mentions will fail" while nothing was wrong — and was
+  told nothing about `ANTHROPIC_API_KEY`, the credential that actually
+  gates it. The row now names the configured backend's credential, like
+  the agent credential row above it.
+
+- **`status`, `logs`, `artifacts` and `gc` look where the daemon actually
+  writes** (#255). The daemon anchors its state at
+  `$XDG_STATE_HOME/sbxloop/<project>`, away from the top-level
+  `state_dir`; the run commands read `state_dir` verbatim, so on a daemon
+  host they reported an unrelated — usually stale, often empty — world,
+  with no flag to correct them. `sbxloop daemon` and its `ctl`
+  subcommands already resolved this way; the run commands now do too, via
+  `paths.resolve_cli_state_dir`. The redirect fires only when a daemon
+  store is actually present, so a single-user `sbxloop run` host is
+  unaffected, and nothing moves on disk.
+
 - **`sbxloop bake` installs the configured languages, and a prebaked run
   tops up what the template lacks** (#615). The bake ignored `[sandbox] languages` and installed Python alone; a run on that template then
   verified the baked worker, skipped the install ladder — and with it

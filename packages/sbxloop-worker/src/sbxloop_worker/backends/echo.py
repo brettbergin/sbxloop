@@ -43,6 +43,10 @@ SCRIPT_ENV = "SBXLOOP_ECHO_SCRIPT"
 class EchoBackend:
     name = "echo"
 
+    def ensure_available(self) -> None:
+        """Nothing to install: the point of this backend is that it runs
+        wherever the worker itself does."""
+
     def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult:
         scripted = self._next_scripted_response()
         if scripted is None:

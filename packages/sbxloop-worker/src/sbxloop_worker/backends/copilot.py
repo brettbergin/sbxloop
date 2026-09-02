@@ -556,13 +556,19 @@ def available_tool_count(data: Any) -> int | None:
 class CopilotBackend:
     name = "copilot"
 
-    def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult:
+    def ensure_available(self) -> None:
+        """What this backend needs before a session can start (see
+        ``backends.ensure_available``): the SDK, which the worker's
+        ``[copilot]`` extra installs."""
         try:
             import copilot  # noqa: F401
         except ImportError as exc:
             raise BackendUnavailableError(
                 "github-copilot-sdk is not installed; install sbxloop-worker[copilot]"
             ) from exc
+
+    def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult:
+        self.ensure_available()
         self._guard_bundled_ripgrep(emit)
         try:
             return asyncio.run(self._run(job, emit))

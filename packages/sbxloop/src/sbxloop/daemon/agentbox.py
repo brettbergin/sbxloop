@@ -13,7 +13,9 @@ session store — the concierge's conversation memory — lives inside the VM,
 and a fresh microVM plus Copilot install costs minutes at every restart.
 So :meth:`DaemonAgent.client` first looks for the deterministic name in
 ``sbx ls`` and keeps the sandbox when the installed worker still matches
-this host (:meth:`WorkerClient.verify_installed`); a host upgrade or a
+this host (:meth:`WorkerClient.verify_installed`) *and* the box is equipped
+for the configured ``[agent] backend``
+(:meth:`WorkerClient.backend_ready`); a host upgrade, a backend switch or a
 wedged VM falls through to a clean re-provision. ``sbxloop sandbox rm
 --all`` still removes it; ``sandbox prune`` reports it as daemon-owned
 and leaves it alone.
@@ -171,24 +173,40 @@ class DaemonAgent:
             job_env=self.provisioner.job_env("agent", sandbox=sandbox),
         )
 
+    def _is_reusable(self, client: WorkerClient) -> bool:
+        """Can the existing box be kept, or must it be rebuilt?
+
+        Two questions, both cheap probes. The worker must match this host —
+        an upgrade re-installs rather than trusting the box. And the box
+        must be equipped for the *configured* backend: it was installed with
+        ``extras=[agent] backend``, so switching that leaves a box whose SDK
+        is the old backend's while its worker version is unchanged, which
+        the version check alone happily reuses (#533). The symptom is every
+        concierge message failing with BackendUnavailableError until an
+        operator removes the sandbox by hand.
+        """
+        return client.verify_installed() and client.backend_ready(self.config.agent.backend)
+
     def _ensure(self) -> WorkerClient:
         started = time.monotonic()
         if self.exists():
             sandbox = Sandbox(self.sbx, self.name)
             client = self._make_client(sandbox)
-            if not self.install_workers or client.verify_installed():
+            if not self.install_workers or self._is_reusable(client):
                 self._sandbox = sandbox
                 self.bus.emit("sandbox.reused", CONCIERGE_RUN_ID, name=self.name, role="agent")
                 log.info(
                     "concierge_sandbox.reused",
                     sandbox=self.name,
+                    backend=self.config.agent.backend,
                     duration_s=round(time.monotonic() - started, 1),
                 )
                 return client
             log.warning(
                 "concierge_sandbox.stale",
                 sandbox=self.name,
-                action="worker does not match this host; re-provisioning",
+                backend=self.config.agent.backend,
+                action="worker or agent backend does not match this host; re-provisioning",
             )
             self.remove()
 

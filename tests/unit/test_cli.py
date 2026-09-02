@@ -122,6 +122,32 @@ class TestStatusAndLogs:
         assert "rseeded11" in result.output
         assert "completed" in result.output
 
+    def test_status_follows_the_daemon_store(self, workdir: Path) -> None:
+        """A daemon anchors its state under XDG (#255), so `status` in the
+        runner directory must report the daemon's runs — not the untouched
+        `~/.sbxloop` it used to read, which shows a stale or empty world with
+        no flag to correct it.
+        """
+        daemon_dir = workdir / "xdg-state" / "sbxloop" / workdir.name
+        daemon_dir.mkdir(parents=True)
+        daemon_store = StateStore(daemon_dir / "state.db")
+        daemon_store.create_run("rdaemon01", "work the daemon claimed")
+        daemon_store.set_run_state("rdaemon01", "completed")
+        daemon_store.close()
+
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        assert "rdaemon01" in result.output
+
+    def test_status_keeps_the_plain_default_without_a_daemon(self, workdir: Path) -> None:
+        """No daemon store: nothing is redirected, and a single-user host
+        reports exactly the runs it always did."""
+        seed_store(workdir)
+        assert not (workdir / "xdg-state").exists()
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        assert "rseeded11" in result.output
+
     def test_status_run_detail(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         seed_store(workdir)
         result = runner.invoke(app, ["status", "rseeded11"])
@@ -823,6 +849,29 @@ class TestDoctor:
             "[discord]\nchannel_id = 42\n[concierge]\nenabled = false\n"
         )
         assert not [c for c in collect_checks(env) if c.name == "chat concierge"]
+
+    def test_concierge_row_names_the_configured_backends_credential(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#533: the concierge box authenticates with whatever [agent]
+        backend names, so the row must follow it. Hardcoding the Copilot
+        token warned "mentions will fail" on a claude-backend host where
+        nothing was wrong — and stayed quiet about the token that matters.
+        """
+        from sbxloop.cli.doctor import collect_checks
+
+        (workdir / "sbxloop.toml").write_text(
+            '[agent]\nbackend = "claude"\n[discord]\nchannel_id = 42\n'
+        )
+        env = {"GH_TOKEN": "tok", "DISCORD_BOT_TOKEN": "tok", "COPILOT_GITHUB_TOKEN": "tok"}
+        (row,) = [c for c in collect_checks(env) if c.name == "chat concierge"]
+        assert not row.ok
+        assert "ANTHROPIC_API_KEY not set" in row.detail
+        assert "COPILOT_GITHUB_TOKEN" not in row.detail
+
+        env["ANTHROPIC_API_KEY"] = "sk-ant-tok"
+        (row,) = [c for c in collect_checks(env) if c.name == "chat concierge"]
+        assert row.ok and "ANTHROPIC_API_KEY present" in row.detail
 
     def test_doctor_hints_at_legacy_relative_state_dir(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

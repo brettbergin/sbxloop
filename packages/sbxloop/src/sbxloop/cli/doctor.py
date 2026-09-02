@@ -801,9 +801,16 @@ def collect_checks(
         )
         # ...and its concierge: an agent session on the daemon host's behalf,
         # so the agent token must be here (the run pair needs it too, but a
-        # chat-only operator may not have noticed).
+        # chat-only operator may not have noticed). *Which* token follows
+        # [agent] backend, exactly like the credential row above (#533): the
+        # concierge box authenticates with ANTHROPIC_API_KEY under the claude
+        # backend, so naming COPILOT_GITHUB_TOKEN here warned that "mentions
+        # will fail" on a host where nothing was wrong.
         if config.concierge.enabled:
-            has_token = bool(env.get("COPILOT_GITHUB_TOKEN"))
+            token_env = (
+                ANTHROPIC_TOKEN_ENV if config.agent.backend == "claude" else COPILOT_TOKEN_ENV
+            )
+            has_token = bool(env.get(token_env))
             checks.append(
                 Check(
                     "chat concierge",
@@ -811,9 +818,9 @@ def collect_checks(
                     f"model {config.concierge.model or config.model}, "
                     f"{config.concierge.timeout_s:.0f}s per message: "
                     + (
-                        "COPILOT_GITHUB_TOKEN present"
+                        f"{token_env} present"
                         if has_token
-                        else "COPILOT_GITHUB_TOKEN not set (mentions will fail)"
+                        else f"{token_env} not set (mentions will fail)"
                     ),
                     hard=False,
                 )

@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from sbxloop_worker.backends import BackendUnavailableError, get_backend
+from sbxloop_worker.backends import BackendUnavailableError, ensure_available, get_backend
 from sbxloop_worker.backends.claude import (
     BACKEND_NAME,
     ClaudeBackend,
@@ -436,6 +436,38 @@ class TestAvailability:
     def test_registry_resolves_claude(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SBXLOOP_WORKER_BACKEND", "claude")
         assert get_backend().name == "claude"
+
+    def test_ensure_available_answers_without_a_session(
+        self, sdk: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same precondition run_session opens with, reachable on its
+        own: the host asks it of a sandbox it is about to reuse, and must
+        not have to start a session (or hold a credential) to find out."""
+        monkeypatch.setattr(
+            "sbxloop_worker.backends.claude.shutil.which", lambda _: "/usr/bin/claude"
+        )
+        ensure_available("claude")
+
+    def test_ensure_available_reports_a_missing_cli(
+        self, sdk: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("sbxloop_worker.backends.claude.shutil.which", lambda _: None)
+        with pytest.raises(BackendUnavailableError, match="Claude Code CLI"):
+            ensure_available("claude")
+
+    def test_ensure_available_reports_a_missing_sdk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
+        with pytest.raises(BackendUnavailableError, match="claude-agent-sdk is not installed"):
+            ensure_available("claude")
+
+    def test_ensure_available_rejects_an_unknown_backend(self) -> None:
+        with pytest.raises(BackendUnavailableError, match="unknown agent backend"):
+            ensure_available("nope")
+
+    def test_echo_backend_needs_nothing(self) -> None:
+        """The probe must not report the test backend as unavailable — it is
+        what the engine's own suites run on."""
+        ensure_available("echo")
 
 
 class TestDecisionLogic:
