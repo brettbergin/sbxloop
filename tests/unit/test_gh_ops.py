@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import FailedCheck, GithubOps, IssueRef
+from sbxloop.gh.ops import MAX_PAGES, FailedCheck, GithubOps, IssueRef, PaginationError, raw_pages
 from sbxloop_worker.protocol import ErrorInfo, JobRequest, JobResult
 from tests.fakes.github_errors import worker_error
 
@@ -202,7 +202,97 @@ class TestGithubOpsFacade:
             ops.blobs_create_many("o/r", [{"path": "a.txt", "content_b64": "YQ=="}])
 
 
+class PagedStubClient(StubWorkerClient):
+    """``raw.api`` replies keyed by the *full* request path, query included
+    — for exercising the page walk itself."""
+
+    def submit(self, job: JobRequest) -> JobResult:
+        self.jobs.append(job)
+        assert job.op == "raw.api"
+        return JobResult(
+            job_id=job.job_id, status="ok", output_json=self.responses.get(job.params["path"])
+        )
+
+
+def paged(path: str, *pages: list[Any], key: str | None = None) -> dict[str, Any]:
+    sep = "&" if "?" in path else "?"
+    return {
+        f"{path}{sep}per_page=100&page={n}": ({key: page} if key else page)
+        for n, page in enumerate(pages, start=1)
+    }
+
+
+class TestRawPages:
+    """#614: every list read walks ``page=`` to a short page, and a list
+    longer than the walk will follow is refused rather than truncated."""
+
+    def test_follows_pages_until_a_short_one(self) -> None:
+        client = PagedStubClient(paged("/repos/o/r/pulls/7/reviews", list(range(100)), [100, 101]))
+        rows = raw_pages(GithubOps(client, "r1"), "/repos/o/r/pulls/7/reviews")
+        assert rows == [*range(100), 100, 101]
+        assert [job.params["path"] for job in client.jobs] == [
+            "/repos/o/r/pulls/7/reviews?per_page=100&page=1",
+            "/repos/o/r/pulls/7/reviews?per_page=100&page=2",
+        ]
+
+    def test_a_short_first_page_is_one_call(self) -> None:
+        client = PagedStubClient(paged("/repos/o/r/pulls/7/reviews", [1, 2, 3]))
+        assert raw_pages(GithubOps(client, "r1"), "/repos/o/r/pulls/7/reviews") == [1, 2, 3]
+        assert len(client.jobs) == 1
+
+    def test_an_exactly_full_page_reads_the_empty_one_after_it(self) -> None:
+        client = PagedStubClient(paged("/repos/o/r/pulls/7/reviews", list(range(100)), []))
+        assert raw_pages(GithubOps(client, "r1"), "/repos/o/r/pulls/7/reviews") == list(range(100))
+        assert len(client.jobs) == 2
+
+    def test_an_enveloped_list_is_read_through_its_key(self) -> None:
+        client = PagedStubClient(
+            paged("/repos/o/r/commits/abc/check-runs", list(range(100)), [7], key="check_runs")
+        )
+        rows = raw_pages(
+            GithubOps(client, "r1"), "/repos/o/r/commits/abc/check-runs", key="check_runs"
+        )
+        assert rows == [*range(100), 7]
+
+    def test_a_path_with_a_query_keeps_it(self) -> None:
+        client = PagedStubClient(paged("/repos/o/r/pulls?state=open", [1]))
+        assert raw_pages(GithubOps(client, "r1"), "/repos/o/r/pulls?state=open") == [1]
+        assert client.jobs[0].params["path"] == "/repos/o/r/pulls?state=open&per_page=100&page=1"
+
+    def test_a_non_list_answer_ends_the_walk_with_what_was_read(self) -> None:
+        client = PagedStubClient(
+            {"/repos/o/r/pulls/7/reviews?per_page=100&page=1": {"message": "x"}}
+        )
+        assert raw_pages(GithubOps(client, "r1"), "/repos/o/r/pulls/7/reviews") == []
+
+    def test_more_pages_than_the_walk_follows_is_refused_not_truncated(self) -> None:
+        client = PagedStubClient(
+            paged("/repos/o/r/pulls/7/reviews", *([list(range(100))] * (MAX_PAGES + 1)))
+        )
+        with pytest.raises(PaginationError, match="more than 1000 entries"):
+            raw_pages(GithubOps(client, "r1"), "/repos/o/r/pulls/7/reviews")
+        assert len(client.jobs) == MAX_PAGES
+
+
 class TestPrChecks:
+    def test_a_red_check_on_the_second_page_is_seen(self) -> None:
+        green = [{"name": f"job-{i}", "conclusion": "success"} for i in range(100)]
+        client = PagedStubClient(
+            {
+                **paged(
+                    "/repos/o/r/commits/abc/check-runs",
+                    green,
+                    [{"name": "unit", "conclusion": "failure"}],
+                    key="check_runs",
+                ),
+                **paged("/repos/o/r/commits/abc/status", [], key="statuses"),
+            }
+        )
+        verdict = GithubOps(client, "r1").pr_checks("o/r", "abc")
+        assert verdict.state == "red"
+        assert verdict.total == 101
+        assert verdict.failed == ("unit",)
+
     def test_reads_check_runs_and_commit_statuses(self) -> None:
         """Both namespaces, one verdict (#610): a red Jenkins status turns a
         green Actions run red, and both GETs go through the github worker."""
@@ -222,8 +312,8 @@ class TestPrChecks:
         assert verdict.total == 2
         assert verdict.failed == ("ci/jenkins",)
         assert [job.params["path"] for job in client.jobs] == [
-            "/repos/o/r/commits/abc/check-runs",
-            "/repos/o/r/commits/abc/status",
+            "/repos/o/r/commits/abc/check-runs?per_page=100&page=1",
+            "/repos/o/r/commits/abc/status?per_page=100&page=1",
         ]
 
     def test_no_checks_and_no_statuses_is_green(self) -> None:
@@ -297,9 +387,12 @@ class PathStubClient(StubWorkerClient):
     def submit(self, job: JobRequest) -> JobResult:
         self.jobs.append(job)
         assert job.op == "raw.api"
-        return JobResult(
-            job_id=job.job_id, status="ok", output_json=self.responses.get(job.params["path"])
-        )
+        # Paged list reads (#614): responses are keyed by the bare path and
+        # hold the whole list; page one answers, later pages are empty.
+        path, _, query = str(job.params["path"]).partition("?")
+        if "page=" in query and not query.endswith("page=1"):
+            return JobResult(job_id=job.job_id, status="ok", output_json=[])
+        return JobResult(job_id=job.job_id, status="ok", output_json=self.responses.get(path))
 
 
 def review(login: str, state: str, body: str = "") -> dict[str, Any]:
@@ -341,8 +434,8 @@ class TestPrReviewFeedback:
             "- no anchor"
         )
         assert [j.params["path"] for j in client.jobs] == [
-            "/repos/o/r/pulls/7/reviews",
-            "/repos/o/r/pulls/7/comments",
+            "/repos/o/r/pulls/7/reviews?per_page=100&page=1",
+            "/repos/o/r/pulls/7/comments?per_page=100&page=1",
         ]
 
     def test_latest_verdict_per_reviewer_wins(self) -> None:

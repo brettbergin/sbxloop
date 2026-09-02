@@ -15,6 +15,7 @@ import pytest
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import (
     GithubOps,
+    PaginationError,
     PostedFinding,
     ReviewComment,
     ReviewThread,
@@ -69,6 +70,11 @@ class RawOps(GithubOps):
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.calls.append((method, path, body))
+        # Paged list reads (#614): routes are keyed by the bare path and
+        # hold the whole list, so page one answers and later pages are empty.
+        path, _, query = path.partition("?")
+        if method == "GET" and "page=" in query and not query.endswith("page=1"):
+            return []
         try:
             answer = self.routes[(method, path)]
         except KeyError:  # pragma: no cover - a mis-scripted test
@@ -285,6 +291,67 @@ class TestReplyAndResolve:
             ops.resolve_review_thread("PRRT_1")
 
 
+class CursorOps(RawOps):
+    """RawOps answering ``POST /graphql`` from a cursor -> payload table."""
+
+    def __init__(self, pages: dict[str | None, Any]) -> None:
+        super().__init__({})
+        self.pages = pages
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        self.calls.append((method, path, body))
+        assert method == "POST" and path == "/graphql" and body is not None
+        return self.pages[body["variables"]["cursor"]]
+
+
+def with_page_info(payload: dict[str, Any], *, end_cursor: str | None) -> dict[str, Any]:
+    connection = payload["data"]["repository"]["pullRequest"]["reviewThreads"]
+    connection["pageInfo"] = {"hasNextPage": end_cursor is not None, "endCursor": end_cursor}
+    return payload
+
+
+class TestReviewThreadPaging:
+    """#614: the thread listing walks ``reviewThreads`` by cursor, and a
+    thread whose own comments were not all read is refused, not judged."""
+
+    def test_threads_past_the_first_page_are_listed(self) -> None:
+        first = [thread_node(f"PRRT_{i}", "a.py", i, 100 + i) for i in range(100)]
+        ops = CursorOps(
+            {
+                None: with_page_info(threads_payload(*first), end_cursor="c1"),
+                "c1": with_page_info(
+                    threads_payload(
+                        *[thread_node(f"PRRT_{i}", "b.py", i, 300 + i) for i in range(50)]
+                    ),
+                    end_cursor=None,
+                ),
+            }
+        )
+        threads = ops.pr_review_threads(REPO, PR)
+        assert len(threads) == 150
+        assert threads[-1].anchor == "b.py:49"
+        cursors = [c[2]["variables"]["cursor"] for c in ops.calls if c[2] is not None]
+        assert cursors == [None, "c1"]
+
+    def test_a_page_without_page_info_is_the_last(self) -> None:
+        ops = CursorOps({None: threads_payload(thread_node("PRRT_1", "a.py", 1, 5))})
+        assert len(ops.pr_review_threads(REPO, PR)) == 1
+        assert len(ops.calls) == 1
+
+    def test_a_thread_with_unread_comments_is_refused_by_name(self) -> None:
+        node = thread_node("PRRT_9", "deep.py", 42, 7)
+        node["comments"]["pageInfo"] = {"hasNextPage": True}
+        ops = CursorOps({None: threads_payload(thread_node("PRRT_1", "a.py", 1, 5), node)})
+        with pytest.raises(PaginationError, match=r"deep\.py:42 \(PRRT_9\) has more comments"):
+            ops.pr_review_threads(REPO, PR)
+
+    def test_the_query_asks_for_the_comment_maximum_and_page_info(self) -> None:
+        query = GithubOps._THREADS_QUERY
+        assert "reviewThreads(first: 100, after: $cursor)" in query
+        assert "pageInfo { hasNextPage endCursor }" in query
+        assert "comments(first: 100) { pageInfo { hasNextPage }" in query
+
+
 class TestReviewThreadListing:
     def test_pr_review_threads_folds_nodes(self) -> None:
         payload = threads_payload(thread_node("PRRT_1", "a.py", 10, 101))
@@ -311,7 +378,7 @@ class TestReviewThreadListing:
         assert thread.has_reply_marked("run=r1 round=2") is False
         body = ops.calls[0][2]
         assert body is not None
-        assert body["variables"] == {"owner": "o", "name": "r", "number": PR}
+        assert body["variables"] == {"owner": "o", "name": "r", "number": PR, "cursor": None}
 
     def test_thread_without_reply_is_not_reconciled(self) -> None:
         ops = RawOps({("POST", "/graphql"): threads_payload(thread_node("PRRT_1", "a.py", 1, 5))})

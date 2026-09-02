@@ -321,6 +321,12 @@ class FakeGithub(GithubOps):
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
+        # List reads arrive paged (`raw_pages`, #614). The fake holds every
+        # list whole, so page one is the list and any later page is empty;
+        # routing below matches on the path without its query.
+        path, _, query = path.partition("?")
+        if method == "GET" and "page=" in query and not query.endswith("page=1"):
+            return []
         if method == "GET" and path == "/user":
             if self.fail_user_lookup is not None:
                 self._record_failed_job("raw.api", method, path, self.fail_user_lookup)
@@ -359,7 +365,7 @@ class FakeGithub(GithubOps):
             return [{"body": body} for body in self.issue_comments]
         if method == "GET" and path.endswith("/comments"):
             return list(self.comments_payload)
-        if method == "GET" and "/pulls?state=open&head=" in path:
+        if method == "GET" and path.endswith("/pulls") and "state=open&head=" in query:
             return [dict(self.pr)] if self.pr_created else []
         if method == "GET" and "/compare/" in path:
             # `base...head`: unrelated histories have no merge base, which
@@ -403,7 +409,7 @@ class FakeGithub(GithubOps):
                 )
             self.labels_created.append(str(body["name"]))
             return {"name": body["name"]}
-        if method == "GET" and "/issues?labels=" in path:
+        if method == "GET" and path.endswith("/issues") and "labels=" in query:
             return list(self.existing_issues)
         if method == "POST" and path.endswith("/pulls/" + str(self.number) + "/comments"):
             # One review comment, standalone (#513): a thread of its own.

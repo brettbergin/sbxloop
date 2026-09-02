@@ -195,8 +195,8 @@ class TestChecksFailedLogs:
         out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc", "max_chars": 4000}, t)
         assert isinstance(out, dict)
         assert t.calls == [
-            ("GET", "/repos/o/r/commits/abc/check-runs", None),
-            ("GET", "/repos/o/r/commits/abc/status", None),
+            ("GET", "/repos/o/r/commits/abc/check-runs?per_page=100&page=1", None),
+            ("GET", "/repos/o/r/commits/abc/status?per_page=100&page=1", None),
         ]
         assert t.text_calls == [("GET", "/repos/o/r/actions/jobs/77/logs")]
         (check,) = out["checks"]
@@ -254,6 +254,34 @@ class TestChecksFailedLogs:
         assert lines[0] == "(logs unavailable: HTTP 410)"
         assert "Job timed out" in check["excerpt"]
         assert "after 6h" in check["excerpt"]
+
+    def test_check_runs_past_the_first_page_are_read(self) -> None:
+        """#614 acceptance: 45 check runs at page size 30 used to hide a
+        red one at #40; at page size 100 the same shape is a full page
+        plus one, and the one is still read."""
+        green = [check_run(f"job-{i}", "success", run_id=i) for i in range(100)]
+        t = RecordingTransport(
+            {
+                "/repos/o/r/commits/abc/check-runs?per_page=100&page=1": {"check_runs": green},
+                "/repos/o/r/commits/abc/check-runs?per_page=100&page=2": {
+                    "check_runs": [check_run("unit", "failure", run_id=500, app="some-bot")]
+                },
+                "/repos/o/r/commits/abc/status": {"statuses": []},
+            }
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert [c["name"] for c in out["checks"]] == ["unit"]
+        assert [p for _, p, _ in t.calls if "check-runs" in p] == [
+            "/repos/o/r/commits/abc/check-runs?per_page=100&page=1",
+            "/repos/o/r/commits/abc/check-runs?per_page=100&page=2",
+        ]
+
+    def test_too_many_pages_is_an_error_not_a_prefix(self) -> None:
+        full = {"check_runs": [check_run(f"job-{i}", "success", run_id=i) for i in range(100)]}
+        t = RecordingTransport({"/repos/o/r/commits/abc/check-runs": full})
+        with pytest.raises(GithubOpError, match="more than 1000 entries"):
+            execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
 
     def test_red_commit_statuses_are_reported_with_their_description(self) -> None:
         """The Status API side of #610: a failing Jenkins/Buildkite context

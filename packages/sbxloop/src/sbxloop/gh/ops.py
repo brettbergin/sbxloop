@@ -180,6 +180,56 @@ class SubmittedReview(NamedTuple):
         return tuple(p for p in self.posted if p.comment_id is None)
 
 
+# -- reading lists -------------------------------------------------------------
+#
+# Every GitHub list endpoint pages at 30 by default and 100 at most. A read
+# that takes the first page for the whole list is a silent truncation, and
+# on the reads that gate a merge (reviews, review comments, threads) a
+# silent truncation is a silent merge over unseen feedback (#614). Every
+# list read goes through `raw_pages`; a list longer than it will follow is
+# refused, not cut — "we could not tell" is not "there is nothing there".
+
+PAGE_SIZE = 100
+# Ten full pages is a thousand entries; a pull request or issue with more
+# history than that is not one the loop should be judging by list-walk.
+MAX_PAGES = 10
+
+
+class PaginationError(GithubOpsError):
+    """A list longer than the reader will follow (or a GraphQL connection
+    with a next page the query does not fetch). The read is incomplete
+    and must be treated as unread, never as "what we saw is all there
+    is"."""
+
+
+def raw_pages(ops: GithubOps, path: str, *, key: str | None = None) -> list[Any]:
+    """Every entry of a REST list endpoint, following ``page=`` until a
+    short page.
+
+    ``key`` names the list inside an envelope (``check_runs`` on the
+    check-runs endpoint, ``statuses`` on the combined status). A response
+    that is not the expected shape ends the walk with what was read so
+    far, matching the single-page callers' "not a list → nothing" reading.
+    Raises :class:`PaginationError` when :data:`MAX_PAGES` full pages did
+    not reach the end.
+    """
+    sep = "&" if "?" in path else "?"
+    rows: list[Any] = []
+    for page in range(1, MAX_PAGES + 1):
+        data = ops.raw("GET", f"{path}{sep}per_page={PAGE_SIZE}&page={page}")
+        if key is not None:
+            data = data.get(key) if isinstance(data, dict) else None
+        if not isinstance(data, list):
+            return rows
+        rows.extend(data)
+        if len(data) < PAGE_SIZE:
+            return rows
+    raise PaginationError(
+        f"GET {path} has more than {MAX_PAGES * PAGE_SIZE} entries; "
+        "the list was not read to its end"
+    )
+
+
 class ChecksVerdict(NamedTuple):
     """Every check run and commit status on a head commit, folded to one
     answer.
@@ -376,20 +426,37 @@ def anchor_of(comment: ReviewComment) -> str:
     return f"{comment.path}:{comment.line}"
 
 
+def _review_threads_connection(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    nodes = (((payload.get("data") or {}).get("repository") or {}).get("pullRequest") or {}).get(
+        "reviewThreads"
+    )
+    return nodes if isinstance(nodes, dict) else {}
+
+
+def review_threads_next_cursor(payload: Any) -> str | None:
+    """The cursor of the page after this one, or ``None`` on the last."""
+    info = _review_threads_connection(payload).get("pageInfo")
+    if not isinstance(info, dict) or not info.get("hasNextPage"):
+        return None
+    cursor = info.get("endCursor")
+    return str(cursor) if cursor else None
+
+
 def fold_review_threads(payload: Any) -> list[ReviewThread]:
-    """The GraphQL ``pullRequest.reviewThreads`` page folded to typed rows.
+    """One GraphQL ``pullRequest.reviewThreads`` page folded to typed rows.
 
     Malformed nodes are skipped rather than raising: a thread the API
     describes in a shape we do not understand must not take down the
-    reconciliation pass that was going to leave it alone anyway.
+    reconciliation pass that was going to leave it alone anyway. A thread
+    whose comments connection has a further page is different — it is
+    understood and *incomplete*, and a reply the loop did not see may be
+    the one that answers or reopens it — so that raises
+    :class:`PaginationError` naming the thread (#614).
     """
     threads: list[ReviewThread] = []
-    if not isinstance(payload, dict):
-        return threads
-    nodes = (((payload.get("data") or {}).get("repository") or {}).get("pullRequest") or {}).get(
-        "reviewThreads"
-    ) or {}
-    entries = nodes.get("nodes") if isinstance(nodes, dict) else None
+    entries = _review_threads_connection(payload).get("nodes")
     for node in entries if isinstance(entries, list) else []:
         if not isinstance(node, dict):
             continue
@@ -398,7 +465,15 @@ def fold_review_threads(payload: Any) -> list[ReviewThread]:
             continue
         raw_line = node.get("line")
         comments: list[ThreadComment] = []
-        comment_nodes = (node.get("comments") or {}).get("nodes")
+        connection = node.get("comments") or {}
+        info = connection.get("pageInfo") if isinstance(connection, dict) else None
+        if isinstance(info, dict) and info.get("hasNextPage"):
+            anchor = f"{node.get('path') or '?'}:{raw_line if raw_line is not None else '?'}"
+            raise PaginationError(
+                f"review thread {anchor} ({node_id}) has more comments than were read; "
+                "it cannot be judged reconciled"
+            )
+        comment_nodes = connection.get("nodes") if isinstance(connection, dict) else None
         for comment in comment_nodes if isinstance(comment_nodes, list) else []:
             if not isinstance(comment, dict):
                 continue
@@ -529,14 +604,22 @@ class GithubOps:
         verdict (#610). "No CI" means both lists empty — a repository
         reporting only through the Status API is not a repository without
         CI, and its red must not read as green."""
-        runs = fold_check_runs(self.raw("GET", f"/repos/{repo}/commits/{sha}/check-runs"))
-        statuses = fold_statuses(self.raw("GET", f"/repos/{repo}/commits/{sha}/status"))
+        runs = fold_check_runs(
+            {
+                "check_runs": raw_pages(
+                    self, f"/repos/{repo}/commits/{sha}/check-runs", key="check_runs"
+                )
+            }
+        )
+        statuses = fold_statuses(
+            {"statuses": raw_pages(self, f"/repos/{repo}/commits/{sha}/status", key="statuses")}
+        )
         return runs.merge(statuses)
 
     def pr_review_state(self, repo: str, number: int, *, login: str | None = None) -> str:
         """``APPROVED`` / ``CHANGES_REQUESTED`` / ``NONE`` — each reviewer's
         latest verdict only. ``login`` narrows it to one reviewer."""
-        return fold_reviews(self.raw("GET", f"/repos/{repo}/pulls/{number}/reviews"), login=login)
+        return fold_reviews(raw_pages(self, f"/repos/{repo}/pulls/{number}/reviews"), login=login)
 
     def checks_failed_logs(
         self, repo: str, sha: str, *, max_chars: int = 6000
@@ -591,9 +674,9 @@ class GithubOps:
         def login_of(entry: dict[str, Any]) -> str:
             return str((entry.get("user") or {}).get("login") or "")
 
-        reviews = self.raw("GET", f"/repos/{repo}/pulls/{number}/reviews")
+        reviews = raw_pages(self, f"/repos/{repo}/pulls/{number}/reviews")
         latest: dict[str, dict[str, Any]] = {}
-        for review in reviews if isinstance(reviews, list) else []:
+        for review in reviews:
             if not isinstance(review, dict):
                 continue
             login = login_of(review)
@@ -609,8 +692,8 @@ class GithubOps:
             body = str(review.get("body") or "").strip()
             if body:
                 parts.append(body)
-        comments = self.raw("GET", f"/repos/{repo}/pulls/{number}/comments")
-        for comment in comments if isinstance(comments, list) else []:
+        comments = raw_pages(self, f"/repos/{repo}/pulls/{number}/comments")
+        for comment in comments:
             if not isinstance(comment, dict):
                 continue
             if exclude_login is not None and logins_match(login_of(comment), exclude_login):
@@ -697,12 +780,12 @@ class GithubOps:
         if review_id is None:
             return tuple(PostedFinding(anchor) for anchor in wanted)
         try:
-            data = self.raw("GET", f"/repos/{repo}/pulls/{number}/reviews/{review_id}/comments")
+            data = raw_pages(self, f"/repos/{repo}/pulls/{number}/reviews/{review_id}/comments")
         except GithubOpsError as exc:
             log.warning("gh.review_comments_read_failed", repo=repo, pr=number, error=str(exc))
             return tuple(PostedFinding(anchor) for anchor in wanted)
         by_anchor: dict[str, int] = {}
-        for entry in data if isinstance(data, list) else []:
+        for entry in data:
             if not isinstance(entry, dict):
                 continue
             comment_id = entry.get("id")
@@ -816,11 +899,18 @@ class GithubOps:
     # "the fix round addressed it" into something a human reading the PR can
     # see. These are the only GitHub writes that touch an existing thread.
 
+    # One page of threads per call, walked by cursor (#614). A thread's
+    # own comments are read at the connection's maximum and refused
+    # beyond it (`fold_review_threads`): a thread whose replies were not
+    # all read cannot be judged answered or not.
     _THREADS_QUERY = (
-        "query($owner: String!, $name: String!, $number: Int!) { "
+        "query($owner: String!, $name: String!, $number: Int!, $cursor: String) { "
         "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
-        "reviewThreads(first: 100) { nodes { id isResolved path line "
-        "comments(first: 50) { nodes { databaseId body author { login } } } } } } } }"
+        "reviewThreads(first: 100, after: $cursor) { "
+        "pageInfo { hasNextPage endCursor } "
+        "nodes { id isResolved path line "
+        "comments(first: 100) { pageInfo { hasNextPage } "
+        "nodes { databaseId body author { login } } } } } } } }"
     )
 
     _RESOLVE_MUTATION = (
@@ -864,22 +954,33 @@ class GithubOps:
         return bool(thread["isResolved"])
 
     def pr_review_threads(self, repo: str, number: int) -> list[ReviewThread]:
-        """Every inline review thread on the PR, with its replies."""
+        """Every inline review thread on the PR, with its replies, across
+        every page of the connection (#614)."""
         owner, _, name = repo.partition("/")
-        data = self.raw(
-            "POST",
-            "/graphql",
-            {
-                "query": self._THREADS_QUERY,
-                "variables": {"owner": owner, "name": name, "number": number},
-            },
+        threads: list[ReviewThread] = []
+        cursor: str | None = None
+        for _ in range(MAX_PAGES):
+            data = self.raw(
+                "POST",
+                "/graphql",
+                {
+                    "query": self._THREADS_QUERY,
+                    "variables": {"owner": owner, "name": name, "number": number, "cursor": cursor},
+                },
+            )
+            if not isinstance(data, dict):
+                raise GithubOpsError(f"reviewThreads returned a malformed result: {data!r}")
+            errors = data.get("errors")
+            if errors:
+                raise GithubOpsError(f"reviewThreads failed: {errors!r}")
+            threads.extend(fold_review_threads(data))
+            cursor = review_threads_next_cursor(data)
+            if cursor is None:
+                return threads
+        raise PaginationError(
+            f"{repo}#{number} has more than {MAX_PAGES * 100} review threads; "
+            "the list was not read to its end"
         )
-        if not isinstance(data, dict):
-            raise GithubOpsError(f"reviewThreads returned a malformed result: {data!r}")
-        errors = data.get("errors")
-        if errors:
-            raise GithubOpsError(f"reviewThreads failed: {errors!r}")
-        return fold_review_threads(data)
 
     # -- landing a pull request ---------------------------------------------
     #

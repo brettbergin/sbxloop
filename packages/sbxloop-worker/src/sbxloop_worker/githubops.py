@@ -489,6 +489,27 @@ def _check_output_excerpt(run: dict[str, Any]) -> str:
     return "\n\n".join(part for part in parts if part)
 
 
+# Mirrors the host's `raw_pages` (#614): the worker cannot import sbxloop.
+_PAGE_SIZE = 100
+_MAX_PAGES = 10
+
+
+def _list_pages(t: Transport, path: str, key: str) -> list[Any]:
+    """Every entry of ``key`` across the pages of an enveloped list
+    endpoint; refuses a list longer than ``_MAX_PAGES`` full pages rather
+    than returning a prefix of it."""
+    rows: list[Any] = []
+    for page in range(1, _MAX_PAGES + 1):
+        data = t.request("GET", f"{path}?per_page={_PAGE_SIZE}&page={page}")
+        entries = data.get(key) if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return rows
+        rows.extend(entries)
+        if len(entries) < _PAGE_SIZE:
+            return rows
+    raise GithubOpError(f"GET {path} has more than {_MAX_PAGES * _PAGE_SIZE} entries")
+
+
 def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
     """The failing check runs and commit statuses on a commit, each with the
     text that explains it.
@@ -508,10 +529,9 @@ def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
     max_chars = int(p.get("max_chars") or DEFAULT_LOG_CHARS)
     head = min(LOG_HEAD_CHARS, max_chars)
     tail = max_chars - head
-    data = t.request("GET", f"/repos/{repo}/commits/{sha}/check-runs")
-    runs = data.get("check_runs") if isinstance(data, dict) else None
+    runs = _list_pages(t, f"/repos/{repo}/commits/{sha}/check-runs", "check_runs")
     checks: list[dict[str, Any]] = []
-    for run in runs if isinstance(runs, list) else []:
+    for run in runs:
         if not isinstance(run, dict):
             continue
         conclusion = run.get("conclusion")
@@ -534,9 +554,7 @@ def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
                 "excerpt": _clip_head_tail(excerpt, head, tail),
             }
         )
-    combined = t.request("GET", f"/repos/{repo}/commits/{sha}/status")
-    statuses = combined.get("statuses") if isinstance(combined, dict) else None
-    for status in statuses if isinstance(statuses, list) else []:
+    for status in _list_pages(t, f"/repos/{repo}/commits/{sha}/status", "statuses"):
         if not isinstance(status, dict):
             continue
         state = str(status.get("state") or "").lower()
