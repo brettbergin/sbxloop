@@ -772,18 +772,26 @@ class LoopEngine:
         if github is not None and pair.github is not None:
             clients.append((pair.github.name, github))
         for name, client in clients:
-            message = (
-                "prebaked worker verified; install skipped"
-                if client.prebaked
-                else "template not prebaked or stale; ran the install ladder "
-                "(re-run `sbxloop bake` to refresh)"
-            )
+            if not client.prebaked:
+                message = (
+                    "template not prebaked or stale; ran the install ladder "
+                    "(re-run `sbxloop bake` to refresh)"
+                )
+            elif client.prebake_topup:
+                message = (
+                    "prebaked worker verified; template lacked "
+                    f"{', '.join(client.prebake_topup)} for this run's languages — "
+                    "provisioned on top (re-run `sbxloop bake` with them configured)"
+                )
+            else:
+                message = "prebaked worker verified; install skipped"
             self.bus.emit(
                 HostEventTypes.SANDBOX_PREBAKED,
                 run_id,
                 name=name,
                 template=self.config.sandbox.template,
                 prebaked=client.prebaked,
+                topped_up=list(client.prebake_topup),
                 message=message,
             )
 

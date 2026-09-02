@@ -892,7 +892,13 @@ class TestDoctor:
         assert "FAIL" in result.output
 
     def _bake_record(
-        self, workdir: Path, *, worker_version: str, ref: str, git: bool | None = None
+        self,
+        workdir: Path,
+        *,
+        worker_version: str,
+        ref: str,
+        git: bool | None = None,
+        languages: list[str] | None = None,
     ) -> None:
         state = workdir / ".sbxloop"
         state.mkdir(exist_ok=True)
@@ -905,7 +911,50 @@ class TestDoctor:
         }
         if git is not None:
             record["git"] = git
+        if languages is not None:
+            record["languages"] = languages
         (state / "bake.json").write_text(json.dumps(record))
+
+    def _languages_row(
+        self,
+        workdir: Path,
+        fake_sbx: FakeSbx,
+        baked: list[str] | None,
+        configured: list[str] | None = None,
+    ) -> Check:
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        self._bake_record(
+            workdir, worker_version=sbxloop.__version__, ref="sbxloop-baked:latest", languages=baked
+        )
+        env = {"COPILOT_GITHUB_TOKEN": "tok", "SBXLOOP_SANDBOX__TEMPLATE": "sbxloop-baked:latest"}
+        if configured is not None:
+            env["SBXLOOP_SANDBOX__LANGUAGES"] = json.dumps(configured)
+        checks = collect_checks(env, cli=SbxCLI(binary=str(fake_sbx.binary)))
+        return {c.name: c for c in checks}["languages in template"]
+
+    def test_doctor_languages_in_template_cover_the_config(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # #615: the template was baked for what [sandbox] languages asks for.
+        row = self._languages_row(workdir, fake_sbx, baked=["python"])
+        assert row.ok and "baked with python" in row.detail
+
+    def test_doctor_languages_in_template_lacking_one_is_soft_warn(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # A run tops the missing toolchain up per provision: slower, not lost.
+        row = self._languages_row(workdir, fake_sbx, baked=["python"], configured=["python", "go"])
+        assert not row.ok and not row.hard
+        assert "also wants go" in row.detail and "sbxloop bake" in row.detail
+
+    def test_doctor_languages_in_template_unrecorded_by_older_bake(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        row = self._languages_row(workdir, fake_sbx, baked=None)
+        assert row.ok and not row.hard
+        assert "not recorded" in row.detail
 
     def _git_row(self, workdir: Path, fake_sbx: FakeSbx, git: bool | None) -> Check:
         from sbxloop.cli.doctor import collect_checks

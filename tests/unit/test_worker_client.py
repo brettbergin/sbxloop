@@ -78,6 +78,23 @@ def script_git_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> None:
     fake_sbx.script(f"exec boxa sh -c {toolchains.GIT.probe}", returncode=returncode)
 
 
+def script_toolchain_probe_batch(
+    fake_sbx: FakeSbx,
+    *,
+    missing: list[str] | None = None,
+    returncode: int = 0,
+    stderr: str = "",
+) -> None:
+    """Script the prebaked path's batched toolchain probe (#615) to name
+    ``missing``. Unscripted it runs every selected probe on the host."""
+    fake_sbx.script(
+        "exec boxa sh -c : sbxloop-toolchain-probe",
+        returncode=returncode,
+        stdout="".join(f"{name}\n" for name in missing or []),
+        stderr=stderr,
+    )
+
+
 def script_probes_for(fake_sbx: FakeSbx, languages: list[str], *, returncode: int = 1) -> None:
     """Script every probe a ``languages`` selection will run, requirements
     included — the safe way to set up a test that passes ``languages=``."""
@@ -958,15 +975,24 @@ class TestPrebakedTemplate:
     """expect_prebaked: verify the baked worker with fast probes and skip the
     install ladder; ANY probe failure degrades to the ladder, never the run."""
 
-    def write_manifest(self, sandbox: Sandbox, *, python: str, version: str | None = None) -> None:
+    def write_manifest(
+        self,
+        sandbox: Sandbox,
+        *,
+        python: str,
+        version: str | None = None,
+        languages: list[str] | None = None,
+    ) -> None:
         import sbxloop
 
-        manifest = {
+        manifest: dict[str, object] = {
             "worker_version": version or sbxloop.__version__,
             "python": python,
             "runtime_cached": True,
             "baked_at": 0.0,
         }
+        if languages is not None:
+            manifest["languages"] = languages
         sandbox.write_text("/home/agent/.sbxloop/bake.json", json.dumps(manifest))
 
     def test_verified_prebaked_skips_ladder(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
@@ -974,6 +1000,7 @@ class TestPrebakedTemplate:
         entrypoint smoke all run genuinely (sys.executable has the worker
         importable) — no scripting, no ladder invocations."""
         self.write_manifest(sandbox, python=sys.executable)
+        script_toolchain_probe_batch(fake_sbx, missing=[])
         client = make_client(sandbox, EventBus(), python="python3")
         client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
 
@@ -983,101 +1010,130 @@ class TestPrebakedTemplate:
         assert not [j for j in joined if "-m venv" in j or "pip install" in j or "apt-get" in j]
         # no wheel was staged either — the fast path never resolves one
         assert not [c for c in fake_sbx.invocations("cp") if any(".whl" in a for a in c)]
-        # the whole verification is ONE exec round trip (#127): manifest
-        # read, import check, and entrypoint smoke run inside one script
-        assert len(fake_sbx.invocations("exec")) == 1
-        # (the host has git, so the probe reported it and no top-up ran)
-        assert client._prebake_missing == []
+        # two exec round trips (#127): the worker verification (manifest
+        # read, import check, entrypoint smoke in one script) and the
+        # batched toolchain probe for this run's languages (#615)
+        assert len(fake_sbx.invocations("exec")) == 2
+        assert client.prebake_topup == []
+
+    def test_toolchain_probe_covers_git_and_the_selected_languages(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
+    ) -> None:
+        """One `sh -c` carries every selected toolchain's own probe (#615),
+        baseline git included (#252), and prints the names that fail."""
+        self.write_manifest(sandbox, python=sys.executable)
+        script_toolchain_probe_batch(fake_sbx, missing=[])
+        client = make_client(sandbox, EventBus(), python="python3")
+        client.install(
+            extras="copilot", ensure_dev_tools=True, expect_prebaked=True, languages=["go"]
+        )
+        (probe,) = [
+            c[-1] for c in fake_sbx.invocations("exec") if "sbxloop-toolchain-probe" in c[-1]
+        ]
+        assert f"( {toolchains.GIT.probe} ) >/dev/null 2>&1 || printf '%s\\n' git" in probe
+        assert f"( {toolchains.GO.probe} ) >/dev/null 2>&1 || printf '%s\\n' go" in probe
+        assert "python" not in probe.split("||")[-1]  # go, not the default set
+
+    def test_toolchain_probe_runs_the_real_probes(self, sandbox: Sandbox) -> None:
+        """Unscripted, the batched probe genuinely runs each toolchain's
+        snippet and names the absent ones — here against a PATH-less
+        shell where nothing resolves except the shell itself."""
+        client = make_client(sandbox, EventBus())
+        present = toolchains.Toolchain(name="sh", wanted="sh", probe="command -v sh >/dev/null")
+        absent = toolchains.Toolchain(name="nope", wanted="nope", probe="command -v sbxloop-nope")
+        assert client.missing_toolchains([present, absent]) == [absent]
+        assert client.missing_toolchains([]) == []
 
     def test_verified_prebaked_without_git_tops_up_baseline(
-        self,
-        sandbox: Sandbox,
-        fake_sbx: FakeSbx,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
     ) -> None:
         """A template that passes every worker check but lacks git (#252):
-        the ONE prebake probe reports it, and install() apt-installs git
-        without falling back to the ladder or spending another probe.
-
-        The fake exec runs on the host, so "no git on PATH" is staged with a
-        PATH holding only a python3 shim (a script, not a symlink — a
-        symlinked venv python would resolve its prefix from the link)."""
-        shim_dir = tmp_path / "shim-bin"
-        shim_dir.mkdir()
-        shim = shim_dir / "python3"
-        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-        shim.chmod(0o755)
-        monkeypatch.setenv("PATH", str(shim_dir))
+        the batched probe reports it, and install() apt-installs git
+        without falling back to the ladder or probing tool by tool."""
         self.write_manifest(sandbox, python=sys.executable)
+        script_toolchain_probe_batch(fake_sbx, missing=["git"])
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
         client = make_client(sandbox, EventBus(), python="python3")
         client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
 
         assert client.prebaked
-        assert client._prebake_missing == [toolchains.GIT]
+        assert client.prebake_topup == ["git"]
         joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
         assert not [j for j in joined if "-m venv" in j or "pip install" in j]
-        assert joined[1:] == [
+        assert joined[2:] == [
             "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
         ]
 
-    @pytest.mark.parametrize(
-        "verdict",
-        [
-            pytest.param({"stage": "ok"}, id="git-absent"),
-            pytest.param({"stage": "ok", "git": "yes"}, id="git-non-boolean"),
-        ],
-    )
-    def test_verified_prebaked_with_malformed_git_verdict_tops_up(
-        self,
-        sandbox: Sandbox,
-        fake_sbx: FakeSbx,
-        monkeypatch: pytest.MonkeyPatch,
-        verdict: dict[str, object],
+    def test_verified_prebaked_tops_up_a_language_the_bake_lacked(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Fail closed (#252): an otherwise-successful "ok" verdict whose
-        ``git`` field is absent or not a bool must NOT be read as "git
-        present" — the apt top-up runs, and the fast path is still taken (no
-        ladder). The real probe always emits a bool, so the malformed verdict
-        is staged by swapping the probe script for one that prints it as-is.
-        """
-        from sbxloop.worker import client as client_mod
-
-        verdict = {**verdict, "python": sys.executable}
-        monkeypatch.setattr(client_mod, "_PREBAKE_PROBE", f"print({json.dumps(verdict)!r})")
+        """#615: a template baked for Python, a run resolved to Go. The
+        worker is verified and kept; Go is provisioned on top exactly as
+        the ladder would have, and the top-up is named."""
         self.write_manifest(sandbox, python=sys.executable)
+        script_toolchain_probe_batch(fake_sbx, missing=["go"])
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e", returncode=0)
         client = make_client(sandbox, EventBus(), python="python3")
-        client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
+        with caplog.at_level("INFO"):
+            client.install(
+                extras="copilot", ensure_dev_tools=True, expect_prebaked=True, languages=["go"]
+            )
 
         assert client.prebaked
-        assert client._prebake_missing == [toolchains.GIT]
+        assert client.prebake_topup == ["go"]
         joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
         assert not [j for j in joined if "-m venv" in j or "pip install" in j]
-        assert joined[1:] == [
+        assert any(
+            f"apt-get install -y -q {' '.join(toolchains.GO.apt_packages)}" in j for j in joined
+        )
+        assert toolchains.GO.install_script is not None
+        assert f"exec boxa sh -c {toolchains.GO.install_script}" in joined
+        topup = [r for r in caplog.records if "worker.prebake_topup" in r.getMessage()]
+        assert topup and "'added': ['go']" in topup[0].getMessage()
+
+    def test_unanswerable_toolchain_probe_falls_back_to_per_tool_probes(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Fail closed (#615): a batched probe that cannot run is not "all
+        present" — the ladder's own per-tool probes decide instead, and
+        the run still takes the fast path for the worker."""
+        self.write_manifest(sandbox, python=sys.executable)
+        script_toolchain_probe_batch(fake_sbx, returncode=127, stderr="sh: not found")
+        script_git_probe(fake_sbx, returncode=1)
+        script_toolchain_probe(fake_sbx, "python", returncode=0)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        client = make_client(sandbox, EventBus(), python="python3")
+        with caplog.at_level("WARNING"):
+            client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
+
+        assert client.prebaked
+        assert any("worker.toolchain_probe_failed" in r.getMessage() for r in caplog.records)
+        joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j]
+        assert joined[-1] == (
             "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
-        ]
+        )
+
+    def test_verified_prebaked_logs_the_baked_languages(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self.write_manifest(sandbox, python=sys.executable, languages=["python", "go"])
+        script_toolchain_probe_batch(fake_sbx, missing=[])
+        client = make_client(sandbox, EventBus(), python="python3")
+        with caplog.at_level("INFO"):
+            client.install(extras="copilot", ensure_dev_tools=True, expect_prebaked=True)
+        verified = [r for r in caplog.records if "worker.prebake_verified" in r.getMessage()]
+        assert verified and "'languages': ['python', 'go']" in verified[0].getMessage()
 
     def test_verified_prebaked_without_git_skips_top_up_for_non_agent(
-        self,
-        sandbox: Sandbox,
-        fake_sbx: FakeSbx,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
     ) -> None:
-        # The github sandbox only runs API ops: same missing-git verdict,
-        # but without ensure_dev_tools nothing is installed.
-        shim_dir = tmp_path / "shim-bin"
-        shim_dir.mkdir()
-        shim = shim_dir / "python3"
-        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-        shim.chmod(0o755)
-        monkeypatch.setenv("PATH", str(shim_dir))
+        # The github sandbox only runs API ops: without ensure_dev_tools
+        # nothing is probed beyond the worker and nothing is installed.
         self.write_manifest(sandbox, python=sys.executable)
         client = make_client(sandbox, EventBus(), python="python3")
         client.install(extras="", expect_prebaked=True)
-
         assert client.prebaked
         assert len(fake_sbx.invocations("exec")) == 1
 

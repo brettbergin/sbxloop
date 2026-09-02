@@ -67,13 +67,13 @@ _SMOKE_BASE = "/tmp/sbxloop-smoke"  # nosec B108 - path inside the sandbox VM, n
 # the install ladder, same as any other probe failure). argv:
 # manifest_path expected_version default_python smoke_base. Emits exactly one
 # JSON verdict line on stdout; the host maps stages onto the same decisions
-# and log messages the serial probes produced. The "ok" verdict also reports
-# whether the baseline tooling (git, #252) is on PATH: a template baked before
-# git joined the baseline passes every worker check and would otherwise skip
-# the ensure that installs it, so the host tops it up from this one answer
-# instead of paying a separate probe round trip.
+# and log messages the serial probes produced. The "ok" verdict carries the
+# language set the bake recorded (#615) so the log can say what the template
+# was built for; what is actually on PATH is answered by the toolchain probe
+# that follows (_toolchain_probe), which covers git (#252) and every selected
+# language alike.
 _PREBAKE_PROBE = """\
-import json, shutil, subprocess, sys
+import json, subprocess, sys
 
 manifest_path, expected, default_python, smoke_base = sys.argv[1:5]
 
@@ -129,8 +129,23 @@ smoke = run(
 )
 if smoke is None or smoke.returncode != 64:
     emit("smoke-failed", rc=smoke.returncode if smoke else -1, output=tail(smoke))
-emit("ok", python=python, git=shutil.which("git") is not None)
+emit("ok", python=python, languages=manifest.get("languages"))
 """
+
+# The batched toolchain presence probe: every selected toolchain's own probe
+# in one `sh -c`, printing the names of the ones that fail. One exec round
+# trip whatever the size of the set — round trips are the cost (#127) — and
+# the same probes the install ladder runs one by one. The leading no-op is a
+# stable prefix for tests to script the answer by.
+_TOOLCHAIN_PROBE_MARK = ": sbxloop-toolchain-probe"
+
+
+def _toolchain_probe(selected: Sequence[toolchains.Toolchain]) -> str:
+    parts = [_TOOLCHAIN_PROBE_MARK]
+    for toolchain in selected:
+        parts.append(f"( {toolchain.probe} ) >/dev/null 2>&1 || printf '%s\\n' {toolchain.name}")
+    return "; ".join(parts)
+
 
 log = get_logger(__name__)
 
@@ -167,9 +182,10 @@ class WorkerClient:
         # Set by install(): True when a prebaked template carried a working
         # worker and the install ladder was skipped entirely.
         self.prebaked = False
-        # Baseline tools the prebake probe found absent (see _PREBAKE_PROBE);
-        # install() tops them up after a successful verification.
-        self._prebake_missing: list[toolchains.Toolchain] = []
+        # Names of the toolchains a verified template lacked and install()
+        # provisioned on top of it (#615) — what the sandbox.prebaked event
+        # and doctor's advice are built from.
+        self.prebake_topup: list[str] = []
         # Sandbox role for enriching resource telemetry (the worker doesn't
         # know which sandbox it lives in), and guardrail thresholds to pass
         # through to the worker's heartbeat sampler.
@@ -254,8 +270,8 @@ class WorkerClient:
         )
         if expect_prebaked and self._verify_prebaked():
             self.prebaked = True
-            if ensure_dev_tools and self._prebake_missing:
-                self._provision_toolchains(self._prebake_missing, timeout)
+            if ensure_dev_tools:
+                self._top_up_prebaked(timeout, languages)
             self._ensure_backend_runtime(extras, timeout)
             log.info(
                 "worker.installed",
@@ -455,18 +471,74 @@ class WorkerClient:
             )
             return False
         self.python = python
-        # Fail closed: anything but an explicit True costs one best-effort
-        # apt call, whereas trusting a malformed answer leaves the agent
-        # without git for the whole run (#252).
-        self._prebake_missing = [] if verdict.get("git") is True else [toolchains.GIT]
+        baked = verdict.get("languages")
         log.info(
             "worker.prebake_verified",
             sandbox=self.sandbox.name,
             version=sbxloop.__version__,
             python=python,
-            git=verdict.get("git") is True,
+            languages=baked if isinstance(baked, list) else None,
         )
         return True
+
+    def missing_toolchains(
+        self, selected: Sequence[toolchains.Toolchain]
+    ) -> list[toolchains.Toolchain] | None:
+        """Which of ``selected`` are absent from the sandbox, probed in one
+        exec round trip; None when the probe itself could not run, which
+        the caller must not read as "all present"."""
+        if not selected:
+            return []
+        try:
+            result = self.sandbox.exec(["sh", "-c", _toolchain_probe(selected)])
+        except SbxError as exc:
+            log.warning("worker.toolchain_probe_failed", sandbox=self.sandbox.name, error=str(exc))
+            return None
+        if not result.ok:
+            log.warning(
+                "worker.toolchain_probe_failed",
+                sandbox=self.sandbox.name,
+                rc=result.returncode,
+                output=_output_tail(result),
+            )
+            return None
+        absent = set(result.stdout.split())
+        return [tc for tc in selected if tc.name in absent]
+
+    def _top_up_prebaked(self, timeout: float, languages: Sequence[str]) -> None:
+        """Make a verified template dev-ready for THIS run's languages (#615).
+
+        A template is baked for one language set — the config's, at bake
+        time — and a run may resolve another (a workspace that turned out
+        to be Go, a config edited since). The template used to be trusted
+        wholesale: the run logged its worker verified and the agent met
+        `go: command not found` on turn one. Now the full selected set is
+        probed in one round trip and whatever is missing is provisioned
+        exactly as the install ladder would have, named in
+        ``worker.prebake_topup`` so an operator knows the bake is behind.
+        A probe that cannot answer degrades to the ladder's own per-tool
+        probes: never proceed silently without a toolchain.
+        """
+        selected = (
+            *toolchains.BASELINE_TOOLS,
+            *toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES),
+        )
+        missing = self.missing_toolchains(selected)
+        if missing is None:
+            self._ensure_dev_tools(timeout, languages)
+            return
+        if not missing:
+            log.debug("worker.dev_tools_present", sandbox=self.sandbox.name)
+            return
+        self.prebake_topup = [tc.name for tc in missing]
+        log.info(
+            "worker.prebake_topup",
+            sandbox=self.sandbox.name,
+            added=self.prebake_topup,
+            hint="the template was baked for a different language set; re-run "
+            "`sbxloop bake` to stop paying this on every provision",
+        )
+        self._provision_toolchains(missing, timeout)
 
     def _ensure_backend_runtime(self, extras: str, timeout: float) -> None:
         """The chosen agent backend's in-sandbox runtime, probe-first (#533).
