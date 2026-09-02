@@ -195,6 +195,11 @@ class HostEventTypes:
     # Landing answered human threads nothing else in the pipeline would
     # ever speak to (`pr`, `acked`) — the reply is the not-silent part.
     LAND_HUMAN_ACK = "land.human_ack"
+    # The ack pass hit ACK_CAP; the rest block truthfully (#613).
+    LAND_HUMAN_ACK_CAPPED = "land.human_ack_capped"
+    # An automated reviewer's changes-requested review stands past its one
+    # fix round; the landing goes on and names it (#613).
+    LAND_BOT_STANDING = "land.bot_standing"
     RUN_MERGED = "run.merged"
     # The opt-in merge gate parked the run: every bar cleared, the merge
     # awaiting one human approval (`pr`, `url`, `sha`, `review_rounds`,

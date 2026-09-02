@@ -88,7 +88,7 @@ Phase = Literal["decompose", "build", "verify", "gate", "review", "steer", "foll
 # What a fix round is for. `review` rounds are charged to the review budget;
 # everything else — a red gate, red CI, a base conflict, a human objecting on
 # the PR — to the CI budget, because those are the rounds red CI would cost.
-FixKind = Literal["review", "gate", "ci", "conflict", "human"]
+FixKind = Literal["review", "gate", "ci", "conflict", "human", "bot"]
 
 
 class _Model(BaseModel):

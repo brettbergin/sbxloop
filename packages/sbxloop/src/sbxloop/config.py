@@ -652,6 +652,12 @@ class LandingConfig(_ConfigModel):
     explicit gating set; ``ignore_checks`` (fnmatch patterns) drops checks
     from the judgment altogether. A regression on a non-gating check gets
     one fix round; still red after that, it is merged over and named.
+
+    The same principle covers reviewers (#613): a changes-requested review
+    from a GitHub App — or a User-type account listed in
+    ``ignore_reviewers`` — buys one fix round, after which it is merged
+    over and named, because a bot never dismisses its review. A person's
+    changes-requested review keeps its full authority.
     """
 
     deliver_draft: bool = True
@@ -675,6 +681,9 @@ class LandingConfig(_ConfigModel):
     # than let the base's protection answer; and the ones never judged.
     required_checks: list[str] = Field(default_factory=list)
     ignore_checks: list[str] = Field(default_factory=list)
+    # User-type accounts to treat as automated reviewers (#613): a bot
+    # that reviews from a personal token. GitHub Apps need no listing.
+    ignore_reviewers: list[str] = Field(default_factory=list)
     # What becomes of the review's out-of-scope notes and the fix rounds'
     # deferred findings once the PR merges (#517): filed as issues on the
     # repository with `followup_label` — never the trigger label, a human

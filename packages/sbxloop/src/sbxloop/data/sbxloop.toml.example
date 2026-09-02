@@ -171,6 +171,7 @@ secret_strategy = "proxy"
 # merge_update_attempts = 3  # update-branch calls when protection wants "up to date"
 # required_checks = []       # the checks that gate the merge; empty = what the base's protection declares, else all
 # ignore_checks = []         # fnmatch patterns never waited on, fixed or reported, e.g. ["codecov/*"]
+# ignore_reviewers = []      # User-type logins treated as automated reviewers (a bot on a personal token): one fix round, never a block
 # followups = "issues"       # after the merge, the review's out-of-scope notes: issues | comment | off
 # followup_label = "sbxloop:follow-up"  # never the trigger label — a human promotes a follow-up
 # max_followups_per_run = 5

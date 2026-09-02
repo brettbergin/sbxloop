@@ -407,6 +407,36 @@ class TestReviewThreadListing:
         assert threads[0].anchor == "a.py"
         assert threads[0].line is None
 
+    def test_fold_carries_whether_each_author_is_an_app(self) -> None:
+        """GraphQL spells it ``author.__typename == "Bot"``; the fold keeps
+        it per comment so landing can tell a bot's thread from a person's
+        (#613) without a second lookup (#622)."""
+        node = thread_node("PRRT_1", "a.py", 3, 5)
+        node["comments"]["nodes"] = [
+            {
+                "databaseId": 5,
+                "body": "nit",
+                "author": {"login": "coderabbitai", "__typename": "Bot"},
+            },
+            {"databaseId": 6, "body": "why?", "author": {"login": "alice", "__typename": "User"}},
+            {"databaseId": 7, "body": "old shape", "author": {"login": "bob"}},
+        ]
+        (folded,) = fold_review_threads(threads_payload(node))
+        assert [(c.login, c.is_bot) for c in folded.comments] == [
+            ("coderabbitai", True),
+            ("alice", False),
+            ("bob", False),
+        ]
+        assert folded.opened_by_bot
+
+    def test_the_query_asks_for_the_author_type(self) -> None:
+        assert "author { login __typename }" in GithubOps._THREADS_QUERY
+
+    def test_a_thread_a_person_opened_is_not_a_bots(self) -> None:
+        opened = ReviewThread("PRRT_1", False, "a.py", 1, (ThreadComment(1, "alice", "x"),))
+        assert not opened.opened_by_bot
+        assert not ReviewThread("PRRT_2", False, "a.py", 1, ()).opened_by_bot
+
 
 class TestFakeGithubModelsThreads:
     def test_fake_captures_resolves_and_replies(self) -> None:

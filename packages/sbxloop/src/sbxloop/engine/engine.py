@@ -1133,7 +1133,7 @@ class LoopEngine:
                 if isinstance(result, Blocked):
                     return "blocked", result.why
                 if isinstance(result, NeedsFix):
-                    if self._advisory_round_unaffordable(p, result.checks):
+                    if self._automated_round_unaffordable(p, result):
                         stage = "landing"
                         continue
                     reason = self._fix_round(
@@ -1160,7 +1160,7 @@ class LoopEngine:
                     return "blocked", outcome.why
                 if isinstance(outcome, Closed):
                     return "failed", outcome.why
-                if self._advisory_round_unaffordable(p, outcome.checks):
+                if self._automated_round_unaffordable(p, outcome):
                     continue
                 reason = self._fix_round(
                     p,
@@ -2213,6 +2213,8 @@ class LoopEngine:
             for name in checks.fix:
                 if name not in checks.gating:
                     self.store.record_advisory_round(run_id, name)
+        if kind == "bot":
+            self.store.record_bot_round(run_id)
         tasks = self.store.get_tasks(run_id)
         round_no = 1 + sum(1 for t in tasks if is_fix_task(t.spec.id))
         verify_commands = [
@@ -2271,23 +2273,30 @@ class LoopEngine:
         self._announce_roster(run_id, self.store.get_tasks(run_id))
         return self._drive_fix_task(p, task)
 
-    def _advisory_round_unaffordable(self, p: Pipeline, checks: CheckJudgment | None) -> bool:
-        """A CI fix that is nothing but advisory regressions, with no CI
-        round left to spend on it (#611): a check the base does not
-        require must never end a run, so it is recorded as spent and the
-        landing goes on to merge over it, named."""
-        if checks is None or not checks.advisory_only:
+    def _automated_round_unaffordable(self, p: Pipeline, fix: NeedsFix) -> bool:
+        """A fix round that only a machine asked for, with no CI round left
+        to spend on it: advisory check regressions (#611) or an automated
+        reviewer's objection (#613). A non-human signal must never end a
+        run, so the round is recorded as spent and the landing goes on to
+        merge over it, named."""
+        checks = fix.checks
+        advisory = checks is not None and checks.advisory_only
+        if not advisory and fix.kind != "bot":
             return False
         run = self.store.get_run(p.run_id)
         if run.ci_rounds < self.config.landing.max_ci_rounds + run.granted_rounds:
             return False
-        for name in checks.fix:
-            self.store.record_advisory_round(p.run_id, name)
+        if checks is not None and advisory:
+            for name in checks.fix:
+                self.store.record_advisory_round(p.run_id, name)
+        if fix.kind == "bot":
+            self.store.record_bot_round(p.run_id)
         log.info(
-            "fix.advisory_skipped",
+            "fix.automated_skipped",
             run=p.run_id,
-            checks=list(checks.fix),
-            hint="no CI fix round left; a check the base does not require is merged over",
+            kind=fix.kind,
+            checks=list(checks.fix) if checks is not None else [],
+            hint="no CI fix round left; a signal no person gave is merged over",
         )
         return True
 
@@ -2433,6 +2442,7 @@ class LoopEngine:
                 cfg=self.config.landing,
                 advisory_spent=self.store.advisory_rounds(run_id),
             ),
+            bot_round_spent=self.store.bot_round_spent(run_id),
         )
         if isinstance(outcome, Landed):
             log.info(

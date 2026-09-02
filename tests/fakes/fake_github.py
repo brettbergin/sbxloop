@@ -74,18 +74,29 @@ BLOCKED_405 = MergeOutcome(False, "", "Pull Request is not mergeable (HTTP 405)"
 STALE_409 = MergeOutcome(False, "", "Head branch was modified (HTTP 409)", stale=True)
 
 
+def _user(login: str, bot: bool) -> dict[str, Any]:
+    return {"login": login, "type": "Bot" if bot else "User"}
+
+
 def human_review(
-    login: str, state: str, body: str = "", *, id: int | None = None
+    login: str, state: str, body: str = "", *, id: int | None = None, bot: bool = False
 ) -> dict[str, Any]:
-    """One entry of the reviews payload, as GitHub shapes it."""
-    return {"user": {"login": login}, "state": state, "body": body, "id": id}
+    """One entry of the reviews payload, as GitHub shapes it; ``bot`` makes
+    the reviewer a GitHub App (``user.type == "Bot"``, #613)."""
+    return {"user": _user(login, bot), "state": state, "body": body, "id": id}
 
 
 def human_comment(
-    login: str, body: str, *, path: str = "", line: int | None = None, id: int | None = None
+    login: str,
+    body: str,
+    *,
+    path: str = "",
+    line: int | None = None,
+    id: int | None = None,
+    bot: bool = False,
 ) -> dict[str, Any]:
     """One entry of the pull request review comments payload."""
-    return {"user": {"login": login}, "body": body, "path": path, "line": line, "id": id}
+    return {"user": _user(login, bot), "body": body, "path": path, "line": line, "id": id}
 
 
 class FakeGithub(GithubOps):

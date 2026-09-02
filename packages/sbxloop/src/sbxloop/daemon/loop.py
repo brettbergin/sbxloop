@@ -1597,6 +1597,7 @@ class DaemonLoop:
                     cfg=self.config.landing,
                     advisory_spent=self.store.advisory_rounds(run_id),
                 ),
+                bot_round_spent=self.store.bot_round_spent(run_id),
             )
         except RunCancelledError as exc:
             self.dstore.reopen_merge_gate(run_id, str(exc))
