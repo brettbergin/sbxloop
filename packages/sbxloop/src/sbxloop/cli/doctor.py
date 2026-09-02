@@ -25,7 +25,8 @@ from rich.table import Table
 import sbxloop
 from sbxloop.config import Config, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
+from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.gh.protection import read_base_requirements
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
@@ -330,43 +331,12 @@ def _requires_approving_reviews(ops: Any, repo: str, base: str) -> bool | None:
     That protection is the one repository setting incompatible with
     human-out-of-the-loop operation: the loop cannot approve its own pull
     request, so GitHub answers every merge with a 405 and the run ends
-    blocked. Read from classic branch protection and from rulesets, both
-    best-effort; ``None`` when GitHub would not say (a token without admin
-    on classic protection, say) — unverifiable is not a verdict.
+    blocked. Read by :func:`sbxloop.gh.protection.read_base_requirements`
+    — the same reading the landing gate uses for required checks (#611) —
+    ``None`` when GitHub would not say (a token without admin on classic
+    protection, say): unverifiable is not a verdict.
     """
-    known = False
-    try:
-        protection = ops.raw("GET", f"/repos/{repo}/branches/{base}/protection")
-        known = True
-        reviews = (
-            protection.get("required_pull_request_reviews")
-            if isinstance(protection, dict)
-            else None
-        )
-        count = reviews.get("required_approving_review_count") if isinstance(reviews, dict) else 0
-        if int(count or 0) > 0:
-            return True
-    except GithubOpsError as exc:
-        if exc.http_status == 404:
-            known = True  # explicitly unprotected — an answer, not a failure
-    except Exception:  # nosec B110 - advisory probe; never a doctor crash
-        pass
-    try:
-        rules = ops.raw("GET", f"/repos/{repo}/rules/branches/{base}")
-        if isinstance(rules, list):
-            known = True
-            for rule in rules:
-                if not isinstance(rule, dict) or rule.get("type") != "pull_request":
-                    continue
-                params = rule.get("parameters")
-                count = (
-                    params.get("required_approving_review_count") if isinstance(params, dict) else 0
-                )
-                if int(count or 0) > 0:
-                    return True
-    except Exception:  # nosec B110 - advisory probe; never a doctor crash
-        pass
-    return False if known else None
+    return read_base_requirements(ops, repo, base).requires_reviews
 
 
 def credential_key(entry: RepoConfig) -> str:

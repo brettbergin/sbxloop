@@ -28,10 +28,18 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from sbxloop.config import LandingConfig
+from sbxloop.engine.checks import (
+    NO_POLICY,
+    CheckJudgment,
+    CheckPolicy,
+    PolicyFor,
+    judge_checks,
+    merged_over_comment,
+    no_policy,
+)
 from sbxloop.engine.model import FixKind
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import (
-    ChecksVerdict,
     FailedCheck,
     GithubOps,
     PaginationError,
@@ -108,6 +116,9 @@ class NeedsFix(NamedTuple):
     failed_checks: tuple[FailedCheck, ...] = ()
     objections: str = ""
     human: tuple[HumanObjection, ...] = ()
+    # The judgment behind a ``ci`` fix (#611): what gates, what the base
+    # already had red, and which advisory regressions this round is for.
+    checks: CheckJudgment | None = None
 
 
 class Closed(NamedTuple):
@@ -144,8 +155,10 @@ def poll_checks(
     emit: Emit,
     clock: Callable[[], float] = time.monotonic,
     settle_from: float | None = None,
-) -> ChecksVerdict:
-    """Wait for the check runs on ``head_sha`` to reach a final state.
+    policy: CheckPolicy = NO_POLICY,
+) -> CheckJudgment:
+    """Wait for the checks on ``head_sha`` to reach a final state, judged
+    under ``policy`` (:mod:`sbxloop.engine.checks`, #611).
 
     ``red`` returns immediately — the build is known broken and waiting on
     stragglers only delays the fix. ``green`` with check runs present
@@ -153,35 +166,39 @@ def poll_checks(
     once ``ci_settle_s`` has passed since ``settle_from`` (the delivery, by
     default now): Actions registers its check runs seconds after a push,
     and reading "nothing failed yet" as success would merge before CI
-    started. Past ``ci_timeout_s`` raises :class:`CiTimeout`.
+    started. Past ``ci_timeout_s`` raises :class:`CiTimeout`. Only gating
+    checks are waited on: an advisory check still running when every
+    gating one is green does not hold the landing.
 
-    ``emit`` fires only when the folded verdict changes, so a long wait
-    costs one event, not one per poll.
+    ``emit`` fires only when the judgment changes, so a long wait costs
+    one event, not one per poll.
     """
     started = clock()
     settle_from = started if settle_from is None else settle_from
-    last: ChecksVerdict | None = None
+    last: CheckJudgment | None = None
     while True:
         verdict = ops.pr_checks(repo, head_sha)
-        if verdict != last:
+        checks = judge_checks(verdict, policy)
+        if checks != last:
             emit(
-                state=verdict.state,
+                state=checks.state,
                 total=verdict.total,
-                pending=list(verdict.pending),
+                pending=list(checks.pending),
                 failed=list(verdict.failed),
                 head_sha=head_sha,
                 waited_s=round(clock() - started),
+                **{k: v for k, v in checks.event().items() if k not in ("state", "pending")},
             )
-            last = verdict
-        if verdict.state == "red":
-            return verdict
-        if verdict.state == "green" and (
+            last = checks
+        if checks.state == "red":
+            return checks
+        if checks.state == "green" and (
             verdict.total > 0 or clock() - settle_from >= cfg.ci_settle_s
         ):
-            return verdict
+            return checks
         if clock() - started >= cfg.ci_timeout_s:
             raise CiTimeout(
-                f"CI did not report within ci_timeout_s={cfg.ci_timeout_s:g}s: {verdict.summary()}"
+                f"CI did not report within ci_timeout_s={cfg.ci_timeout_s:g}s: {checks.summary()}"
             )
         tick("ci")
 
@@ -465,6 +482,7 @@ def land(
     review_posted: bool = True,
     ack: Ack | None = None,
     gate: bool = False,
+    policy_for: PolicyFor = no_policy,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
@@ -486,8 +504,15 @@ def land(
     ``gate`` is the opt-in merge gate: True returns :class:`Gated` where
     the merge would have happened — after every other bar — so the caller
     parks the run for one human approval instead of merging.
+
+    ``policy_for`` judges the head's checks against the base (#611): which
+    of them gate, and which reds the base already had. The default judges
+    the way the loop always did — every check gates, every red is ours.
+    A red the merge goes over is named in a PR comment before the merge.
     """
     started = clock()
+    last_checks: CheckJudgment | None = None
+    named: set[tuple[str, ...]] = set()
     while True:
         if clock() - started >= cfg.ci_timeout_s:
             return Blocked(f"landing did not settle within ci_timeout_s={cfg.ci_timeout_s:g}s")
@@ -534,13 +559,21 @@ def land(
                 f"a reviewer's changes-requested review is still standing after "
                 f"{len(standing)} replied objection(s); only they can dismiss it"
             )
-        checks = ops.pr_checks(repo, head)
+        checks = judge_checks(ops.pr_checks(repo, head), policy_for(head))
         if checks.state == "pending":
             tick("ci")
             continue
+        if checks.noteworthy and checks != last_checks:
+            emit("landing.checks", pr=number, head=head, **checks.event())
+            last_checks = checks
         if checks.state == "red":
             return NeedsFix(
-                "ci", checks.summary(), failed_checks=tuple(ops.checks_failed_logs(repo, head))
+                "ci",
+                checks.summary(),
+                failed_checks=tuple(
+                    c for c in ops.checks_failed_logs(repo, head) if c.name in checks.fix
+                ),
+                checks=checks,
             )
         mergeable = pr.get("mergeable")
         if mergeable is None:
@@ -589,6 +622,17 @@ def land(
             # a human could be waiting on is already settled.
             emit("land.gated", pr=number, head=head)
             return Gated(head)
+        comment = merged_over_comment(checks)
+        if comment is not None and checks.merged_over not in named:
+            # Said before the merge, on the PR, so the red the loop went
+            # over is on the record where the next reader looks — best
+            # effort: a comment refusal must not stop a merge every bar
+            # has cleared.
+            named.add(checks.merged_over)
+            try:
+                ops.pr_issue_comment(repo, number, comment)
+            except GithubOpsError:
+                log.warning("land.merged_over_unposted", repo=repo, pr=number, exc_info=True)
         outcome = ops.pr_merge(repo, number, method=cfg.merge_method, sha=head)
         if outcome.stale:
             # The head moved between the read that judged it and the merge;

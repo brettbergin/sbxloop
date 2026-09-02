@@ -98,7 +98,7 @@ class TestMergeVerdicts:
         runs_verdict = fold_check_runs(runs(("lint", "success"), ("test", "failure")))
         status_verdict = fold_statuses(statuses(("ci/jenkins", "pending")))
         merged = runs_verdict.merge(status_verdict)
-        assert merged == ChecksVerdict("red", 3, ("ci/jenkins",), ("test",))
+        assert merged == ChecksVerdict("red", 3, ("ci/jenkins",), ("test",), ("lint",))
         assert merged.summary() == "1 of 3 check(s) failed: test"
 
     def test_a_status_only_repository_is_not_no_ci(self) -> None:

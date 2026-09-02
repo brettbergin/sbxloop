@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from sbxloop.config import LandingConfig
+from sbxloop.engine.checks import PolicyFor, check_policy_reader, no_policy
 from sbxloop.engine.landing import (
     Blocked,
     CiTimeout,
@@ -97,7 +98,7 @@ class TestPollChecks:
             tick=rec.tick,
             emit=rec.emit_checks,
             clock=rec.clock,
-        )
+        ).verdict
 
     def test_green_with_check_runs_returns_at_once(self) -> None:
         fake = FakeGithub()
@@ -142,7 +143,7 @@ class TestPollChecks:
             emit=rec.emit_checks,
             clock=clock,
             settle_from=delivered_at,
-        )
+        ).verdict
         assert verdict == NO_CHECKS
         assert rec.waits == ["ci", "ci", "ci"]  # 0, 30, 60 -> 90 settles
         assert len(fake.checks_calls) == 4
@@ -296,6 +297,7 @@ class Landing:
         login: str = LOGIN,
         answered: Container[str] = frozenset(),
         review_posted: bool = True,
+        policy_for: PolicyFor = no_policy,
     ) -> Any:
         return land(
             self.fake,
@@ -312,6 +314,13 @@ class Landing:
             clock=self.clock,
             answered=answered,
             review_posted=review_posted,
+            policy_for=policy_for,
+        )
+
+    def against_base(self, *, advisory_spent: Container[str] = frozenset()) -> PolicyFor:
+        """Judge the head against the base the fake serves (#611)."""
+        return check_policy_reader(
+            self.fake, REPO, "main", cfg=self.cfg, advisory_spent=advisory_spent
         )
 
 
@@ -624,3 +633,130 @@ class TestLand:
         outcome = Landing(fake).run()
         assert isinstance(outcome, NeedsFix) and outcome.kind == "human"
         assert fake.checks_calls == []
+
+
+def red(*names: str, passed: tuple[str, ...] = ()) -> ChecksVerdict:
+    return ChecksVerdict("red", len(names) + len(passed), (), names, passed)
+
+
+class TestLandAgainstTheBase:
+    """#611: a red the PR did not cause is merged over and named; one it
+    did cause is fixed — for as many rounds as it gates, one if it does
+    not."""
+
+    def test_a_red_already_red_on_the_base_is_merged_over_and_named(self) -> None:
+        fake = FakeGithub()
+        fake.checks_by_sha["base123"] = red("flaky", passed=("ci",))
+        fake.checks = [red("flaky", passed=("ci",))]
+        lp = Landing(fake)
+        assert lp.run(policy_for=lp.against_base()) == Landed("merge0001", by_human=False)
+        assert fake.issue_comments == [
+            "Merged with checks still red that this pull request did not cause:\n"
+            "\n"
+            "- `flaky` — already red on base123, the commit this PR is built on"
+        ]
+        (checks,) = [d for t, d in lp.rec.events if t == "landing.checks"]
+        assert checks["state"] == "green"
+        assert checks["preexisting"] == ["flaky"]
+        assert checks["source"] == "all"
+        assert checks["baseline_sha"] == "base123"
+
+    def test_the_merged_over_comment_is_posted_once_across_a_stale_retry(self) -> None:
+        fake = FakeGithub()
+        fake.checks_by_sha["base123"] = red("flaky")
+        fake.checks = [red("flaky")]
+        fake.merge_outcomes = [STALE_409, MERGED]
+        lp = Landing(fake)
+        lp.rec.on_tick.append(lambda n: fake._move_head("commit1"))
+        assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
+        assert len(fake.merges) == 2
+        assert len(fake.issue_comments) == 1
+
+    def test_a_refused_comment_does_not_stop_the_merge(self) -> None:
+        fake = FakeGithub()
+        fake.checks_by_sha["base123"] = red("flaky")
+        fake.checks = [red("flaky")]
+        fake.fail_once["pr_issue_comment"] = GithubOpsError("locked", http_status=403)
+        lp = Landing(fake)
+        assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
+
+    def test_a_red_the_pr_caused_goes_back_for_a_fix_with_only_its_logs(self) -> None:
+        fake = FakeGithub()
+        fake.checks_by_sha["base123"] = red("flaky", passed=("ci",))
+        fake.checks = [red("ci", "flaky")]
+        fake.failed_logs = [
+            FailedCheck("ci", "failure", "boom", "https://x"),
+            FailedCheck("flaky", "failure", "still flaky", "https://y"),
+        ]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, NeedsFix)
+        assert outcome.why == "1 check(s) failed: ci; already red on the base: flaky"
+        assert [c.name for c in outcome.failed_checks] == ["ci"]
+        assert outcome.checks is not None and outcome.checks.preexisting == ("flaky",)
+        assert fake.issue_comments == []
+
+    def test_a_required_check_red_on_the_base_is_still_fixed(self) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.checks_by_sha["base123"] = red("ci")
+        fake.checks = [red("ci")]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, NeedsFix)
+        assert outcome.checks is not None and not outcome.checks.advisory_only
+        assert fake.merges == []
+
+    def test_an_advisory_regression_gets_one_round_then_is_merged_over(self) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.checks = [red("lint", passed=("ci",))]
+        lp = Landing(fake)
+        first = lp.run(policy_for=lp.against_base())
+        assert isinstance(first, NeedsFix)
+        assert first.checks is not None and first.checks.advisory_only
+        assert first.checks.fix == ("lint",)
+
+        second = lp.run(policy_for=lp.against_base(advisory_spent={"lint"}))
+        assert isinstance(second, Landed)
+        assert fake.issue_comments == [
+            "Merged with checks still red that this pull request did not cause:\n"
+            "\n"
+            "- `lint` — went red on this PR but is not required by the base branch; "
+            "one fix round did not clear it"
+        ]
+
+    def test_only_gating_checks_are_waited_on(self) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.checks = [ChecksVerdict("pending", 2, ("slow-e2e",), (), ("ci",))]
+        lp = Landing(fake)
+        assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
+        assert lp.rec.waits == []
+
+    def test_a_declared_check_absent_from_the_head_is_waited_on(self) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci", "docs"]}}
+        fake.checks = [
+            ChecksVerdict("green", 1, (), (), ("ci",)),
+            ChecksVerdict("green", 2, (), (), ("ci", "docs")),
+        ]
+        lp = Landing(fake)
+        assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
+        assert lp.rec.waits == ["ci"]
+
+    def test_ignored_checks_never_block(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [red("codecov/patch", passed=("ci",))]
+        lp = Landing(fake, ignore_checks=["codecov/*"])
+        assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
+        assert fake.issue_comments == []
+        (checks,) = [d for t, d in lp.rec.events if t == "landing.checks"]
+        assert checks["ignored"] == ["codecov/patch"]
+
+    def test_a_clean_landing_says_nothing_extra(self) -> None:
+        fake = FakeGithub()
+        lp = Landing(fake)
+        assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
+        assert [t for t, _ in lp.rec.events if t == "landing.checks"] == []
+        assert fake.issue_comments == []

@@ -186,6 +186,10 @@ class HostEventTypes:
     # line (`round`, `task_id`, `anchors`); they ride into the next brief.
     FIX_UNANSWERED = "fix.unanswered"
     CI_STATUS = "ci.status"
+    # The landing's judgment of the head's checks against the base (#611):
+    # `required` (the gating names) and their `source`, `fix`,
+    # `regressions`, `preexisting`, `advisory`, `ignored`, `baseline_sha`.
+    LANDING_CHECKS = "landing.checks"
     LAND_UNDRAFT = "land.undraft"
     LAND_UPDATE = "land.update"
     # Landing answered human threads nothing else in the pipeline would

@@ -8,6 +8,30 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Red checks are judged against the base the PR is built on** (#611).
+  A red check on the head used to mean "this PR broke it": every red
+  spent a CI fix round, and a base whose own CI was already red — a
+  flaky job, a broken nightly — could never be landed on. The landing
+  stage now folds the same checks on the PR's merge base (the compare
+  API; never the base's *current* head, whose red is someone else's)
+  and reads the base's protection and rulesets (`gh/protection.py`,
+  also what `doctor` reads now). A red already red on the base is
+  **preexisting**: merged over and named in a PR comment. A red the PR
+  caused is a **regression**: fixed for the full `max_ci_rounds` if the
+  base requires that check, for **one** round if it does not — after
+  which it is merged over and named, so a signal no human demanded
+  never blocks a landing. Absent from the base (a check that only runs
+  on pull requests) or an unreadable baseline counts as the PR's own —
+  "could not tell" fails closed. A base that declares no required
+  checks gates on all of them, as before; a required check red on the
+  base is still fixed (GitHub will refuse the merge otherwise), and its
+  fix brief says the failure was inherited. Only gating checks are
+  waited on. New `[landing] required_checks` (an explicit gating set,
+  overriding what the base declares) and `ignore_checks` (fnmatch
+  patterns dropped everywhere); new `landing.checks` event with the
+  gating set and its source, the pending, fix, regression, preexisting,
+  advisory and ignored names, and the baseline sha.
+
 - **Review, comment, check, and thread reads are paginated** (#614).
   Every GitHub list read took the first page (30 entries) as the whole
   list, so on a busy pull request a standing `CHANGES_REQUESTED` past

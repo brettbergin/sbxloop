@@ -723,6 +723,7 @@ def fix_brief(
     conflicts: Sequence[str] = (),
     history: str = "",
     unanswered: Sequence[ReviewFinding] = (),
+    preexisting: Sequence[str] = (),
 ) -> str:
     """What one fix round is for, concretely.
 
@@ -740,6 +741,9 @@ def fix_brief(
     case the finding named and leave the adjacent one for the next round
     (#521). ``history`` is the earlier rounds as :func:`render_fix_history`
     renders them, so this fixer knows what its predecessors chose and why.
+    ``preexisting`` names the failing checks that were already red on the
+    commit the PR is built on (#611) — required by the base, so still to
+    be fixed, but not this PR's doing, and the fixer should know that.
     """
     what = _pr_label(pr_number)
     parts = [
@@ -802,6 +806,13 @@ def fix_brief(
             heading = f"#### `{check.name}` ({check.conclusion})"
             if check.url:
                 heading += f" — {check.url}"
+            if check.name in preexisting:
+                heading += (
+                    "\n\nThis check was already red on the commit this pull request "
+                    "is built on, so the failure predates the PR; the base branch "
+                    "requires it, so it still has to pass here. Fix the cause and "
+                    "say in your report that it was inherited."
+                )
             excerpt = check.excerpt.strip()
             if excerpt:
                 blocks.append(f"{heading}\n\n```\n{excerpt}\n```")

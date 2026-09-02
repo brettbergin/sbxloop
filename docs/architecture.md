@@ -332,7 +332,10 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   converging one adjacent case at a time.
 - **CI** — poll the delivered head's check runs; red fetches the failing
   jobs' logs into a fix brief. "No check runs yet" is trusted as "no CI"
-  only after `ci_settle_s`.
+  only after `ci_settle_s`. A red is judged against the PR's merge base
+  and the base's protection/rulesets (`engine/checks.py`, #611): red on
+  the base too is merged over and named; a regression is fixed — every
+  round if the base requires the check, one if it does not.
 - **LAND** — see below. Once the PR has merged — never before — the
   review's `followups` (real, out of scope, kept out of `findings` so they
   cost no fix round) and the fix rounds' `deferred:` findings are filed as
@@ -838,7 +841,10 @@ carried-over finding in its own thread rather than restating it in a fresh
 review body, resolving the ones it confirms fixed, `fix.round` (the round, its kind
 — `review`, `gate`, `ci`, `conflict`, `human` — the task appended and the
 budget it spent), `ci.status` (the folded check-run state, emitted on change
-only), `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
+only), `landing.checks` (the judgment against the base, #611: the gating
+set and its source, what is pending, to fix, a regression, preexisting,
+advisory or ignored, and the baseline sha — emitted when it says more than
+"all green, all gating"), `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
 the PR and why. `run.state` fires on every stage entry — the state *is* the
 stage. These carry no information the agent's reply did not — they exist so
 a surface can show the decision without showing the agent's JSON, which is

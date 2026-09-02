@@ -18,6 +18,7 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch
 from sbxloop.daemon.model import WorkItem
+from sbxloop.gh.ops import ChecksVerdict
 from tests.fakes.fake_github import BLOCKED_405, FakeGithub
 from tests.unit.test_daemon_loop import (
     PR_URL,
@@ -166,6 +167,21 @@ class TestApprove:
         front = h.loop.frontend
         assert isinstance(front, GateFrontend)
         assert front.gates_resolved and front.gates_resolved[0][1] == "merged"
+
+    def test_approve_judges_the_checks_against_the_prs_base(self, tmp_path: Path) -> None:
+        """#611: the approve path makes the run's own judgment — a red the
+        PR did not cause is merged over and named, against the base the
+        PR actually targets."""
+        h, fake, run_id = self.approve_ready(tmp_path)
+        fake.pr["base"] = {"ref": "release/2"}
+        fake.checks_by_sha["base123"] = ChecksVerdict("red", 1, (), ("flaky",))
+        fake.checks = [ChecksVerdict("red", 1, (), ("flaky",))]
+        gate = h.dstore.merge_gate_for(run_id)
+        assert gate is not None and h.dstore.claim_merge_gate(run_id)
+        h.loop._complete_landing(gate, "Discord user `brett`")
+        assert fake.merges
+        assert any("`flaky` — already red on base123" in c for c in fake.issue_comments)
+        assert any(p.endswith("/branches/release/2/protection") for _, p, _ in fake.raw_calls)
 
     def test_approve_merge_spawns_and_answers(self, tmp_path: Path) -> None:
         h, _fake, _run_id = self.approve_ready(tmp_path)

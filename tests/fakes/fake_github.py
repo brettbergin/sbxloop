@@ -121,6 +121,15 @@ class FakeGithub(GithubOps):
             "head": {"sha": "commit0"},
         }
         self.checks: list[ChecksVerdict] = []
+        # Verdicts by commit, consulted before the scripted queue: the
+        # baseline read of #611 asks about the merge base ("base123", the
+        # compare stub's answer), and must not eat the head's script. No
+        # checks on the base by default, so every red is the PR's own.
+        self.checks_by_sha: dict[str, ChecksVerdict] = {"base123": NO_CHECKS}
+        # What the base branch requires (#611): classic protection (None =
+        # 404, unprotected) and the rulesets list.
+        self.protection: dict[str, Any] | None = None
+        self.rules: list[dict[str, Any]] = []
         self.failed_logs: list[FailedCheck] = []
         self.reviews_payload: list[dict[str, Any]] = []
         self.comments_payload: list[dict[str, Any]] = []
@@ -367,6 +376,16 @@ class FakeGithub(GithubOps):
             return list(self.comments_payload)
         if method == "GET" and path.endswith("/pulls") and "state=open&head=" in query:
             return [dict(self.pr)] if self.pr_created else []
+        if method == "GET" and "/branches/" in path and path.endswith("/protection"):
+            if self.protection is None:
+                raise GithubOpsError(
+                    "github op raw.api failed: GithubOpError: gh api GET "
+                    f"{path} failed (rc=1): Branch not protected (HTTP 404)",
+                    http_status=404,
+                )
+            return dict(self.protection)
+        if method == "GET" and "/rules/branches/" in path:
+            return list(self.rules)
         if method == "GET" and "/compare/" in path:
             # `base...head`: unrelated histories have no merge base, which
             # GitHub reports as a 404 rather than a comparison.
@@ -453,6 +472,8 @@ class FakeGithub(GithubOps):
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
         self.checks_calls.append(sha)
         self._maybe_fail("pr_checks")
+        if sha in self.checks_by_sha:
+            return self.checks_by_sha[sha]
         if not self.checks:
             return GREEN
         return self.checks.pop(0) if len(self.checks) > 1 else self.checks[0]

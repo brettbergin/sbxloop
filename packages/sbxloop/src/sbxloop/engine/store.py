@@ -758,6 +758,19 @@ class StateStore:
         """``{key: status}`` of the human objections this run has answered."""
         return self.reconciliations(run_id, self.HUMAN_ROUND)
 
+    # Advisory-check fix rounds (#611) live under their own sentinel round:
+    # a regression on a check the base does not require gets one round,
+    # and this is how the next landing pass knows it was spent.
+    ADVISORY_ROUND = -2
+
+    def record_advisory_round(self, run_id: str, check: str) -> None:
+        """Note that this run spent its one fix round on advisory ``check``."""
+        self.record_reconciliation(run_id, self.ADVISORY_ROUND, check, "spent")
+
+    def advisory_rounds(self, run_id: str) -> frozenset[str]:
+        """The advisory checks this run has already spent a round on."""
+        return frozenset(self.reconciliations(run_id, self.ADVISORY_ROUND))
+
     # Round n+1's confirmations of carried-over findings share the table too,
     # under their own negative rounds: they are keyed by the *same* anchors a
     # reconciliation pass uses, so mixing them would make one look like the

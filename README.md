@@ -986,6 +986,20 @@ standing `REQUEST_CHANGES` on the PR is honoured — it costs a fix round on
 the CI budget — and a human merging the PR themselves is the acceptance,
 while a human closing it unmerged fails the run.
 
+**Whose red is it.** A red check on the delivered head is judged against
+the commit the PR is built on (its merge base with the base branch, never
+the base's current head) and against what the base's protection and
+rulesets require. Red on the base too is *preexisting*: merged over and
+named in a PR comment, never fixed — unless the base requires that check,
+in which case it is fixed (GitHub would refuse the merge) and the fix brief
+says the failure was inherited. Red only on the PR is a *regression*: a
+required one gets the full `max_ci_rounds`; one the base does not require
+gets one round and is then merged over and named, so a signal no human
+demanded never blocks a landing. Absent from the base, or a baseline that
+could not be read, counts as the PR's own. A base that declares no required
+checks gates on all of them. `required_checks` names the gating set
+explicitly; `ignore_checks` drops a check everywhere.
+
 **Branch protection.** "Require branches to be up to date" is handled: the
 landing stage calls update-branch (bounded by `merge_update_attempts`, each
 one API call) and re-judges the new head. A rule the loop cannot satisfy —
@@ -1009,6 +1023,8 @@ ci_timeout_s = 3600             # per wait, not charged to max_wall_clock_s; exc
 merge_method = "squash"         # squash | merge | rebase
 delete_branch_on_merge = true
 merge_update_attempts = 3       # update-branch calls when protection wants "up to date"; 0 disables
+required_checks = []            # the checks that gate the merge; empty = what the base's protection/rulesets declare, else all
+ignore_checks = []              # fnmatch patterns never waited on, fixed or reported (e.g. "codecov/*")
 followups = "issues"            # after the merge, the review's out-of-scope notes: issues | comment | off
 followup_label = "sbxloop:follow-up"  # never the trigger label — a human promotes a follow-up to work
 max_followups_per_run = 5
@@ -1306,7 +1322,7 @@ came from. The notable knobs:
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
 | `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public` beside it.                                                                                                                                                                                                                   |
-| `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`.                                                                                                             |
+| `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`.                                                                         |
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
 | `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                                                                                                                                                                                                |
 | `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                                                                                                                                                                                                    |

@@ -55,6 +55,7 @@ from sbxloop.daemon.model import (
 )
 from sbxloop.daemon.sources import WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate
+from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.landing import (
     Blocked,
@@ -1568,6 +1569,8 @@ class DaemonLoop:
                 gate.pr_number,
                 bot_login=self.github.provisioner.gh_bot_login(gate.repo),
             )
+            base = ops.pr_get(gate.repo, gate.pr_number).get("base")
+            base_ref = str(base.get("ref") or "") if isinstance(base, dict) else ""
             outcome = land(
                 ops,
                 gate.repo,
@@ -1584,6 +1587,15 @@ class DaemonLoop:
                 review_posted=True,
                 ack=lambda threads: acknowledge_human_threads(
                     ops, gate.repo, gate.pr_number, run_id=run_id, login=login, threads=threads
+                ),
+                # The same judgment the run's landing made (#611): the PR's
+                # own base, its merge base, and the advisory rounds spent.
+                policy_for=check_policy_reader(
+                    ops,
+                    gate.repo,
+                    base_ref or self.config.github.for_repo(gate.repo).deliver_base or "main",
+                    cfg=self.config.landing,
+                    advisory_spent=self.store.advisory_rounds(run_id),
                 ),
             )
         except RunCancelledError as exc:

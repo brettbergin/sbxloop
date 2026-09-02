@@ -61,6 +61,7 @@ from pydantic import ValidationError
 from sbxloop import hostgit
 from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace, ensure_repository
+from sbxloop.engine.checks import CheckJudgment, check_policy_reader, read_check_policy
 from sbxloop.engine.followups import (
     checklist_comment,
     collect_followups,
@@ -1132,8 +1133,15 @@ class LoopEngine:
                 if isinstance(result, Blocked):
                     return "blocked", result.why
                 if isinstance(result, NeedsFix):
+                    if self._advisory_round_unaffordable(p, result.checks):
+                        stage = "landing"
+                        continue
                     reason = self._fix_round(
-                        p, result.kind, result.why, failed_checks=result.failed_checks
+                        p,
+                        result.kind,
+                        result.why,
+                        failed_checks=result.failed_checks,
+                        checks=result.checks,
                     )
                     if reason is not None:
                         return "failed", reason
@@ -1152,6 +1160,8 @@ class LoopEngine:
                     return "blocked", outcome.why
                 if isinstance(outcome, Closed):
                     return "failed", outcome.why
+                if self._advisory_round_unaffordable(p, outcome.checks):
+                    continue
                 reason = self._fix_round(
                     p,
                     outcome.kind,
@@ -1159,6 +1169,7 @@ class LoopEngine:
                     failed_checks=outcome.failed_checks,
                     objections=outcome.objections,
                     human=outcome.human,
+                    checks=outcome.checks,
                 )
                 if reason is not None:
                     return "failed", reason
@@ -2162,10 +2173,17 @@ class LoopEngine:
         failed_checks: Sequence[FailedCheck] = (),
         objections: str = "",
         human: Sequence[HumanObjection] = (),
+        checks: CheckJudgment | None = None,
     ) -> str | None:
         """Spend one fix round: a seeded task built and verified like any
         other, then back to the gate. Returns the reason the run failed —
-        the budget, or the task — or None when the fix is in."""
+        the budget, or the task — or None when the fix is in.
+
+        ``checks`` is the judgment behind a CI round (#611). The advisory
+        regressions in its fix scope are recorded as spent *before* the
+        round runs, so the next landing pass merges over them rather than
+        buying them another — one round is the whole budget for a check
+        the base does not require."""
         run_id, phases = p.run_id, p.phases
         # Held for the reconciliation that follows the re-delivery: the
         # human hears back on their own thread, not only in a build report.
@@ -2191,6 +2209,10 @@ class LoopEngine:
                 f"{counter}{granted}): {why}"
             )
         spent = self.store.bump_run_counter(run_id, counter)
+        if checks is not None:
+            for name in checks.fix:
+                if name not in checks.gating:
+                    self.store.record_advisory_round(run_id, name)
         tasks = self.store.get_tasks(run_id)
         round_no = 1 + sum(1 for t in tasks if is_fix_task(t.spec.id))
         verify_commands = [
@@ -2229,6 +2251,7 @@ class LoopEngine:
                 # unanswered, which comes back until someone answers (#522).
                 history=render_fix_history(rounds_so_far),
                 unanswered=unanswered_findings(rounds_so_far),
+                preexisting=checks.preexisting if checks is not None else (),
             ),
             verify_commands=verify_commands,
             failed_checks=failed_checks,
@@ -2247,6 +2270,26 @@ class LoopEngine:
         )
         self._announce_roster(run_id, self.store.get_tasks(run_id))
         return self._drive_fix_task(p, task)
+
+    def _advisory_round_unaffordable(self, p: Pipeline, checks: CheckJudgment | None) -> bool:
+        """A CI fix that is nothing but advisory regressions, with no CI
+        round left to spend on it (#611): a check the base does not
+        require must never end a run, so it is recorded as spent and the
+        landing goes on to merge over it, named."""
+        if checks is None or not checks.advisory_only:
+            return False
+        run = self.store.get_run(p.run_id)
+        if run.ci_rounds < self.config.landing.max_ci_rounds + run.granted_rounds:
+            return False
+        for name in checks.fix:
+            self.store.record_advisory_round(p.run_id, name)
+        log.info(
+            "fix.advisory_skipped",
+            run=p.run_id,
+            checks=list(checks.fix),
+            hint="no CI fix round left; a check the base does not require is merged over",
+        )
+        return True
 
     def _base_branch(self, p: Pipeline) -> str:
         """The branch the PR targets: configured, else the repository's default."""
@@ -2314,8 +2357,16 @@ class LoopEngine:
                 HostEventTypes.CI_STATUS, run_id, pr=run.pr_number, round=round_no, **data
             )
 
+        policy = read_check_policy(
+            ops,
+            repo,
+            self._base_branch(p),
+            run.head_sha,
+            cfg=self.config.landing,
+            advisory_spent=self.store.advisory_rounds(run_id),
+        )
         try:
-            verdict = poll_checks(
+            checks = poll_checks(
                 ops,
                 repo,
                 run.head_sha,
@@ -2324,14 +2375,18 @@ class LoopEngine:
                 emit=emit,
                 clock=self.clock,
                 settle_from=p.delivered_at,
+                policy=policy,
             )
         except CiTimeout as exc:
             return Blocked(str(exc))
-        if verdict.state == "red":
+        if checks.state == "red":
             return NeedsFix(
                 "ci",
-                verdict.summary(),
-                failed_checks=tuple(ops.checks_failed_logs(repo, run.head_sha)),
+                checks.summary(),
+                failed_checks=tuple(
+                    c for c in ops.checks_failed_logs(repo, run.head_sha) if c.name in checks.fix
+                ),
+                checks=checks,
             )
         return None
 
@@ -2371,6 +2426,13 @@ class LoopEngine:
                 ops, repo, number, run_id=run_id, login=login, threads=threads
             ),
             gate=self.config.landing.merge_gate == "chat",
+            policy_for=check_policy_reader(
+                ops,
+                repo,
+                self._base_branch(p),
+                cfg=self.config.landing,
+                advisory_spent=self.store.advisory_rounds(run_id),
+            ),
         )
         if isinstance(outcome, Landed):
             log.info(
