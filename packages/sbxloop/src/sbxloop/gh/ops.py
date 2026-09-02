@@ -93,6 +93,15 @@ class PostedFinding(NamedTuple):
     thread_node_id: str | None = None
 
 
+def _typename_kind(typename: Any) -> bool | None:
+    """GraphQL ``author.__typename`` as a kind: ``Bot`` → True, any other
+    named type → False, absent (a deleted account, an unrequested field)
+    → None."""
+    if not typename:
+        return None
+    return str(typename) == "Bot"
+
+
 def normalize_login(login: str) -> str:
     """One canonical form for a GitHub identity.
 
@@ -107,10 +116,34 @@ def normalize_login(login: str) -> str:
     return login.removesuffix("[bot]").casefold()
 
 
+# A GitHub identity as the loop compares them: the login and whether the
+# account is a GitHub App — True (App), False (user), or None when the
+# payload it was read from does not say.
+Identity = tuple[str, bool | None]
+
+
+def identities_match(a: Identity, b: Identity) -> bool:
+    """Whether two identities are the same account (#622).
+
+    The logins must match under :func:`normalize_login` **and**, when both
+    sides know whether they are an App, that must agree: the suffix fold
+    makes a human ``foo`` and an App ``foo[bot]`` spell the same, and
+    GitHub lets both exist — so the kind, read from the payload
+    (``user.type`` on REST, ``author.__typename`` on GraphQL), is what
+    tells them apart. Either side not knowing its kind matches on the
+    login alone, so nothing regresses where the type is not reported.
+    Two empty logins never match: an unknown identity equals nobody.
+    """
+    (login_a, bot_a), (login_b, bot_b) = a, b
+    if not login_a or not login_b or normalize_login(login_a) != normalize_login(login_b):
+        return False
+    return bot_a is None or bot_b is None or bot_a == bot_b
+
+
 def logins_match(a: str, b: str) -> bool:
-    """Whether two login spellings name the same identity. Two empty
-    logins never match: an unknown identity equals nobody."""
-    return bool(a) and bool(b) and normalize_login(a) == normalize_login(b)
+    """Whether two login spellings name the same identity, kinds unknown.
+    Two empty logins never match: an unknown identity equals nobody."""
+    return identities_match((a, None), (b, None))
 
 
 def is_bot_user(user: Any) -> bool:
@@ -123,14 +156,33 @@ def is_bot_user(user: Any) -> bool:
     return isinstance(user, dict) and str(user.get("type") or "") == "Bot"
 
 
+def user_kind(user: Any) -> bool | None:
+    """A REST ``user`` object's kind for :func:`identities_match`: True for
+    an App, False for a user, None when the payload carries no ``type``."""
+    if not isinstance(user, dict) or not user.get("type"):
+        return None
+    return is_bot_user(user)
+
+
+def user_identity(user: Any) -> Identity:
+    """A REST ``user`` object as an :data:`Identity`."""
+    login = str(user.get("login") or "") if isinstance(user, dict) else ""
+    return login, user_kind(user)
+
+
 class ThreadComment(NamedTuple):
     """One comment inside a review thread."""
 
     comment_id: int | None
     login: str
     body: str
-    # The author is a GitHub App (GraphQL ``author.__typename == "Bot"``).
-    is_bot: bool = False
+    # Whether the author is a GitHub App (GraphQL ``author.__typename ==
+    # "Bot"``); None when the payload named no type (#622).
+    is_bot: bool | None = None
+
+    @property
+    def identity(self) -> Identity:
+        return self.login, self.is_bot
 
 
 class ReviewThread(NamedTuple):
@@ -156,13 +208,23 @@ class ReviewThread(NamedTuple):
 
     @property
     def opened_by_bot(self) -> bool:
-        return bool(self.comments) and self.comments[0].is_bot
+        return bool(self.comments) and bool(self.comments[0].is_bot)
 
-    def has_reply_from(self, login: str) -> bool:
-        return any(logins_match(c.login, login) for c in self.comments[1:])
+    def has_reply_from(self, login: str, is_bot: bool | None = None) -> bool:
+        return any(identities_match(c.identity, (login, is_bot)) for c in self.comments[1:])
 
-    def has_reply_marked(self, marker: str) -> bool:
-        return any(marker in c.body for c in self.comments[1:])
+    def has_reply_marked(self, marker: str, login: str, is_bot: bool | None = None) -> bool:
+        """Whether the loop's own reply carrying ``marker`` is on the thread.
+
+        The marker must sit in a comment the loop authored (#618): GitHub's
+        quote-reply copies a body verbatim, marker and all, so a human's
+        quoted reply would otherwise read as the loop's and the thread —
+        and their feedback in it — would be skipped forever.
+        """
+        return any(
+            marker in c.body and identities_match(c.identity, (login, is_bot))
+            for c in self.comments[1:]
+        )
 
 
 class SubmittedReview(NamedTuple):
@@ -431,15 +493,16 @@ def fold_statuses(payload: Any) -> ChecksVerdict:
     return _verdict(total, pending, failed, passed)
 
 
-def fold_reviews(payload: Any, *, login: str | None = None) -> str:
+def fold_reviews(payload: Any, *, login: str | None = None, is_bot: bool | None = None) -> str:
     """``GET /repos/{repo}/pulls/{n}/reviews`` folded to one state.
 
     GitHub keeps every review ever submitted, so only each reviewer's
     *latest* verdict counts — an APPROVE after a REQUEST_CHANGES clears it.
     ``COMMENT`` reviews never change a reviewer's standing verdict (GitHub's
-    own rule) and are skipped. ``login`` narrows the fold to one reviewer,
-    which is how the loop asks "did *my* review get satisfied?" without a
-    human's approval answering on its behalf.
+    own rule) and are skipped. ``login`` (with ``is_bot``, the loop's own
+    kind when known, #622) narrows the fold to one reviewer, which is how
+    the loop asks "did *my* review get satisfied?" without a human's
+    approval answering on its behalf.
 
     Returns ``APPROVED``, ``CHANGES_REQUESTED`` or ``NONE``.
     """
@@ -453,7 +516,9 @@ def fold_reviews(payload: Any, *, login: str | None = None) -> str:
         if state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             continue
         who = str((review.get("user") or {}).get("login") or "")
-        if login is not None and not logins_match(who, login):
+        if login is not None and not identities_match(
+            user_identity(review.get("user")), (login, is_bot)
+        ):
             continue
         # A dismissed review no longer stands; recording it stops a later
         # entry-free fold from resurrecting the verdict it replaced.
@@ -545,7 +610,7 @@ def fold_review_threads(payload: Any) -> list[ReviewThread]:
                     comment_id=int(database_id) if isinstance(database_id, int) else None,
                     login=str(author.get("login") or ""),
                     body=str(comment.get("body") or ""),
-                    is_bot=str(author.get("__typename") or "") == "Bot",
+                    is_bot=_typename_kind(author.get("__typename")),
                 )
             )
         threads.append(
@@ -736,7 +801,13 @@ class GithubOps:
         return failed
 
     def pr_review_feedback(
-        self, repo: str, number: int, *, exclude_login: str | None = None, clip: int = 6000
+        self,
+        repo: str,
+        number: int,
+        *,
+        exclude_login: str | None = None,
+        exclude_is_bot: bool | None = None,
+        clip: int = 6000,
     ) -> str:
         """The objections standing on a PR, as one markdown block a fix
         round can act on; ``""`` when nothing stands.
@@ -752,13 +823,18 @@ class GithubOps:
         def login_of(entry: dict[str, Any]) -> str:
             return str((entry.get("user") or {}).get("login") or "")
 
+        def excluded(entry: dict[str, Any]) -> bool:
+            return exclude_login is not None and identities_match(
+                user_identity(entry.get("user")), (exclude_login, exclude_is_bot)
+            )
+
         reviews = raw_pages(self, f"/repos/{repo}/pulls/{number}/reviews")
         latest: dict[str, dict[str, Any]] = {}
         for review in reviews:
             if not isinstance(review, dict):
                 continue
             login = login_of(review)
-            if exclude_login is not None and logins_match(login, exclude_login):
+            if excluded(review):
                 continue
             state = str(review.get("state") or "").upper()
             if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
@@ -774,7 +850,7 @@ class GithubOps:
         for comment in comments:
             if not isinstance(comment, dict):
                 continue
-            if exclude_login is not None and logins_match(login_of(comment), exclude_login):
+            if excluded(comment):
                 continue
             body = str(comment.get("body") or "").strip()
             if not body:

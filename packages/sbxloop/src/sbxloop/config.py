@@ -250,6 +250,17 @@ def _check_branch_prefix(value: str, key: str) -> str:
     return value
 
 
+# A GitHub login: alphanumerics and single hyphens, optionally an App's
+# `[bot]` suffix.
+_LOGIN = re.compile(r"^[A-Za-z0-9](?:-?[A-Za-z0-9])*(?:\[bot\])?$")
+
+
+def _check_login(value: str, key: str) -> str:
+    if not _LOGIN.match(value):
+        raise ValueError(f"{key} {value!r} is not a GitHub login (e.g. octocat or my-app[bot])")
+    return value
+
+
 class RepoConfig(_ConfigModel):
     """One repository sbxloop works with.
 
@@ -279,6 +290,9 @@ class RepoConfig(_ConfigModel):
     pr_title_template: str | None = None
     commit_message_template: str | None = None
     branch_prefix: str | None = None
+    # The loop's own login on this repository, for when neither the App
+    # slug nor `GET /user` can say (#622); None → `[github] bot_login`.
+    bot_login: str | None = None
 
     @field_validator("repo")
     @classmethod
@@ -300,6 +314,11 @@ class RepoConfig(_ConfigModel):
         return (
             None if value is None else _check_branch_prefix(value, "github.repos[].branch_prefix")
         )
+
+    @field_validator("bot_login")
+    @classmethod
+    def _check_bot_login(cls, value: str | None) -> str | None:
+        return None if value is None else _check_login(value, "github.repos[].bot_login")
 
     @property
     def owner(self) -> str:
@@ -340,6 +359,12 @@ class GithubConfig(_ConfigModel):
     pr_title_template: str = DEFAULT_PR_TITLE_TEMPLATE
     commit_message_template: str = DEFAULT_COMMIT_MESSAGE_TEMPLATE
     branch_prefix: str = DEFAULT_BRANCH_PREFIX
+    # The loop's own GitHub login, consulted only when the credential
+    # cannot name itself — no App slug and `GET /user` refused (#622). An
+    # App's is `<slug>[bot]`. Unset, the delivered PR's author stands in
+    # (the same credential opened it), else the identity is unknown and
+    # landing hands over rather than guess.
+    bot_login: str | None = None
     # How many repositories were enabled in the *un-narrowed* config this was
     # derived from. `for_repo` cuts `repos` down to a single entry, so the
     # list length downstream says nothing about the deployment's shape; the
@@ -364,6 +389,11 @@ class GithubConfig(_ConfigModel):
     @classmethod
     def _check_prefix(cls, value: str) -> str:
         return _check_branch_prefix(value, "github.branch_prefix")
+
+    @field_validator("bot_login")
+    @classmethod
+    def _check_bot_login(cls, value: str | None) -> str | None:
+        return None if value is None else _check_login(value, "github.bot_login")
 
     @model_validator(mode="after")
     def _normalise_repos(self) -> GithubConfig:
@@ -470,6 +500,7 @@ class GithubConfig(_ConfigModel):
                     entry.commit_message_template or self.commit_message_template
                 ),
                 "branch_prefix": entry.branch_prefix or self.branch_prefix,
+                "bot_login": entry.bot_login or self.bot_login,
             }
         )
 
@@ -480,6 +511,14 @@ class GithubConfig(_ConfigModel):
         if entry is not None and entry.branch_prefix:
             return entry.branch_prefix
         return self.branch_prefix
+
+    def bot_login_for(self, repo: str | None = None) -> str | None:
+        """The operator-declared login for ``repo``'s runs: the entry's own,
+        else `[github] bot_login`, else None (#622)."""
+        entry = self.effective_repo(repo)
+        if entry is not None and entry.bot_login:
+            return entry.bot_login
+        return self.bot_login
 
     def for_repo(
         self, repo: str | None, *, workspace: Path | _Unset | None = _UNSET

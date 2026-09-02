@@ -71,6 +71,7 @@ def run(gh: FakeGithub, objections, *, report: str = REPORT, round: int = 1, don
         REPO,
         PR,
         run_id=RUN,
+        login=gh.user_login,
         round=round,
         head_sha=HEAD,
         objections=objections,
@@ -225,11 +226,18 @@ class TestAcknowledgeHumanThreads:
         assert gh.replies == []
 
     def test_skips_a_marker_stamped_thread(self) -> None:
-        """A reply another identity posted for this run still counts: the
-        marker, not the login, is the resume-safe idempotency key."""
+        """The marker is the resume-safe idempotency key — under either
+        spelling of the loop's login (GraphQL drops an App's ``[bot]``)."""
         gh = FakeGithub()
-        stamped = ack_thread(("alice", "why?"), ("other-bot", ack_body(run_id=RUN)))
+        stamped = ack_thread(("alice", "why?"), (f"{self.LOGIN}[bot]", ack_body(run_id=RUN)))
         assert self.ack(gh, [stamped]) == 0
+
+    def test_a_marker_quoted_by_someone_else_does_not_count(self) -> None:
+        """Only the loop's own reply carries the marker (#618): a person
+        quoting it back does not make the thread acknowledged."""
+        gh = FakeGithub()
+        quoted = ack_thread(("alice", "why?"), ("bob", f"> {ack_body(run_id=RUN)}\n\nstill why?"))
+        assert self.ack(gh, [quoted]) == 1
 
     def test_skips_loop_threads_and_rootless_threads(self) -> None:
         gh = FakeGithub()

@@ -22,6 +22,7 @@ loop simply re-judges the new head.
 
 from __future__ import annotations
 
+import functools
 import time
 from collections.abc import Callable, Container, Sequence
 from dataclasses import dataclass
@@ -42,12 +43,16 @@ from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import (
     FailedCheck,
     GithubOps,
+    Identity,
     PaginationError,
     ReviewThread,
     fold_reviews,
+    identities_match,
     is_bot_user,
     logins_match,
     raw_pages,
+    user_identity,
+    user_kind,
 )
 from sbxloop.gh.protection import BaseRequirements
 from sbxloop.log import get_logger
@@ -215,24 +220,54 @@ def poll_checks(
         tick("ci")
 
 
-def resolve_login(
-    ops: GithubOps, repo: str, pr_number: int | None, *, bot_login: str | None = None
-) -> str:
-    """The loop's own GitHub login, from whatever source can answer.
+class LoopIdentity(NamedTuple):
+    """The loop's own GitHub account: its login and, when the source that
+    answered says so, whether it is an App (#622). ``login == ""`` is the
+    unknown identity, which landing refuses to classify threads with."""
+
+    login: str
+    is_bot: bool | None = None
+
+    @property
+    def identity(self) -> Identity:
+        return self.login, self.is_bot
+
+
+UNKNOWN_IDENTITY = LoopIdentity("")
+
+
+def resolve_identity(
+    ops: GithubOps,
+    repo: str,
+    pr_number: int | None,
+    *,
+    bot_login: str | None = None,
+    configured_login: str | None = None,
+    pr_author_is_loop: bool = True,
+) -> LoopIdentity:
+    """The loop's own GitHub identity, from whatever source can answer.
 
     Resolution order: the App's ``<slug>[bot]`` when the host resolved one
-    (an installation token cannot call ``GET /user`` — 403, #581); ``GET
-    /user`` (PAT mode); the author of the delivered PR (the same token
-    opened it); ``""`` — which landing then refuses to classify threads
-    with (:func:`_reconciliation_block`). The engine caches the answer per
-    drive (``LoopEngine._login``); the daemon's gate-approve path calls it
-    fresh.
+    (an installation token cannot call ``GET /user`` — 403, #581; kind
+    App); ``GET /user`` (PAT mode; kind from the payload's ``type``);
+    ``[github] bot_login`` when the operator set it (an App when spelt
+    ``<slug>[bot]`` — no user login carries brackets — else kind
+    unknown); the author of the
+    delivered PR, **only** when ``pr_author_is_loop`` — the review
+    credential is the delivery credential, so the same token opened it
+    (#622: a reviewer-only identity would otherwise adopt the deliverer's
+    name and misread its own threads as a human's); ``""`` — which landing
+    then refuses to classify threads with (:func:`_reconciliation_block`).
+    The engine caches the answer per drive (``LoopEngine._login``); the
+    daemon's gate-approve path calls it fresh.
     """
     if bot_login:
-        return bot_login
+        return LoopIdentity(bot_login, True)
     try:
         user = ops.raw("GET", "/user")
-        return str(user.get("login", "")) if isinstance(user, dict) else ""
+        login = str(user.get("login", "")) if isinstance(user, dict) else ""
+        if login:
+            return LoopIdentity(login, user_kind(user))
     except GithubOpsError as exc:
         log.warning(
             "land.login_lookup_failed",
@@ -241,19 +276,45 @@ def resolve_login(
             http_status=exc.http_status,
             error=str(exc),
             hint="GET /user needs a user token — a GitHub App installation "
-            "token cannot call it; falling back to the delivered PR's author",
+            "token cannot call it; falling back to [github] bot_login, then "
+            "to the delivered PR's author",
         )
-    if pr_number is None:
-        return ""
+    if configured_login:
+        return LoopIdentity(configured_login, True if configured_login.endswith("[bot]") else None)
+    if pr_number is None or not pr_author_is_loop:
+        return UNKNOWN_IDENTITY
     try:
         user = ops.pr_get(repo, pr_number).get("user")
     except GithubOpsError:
         log.warning("land.login_pr_author_lookup_failed", repo=repo, pr=pr_number, exc_info=True)
-        return ""
-    return str(user.get("login") or "") if isinstance(user, dict) else ""
+        return UNKNOWN_IDENTITY
+    login, kind = user_identity(user)
+    return LoopIdentity(login, kind) if login else UNKNOWN_IDENTITY
 
 
-def human_objection(ops: GithubOps, repo: str, number: int, *, login: str) -> bool:
+def resolve_login(
+    ops: GithubOps,
+    repo: str,
+    pr_number: int | None,
+    *,
+    bot_login: str | None = None,
+    configured_login: str | None = None,
+    pr_author_is_loop: bool = True,
+) -> str:
+    """:func:`resolve_identity`'s login alone."""
+    return resolve_identity(
+        ops,
+        repo,
+        pr_number,
+        bot_login=bot_login,
+        configured_login=configured_login,
+        pr_author_is_loop=pr_author_is_loop,
+    ).login
+
+
+def human_objection(
+    ops: GithubOps, repo: str, number: int, *, login: str, is_bot: bool | None = None
+) -> bool:
     """Whether a reviewer other than the loop's own identity has a standing
     ``CHANGES_REQUESTED`` on the PR. The loop's own reviews are excluded
     rather than trusted: our verdict lives in the run, not on GitHub."""
@@ -262,12 +323,14 @@ def human_objection(ops: GithubOps, repo: str, number: int, *, login: str) -> bo
         review
         for review in payload
         if isinstance(review, dict)
-        and not logins_match(str((review.get("user") or {}).get("login") or ""), login)
+        and not identities_match(user_identity(review.get("user")), (login, is_bot))
     ]
     return fold_reviews(others) == "CHANGES_REQUESTED"
 
 
-def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> list[HumanObjection]:
+def human_objections(
+    ops: GithubOps, repo: str, number: int, *, login: str, is_bot: bool | None = None
+) -> list[HumanObjection]:
     """The standing human objections on a PR, one entry per thing to answer.
 
     A reviewer's ``CHANGES_REQUESTED`` body is one objection; each of that
@@ -293,7 +356,7 @@ def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> l
         if not isinstance(review, dict):
             continue
         who = login_of(review)
-        if logins_match(who, login):
+        if identities_match(user_identity(review.get("user")), (login, is_bot)):
             continue
         state = str(review.get("state") or "").upper()
         if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
@@ -352,7 +415,11 @@ def automated(login: str, is_bot: bool, cfg: LandingConfig) -> bool:
 
 
 def unreconciled_threads(
-    threads: Sequence[ReviewThread], *, login: str, ignore: Sequence[str] = ()
+    threads: Sequence[ReviewThread],
+    *,
+    login: str,
+    ignore: Sequence[str] = (),
+    is_bot: bool | None = None,
 ) -> tuple[list[str], list[str]]:
     """Split the PR's inline threads into the loop's own and the humans'
     that are *not* reconciled yet, as anchors ready to name in a reason.
@@ -383,17 +450,18 @@ def unreconciled_threads(
     for thread in threads:
         if not thread.comments:
             continue
-        author = thread.comments[0].login
         # GraphQL spells an App's login without the [bot] suffix REST uses;
-        # logins_match folds the two (the r9t8hnv33 field failure).
-        if logins_match(author, login):
-            if thread.is_resolved or thread.has_reply_from(login):
+        # the fold in identities_match reconciles the two (the r9t8hnv33
+        # field failure) and the kind, when both sides know it, keeps a
+        # human `foo` apart from an App `foo[bot]` (#622).
+        if identities_match(thread.comments[0].identity, (login, is_bot)):
+            if thread.is_resolved or thread.has_reply_from(login, is_bot):
                 continue
             loop_open.append(thread.anchor)
         elif _bot_thread(thread, ignore):
             continue
         else:
-            if thread.has_reply_from(login):
+            if thread.has_reply_from(login, is_bot):
                 continue
             human_open.append(thread.anchor)
     return loop_open, human_open
@@ -449,6 +517,7 @@ def _reconciliation_block(
     tick: Tick,
     emit: Emit,
     ack: Ack | None = None,
+    is_bot: bool | None = None,
 ) -> Blocked | None:
     """The merge gate of #520 step 5: a pull request does not merge while a
     review finding on it is still unanswered.
@@ -481,16 +550,16 @@ def _reconciliation_block(
         # replaces with the truth.
         return Blocked(_IDENTITY_WHY)
     ignore = tuple(cfg.ignore_reviewers)
-    loop_open, human_open = unreconciled_threads(threads, login=login, ignore=ignore)
+    loop_open, human_open = unreconciled_threads(threads, login=login, ignore=ignore, is_bot=is_bot)
     capped = 0
     if human_open and ack is not None:
         pending = [
             t
             for t in threads
             if t.comments
-            and not logins_match(t.comments[0].login, login)
+            and not identities_match(t.comments[0].identity, (login, is_bot))
             and not _bot_thread(t, ignore)
-            and not t.has_reply_from(login)
+            and not t.has_reply_from(login, is_bot)
         ]
         capped = max(0, len(pending) - ACK_CAP)
         acked = ack(pending[:ACK_CAP])
@@ -531,6 +600,8 @@ def land(
     gate: bool = False,
     policy_for: PolicyFor = no_policy,
     bot_round_spent: bool = False,
+    is_bot: bool | None = None,
+    settle_from: float | None = None,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
@@ -563,6 +634,19 @@ def land(
     objection buys exactly that round; afterwards its standing review is
     merged over and named — bots do not dismiss, and a human's authority
     is the only kind that blocks.
+
+    ``is_bot`` is the loop's own kind when known (#622), so its threads
+    and reviews are told from a same-named account of the other kind.
+
+    A head with **no checks at all** is not trusted on sight (#633): the
+    read is handed to :func:`poll_checks`, which waits out ``ci_settle_s``
+    from the moment this head was first seen here before "no CI" means
+    no CI. A resume at landing and the merge-gate approve path enter
+    here with no poll before them, and an update-branch makes a head no
+    poll has seen — either would otherwise merge before a slow CI had
+    registered its first run. A caller that already waited on the head it
+    enters with passes ``settle_from`` (the CI stage's delivery time) so
+    the window is not paid twice.
     """
     started = clock()
     last_checks: CheckJudgment | None = None
@@ -570,6 +654,7 @@ def land(
     bots_named: set[tuple[str, ...]] = set()
     method: MergeMethod | None = None
     blocked_at: str | None = None
+    head_seen: tuple[str, float] | None = None
     while True:
         if clock() - started >= cfg.ci_timeout_s:
             return Blocked(f"landing did not settle within ci_timeout_s={cfg.ci_timeout_s:g}s")
@@ -588,7 +673,12 @@ def land(
             tick("undraft")
             continue
         head = _head_sha(pr)
-        standing = human_objections(ops, repo, number, login=login)
+        if head_seen is None or head_seen[0] != head:
+            # The entry head's clock may come from the caller; a head
+            # that turns up later (update-branch) starts its own.
+            since = clock() if head_seen is not None or settle_from is None else settle_from
+            head_seen = (head, since)
+        standing = human_objections(ops, repo, number, login=login, is_bot=is_bot)
         if standing and not login:
             # An unknown identity cannot exclude the loop's own reviews
             # (landing.py's `login` filter), so these "objections" may be
@@ -602,7 +692,9 @@ def land(
             return NeedsFix(
                 "human",
                 "a reviewer requested changes on the pull request",
-                objections=ops.pr_review_feedback(repo, number, exclude_login=login),
+                objections=ops.pr_review_feedback(
+                    repo, number, exclude_login=login, exclude_is_bot=is_bot
+                ),
                 human=tuple(unanswered),
             )
         if standing:
@@ -626,7 +718,9 @@ def land(
             return NeedsFix(
                 "bot",
                 "an automated reviewer requested changes on the pull request",
-                objections=ops.pr_review_feedback(repo, number, exclude_login=login),
+                objections=ops.pr_review_feedback(
+                    repo, number, exclude_login=login, exclude_is_bot=is_bot
+                ),
                 human=tuple(o for o in bots if o.key not in answered),
             )
         bot_reviewers = tuple(dict.fromkeys(o.login for o in bots))
@@ -635,6 +729,34 @@ def land(
             emit("land.bot_standing", pr=number, reviewers=list(bot_reviewers))
         policy = policy_for(head)
         checks = judge_checks(ops.pr_checks(repo, head), policy)
+        if (
+            checks.state == "green"
+            and checks.verdict.total == 0
+            and clock() - head_seen[1] < cfg.ci_settle_s
+        ):
+            # Nothing has reported on this head — neither a check run nor
+            # a status. Settle before believing it (#633): the same window
+            # the CI stage applies after a delivery, counted from when
+            # this head was first seen here. Past the window the read
+            # stands: no CI is no CI.
+            try:
+                checks = poll_checks(
+                    ops,
+                    repo,
+                    head,
+                    cfg=cfg,
+                    tick=tick,
+                    emit=functools.partial(emit, "landing.checks", pr=number, head=head),
+                    clock=clock,
+                    settle_from=head_seen[1],
+                    policy=policy,
+                )
+            except CiTimeout as exc:
+                return Blocked(str(exc))
+            if checks.verdict.total > 0:
+                # CI turned up during the settle; the outcome is judged
+                # below, and a red one gets its round.
+                emit("land.settled", pr=number, head=head, checks=checks.verdict.total)
         if checks.needs_approval and checks.state != "red":
             # A workflow a maintainer has not approved (#612): no commit
             # fixes it and no wait ends it. A real red still comes first —
@@ -706,7 +828,15 @@ def land(
         if not review_posted:
             return Blocked("review record could not be posted")
         blocked = _reconciliation_block(
-            ops, repo, number, cfg=cfg, login=login, tick=tick, emit=emit, ack=ack
+            ops,
+            repo,
+            number,
+            cfg=cfg,
+            login=login,
+            tick=tick,
+            emit=emit,
+            ack=ack,
+            is_bot=is_bot,
         )
         if blocked is not None:
             emit("land.unreconciled", pr=number, why=blocked.why)

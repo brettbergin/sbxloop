@@ -323,6 +323,7 @@ class Landing:
         review_posted: bool = True,
         policy_for: PolicyFor = no_policy,
         bot_round_spent: bool = False,
+        settle_from: float | None = None,
     ) -> Any:
         return land(
             self.fake,
@@ -341,6 +342,7 @@ class Landing:
             review_posted=review_posted,
             policy_for=policy_for,
             bot_round_spent=bot_round_spent,
+            settle_from=settle_from,
         )
 
     def against_base(self, *, advisory_spent: Container[str] = frozenset()) -> PolicyFor:
@@ -663,6 +665,78 @@ class TestLand:
         outcome = Landing(fake).run()
         assert isinstance(outcome, NeedsFix) and outcome.kind == "human"
         assert fake.checks_calls == []
+
+
+class TestSettleAtLanding:
+    """#633: a head with nothing reported on it is not trusted on sight.
+    A resume at landing and the gate-approve path enter with no CI poll
+    behind them; an update-branch makes a head no poll has seen. Each
+    waits out ``ci_settle_s`` before "no CI" means no CI."""
+
+    def test_a_fresh_entry_waits_out_the_settle_window(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [NO_CHECKS]
+        lp = Landing(fake, per_tick=30.0, ci_settle_s=90.0)
+        assert isinstance(lp.run(), Landed)
+        # the landing's read, then the poller's at +0, +30, +60, +90 ->
+        # settled; the merge follows
+        assert lp.rec.waits == ["ci", "ci", "ci"]
+        assert fake.checks_calls == ["commit0"] * 5
+        assert fake.merges == [(7, "squash", "commit0")]
+
+    def test_ci_that_turns_up_during_the_settle_is_judged(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [NO_CHECKS, NO_CHECKS, RED]
+        lp = Landing(fake, per_tick=30.0, ci_settle_s=90.0)
+        outcome = lp.run()
+        assert isinstance(outcome, NeedsFix) and outcome.kind == "ci"
+        assert fake.merges == []
+        assert ("land.settled", {"pr": 7, "head": "commit0", "checks": RED.total}) in lp.rec.events
+
+    def test_a_caller_that_already_settled_the_head_pays_nothing(self) -> None:
+        """The CI stage settled this head from its delivery; landing in the
+        same drive reads the checks once and merges."""
+        fake = FakeGithub()
+        fake.checks = [NO_CHECKS]
+        lp = Landing(fake, per_tick=30.0, ci_settle_s=90.0)
+        assert isinstance(lp.run(settle_from=lp.clock.t - 90.0), Landed)
+        assert lp.rec.waits == []
+        assert fake.checks_calls == ["commit0"]
+
+    def test_an_update_branch_head_settles_on_its_own_clock(self) -> None:
+        """The entry head was settled by the caller; the head the update
+        makes is new to everyone and waits its own window."""
+        fake = FakeGithub()
+        fake.checks = [NO_CHECKS]
+        fake.merge_outcomes = [STALE_409, MERGED]
+        lp = Landing(fake, per_tick=30.0, ci_settle_s=90.0)
+        moved = False
+
+        def move(n: int) -> None:
+            nonlocal moved
+            if not moved:
+                moved = True
+                fake._move_head("commit1")
+
+        lp.rec.on_tick.append(move)
+        assert isinstance(lp.run(settle_from=lp.clock.t - 90.0), Landed)
+        assert lp.rec.waits == ["merge", "ci", "ci", "ci"]
+        assert fake.merges == [(7, "squash", "commit0"), (7, "squash", "commit1")]
+
+    def test_a_settle_that_outlives_the_timeout_is_blocked(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [NO_CHECKS]
+        lp = Landing(fake, per_tick=100.0, ci_settle_s=1000.0, ci_timeout_s=250.0)
+        outcome = lp.run()
+        assert isinstance(outcome, Blocked) and "ci_timeout_s=250s" in outcome.why
+        assert fake.merges == []
+
+    def test_settle_off_trusts_the_first_read(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [NO_CHECKS]
+        lp = Landing(fake, per_tick=30.0)  # ci_settle_s = 0
+        assert isinstance(lp.run(), Landed)
+        assert lp.rec.waits == []
 
 
 def red(*names: str, passed: tuple[str, ...] = ()) -> ChecksVerdict:

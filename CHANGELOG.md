@@ -8,6 +8,33 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A head with no checks is settled at landing too** (#633). `land()`
+  trusted "nothing has reported" on sight; only the CI stage after a
+  delivery waited out `ci_settle_s`. A resume at the landing stage, a
+  merge-gate approve and the head an update-branch makes now hand the
+  read to `poll_checks`, settling from when the landing first saw that
+  head — a slow CI's first run is no longer merged ahead of. The engine
+  passes its delivery time along (`settle_from`) so the window is not
+  paid twice in one drive. `ci_settle_s` is documented as calibrated to
+  GitHub Actions' registration latency; raise it for CI that registers
+  later.
+
+- **A reconciliation marker counts only in the loop's own reply**
+  (#618). `has_reply_marked(marker, login)` now requires the stamped
+  comment to be loop-authored; a person quoting the marker back no
+  longer makes a thread answered or acknowledged.
+
+- **The loop's identity carries its kind** (#622). `Identity` /
+  `identities_match` compare logins under the `[bot]` fold **and** the
+  account kind when both sides know it (App from the slug or
+  `user.type`/`__typename`, user from `GET /user`), so a person named
+  `foo` is never the App `foo[bot]`. `resolve_identity` consults, in
+  order, the App slug, `GET /user`, the new `[github] bot_login`
+  (overridable per `[[github.repos]]` entry) and — only when the
+  delivering credential is the reviewing one — the PR's author.
+  `ThreadComment.is_bot`, `Pipeline.is_bot` and an `is_bot` argument on
+  the landing, reconciliation and acknowledgement paths carry it through.
+
 - **The merge method follows the repository, and a merge GitHub refuses
   is named** (#620). `[landing] merge_method` defaulted to `squash`,
   which a repository with squash merging disabled answers with a 405 the

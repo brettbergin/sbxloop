@@ -185,6 +185,42 @@ class TestNaming:
         with pytest.raises(ConfigError, match="pr_title_template"):
             load_config(cwd=tmp_path, env={})
 
+    def test_bot_login_folds_per_repo_and_is_validated(self, tmp_path: Path) -> None:
+        """#622: the operator's word on the loop's login, daemon-wide with
+        per-repository overrides; unset everywhere is None, never ""."""
+        _write(
+            tmp_path,
+            "[github]\n"
+            'bot_login = "my-app[bot]"\n'
+            "[[github.repos]]\n"
+            'repo = "o/one"\n'
+            "[[github.repos]]\n"
+            'repo = "o/two"\n'
+            'bot_login = "other-bot"\n',
+        )
+        cfg = load_config(cwd=tmp_path, env={})
+        assert cfg.github.bot_login_for("o/one") == "my-app[bot]"
+        assert cfg.github.bot_login_for("o/two") == "other-bot"
+        assert cfg.github.bot_login_for(None) == "my-app[bot]"
+        two = cfg.github.effective_repo("o/two")
+        assert two is not None and two.bot_login == "other-bot"
+        assert load_config(cwd=tmp_path, env={}).github.bot_login_for("o/three") == "my-app[bot]"
+
+    def test_unset_bot_login_is_none(self, tmp_path: Path) -> None:
+        _write(tmp_path, '[github]\nrepo = "o/r"\n')
+        cfg = load_config(cwd=tmp_path, env={})
+        assert cfg.github.bot_login is None
+        assert cfg.github.bot_login_for("o/r") is None
+
+    @pytest.mark.parametrize("value", ['""', '"-leading"', '"has space"', '"foo[bot]x"', '"a--b"'])
+    def test_a_bad_bot_login_is_rejected_at_load(self, tmp_path: Path, value: str) -> None:
+        _write(tmp_path, f'[github]\nrepo = "o/r"\nbot_login = {value}\n')
+        with pytest.raises(ConfigError, match="bot_login"):
+            load_config(cwd=tmp_path, env={})
+        _write(tmp_path, f'[[github.repos]]\nrepo = "o/r"\nbot_login = {value}\n')
+        with pytest.raises(ConfigError, match="bot_login"):
+            load_config(cwd=tmp_path, env={})
+
     def test_placeholders_may_repeat_and_use_format_spec(self, tmp_path: Path) -> None:
         _write(
             tmp_path, '[github]\nrepo = "o/r"\npr_title_template = "[{repo}] {title} {title!s}"\n'

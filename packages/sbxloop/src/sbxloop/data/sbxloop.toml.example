@@ -142,6 +142,14 @@ secret_strategy = "proxy"
 # rulesets admit — a refused ref ends the run at delivery, naming this key.
 # branch_prefix = "sbxloop/"
 #
+# IDENTITY. The loop tells its own review threads and reviews from a
+# person's by its login, read from the credential (a GitHub App's slug, or
+# GET /user on a PAT). Set this only when neither answers — a fine-grained
+# token that cannot call GET /user, say — to the login GitHub attributes
+# the loop's writes to; `<slug>[bot]` for an App. Overridable per
+# repository below.
+# bot_login = "my-app[bot]"
+#
 # Several repositories: declare them as an array of tables instead of the
 # single `repo` above. The daemon polls every enabled entry for the trigger
 # label and routes each run — clone, branch, PR, review, CI, merge, issue
@@ -160,6 +168,7 @@ secret_strategy = "proxy"
 # pr_title_template = "feat: {title}"  # naming overrides; unset uses [github]'s
 # commit_message_template = "{title}"
 # branch_prefix = "bot/"
+# bot_login = "other-app[bot]"     # identity override; unset uses [github]'s
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled
@@ -183,7 +192,10 @@ secret_strategy = "proxy"
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
 # retry_rounds = 2           # daemon: an exhausted run resumes its own PR once with this many more; 0 = hand to a human
 # ci_poll_interval_s = 60
-# ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI"
+# ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI" — after a delivery, and again
+#                            # at landing for a head no poll has seen (a resume, a merge-gate approve, an update-branch).
+#                            # Calibrated to GitHub Actions' check-run registration latency; raise it for CI that
+#                            # registers later (queued self-hosted runners, Jenkins reporting through webhooks)
 # ci_timeout_s = 3600        # per wait; exceeding it ends the run blocked
 # merge_method = "auto"      # auto | squash | merge | rebase — auto takes the first of squash, merge, rebase the repository allows; an explicit method the repository disallows ends the run blocked, named
 # delete_branch_on_merge = true

@@ -64,7 +64,7 @@ from sbxloop.engine.landing import (
     NeedsFix,
     UpdateState,
     land,
-    resolve_login,
+    resolve_identity,
 )
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
@@ -1563,12 +1563,14 @@ class DaemonLoop:
         assert self.github is not None  # approve_merge refused without one
         try:
             ops = self.github.ops()
-            login = resolve_login(
+            identity = resolve_identity(
                 ops,
                 gate.repo,
                 gate.pr_number,
                 bot_login=self.github.provisioner.gh_bot_login(gate.repo),
+                configured_login=self.config.github.bot_login_for(gate.repo),
             )
+            login = identity.login
             base = ops.pr_get(gate.repo, gate.pr_number).get("base")
             base_ref = str(base.get("ref") or "") if isinstance(base, dict) else ""
             outcome = land(
@@ -1579,6 +1581,7 @@ class DaemonLoop:
                 branch=gate.branch,
                 node_id=None,
                 login=login,
+                is_bot=identity.is_bot,
                 update=UpdateState(),
                 on_update=lambda state: None,
                 tick=self._merge_tick,
@@ -1586,7 +1589,13 @@ class DaemonLoop:
                 answered=self.store.answered_objections(run_id),
                 review_posted=True,
                 ack=lambda threads: acknowledge_human_threads(
-                    ops, gate.repo, gate.pr_number, run_id=run_id, login=login, threads=threads
+                    ops,
+                    gate.repo,
+                    gate.pr_number,
+                    run_id=run_id,
+                    login=login,
+                    threads=threads,
+                    is_bot=identity.is_bot,
                 ),
                 # The same judgment the run's landing made (#611): the PR's
                 # own base, its merge base, and the advisory rounds spent.

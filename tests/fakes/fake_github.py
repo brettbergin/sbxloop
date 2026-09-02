@@ -119,6 +119,10 @@ class FakeGithub(GithubOps):
         # refuses REQUEST_CHANGES/APPROVE (#513). The default keeps a
         # distinct author so the review-feature path stays exercised.
         self.user_login = "sbxloop-bot"
+        # What `GET /user` says the credential is (#622): "User" for a PAT,
+        # "Bot" for a GitHub App; None leaves the field out, as an older
+        # fake did, and the loop's kind is then unknown.
+        self.user_type: str | None = "User"
         self.pr_author = self.user_login if self_review else "someone-else"
         self.pr: dict[str, Any] = {
             "number": number,
@@ -363,7 +367,10 @@ class FakeGithub(GithubOps):
             if self.fail_user_lookup is not None:
                 self._record_failed_job("raw.api", method, path, self.fail_user_lookup)
                 raise self.fail_user_lookup
-            return {"login": self.user_login}
+            user: dict[str, Any] = {"login": self.user_login}
+            if self.user_type is not None:
+                user["type"] = self.user_type
+            return user
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree"}}
         if method == "POST" and path.endswith("/git/trees"):
@@ -474,7 +481,7 @@ class FakeGithub(GithubOps):
                     is_resolved=False,
                     path=str(body["path"]),
                     line=int(body["line"]),
-                    comments=(ThreadComment(self._comment_id, self.user_login, str(body["body"])),),
+                    comments=(self._loop_comment(str(body["body"])),),
                 )
             )
             return {
@@ -511,8 +518,22 @@ class FakeGithub(GithubOps):
     ) -> list[FailedCheck]:
         return list(self.failed_logs)
 
+    @property
+    def user_is_bot(self) -> bool | None:
+        """The loop credential's kind, as its own comments carry it (#622)."""
+        return None if self.user_type is None else self.user_type == "Bot"
+
+    def _loop_comment(self, body: str) -> ThreadComment:
+        return ThreadComment(self._comment_id, self.user_login, body, is_bot=self.user_is_bot)
+
     def pr_review_feedback(
-        self, repo: str, number: int, *, exclude_login: str | None = None, clip: int = 6000
+        self,
+        repo: str,
+        number: int,
+        *,
+        exclude_login: str | None = None,
+        exclude_is_bot: bool | None = None,
+        clip: int = 6000,
     ) -> str:
         return self.feedback
 
@@ -548,7 +569,7 @@ class FakeGithub(GithubOps):
                     is_resolved=False,
                     path=comment.path,
                     line=comment.line,
-                    comments=(ThreadComment(self._comment_id, self.user_login, comment.body),),
+                    comments=(self._loop_comment(comment.body),),
                 )
             )
             posted.append(PostedFinding(anchor_of(comment), self._comment_id, node_id))
@@ -567,7 +588,7 @@ class FakeGithub(GithubOps):
                 self.threads[index] = thread._replace(
                     comments=(
                         *thread.comments,
-                        ThreadComment(self._comment_id, self.user_login, body),
+                        self._loop_comment(body),
                     )
                 )
                 break

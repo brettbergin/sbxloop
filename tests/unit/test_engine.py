@@ -3176,6 +3176,58 @@ class TestAppIdentityLanding:
         assert result.state == "blocked"
         assert "identity could not be resolved" in str(result.reason)
 
+    def test_a_configured_bot_login_answers_when_get_user_cannot(self, harness: Harness) -> None:
+        """#622: `[github] bot_login` is the operator's word on the loop's
+        login — consulted before the PR author, which is a last resort."""
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        fake.pr["user"] = None
+        self._loop_thread(fake)
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.engine(
+            ops=fake,
+            github={"repo": fake.repo, "bot_login": fake.user_login},
+            landing=FAST_LANDING,
+        )
+        result = engine.start("land it")
+        assert result.state == "merged", result.reason
+
+    def test_an_app_and_a_person_of_the_same_name_are_told_apart(self, harness: Harness) -> None:
+        """#622 acceptance: the loop is the App `sbxloop[bot]`; a person
+        whose login is `sbxloop` opens a thread — theirs, acknowledged as
+        a human's; the App's own resolved thread is its own."""
+        from sbxloop.gh.ops import ReviewThread, ThreadComment
+        from sbxloop.sbx.provision import Provisioner
+
+        fake = FakeGithub()
+        fake.user_login = "sbxloop"
+        fake.user_type = "Bot"
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        harness.monkeypatch.setattr(
+            Provisioner, "gh_bot_login", lambda self, repo=None: "sbxloop[bot]"
+        )
+        fake.threads = [
+            ReviewThread(
+                node_id="PRRT_1",
+                is_resolved=True,
+                path="a.py",
+                line=1,
+                comments=(ThreadComment(1, "sbxloop", "[minor] naming", is_bot=True),),
+            ),
+            ReviewThread(
+                node_id="PRRT_2",
+                is_resolved=False,
+                path="b.py",
+                line=2,
+                comments=(ThreadComment(2, "sbxloop", "why this way?", is_bot=False),),
+            ),
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake).start("land it")
+        assert result.state == "merged", result.reason
+        acked = [(cid, body) for cid, body in fake.replies if "requesting changes" in body]
+        assert [cid for cid, _ in acked] == [2], "the person's thread, and only that one"
+
 
 class TestReviewRecordRepost:
     """#503 self-heal: a review whose post failed reposts its record as a
@@ -3239,6 +3291,7 @@ class TestBotSuffixLanding:
 
         fake = FakeGithub()
         fake.user_login = "sbxloop"  # thread comments: GraphQL's bare spelling
+        fake.user_type = "Bot"  # ...typed as an App, which is what tells it apart (#622)
         fake.pr["user"] = {"login": "sbxloop[bot]"}  # REST attribution
         fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
         harness.monkeypatch.setattr(
