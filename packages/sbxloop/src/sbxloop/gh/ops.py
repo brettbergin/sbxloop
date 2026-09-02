@@ -181,17 +181,35 @@ class SubmittedReview(NamedTuple):
 
 
 class ChecksVerdict(NamedTuple):
-    """Every check run on a head commit, folded to one answer.
+    """Every check run and commit status on a head commit, folded to one
+    answer.
 
     ``pending`` is deliberately distinct from ``green``: a PR whose checks
     have not reported yet has not passed, and reading "no failures so far"
     as success is exactly how a red PR gets settled as done.
+
+    Check runs (the Checks API — GitHub Actions and most modern apps) and
+    commit statuses (the older Status API — Jenkins, Buildkite, Travis,
+    CircleCI's default, Codecov, many org bots) are two namespaces GitHub
+    keeps separate and the merge box shows together; the verdict merges
+    them the same way (#610). Names are the check-run ``name`` or the
+    status ``context``, untagged, so a required-context list from branch
+    protection (which names both kinds the same way) can be matched
+    against them.
     """
 
     state: CheckState
     total: int
     pending: tuple[str, ...]
     failed: tuple[str, ...]
+
+    def merge(self, other: ChecksVerdict) -> ChecksVerdict:
+        """Both verdicts as one: red beats pending beats green, names and
+        counts pooled."""
+        pending = (*self.pending, *other.pending)
+        failed = (*self.failed, *other.failed)
+        state: CheckState = "red" if failed else ("pending" if pending else "green")
+        return ChecksVerdict(state, self.total + other.total, pending, failed)
 
     def summary(self) -> str:
         if self.state == "green":
@@ -202,11 +220,15 @@ class ChecksVerdict(NamedTuple):
 
 
 class FailedCheck(NamedTuple):
-    """One red check run, with the text that explains it.
+    """One red check run or commit status, with the text that explains it.
 
     ``excerpt`` is the job log (head+tail clipped) for a GitHub Actions
-    check, or the check's own title/summary/text for anything else — what a
-    fix round reads to learn *why* the build is red, not just that it is.
+    check, the check's own title/summary/text for another check run, or
+    the one-line ``description`` a commit status carries — what a fix round
+    reads to learn *why* the build is red, not just that it is. ``url`` is
+    the check's ``details_url`` / the status's ``target_url``: when the
+    excerpt is empty (a status, or logs the token cannot read) it is the
+    only lead the brief has (#629).
     """
 
     name: str
@@ -250,6 +272,48 @@ def fold_check_runs(payload: Any) -> ChecksVerdict:
     if failed:
         # Red beats pending: the build is already known broken, and waiting
         # on the stragglers only delays the fix.
+        return ChecksVerdict("red", total, tuple(pending), tuple(failed))
+    if pending:
+        return ChecksVerdict("pending", total, tuple(pending), ())
+    return ChecksVerdict("green", total, (), ())
+
+
+# Commit-status states that are not failures. The Status API has exactly
+# four: success, pending, failure, error — error is a red build too (the
+# CI system itself broke), and anything unrecognized fails closed like an
+# unknown check-run conclusion.
+PASSING_STATUS_STATES = frozenset({"success"})
+PENDING_STATUS_STATES = frozenset({"pending"})
+
+
+def fold_statuses(payload: Any) -> ChecksVerdict:
+    """``GET /repos/{repo}/commits/{sha}/status`` folded to a verdict.
+
+    The combined endpoint already keeps only the newest status per
+    ``context``, so every entry counts once. Folded from the ``statuses``
+    list, NEVER from the payload's top-level ``state``: a commit with no
+    statuses at all answers ``state: "pending"`` with an empty list, and
+    reading that as pending would deadlock the loop on every repository
+    that only uses the Checks API — the exact "no CI must not block" case
+    ``fold_check_runs`` handles for its side.
+    """
+    statuses = payload.get("statuses") if isinstance(payload, dict) else None
+    if not isinstance(statuses, list):
+        return ChecksVerdict("green", 0, (), ())
+    pending: list[str] = []
+    failed: list[str] = []
+    total = 0
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        total += 1
+        name = str(status.get("context") or "status")
+        state = str(status.get("state") or "").lower()
+        if state in PENDING_STATUS_STATES:
+            pending.append(name)
+        elif state not in PASSING_STATUS_STATES:
+            failed.append(name)
+    if failed:
         return ChecksVerdict("red", total, tuple(pending), tuple(failed))
     if pending:
         return ChecksVerdict("pending", total, tuple(pending), ())
@@ -461,8 +525,13 @@ class GithubOps:
         return data
 
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
-        """Every check run on ``sha``, folded to one verdict."""
-        return fold_check_runs(self.raw("GET", f"/repos/{repo}/commits/{sha}/check-runs"))
+        """Every check run AND commit status on ``sha``, folded to one
+        verdict (#610). "No CI" means both lists empty — a repository
+        reporting only through the Status API is not a repository without
+        CI, and its red must not read as green."""
+        runs = fold_check_runs(self.raw("GET", f"/repos/{repo}/commits/{sha}/check-runs"))
+        statuses = fold_statuses(self.raw("GET", f"/repos/{repo}/commits/{sha}/status"))
+        return runs.merge(statuses)
 
     def pr_review_state(self, repo: str, number: int, *, login: str | None = None) -> str:
         """``APPROVED`` / ``CHANGES_REQUESTED`` / ``NONE`` — each reviewer's
@@ -472,7 +541,8 @@ class GithubOps:
     def checks_failed_logs(
         self, repo: str, sha: str, *, max_chars: int = 6000
     ) -> list[FailedCheck]:
-        """The red check runs on ``sha``, each with its log or output excerpt.
+        """The red check runs and commit statuses on ``sha``, each with its
+        log, output, or description excerpt.
 
         A dedicated worker op rather than ``raw.api``: the Actions logs
         endpoint answers a text body behind a redirect, which the JSON

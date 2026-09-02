@@ -799,10 +799,24 @@ def fix_brief(
     if failed_checks:
         blocks = []
         for check in failed_checks:
-            excerpt = check.excerpt.strip() or "(no log output was available)"
-            blocks.append(f"#### `{check.name}` ({check.conclusion})\n\n```\n{excerpt}\n```")
+            heading = f"#### `{check.name}` ({check.conclusion})"
+            if check.url:
+                heading += f" — {check.url}"
+            excerpt = check.excerpt.strip()
+            if excerpt:
+                blocks.append(f"{heading}\n\n```\n{excerpt}\n```")
+            else:
+                # A commit status, or a check whose logs this token cannot
+                # read: the name and the link are all there is (#629).
+                # Say so, rather than leaving a placeholder the agent
+                # might mistake for an empty log.
+                blocks.append(
+                    f"{heading}\n\nThe log for this check is not readable from here; "
+                    "the link above is where it lives. Reproduce the failure with "
+                    "the project's own gate before changing anything."
+                )
         parts.append(
-            "Failing checks, with their log output:\n\n"
+            "Failing checks, with their log output where it could be read:\n\n"
             + "\n\n".join(blocks)
             + "\n\nMake these pass; run the project's own gate here before you finish."
         )

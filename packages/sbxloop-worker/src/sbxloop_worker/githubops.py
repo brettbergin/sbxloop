@@ -459,6 +459,10 @@ def _raw_api(t: Transport, p: dict[str, Any]) -> JsonValue:
 # and ``skipped`` are not red builds; everything else, including conclusions
 # GitHub adds later, fails closed.
 PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+# Commit-status states that are not red — mirrors the host's
+# ``fold_statuses``: ``pending`` is not a failure yet, ``success`` is not
+# one at all, ``failure``/``error``/anything else is.
+NON_RED_STATUS_STATES = frozenset({"success", "pending"})
 
 # Per-check excerpt budget, and how much of it goes to the head of the log.
 # The tail is where a failing job says *why* (the assertion, the traceback,
@@ -486,13 +490,17 @@ def _check_output_excerpt(run: dict[str, Any]) -> str:
 
 
 def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
-    """The failing check runs on a commit, each with the text that explains it.
+    """The failing check runs and commit statuses on a commit, each with the
+    text that explains it.
 
     A fix round needs more than the name of a red check: it needs the
     assertion or the compiler error. For GitHub Actions the check-run id is
     the job id, so the job's log is fetched; other checks (and Actions jobs
     whose logs are gone — expired, or a token without ``actions:read``)
-    fall back to what the check itself reported. Each excerpt is clipped
+    fall back to what the check itself reported. A red commit status (the
+    older Status API — #610) carries only a one-line ``description`` and a
+    ``target_url``; both are passed through, and the host's brief tells the
+    agent the log is not readable from here. Each excerpt is clipped
     head+tail to ``max_chars`` so a chatty build cannot flood the brief.
     """
     _require(p, "repo", "sha")
@@ -524,6 +532,24 @@ def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
                 "conclusion": str(conclusion),
                 "details_url": str(run.get("details_url") or ""),
                 "excerpt": _clip_head_tail(excerpt, head, tail),
+            }
+        )
+    combined = t.request("GET", f"/repos/{repo}/commits/{sha}/status")
+    statuses = combined.get("statuses") if isinstance(combined, dict) else None
+    for status in statuses if isinstance(statuses, list) else []:
+        if not isinstance(status, dict):
+            continue
+        state = str(status.get("state") or "").lower()
+        if state in NON_RED_STATUS_STATES:
+            continue
+        checks.append(
+            {
+                "name": str(status.get("context") or "status"),
+                "conclusion": state or "unknown",
+                "details_url": str(status.get("target_url") or ""),
+                "excerpt": _clip_head_tail(
+                    str(status.get("description") or "").strip(), head, tail
+                ),
             }
         )
     return {"checks": checks}

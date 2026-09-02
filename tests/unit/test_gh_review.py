@@ -16,6 +16,7 @@ from sbxloop.gh.ops import (
     SubmittedReview,
     fold_check_runs,
     fold_reviews,
+    fold_statuses,
     review_payload,
 )
 
@@ -24,8 +25,96 @@ def runs(*entries: tuple[str, str | None]) -> dict[str, object]:
     return {"check_runs": [{"name": name, "conclusion": c} for name, c in entries]}
 
 
+def statuses(*entries: tuple[str, str], state: str = "pending") -> dict[str, object]:
+    """A ``/commits/{sha}/status`` payload; ``state`` is the top-level roll-up
+    GitHub computes, which the fold must ignore."""
+    return {
+        "state": state,
+        "statuses": [
+            {"context": c, "state": st, "target_url": f"https://ci/{c}"} for c, st in entries
+        ],
+    }
+
+
 def review(login: str, state: str) -> dict[str, object]:
     return {"user": {"login": login}, "state": state}
+
+
+class TestFoldStatuses:
+    """The Status API side of #610 — folded the same way as check runs."""
+
+    def test_all_successful_is_green(self) -> None:
+        verdict = fold_statuses(
+            statuses(("ci/jenkins", "success"), ("codecov", "success"), state="success")
+        )
+        assert verdict.state == "green"
+        assert verdict.total == 2 and verdict.failed == ()
+
+    def test_a_pending_status_is_pending_not_green(self) -> None:
+        verdict = fold_statuses(statuses(("ci/jenkins", "success"), ("buildkite", "pending")))
+        assert verdict.state == "pending"
+        assert verdict.pending == ("buildkite",)
+
+    def test_failure_and_error_are_both_red(self) -> None:
+        verdict = fold_statuses(
+            statuses(
+                ("ci/jenkins", "failure"),
+                ("buildkite", "error"),
+                ("codecov", "pending"),
+                state="failure",
+            )
+        )
+        assert verdict.state == "red"
+        assert verdict.failed == ("ci/jenkins", "buildkite")
+        assert verdict.pending == ("codecov",)
+
+    def test_an_unknown_state_fails_closed(self) -> None:
+        assert fold_statuses(statuses(("ci", "queued"))).state == "red"
+
+    def test_no_statuses_is_green_despite_the_pending_rollup(self) -> None:
+        """GitHub answers ``state: "pending"`` for a commit with no statuses
+        at all. Reading that roll-up would deadlock every Checks-only
+        repository on "pending" forever; the fold keys on the list."""
+        verdict = fold_statuses({"state": "pending", "statuses": []})
+        assert verdict.state == "green"
+        assert verdict.total == 0
+
+    def test_garbage_payload_is_no_signal(self) -> None:
+        assert fold_statuses(None).state == "green"
+        assert fold_statuses({"state": "failure"}).state == "green"
+
+
+class TestMergeVerdicts:
+    def test_red_beats_pending_beats_green(self) -> None:
+        green = ChecksVerdict("green", 1, (), ())
+        pending = ChecksVerdict("pending", 1, ("b",), ())
+        red = ChecksVerdict("red", 1, (), ("c",))
+        assert green.merge(green).state == "green"
+        assert green.merge(pending).state == "pending"
+        assert pending.merge(red).state == "red"
+        assert red.merge(green).state == "red"
+
+    def test_pools_names_and_counts(self) -> None:
+        runs_verdict = fold_check_runs(runs(("lint", "success"), ("test", "failure")))
+        status_verdict = fold_statuses(statuses(("ci/jenkins", "pending")))
+        merged = runs_verdict.merge(status_verdict)
+        assert merged == ChecksVerdict("red", 3, ("ci/jenkins",), ("test",))
+        assert merged.summary() == "1 of 3 check(s) failed: test"
+
+    def test_a_status_only_repository_is_not_no_ci(self) -> None:
+        """The #610 failure: a repo that reports through the Status API has
+        no check runs, and "no check runs" used to mean green."""
+        merged = fold_check_runs({"check_runs": []}).merge(
+            fold_statuses(statuses(("ci/jenkins", "failure")))
+        )
+        assert merged.state == "red"
+        assert merged.failed == ("ci/jenkins",)
+
+    def test_no_signal_on_either_side_is_green(self) -> None:
+        merged = fold_check_runs({"check_runs": []}).merge(
+            fold_statuses({"state": "pending", "statuses": []})
+        )
+        assert merged == ChecksVerdict("green", 0, (), ())
 
 
 class TestFoldCheckRuns:
