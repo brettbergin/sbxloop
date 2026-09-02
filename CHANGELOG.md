@@ -8,6 +8,27 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **The gate is detected for more than a Python-and-npm repo** (#625,
+  #626). Detection knew a `check`/`ci` target in a makefile, justfile or
+  Taskfile, an npm script, tox and nox — and always ran the npm script
+  with `npm run`, which on a pnpm or yarn workspace fails to resolve
+  the very tools the script names. The package.json script now runs
+  under the client the project uses: the `packageManager` field, else
+  the lockfile (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock[b]`), else
+  npm. `verify` joins `check`/`ci` as a gate target everywhere (`all`
+  does not: it is the default build). New detectors: a Rakefile
+  `ci`/`check`/`default` task (`bundle exec rake <task>`), composer
+  `check`/`ci` scripts, a Gradle build with its wrapper (`./gradlew check`; the sandbox has no Gradle of its own, so a build without a
+  wrapper is no gate), `pom.xml` (`./mvnw -q verify` or `mvn -q verify`), and a `[alias] ci` in `.cargo/config.toml` (`cargo ci` — a
+  `check` alias is not honored because cargo silently shadows it with
+  the built-in). Go, Rust and .NET have no task-runner convention, so
+  when such a repo declares nothing the tool itself is the gate: `go vet ./... && go test ./...`, `cargo test`, `dotnet test` (a .NET
+  tree with one solution, or no solution and one project). Every
+  detector is tied to the language whose toolchain runs it and is
+  consulted only when that language was resolved for the sandbox
+  (#624), so the loop never asks the sandbox for a command it cannot
+  run; the task-runner detectors are consulted under any set.
+
 - **Red checks are judged against the base the PR is built on** (#611).
   A red check on the head used to mean "this PR broke it": every red
   spent a CI fix round, and a base whose own CI was already red — a

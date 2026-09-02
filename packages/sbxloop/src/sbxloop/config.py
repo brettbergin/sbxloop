@@ -104,9 +104,13 @@ class SandboxConfig(_ConfigModel):
     # that never contained the PR's work, and force-updating the branch with
     # it destroys that work. A failed provision is recoverable; that is not.
     # The one command that runs everything this project holds itself to.
-    # Unset: detected from what the project declares (a `check`/`ci` target in
-    # a makefile, justfile or Taskfile; an npm script; tox.ini; noxfile.py) —
-    # see `verifylint.GATE_DETECTORS`. Set it for a project whose gate no
+    # Unset: detected from what the project declares (a `check`/`ci`/`verify`
+    # target in a makefile, justfile or Taskfile; a package.json or
+    # composer.json script; tox.ini; noxfile.py; a Rakefile task; a Gradle
+    # wrapper or pom.xml; a cargo `ci` alias) or, for the ecosystems whose
+    # build tool is the gate, the tool itself (`go vet && go test`, `cargo
+    # test`, `dotnet test`) — see `verifylint.GATE_DETECTORS`, filtered by the
+    # run's resolved toolchains. Set it for a project whose gate no
     # convention describes, or to `""` to say this project has no gate and
     # switch the requirement off.
     #

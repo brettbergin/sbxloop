@@ -500,9 +500,13 @@ class PhaseRunner:
 
         Re-derived per call rather than cached: a run may create the
         makefile (or the package.json) that declares it, and later plans
-        should be held to the convention the workspace now has.
+        should be held to the convention the workspace now has. Detection
+        is bounded by the run's resolved toolchains (#624): a gate the
+        sandbox could not run is not a gate (#625).
         """
-        return project_gate(self.workspace, self.config.sandbox.gate_command)
+        return project_gate(
+            self.workspace, self.config.sandbox.gate_command, languages=self.languages
+        )
 
     def _check_taskgraph(self, graph: TaskGraph) -> None:
         """Reject graphs whose verify commands violate toolchain conventions

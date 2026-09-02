@@ -289,9 +289,16 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   the one thrown away.
 - **VERIFY** — mechanical: the task's decomposer-authored `verify_commands`
   must all exit 0. No LLM.
-- **GATE** — the project's own gate (`[sandbox] gate_command`, or the
-  detected `make check` / `just ci` / `npm run check` / tox / nox) over the
-  whole tree, mechanical. The decomposer must put the gate in *some* task's
+- **GATE** — the project's own gate (`[sandbox] gate_command`, or the one
+  `verifylint.project_gate` detects: a `check`/`ci`/`verify` target in a
+  makefile, justfile or Taskfile; a package.json script run under the
+  client its `packageManager` field or lockfile names; tox; nox; a
+  Rakefile `ci`/`check`/`default` task; a composer `check`/`ci` script;
+  `./gradlew check`; `mvn -q verify`; a cargo `ci` alias; and, when a Go,
+  Rust or .NET repo declares nothing, the tool itself — `go vet && go test`, `cargo test`, `dotnet test`) over the whole tree, mechanical.
+  Detectors tied to a language only run when that language was resolved
+  for the sandbox (#624), so the gate is always a command the toolchain
+  can execute. The decomposer must put the gate in *some* task's
   exam, but a later task can break what an earlier one proved; this is the
   last check on the tree exactly as it will be delivered. A run with no
   `[github] repo` (and no `[[github.repos]]`) ends `completed` here, its
