@@ -43,6 +43,7 @@ from sbxloop.errors import (
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gh.ops import ChecksVerdict, FailedCheck, GithubOps
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.verifylint import project_gate
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import (
     BLOCKED_405,
@@ -1187,7 +1188,13 @@ class TestLanguageResolution:
         (source / "go.mod").write_text("module example.com/x\n\ngo 1.26\n")
         git("add", "go.mod", cwd=source)
         git("commit", "-m", "go", cwd=source)
-        result, captured = self._run_capturing(harness, sandbox={"workspace": str(source)})
+        # A Go module with nothing declared makes `go vet && go test` the
+        # gate (#625), which the scripted decomposer does not carry and the
+        # fake sandbox cannot run; the override keeps this test about
+        # provisioning and the gate is asserted against the tree below.
+        result, captured = self._run_capturing(
+            harness, sandbox={"workspace": str(source), "gate_command": ""}
+        )
 
         events = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_LANGUAGES]
         assert len(events) == 1
@@ -1198,7 +1205,11 @@ class TestLanguageResolution:
         }
         # the same answer reached the install and the lint
         assert tuple(captured["install"]["languages"]) == ("go",)
-        assert captured["phases"].languages == ("go",)
+        phases = captured["phases"]
+        assert phases.languages == ("go",)
+        assert project_gate(phases.workspace, languages=phases.languages) == (
+            "go vet ./... && go test ./..."
+        )
         # ...and the agent sandbox was created able to fetch the Go tarball
         agent = f"sbxloop-{result.run_id}-agent"
         allows = [

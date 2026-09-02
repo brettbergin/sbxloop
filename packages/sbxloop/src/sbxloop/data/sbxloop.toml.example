@@ -66,8 +66,13 @@ secret_strategy = "proxy"
 # the workspace directly (the pre-0.6 behavior).
 # workspace_isolation = "auto"
 # The one command this project holds itself to. Unset: detected from what the
-# project declares (a check/ci target in a makefile, justfile or Taskfile; an
-# npm script; tox.ini; noxfile.py). Set "" to say this project has no gate.
+# project declares (a check/ci/verify target in a makefile, justfile or
+# Taskfile; a package.json script, run with pnpm/yarn/bun/npm as the lockfile
+# says; tox.ini; noxfile.py; a Rakefile task; a composer script; a Gradle
+# wrapper; pom.xml; a cargo alias) or, for Go, Rust and .NET, the tool itself
+# (go vet && go test, cargo test, dotnet test). Detectors for a language only
+# run when that language is in the sandbox. Set "" to say this project has no
+# gate.
 # gate_command = "make check"
 # Continue existing work on this branch instead of starting fresh. Set by the
 # engine when a run is resumed after its clone was pruned; never by hand.

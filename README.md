@@ -147,9 +147,13 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
 - **Verify** — mechanical: the task's `verify_commands` must exit 0, run from
   the workspace root. No LLM. The full command transcript is persisted with
   the attempt, so a resumed run judges with the real evidence.
-- **Gate** — the project's own check (`[sandbox] gate_command`, or the
-  detected `make check` / `just ci` / `npm run check` / tox / nox) over the
-  whole tree, mechanical. A later task can break what an earlier one proved,
+- **Gate** — the project's own check (`[sandbox] gate_command`, or the one
+  the project declares — a `check`/`ci`/`verify` target in a makefile,
+  justfile or Taskfile, a package.json script run under the client its
+  lockfile names, tox, nox, a Rakefile task, a composer script, a Gradle
+  wrapper, a `pom.xml`, a cargo alias — or, for Go, Rust and .NET, the tool
+  itself) over the whole tree, mechanical. A detector only fires for a
+  language the sandbox was provisioned with. A later task can break what an earlier one proved,
   so this is the last look at the tree exactly as it will be delivered. A run
   with no `[github] repo` ends **`completed`** here, its work in the
   workspace.

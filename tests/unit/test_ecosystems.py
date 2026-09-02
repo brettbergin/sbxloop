@@ -2,10 +2,10 @@
 must not mistake for a Python repo, walked through every generalization
 surface that has landed.
 
-Today's columns: language detection (#624) and the installer allowlist
-(#616). Later work adds its column here rather than a test of its own — the
-project gate (#625/#626), the lint table (#628) — so "does a Go repo work?"
-stays one table, and a regression names the decision that changed.
+Today's columns: language detection (#624), the installer allowlist
+(#616) and the project gate (#625/#626). Later work adds its column here
+rather than a test of its own — the lint table (#628) — so "does a Go repo
+work?" stays one table, and a regression names the decision that changed.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
+from sbxloop.verifylint import project_gate
 from tests.conftest import FakeSbx
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "ecosystems"
@@ -31,6 +32,9 @@ class Expectation(NamedTuple):
     # must NOT be — a language nobody selected opens nothing (#616)
     allowed: tuple[str, ...]
     not_allowed: tuple[str, ...]
+    # the project's own gate under the resolved toolchains (#625/#626);
+    # None = the project declares none and nothing is invented for it
+    gate: str | None
 
 
 EXPECTATIONS: dict[str, Expectation] = {
@@ -39,6 +43,7 @@ EXPECTATIONS: dict[str, Expectation] = {
         "detected",
         allowed=("release-assets.githubusercontent.com",),
         not_allowed=("nodejs.org", "go.dev"),
+        gate=None,
     ),
     # A pnpm monorepo: the root package.json fires javascript; the
     # workspace package's tsconfig.json, two levels down, fires typescript.
@@ -47,18 +52,21 @@ EXPECTATIONS: dict[str, Expectation] = {
         "detected",
         allowed=("nodejs.org", "registry.npmjs.org"),
         not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="pnpm run check",
     ),
     "go": Expectation(
         ("go",),
         "detected",
         allowed=("go.dev", "dl.google.com"),
         not_allowed=("nodejs.org", "static.rust-lang.org"),
+        gate="go vet ./... && go test ./...",
     ),
     "rust": Expectation(
         ("rust",),
         "detected",
         allowed=("static.rust-lang.org",),
         not_allowed=("nodejs.org", "go.dev"),
+        gate="cargo test",
     ),
     # apt-only toolchain: nothing beyond the always-reachable mirrors
     "java-gradle": Expectation(
@@ -66,12 +74,14 @@ EXPECTATIONS: dict[str, Expectation] = {
         "detected",
         allowed=(),
         not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
+        gate="./gradlew check",
     ),
     "ruby": Expectation(
         ("ruby",),
         "detected",
         allowed=(),
         not_allowed=("nodejs.org", "go.dev"),
+        gate="bundle exec rake default",
     ),
     # both, in registry order — union, never "best guess"
     "polyglot": Expectation(
@@ -79,6 +89,7 @@ EXPECTATIONS: dict[str, Expectation] = {
         "detected",
         allowed=("release-assets.githubusercontent.com", "nodejs.org"),
         not_allowed=("go.dev",),
+        gate=None,
     ),
     # No manifest at the root or one level down (the node_modules
     # package.json is skipped): the historical default applies.
@@ -87,6 +98,7 @@ EXPECTATIONS: dict[str, Expectation] = {
         "default",
         allowed=("release-assets.githubusercontent.com",),
         not_allowed=("nodejs.org",),
+        gate=None,
     ),
 }
 
@@ -122,3 +134,12 @@ def test_agent_allowlist(fixture: str, fake_sbx: FakeSbx, tmp_path: Path) -> Non
         assert host in agent.policy_allows, host
     for host in expected.not_allowed:
         assert host not in agent.policy_allows, host
+
+
+@pytest.mark.parametrize("fixture", sorted(EXPECTATIONS))
+def test_project_gate(fixture: str) -> None:
+    """The gate is detected under the toolchains the same fixture resolved
+    to — a gate the sandbox could not run is not a gate (#625)."""
+    expected = EXPECTATIONS[fixture]
+    resolved = toolchains.resolve_languages((), FIXTURES / fixture)
+    assert project_gate(FIXTURES / fixture, languages=resolved.languages) == expected.gate

@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from sbxloop.verifylint import (
+    GATE_DETECTORS,
     command_heads,
     gate_rule,
     lint_verify_commands,
+    node_script_runner,
     project_gate,
     runs_gate,
 )
@@ -515,6 +517,221 @@ class TestGateDetectionAcrossEcosystems:
     def test_an_empty_override_switches_the_requirement_off(self, tmp_path: Path) -> None:
         (tmp_path / "Makefile").write_text("check:\n\t@echo\n")
         assert project_gate(tmp_path, "") is None
+
+
+def write(root: Path, name: str, text: str = "") -> Path:
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+class TestGateTargets:
+    """`verify` names the whole gate as `check`/`ci` do (#625); `all` and
+    `test` do not."""
+
+    def test_a_verify_target_is_a_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "Makefile", "verify: lint test\n\t@echo\n")
+        assert project_gate(tmp_path) == "make verify"
+        write(tmp_path, "justfile", "verify:\n    echo\n")
+        (tmp_path / "Makefile").unlink()
+        assert project_gate(tmp_path) == "just verify"
+
+    def test_verify_in_a_taskfile_and_an_npm_script(self, tmp_path: Path) -> None:
+        write(
+            tmp_path, "Taskfile.yml", "version: '3'\ntasks:\n  verify:\n    cmds:\n      - echo\n"
+        )
+        assert project_gate(tmp_path) == "task verify"
+        (tmp_path / "Taskfile.yml").unlink()
+        write(tmp_path, "package.json", json.dumps({"scripts": {"verify": "vitest"}}))
+        assert project_gate(tmp_path) == "npm run verify"
+
+    def test_all_is_the_default_build_not_a_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "Makefile", "all: build\n\t@echo\n")
+        assert project_gate(tmp_path) is None
+
+    def test_check_still_wins_over_verify(self, tmp_path: Path) -> None:
+        write(tmp_path, "Makefile", "verify:\n\t@echo\ncheck:\n\t@echo\n")
+        assert project_gate(tmp_path) == "make check"
+
+
+class TestNodeScriptRunner:
+    """#626: the client a package.json's scripts run under, strongest
+    signal first — `packageManager`, then the lockfile, then npm."""
+
+    def test_a_plain_npm_repo_is_unchanged(self, tmp_path: Path) -> None:
+        write(tmp_path, "package.json", json.dumps({"scripts": {"check": "x"}}))
+        write(tmp_path, "package-lock.json", "{}")
+        assert project_gate(tmp_path) == "npm run check"
+
+    @pytest.mark.parametrize(
+        ("lockfile", "gate"),
+        [
+            ("pnpm-lock.yaml", "pnpm run check"),
+            ("yarn.lock", "yarn check"),
+            ("bun.lockb", "bun run check"),
+            ("bun.lock", "bun run check"),
+        ],
+    )
+    def test_the_lockfile_names_the_client(self, tmp_path: Path, lockfile: str, gate: str) -> None:
+        write(tmp_path, "package.json", json.dumps({"scripts": {"check": "x"}}))
+        write(tmp_path, lockfile)
+        assert project_gate(tmp_path) == gate
+
+    def test_package_manager_wins_over_a_stray_lockfile(self, tmp_path: Path) -> None:
+        write(
+            tmp_path,
+            "package.json",
+            json.dumps({"packageManager": "pnpm@9.1.0", "scripts": {"check": "x"}}),
+        )
+        write(tmp_path, "package-lock.json", "{}")
+        assert project_gate(tmp_path) == "pnpm run check"
+
+    def test_an_unknown_package_manager_falls_through_to_the_lockfile(self, tmp_path: Path) -> None:
+        write(
+            tmp_path,
+            "package.json",
+            json.dumps({"packageManager": "volta@1", "scripts": {"check": "x"}}),
+        )
+        write(tmp_path, "yarn.lock")
+        assert node_script_runner(tmp_path) == "yarn"
+
+    def test_a_malformed_declaration_falls_through(self, tmp_path: Path) -> None:
+        write(tmp_path, "package.json", json.dumps({"packageManager": 7}))
+        assert node_script_runner(tmp_path) == "npm run"
+        write(tmp_path, "package.json", "{{{")
+        assert node_script_runner(tmp_path) == "npm run"
+
+
+class TestCompiledAndScriptedEcosystems:
+    """#625: the detector table covers what a Go, Rust, Java, Ruby, PHP or
+    .NET repo declares — and, for the ecosystems whose build tool IS the
+    gate, the tool itself, satisfiable by construction."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "task :ci do\n  sh 'x'\nend\n",
+            "task ci: [:lint, :test]\n",
+            "task 'ci' => [:test]\n",
+            'task("ci") { }\n',
+        ],
+    )
+    def test_a_rake_task_in_each_spelling(self, tmp_path: Path, line: str) -> None:
+        write(tmp_path, "Rakefile", "require 'rake'\n" + line)
+        assert project_gate(tmp_path) == "bundle exec rake ci"
+
+    def test_rakes_default_task_is_a_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "Rakefile", "task default: %w[rubocop spec]\n")
+        assert project_gate(tmp_path) == "bundle exec rake default"
+
+    def test_a_rakefile_declaring_only_test_is_no_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "Rakefile", "task :test do\nend\n")
+        assert project_gate(tmp_path) is None
+
+    def test_composer_scripts(self, tmp_path: Path) -> None:
+        write(tmp_path, "composer.json", json.dumps({"scripts": {"ci": ["@lint", "@test"]}}))
+        assert project_gate(tmp_path) == "composer run ci"
+        write(tmp_path, "composer.json", json.dumps({"scripts": {"test": "phpunit"}}))
+        assert project_gate(tmp_path) is None
+
+    def test_gradle_needs_the_wrapper_and_a_build_file(self, tmp_path: Path) -> None:
+        write(tmp_path, "build.gradle.kts", 'plugins { id("java") }\n')
+        assert project_gate(tmp_path) is None, "no wrapper: the sandbox has no gradle"
+        write(tmp_path, "gradlew", "#!/bin/sh\n")
+        assert project_gate(tmp_path) == "./gradlew check"
+
+    def test_a_wrapper_without_a_build_file_is_no_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "gradlew", "#!/bin/sh\n")
+        assert project_gate(tmp_path) is None
+
+    def test_maven_verify_prefers_the_wrapper(self, tmp_path: Path) -> None:
+        write(tmp_path, "pom.xml", "<project/>\n")
+        assert project_gate(tmp_path) == "mvn -q verify"
+        write(tmp_path, "mvnw", "#!/bin/sh\n")
+        assert project_gate(tmp_path) == "./mvnw -q verify"
+
+    def test_a_cargo_ci_alias(self, tmp_path: Path) -> None:
+        write(tmp_path, "Cargo.toml", "[package]\nname = 'x'\n")
+        write(
+            tmp_path, ".cargo/config.toml", "[alias]\nci = 'clippy --all-targets -- -D warnings'\n"
+        )
+        assert project_gate(tmp_path) == "cargo ci"
+
+    def test_a_cargo_check_alias_is_shadowed_by_the_builtin(self, tmp_path: Path) -> None:
+        """cargo ignores a user alias named after a built-in, so `cargo
+        check` would type-check, not run the declared gate."""
+        write(tmp_path, "Cargo.toml", "[package]\nname = 'x'\n")
+        write(tmp_path, ".cargo/config.toml", "[alias]\ncheck = 'clippy'\n")
+        assert project_gate(tmp_path) == "cargo test"
+
+    def test_a_malformed_cargo_config_falls_back_to_cargo_test(self, tmp_path: Path) -> None:
+        write(tmp_path, "Cargo.toml", "[package]\nname = 'x'\n")
+        write(tmp_path, ".cargo/config.toml", "[alias\n")
+        assert project_gate(tmp_path) == "cargo test"
+
+    def test_go_has_no_task_runner_so_the_tool_is_the_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.mod", "module example.com/x\n\ngo 1.22\n")
+        assert project_gate(tmp_path) == "go vet ./... && go test ./..."
+
+    def test_a_makefile_check_still_fronts_a_go_repo(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.mod", "module example.com/x\n")
+        write(tmp_path, "Makefile", "check:\n\tgolangci-lint run\n")
+        assert project_gate(tmp_path) == "make check"
+
+    def test_dotnet_test_needs_one_solution_or_project(self, tmp_path: Path) -> None:
+        write(tmp_path, "App.csproj", "<Project/>")
+        assert project_gate(tmp_path) == "dotnet test"
+        write(tmp_path, "Lib.csproj", "<Project/>")
+        assert project_gate(tmp_path) is None, "two projects: dotnet cannot pick"
+        write(tmp_path, "All.sln", "")
+        assert project_gate(tmp_path) == "dotnet test", "one solution decides"
+        write(tmp_path, "Other.sln", "")
+        assert project_gate(tmp_path) is None
+
+    def test_nothing_declared_nothing_invented(self, tmp_path: Path) -> None:
+        write(tmp_path, "src/main.go", "package main\n")
+        assert project_gate(tmp_path) is None
+
+
+class TestGateNeedsItsToolchain:
+    """Rule: a detector may only emit a command the resolved toolchains
+    can run (#625). Task runners are consulted whatever the set; a
+    language's own runner only when that language was resolved (#624)."""
+
+    def test_a_rakefile_under_a_python_only_sandbox_is_no_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "Rakefile", "task :ci do\nend\n")
+        assert project_gate(tmp_path, languages=("python",)) is None
+        assert project_gate(tmp_path, languages=("ruby",)) == "bundle exec rake ci"
+
+    def test_a_task_runner_is_consulted_under_any_set(self, tmp_path: Path) -> None:
+        write(tmp_path, "Makefile", "check:\n\t@echo\n")
+        assert project_gate(tmp_path, languages=()) == "make check"
+
+    def test_no_resolution_consults_every_detector(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.mod", "module x\n")
+        assert project_gate(tmp_path) == "go vet ./... && go test ./..."
+        assert project_gate(tmp_path, languages=("python",)) is None
+
+    def test_a_filtered_detector_lets_the_next_one_answer(self, tmp_path: Path) -> None:
+        """A polyglot tree: package.json scripts with no node toolchain, and
+        a tox.ini that the python sandbox can run."""
+        write(tmp_path, "package.json", json.dumps({"scripts": {"check": "x"}}))
+        write(tmp_path, "tox.ini", "[tox]\n")
+        assert project_gate(tmp_path, languages=("python",)) == "tox"
+        assert project_gate(tmp_path, languages=("javascript", "python")) == "npm run check"
+
+    def test_every_language_detector_names_a_registry_toolchain(self) -> None:
+        from sbxloop.toolchains import supported_languages
+
+        known = set(supported_languages())
+        for detector in GATE_DETECTORS:
+            assert detector.language is None or detector.language in known, detector
+
+    def test_the_override_ignores_the_toolchain_set(self, tmp_path: Path) -> None:
+        assert project_gate(tmp_path, "bundle exec rake ci", languages=("python",)) == (
+            "bundle exec rake ci"
+        )
 
 
 class TestGateMatchingAcrossEcosystems:

@@ -43,6 +43,7 @@ import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -314,27 +315,47 @@ def command_heads(command: str) -> list[str]:
 # YAML we half-understood is unfixable by the executor, which cannot edit
 # verify commands.
 #
-# `check` and `ci` only, never `test`: those two name the whole gate by
-# convention, whereas `test` is one part of it and demanding it would let a
-# lint-failing PR through while looking satisfied.
-GATE_TARGETS = ("check", "ci")
+# Target names, never `test` and never `all`: `check`, `ci` and `verify`
+# name the whole gate by convention (verify is Maven's lifecycle word and
+# common in makefiles), whereas `test` is one part of it and demanding it
+# would let a lint-failing PR through while looking satisfied, and `all` is
+# the default build, not a check. Each detector carries its own list
+# (#625): Rake's `default` is a gate where make's is not.
+GATE_TARGETS = ("check", "ci", "verify")
+RAKE_TARGETS = ("ci", "check", "default")
+COMPOSER_TARGETS = ("check", "ci")
+# `check` is a cargo built-in and a `[alias] check` is silently shadowed by
+# it, so only `ci` names a gate here.
+CARGO_ALIASES = ("ci",)
 
 
-def _target_gate(workspace: Path, files: Sequence[str], pattern: str, command: str) -> str | None:
+def _read(path: Path) -> str | None:
+    """The file's text, or None when it is not a readable file."""
+    try:
+        if not path.is_file():
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _target_gate(
+    workspace: Path,
+    files: Sequence[str],
+    pattern: str,
+    command: str,
+    targets: Sequence[str] = GATE_TARGETS,
+) -> str | None:
     """First declared target in the first of ``files`` that exists.
 
     Only the first file is consulted: make, just and task each read one, so
     a target in a shadowed file is not the gate the tool would run.
     """
     for name in files:
-        path = workspace / name
-        try:
-            if not path.is_file():
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = _read(workspace / name)
+        if text is None:
             continue
-        for target in GATE_TARGETS:
+        for target in targets:
             if re.search(pattern.format(target=re.escape(target)), text, re.M):
                 return command.format(target=target)
         return None
@@ -362,17 +383,77 @@ def _task_gate(workspace: Path) -> str | None:
     )
 
 
-def _npm_gate(workspace: Path) -> str | None:
-    path = workspace / "package.json"
-    try:
-        scripts = json.loads(path.read_text(encoding="utf-8", errors="replace")).get("scripts")
-    except (OSError, ValueError, AttributeError):
+def _rake_gate(workspace: Path) -> str | None:
+    # `task :ci do`, `task ci: [...]`, `task "check" => ...`, `task default:`.
+    return _target_gate(
+        workspace,
+        ("Rakefile", "rakefile", "Rakefile.rb"),
+        r"^\s*task\s*\(?\s*(?::{target}\b|{target}\s*:|['\"]{target}['\"])",
+        "bundle exec rake {target}",
+        RAKE_TARGETS,
+    )
+
+
+def _json_object(path: Path, key: str) -> dict[str, Any] | None:
+    """``key``'s object in a JSON file, or None for anything else."""
+    text = _read(path)
+    if text is None:
         return None
-    if not isinstance(scripts, dict):
+    try:
+        value = json.loads(text).get(key)
+    except (ValueError, AttributeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+# The client a package.json's scripts run under (#626), strongest signal
+# first: corepack's `packageManager` declaration, then the lockfile. `npm
+# run` in a pnpm workspace fails outright on `workspace:` dependencies, so
+# it would be a gate the executor cannot satisfy.
+_LOCKFILE_CLIENTS: tuple[tuple[str, str], ...] = (
+    ("pnpm-lock.yaml", "pnpm run"),
+    ("yarn.lock", "yarn"),
+    ("bun.lockb", "bun run"),
+    ("bun.lock", "bun run"),
+)
+_PACKAGE_MANAGER_CLIENTS = {"pnpm": "pnpm run", "yarn": "yarn", "bun": "bun run", "npm": "npm run"}
+
+
+def node_script_runner(workspace: Path) -> str:
+    """How to run a script declared in ``workspace``'s package.json."""
+    text = _read(workspace / "package.json")
+    if text is not None:
+        try:
+            declared = json.loads(text).get("packageManager")
+        except (ValueError, AttributeError):
+            declared = None
+        if isinstance(declared, str):
+            name = declared.split("@", 1)[0].strip()
+            if name in _PACKAGE_MANAGER_CLIENTS:
+                return _PACKAGE_MANAGER_CLIENTS[name]
+    for lockfile, client in _LOCKFILE_CLIENTS:
+        if (workspace / lockfile).is_file():
+            return client
+    return "npm run"
+
+
+def _npm_gate(workspace: Path) -> str | None:
+    scripts = _json_object(workspace / "package.json", "scripts")
+    if scripts is None:
         return None
     for target in GATE_TARGETS:
         if target in scripts:
-            return f"npm run {target}"
+            return f"{node_script_runner(workspace)} {target}"
+    return None
+
+
+def _composer_gate(workspace: Path) -> str | None:
+    scripts = _json_object(workspace / "composer.json", "scripts")
+    if scripts is None:
+        return None
+    for target in COMPOSER_TARGETS:
+        if target in scripts:
+            return f"composer run {target}"
     return None
 
 
@@ -386,26 +467,124 @@ def _nox_gate(workspace: Path) -> str | None:
     return "nox" if (workspace / "noxfile.py").is_file() else None
 
 
+def _gradle_gate(workspace: Path) -> str | None:
+    # `check` is Gradle's built-in lifecycle gate; the wrapper script is the
+    # declaration of how to run it (and the only Gradle the sandbox has —
+    # the java toolchain ships Maven, not Gradle).
+    if not (workspace / "gradlew").is_file():
+        return None
+    if any((workspace / name).is_file() for name in ("build.gradle", "build.gradle.kts")):
+        return "./gradlew check"
+    return None
+
+
+def _maven_gate(workspace: Path) -> str | None:
+    # `verify` is Maven's lifecycle gate; a wrapper is preferred when the
+    # project ships one, else the toolchain's mvn.
+    if not (workspace / "pom.xml").is_file():
+        return None
+    return "./mvnw -q verify" if (workspace / "mvnw").is_file() else "mvn -q verify"
+
+
+def _cargo_alias_gate(workspace: Path) -> str | None:
+    for name in (".cargo/config.toml", ".cargo/config"):
+        text = _read(workspace / name)
+        if text is None:
+            continue
+        try:
+            aliases = tomllib.loads(text).get("alias")
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return None
+        if not isinstance(aliases, dict):
+            return None
+        for alias in CARGO_ALIASES:
+            if alias in aliases:
+                return f"cargo {alias}"
+        return None
+    return None
+
+
+# Language-native gates for the ecosystems whose build tool IS the gate
+# (#625): nothing to declare, so nothing to read — the manifest at the root
+# is the declaration, and the command is satisfiable by construction on the
+# toolchain that manifest resolved. Go has no task-runner convention at all,
+# which is why it is here and not above.
+def _go_gate(workspace: Path) -> str | None:
+    return "go vet ./... && go test ./..." if (workspace / "go.mod").is_file() else None
+
+
+def _cargo_gate(workspace: Path) -> str | None:
+    return "cargo test" if (workspace / "Cargo.toml").is_file() else None
+
+
+def _dotnet_gate(workspace: Path) -> str | None:
+    # `dotnet test` needs exactly one solution or project file in the
+    # directory to know what to build.
+    try:
+        names = [p.name for p in workspace.iterdir() if p.is_file()]
+    except OSError:
+        return None
+    solutions = [n for n in names if n.endswith(".sln")]
+    projects = [n for n in names if n.endswith((".csproj", ".fsproj"))]
+    if len(solutions) == 1 or (not solutions and len(projects) == 1):
+        return "dotnet test"
+    return None
+
+
+@dataclass(frozen=True)
+class GateDetector:
+    """One convention: the detector, and the toolchain its command needs.
+
+    ``language`` is None for a task runner (make, just, task) that any
+    sandbox has; otherwise the registry name whose toolchain must be in
+    the run's resolved set (#624) for the command to be runnable at all.
+    Rule: a detector may only emit a command the resolved toolchain can
+    run — a gate the executor cannot invoke is unsatisfiable, not strict.
+    """
+
+    detect: Callable[[Path], str | None]
+    language: str | None = None
+
+
 # Order matters only where a repo declares more than one; the first is taken.
 # Task runners come before language runners because a repo carrying both has
-# usually made the task runner the front door.
-GATE_DETECTORS: tuple[Callable[[Path], str | None], ...] = (
-    _make_gate,
-    _just_gate,
-    _task_gate,
-    _npm_gate,
-    _tox_gate,
-    _nox_gate,
+# usually made the task runner the front door; the language-native
+# fallbacks come last, after every declaration.
+GATE_DETECTORS: tuple[GateDetector, ...] = (
+    GateDetector(_make_gate),
+    GateDetector(_just_gate),
+    GateDetector(_task_gate),
+    GateDetector(_npm_gate, "javascript"),
+    GateDetector(_tox_gate, "python"),
+    GateDetector(_nox_gate, "python"),
+    GateDetector(_rake_gate, "ruby"),
+    GateDetector(_composer_gate, "php"),
+    GateDetector(_gradle_gate, "java"),
+    GateDetector(_maven_gate, "java"),
+    GateDetector(_cargo_alias_gate, "rust"),
+    GateDetector(_go_gate, "go"),
+    GateDetector(_cargo_gate, "rust"),
+    GateDetector(_dotnet_gate, "dotnet"),
 )
 
 
-def project_gate(workspace: Path | None, override: str | None = None) -> str | None:
+def project_gate(
+    workspace: Path | None,
+    override: str | None = None,
+    *,
+    languages: Sequence[str] | None = None,
+) -> str | None:
     """The command running this project's whole gate, or None if it has none.
 
     ``override`` is the operator's answer (``[sandbox] gate_command``) and
     wins over every detector — the escape hatch for a project whose gate no
     convention describes, and, set to an empty string, the way to say "this
     project has no gate" and switch the requirement off.
+
+    ``languages`` is the run's resolved toolchain set (#624): a detector
+    whose command needs a toolchain outside it is not consulted, because
+    the command could not run. None (no resolution at hand — embedders,
+    tests) consults every detector.
 
     A project that declares nothing gets nothing required of it. A guessed
     requirement is worse than none: the executor cannot edit verify commands,
@@ -415,8 +594,14 @@ def project_gate(workspace: Path | None, override: str | None = None) -> str | N
         return override.strip() or None
     if workspace is None:
         return None
-    for detect in GATE_DETECTORS:
-        gate = detect(workspace)
+    for detector in GATE_DETECTORS:
+        if (
+            languages is not None
+            and detector.language is not None
+            and detector.language not in languages
+        ):
+            continue
+        gate = detector.detect(workspace)
         if gate:
             return gate
     return None
