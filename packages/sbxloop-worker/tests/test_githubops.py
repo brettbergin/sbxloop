@@ -194,7 +194,10 @@ class TestChecksFailedLogs:
         )
         out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc", "max_chars": 4000}, t)
         assert isinstance(out, dict)
-        assert t.calls == [("GET", "/repos/o/r/commits/abc/check-runs", None)]
+        assert t.calls == [
+            ("GET", "/repos/o/r/commits/abc/check-runs", None),
+            ("GET", "/repos/o/r/commits/abc/status", None),
+        ]
         assert t.text_calls == [("GET", "/repos/o/r/actions/jobs/77/logs")]
         (check,) = out["checks"]
         assert (check["name"], check["conclusion"]) == ("unit", "failure")
@@ -251,6 +254,59 @@ class TestChecksFailedLogs:
         assert lines[0] == "(logs unavailable: HTTP 410)"
         assert "Job timed out" in check["excerpt"]
         assert "after 6h" in check["excerpt"]
+
+    def test_red_commit_statuses_are_reported_with_their_description(self) -> None:
+        """The Status API side of #610: a failing Jenkins/Buildkite context
+        has no log to fetch, only a description and a target_url — both go
+        through so the host brief can point at the link (#629). Green and
+        pending contexts are skipped; ``error`` is red like ``failure``."""
+        t = RecordingTransport(
+            {
+                **check_runs(check_run("unit", "success")),
+                "/repos/o/r/commits/abc/status": {
+                    "state": "failure",
+                    "statuses": [
+                        {"context": "codecov", "state": "success", "description": "90%"},
+                        {"context": "buildkite/x", "state": "pending", "description": "running"},
+                        {
+                            "context": "ci/jenkins",
+                            "state": "failure",
+                            "target_url": "https://jenkins/42",
+                            "description": "Build #42 failed: 2 tests",
+                        },
+                        {"context": "flaky-bot", "state": "error", "target_url": ""},
+                    ],
+                },
+            }
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert t.text_calls == []
+        assert out == {
+            "checks": [
+                {
+                    "name": "ci/jenkins",
+                    "conclusion": "failure",
+                    "details_url": "https://jenkins/42",
+                    "excerpt": "Build #42 failed: 2 tests",
+                },
+                {"name": "flaky-bot", "conclusion": "error", "details_url": "", "excerpt": ""},
+            ]
+        }
+
+    def test_a_red_check_run_and_a_red_status_both_appear(self) -> None:
+        t = RecordingTransport(
+            {
+                **check_runs(
+                    check_run("unit", "failure", app="some-bot", output={"title": "boom"})
+                ),
+                "/repos/o/r/commits/abc/status": {
+                    "statuses": [{"context": "ci/jenkins", "state": "failure"}]
+                },
+            }
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert [c["name"] for c in out["checks"]] == ["unit", "ci/jenkins"]
 
     def test_logs_error_without_status_quotes_the_message(self) -> None:
         t = RecordingTransport(

@@ -403,10 +403,30 @@ class TestFixBrief:
                 FailedCheck("test", "timed_out", "   ", "https://y"),
             ],
         )
-        assert "Failing checks, with their log output:" in brief
-        assert "#### `lint` (failure)\n\n```\nE501 line too long (src/app.py:3)\n```" in brief
-        assert "#### `test` (timed_out)\n\n```\n(no log output was available)\n```" in brief
+        assert "Failing checks, with their log output where it could be read:" in brief
+        assert (
+            "#### `lint` (failure) — https://x\n\n```\nE501 line too long (src/app.py:3)\n```"
+            in brief
+        )
         assert "run the project's own gate here before you finish" in brief
+
+    def test_a_check_without_a_log_points_at_its_link_not_a_placeholder(self) -> None:
+        """A commit status, or an Actions job whose log the token cannot
+        read, has only a name and a URL. The brief says so and tells the
+        agent to reproduce locally, instead of a placeholder that reads
+        like an empty log (#629)."""
+        brief = fix_brief(
+            pr_number=9,
+            kind="ci",
+            why="1 of 2 check(s) failed: ci/jenkins",
+            round=2,
+            failed_checks=[FailedCheck("ci/jenkins", "failure", "   ", "https://jenkins/42")],
+        )
+        assert "#### `ci/jenkins` (failure) — https://jenkins/42\n\n" in brief
+        assert "not readable from here" in brief
+        assert "Reproduce the failure with the project's own gate" in brief
+        assert "(no log output was available)" not in brief
+        assert "```" not in brief.split("#### `ci/jenkins`")[1].split("Make these pass")[0]
 
     def test_human_objections_are_quoted_verbatim(self) -> None:
         brief = fix_brief(

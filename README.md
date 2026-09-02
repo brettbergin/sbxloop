@@ -178,9 +178,15 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   the fix brief makes it a regression test that fails first, asks for the
   adjacent cases the same code path sees, and shows the fixer what earlier
   rounds decided — so rounds stop converging one case at a time.
-- **CI** — the delivered head's check runs are polled; red fetches the
-  failing jobs' logs into the next fix brief. "No check runs yet" only
-  counts as "no CI" once it has persisted for `ci_settle_s`.
+- **CI** — the delivered head's check runs *and* commit statuses are
+  polled (GitHub Actions and Checks-API apps alongside Jenkins, Buildkite,
+  Travis, Codecov and anything else that reports through the Status API);
+  red fetches the failing jobs' logs into the next fix brief, and a check
+  whose log cannot be read from the sandbox (a commit status, or an
+  Actions job the token cannot see) is briefed with its link and an
+  instruction to reproduce with the project gate. "Nothing has reported"
+  on either API only counts as "no CI" once it has persisted for
+  `ci_settle_s`.
 - **Land** — un-draft, update the branch if protection wants it current,
   merge with the head the review actually judged (a push that landed since
   loses the race rather than being merged over). Then, and only then, the

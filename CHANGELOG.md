@@ -6,6 +6,30 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Commit statuses count as CI** (#610). The CI gate read only the
+  Checks API, so a repository whose CI reports through the older Status
+  API — Jenkins, Buildkite, Travis, CircleCI's default integration,
+  Codecov, most org bots — looked like a repository with no CI at all,
+  and its red delivered head was settled as done. `pr_checks` now reads
+  `/commits/{sha}/status` alongside `/commits/{sha}/check-runs` and folds
+  both into one verdict (red beats pending beats green; `failure` and
+  `error` are both red; names are the check name or the status context,
+  untagged, so they match branch protection's required contexts). The
+  fold keys on the `statuses` list, never the payload's top-level
+  `state`, because GitHub reports `pending` for a commit with no statuses
+  — reading that would deadlock every Checks-only repository. "No CI"
+  now means both lists empty. The failed-logs op reports red statuses
+  too, carrying the status `description` and `target_url`.
+- **A check without a readable log is briefed as such** (#629, minimum).
+  The fix brief used to show `(no log output was available)` under a
+  failing check, which reads like an empty log. It now shows the check's
+  link next to its name, says the log is not readable from the sandbox,
+  and tells the fixer to reproduce the failure with the project's own
+  gate before changing anything. Every failing check's `details_url` /
+  `target_url` is now in the brief.
+
 ### Added
 
 - **Toolchains are detected from the workspace** (#624, #616, #644). A run

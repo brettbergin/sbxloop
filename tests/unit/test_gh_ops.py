@@ -202,6 +202,40 @@ class TestGithubOpsFacade:
             ops.blobs_create_many("o/r", [{"path": "a.txt", "content_b64": "YQ=="}])
 
 
+class TestPrChecks:
+    def test_reads_check_runs_and_commit_statuses(self) -> None:
+        """Both namespaces, one verdict (#610): a red Jenkins status turns a
+        green Actions run red, and both GETs go through the github worker."""
+        client = PathStubClient(
+            {
+                "/repos/o/r/commits/abc/check-runs": {
+                    "check_runs": [{"name": "unit", "conclusion": "success"}]
+                },
+                "/repos/o/r/commits/abc/status": {
+                    "state": "failure",
+                    "statuses": [{"context": "ci/jenkins", "state": "failure"}],
+                },
+            }
+        )
+        verdict = GithubOps(client, "r1").pr_checks("o/r", "abc")
+        assert verdict.state == "red"
+        assert verdict.total == 2
+        assert verdict.failed == ("ci/jenkins",)
+        assert [job.params["path"] for job in client.jobs] == [
+            "/repos/o/r/commits/abc/check-runs",
+            "/repos/o/r/commits/abc/status",
+        ]
+
+    def test_no_checks_and_no_statuses_is_green(self) -> None:
+        client = PathStubClient(
+            {
+                "/repos/o/r/commits/abc/check-runs": {"check_runs": []},
+                "/repos/o/r/commits/abc/status": {"state": "pending", "statuses": []},
+            }
+        )
+        assert GithubOps(client, "r1").pr_checks("o/r", "abc").state == "green"
+
+
 class TestChecksFailedLogs:
     def test_maps_entries_and_doubles_the_timeout(self) -> None:
         ops, client = make_ops(
