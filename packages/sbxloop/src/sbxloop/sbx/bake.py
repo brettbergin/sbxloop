@@ -110,10 +110,20 @@ def bake_template(
             template=base_template,
             # Same allows a run's agent sandbox gets, so the wheel deps, the
             # dev-tools apt ensure, and the Copilot runtime download all
-            # resolve during the bake.
+            # resolve during the bake — including the configured
+            # toolchains' installer hosts (#616). Config languages only:
+            # there is no workspace to detect from at bake time.
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
-                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, config.policy.deny),
+                *baseline_allows(
+                    (
+                        *PROMPT_ADVERTISED_DOMAINS,
+                        *toolchains.install_domains(
+                            toolchains.resolve(config.sandbox.effective_languages)
+                        ),
+                    ),
+                    config.policy.deny,
+                ),
                 *config.sandbox.extra_allow_domains,
             ],
         )

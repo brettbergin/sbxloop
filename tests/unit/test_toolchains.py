@@ -459,3 +459,77 @@ def test_python_leaves_the_system_interpreter_alone() -> None:
     assert "/usr/local/bin/python3 " not in python.install_script
     assert "/usr/local/bin/python3;" not in python.install_script
     assert not python.install_script.endswith("/usr/local/bin/python3")
+
+
+# -- #624 / #616: detection and installer hosts -----------------------------
+
+
+def test_every_language_declares_manifests() -> None:
+    # A registry entry detection can never select is a language that only
+    # works with explicit config — the default-to-Python trap #624 removes.
+    for toolchain in toolchains.TOOLCHAINS:
+        assert toolchain.manifests, toolchain.name
+
+
+def test_installer_entries_declare_their_hosts() -> None:
+    # Every https:// host an install script fetches from is in the entry's
+    # install_domains (the redirect targets are extra; they cannot be read
+    # off the script). Colocation is the point of the field: a CDN change
+    # in the URL that forgets the allowlist fails here, not in a sandbox.
+    for toolchain in (*toolchains.TOOLCHAINS, toolchains.CLAUDE_CODE):
+        script = toolchain.install_script or ""
+        for host in re.findall(r"https://([a-zA-Z0-9.-]+)", script):
+            assert host in toolchain.install_domains, (toolchain.name, host)
+
+
+def test_apt_only_entries_open_no_hosts() -> None:
+    for name in ("cpp", "ruby", "java"):
+        assert toolchains.resolve([name])[0].install_domains == ()
+
+
+def test_install_domains_pools_without_duplicates() -> None:
+    domains = toolchains.install_domains(toolchains.resolve(["typescript", "javascript"]))
+    assert domains == ("nodejs.org", "registry.npmjs.org")
+
+
+def test_detect_reads_root_and_two_levels_only(tmp_path: Path) -> None:
+    (tmp_path / "go.mod").write_text("module x\n")
+    (tmp_path / "packages/ui").mkdir(parents=True)
+    (tmp_path / "packages/ui/package.json").write_text("{}\n")
+    (tmp_path / "packages/ui/deep").mkdir()
+    (tmp_path / "packages/ui/deep/Cargo.toml").write_text("[package]\n")
+    found = toolchains.detect_languages(tmp_path)
+    assert found == {"javascript": ("package.json",), "go": ("go.mod",)}
+    # registry order, not discovery order
+    assert list(found) == ["javascript", "go"]
+
+
+@pytest.mark.parametrize("skipped", [".git", ".venv", "node_modules", "vendor"])
+def test_detect_skips_dependency_and_dot_directories(tmp_path: Path, skipped: str) -> None:
+    (tmp_path / skipped).mkdir()
+    (tmp_path / skipped / "package.json").write_text("{}\n")
+    assert toolchains.detect_languages(tmp_path) == {}
+
+
+def test_detect_matches_suffix_patterns(tmp_path: Path) -> None:
+    (tmp_path / "App.csproj").write_text("<Project/>\n")
+    (tmp_path / "widget.gemspec").write_text("Gem::Specification.new\n")
+    found = toolchains.detect_languages(tmp_path)
+    assert found == {"ruby": ("widget.gemspec",), "dotnet": ("App.csproj",)}
+
+
+def test_detect_on_a_missing_workspace_is_empty(tmp_path: Path) -> None:
+    assert toolchains.detect_languages(tmp_path / "absent") == {}
+
+
+def test_resolve_languages_explicit_wins_over_manifests(tmp_path: Path) -> None:
+    (tmp_path / "go.mod").write_text("module x\n")
+    resolved = toolchains.resolve_languages(["rust"], tmp_path)
+    assert resolved == toolchains.LanguageResolution(("rust",), "config", {})
+
+
+def test_resolve_languages_falls_back_to_default_last(tmp_path: Path) -> None:
+    assert toolchains.resolve_languages((), tmp_path) == toolchains.LanguageResolution(
+        toolchains.DEFAULT_LANGUAGES, "default", {}
+    )
+    assert toolchains.resolve_languages((), None).source == "default"

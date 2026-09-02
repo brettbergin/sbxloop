@@ -19,6 +19,14 @@ Each entry carries the three things the ensure needs and nothing else:
 - ``install_script`` — a ``sh -c`` script for the direct/official-installer
   path, run after the apt batch (installers frequently need curl/ca-certs
   that the batch pulls in).
+- ``install_domains`` — the hosts that script downloads from (#616). They
+  are seeded into the agent sandbox's egress allowlist for the *selected*
+  toolchains only, so the installer works under a default-deny preset and
+  a language nobody asked for opens no host. Colocated with the URL so a
+  CDN change cannot drift the two apart.
+- ``manifests`` — the files whose presence in a workspace means "this
+  project is written in this language" (#624). ``detect_languages`` reads
+  them so a run on a Go repo gets Go without an operator editing config.
 
 Per the #140 decision the convention is **apt where viable, direct/official
 installer otherwise** — "viable" meaning the distro package is complete and
@@ -35,15 +43,21 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, NamedTuple
 
 __all__ = [
     "BASELINE_TOOLS",
     "DEFAULT_LANGUAGES",
     "GIT",
     "TOOLCHAINS",
+    "LanguageResolution",
     "Toolchain",
+    "detect_languages",
+    "install_domains",
     "normalize_language",
     "resolve",
+    "resolve_languages",
     "supported_languages",
 ]
 
@@ -71,6 +85,14 @@ class Toolchain:
     # probed and installed first — TypeScript needs the Node runtime present
     # before `npm i -g typescript` can mean anything.
     requires: tuple[str, ...] = ()
+    # Hosts ``install_script`` fetches from, plus the redirect targets those
+    # hosts answer with (a redirect to an unlisted host fails the download
+    # just as surely as the original host being blocked). Empty for pure-apt
+    # entries: the mirrors are in the always-reachable baseline already.
+    install_domains: tuple[str, ...] = ()
+    # Workspace files that identify a project of this language. A plain
+    # name matches exactly; a ``*.ext`` pattern matches by suffix.
+    manifests: tuple[str, ...] = ()
 
 
 def _arch_dispatch(cases: dict[str, tuple[str, str]]) -> str:
@@ -159,6 +181,18 @@ PYTHON = Toolchain(
         f'UV_PYTHON_INSTALL_MIRROR="{UV_PYTHON_INSTALL_MIRROR}" uv python install {PYTHON_SERIES}; '
         f'sudo -n ln -sf "$(uv python find {PYTHON_SERIES})" /usr/local/bin/python{PYTHON_SERIES}'
     ),
+    # The uv tarball and uv's managed interpreter are both GitHub release
+    # assets; github.com answers with a redirect to release-assets.
+    install_domains=("github.com", "release-assets.githubusercontent.com"),
+    manifests=(
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "Pipfile",
+        "uv.lock",
+        "poetry.lock",
+    ),
     aliases=("py", "python3"),
 )
 
@@ -180,6 +214,7 @@ CPP = Toolchain(
     # that are already in the always-reachable baseline. build-essential
     # brings gcc, g++, make, and libc headers.
     apt_packages=("build-essential", "cmake", "ninja-build", "pkg-config"),
+    manifests=("CMakeLists.txt", "meson.build", "configure.ac"),
     aliases=("c", "c++", "cxx", "c-cpp"),
 )
 
@@ -196,6 +231,7 @@ RUBY = Toolchain(
     # `ruby` is installed. build-essential is shared with cpp and installs
     # once thanks to the pooled apt call.
     apt_packages=("ruby-full", "ruby-dev", "bundler", "build-essential"),
+    manifests=("Gemfile", "Rakefile", "*.gemspec"),
     aliases=("rb",),
 )
 
@@ -249,6 +285,13 @@ JAVA = Toolchain(
     install_script=_persist_env(
         "JAVA_HOME", '$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")'
     ),
+    manifests=(
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    ),
     aliases=("jdk", "jvm"),
 )
 
@@ -295,6 +338,8 @@ PHP = Toolchain(
         f"sudo -n install -m 0755 {_COMPOSER_PHAR} /usr/local/bin/composer; "
         f"rm -f {_COMPOSER_PHAR}"
     ),
+    install_domains=("getcomposer.org",),
+    manifests=("composer.json",),
 )
 
 
@@ -336,6 +381,8 @@ NODE = Toolchain(
         "sudo -n rm -f /usr/local/CHANGELOG.md /usr/local/LICENSE /usr/local/README.md; "
         f"rm -f {_NODE_TARBALL}"
     ),
+    install_domains=("nodejs.org",),
+    manifests=("package.json",),
     aliases=("js", "node", "nodejs", "javascript-node"),
 )
 
@@ -360,6 +407,10 @@ TYPESCRIPT = Toolchain(
     install_script=(
         f"set -e; sudo -n npm install -g --no-fund --no-audit typescript@{TYPESCRIPT_VERSION}"
     ),
+    # `npm i -g typescript` resolves through the npm registry, which is in
+    # the always-reachable baseline; listed so the entry is self-describing.
+    install_domains=("registry.npmjs.org",),
+    manifests=("tsconfig.json",),
     aliases=("ts",),
 )
 
@@ -398,6 +449,10 @@ GO = Toolchain(
         "sudo -n ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt; "
         f"rm -f {_GO_TARBALL}"
     ),
+    # go.dev/dl answers with a redirect to Google's download CDN — the same
+    # trap release-assets is listed for on the Python entry.
+    install_domains=("go.dev", "dl.google.com"),
+    manifests=("go.mod",),
     aliases=("golang",),
 )
 
@@ -461,6 +516,8 @@ RUST = Toolchain(
         'sudo -n ln -sf "$HOME/.cargo/bin/$shim" "/usr/local/bin/$shim"; done; '
         f"rm -f {_RUSTUP_INIT}"
     ),
+    install_domains=("static.rust-lang.org",),
+    manifests=("Cargo.toml",),
     aliases=("rs", "cargo"),
 )
 
@@ -518,6 +575,8 @@ DOTNET = Toolchain(
         + "; "
         f"rm -f {_DOTNET_TARBALL}"
     ),
+    install_domains=("builds.dotnet.microsoft.com",),
+    manifests=("global.json", "Directory.Build.props", "*.sln", "*.csproj", "*.fsproj"),
     aliases=("csharp", "c#", "net", "dotnet-sdk"),
 )
 
@@ -568,13 +627,21 @@ CLAUDE_CODE = Toolchain(
     probe="command -v claude >/dev/null",
     install_script="sudo -n npm install -g @anthropic-ai/claude-code",
     requires=("javascript",),
+    install_domains=("registry.npmjs.org",),
 )
 
-# What a run provisions when `[sandbox] languages` is unset. Python has had
-# this head start since 0.4.0 and keeping it as the default means #140
-# changes nothing for existing runs; an explicit `languages` REPLACES it,
-# so nothing is hardcoded as privileged once an operator has an opinion.
+# What a run provisions when `[sandbox] languages` is unset AND the
+# workspace declares nothing detect_languages recognizes. Python has had
+# this head start since 0.4.0; since #624 it is the last resort rather than
+# the default — a workspace with a go.mod gets Go, not Python — and an
+# explicit `languages` REPLACES both, so nothing is hardcoded as privileged
+# once an operator has an opinion.
 DEFAULT_LANGUAGES: tuple[str, ...] = ("python",)
+
+# Subdirectory names detect_languages never descends into: dependency and
+# tool trees carry other ecosystems' manifests (a Python repo's node_modules
+# is full of package.json), and dot-directories are tooling, not project.
+_SKIP_DIRS = frozenset({"node_modules", "vendor", "third_party", "site-packages"})
 
 _BY_KEY: dict[str, Toolchain] = {}
 for _toolchain in TOOLCHAINS:
@@ -625,3 +692,117 @@ def apt_packages(toolchains: Iterable[Toolchain]) -> tuple[str, ...]:
             if package not in packages:
                 packages.append(package)
     return tuple(packages)
+
+
+def install_domains(toolchains: Iterable[Toolchain]) -> tuple[str, ...]:
+    """The union of installer hosts for ``toolchains``, deduped, order-stable."""
+    domains: list[str] = []
+    for toolchain in toolchains:
+        for domain in toolchain.install_domains:
+            if domain not in domains:
+                domains.append(domain)
+    return tuple(domains)
+
+
+def _manifest_matches(name: str, manifests: Iterable[str]) -> bool:
+    for pattern in manifests:
+        if pattern.startswith("*."):
+            if name.endswith(pattern[1:]):
+                return True
+        elif name == pattern:
+            return True
+    return False
+
+
+# How far below the root detect_languages reads. Two levels, not a full
+# walk: monorepos put their packages at `packages/<name>/` or `apps/<name>/`
+# (a pnpm workspace's tsconfig.json lives there, not at the root), while
+# descending further starts reading fixtures and dependency trees — the
+# false positives outweigh the finds.
+_DETECT_DEPTH = 2
+
+
+def _candidate_files(workspace: Path) -> list[str]:
+    """Names of the files at the workspace root and up to ``_DETECT_DEPTH``
+    levels down, skipping dot-directories and dependency trees.
+
+    A workspace that does not exist yields nothing rather than raising: the
+    per-run dir of a workspace-less run is legitimately empty.
+    """
+    names: list[str] = []
+    pending = [(workspace, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_file():
+                names.append(entry.name)
+            elif (
+                depth < _DETECT_DEPTH
+                and entry.is_dir()
+                and not entry.name.startswith(".")
+                and entry.name not in _SKIP_DIRS
+            ):
+                pending.append((entry, depth + 1))
+    return names
+
+
+def detect_languages(workspace: Path) -> dict[str, tuple[str, ...]]:
+    """Which registry languages ``workspace`` declares, and on what evidence.
+
+    Pure filesystem read, no process spawn, bounded at ``_DETECT_DEPTH``
+    levels below the root. Returns ``{language: signals}`` in registry
+    order — the signals being the manifest names that matched, so the run
+    event can say *why* Go was provisioned. Union, not "best guess": a repo
+    with both ``pyproject.toml`` and ``package.json`` needs both toolchains,
+    and provisioning an extra one costs seconds while missing one costs
+    revision budget.
+    """
+    names = _candidate_files(workspace)
+    found: dict[str, tuple[str, ...]] = {}
+    for toolchain in TOOLCHAINS:
+        signals = tuple(
+            sorted({name for name in names if _manifest_matches(name, toolchain.manifests)})
+        )
+        if signals:
+            found[toolchain.name] = signals
+    return found
+
+
+LanguageSource = Literal["config", "detected", "default"]
+
+
+class LanguageResolution(NamedTuple):
+    """The language set one run provisions, and where it came from.
+
+    ``source`` is what the ``sandbox.languages`` event reports: an operator
+    reading the run log can tell an explicit choice from an inference from
+    the fallback, which is the difference between "I asked for this" and
+    "sbxloop guessed" when the toolchain turns out wrong.
+    """
+
+    languages: tuple[str, ...]
+    source: LanguageSource
+    # manifest names per detected language — empty unless source is
+    # "detected"
+    signals: dict[str, tuple[str, ...]]
+
+
+def resolve_languages(explicit: Sequence[str], workspace: Path | None) -> LanguageResolution:
+    """Explicit ``[sandbox] languages`` → workspace detection → the default.
+
+    Explicit wins outright (an operator's opinion is never second-guessed
+    by a manifest); detection fires only when nothing is configured; the
+    default applies only when nothing was detected either. The result is
+    the ONE language set every consumer — egress allowlist, toolchain
+    install, verify-command lint — reads, resolved once per run (#624).
+    """
+    if explicit:
+        return LanguageResolution(tuple(explicit), "config", {})
+    detected = detect_languages(workspace) if workspace is not None else {}
+    if detected:
+        return LanguageResolution(tuple(detected), "detected", detected)
+    return LanguageResolution(DEFAULT_LANGUAGES, "default", {})

@@ -146,7 +146,14 @@ class SandboxConfig(_ConfigModel):
 
     @property
     def effective_languages(self) -> tuple[str, ...]:
-        """Languages to provision, applying the default for an unset list."""
+        """Languages to provision when there is no workspace to consult,
+        applying the default for an unset list.
+
+        A run resolves its set through ``toolchains.resolve_languages``
+        instead (#624), which lets the workspace's manifests speak before
+        the default does; this property is the config-only answer for the
+        contexts without a workspace — bake, the concierge sandbox.
+        """
         return tuple(self.languages) or DEFAULT_LANGUAGES
 
 

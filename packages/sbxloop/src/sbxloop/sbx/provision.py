@@ -42,14 +42,14 @@ import shlex
 import shutil
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from sbxloop import hostgit
+from sbxloop import hostgit, toolchains
 from sbxloop.config import Config, RepoConfig
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
@@ -304,10 +304,23 @@ class Provisioner:
     # -- spec construction -------------------------------------------------
 
     def build_specs(
-        self, run_id: str, workspace: Path, repo: str | None = None
+        self,
+        run_id: str,
+        workspace: Path,
+        repo: str | None = None,
+        *,
+        languages: Sequence[str] | None = None,
     ) -> tuple[SandboxSpec, SandboxSpec]:
+        """The agent and github specs for one run.
+
+        ``languages`` is the run's resolved toolchain set (see
+        :meth:`resolve_languages`); None means the config's own answer,
+        which is what callers without a workspace to detect from get.
+        """
         extra = tuple(self.config.sandbox.extra_allow_domains)
         template = self.config.sandbox.template
+        if languages is None:
+            languages = self.config.sandbox.effective_languages
         agent = SandboxSpec(
             name=sandbox_name(run_id, "agent"),
             role="agent",
@@ -319,11 +332,16 @@ class Provisioner:
             # before any plan-declared egress exists — the promise must not
             # depend on the operator's global sbx preset. Seeded through
             # baseline_allows so [policy] deny still wins over the tier that
-            # never asks for a grant.
+            # never asks for a grant. The selected toolchains' installer
+            # hosts ride the same tier (#616): a language nobody selected
+            # opens nothing.
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
                 *self._agent_extra_allows(),
-                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.config.policy.deny),
+                *baseline_allows(
+                    (*PROMPT_ADVERTISED_DOMAINS, *self._install_domains(languages)),
+                    self.config.policy.deny,
+                ),
                 *extra,
             ],
             secrets=[self._agent_secret_spec()],
@@ -339,6 +357,22 @@ class Provisioner:
             persistent_env=self.github_repo_env(repo),
         )
         return agent, github
+
+    def _install_domains(self, languages: Sequence[str]) -> tuple[str, ...]:
+        """Installer hosts for ``languages`` plus the backend's own runtime
+        prerequisite, minus anything the control-plane list already has."""
+        selected = list(toolchains.resolve(languages))
+        if self.agent_backend() == "claude":
+            selected.append(toolchains.CLAUDE_CODE)
+        return tuple(
+            d for d in toolchains.install_domains(selected) if d not in AGENT_ALLOW_DOMAINS
+        )
+
+    def resolve_languages(self, workspace: Path | None) -> toolchains.LanguageResolution:
+        """The language set a run on ``workspace`` provisions (#624):
+        ``[sandbox] languages`` when set, else what the workspace's manifests
+        declare, else the default."""
+        return toolchains.resolve_languages(self.config.sandbox.languages, workspace)
 
     # -- tokens ------------------------------------------------------------
 
@@ -517,7 +551,20 @@ class Provisioner:
         else:
             workspace = self._resolve_workspace(run_id, repo)
         workspace.mkdir(parents=True, exist_ok=True)
-        return self._provision_pair(run_id, workspace, repo)
+        # Resolved here, after the workspace exists and before any microVM
+        # does: the agent sandbox's egress allowlist is fixed at creation,
+        # so "which toolchains" has to be known before the spec is built —
+        # and it is decided exactly once, so the install and the lint
+        # cannot disagree with the allowlist.
+        languages = self.resolve_languages(workspace)
+        self.bus.emit(
+            "sandbox.languages",
+            run_id,
+            languages=list(languages.languages),
+            source=languages.source,
+            signals={k: list(v) for k, v in languages.signals.items()},
+        )
+        return self._provision_pair(run_id, workspace, repo, languages=languages)
 
     def _run_repo(self, repo: str | None) -> str | None:
         """The ``owner/name`` this run acts on, or None when there is none."""
@@ -785,7 +832,14 @@ class Provisioner:
         )
         return clone_dir
 
-    def _provision_pair(self, run_id: str, workspace: Path, repo: str | None = None) -> SandboxPair:
+    def _provision_pair(
+        self,
+        run_id: str,
+        workspace: Path,
+        repo: str | None = None,
+        *,
+        languages: toolchains.LanguageResolution | None = None,
+    ) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
         # no GitHub capability at all — and one less microVM to boot.
@@ -804,7 +858,9 @@ class Provisioner:
             "github": self._env_file_reason("github", gh_cred),
         }
 
-        agent_spec, github_spec = self.build_specs(run_id, workspace, repo)
+        agent_spec, github_spec = self.build_specs(
+            run_id, workspace, repo, languages=languages.languages if languages else None
+        )
         specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
         created: list[Sandbox] = []
         registered_secret_rms: list[Callable[[], bool]] = []
@@ -908,6 +964,7 @@ class Provisioner:
                 workspace=workspace,
                 agent_workdir=agent_workdir,
                 mounted=mounted,
+                languages=languages,
             )
         except Exception as exc:
             log.warning(
@@ -967,7 +1024,13 @@ class Provisioner:
             policy_allows=[
                 *AGENT_ALLOW_DOMAINS,
                 *self._agent_extra_allows(),
-                *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.config.policy.deny),
+                *baseline_allows(
+                    (
+                        *PROMPT_ADVERTISED_DOMAINS,
+                        *self._install_domains(self.config.sandbox.effective_languages),
+                    ),
+                    self.config.policy.deny,
+                ),
                 *self.config.sandbox.extra_allow_domains,
             ],
             secrets=[self._agent_secret_spec()],

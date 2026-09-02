@@ -212,6 +212,9 @@ class HostEventTypes:
     POLICY_ALLOW = "policy.allow"
     POLICY_DENY = "policy.deny"
     SANDBOX_PROVISION_START = "sandbox.provision_start"
+    # The language set this run provisions and where it came from
+    # (config / detected from the workspace / the default) — #624.
+    SANDBOX_LANGUAGES = "sandbox.languages"
     SANDBOX_READY = "sandbox.ready"
     SANDBOX_PREBAKED = "sandbox.prebaked"
     SANDBOX_CLEANUP = "sandbox.cleanup"

@@ -95,6 +95,20 @@ class TestBakeHappyPath:
         # templates carry software, never secrets
         assert fake_sbx.secrets() == []
 
+    def test_bake_allows_the_configured_toolchains_installer_hosts(
+        self, cli: SbxCLI, tmp_path: Path, fake_sbx: FakeSbx
+    ) -> None:
+        # #616: the bake installs the configured toolchains, so their
+        # installer hosts must be reachable in the scratch sandbox too.
+        config = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "sandbox": {"languages": ["go"]}}
+        )
+        script_install(fake_sbx)
+        bake_template(cli, config, name=BOX)
+        allows = [p[2] for p in fake_sbx.policies() if p[:2] == ["allow", "network"]]
+        assert "go.dev" in allows and "dl.google.com" in allows
+        assert "nodejs.org" not in allows
+
     def test_baked_template_seeds_new_sandboxes(
         self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
