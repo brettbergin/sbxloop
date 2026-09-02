@@ -148,6 +148,7 @@ from sbxloop.gh.ops import (
     ReviewComment,
     SubmittedReview,
     logins_match,
+    raw_pages,
 )
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
@@ -2101,10 +2102,10 @@ class LoopEngine:
         assert ops is not None and repo is not None
         stamp = f"<!-- sbxloop:review-record run={run_id} -->"
         try:
-            existing = ops.raw("GET", f"/repos/{repo}/issues/{number}/comments")
+            existing = raw_pages(ops, f"/repos/{repo}/issues/{number}/comments")
         except GithubOpsError:
             existing = []
-        for entry in existing if isinstance(existing, list) else []:
+        for entry in existing:
             if isinstance(entry, dict) and stamp in str(entry.get("body") or ""):
                 return True
         rounds = self._review_rounds(run_id)
@@ -2543,14 +2544,11 @@ class LoopEngine:
         label's issue list, which unlike search is not eventually consistent."""
         out: dict[str, str] = {}
         try:
-            data = ops.raw(
-                "GET",
-                f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all&per_page=100",
-            )
+            data = raw_pages(ops, f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all")
         except GithubOpsError:
             log.warning("run.followups_list_failed", repo=repo, exc_info=True)
             return out
-        for issue in data if isinstance(data, list) else []:
+        for issue in data:
             if not isinstance(issue, dict):
                 continue
             found = marker_key(str(issue.get("body") or ""))

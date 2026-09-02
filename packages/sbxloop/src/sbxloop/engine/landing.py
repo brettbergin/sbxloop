@@ -34,9 +34,11 @@ from sbxloop.gh.ops import (
     ChecksVerdict,
     FailedCheck,
     GithubOps,
+    PaginationError,
     ReviewThread,
     fold_reviews,
     logins_match,
+    raw_pages,
 )
 from sbxloop.log import get_logger
 
@@ -226,9 +228,7 @@ def human_objection(ops: GithubOps, repo: str, number: int, *, login: str) -> bo
     """Whether a reviewer other than the loop's own identity has a standing
     ``CHANGES_REQUESTED`` on the PR. The loop's own reviews are excluded
     rather than trusted: our verdict lives in the run, not on GitHub."""
-    payload = ops.raw("GET", f"/repos/{repo}/pulls/{number}/reviews")
-    if not isinstance(payload, list):
-        return False
+    payload = raw_pages(ops, f"/repos/{repo}/pulls/{number}/reviews")
     others = [
         review
         for review in payload
@@ -255,9 +255,9 @@ def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> l
     def login_of(entry: dict[str, Any]) -> str:
         return str((entry.get("user") or {}).get("login") or "")
 
-    payload = ops.raw("GET", f"/repos/{repo}/pulls/{number}/reviews")
+    payload = raw_pages(ops, f"/repos/{repo}/pulls/{number}/reviews")
     latest: dict[str, dict[str, Any]] = {}
-    for review in payload if isinstance(payload, list) else []:
+    for review in payload:
         if not isinstance(review, dict):
             continue
         who = login_of(review)
@@ -283,8 +283,8 @@ def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> l
                 body=str(review.get("body") or "").strip(),
             )
         )
-    comments = ops.raw("GET", f"/repos/{repo}/pulls/{number}/comments")
-    for comment in comments if isinstance(comments, list) else []:
+    comments = raw_pages(ops, f"/repos/{repo}/pulls/{number}/comments")
+    for comment in comments:
         if not isinstance(comment, dict):
             continue
         who = login_of(comment)
@@ -353,17 +353,22 @@ def unreconciled_threads(
 
 def _read_threads(
     ops: GithubOps, repo: str, number: int, *, tick: Tick
-) -> list[ReviewThread] | None:
+) -> list[ReviewThread] | Blocked:
     """The PR's inline threads, retried through transient failures.
 
-    ``None`` when GitHub would not answer in :data:`THREAD_READ_ATTEMPTS`
-    attempts — a one-off 502 must not strand a run that cleared every
-    other bar, but a persistently unreadable PR still blocks: "we could
-    not tell" is not "there is nothing to answer".
+    :class:`Blocked` when GitHub would not answer in
+    :data:`THREAD_READ_ATTEMPTS` attempts — a one-off 502 must not strand
+    a run that cleared every other bar, but a persistently unreadable PR
+    still blocks: "we could not tell" is not "there is nothing to answer".
+    A :class:`PaginationError` is that answer on the first read: the list
+    is longer than the loop will follow, and retrying does not shorten it.
     """
     for attempt in range(1, THREAD_READ_ATTEMPTS + 1):
         try:
             return list(ops.pr_review_threads(repo, number))
+        except PaginationError as exc:
+            log.warning("land.threads_unread", repo=repo, pr=number, error=str(exc))
+            return Blocked(f"its review threads were not all read: {exc}")
         except GithubOpsError as exc:
             log.warning(
                 "land.threads_unreadable",
@@ -374,7 +379,10 @@ def _read_threads(
             )
             if attempt < THREAD_READ_ATTEMPTS:
                 tick("threads")
-    return None
+    return Blocked(
+        "its review threads could not be read, so reconciliation cannot "
+        f"be confirmed (after {THREAD_READ_ATTEMPTS} attempts)"
+    )
 
 
 def _reconciliation_block(
@@ -405,11 +413,8 @@ def _reconciliation_block(
     answers non-blocking commenters.
     """
     threads = _read_threads(ops, repo, number, tick=tick)
-    if threads is None:
-        return Blocked(
-            "its review threads could not be read, so reconciliation cannot "
-            f"be confirmed (after {THREAD_READ_ATTEMPTS} attempts)"
-        )
+    if isinstance(threads, Blocked):
+        return threads
     if not threads:
         return None
     if not login:
@@ -431,7 +436,7 @@ def _reconciliation_block(
         if acked:
             emit("land.human_ack", pr=number, acked=acked)
         reread = _read_threads(ops, repo, number, tick=tick)
-        if reread is not None:
+        if not isinstance(reread, Blocked):
             loop_open, human_open = unreconciled_threads(reread, login=login)
     if loop_open:
         return Blocked(f"{len(loop_open)} review threads unreconciled: {', '.join(loop_open)}")

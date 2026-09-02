@@ -8,6 +8,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Review, comment, check, and thread reads are paginated** (#614).
+  Every GitHub list read took the first page (30 entries) as the whole
+  list, so on a busy pull request a standing `CHANGES_REQUESTED` past
+  the first page of reviews was invisible, inline comments past the
+  first page were never answered, and `reviewThreads` stopped at 100
+  threads / 50 comments per thread with no cursor — the exact silent
+  merge the reconciliation gate exists to prevent. REST list reads now
+  go through one `raw_pages` walk (`per_page=100`, following `page=`
+  to a short page: reviews, review comments, issue comments, the
+  follow-up dedupe's label issue list, check runs, commit statuses, the daemon's claim comments and label events;
+  the worker's `checks.failed_logs` walks the same way); the thread
+  listing follows `pageInfo.endCursor` and reads each thread's comments
+  at the connection maximum. Consistent with the gate's "we could not
+  tell is not there is nothing to answer": a list longer than ten full
+  pages, or a thread whose comments have a further page, raises
+  `PaginationError` — the landing gate blocks on it at once, naming
+  the thread, instead of retrying or judging a prefix.
+
 - **Commit statuses count as CI** (#610). The CI gate read only the
   Checks API, so a repository whose CI reports through the older Status
   API — Jenkins, Buildkite, Travis, CircleCI's default integration,
@@ -22,6 +40,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   — reading that would deadlock every Checks-only repository. "No CI"
   now means both lists empty. The failed-logs op reports red statuses
   too, carrying the status `description` and `target_url`.
+
 - **A check without a readable log is briefed as such** (#629, minimum).
   The fix brief used to show `(no log output was available)` under a
   failing check, which reads like an empty log. It now shows the check's

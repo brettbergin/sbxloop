@@ -26,7 +26,7 @@ import re
 import socket
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -34,7 +34,7 @@ from urllib.parse import quote
 
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import GithubOps
+from sbxloop.gh.ops import GithubOps, raw_pages
 from sbxloop.ghids import issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
@@ -83,11 +83,6 @@ def pid_alive(pid: int) -> bool:
     except OSError:
         return True  # unknown: assume alive, never reclaim on a guess
     return True
-
-
-# GitHub list endpoints page at 100; an issue with more history than this
-# many pages is not one the daemon should be arbitrating by comment anyway.
-_MAX_PAGES = 10
 
 
 class WorkSource(Protocol):
@@ -433,13 +428,12 @@ class GitHubIssueSource:
         counts) if the issue's events do not show one."""
         trigger = trigger or self.labels.trigger
         latest = ""
-        for events in self._pages(ops, f"{self._issue_path(number)}/events"):
-            for event in events:
-                if not isinstance(event, dict) or event.get("event") != "labeled":
-                    continue
-                label = event.get("label")
-                if isinstance(label, dict) and label.get("name") == trigger:
-                    latest = max(latest, str(event.get("created_at") or ""))
+        for event in raw_pages(ops, f"{self._issue_path(number)}/events"):
+            if not isinstance(event, dict) or event.get("event") != "labeled":
+                continue
+            label = event.get("label")
+            if isinstance(label, dict) and label.get("name") == trigger:
+                latest = max(latest, str(event.get("created_at") or ""))
         return latest
 
     def _claim_body(
@@ -496,25 +490,24 @@ class GitHubIssueSource:
         rows for :meth:`_stale`, which needs to see what came after."""
         claims: list[ClaimComment] = []
         rows: list[dict[str, Any]] = []
-        for comments in self._pages(ops, f"{self._issue_path(number)}/comments"):
-            for comment in comments:
-                if not isinstance(comment, dict):
-                    continue
-                rows.append(comment)
-                match = _CLAIM_RE.search(str(comment.get("body") or ""))
-                created = str(comment.get("created_at") or "")
-                if match is None or created < epoch:
-                    continue
-                pid = match.group("pid")
-                claims.append(
-                    ClaimComment(
-                        created,
-                        int(comment.get("id") or 0),
-                        match.group("token"),
-                        match.group("host") or "",
-                        int(pid) if pid else None,
-                    )
+        for comment in raw_pages(ops, f"{self._issue_path(number)}/comments"):
+            if not isinstance(comment, dict):
+                continue
+            rows.append(comment)
+            match = _CLAIM_RE.search(str(comment.get("body") or ""))
+            created = str(comment.get("created_at") or "")
+            if match is None or created < epoch:
+                continue
+            pid = match.group("pid")
+            claims.append(
+                ClaimComment(
+                    created,
+                    int(comment.get("id") or 0),
+                    match.group("token"),
+                    match.group("host") or "",
+                    int(pid) if pid else None,
                 )
+            )
         self._last_comments = rows
         claims.sort()
         return claims
@@ -585,15 +578,6 @@ class GitHubIssueSource:
             return False
         log.info("github.claim_settled", item=item.item_id, repo=self.repo, token=token)
         return True
-
-    def _pages(self, ops: GithubOps, path: str) -> Iterator[list[Any]]:
-        for page in range(1, _MAX_PAGES + 1):
-            data = ops.raw("GET", f"{path}?per_page=100&page={page}")
-            if not isinstance(data, list) or not data:
-                return
-            yield data
-            if len(data) < 100:
-                return
 
     def _delete_comment_quietly(self, number: str, comment_id: int | None) -> None:
         """Release the comment lock after a lost race or failed claim; a

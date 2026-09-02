@@ -27,7 +27,7 @@ from sbxloop.engine.landing import (
 )
 from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ReviewThread, ThreadComment
+from sbxloop.gh.ops import PaginationError, ReviewThread, ThreadComment
 from tests.fakes.fake_github import FakeGithub, human_review
 
 REPO = "o/r"
@@ -208,6 +208,31 @@ def gate_ack(fake: FakeGithub, run_id: str = "rgate1234") -> Any:
     )
 
 
+class TestManyThreads:
+    """#614 acceptance: one unanswered human thread among 150 blocks the
+    merge and is named."""
+
+    def test_one_unanswered_thread_in_150_blocks_and_is_named(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [
+            thread(
+                node_id=f"PRRT_{i}",
+                path="a.py",
+                line=i,
+                resolved=True,
+                comments=((LOGIN, "[minor] x"), (LOGIN, "addressed")),
+            )
+            for i in range(149)
+        ]
+        fake.threads.insert(
+            120, thread(node_id="PRRT_H", path="deep.py", line=7, comments=((HUMAN, "why?"),))
+        )
+        outcome = run_land(fake)
+        assert isinstance(outcome, Blocked)
+        assert outcome.why == "1 human review threads have no reply: deep.py:7"
+        assert fake.merges == []
+
+
 class TestThreadReadRetry:
     """A transient listing failure self-heals; a persistent one blocks
     with the attempt count — merging blind stays forbidden (#520)."""
@@ -224,6 +249,23 @@ class TestThreadReadRetry:
         assert isinstance(outcome, Blocked)
         assert "could not be read" in outcome.why
         assert "3 attempts" in outcome.why
+        assert fake.merges == []
+
+    def test_an_unread_page_blocks_at_once_without_retrying(self) -> None:
+        """A list longer than the walk follows does not get shorter on
+        retry (#614): block with the thread's name, no waiting."""
+        fake = FakeGithub()
+        fake.fail_always["pr_review_threads"] = PaginationError(
+            "review thread deep.py:42 (PRRT_9) has more comments than were read; "
+            "it cannot be judged reconciled"
+        )
+        waits: list[str] = []
+        outcome = run_land(fake, tick=waits.append)
+        assert isinstance(outcome, Blocked)
+        assert outcome.why.startswith(
+            "its review threads were not all read: review thread deep.py:42"
+        )
+        assert waits == []
         assert fake.merges == []
 
     def test_the_gate_waits_one_tick_between_attempts(self) -> None:

@@ -192,6 +192,60 @@ class TestHumanObjection:
         assert human_objection(fake, REPO, 7, login=LOGIN) is False
 
 
+class PagedFake(FakeGithub):
+    """FakeGithub whose review and review-comment lists are served in real
+    100-entry pages, so the landing readers' page walk is exercised."""
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        base, _, query = path.partition("?")
+        if method == "GET" and (base.endswith("/reviews") or base.endswith("/comments")):
+            self.raw_calls.append((method, path, body))
+            page = int(query.rsplit("page=", 1)[1]) if "page=" in query else 1
+            rows = self.reviews_payload if base.endswith("/reviews") else self.comments_payload
+            return list(rows[(page - 1) * 100 : page * 100])
+        return super().raw(method, path, body)
+
+
+class TestObjectionsAcrossPages:
+    """#614 acceptance: a standing CHANGES_REQUESTED past the first page of
+    reviews is still an objection, and inline comments on the second page
+    are still things to answer."""
+
+    def test_a_changes_requested_on_the_second_page_is_detected(self) -> None:
+        fake = PagedFake()
+        fake.reviews_payload = [
+            *(human_review(f"drive-by-{i}", "COMMENTED", "lgtm-ish", id=i) for i in range(134)),
+            human_review("alice", "CHANGES_REQUESTED", "please no", id=135),
+            *(human_review(f"drive-by-{i}", "COMMENTED", "", id=i) for i in range(136, 150)),
+        ]
+        assert human_objection(fake, REPO, 7, login=LOGIN) is True
+        standing = human_objections(fake, REPO, 7, login=LOGIN)
+        assert [o.login for o in standing] == ["alice"]
+        assert standing[0].body == "please no"
+        pages = [p.rsplit("page=", 1)[1] for m, p, _ in fake.raw_calls if "/reviews?" in p]
+        assert pages == ["1", "2", "1", "2"], "each reader walked to the second page"
+
+    def test_a_first_page_only_read_would_have_missed_it(self) -> None:
+        """The failure this guards against, stated as the pre-#614 read."""
+        fake = PagedFake()
+        fake.reviews_payload = [
+            *(human_review(f"drive-by-{i}", "COMMENTED", "", id=i) for i in range(134)),
+            human_review("alice", "CHANGES_REQUESTED", "please no", id=135),
+        ]
+        first_page = fake.raw("GET", f"/repos/{REPO}/pulls/7/reviews?per_page=100&page=1")
+        assert not any(r["state"] == "CHANGES_REQUESTED" for r in first_page)
+
+    def test_inline_comments_on_the_second_page_are_objections(self) -> None:
+        fake = PagedFake()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "", id=41)]
+        fake.comments_payload = [
+            *(human_comment("bob", f"nit {i}", path="z.py", line=i, id=i) for i in range(100)),
+            human_comment("alice", "this one matters", path="a.py", line=3, id=900),
+        ]
+        standing = human_objections(fake, REPO, 7, login=LOGIN)
+        assert [o.body for o in standing] == ["", "this one matters"]
+
+
 class TestHumanObjections:
     """Each thing a human asked for, as something the loop can answer."""
 
