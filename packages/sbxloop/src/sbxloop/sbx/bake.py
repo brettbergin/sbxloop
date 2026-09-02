@@ -35,10 +35,9 @@ from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.errors import BakeError, SbxError, SbxloopError
 from sbxloop.log import get_logger
-from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
-from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
+from sbxloop.sbx.provision import agent_policy_allows
 from sbxloop.sbx.sandbox import BAKE_MANIFEST, SBXLOOP_DIR, Sandbox
 from sbxloop.worker.client import WorkerClient
 
@@ -63,6 +62,10 @@ class BakeRecord(BaseModel):
     # records written before the field existed still load; None reads as
     # "not recorded" in doctor rather than as a failure.
     git: bool | None = None
+    # The language toolchains on PATH when the template was saved (#615):
+    # canonical registry names, what actually landed rather than what was
+    # configured. None for records older than the field.
+    languages: tuple[str, ...] | None = None
 
 
 def bake_record_path(config: Config) -> Path:
@@ -102,6 +105,10 @@ def bake_template(
     name = name or f"sbxloop-bake-{secrets.token_hex(4)}"
     runtime_cached = False
     git_present = False
+    baked_languages: list[str] = []
+    # Config languages only: there is no workspace to detect from at bake
+    # time (#624). A run that resolves more tops the template up (#615).
+    languages = config.sandbox.effective_languages
     with tempfile.TemporaryDirectory(prefix="sbxloop-bake-") as scratch:
         spec = SandboxSpec(
             name=name,
@@ -111,21 +118,8 @@ def bake_template(
             # Same allows a run's agent sandbox gets, so the wheel deps, the
             # dev-tools apt ensure, and the Copilot runtime download all
             # resolve during the bake — including the configured
-            # toolchains' installer hosts (#616). Config languages only:
-            # there is no workspace to detect from at bake time.
-            policy_allows=[
-                *AGENT_ALLOW_DOMAINS,
-                *baseline_allows(
-                    (
-                        *PROMPT_ADVERTISED_DOMAINS,
-                        *toolchains.install_domains(
-                            toolchains.resolve(config.sandbox.effective_languages)
-                        ),
-                    ),
-                    config.policy.deny,
-                ),
-                *config.sandbox.extra_allow_domains,
-            ],
+            # toolchains' installer hosts (#616).
+            policy_allows=agent_policy_allows(config, languages),
         )
         report(f"creating scratch sandbox {name}")
         sandbox: Sandbox | None = None
@@ -134,24 +128,33 @@ def bake_template(
             sandbox = Sandbox(cli, name)
             cli.policy_allow(*spec.policy_allows, sandbox=name)
 
-            report("installing the worker (full install ladder)")
+            report(f"installing the worker (full install ladder) and {', '.join(languages)}")
             client = WorkerClient(sandbox)
-            client.install(extras=config.agent.backend, ensure_dev_tools=True)
+            client.install(extras=config.agent.backend, ensure_dev_tools=True, languages=languages)
 
             if cache_runtime and config.agent.backend == "copilot":
                 report("pre-caching the Copilot runtime")
                 runtime_cached = _cache_copilot_runtime(sandbox, client.python)
 
-            # The dev-tools ensure above installs git best-effort; record
-            # what actually landed so doctor can say whether runs will pay
-            # an apt top-up on every provision.
-            git_present = sandbox.exec(["sh", "-c", toolchains.GIT.probe]).ok
+            # The dev-tools ensure above is best-effort; record what
+            # actually landed (git, #252; the toolchains, #615) so doctor can
+            # say whether runs will pay a top-up on every provision.
+            selected = toolchains.resolve(languages)
+            missing = client.missing_toolchains((*toolchains.BASELINE_TOOLS, *selected))
+            if missing is None:
+                raise BakeError("could not probe the baked toolchains")
+            absent = {tc.name for tc in missing}
+            git_present = toolchains.GIT.name not in absent
+            baked_languages = [tc.name for tc in selected if tc.name not in absent]
+            if absent:
+                report(f"not on PATH after the install: {', '.join(sorted(absent))}")
 
             manifest = {
                 "worker_version": sbxloop.__version__,
                 "python": client.python,
                 "runtime_cached": runtime_cached,
                 "baked_at": time.time(),
+                "languages": baked_languages,
             }
             # The user-site install fallback never creates ~/.sbxloop.
             sandbox.mkdirs(SBXLOOP_DIR)
@@ -175,6 +178,7 @@ def bake_template(
         runtime_cached=runtime_cached,
         baked_at=time.time(),
         git=git_present,
+        languages=tuple(baked_languages),
     )
     path = bake_record_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)

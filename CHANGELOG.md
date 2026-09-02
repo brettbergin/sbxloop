@@ -8,6 +8,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **`sbxloop bake` installs the configured languages, and a prebaked run
+  tops up what the template lacks** (#615). The bake ignored `[sandbox] languages` and installed Python alone; a run on that template then
+  verified the baked worker, skipped the install ladder — and with it
+  the toolchain provisioning of #624 — and handed the agent a sandbox
+  without the language it had just resolved for. The bake now
+  provisions the configured languages (through the same allowlist
+  builder the runs use, so their installer hosts are reachable at bake
+  time too) and records what actually landed in `bake.json` and the
+  host's bake record. A prebaked run keeps the fast path but probes its
+  full resolved set in one batched `sh -c`; whatever is absent is
+  provisioned on top, named in `worker.prebake_topup` and in the
+  `sandbox.prebaked` event (`topped_up`). A probe that cannot answer
+  falls back to the per-tool probes rather than assuming presence.
+  `sbxloop doctor` gains a *languages in template* row that compares the
+  baked set with `[sandbox] languages` and says when a re-bake would
+  stop the per-provision top-up; a bake that cannot probe its own
+  result fails instead of recording a guess.
+
 - **The gate is detected for more than a Python-and-npm repo** (#625,
   #626). Detection knew a `check`/`ci` target in a makefile, justfile or
   Taskfile, an npm script, tox and nox — and always ran the npm script

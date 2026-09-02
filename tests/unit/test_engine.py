@@ -1270,8 +1270,21 @@ class TestPrebakedTemplate:
         cli.template_save("seed", self.REF)
         cli.rm("seed")
 
+    def pin_toolchain_probe(self, harness: Harness, missing: list[str]) -> None:
+        """The prebaked path probes the run's toolchains in one batched
+        `sh -c` (#615); unscripted it runs on the host. The sandbox name is
+        not known before the run, so answer at the client instead."""
+        from sbxloop import toolchains
+        from sbxloop.worker.client import WorkerClient
+
+        def answer(self: WorkerClient, selected: Any) -> list[toolchains.Toolchain]:
+            return [tc for tc in selected if tc.name in missing]
+
+        harness.monkeypatch.setattr(WorkerClient, "missing_toolchains", answer)
+
     def test_prebaked_run_skips_install_and_emits_event(self, harness: Harness) -> None:
         self.seed_template(harness)
+        self.pin_toolchain_probe(harness, missing=[])
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         result = harness.engine(install_workers=True, sandbox={"template": self.REF}).start(
             "use the baked template"
@@ -1288,11 +1301,46 @@ class TestPrebakedTemplate:
         assert len(prebaked) == 1
         assert prebaked[0].data["prebaked"] is True
         assert prebaked[0].data["template"] == self.REF
+        assert prebaked[0].data["topped_up"] == []
+
+    def test_prebaked_run_tops_up_a_language_the_template_lacks(self, harness: Harness) -> None:
+        """#615: a template baked for Python, a run resolved to Go from its
+        workspace (#624). The baked worker is kept, Go is provisioned on
+        top, and the event names what the bake is behind on."""
+        from tests.unit.test_hostgit import git, make_repo
+
+        self.seed_template(harness)
+        self.pin_toolchain_probe(harness, missing=["go"])
+        source = make_repo(harness.tmp_path)
+        (source / "go.mod").write_text("module example.com/x\n")
+        git("add", "go.mod", cwd=source)
+        git("commit", "-m", "go", cwd=source)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(
+            install_workers=True,
+            sandbox={"template": self.REF, "workspace": str(source), "gate_command": ""},
+        )
+        run_id = new_run_id_for(engine)
+        # apt and the go installer (both `sh -c`) succeed; the prebake probe
+        # (`python3 -c`) and the jobs still run against the fake sandbox.
+        harness.fake_sbx.script(f"exec sbxloop-{run_id}-agent sh -c", returncode=0)
+        result = engine.start("use the baked template on a go repo", run_id=run_id)
+
+        assert result.state == "completed"
+        joined = [" ".join(c) for c in harness.fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "-m venv" in j or "pip install" in j]
+        assert [j for j in joined if "apt-get install" in j and "golang" not in j]
+        assert [j for j in joined if "go.dev/dl" in j or "dl.google.com" in j]
+        (prebaked,) = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_PREBAKED]
+        assert prebaked.data["prebaked"] is True
+        assert prebaked.data["topped_up"] == ["go"]
+        assert "lacked go" in prebaked.data["message"]
 
     def test_prebaked_pair_installs_both_and_emits_two_events(self, harness: Harness) -> None:
         """With [github].repo the pair installs concurrently (#127); both
         sandboxes verify their baked worker and each emits its own event."""
         self.seed_template(harness)
+        self.pin_toolchain_probe(harness, missing=[])
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
         result = harness.pipeline(
             FakeGithub(),

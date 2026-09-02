@@ -259,6 +259,33 @@ def sandbox_name(run_id: str, role: SandboxRole) -> str:
     return f"sbxloop-{run_id}-{role}"
 
 
+def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
+    """The agent sandbox's network allowlist for ``languages``.
+
+    The one builder behind a run's agent spec, the daemon's concierge
+    sandbox and the bake's scratch sandbox (#615): what a template is baked
+    with is exactly what a run may reach. PROMPT_ADVERTISED_DOMAINS: the
+    prompts promise the language registry baseline and the apt mirrors are
+    reachable, and both the worker's pip install and the dev-tools apt
+    ensure run before any plan-declared egress exists — the promise must not
+    depend on the operator's global sbx preset. Seeded through
+    baseline_allows so [policy] deny still wins over the tier that never
+    asks for a grant. The selected toolchains' installer hosts ride the same
+    tier (#616): a language nobody selected opens nothing.
+    """
+    claude = config.agent.backend == "claude"
+    selected = list(toolchains.resolve(languages))
+    if claude:
+        selected.append(toolchains.CLAUDE_CODE)
+    installers = (d for d in toolchains.install_domains(selected) if d not in AGENT_ALLOW_DOMAINS)
+    return [
+        *AGENT_ALLOW_DOMAINS,
+        *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
+        *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
+        *config.sandbox.extra_allow_domains,
+    ]
+
+
 class Provisioner:
     def __init__(
         self,
@@ -326,24 +353,7 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=template,
-            # PROMPT_ADVERTISED_DOMAINS: the prompts promise the language
-            # registry baseline and the apt mirrors are reachable, and both
-            # the worker's pip install and the dev-tools apt ensure run
-            # before any plan-declared egress exists — the promise must not
-            # depend on the operator's global sbx preset. Seeded through
-            # baseline_allows so [policy] deny still wins over the tier that
-            # never asks for a grant. The selected toolchains' installer
-            # hosts ride the same tier (#616): a language nobody selected
-            # opens nothing.
-            policy_allows=[
-                *AGENT_ALLOW_DOMAINS,
-                *self._agent_extra_allows(),
-                *baseline_allows(
-                    (*PROMPT_ADVERTISED_DOMAINS, *self._install_domains(languages)),
-                    self.config.policy.deny,
-                ),
-                *extra,
-            ],
+            policy_allows=agent_policy_allows(self.config, languages),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(),
         )
@@ -357,16 +367,6 @@ class Provisioner:
             persistent_env=self.github_repo_env(repo),
         )
         return agent, github
-
-    def _install_domains(self, languages: Sequence[str]) -> tuple[str, ...]:
-        """Installer hosts for ``languages`` plus the backend's own runtime
-        prerequisite, minus anything the control-plane list already has."""
-        selected = list(toolchains.resolve(languages))
-        if self.agent_backend() == "claude":
-            selected.append(toolchains.CLAUDE_CODE)
-        return tuple(
-            d for d in toolchains.install_domains(selected) if d not in AGENT_ALLOW_DOMAINS
-        )
 
     def resolve_languages(self, workspace: Path | None) -> toolchains.LanguageResolution:
         """The language set a run on ``workspace`` provisions (#624):
@@ -432,9 +432,6 @@ class Provisioner:
         if self.agent_backend() == "claude":
             return SecretSpec(kind="custom", host=ANTHROPIC_TOKEN_HOST, env=ANTHROPIC_TOKEN_ENV)
         return SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)
-
-    def _agent_extra_allows(self) -> tuple[str, ...]:
-        return (ANTHROPIC_TOKEN_HOST,) if self.agent_backend() == "claude" else ()
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to
@@ -1021,18 +1018,7 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=self.config.sandbox.template,
-            policy_allows=[
-                *AGENT_ALLOW_DOMAINS,
-                *self._agent_extra_allows(),
-                *baseline_allows(
-                    (
-                        *PROMPT_ADVERTISED_DOMAINS,
-                        *self._install_domains(self.config.sandbox.effective_languages),
-                    ),
-                    self.config.policy.deny,
-                ),
-                *self.config.sandbox.extra_allow_domains,
-            ],
+            policy_allows=agent_policy_allows(self.config, self.config.sandbox.effective_languages),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(),
         )

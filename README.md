@@ -103,7 +103,12 @@ sbxloop bake            # installs the worker + Copilot runtime into a template
 
 Runs verify the baked worker with fast probes and fall back to the normal
 install if the template is stale (`sbxloop doctor` will tell you to re-bake
-after upgrading sbxloop).
+after upgrading sbxloop). The bake also installs the toolchains for the
+configured `[sandbox] languages` (python by default) and records which ones
+landed; a run whose languages the template lacks — a Go repo on a Python bake,
+say — keeps the baked worker and provisions the missing toolchain on top, and
+the `sandbox.prebaked` event and `sbxloop doctor` both say so, so you know
+when a re-bake would stop paying for that per provision.
 
 Wondering what to put in `model = "..."` (or `--model`)? Ask the Copilot SDK
 which models your subscription can actually use:
@@ -1207,7 +1212,9 @@ over an installer host (the toolchain then fails to provision, loudly).
 | `dotnet`     | `builds.dotnet.microsoft.com`                        |
 
 `sbxloop bake` allows the same hosts for the configured `languages` (there is
-no workspace to detect from at bake time).
+no workspace to detect from at bake time) and installs those toolchains into
+the template. A run on a prebaked template probes its own resolved set in one
+shot and provisions only what the template lacks, under the run's allowlist.
 
 Without them the install warns and the run continues — the agent falls back to
 bootstrapping the toolchain itself, which is the behavior these entries exist

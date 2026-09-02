@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 import sbxloop
+from sbxloop import toolchains
 from sbxloop.config import Config, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
@@ -566,6 +567,31 @@ def collect_checks(
                     "`sbxloop bake`"
                 )
             checks.append(Check("git in template", record.git is not False, git_detail, hard=False))
+            # The template is baked for one language set; a run resolving
+            # more tops it up per provision (#615). Config only — the
+            # workspace a run detects from (#624) is not known here.
+            wanted = [tc.name for tc in toolchains.resolve(config.sandbox.effective_languages)]
+            if record.languages is None:
+                languages_ok, languages_detail = (
+                    True,
+                    "not recorded by this bake (older sbxloop) — runs probe and top up the "
+                    "configured languages per provision; re-run `sbxloop bake` to carry them",
+                )
+            else:
+                lacking = [name for name in wanted if name not in record.languages]
+                languages_ok = not lacking
+                languages_detail = (
+                    f"baked with {', '.join(record.languages) or 'no language toolchains'}"
+                    + (
+                        f"; `[sandbox] languages` also wants {', '.join(lacking)} — every run "
+                        "provisions it on top of the template; re-run `sbxloop bake`"
+                        if lacking
+                        else " — covers `[sandbox] languages`"
+                    )
+                )
+            checks.append(
+                Check("languages in template", languages_ok, languages_detail, hard=False)
+            )
         else:
             checks.append(
                 Check(
