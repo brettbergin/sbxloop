@@ -641,6 +641,17 @@ class LandingConfig(_ConfigModel):
     merging, and the base moves; ``merge_update_attempts`` bounds the
     update-branch calls (each is one API call, not a run) before the PR is
     handed over ``blocked``. 0 disables updating.
+
+    A red check is judged against the commit the PR is built on (#611): a
+    check that was already red there is the base branch's problem, not
+    this PR's, and is merged over and named in a PR comment; one that went
+    red here is a regression. Which checks *gate* the merge comes from the
+    base's branch protection and rulesets — every check when the base
+    declares none, or when they cannot be read — and only gating checks
+    are waited on. ``required_checks`` replaces that reading with an
+    explicit gating set; ``ignore_checks`` (fnmatch patterns) drops checks
+    from the judgment altogether. A regression on a non-gating check gets
+    one fix round; still red after that, it is merged over and named.
     """
 
     deliver_draft: bool = True
@@ -660,6 +671,10 @@ class LandingConfig(_ConfigModel):
     merge_method: MergeMethod = "squash"
     delete_branch_on_merge: bool = True
     merge_update_attempts: int = Field(default=3, ge=0)
+    # The checks that gate the merge, when the operator would rather say
+    # than let the base's protection answer; and the ones never judged.
+    required_checks: list[str] = Field(default_factory=list)
+    ignore_checks: list[str] = Field(default_factory=list)
     # What becomes of the review's out-of-scope notes and the fix rounds'
     # deferred findings once the PR merges (#517): filed as issues on the
     # repository with `followup_label` — never the trigger label, a human

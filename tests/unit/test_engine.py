@@ -41,7 +41,7 @@ from sbxloop.errors import (
     WorkerError,
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
-from sbxloop.gh.ops import FailedCheck, GithubOps
+from sbxloop.gh.ops import ChecksVerdict, FailedCheck, GithubOps
 from sbxloop.sbx.cli import SbxCLI
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import (
@@ -2034,7 +2034,7 @@ class TestPipeline:
 
     def test_ci_red_fix_round_carries_the_log_excerpt(self, harness: Harness) -> None:
         fake = FakeGithub()
-        fake.checks = [RED, GREEN]
+        fake.checks = [ChecksVerdict("red", 1, (), ("lint",)), GREEN]
         fake.failed_logs = [
             FailedCheck("lint", "failure", "E501 hello.txt:1 too long", "https://x")
         ]
@@ -2048,7 +2048,7 @@ class TestPipeline:
         assert "the `lint` check passes" in fix.acceptance_criteria
         (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
         assert fix_round.data["kind"] == "ci"
-        assert fix_round.data["why"] == "1 of 1 check(s) failed: ci"
+        assert fix_round.data["why"] == "1 of 1 check(s) failed: lint"
         statuses = [e.data["state"] for e in self._events(harness, HostEventTypes.CI_STATUS)]
         assert statuses == ["red", "green"]
         run = engine.store.get_run(result.run_id)
@@ -2065,6 +2065,76 @@ class TestPipeline:
         assert "ci fix rounds exhausted (0 allowed by [landing] ci_rounds)" in result.reason
         assert fake.merges == []
         assert [t.spec.id for t in result.tasks] == ["t1"]
+
+    def test_a_red_the_base_already_had_is_merged_over_and_named(self, harness: Harness) -> None:
+        """#611: the fake's base is `base123`; a check red there and red on
+        the head is not the PR's to fix under the all-gate fallback."""
+        fake = FakeGithub()
+        fake.checks_by_sha["base123"] = ChecksVerdict("red", 2, (), ("flaky",), ("ci",))
+        fake.checks = [ChecksVerdict("red", 2, (), ("flaky",), ("ci",))]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("inherit a red")
+        assert result.state == "merged"
+        assert [t.spec.id for t in result.tasks] == ["t1"], "no fix round for the base's red"
+        assert self._events(harness, HostEventTypes.FIX_ROUND) == []
+        assert any("`flaky` — already red on base123" in c for c in fake.issue_comments)
+        (checks,) = self._events(harness, HostEventTypes.LANDING_CHECKS)
+        assert checks.data["preexisting"] == ["flaky"] and checks.data["state"] == "green"
+
+    def test_an_advisory_regression_gets_one_round_then_is_merged_over(
+        self, harness: Harness
+    ) -> None:
+        """#611: `lint` is not required by the base, so it gets one fix
+        round; still red after, the landing merges over it and says so."""
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.checks = [ChecksVerdict("red", 2, (), ("lint",), ("ci",))]
+        fake.failed_logs = [FailedCheck("lint", "failure", "E501", "https://x")]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 3})
+        result = engine.start("advisory red")
+        assert result.state == "merged"
+        assert [t.spec.id for t in result.tasks] == ["t1", "fix-1"]
+        run = engine.store.get_run(result.run_id)
+        assert run.ci_rounds == 1, "one round, not max_ci_rounds"
+        assert engine.store.advisory_rounds(result.run_id) == frozenset({"lint"})
+        assert any(
+            "`lint` — went red on this PR but is not required" in c for c in fake.issue_comments
+        )
+
+    def test_an_advisory_regression_with_no_round_left_is_merged_over(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.checks = [ChecksVerdict("red", 2, (), ("lint",), ("ci",))]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 0})
+        result = engine.start("advisory red, no budget")
+        assert result.state == "merged"
+        assert [t.spec.id for t in result.tasks] == ["t1"]
+        assert engine.store.advisory_rounds(result.run_id) == frozenset({"lint"})
+        assert len(fake.issue_comments) >= 1
+
+    def test_a_required_check_red_on_the_base_is_fixed_and_the_brief_says_so(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.checks_by_sha["base123"] = RED
+        # the fix round's head must name `ci` green: a declared context
+        # absent from the head is one GitHub is still waiting for
+        fake.checks = [RED, ChecksVerdict("green", 1, (), (), ("ci",))]
+        fake.failed_logs = [FailedCheck("ci", "failure", "boom", "https://x")]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("inherited but required")
+        assert result.state == "merged"
+        fix = result.tasks[1].spec
+        assert "already red on the commit this pull request is built on" in fix.description
+        assert "say in your report that it was inherited" in fix.description
+        assert engine.store.advisory_rounds(result.run_id) == frozenset()
 
     def test_ci_that_never_reports_blocks(self, harness: Harness) -> None:
         fake = FakeGithub()
@@ -2086,7 +2156,8 @@ class TestPipeline:
 
         class SlowCi(FakeGithub):
             def pr_checks(self, repo: str, sha: str) -> Any:
-                clock.advance(30.0)
+                if sha == self.head_sha:
+                    clock.advance(30.0)
                 return super().pr_checks(repo, sha)
 
         fake = SlowCi()
@@ -2097,8 +2168,9 @@ class TestPipeline:
         result = engine.start("no CI here")
         assert result.state == "merged"
         # delivered at t; polled at +30, +60, +90 (waiting), +120 (settled);
-        # then landing reads the checks once more
-        assert len(fake.checks_calls) == 5
+        # then landing reads the checks once more (the baseline reads on
+        # the merge base, #611, are not polls of the head)
+        assert [c for c in fake.checks_calls if c == fake.head_sha] == [fake.head_sha] * 5
         (status,) = self._events(harness, HostEventTypes.CI_STATUS)
         assert status.data["total"] == 0 and status.data["state"] == "green"
 
@@ -2568,8 +2640,20 @@ class TestPipeline:
         assert fake.merges == [(7, "squash", "commit2")]
 
     def test_resume_at_awaiting_ci_re_polls(self, harness: Harness) -> None:
-        fake = FakeGithub()
-        fake.fail_once["pr_checks"] = GithubOpsError("github down", http_status=502)
+        class HeadDown(FakeGithub):
+            """GitHub 502s the first read of the *head's* checks. (A 502 on
+            the baseline read is swallowed by design — #611 fails closed
+            to "every red is ours" — so it would not interrupt the run.)"""
+
+            flaked = False
+
+            def pr_checks(self, repo: str, sha: str) -> Any:
+                if sha == self.head_sha and not self.flaked:
+                    self.flaked = True
+                    raise GithubOpsError("github down", http_status=502)
+                return super().pr_checks(repo, sha)
+
+        fake = HeadDown()
         engine, run_id = self._interrupted(
             harness, fake, [taskgraph(task("t1")), FILES_BUILD, REVIEW_OK], GithubOpsError
         )

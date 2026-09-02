@@ -252,14 +252,22 @@ class ChecksVerdict(NamedTuple):
     total: int
     pending: tuple[str, ...]
     failed: tuple[str, ...]
+    # The names that passed, so a required context that has not reported
+    # at all can be told from one that reported green (#611).
+    passed: tuple[str, ...] = ()
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return (*self.failed, *self.pending, *self.passed)
 
     def merge(self, other: ChecksVerdict) -> ChecksVerdict:
         """Both verdicts as one: red beats pending beats green, names and
         counts pooled."""
         pending = (*self.pending, *other.pending)
         failed = (*self.failed, *other.failed)
+        passed = (*self.passed, *other.passed)
         state: CheckState = "red" if failed else ("pending" if pending else "green")
-        return ChecksVerdict(state, self.total + other.total, pending, failed)
+        return ChecksVerdict(state, self.total + other.total, pending, failed, passed)
 
     def summary(self) -> str:
         if self.state == "green":
@@ -309,6 +317,7 @@ def fold_check_runs(payload: Any) -> ChecksVerdict:
         return ChecksVerdict("green", 0, (), ())
     pending: list[str] = []
     failed: list[str] = []
+    passed: list[str] = []
     for run in runs:
         if not isinstance(run, dict):
             continue
@@ -318,14 +327,19 @@ def fold_check_runs(payload: Any) -> ChecksVerdict:
             pending.append(name)
         elif str(conclusion).lower() not in PASSING_CONCLUSIONS:
             failed.append(name)
-    total = len(runs)
+        else:
+            passed.append(name)
+    return _verdict(len(runs), pending, failed, passed)
+
+
+def _verdict(total: int, pending: list[str], failed: list[str], passed: list[str]) -> ChecksVerdict:
     if failed:
         # Red beats pending: the build is already known broken, and waiting
         # on the stragglers only delays the fix.
-        return ChecksVerdict("red", total, tuple(pending), tuple(failed))
+        return ChecksVerdict("red", total, tuple(pending), tuple(failed), tuple(passed))
     if pending:
-        return ChecksVerdict("pending", total, tuple(pending), ())
-    return ChecksVerdict("green", total, (), ())
+        return ChecksVerdict("pending", total, tuple(pending), (), tuple(passed))
+    return ChecksVerdict("green", total, (), (), tuple(passed))
 
 
 # Commit-status states that are not failures. The Status API has exactly
@@ -352,6 +366,7 @@ def fold_statuses(payload: Any) -> ChecksVerdict:
         return ChecksVerdict("green", 0, (), ())
     pending: list[str] = []
     failed: list[str] = []
+    passed: list[str] = []
     total = 0
     for status in statuses:
         if not isinstance(status, dict):
@@ -363,11 +378,9 @@ def fold_statuses(payload: Any) -> ChecksVerdict:
             pending.append(name)
         elif state not in PASSING_STATUS_STATES:
             failed.append(name)
-    if failed:
-        return ChecksVerdict("red", total, tuple(pending), tuple(failed))
-    if pending:
-        return ChecksVerdict("pending", total, tuple(pending), ())
-    return ChecksVerdict("green", total, (), ())
+        else:
+            passed.append(name)
+    return _verdict(total, pending, failed, passed)
 
 
 def fold_reviews(payload: Any, *, login: str | None = None) -> str:
@@ -615,6 +628,21 @@ class GithubOps:
             {"statuses": raw_pages(self, f"/repos/{repo}/commits/{sha}/status", key="statuses")}
         )
         return runs.merge(statuses)
+
+    def merge_base(self, repo: str, base: str, head: str) -> str | None:
+        """The commit ``head`` is built on: the merge base of ``base`` and
+        ``head``, or None when GitHub cannot compare them (unrelated
+        histories, 404). What #611 folds checks on to tell a red the PR
+        caused from one it inherited."""
+        try:
+            data = self.raw("GET", f"/repos/{repo}/compare/{base}...{head}")
+        except GithubOpsError as exc:
+            if exc.http_status == 404:
+                return None
+            raise
+        merge_base = data.get("merge_base_commit") if isinstance(data, dict) else None
+        sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
+        return str(sha) if sha else None
 
     def pr_review_state(self, repo: str, number: int, *, login: str | None = None) -> str:
         """``APPROVED`` / ``CHANGES_REQUESTED`` / ``NONE`` — each reviewer's
