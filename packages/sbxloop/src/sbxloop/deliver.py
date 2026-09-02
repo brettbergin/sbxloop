@@ -85,6 +85,14 @@ def _is_ref_collision(exc: GithubOpsError) -> bool:
     return "HTTP 422" in text and "already exists" in text.lower()
 
 
+def _is_ref_refusal(exc: GithubOpsError) -> bool:
+    """Whether a refs POST was refused by the repository's rules rather
+    than by an existing ref: a 422 that does not say "already exists"."""
+    text = str(exc)
+    is_422 = exc.http_status == 422 or "HTTP 422" in text
+    return is_422 and "already exists" not in text.lower()
+
+
 def _is_pr_collision(exc: GithubOpsError) -> bool:
     """Whether a PR create *may* have failed because that head already has
     an open PR. GitHub's answer is HTTP 422 "A pull request already exists
@@ -181,6 +189,8 @@ def deliver_workspace(
     pr_number: int | None = None,
     round_no: int | None = None,
     parent: str | None = None,
+    title: str | None = None,
+    commit_message: str | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
@@ -207,6 +217,11 @@ def deliver_workspace(
     ``closes`` is the issue this delivery resolves; it becomes a
     ``Closes #N`` line in the PR body, so GitHub links issue and PR and
     closes the issue on merge on its own.
+
+    ``title`` and ``commit_message`` are the rendered naming templates
+    (#621, :func:`render_naming`); unset, the loop's historical wording.
+    A re-delivery whose title differs from the open PR's retitles it
+    (``deliver.title_changed``) — how a fix round cures a title-lint check.
     """
     plan: DeliveryPlan | None = None
     if not _is_checkout_root(source_dir):
@@ -278,7 +293,7 @@ def deliver_workspace(
             "POST",
             f"/repos/{repo}/git/commits",
             {
-                "message": f"sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}",
+                "message": commit_message or _commit_message(run_id, outcome),
                 "tree": tree,
                 "parents": [parent or base_sha],
             },
@@ -289,6 +304,7 @@ def deliver_workspace(
     _point_branch(ops, repo, branch, commit, run_id=run_id, round_no=round_no)
     log.info("deliver.branch_pushed", run=run_id, repo=repo, branch=branch, commit=commit[:12])
 
+    title = _clip_title(title) if title else _title(outcome)
     if pr_number is not None:
         # The PR already exists and its branch just moved under it: there
         # is nothing to create. Blind-POSTing and parsing the refusal is
@@ -296,13 +312,16 @@ def deliver_workspace(
         data = ops.pr_get(repo, pr_number)
         url = str(data.get("html_url") or "")
         log.info("deliver.pr_refreshed", run=run_id, repo=repo, pr=pr_number, url=url)
+        _retitle(
+            ops, repo, pr_number, current=str(data.get("title") or ""), wanted=title, run_id=run_id
+        )
         return PrRef(number=pr_number, url=url)
     try:
         pr = ops.pr_create(
             repo,
             base=base,
             head=branch,
-            title=_title(outcome),
+            title=title,
             body=_body(run_id, outcome, plan, closes=closes),
             draft=draft,
         )
@@ -359,6 +378,16 @@ def _point_branch(
     try:
         ops.raw("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": commit})
     except GithubOpsError as exc:
+        if _is_ref_refusal(exc):
+            # A 422 that is not "already exists" is the repository refusing
+            # the name itself — a ruleset or protection admitting only
+            # certain branch patterns (#621). No retry changes that; say
+            # which knob does.
+            raise DeliveryError(
+                f"{repo} refused to create branch {branch!r}: {exc}. The repository's "
+                "rules do not admit that branch name — set `[github] branch_prefix` "
+                "(or the [[github.repos]] entry's) to a prefix its rulesets allow"
+            ) from exc
         if not _is_ref_collision(exc):
             raise
         _force_move(
@@ -568,8 +597,42 @@ def _sha(response: Any, what: str) -> str:
 
 
 def _title(outcome: str) -> str:
-    title = f"sbxloop: {outcome}"
+    return _clip_title(f"sbxloop: {outcome}")
+
+
+def _clip_title(title: str) -> str:
+    title = " ".join(title.split())
     return title if len(title) <= TITLE_CLIP else title[: TITLE_CLIP - 1] + "…"
+
+
+def _commit_message(run_id: str, outcome: str) -> str:
+    return f"sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}"
+
+
+def render_naming(template: str, *, title: str | None, outcome: str, run_id: str, repo: str) -> str:
+    """Render a `[github]` naming template (#621). ``{title}`` is the
+    plan's own title when the model gave one, else the outcome — so the
+    default templates render byte-identically to what the loop always
+    wrote when no title was authored."""
+    return template.format(
+        title=" ".join((title or outcome).split()), outcome=outcome, run_id=run_id, repo=repo
+    )
+
+
+def _retitle(
+    ops: GithubOps, repo: str, number: int, *, current: str, wanted: str, run_id: str
+) -> None:
+    """Rename the open PR when a re-delivery wants a different title —
+    the model retitled it in a fix round, or the template changed. Best
+    effort: a refused rename must not fail a delivery that landed."""
+    if not wanted or not current or current == wanted:
+        return  # no current title = GitHub did not say; nothing to compare
+    try:
+        ops.raw("PATCH", f"/repos/{repo}/pulls/{number}", {"title": wanted})
+    except GithubOpsError:
+        log.warning("deliver.title_unchanged", run=run_id, repo=repo, pr=number, exc_info=True)
+        return
+    log.info("deliver.title_changed", run=run_id, repo=repo, pr=number, old=current, new=wanted)
 
 
 def _body(run_id: str, outcome: str, plan: DeliveryPlan, *, closes: int | None = None) -> str:

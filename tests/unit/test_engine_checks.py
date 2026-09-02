@@ -214,6 +214,7 @@ class TestDoesItGate:
             "required": ["ci"],
             "source": "protection",
             "pending": [],
+            "needs_approval": [],
             "fix": [],
             "regressions": [],
             "preexisting": ["old"],

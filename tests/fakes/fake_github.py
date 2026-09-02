@@ -12,6 +12,8 @@ and a re-delivery collides on the existing branch (422) and PR (422)
 exactly as GitHub does. Everything else is a knob:
 
 - ``pr``: what ``pr_get`` returns (draft/state/merged/mergeable/head...).
+- ``repo_payload``: what ``repo_get`` returns (default branch, allowed
+  merge methods).
 - ``checks``: one ``ChecksVerdict`` per ``pr_checks`` call; the last one
   repeats, and an empty list means green.
 - ``failed_logs``, ``feedback``, ``reviews_payload``, ``comments_payload``:
@@ -130,6 +132,14 @@ class FakeGithub(GithubOps):
             "mergeable": True,
             "mergeable_state": "clean",
             "head": {"sha": "commit0"},
+        }
+        # What `repo_get` answers (#620): every merge method allowed, so
+        # `merge_method = "auto"` resolves to squash as it always did.
+        self.repo_payload: dict[str, Any] = {
+            "default_branch": "main",
+            "allow_squash_merge": True,
+            "allow_merge_commit": True,
+            "allow_rebase_merge": True,
         }
         self.checks: list[ChecksVerdict] = []
         # Verdicts by commit, consulted before the scripted queue: the
@@ -257,7 +267,8 @@ class FakeGithub(GithubOps):
     # -- repository / delivery -----------------------------------------------
 
     def repo_get(self, repo: str) -> dict[str, Any]:
-        return {"default_branch": "main"}
+        self._maybe_fail("repo_get")
+        return dict(self.repo_payload)
 
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         self._maybe_fail("repo_lookup")
@@ -328,6 +339,7 @@ class FakeGithub(GithubOps):
             )
         self.pr_created = True
         self.pr["draft"] = draft
+        self.pr["title"] = title
         return PrRef(number=self.number, url=str(self.pr["html_url"]))
 
     def _failed(
@@ -378,6 +390,11 @@ class FakeGithub(GithubOps):
             assert body is not None
             self._move_head(str(body["sha"]))
             return {"ref": path}
+        if method == "PATCH" and path.endswith("/pulls/" + str(self.number)):
+            # A re-delivery renaming its PR (#621).
+            assert body is not None
+            self.pr.update(body)
+            return dict(self.pr)
         if method == "GET" and path.endswith("/reviews"):
             return list(self.reviews_payload)
         if method == "GET" and "/issues/" in path and path.endswith("/comments"):

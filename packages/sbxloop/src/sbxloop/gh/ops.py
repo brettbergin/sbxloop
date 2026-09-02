@@ -271,10 +271,16 @@ class ChecksVerdict(NamedTuple):
     # The names that passed, so a required context that has not reported
     # at all can be told from one that reported green (#611).
     passed: tuple[str, ...] = ()
+    # Check runs concluded `action_required` (#612): a workflow waiting for
+    # a maintainer to approve it — the fork-PR / first-time-contributor
+    # gate on GitHub Actions. Not red (no commit fixes it) and not going
+    # to finish on its own (waiting is not an answer either): the state is
+    # `pending`, and the callers that poll return on it at once.
+    needs_approval: tuple[str, ...] = ()
 
     @property
     def names(self) -> tuple[str, ...]:
-        return (*self.failed, *self.pending, *self.passed)
+        return (*self.failed, *self.pending, *self.passed, *self.needs_approval)
 
     def merge(self, other: ChecksVerdict) -> ChecksVerdict:
         """Both verdicts as one: red beats pending beats green, names and
@@ -282,13 +288,16 @@ class ChecksVerdict(NamedTuple):
         pending = (*self.pending, *other.pending)
         failed = (*self.failed, *other.failed)
         passed = (*self.passed, *other.passed)
-        state: CheckState = "red" if failed else ("pending" if pending else "green")
-        return ChecksVerdict(state, self.total + other.total, pending, failed, passed)
+        approval = (*self.needs_approval, *other.needs_approval)
+        state: CheckState = "red" if failed else ("pending" if pending or approval else "green")
+        return ChecksVerdict(state, self.total + other.total, pending, failed, passed, approval)
 
     def summary(self) -> str:
         if self.state == "green":
             return f"all {self.total} check(s) passed"
         if self.state == "pending":
+            if self.needs_approval:
+                return approval_summary(self.needs_approval)
             return f"{len(self.pending)} of {self.total} check(s) still running"
         return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
 
@@ -311,13 +320,26 @@ class FailedCheck(NamedTuple):
     url: str
 
 
+def approval_summary(names: Sequence[str]) -> str:
+    """Why a run cannot proceed on ``action_required`` checks (#612)."""
+    listed = ", ".join(names)
+    return (
+        f"check {listed} needs a maintainer to approve the workflow run"
+        if len(names) == 1
+        else f"checks {listed} need a maintainer to approve their workflow runs"
+    )
+
+
 # Check-run conclusions that are not failures. ``neutral`` and ``skipped``
 # are deliberately included: a skipped job is not a red build, and treating
 # it as one would wedge the fix loop against something no commit can change.
-# Everything else — failure, timed_out, cancelled, action_required, stale, or
-# a conclusion GitHub adds later — counts as failed. Unknown conclusions fail
-# closed: a check nobody understands must not read as permission to merge.
+# `action_required` is its own bucket (#612): a workflow a maintainer has
+# not approved yet is neither red nor running. Everything else — failure,
+# timed_out, cancelled, stale, or a conclusion GitHub adds later — counts
+# as failed. Unknown conclusions fail closed: a check nobody understands
+# must not read as permission to merge.
 PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+APPROVAL_CONCLUSIONS = frozenset({"action_required"})
 
 
 def fold_check_runs(payload: Any) -> ChecksVerdict:
@@ -334,6 +356,7 @@ def fold_check_runs(payload: Any) -> ChecksVerdict:
     pending: list[str] = []
     failed: list[str] = []
     passed: list[str] = []
+    approval: list[str] = []
     for run in runs:
         if not isinstance(run, dict):
             continue
@@ -341,20 +364,29 @@ def fold_check_runs(payload: Any) -> ChecksVerdict:
         conclusion = run.get("conclusion")
         if conclusion is None:
             pending.append(name)
+        elif str(conclusion).lower() in APPROVAL_CONCLUSIONS:
+            approval.append(name)
         elif str(conclusion).lower() not in PASSING_CONCLUSIONS:
             failed.append(name)
         else:
             passed.append(name)
-    return _verdict(len(runs), pending, failed, passed)
+    return _verdict(len(runs), pending, failed, passed, approval)
 
 
-def _verdict(total: int, pending: list[str], failed: list[str], passed: list[str]) -> ChecksVerdict:
+def _verdict(
+    total: int,
+    pending: list[str],
+    failed: list[str],
+    passed: list[str],
+    approval: Sequence[str] = (),
+) -> ChecksVerdict:
+    approval = tuple(approval)
     if failed:
         # Red beats pending: the build is already known broken, and waiting
         # on the stragglers only delays the fix.
-        return ChecksVerdict("red", total, tuple(pending), tuple(failed), tuple(passed))
-    if pending:
-        return ChecksVerdict("pending", total, tuple(pending), (), tuple(passed))
+        return ChecksVerdict("red", total, tuple(pending), tuple(failed), tuple(passed), approval)
+    if pending or approval:
+        return ChecksVerdict("pending", total, tuple(pending), (), tuple(passed), approval)
     return ChecksVerdict("green", total, (), (), tuple(passed))
 
 

@@ -138,6 +138,18 @@ class TaskSpec(_Model):
 
 class TaskGraph(_Model):
     tasks: list[TaskSpec]
+    # The pull request's title in the repository's own commit-subject
+    # style (#621), decomposer-authored; None leaves the outcome as the
+    # title. One line, whitespace-folded; an empty answer is None.
+    pr_title: str | None = None
+
+    @field_validator("pr_title")
+    @classmethod
+    def _fold_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        folded = " ".join(str(value).split())
+        return folded or None
 
     @model_validator(mode="after")
     def _check_graph(self) -> TaskGraph:
@@ -262,6 +274,9 @@ class RunRecord(_Model):
     pr_node_id: str | None = None
     branch: str | None = None
     head_sha: str | None = None
+    # The plan's own PR title (#621), moved by a fix round that retitled;
+    # None → the outcome names the PR.
+    pr_title: str | None = None
     review_rounds: int = 0
     ci_rounds: int = 0
     update_attempts: int = 0

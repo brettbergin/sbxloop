@@ -8,6 +8,51 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **The merge method follows the repository, and a merge GitHub refuses
+  is named** (#620). `[landing] merge_method` defaulted to `squash`,
+  which a repository with squash merging disabled answers with a 405 the
+  loop reported as "branch protection"; and a PR whose checks were green
+  but whose `mergeable_state` was `blocked` was polled to the timeout.
+  The default is now `auto`: the first of squash, merge, rebase the
+  repository's settings allow, resolved once per landing and logged in
+  `land.merge_method`. An explicit method the repository disallows is
+  never swapped for another: `sbxloop doctor` reports it on the repo
+  row (`merge method squash not allowed`) and a run ends `blocked`
+  naming it. A `blocked` mergeability after green checks is re-read
+  once and then explained from the base's protection — the required
+  approvals its identity cannot give (with the `merge_gate = "chat"`
+  pointer), CODEOWNERS, the merge queue, unresolved conversations —
+  and a bare 405 carries the same reading. `unstable` (a non-required
+  check red) stays mergeable.
+
+- **The PR title, commit message and branch name are the operator's,
+  and the plan can title its own PR** (#621). Every PR was
+  `sbxloop: <outcome>` on `sbxloop/<run>` with a fixed commit message,
+  which a repository's title lint, commit lint or branch ruleset
+  refuses — and the refusal read as a mystery 422. `[github]` gains
+  `pr_title_template` (default `sbxloop: {title}`),
+  `commit_message_template` and `branch_prefix` (default `sbxloop/`),
+  each overridable per `[[github.repos]]` entry, with `{title}`,
+  `{outcome}`, `{run_id}` and `{repo}` placeholders; the defaults
+  render byte-for-byte what shipped before. The decomposer may return
+  a `pr_title` in the repository's own commit style (it is shown the
+  recent `git log`); `{title}` falls back to the outcome when it does
+  not. A fix round can retitle the PR by writing `.sbxloop/pr-title`
+  in the workspace — a red title-lint check is thereby curable — and a
+  re-delivery whose title changed PATCHes the PR (`deliver.title_changed`).
+  A branch the repository's rulesets refuse fails the delivery naming
+  `[github] branch_prefix` rather than the raw 422.
+
+- **A workflow waiting on a maintainer's approval ends the run blocked
+  and named, not timed out** (#612). A first-time contributor's — or a
+  fork's — workflow run sits at `action_required` until a maintainer
+  approves it; the loop read that as a failure and spent its fix rounds
+  on it. It is now its own bucket (`ChecksVerdict.needs_approval`): the
+  poll returns at once, no fix round is spent, and the run ends
+  `blocked` with "check X needs a maintainer to approve the workflow
+  run". A real red beside it is fixed first, and the approval is
+  re-judged on the re-delivery.
+
 - **`sbxloop bake` installs the configured languages, and a prebaked run
   tops up what the template lacks** (#615). The bake ignored `[sandbox] languages` and installed Python alone; a run on that template then
   verified the baked worker, skipped the install ladder — and with it

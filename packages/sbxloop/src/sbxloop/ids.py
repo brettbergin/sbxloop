@@ -20,9 +20,16 @@ def new_run_id() -> str:
     return "r" + _token(8)
 
 
-def branch_name(run_id: str) -> str:
-    """The run's git branch, shared by workspace clones and PR delivery."""
-    return f"sbxloop/{run_id}"
+DEFAULT_BRANCH_PREFIX = "sbxloop/"
+
+
+def branch_name(run_id: str, prefix: str = DEFAULT_BRANCH_PREFIX) -> str:
+    """The run's git branch, shared by workspace clones and PR delivery.
+
+    ``prefix`` is `[github] branch_prefix` (#621): a ruleset that only
+    admits `feature/*` branches wants the loop's branches under it too.
+    """
+    return f"{prefix}{run_id}"
 
 
 def is_run_id(value: str) -> bool:

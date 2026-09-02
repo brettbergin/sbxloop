@@ -131,6 +131,17 @@ secret_strategy = "proxy"
 # the daemon; not something you configure by hand.
 # deliver_closes = 1
 #
+# NAMING what the loop writes. Placeholders: {title} (the plan's PR title,
+# matched to the repository's commit-subject style; falls back to the run's
+# outcome), {outcome}, {run_id}, {repo}. Every one is overridable per
+# repository in a `[[github.repos]]` entry. The defaults are what the loop
+# always wrote.
+# pr_title_template = "sbxloop: {title}"
+# commit_message_template = "sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}"
+# Branches are `<branch_prefix><run id>`; pick a prefix the repository's
+# rulesets admit — a refused ref ends the run at delivery, naming this key.
+# branch_prefix = "sbxloop/"
+#
 # Several repositories: declare them as an array of tables instead of the
 # single `repo` above. The daemon polls every enabled entry for the trigger
 # label and routes each run — clone, branch, PR, review, CI, merge, issue
@@ -146,6 +157,9 @@ secret_strategy = "proxy"
 # deliver_base = "main"            # base branch; unset uses the repo's default
 # create_repo = false              # create the repository when missing
 # create_public = false            # created repos are private unless flipped
+# pr_title_template = "feat: {title}"  # naming overrides; unset uses [github]'s
+# commit_message_template = "{title}"
+# branch_prefix = "bot/"
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled
@@ -171,7 +185,7 @@ secret_strategy = "proxy"
 # ci_poll_interval_s = 60
 # ci_settle_s = 90           # "no check runs yet" must persist this long to mean "no CI"
 # ci_timeout_s = 3600        # per wait; exceeding it ends the run blocked
-# merge_method = "squash"    # squash | merge | rebase
+# merge_method = "auto"      # auto | squash | merge | rebase — auto takes the first of squash, merge, rebase the repository allows; an explicit method the repository disallows ends the run blocked, named
 # delete_branch_on_merge = true
 # merge_update_attempts = 3  # update-branch calls when protection wants "up to date"
 # required_checks = []       # the checks that gate the merge; empty = what the base's protection declares, else all

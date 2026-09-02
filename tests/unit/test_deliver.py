@@ -951,3 +951,157 @@ class TestContinuedHistory:
         # The prior commit is still the parent, so its history survives.
         (commit_body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/commits")]
         assert commit_body is not None and commit_body["parents"] == ["PRIORHEAD"]
+
+
+class TestNaming:
+    """#621: the PR title and commit message are the operator's templates,
+    rendered with the plan's title when the model gave one; unset, they
+    are byte-for-byte what the loop always wrote."""
+
+    def test_render_naming(self) -> None:
+        from sbxloop.deliver import render_naming
+
+        out = render_naming(
+            "{repo} · {title} · {outcome} · {run_id}",
+            title="  Add   the\nthing ",
+            outcome="o",
+            run_id="r1",
+            repo="o/r",
+        )
+        assert out == "o/r · Add the thing · o · r1"
+        assert render_naming("{title}", title=None, outcome="fallback", run_id="r", repo="x") == (
+            "fallback"
+        )
+
+    def test_defaults_render_identically_with_no_title(self, tmp_path: Path) -> None:
+        from sbxloop.config import DEFAULT_COMMIT_MESSAGE_TEMPLATE, DEFAULT_PR_TITLE_TEMPLATE
+        from sbxloop.deliver import render_naming
+
+        plain, templated = StubOps(), StubOps()
+        kwargs: dict[str, Any] = {"run_id": "r42", "outcome": "write hello"}
+        deliver_workspace(plain, "o/r", source_dir=make_workspace(tmp_path), **kwargs)  # type: ignore[arg-type]
+        deliver_workspace(
+            templated,  # type: ignore[arg-type]
+            "o/r",
+            source_dir=make_workspace(tmp_path / "b"),
+            title=render_naming(DEFAULT_PR_TITLE_TEMPLATE, title=None, repo="o/r", **kwargs),
+            commit_message=render_naming(
+                DEFAULT_COMMIT_MESSAGE_TEMPLATE, title=None, repo="o/r", **kwargs
+            ),
+            **kwargs,
+        )
+        assert plain.pr_kwargs["title"] == templated.pr_kwargs["title"] == "sbxloop: write hello"
+        commits = [
+            b["message"]
+            for ops in (plain, templated)
+            for _, p, b in ops.raw_calls
+            if p.endswith("/git/commits") and b
+        ]
+        assert commits == ["sbxloop run r42: deliver artifacts\n\nOutcome: write hello"] * 2
+
+    def test_a_given_title_and_message_are_used_and_the_title_clipped(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            title="feat: " + "y" * 100,
+            commit_message="feat: the thing\n\nBody.",
+        )
+        assert ops.pr_kwargs["title"].startswith("feat: yyy") and len(ops.pr_kwargs["title"]) == 72
+        (body,) = [b for _, p, b in ops.raw_calls if p.endswith("/git/commits")]
+        assert body is not None and body["message"] == "feat: the thing\n\nBody."
+
+    def test_a_redelivery_renames_the_pr_when_the_title_changed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class TitledOps(StubOps):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                return {
+                    "number": number,
+                    "html_url": "https://github.com/o/r/pull/12",
+                    "title": "old",
+                }
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "PATCH" and path.endswith("/pulls/12"):
+                    self.raw_calls.append((method, path, body))
+                    return {"title": body["title"] if body else ""}
+                return super().raw(method, path, body)
+
+        ops = TitledOps()
+        with caplog.at_level(logging.INFO, logger="sbxloop.deliver"):
+            deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                pr_number=12,
+                title="new",
+            )
+        assert ("PATCH", "/repos/o/r/pulls/12", {"title": "new"}) in ops.raw_calls
+        assert any("deliver.title_changed" in r.getMessage() for r in caplog.records)
+
+        # Same title: nothing to say to GitHub.
+        ops = TitledOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path / "b"),
+            pr_number=12,
+            title="old",
+        )
+        assert not any(m == "PATCH" and p.endswith("/pulls/12") for m, p, _ in ops.raw_calls)
+
+    def test_a_refused_rename_does_not_fail_the_delivery(self, tmp_path: Path) -> None:
+        class RefusingOps(StubOps):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                return {
+                    "number": number,
+                    "html_url": "https://github.com/o/r/pull/12",
+                    "title": "old",
+                }
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "PATCH" and path.endswith("/pulls/12"):
+                    raise GithubOpsError("locked", http_status=403)
+                return super().raw(method, path, body)
+
+        pr = deliver_workspace(
+            RefusingOps(),  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=12,
+            title="new",
+        )
+        assert pr.number == 12
+
+    def test_a_ruleset_refusing_the_branch_names_the_knob(self, tmp_path: Path) -> None:
+        class RefusedRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise GithubOpsError(
+                        "github op raw.api failed: GithubOpError: gh api POST "
+                        f"{path} failed (rc=1): Cannot create ref due to creations being "
+                        "restricted. (HTTP 422)",
+                        http_status=422,
+                    )
+                return super().raw(method, path, body)
+
+        with pytest.raises(DeliveryError, match=r"\[github\] branch_prefix") as info:
+            deliver_workspace(
+                RefusedRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        assert "'sbxloop/r42'" in str(info.value)
+        assert "creations being restricted" in str(info.value)

@@ -24,10 +24,13 @@ from sbxloop.engine.landing import (
     Landed,
     NeedsFix,
     UpdateState,
+    allowed_merge_methods,
+    blocked_reason,
     human_objection,
     human_objections,
     land,
     poll_checks,
+    resolve_merge_method,
 )
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import ChecksVerdict, FailedCheck, MergeOutcome
@@ -598,7 +601,11 @@ class TestLand:
         fake = FakeGithub()
         fake.merge_outcomes = [BLOCKED_405]
         outcome = Landing(fake).run()
-        assert outcome == Blocked(BLOCKED_405.reason)
+        assert isinstance(outcome, Blocked)
+        # A bare 405 is rewritten to name what the base's rules are known to
+        # want (#620), GitHub's own words kept.
+        assert BLOCKED_405.reason in outcome.why
+        assert "protection could not be read" in outcome.why
         assert fake.deleted_branches == [], "a PR that did not merge keeps its branch"
 
     def test_a_stale_merge_re_judges_the_new_head(self) -> None:
@@ -903,3 +910,172 @@ class TestBotReviewers:
         outcome = Landing(fake).run(login="")
         assert isinstance(outcome, Blocked)
         assert "identity could not be resolved" in outcome.why
+
+
+def approval(*names: str, passed: tuple[str, ...] = ()) -> ChecksVerdict:
+    return ChecksVerdict("pending", len(names) + len(passed), (), (), passed, names)
+
+
+class TestWorkflowApproval:
+    """#612: `action_required` is a maintainer's to clear — the loop neither
+    waits it out nor spends a fix round on it, and says so."""
+
+    def test_poll_returns_at_once_on_an_unapproved_workflow(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [approval("ci")]
+        rec = Recorder(FakeClock())
+        verdict = poll_checks(
+            fake,
+            REPO,
+            fake.head_sha,
+            cfg=cfg(),
+            tick=rec.tick,
+            emit=rec.emit_checks,
+            clock=rec.clock,
+        )
+        assert verdict.needs_approval == ("ci",)
+        assert rec.waits == []
+
+    def test_landing_hands_over_named_without_a_fix_round(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [approval("ci")]
+        lp = Landing(fake)
+        outcome = lp.run()
+        assert outcome == Blocked("check ci needs a maintainer to approve the workflow run")
+        assert fake.merges == [] and lp.rec.waits == []
+        (checks,) = [d for t, d in lp.rec.events if t == "landing.checks"]
+        assert checks["needs_approval"] == ["ci"]
+
+    def test_a_real_red_is_fixed_before_the_approval_is_named(self) -> None:
+        fake = FakeGithub()
+        fake.checks = [ChecksVerdict("red", 2, (), ("lint",), (), ("ci",))]
+        fake.failed_logs = [FailedCheck("lint", "failure", "boom", "https://x")]
+        outcome = Landing(fake).run()
+        assert isinstance(outcome, NeedsFix)
+        assert [c.name for c in outcome.failed_checks] == ["lint"]
+
+    def test_an_unapproved_advisory_workflow_does_not_block(self) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.checks = [approval("optional-e2e", passed=("ci",))]
+        lp = Landing(fake)
+        assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
+
+
+class TestMergeMethod:
+    """#620: `auto` takes what the repository allows; an explicit method it
+    refuses is named, never swapped for another."""
+
+    def test_allowed_methods_come_in_the_loops_order(self) -> None:
+        payload = {
+            "allow_squash_merge": False,
+            "allow_merge_commit": True,
+            "allow_rebase_merge": True,
+        }
+        assert allowed_merge_methods(payload) == ("merge", "rebase")
+        assert allowed_merge_methods({"allow_squash_merge": True}) is None, "partial = unknown"
+        assert allowed_merge_methods(None) is None
+
+    def test_resolution(self) -> None:
+        assert resolve_merge_method("auto", ("merge", "rebase"))[0] == "merge"
+        assert resolve_merge_method("auto", None)[0] == "squash"
+        assert resolve_merge_method("rebase", ("merge", "rebase"))[0] == "rebase"
+        assert resolve_merge_method("rebase", None)[0] == "rebase"
+        method, why = resolve_merge_method("auto", ())
+        assert method is None and "allows no merge method" in why
+        method, why = resolve_merge_method("squash", ("merge",))
+        assert method is None
+        assert '`[landing] merge_method = "squash"`' in why and "it allows: merge" in why
+
+    def test_auto_takes_the_first_allowed_method(self) -> None:
+        fake = FakeGithub()
+        fake.repo_payload["allow_squash_merge"] = False
+        lp = Landing(fake)
+        assert isinstance(lp.run(), Landed)
+        assert fake.merges == [(7, "merge", "commit0")]
+        assert ("land.merge_method", {"pr": 7, "method": "merge", "configured": "auto"}) in (
+            lp.rec.events
+        )
+
+    def test_auto_is_squash_by_default_as_before(self) -> None:
+        lp = Landing(FakeGithub())
+        lp.run()
+        assert lp.fake.merges == [(7, "squash", "commit0")]
+
+    def test_an_explicit_disallowed_method_blocks_and_never_substitutes(self) -> None:
+        fake = FakeGithub()
+        fake.repo_payload["allow_rebase_merge"] = False
+        outcome = Landing(fake, merge_method="rebase").run()
+        assert isinstance(outcome, Blocked)
+        assert '`[landing] merge_method = "rebase"`' in outcome.why
+        assert fake.merges == []
+
+    def test_an_unreadable_repository_lets_the_merge_answer(self) -> None:
+        fake = FakeGithub()
+        fake.fail_always["repo_get"] = GithubOpsError("nope", http_status=500)
+        lp = Landing(fake)
+        assert isinstance(lp.run(), Landed)
+        assert fake.merges == [(7, "squash", "commit0")]
+
+    def test_the_method_is_resolved_once_per_landing(self) -> None:
+        fake = FakeGithub()
+        fake.merge_outcomes = [STALE_409, MERGED]
+        lp = Landing(fake)
+        lp.rec.on_tick.append(lambda n: fake._move_head("commit1"))
+        assert isinstance(lp.run(), Landed)
+        assert len([t for t, _ in lp.rec.events if t == "land.merge_method"]) == 1
+
+
+class TestBlockedWithGreenChecks:
+    """#620: GitHub says `blocked` with every check green — name what the
+    base's rules want instead of PUTting and parsing a 405."""
+
+    def test_a_blocked_state_is_reread_once_then_named(self) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "blocked"
+        fake.protection = {"required_pull_request_reviews": {"required_approving_review_count": 1}}
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert "requires an approving review" in outcome.why
+        assert '`[landing] merge_gate = "chat"`' in outcome.why
+        assert fake.merges == []
+        assert lp.rec.waits == ["mergeability"], (
+            "read again: the first state may predate the checks"
+        )
+
+    def test_a_blocked_state_that_clears_on_the_reread_merges(self) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "blocked"
+        lp = Landing(fake)
+        lp.rec.on_tick.append(lambda n: fake.pr.__setitem__("mergeable_state", "clean"))
+        assert isinstance(lp.run(), Landed)
+
+    def test_unstable_is_merged_over(self) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "unstable"
+        assert isinstance(Landing(fake).run(), Landed)
+
+    def test_the_reason_names_what_is_known(self) -> None:
+        from sbxloop.gh.protection import BaseRequirements
+
+        reviews = BaseRequirements((), True, "protection")
+        assert "requires an approving review" in blocked_reason(reviews, cfg())
+        assert "merge_gate" not in blocked_reason(reviews, cfg(merge_gate="chat"))
+        unknown = BaseRequirements(None, None, "unknown")
+        assert "could not be read" in blocked_reason(unknown, cfg())
+        none = BaseRequirements((), False, "protection")
+        why = blocked_reason(none, cfg(), detail="Pull Request is not mergeable (HTTP 405)")
+        assert "CODEOWNERS" in why and why.endswith(
+            "(GitHub: Pull Request is not mergeable (HTTP 405))"
+        )
+
+    def test_a_405_on_the_merge_is_rewritten_with_the_bases_rules(self) -> None:
+        fake = FakeGithub()
+        fake.merge_outcomes = [BLOCKED_405]
+        fake.protection = {"required_pull_request_reviews": {"required_approving_review_count": 1}}
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert "requires an approving review" in outcome.why
+        assert outcome.why.endswith("(GitHub: Pull Request is not mergeable (HTTP 405))")

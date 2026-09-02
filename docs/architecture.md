@@ -303,9 +303,10 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   last check on the tree exactly as it will be delivered. A run with no
   `[github] repo` (and no `[[github.repos]]`) ends `completed` here, its
   work in the workspace.
-- **DELIVER** — the tree becomes one commit on `sbxloop/<run>` and a draft
-  PR (see [Delivery](#delivery)); every later round re-delivers onto the
-  same branch, so one run is one PR.
+- **DELIVER** — the tree becomes one commit on `sbxloop/<run>` (the
+  prefix, the PR title and the commit message are `[github]` templates)
+  and a draft PR (see [Delivery](#delivery)); every later round re-delivers
+  onto the same branch, so one run is one PR.
 - **REVIEW** — a fresh read-only session reads the PR's whole diff
   adversarially (concurrency, failure ordering, trust-boundary parsing,
   cross-module invariants, scope) and returns a verdict with line-anchored

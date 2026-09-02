@@ -60,7 +60,7 @@ from pydantic import ValidationError
 
 from sbxloop import hostgit
 from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_dotenv_file
-from sbxloop.deliver import deliver_workspace, ensure_repository
+from sbxloop.deliver import deliver_workspace, ensure_repository, render_naming
 from sbxloop.engine.checks import CheckJudgment, check_policy_reader, read_check_policy
 from sbxloop.engine.followups import (
     checklist_comment,
@@ -112,6 +112,7 @@ from sbxloop.engine.reconcile import (
     reconcile_round,
 )
 from sbxloop.engine.review import (
+    PR_TITLE_FILE,
     CarriedVerdict,
     Reconciliation,
     ReviewFinding,
@@ -1225,6 +1226,8 @@ class LoopEngine:
                 )
             ordered = graph.topo_order()
             self.store.save_tasks(run_id, ordered)
+            if graph.pr_title:
+                self.store.set_run_title(run_id, graph.pr_title)
             spend = phases.drain_spend()
             self.store.record_phase(
                 run_id,
@@ -1441,7 +1444,11 @@ class LoopEngine:
         if source is None:
             raise StateError(f"run {run_id} has no artifacts directory to deliver")
         gh, landing = self.config.github, self.config.landing
-        branch = run.branch or p.branch or branch_name(run_id)
+        branch = run.branch or p.branch or branch_name(run_id, gh.branch_prefix_for(repo))
+        title = self._retitled(p, run.pr_title)
+        if title != run.pr_title:
+            self.store.set_run_title(run_id, title)
+        pr_title, commit_message = self._naming(p, title)
         # Only the first delivery of an adopted branch continues its
         # history; once this run has delivered, later rounds force-move
         # onto their own head as they always did.
@@ -1470,6 +1477,8 @@ class LoopEngine:
             pr_number=run.pr_number if run.pr_number is not None else p.prior_pr,
             round_no=round_no,
             parent=parent,
+            title=pr_title,
+            commit_message=commit_message,
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
@@ -1504,6 +1513,43 @@ class LoopEngine:
             head_sha=head_sha,
             round=round_no,
         )
+
+    def _naming(self, p: Pipeline, title: str | None) -> tuple[str, str]:
+        """The PR title and commit message from the `[github]` templates
+        (#621) — the repo entry's own when it overrides them."""
+        assert p.repo is not None
+        gh = self.config.github
+        entry = p.repo_config
+        title_template = (entry.pr_title_template if entry else None) or gh.pr_title_template
+        message_template = (
+            entry.commit_message_template if entry else None
+        ) or gh.commit_message_template
+
+        def render(template: str) -> str:
+            return render_naming(
+                template, title=title, outcome=p.outcome, run_id=p.run_id, repo=str(p.repo)
+            )
+
+        return render(title_template), render(message_template)
+
+    def _retitled(self, p: Pipeline, current: str | None) -> str | None:
+        """The PR title after a fix round: a round that had to retitle
+        (a title-lint check) leaves the new title alone in
+        ``.sbxloop/pr-title`` under the workspace (#621) — outside the
+        delivered tree, read here, then cleared so it names one round."""
+        path = f"{p.pair.agent_workdir}/{PR_TITLE_FILE}"
+        try:
+            # One exec: read it and take it away. A missing file is the
+            # usual case (rc 1, no stdout) and not worth a log line.
+            result = p.pair.agent.exec(["sh", "-c", 'cat "$1" && rm -f "$1"', "sh", path])
+        except SbxError:
+            log.warning("deliver.title_file_unread", run=p.run_id, path=path, exc_info=True)
+            return current
+        title = " ".join(result.stdout.split()) if result.returncode == 0 else ""
+        if not title:
+            return current
+        log.info("deliver.title_from_fix", run=p.run_id, old=current, new=title)
+        return title
 
     def _label_pr(self, p: Pipeline, number: int) -> None:
         """Put the repository's own ``labels`` (``[[github.repos]]``) on the
@@ -2396,6 +2442,10 @@ class LoopEngine:
             )
         except CiTimeout as exc:
             return Blocked(str(exc))
+        if checks.needs_approval and checks.state != "red":
+            # #612: nothing to fix and nothing to wait for — a maintainer
+            # has to approve the workflow run.
+            return Blocked(checks.summary())
         if checks.state == "red":
             return NeedsFix(
                 "ci",

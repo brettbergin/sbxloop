@@ -150,8 +150,27 @@ class TestFoldCheckRuns:
         assert verdict.state == "red" and verdict.failed == ("weird",)
 
     def test_every_real_failure_conclusion_is_red(self) -> None:
-        for conclusion in ("failure", "timed_out", "cancelled", "action_required", "stale"):
+        for conclusion in ("failure", "timed_out", "cancelled", "stale"):
             assert fold_check_runs(runs(("job", conclusion))).state == "red", conclusion
+
+    def test_action_required_needs_a_maintainer_not_a_fix(self) -> None:
+        """A workflow awaiting approval (#612) is neither red — nothing ran,
+        nothing to fix — nor something to wait out: it is its own bucket,
+        pending in state so no consumer reads it as green."""
+        verdict = fold_check_runs(runs(("ci", "action_required"), ("lint", "success")))
+        assert verdict.state == "pending"
+        assert verdict.needs_approval == ("ci",)
+        assert verdict.failed == () and verdict.pending == ()
+        assert verdict.passed == ("lint",)
+        assert "ci" in verdict.names
+        assert verdict.summary() == "check ci needs a maintainer to approve the workflow run"
+
+    def test_approval_rides_through_a_merge(self) -> None:
+        approval = fold_check_runs(runs(("ci", "action_required")))
+        merged = fold_check_runs(runs(("lint", "success"))).merge(approval)
+        assert merged.state == "pending" and merged.needs_approval == ("ci",)
+        several = fold_check_runs(runs(("a", "action_required"), ("b", "action_required")))
+        assert several.summary() == "checks a, b need a maintainer to approve their workflow runs"
 
     def test_a_repo_without_ci_is_green_not_deadlocked(self) -> None:
         """No checks at all must not hold the loop waiting for a report that

@@ -122,3 +122,71 @@ def test_repo_config_owner_and_name() -> None:
     gh = GithubConfig(repos=[{"repo": "owner/name"}])
     entry = gh.repo_list()[0]
     assert (entry.owner, entry.name) == ("owner", "name")
+
+
+class TestNaming:
+    """#621: what the loop calls its branches, commits and pull requests is
+    the operator's, daemon-wide with per-repository overrides."""
+
+    def test_defaults_are_what_the_loop_always_wrote(self, tmp_path: Path) -> None:
+        cfg = load_config(cwd=tmp_path, env={})
+        assert cfg.github.pr_title_template == "sbxloop: {title}"
+        assert cfg.github.branch_prefix == "sbxloop/"
+        assert cfg.github.commit_message_template.startswith("sbxloop run {run_id}")
+        assert cfg.github.branch_prefix_for("o/r") == "sbxloop/"
+
+    def test_per_repo_overrides_fold_into_the_effective_entry(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "[github]\n"
+            'branch_prefix = "bot/"\n'
+            'pr_title_template = "chore: {title}"\n'
+            "[[github.repos]]\n"
+            'repo = "o/one"\n'
+            "[[github.repos]]\n"
+            'repo = "o/two"\n'
+            'branch_prefix = "sbx-"\n'
+            'commit_message_template = "{title} ({run_id})"\n',
+        )
+        cfg = load_config(cwd=tmp_path, env={})
+        one = cfg.github.effective_repo("o/one")
+        two = cfg.github.effective_repo("o/two")
+        assert one is not None and two is not None
+        assert (one.branch_prefix, one.pr_title_template) == ("bot/", "chore: {title}")
+        assert one.commit_message_template == cfg.github.commit_message_template
+        assert two.branch_prefix == "sbx-"
+        assert two.commit_message_template == "{title} ({run_id})"
+        assert cfg.github.branch_prefix_for("o/two") == "sbx-"
+        assert cfg.github.branch_prefix_for("o/one") == "bot/"
+        assert cfg.github.branch_prefix_for(None) == "bot/"
+
+    @pytest.mark.parametrize(
+        ("key", "value", "match"),
+        [
+            ("pr_title_template", '"{titel}"', "unknown placeholder"),
+            ("pr_title_template", '""', "empty"),
+            ("commit_message_template", '"{run_id} {branch}"', "unknown placeholder"),
+            ("branch_prefix", '""', "empty"),
+            ("branch_prefix", '"sbx loop/"', "branch_prefix"),
+            ("branch_prefix", '"/sbx/"', "branch_prefix"),
+            ("branch_prefix", '"a..b/"', "branch_prefix"),
+            ("branch_prefix", '"x.lock"', "branch_prefix"),
+        ],
+    )
+    def test_bad_naming_is_rejected_at_load(
+        self, tmp_path: Path, key: str, value: str, match: str
+    ) -> None:
+        _write(tmp_path, f'[github]\nrepo = "o/r"\n{key} = {value}\n')
+        with pytest.raises(ConfigError, match=match):
+            load_config(cwd=tmp_path, env={})
+
+    def test_a_bad_per_repo_value_names_its_key(self, tmp_path: Path) -> None:
+        _write(tmp_path, '[[github.repos]]\nrepo = "o/r"\npr_title_template = "{nope}"\n')
+        with pytest.raises(ConfigError, match="pr_title_template"):
+            load_config(cwd=tmp_path, env={})
+
+    def test_placeholders_may_repeat_and_use_format_spec(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path, '[github]\nrepo = "o/r"\npr_title_template = "[{repo}] {title} {title!s}"\n'
+        )
+        assert load_config(cwd=tmp_path, env={}).github.pr_title_template.startswith("[{repo}]")

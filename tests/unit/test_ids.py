@@ -33,3 +33,8 @@ def test_task_id_rejects_zero() -> None:
 
     with pytest.raises(ValueError, match="starts at 1"):
         ids.task_id(0)
+
+
+def test_branch_name_takes_the_operators_prefix() -> None:
+    assert ids.branch_name("r12345678") == "sbxloop/r12345678"
+    assert ids.branch_name("r12345678", "bot/") == "bot/r12345678"

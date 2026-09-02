@@ -24,7 +24,8 @@ from rich.table import Table
 
 import sbxloop
 from sbxloop import toolchains
-from sbxloop.config import Config, RepoConfig, load_config, load_config_with_sources
+from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
+from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.gh.protection import read_base_requirements
@@ -94,6 +95,9 @@ class RepoProbe:
     # Whether the delivery base requires approving reviews to merge — the
     # repo config that 405s every loop merge. None = unverifiable.
     review_protected: bool | None = None
+    # The merge methods the repository allows, in the loop's order of
+    # preference (#620). None = the payload did not say.
+    merge_methods: tuple[MergeMethod, ...] | None = None
 
 
 def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
@@ -222,7 +226,11 @@ def repo_checks(
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         notes.append(result.detail or "reachable, token has the required permissions")
+        merge_note, merge_row = _merge_method_status(name, config, result.merge_methods)
+        notes.append(merge_note)
         rows.append(Check(name, True, "; ".join(notes)))
+        if merge_row is not None:
+            rows.append(merge_row)
         if result.review_protected:
             rows.append(
                 Check(
@@ -236,6 +244,26 @@ def repo_checks(
                 )
             )
     return rows
+
+
+def _merge_method_status(
+    name: str, config: Config, allowed: tuple[MergeMethod, ...] | None
+) -> tuple[str, Check | None]:
+    """How the loop will merge on this repository (#620): a note for the
+    repo's row — what ``auto`` resolves to — and, when the configured
+    method is one the repository refuses, a failing row of its own, so
+    the operator hears it here rather than from a blocked run."""
+    configured = config.landing.merge_method
+    if allowed is None:
+        return f"merge method {configured} (repository merge settings not reported)", None
+    method, why = resolve_merge_method(configured, allowed)
+    if method is None:
+        return f"merge method {configured} not allowed", Check(
+            f"{name} merge method", False, why, hard=False
+        )
+    if configured == "auto":
+        return f"merge method auto → {method}", None
+    return f"merge method {method}", None
 
 
 @dataclass
@@ -410,6 +438,7 @@ def sandbox_repo_probe(
             detail="reachable, token has the required permissions" if not missing else "reachable",
             missing_permissions=missing,
             review_protected=_requires_approving_reviews(ops, entry.repo, base) if base else None,
+            merge_methods=allowed_merge_methods(data),
         )
 
     return probe

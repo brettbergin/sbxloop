@@ -1603,8 +1603,11 @@ class TestClaudeBackendRuntime:
         # regardless of what the host machine has on PATH.
         for toolchain in (*toolchains.resolve(["javascript"]), toolchains.CLAUDE_CODE):
             fake_sbx.script(f"exec boxa sh -c {toolchain.probe}", returncode=1)
-        # The node tarball install and the npm -g install both run in-sandbox;
-        # script them as successes so no real network is touched.
+        # The pooled apt call, the node tarball install and the npm -g install
+        # all run in-sandbox; script them as successes so no real network is
+        # touched. Unscripted, the fake runs them on the host — where a CI
+        # runner's passwordless sudo makes `apt-get update` real, and slow.
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
         fake_sbx.script("exec boxa sh -c set -e", returncode=0)
         fake_sbx.script("exec boxa sh -c sudo -n npm install -g @anthropic-ai/claude-code")
         make_client(sandbox, EventBus())._ensure_backend_runtime("claude", timeout=60)
