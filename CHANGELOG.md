@@ -8,6 +8,30 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Toolchains are detected from the workspace** (#624, #616, #644). A run
+  with `[sandbox] languages` unset now provisions what the repository
+  declares — `go.mod` selects Go, `package.json` JavaScript, `Cargo.toml`
+  Rust, `pom.xml`/Gradle files Java, `Gemfile` Ruby, `composer.json` PHP,
+  `*.csproj`/`*.sln` .NET, `tsconfig.json` TypeScript — reading the root
+  and two levels of subdirectories (dependency trees and dot-directories
+  excluded) and selecting every match. Python remains the answer only when
+  nothing is recognized, so runs on repos with no manifest are unchanged;
+  an explicit `languages` still replaces detection outright. The resolved
+  set is decided once per run, before the agent sandbox exists, and
+  reported as a `sandbox.languages` event (`source`: `config` / `detected`
+  / `default`, plus the manifests that fired); the egress allowlist, the
+  toolchain install, and the verify-command lint all read that one answer.
+  Each toolchain now also carries its installer hosts, and the agent
+  sandbox is created with the *selected* toolchains' hosts allowed
+  (`nodejs.org`, `go.dev` + `dl.google.com`, `static.rust-lang.org`,
+  `builds.dotnet.microsoft.com`, `getcomposer.org`), so a Node or Go
+  project provisions under a default-deny sbx preset without
+  `extra_allow_domains`; a language that was not selected opens nothing,
+  and `[policy] deny` still wins. `sbxloop bake` allows the same hosts for
+  the configured languages. An ecosystem fixture matrix under
+  `tests/fixtures/ecosystems/` now pins these expectations per project
+  shape.
+
 - **Chat names the agent backend next to its model** (#601). Discord and
   Slack messages that surfaced only a model reference now read
   `backend · model` (`copilot · gpt-5`, `claude · claude-sonnet-4-5`), so a

@@ -91,6 +91,47 @@ class TestSpecs:
         assert "deb.debian.org" in agent.policy_allows
         assert "api.githubcopilot.com" in agent.policy_allows
 
+    def test_selected_toolchain_installer_hosts_are_seeded(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # #616: provisioning runs before any plan, so a toolchain's
+        # installer host has to be on the spec — for the selected
+        # toolchains only.
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        agent, github = provisioner.build_specs("r1", tmp_path, languages=["go", "php"])
+        for host in ("go.dev", "dl.google.com", "getcomposer.org"):
+            assert host in agent.policy_allows, host
+            assert host not in github.policy_allows, host
+        assert "nodejs.org" not in agent.policy_allows
+        assert "static.rust-lang.org" not in agent.policy_allows
+
+    def test_build_specs_without_languages_uses_the_config(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = Config.model_validate({"sandbox": {"languages": ["rust"]}, **GITHUB_ENABLED})
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
+        agent, _github = provisioner.build_specs("r1", tmp_path)
+        assert "static.rust-lang.org" in agent.policy_allows
+
+    def test_denied_installer_host_is_never_seeded(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        config = Config.model_validate({"policy": {"deny": ["*.rust-lang.org"]}, **GITHUB_ENABLED})
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
+        agent, _github = provisioner.build_specs("r1", tmp_path, languages=["rust", "go"])
+        assert "static.rust-lang.org" not in agent.policy_allows
+        assert "go.dev" in agent.policy_allows
+
+    def test_claude_backend_seeds_the_cli_runtime_host(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # The claude backend's in-sandbox CLI comes from npm, which is in
+        # the baseline already — the point is that the entry is consulted.
+        config = Config.model_validate({"agent": {"backend": "claude"}, **GITHUB_ENABLED})
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, config=config, env={**TOKENS, "ANTHROPIC_API_KEY": "sk"}
+        )
+        agent, _github = provisioner.build_specs("r1", tmp_path, languages=["python"])
+        assert "registry.npmjs.org" in agent.policy_allows
+
     def test_extra_allow_domains_added(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         config = Config.model_validate(
             {"sandbox": {"extra_allow_domains": ["internal.example.com"]}}
@@ -239,6 +280,42 @@ class TestEnsurePair:
             types = [e.type for e in events]
             assert types.count("sandbox.provision_start") == 2
             assert types.count("sandbox.ready") == 2
+        finally:
+            pair.cleanup()
+
+    def test_ensure_pair_resolves_languages_from_the_workspace(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # #624: decided once, after the workspace exists and before any
+        # microVM does; reported as an event; carried on the pair.
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / "Cargo.toml").write_text("[package]\n")
+        provisioner = make_provisioner(fake_sbx, tmp_path, bus=bus)
+        pair = provisioner.ensure_pair("r1", workspace)
+        try:
+            assert pair.languages.languages == ("rust",)
+            assert pair.languages.source == "detected"
+            langs = [e for e in events if e.type == "sandbox.languages"]
+            assert len(langs) == 1
+            assert langs[0].data == {
+                "languages": ["rust"],
+                "source": "detected",
+                "signals": {"rust": ["Cargo.toml"]},
+            }
+            # the event precedes sandbox creation: the allowlist depends on it
+            types = [e.type for e in events]
+            assert types.index("sandbox.languages") < types.index("sandbox.provision_start")
+            assert [
+                "allow",
+                "network",
+                "static.rust-lang.org",
+                "--sandbox",
+                pair.agent.name,
+            ] in fake_sbx.policies()
         finally:
             pair.cleanup()
 

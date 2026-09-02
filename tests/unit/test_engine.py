@@ -1152,6 +1152,85 @@ class TestWorkspaceExecution:
         assert len(tar_calls) == 1
 
 
+class TestLanguageResolution:
+    """#624: the run's toolchain set is resolved once from the workspace and
+    every consumer — allowlist, worker install, verify-command lint — reads
+    that one answer."""
+
+    def _run_capturing(self, harness: Harness, **config: Any) -> tuple[Any, dict[str, Any]]:
+        from sbxloop.engine.phases import PhaseRunner
+        from sbxloop.worker.client import WorkerClient
+
+        captured: dict[str, Any] = {}
+        original_init = PhaseRunner.__init__
+
+        def spy_init(self: PhaseRunner, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            captured["phases"] = self
+
+        def spy_install(self: WorkerClient, **kwargs: Any) -> None:
+            if self.role == "agent":
+                captured["install"] = kwargs
+
+        harness.monkeypatch.setattr(PhaseRunner, "__init__", spy_init)
+        harness.monkeypatch.setattr(WorkerClient, "install", spy_install)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine(install_workers=True, **config).start("improve the project")
+        assert result.state == "completed"
+        return result, captured
+
+    def test_go_workspace_provisions_go_everywhere(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import git, make_repo
+
+        source = make_repo(harness.tmp_path)
+        (source / "go.mod").write_text("module example.com/x\n\ngo 1.26\n")
+        git("add", "go.mod", cwd=source)
+        git("commit", "-m", "go", cwd=source)
+        result, captured = self._run_capturing(harness, sandbox={"workspace": str(source)})
+
+        events = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_LANGUAGES]
+        assert len(events) == 1
+        assert events[0].data == {
+            "languages": ["go"],
+            "source": "detected",
+            "signals": {"go": ["go.mod"]},
+        }
+        # the same answer reached the install and the lint
+        assert tuple(captured["install"]["languages"]) == ("go",)
+        assert captured["phases"].languages == ("go",)
+        # ...and the agent sandbox was created able to fetch the Go tarball
+        agent = f"sbxloop-{result.run_id}-agent"
+        allows = [
+            p[2]
+            for p in harness.fake_sbx.policies()
+            if p[:2] == ["allow", "network"] and p[-1] == agent
+        ]
+        assert "go.dev" in allows and "dl.google.com" in allows
+        assert "nodejs.org" not in allows
+
+    def test_explicit_languages_win_over_the_workspace(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import git, make_repo
+
+        source = make_repo(harness.tmp_path)
+        (source / "go.mod").write_text("module example.com/x\n")
+        git("add", "go.mod", cwd=source)
+        git("commit", "-m", "go", cwd=source)
+        _result, captured = self._run_capturing(
+            harness, sandbox={"workspace": str(source), "languages": ["rust"]}
+        )
+        events = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_LANGUAGES]
+        assert events[0].data["languages"] == ["rust"]
+        assert events[0].data["source"] == "config"
+        assert tuple(captured["install"]["languages"]) == ("rust",)
+
+    def test_bare_workspace_keeps_the_python_default(self, harness: Harness) -> None:
+        _result, captured = self._run_capturing(harness)
+        events = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_LANGUAGES]
+        assert events[0].data["languages"] == ["python"]
+        assert events[0].data["source"] == "default"
+        assert tuple(captured["install"]["languages"]) == ("python",)
+
+
 class TestPrebakedTemplate:
     """[sandbox].template + a baked template: install verifies and skips the
     ladder, and the run emits sandbox.prebaked telemetry."""

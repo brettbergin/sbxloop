@@ -1,0 +1,1 @@
+{"name": "fixture", "packageManager": "pnpm@9.0.0", "scripts": {"check": "echo ok"}}

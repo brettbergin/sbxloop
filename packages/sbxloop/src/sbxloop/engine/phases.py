@@ -233,6 +233,7 @@ class PhaseRunner:
         *,
         workdir: str | None = None,
         workspace: Path | None = None,
+        languages: Sequence[str] | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
@@ -250,6 +251,13 @@ class PhaseRunner:
         # is mounted identically in the common case, and an unmounted run
         # still starts from this clone.
         self.workspace = workspace
+        # The run's resolved toolchain set (#624) — what the sandbox was
+        # actually provisioned with, which the verify-command lint keys its
+        # per-language rules on. None (embedders, tests) falls back to the
+        # config's own answer.
+        self.languages: tuple[str, ...] = (
+            tuple(languages) if languages is not None else config.sandbox.effective_languages
+        )
         # Standing chat guidance (steer_run verdicts), injected into every
         # later build prompt. The engine appends live entries and
         # replays persisted ones on resume.
@@ -290,7 +298,7 @@ class PhaseRunner:
         uv_project = self.workspace is not None and (self.workspace / UV_LOCKFILE).is_file()
         return lint_verify_commands(
             commands,
-            self.config.sandbox.effective_languages,
+            self.languages,
             uv_project=uv_project,
             workspace=self.workspace,
         )

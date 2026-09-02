@@ -78,7 +78,9 @@ secret_strategy = "proxy"
 # continue_branch_optional = false
 # Extra network allow rules applied to both sandboxes.
 # extra_allow_domains = []
-# Toolchains preinstalled in the agent sandbox. Empty = Python alone.
+# Toolchains preinstalled in the agent sandbox. Unset = whatever the
+# workspace's manifests declare (go.mod, package.json, Cargo.toml, ...),
+# Python when nothing is recognized. Setting it replaces detection.
 # languages = ["python", "node"]
 
 # [policy]

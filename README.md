@@ -1090,27 +1090,43 @@ the `page-size` probe under `sbxloop doctor --deep`.
 ## Language toolchains
 
 The agent builds a project inside its sandbox, so whatever that project needs
-to compile has to be there. `[sandbox] languages` says which toolchains get
-installed before the agent's first turn, instead of the agent discovering a
-missing compiler on its first build and spending revision budget on it:
+to compile has to be there. Toolchains are installed before the agent's first
+turn, instead of the agent discovering a missing compiler on its first build
+and spending revision budget on it. Which ones is resolved once per run:
+
+1. `[sandbox] languages`, when set — the operator's choice, never
+   second-guessed.
+2. Otherwise, **what the workspace declares**: a `go.mod` selects `go`, a
+   `package.json` selects `javascript`, a `Cargo.toml` selects `rust`, and so
+   on through the manifests in the table below. The root and two levels of
+   subdirectories are read (so a monorepo's `packages/<name>/` count;
+   `node_modules`, `vendor`, and dot-directories do not), and every match is
+   selected — a repo carrying both `pyproject.toml` and `package.json` gets
+   both.
+3. Otherwise `python`, so a workspace with no recognizable manifest behaves
+   as it always has.
+
+The run log records the answer and its provenance as a `sandbox.languages`
+event (`source` is `config`, `detected`, or `default`, and `signals` names the
+manifests that matched), so "why did this run install Go?" has an answer.
 
 ```toml
 [sandbox]
-languages = ["python"]   # the default when the key is unset
+languages = ["python"]   # optional; unset = detect from the workspace
 ```
 
-| Value        | Also accepts               | Installs                                                         |
-| ------------ | -------------------------- | ---------------------------------------------------------------- |
-| `python`     | `py`, `python3`            | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 (pinned) |
-| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)    |
-| `ruby`       | `rb`                       | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)      |
-| `java`       | `jdk`, `jvm`               | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                |
-| `php`        | —                          | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)       |
-| `javascript` | `js`, `node`, `nodejs`     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)            |
-| `typescript` | `ts`                       | `tsc` from npm, on top of `javascript`                           |
-| `go`         | `golang`                   | Go toolchain (pinned tarball from `go.dev`)                      |
-| `rust`       | `rs`, `cargo`              | cargo, rustc, rustfmt, clippy (pinned rustup)                    |
-| `dotnet`     | `csharp`, `c#`, `net`      | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`       |
+| Value        | Also accepts               | Detected from                                                                                      | Installs                                                         |
+| ------------ | -------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `python`     | `py`, `python3`            | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile`, `uv.lock`, `poetry.lock` | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 (pinned) |
+| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `CMakeLists.txt`, `meson.build`, `configure.ac`                                                    | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)    |
+| `ruby`       | `rb`                       | `Gemfile`, `Rakefile`, `*.gemspec`                                                                 | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)      |
+| `java`       | `jdk`, `jvm`               | `pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`                                           | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                |
+| `php`        | —                          | `composer.json`                                                                                    | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)       |
+| `javascript` | `js`, `node`, `nodejs`     | `package.json`                                                                                     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)            |
+| `typescript` | `ts`                       | `tsconfig.json`                                                                                    | `tsc` from npm, on top of `javascript`                           |
+| `go`         | `golang`                   | `go.mod`                                                                                           | Go toolchain (pinned tarball from `go.dev`)                      |
+| `rust`       | `rs`, `cargo`              | `Cargo.toml`                                                                                       | cargo, rustc, rustfmt, clippy (pinned rustup)                    |
+| `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`       |
 
 Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
 
@@ -1126,37 +1142,34 @@ Three rules apply to every entry. Provisioning is **probe-first** — a template
 that already ships the toolchain costs no install and no network. It is
 **never fatal** — a failure warns with the toolchain named and the run
 continues, since the agent has passwordless `sudo apt-get` as an escape
-hatch. And it is **opt-in** — setting `languages` replaces the default rather
-than adding to it, so nothing is installed for a language you did not ask
-for. Heavier toolchains are better baked into a template (`sbxloop bake`)
-than downloaded per run.
+hatch. And it is **selected, not accumulated** — an explicit `languages`
+replaces detection rather than adding to it, so nothing is installed for a
+language you did not ask for. Heavier toolchains are better baked into a
+template (`sbxloop bake`) than downloaded per run.
 
-### Toolchains that download from upstream need egress
+### Installer hosts are allowed for the selected toolchains
 
-The apt-only entries (`cpp`, `ruby`, `java`) work out of the box: apt mirrors
-are in the sandbox's always-reachable baseline. So does `python`: its `uv`
-release and the uv-managed Python 3.13 are both GitHub release assets
-(`github.com`, redirecting to `release-assets.githubusercontent.com`), and
-both hosts are in the agent sandbox's provisioning-time allowlist. The rest
-fetch from a vendor or registry, and
-**provisioning runs before any task**, so a task's `egress` declaration
-is too late to help it. Until those domains are part of the provisioning
-baseline, allow them explicitly:
+The apt-only entries (`cpp`, `ruby`, `java`) need only the apt mirrors, which
+are in the sandbox's always-reachable baseline. The rest download from a
+vendor or registry, and **provisioning runs before any task**, so a task's
+`egress` declaration is too late to help it. Each toolchain therefore carries
+its installer hosts, and the agent sandbox is created with the hosts of the
+*selected* toolchains allowed — under a default-deny sbx preset too. A
+language that was not selected opens nothing, and `[policy] deny` still wins
+over an installer host (the toolchain then fails to provision, loudly).
 
-```toml
-[sandbox]
-languages = ["typescript"]
-extra_allow_domains = ["nodejs.org", "registry.npmjs.org"]
-```
+| Language     | Allowed at provisioning time                         |
+| ------------ | ---------------------------------------------------- |
+| `python`     | `github.com`, `release-assets.githubusercontent.com` |
+| `php`        | `getcomposer.org`                                    |
+| `javascript` | `nodejs.org`                                         |
+| `typescript` | `nodejs.org`, `registry.npmjs.org`                   |
+| `go`         | `go.dev`, `dl.google.com`                            |
+| `rust`       | `static.rust-lang.org`                               |
+| `dotnet`     | `builds.dotnet.microsoft.com`                        |
 
-| Language     | Needs reachable at provisioning time |
-| ------------ | ------------------------------------ |
-| `php`        | `getcomposer.org`                    |
-| `javascript` | `nodejs.org`                         |
-| `typescript` | `nodejs.org`, `registry.npmjs.org`   |
-| `go`         | `go.dev`, `dl.google.com`            |
-| `rust`       | `static.rust-lang.org`               |
-| `dotnet`     | `builds.dotnet.microsoft.com`        |
+`sbxloop bake` allows the same hosts for the configured `languages` (there is
+no workspace to detect from at bake time).
 
 Without them the install warns and the run continues — the agent falls back to
 bootstrapping the toolchain itself, which is the behavior these entries exist
@@ -1284,7 +1297,7 @@ came from. The notable knobs:
 | `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                                                                                                                                                                                                            |
 | `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                                                                                                                                                                                                                   |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
-| `[sandbox] languages`                                     | `["python"]`       | Toolchains pre-installed in the agent sandbox (see below).                                                                                                                                                                                                                                                                                                         |
+| `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
 | `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public` beside it.                                                                                                                                                                                                                   |
 | `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`.                                                                                                             |

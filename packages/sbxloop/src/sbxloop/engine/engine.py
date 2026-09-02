@@ -622,6 +622,7 @@ class LoopEngine:
                         outcome,
                         workdir=pair.agent_workdir,
                         workspace=pair.workspace,
+                        languages=pair.languages.languages,
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -704,8 +705,9 @@ class LoopEngine:
         A configured template is expected to be prebaked (`sbxloop bake`):
         install() probes it and skips the ladder on success, falling back
         when stale. ensure_dev_tools is agent-only — the agent builds
-        projects in its VM, so it gets the `[sandbox] languages` toolchains;
-        the github sandbox only runs API ops. Both installs always run to
+        projects in its VM, so it gets the run's resolved toolchains
+        (`[sandbox] languages`, or what the workspace declares); the github
+        sandbox only runs API ops. Both installs always run to
         completion before any failure
         propagates, so an error never unwinds into pair teardown while the
         other install is still mid-exec.
@@ -719,7 +721,10 @@ class LoopEngine:
                 # CLI runtime (#533).
                 extras=self.config.agent.backend,
                 ensure_dev_tools=True,
-                languages=self.config.sandbox.effective_languages,
+                # The set provisioning resolved for this workspace (#624),
+                # not the config's answer alone: the allowlist was built
+                # from it, and the install must match the allowlist.
+                languages=pair.languages.languages,
                 expect_prebaked=prebaked_expected,
             )
         ]
