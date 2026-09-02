@@ -42,7 +42,7 @@ import shlex
 import shutil
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -259,6 +259,25 @@ def sandbox_name(run_id: str, role: SandboxRole) -> str:
     return f"sbxloop-{run_id}-{role}"
 
 
+def dedupe_domains(domains: Iterable[str]) -> list[str]:
+    """``domains`` with repeats dropped, first occurrence winning.
+
+    `sbx policy allow` refuses a rule it already holds — including one made
+    moments earlier from the same argv — and the refusal fails the whole
+    call, so a list naming a host twice does not merely waste a rule: it
+    fails provisioning outright. The tiers assembled below overlap by
+    construction (a toolchain's installer host is often a package registry
+    the baseline already promises, and an operator may name either in
+    ``extra_allow_domains``), so the union is taken here rather than left
+    to each caller to get right.
+    """
+    seen: list[str] = []
+    for domain in domains:
+        if domain not in seen:
+            seen.append(domain)
+    return seen
+
+
 def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
     """The agent sandbox's network allowlist for ``languages``.
 
@@ -272,18 +291,26 @@ def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
     baseline_allows so [policy] deny still wins over the tier that never
     asks for a grant. The selected toolchains' installer hosts ride the same
     tier (#616): a language nobody selected opens nothing.
+
+    The result is deduped: the installer tier and the advertised baseline
+    genuinely overlap — the claude backend pulls in the javascript
+    toolchain, whose installer host is the `registry.npmjs.org` the
+    baseline already names — and a repeat is fatal, not cosmetic (see
+    :func:`dedupe_domains`).
     """
     claude = config.agent.backend == "claude"
     selected = list(toolchains.resolve(languages))
     if claude:
         selected.append(toolchains.CLAUDE_CODE)
     installers = (d for d in toolchains.install_domains(selected) if d not in AGENT_ALLOW_DOMAINS)
-    return [
-        *AGENT_ALLOW_DOMAINS,
-        *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
-        *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
-        *config.sandbox.extra_allow_domains,
-    ]
+    return dedupe_domains(
+        [
+            *AGENT_ALLOW_DOMAINS,
+            *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
+            *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
+            *config.sandbox.extra_allow_domains,
+        ]
+    )
 
 
 class Provisioner:
@@ -1138,7 +1165,12 @@ class Provisioner:
             raise ProvisionError(f"provisioning {name} failed: {exc}") from exc
 
     def _apply_policy(self, spec: SandboxSpec) -> None:
-        self.cli.policy_allow(*spec.policy_allows, sandbox=spec.name)
+        # Deduped at the point of use as well as in agent_policy_allows: the
+        # github spec builds its own list, where an operator's
+        # extra_allow_domains can name a host GITHUB_ALLOW_DOMAINS already
+        # holds. sbx fails the whole call on a repeat, so no spec may reach
+        # it with one.
+        self.cli.policy_allow(*dedupe_domains(spec.policy_allows), sandbox=spec.name)
 
     def _apply_secrets(
         self, spec: SandboxSpec, sandbox: Sandbox, token: str

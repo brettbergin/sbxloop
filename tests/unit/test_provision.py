@@ -1829,6 +1829,45 @@ class TestClaudeAgentBackend:
         with pytest.raises(ValueError, match="backend"):
             Config.model_validate({"state_dir": str(tmp_path), "agent": {"backend": "gemini"}})
 
+    def test_the_allowlist_never_repeats_a_host(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        """`sbx policy allow` fails the whole call on a repeat, so a repeat
+        is fatal rather than wasteful — field failure on `db`: the concierge
+        sandbox could not provision at all under the claude backend.
+
+        The overlap is structural: the claude backend pulls in the
+        javascript toolchain for the Claude Code CLI, and its installer host
+        is the `registry.npmjs.org` PROMPT_ADVERTISED_DOMAINS already names.
+        """
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        agent, _github = provisioner.build_specs("r1", tmp_path)
+        assert "registry.npmjs.org" in agent.policy_allows
+        assert len(agent.policy_allows) == len(set(agent.policy_allows)), [
+            d for d in agent.policy_allows if agent.policy_allows.count(d) > 1
+        ]
+
+    def test_an_operator_may_repeat_a_host_the_tiers_already_hold(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Naming a host in extra_allow_domains that a toolchain or the
+        baseline also opens is a reasonable thing to write — and used to
+        fail provisioning."""
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "agent": {"backend": "claude"},
+                "sandbox": {
+                    "languages": ["dotnet", "python"],
+                    "extra_allow_domains": ["builds.dotnet.microsoft.com", "example.invalid"],
+                },
+                **GITHUB_ENABLED,
+            }
+        )
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config, env=self.CLAUDE_ENV)
+        agent, _github = provisioner.build_specs("r1", tmp_path)
+        assert len(agent.policy_allows) == len(set(agent.policy_allows))
+        assert "builds.dotnet.microsoft.com" in agent.policy_allows
+        assert "example.invalid" in agent.policy_allows
+
     def test_job_env_delivers_anthropic_key_and_backend_selector(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
