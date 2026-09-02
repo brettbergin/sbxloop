@@ -200,7 +200,11 @@ def usage_from_result(message: Any, model: str | None) -> Usage:
 class ClaudeBackend:
     name = "claude"
 
-    def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult:
+    def ensure_available(self) -> None:
+        """What this backend needs before a session can start (see
+        ``backends.ensure_available``): the SDK from the worker's
+        ``[claude]`` extra, and the CLI it spawns, which the pip package
+        does not bundle."""
         try:
             import claude_agent_sdk  # noqa: F401
         except ImportError as exc:
@@ -214,6 +218,9 @@ class ClaudeBackend:
                 "@anthropic-ai/claude-code — re-provision, or bake a template "
                 "with the claude backend configured)"
             )
+
+    def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult:
+        self.ensure_available()
         try:
             return asyncio.run(self._run(job, emit))
         except BackendUnavailableError:

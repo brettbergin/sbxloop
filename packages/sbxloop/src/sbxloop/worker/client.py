@@ -60,6 +60,16 @@ STAGED_WHEEL_DIR = "/tmp"  # nosec B108 - path inside the sandbox VM, not host t
 
 _SMOKE_BASE = "/tmp/sbxloop-smoke"  # nosec B108 - path inside the sandbox VM, not host tmp
 
+# Ask the worker whether a backend can run in this sandbox, without starting
+# a session (see WorkerClient.backend_ready). Exits nonzero on
+# BackendUnavailableError — the same precondition run_session opens with, so
+# there is no second copy of "what this backend needs" to drift. argv: the
+# backend name.
+_BACKEND_PROBE = (
+    "import sys; from sbxloop_worker.backends import ensure_available; "
+    "ensure_available(sys.argv[1])"
+)
+
 # One in-sandbox orchestrator for the whole prebake verification: manifest
 # read+parse, import/version check, and entrypoint smoke — each formerly its
 # own `sbx exec` round trip (#127). Runs under the template's system python3
@@ -356,6 +366,27 @@ class WorkerClient:
             return self._entrypoint_smoke(self.python).returncode == 64
         except SbxError:
             return False
+
+    def backend_ready(self, backend: str) -> bool:
+        """Is this sandbox equipped to run ``backend``?
+
+        :meth:`verify_installed` answers "is *a* worker of this version
+        installed", which is backend-blind: the worker is installed with the
+        configured backend's extra, so a box provisioned under copilot has
+        the Copilot SDK and no Claude Code CLI while reporting the very same
+        version. A reuse gate built on the version alone therefore keeps a
+        box the configured backend cannot run in (#533) — the operator's
+        only symptom being every concierge message failing.
+
+        The probe asks the worker's own precondition
+        (``backends.ensure_available``), so the answer stays in one place
+        rather than being re-derived host-side.
+        """
+        try:
+            probe = self.sandbox.exec([self.python, "-c", _BACKEND_PROBE, backend])
+        except SbxError:
+            return False
+        return probe.ok
 
     def _entrypoint_smoke(self, python: str) -> ExecResult:
         """Run the worker entrypoint against a missing job file; a healthy

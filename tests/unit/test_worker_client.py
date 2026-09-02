@@ -1624,3 +1624,56 @@ class TestClaudeBackendRuntime:
     def test_copilot_extras_skip_the_ensure(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
         make_client(sandbox, EventBus())._ensure_backend_runtime("copilot", timeout=60)
         assert fake_sbx.invocations("exec") == []
+
+
+class TestBackendReady:
+    """`backend_ready` — the probe the concierge reuse gate leans on (#533).
+
+    `verify_installed` is backend-blind: the worker is installed with the
+    configured backend's extra, so a box built under one backend reports the
+    very same version as one built under another.
+    """
+
+    def test_ready_when_the_probe_exits_zero(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script(f"exec boxa {sys.executable} -c import sys; from sbxloop_worker.backends")
+        assert client.backend_ready("copilot") is True
+
+    def test_not_ready_when_the_backend_cannot_run(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
+    ) -> None:
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script(
+            f"exec boxa {sys.executable} -c import sys; from sbxloop_worker.backends",
+            returncode=1,
+            stderr="claude-agent-sdk is not installed; install sbxloop-worker[claude]",
+        )
+        assert client.backend_ready("claude") is False
+
+    def test_the_probe_asks_about_the_named_backend(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
+    ) -> None:
+        """The backend name travels as argv, not baked into the snippet —
+        the worker's own ensure_available decides, so there is no host-side
+        copy of what each backend needs."""
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script(f"exec boxa {sys.executable} -c import sys; from sbxloop_worker.backends")
+        client.backend_ready("claude")
+        probe = [
+            call
+            for call in fake_sbx.invocations("exec")
+            if "sbxloop_worker.backends" in " ".join(call)
+        ][-1]
+        assert probe[-1] == "claude"
+        assert "ensure_available" in " ".join(probe)
+
+    def test_an_sbx_level_failure_is_not_ready(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        """A dead sandbox answers "not ready" rather than raising: the gate's
+        job is to decide reuse, and an unreachable box is not reusable."""
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script(
+            f"exec boxa {sys.executable} -c import sys; from sbxloop_worker.backends",
+            returncode=1,
+            stderr="Error: sandbox not found",
+        )
+        assert client.backend_ready("claude") is False

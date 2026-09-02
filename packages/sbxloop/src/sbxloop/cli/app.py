@@ -118,9 +118,38 @@ def _main_callback(
 
 
 def _config_with_overrides(**overrides: Any) -> Config:
-    config = load_config()
+    config = _run_config()
     updates = {k: v for k, v in overrides.items() if v is not None}
     return config.model_copy(update=updates) if updates else config
+
+
+def _run_config() -> Config:
+    """Config for a command that reads or writes *runs*, with ``state_dir``
+    pointing where this project's runs actually live.
+
+    On a daemon host the daemon anchors its state away from the top-level
+    default (#255), so a command that trusts ``state_dir`` verbatim reports
+    an unrelated — usually stale, often empty — world: `sbxloop status` in
+    the runner directory answers about neither the daemon's runs nor
+    anything else current. ``sbxloop daemon`` and its ``ctl`` subcommands
+    already resolve this way (``_daemon_state_dir``); the run commands were
+    left behind.
+
+    Stamped onto the config rather than applied at each read, because a run
+    directory is derived from ``state_dir`` too (``LoopEngine``): resolving
+    only the store would file a run's rows in one place and its workspace
+    and artifacts in another. See ``paths.resolve_cli_state_dir`` for when
+    the redirect fires at all — never on a host with no daemon store.
+    """
+    from sbxloop.daemon.paths import resolve_cli_state_dir
+
+    config, sources = load_config_with_sources()
+    resolved = resolve_cli_state_dir(
+        config, sources, cwd=Path.cwd(), env=os.environ, home=Path.home()
+    ).path
+    if resolved == config.state_dir:
+        return config
+    return config.model_copy(update={"state_dir": resolved})
 
 
 def _store(config: Config) -> StateStore:
@@ -648,7 +677,7 @@ def resume(
     ] = 0,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
-    config = load_config()
+    config = _run_config()
     engine = LoopEngine(config)
     try:
         if grant_rounds:
@@ -667,7 +696,7 @@ def resume(
 @app.command()
 def cancel(run_id: Annotated[str, typer.Argument()]) -> None:
     """Mark a run cancelled (takes effect at the next phase boundary)."""
-    config = load_config()
+    config = _run_config()
     engine = LoopEngine(config)
     try:
         engine.cancel(run_id)
@@ -682,7 +711,7 @@ def status(
     run_id: Annotated[str | None, typer.Argument(help="Run id for details.")] = None,
 ) -> None:
     """List runs, or show one run's tasks and phase history."""
-    config = load_config()
+    config = _run_config()
     store = _store(config)
     if run_id is None:
         table = Table(title="sbxloop runs")
@@ -772,7 +801,7 @@ def logs(
     ] = 10.0,
 ) -> None:
     """Replay (or tail) a run's event stream from the state store."""
-    config = load_config()
+    config = _run_config()
     store = _store(config)
     store.get_run(run_id)  # validates existence
     last_seq = 0
@@ -827,7 +856,7 @@ def shell(
     if role not in ("agent", "github"):
         console.print(f"[bold red]invalid --role {role!r}:[/] must be agent or github")
         raise typer.Exit(2)
-    config = load_config()
+    config = _run_config()
     store = _store(config)
     try:
         store.get_run(run_id)
@@ -863,7 +892,7 @@ def artifacts(
     ] = False,
 ) -> None:
     """Show where a run's artifacts live on the host, and what is in there."""
-    config = load_config()
+    config = _run_config()
     store = _store(config)
     try:
         record = store.get_run(run_id)
@@ -901,7 +930,7 @@ def artifacts(
 @sandbox_app.command("ls")
 def sandbox_ls() -> None:
     """List sbxloop-managed sandboxes."""
-    config = load_config()
+    config = _run_config()
     cli = SbxCLI(app_name=config.app_name or None)
     table = Table(title="sbxloop sandboxes")
     for column in ("name", "agent", "status", "workspace"):
@@ -919,7 +948,7 @@ def sandbox_rm(
     all_: Annotated[bool, typer.Option("--all", help="Remove all sbxloop sandboxes.")] = False,
 ) -> None:
     """Remove sbxloop sandboxes by name, by run, or all of them."""
-    config = load_config()
+    config = _run_config()
     cli = SbxCLI(app_name=config.app_name or None)
     targets: list[str] = []
     if name:
@@ -1167,7 +1196,7 @@ def sandbox_prune(
     by default: prints the classification and removes nothing without
     --force.
     """
-    config = load_config()
+    config = _run_config()
     store = _store(config)
     cli = SbxCLI(app_name=config.app_name or None)
     try:
@@ -1249,7 +1278,7 @@ def gc(
     kept-for-debugging and whose delivery did not fail. Run rows in the
     state DB — the audit trail — are never removed.
     """
-    config = load_config()
+    config = _run_config()
     days = config.daemon.prune_runs_after_days if older_than is None else older_than
     # typer parses "nan" and "inf" as valid floats; NaN compares false
     # against everything, which would make EVERY terminal run "past

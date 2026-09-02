@@ -64,7 +64,10 @@ also allows `api.anthropic.com` egress and keeps the CLI hermetic
 (telemetry/auto-update traffic disabled). Missing or invalid configuration
 fails fast: an unknown backend fails config loading, and a missing
 `ANTHROPIC_API_KEY` fails before any microVM boots. Re-run `sbxloop bake`
-after switching backends so a baked template carries the right runtime.
+after switching backends so a baked template carries the right runtime; the
+daemon's long-lived concierge sandbox rebuilds itself, since its reuse check
+asks whether the box is equipped for the configured backend and not only
+whether the worker version matches.
 
 ## Quickstart
 
