@@ -32,6 +32,31 @@ All notable changes to sbxloop are documented here. The project adheres to
   gating set and its source, the pending, fix, regression, preexisting,
   advisory and ignored names, and the baseline sha.
 
+- **An automated reviewer's changes-requested review is a signal, not
+  a veto** (#613). A GitHub App that reviews pull requests (CodeRabbit,
+  Copilot, Sourcery…) leaves a `CHANGES_REQUESTED` it never dismisses,
+  and the landing stage read it as a person's: one fix round, then
+  `blocked` for ever with "only they can dismiss it", so no PR on a
+  repository with such a bot ever landed. Reviewers now carry whether
+  they are a bot — REST `user.type == "Bot"` on reviews and comments,
+  GraphQL `author.__typename` on threads (`ThreadComment.is_bot`,
+  `ReviewThread.opened_by_bot`, `HumanObjection.is_bot`; the field
+  #622 reads). A bot's standing review buys **one** dedicated fix round
+  (`fix.round` kind `bot`, its findings in the brief, its threads
+  answered by the reconciliation that follows the fix — spending a CI
+  round when one is left, skipped when none is); a bot review still
+  standing after that is merged over, named in a PR comment ("bots do
+  not dismiss their reviews"), and reported as `land.bot_standing`. It
+  never produces the terminal block. A person's review is untouched:
+  full authority, and a person standing beside a bot still wins. A
+  bot's inline threads are neither acknowledged nor a reconciliation
+  block — the gate is for people. New `[landing] ignore_reviewers`
+  names User-type accounts to treat as bots (a reviewer on a personal
+  token); there is no reverse list, an App is never a person. Human
+  thread acknowledgments are capped at 25 per landing pass
+  (`land.human_ack_capped`), the remainder blocking truthfully with a
+  note rather than posting hundreds of replies in one go.
+
 - **Review, comment, check, and thread reads are paginated** (#614).
   Every GitHub list read took the first page (30 entries) as the whole
   list, so on a busy pull request a standing `CHANGES_REQUESTED` past

@@ -17,6 +17,7 @@ import pytest
 
 from sbxloop.config import LandingConfig
 from sbxloop.engine.landing import (
+    ACK_CAP,
     Blocked,
     Gated,
     Landed,
@@ -42,14 +43,17 @@ def thread(
     line: int | None = 12,
     resolved: bool = False,
     comments: tuple[tuple[str, str], ...] = ((LOGIN, "[major] this leaks"),),
+    bot: bool = False,
 ) -> ReviewThread:
+    """``bot`` marks the root comment's author as a GitHub App."""
     return ReviewThread(
         node_id=node_id,
         is_resolved=resolved,
         path=path,
         line=line,
         comments=tuple(
-            ThreadComment(index + 1, login, body) for index, (login, body) in enumerate(comments)
+            ThreadComment(index + 1, login, body, is_bot=bot and index == 0)
+            for index, (login, body) in enumerate(comments)
         ),
     )
 
@@ -350,6 +354,101 @@ class TestHumanAck:
         fake.pr["merged"] = False  # run the landing pass again from the top
         assert isinstance(run_land(fake, ack=gate_ack(fake)), Landed)
         assert len(fake.replies) == posted
+
+
+class TestBotThreads:
+    """#613: a bot's inline threads reach the loop through the one fix
+    round its review buys, never through the reconciliation gate."""
+
+    BOT = "coderabbitai[bot]"
+
+    def test_a_bot_opened_thread_is_not_a_humans(self) -> None:
+        opened = thread(comments=((self.BOT, "nit"),), bot=True)
+        assert unreconciled_threads([opened], login=LOGIN) == ([], [])
+
+    def test_an_ignored_reviewers_thread_is_a_bots(self) -> None:
+        opened = thread(comments=(("Review-Robot", "nit"),))
+        assert unreconciled_threads([opened], login=LOGIN) == ([], ["a.py:12"])
+        assert unreconciled_threads([opened], login=LOGIN, ignore=["review-robot"]) == ([], [])
+
+    def test_a_human_reply_inside_a_bot_thread_does_not_make_it_human(self) -> None:
+        opened = thread(comments=((self.BOT, "nit"), (HUMAN, "agreed")), bot=True)
+        assert unreconciled_threads([opened], login=LOGIN) == ([], [])
+
+    def test_a_bot_thread_is_neither_acked_nor_a_block(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread(comments=((self.BOT, "nit"),), bot=True)]
+        assert isinstance(run_land(fake, ack=gate_ack(fake)), Landed)
+        assert fake.replies == []
+
+    def test_an_ignored_reviewers_thread_is_neither_acked_nor_a_block(self) -> None:
+        fake = FakeGithub()
+        fake.threads = [thread(comments=(("review-robot", "nit"),))]
+        cfg = LandingConfig.model_validate(
+            {"ci_poll_interval_s": 1.0, "ci_settle_s": 0, "ignore_reviewers": ["review-robot"]}
+        )
+        assert isinstance(run_land(fake, cfg=cfg, ack=gate_ack(fake)), Landed)
+        assert fake.replies == []
+
+
+class TestAckCap:
+    """Human acknowledgments are capped per landing pass (#613): a burst of
+    hundreds of threads is answered a page at a time, and the remainder
+    blocks truthfully rather than being papered over."""
+
+    def _threads(self, count: int) -> list[ReviewThread]:
+        # Distinct root comment ids: the fake files a reply by the root it
+        # answers, as GitHub does.
+        return [
+            ReviewThread(
+                node_id=f"PRRT_{i}",
+                is_resolved=False,
+                path="a.py",
+                line=i,
+                comments=(ThreadComment(1000 + i, HUMAN, f"why {i}?"),),
+            )
+            for i in range(1, count + 1)
+        ]
+
+    def test_the_cap_is_twenty_five(self) -> None:
+        assert ACK_CAP == 25
+
+    def test_at_the_cap_everything_is_acked_and_the_pr_merges(self) -> None:
+        fake = FakeGithub()
+        fake.threads = self._threads(ACK_CAP)
+        seen: list[tuple[str, dict[str, Any]]] = []
+        outcome = run_land(
+            fake, ack=gate_ack(fake), emit=lambda type, **data: seen.append((type, data))
+        )
+        assert isinstance(outcome, Landed)
+        assert len(fake.replies) == ACK_CAP
+        assert [t for t, _ in seen if t == "land.human_ack_capped"] == []
+
+    def test_past_the_cap_the_rest_block_and_the_reason_says_so(self) -> None:
+        fake = FakeGithub()
+        fake.threads = self._threads(ACK_CAP + 3)
+        seen: list[tuple[str, dict[str, Any]]] = []
+        outcome = run_land(
+            fake, ack=gate_ack(fake), emit=lambda type, **data: seen.append((type, data))
+        )
+        assert isinstance(outcome, Blocked)
+        assert outcome.why == (
+            f"3 human review threads have no reply (acknowledgments are capped at {ACK_CAP} "
+            f"per landing pass): a.py:{ACK_CAP + 1}, a.py:{ACK_CAP + 2}, a.py:{ACK_CAP + 3}"
+        )
+        assert len(fake.replies) == ACK_CAP
+        assert (
+            "land.human_ack_capped",
+            {"pr": 7, "acked": ACK_CAP, "remaining": 3, "cap": ACK_CAP},
+        ) in seen
+        assert fake.merges == []
+
+    def test_the_next_pass_answers_the_rest(self) -> None:
+        fake = FakeGithub()
+        fake.threads = self._threads(ACK_CAP + 3)
+        assert isinstance(run_land(fake, ack=gate_ack(fake)), Blocked)
+        assert isinstance(run_land(fake, ack=gate_ack(fake)), Landed)
+        assert len(fake.replies) == ACK_CAP + 3
 
 
 class TestOptInMergeGate:

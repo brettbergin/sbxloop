@@ -832,8 +832,9 @@ def fix_brief(
             + "\n\nMake these pass; run the project's own gate here before you finish."
         )
     if objections:
+        who = "an automated reviewer" if kind == "bot" else "a human"
         parts.append(
-            "Review comments a human left on the PR, quoted verbatim:\n\n"
+            f"Review comments {who} left on the PR, quoted verbatim:\n\n"
             + objections
             + "\n\nAddress each one — with a change, or with a reasoned explanation."
         )

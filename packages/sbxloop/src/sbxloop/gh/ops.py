@@ -113,12 +113,24 @@ def logins_match(a: str, b: str) -> bool:
     return bool(a) and bool(b) and normalize_login(a) == normalize_login(b)
 
 
+def is_bot_user(user: Any) -> bool:
+    """Whether a REST ``user`` object is a GitHub App (``type == "Bot"``).
+
+    Carried alongside the login (#613, #622) so a reviewer's kind is a
+    fact read from GitHub, not a guess from a ``[bot]`` suffix — a human
+    ``foo`` and an App ``foo[bot]`` are different accounts.
+    """
+    return isinstance(user, dict) and str(user.get("type") or "") == "Bot"
+
+
 class ThreadComment(NamedTuple):
     """One comment inside a review thread."""
 
     comment_id: int | None
     login: str
     body: str
+    # The author is a GitHub App (GraphQL ``author.__typename == "Bot"``).
+    is_bot: bool = False
 
 
 class ReviewThread(NamedTuple):
@@ -141,6 +153,10 @@ class ReviewThread(NamedTuple):
     @property
     def root_comment_id(self) -> int | None:
         return self.comments[0].comment_id if self.comments else None
+
+    @property
+    def opened_by_bot(self) -> bool:
+        return bool(self.comments) and self.comments[0].is_bot
 
     def has_reply_from(self, login: str) -> bool:
         return any(logins_match(c.login, login) for c in self.comments[1:])
@@ -491,11 +507,13 @@ def fold_review_threads(payload: Any) -> list[ReviewThread]:
             if not isinstance(comment, dict):
                 continue
             database_id = comment.get("databaseId")
+            author = comment.get("author") or {}
             comments.append(
                 ThreadComment(
                     comment_id=int(database_id) if isinstance(database_id, int) else None,
-                    login=str((comment.get("author") or {}).get("login") or ""),
+                    login=str(author.get("login") or ""),
                     body=str(comment.get("body") or ""),
+                    is_bot=str(author.get("__typename") or "") == "Bot",
                 )
             )
         threads.append(
@@ -938,7 +956,7 @@ class GithubOps:
         "pageInfo { hasNextPage endCursor } "
         "nodes { id isResolved path line "
         "comments(first: 100) { pageInfo { hasNextPage } "
-        "nodes { databaseId body author { login } } } } } } } }"
+        "nodes { databaseId body author { login __typename } } } } } } } }"
     )
 
     _RESOLVE_MUTATION = (

@@ -45,6 +45,7 @@ from sbxloop.gh.ops import (
     PaginationError,
     ReviewThread,
     fold_reviews,
+    is_bot_user,
     logins_match,
     raw_pages,
 )
@@ -66,6 +67,11 @@ Ack = Callable[[Sequence[ReviewThread]], int]
 # apart) before the gate gives up; a code constant, not a config key —
 # there is nothing for an operator to tune about a transient 5xx.
 THREAD_READ_ATTEMPTS = 3
+
+# Human threads acknowledged in one landing pass, at most (#613). A pass
+# that hits the cap says so and the gate blocks on the rest — a human who
+# opened that many threads is a human who is looking at the PR.
+ACK_CAP = 25
 
 _IDENTITY_WHY = (
     "the loop's own GitHub identity could not be resolved, so its review "
@@ -108,6 +114,8 @@ class HumanObjection(NamedTuple):
     anchor: str = ""
     comment_id: int | None = None
     thread_node_id: str | None = None
+    # The reviewer is a GitHub App (REST ``user.type == "Bot"``, #613).
+    is_bot: bool = False
 
 
 class NeedsFix(NamedTuple):
@@ -272,6 +280,9 @@ def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> l
     def login_of(entry: dict[str, Any]) -> str:
         return str((entry.get("user") or {}).get("login") or "")
 
+    def bot(entry: dict[str, Any]) -> bool:
+        return is_bot_user(entry.get("user"))
+
     payload = raw_pages(ops, f"/repos/{repo}/pulls/{number}/reviews")
     latest: dict[str, dict[str, Any]] = {}
     for review in payload:
@@ -298,6 +309,7 @@ def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> l
                 key=f"human:review:{review.get('id')}",
                 login=who,
                 body=str(review.get("body") or "").strip(),
+                is_bot=bot(review),
             )
         )
     comments = raw_pages(ops, f"/repos/{repo}/pulls/{number}/comments")
@@ -321,13 +333,22 @@ def human_objections(ops: GithubOps, repo: str, number: int, *, login: str) -> l
                 body=body,
                 anchor=anchor,
                 comment_id=int(comment_id) if comment_id is not None else None,
+                is_bot=bot(comment) or bot(latest[who]),
             )
         )
     return out
 
 
+def automated(login: str, is_bot: bool, cfg: LandingConfig) -> bool:
+    """Whether a reviewer is a machine (#613): a GitHub App, or a User-type
+    account the operator listed in ``[landing] ignore_reviewers`` (a bot
+    that reviews from a personal token). There is no reverse list — an
+    App is never a human."""
+    return is_bot or any(logins_match(login, name) for name in cfg.ignore_reviewers)
+
+
 def unreconciled_threads(
-    threads: Sequence[ReviewThread], *, login: str
+    threads: Sequence[ReviewThread], *, login: str, ignore: Sequence[str] = ()
 ) -> tuple[list[str], list[str]]:
     """Split the PR's inline threads into the loop's own and the humans'
     that are *not* reconciled yet, as anchors ready to name in a reason.
@@ -340,7 +361,11 @@ def unreconciled_threads(
     A **human** thread is reconciled when the loop replied in it. It is
     never required to be resolved: closing a human's thread is theirs to do.
 
-    Threads with no comments at all cannot be spoken to and are ignored.
+    Threads with no comments at all cannot be spoken to and are ignored. So
+    is a thread a bot opened (a GitHub App, or a login in ``ignore`` —
+    ``[landing] ignore_reviewers``): a bot's inline comments reach the loop
+    through the one fix round its changes-requested review buys (#613),
+    never through the reconciliation gate, which is for people.
 
     ``login`` must be the loop's real identity. An empty login would
     classify every loop thread as a human's (and ``has_reply_from("")``
@@ -361,11 +386,19 @@ def unreconciled_threads(
             if thread.is_resolved or thread.has_reply_from(login):
                 continue
             loop_open.append(thread.anchor)
+        elif _bot_thread(thread, ignore):
+            continue
         else:
             if thread.has_reply_from(login):
                 continue
             human_open.append(thread.anchor)
     return loop_open, human_open
+
+
+def _bot_thread(thread: ReviewThread, ignore: Sequence[str]) -> bool:
+    return thread.opened_by_bot or any(
+        logins_match(thread.comments[0].login, name) for name in ignore
+    )
 
 
 def _read_threads(
@@ -407,6 +440,7 @@ def _reconciliation_block(
     repo: str,
     number: int,
     *,
+    cfg: LandingConfig,
     login: str,
     tick: Tick,
     emit: Emit,
@@ -427,7 +461,9 @@ def _reconciliation_block(
     :func:`sbxloop.engine.reconcile.acknowledge_human_threads`) and judges
     again on a fresh read. A standing changes-requested review never
     reaches here — ``land()`` hands over on it first — so an ack only ever
-    answers non-blocking commenters.
+    answers non-blocking commenters. At most :data:`ACK_CAP` of them per
+    pass, and never a bot's thread (#613): the rest, if any, block
+    truthfully.
     """
     threads = _read_threads(ops, repo, number, tick=tick)
     if isinstance(threads, Blocked):
@@ -440,26 +476,33 @@ def _reconciliation_block(
         # loop thread a human's — the App-auth field failure this guard
         # replaces with the truth.
         return Blocked(_IDENTITY_WHY)
-    loop_open, human_open = unreconciled_threads(threads, login=login)
+    ignore = tuple(cfg.ignore_reviewers)
+    loop_open, human_open = unreconciled_threads(threads, login=login, ignore=ignore)
+    capped = 0
     if human_open and ack is not None:
         pending = [
             t
             for t in threads
             if t.comments
             and not logins_match(t.comments[0].login, login)
+            and not _bot_thread(t, ignore)
             and not t.has_reply_from(login)
         ]
-        acked = ack(pending)
+        capped = max(0, len(pending) - ACK_CAP)
+        acked = ack(pending[:ACK_CAP])
         if acked:
             emit("land.human_ack", pr=number, acked=acked)
+        if capped:
+            emit("land.human_ack_capped", pr=number, acked=acked, remaining=capped, cap=ACK_CAP)
         reread = _read_threads(ops, repo, number, tick=tick)
         if not isinstance(reread, Blocked):
-            loop_open, human_open = unreconciled_threads(reread, login=login)
+            loop_open, human_open = unreconciled_threads(reread, login=login, ignore=ignore)
     if loop_open:
         return Blocked(f"{len(loop_open)} review threads unreconciled: {', '.join(loop_open)}")
     if human_open:
+        note = f" (acknowledgments are capped at {ACK_CAP} per landing pass)" if capped else ""
         return Blocked(
-            f"{len(human_open)} human review threads have no reply: {', '.join(human_open)}"
+            f"{len(human_open)} human review threads have no reply{note}: {', '.join(human_open)}"
         )
     return None
 
@@ -483,6 +526,7 @@ def land(
     ack: Ack | None = None,
     gate: bool = False,
     policy_for: PolicyFor = no_policy,
+    bot_round_spent: bool = False,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
@@ -509,10 +553,17 @@ def land(
     of them gate, and which reds the base already had. The default judges
     the way the loop always did — every check gates, every red is ours.
     A red the merge goes over is named in a PR comment before the merge.
+
+    ``bot_round_spent`` is whether this run already had its one fix round
+    for an automated reviewer's changes-requested review (#613). A bot's
+    objection buys exactly that round; afterwards its standing review is
+    merged over and named — bots do not dismiss, and a human's authority
+    is the only kind that blocks.
     """
     started = clock()
     last_checks: CheckJudgment | None = None
     named: set[tuple[str, ...]] = set()
+    bots_named: set[tuple[str, ...]] = set()
     while True:
         if clock() - started >= cfg.ci_timeout_s:
             return Blocked(f"landing did not settle within ci_timeout_s={cfg.ci_timeout_s:g}s")
@@ -538,6 +589,8 @@ def land(
             # our own words: a fix round on them is budget burn, not
             # autonomy. Hand over with the truth instead.
             return Blocked(_IDENTITY_WHY)
+        bots = [o for o in standing if automated(o.login, o.is_bot, cfg)]
+        standing = [o for o in standing if not automated(o.login, o.is_bot, cfg)]
         unanswered = [o for o in standing if o.key not in answered]
         if standing and unanswered:
             return NeedsFix(
@@ -559,6 +612,21 @@ def land(
                 f"a reviewer's changes-requested review is still standing after "
                 f"{len(standing)} replied objection(s); only they can dismiss it"
             )
+        if bots and not bot_round_spent:
+            # An automated reviewer's objection is a signal worth one round
+            # (#613): its findings go into the brief and its threads get
+            # their reply from the reconciliation that follows the fix.
+            # It is not an authority — a bot never dismisses its review.
+            return NeedsFix(
+                "bot",
+                "an automated reviewer requested changes on the pull request",
+                objections=ops.pr_review_feedback(repo, number, exclude_login=login),
+                human=tuple(o for o in bots if o.key not in answered),
+            )
+        bot_reviewers = tuple(dict.fromkeys(o.login for o in bots))
+        if bot_reviewers and bot_reviewers not in bots_named:
+            bots_named.add(bot_reviewers)
+            emit("land.bot_standing", pr=number, reviewers=list(bot_reviewers))
         checks = judge_checks(ops.pr_checks(repo, head), policy_for(head))
         if checks.state == "pending":
             tick("ci")
@@ -612,7 +680,7 @@ def land(
         if not review_posted:
             return Blocked("review record could not be posted")
         blocked = _reconciliation_block(
-            ops, repo, number, login=login, tick=tick, emit=emit, ack=ack
+            ops, repo, number, cfg=cfg, login=login, tick=tick, emit=emit, ack=ack
         )
         if blocked is not None:
             emit("land.unreconciled", pr=number, why=blocked.why)
@@ -629,10 +697,10 @@ def land(
             # effort: a comment refusal must not stop a merge every bar
             # has cleared.
             named.add(checks.merged_over)
-            try:
-                ops.pr_issue_comment(repo, number, comment)
-            except GithubOpsError:
-                log.warning("land.merged_over_unposted", repo=repo, pr=number, exc_info=True)
+            _say(ops, repo, number, comment)
+        if bot_reviewers and ("comment", *bot_reviewers) not in bots_named:
+            bots_named.add(("comment", *bot_reviewers))
+            _say(ops, repo, number, bot_review_comment(bot_reviewers))
         outcome = ops.pr_merge(repo, number, method=cfg.merge_method, sha=head)
         if outcome.stale:
             # The head moved between the read that judged it and the merge;
@@ -650,6 +718,27 @@ def land(
                 # not a failure of the thing that just succeeded.
                 log.warning("land.branch_delete_failed", repo=repo, branch=branch, exc_info=True)
         return Landed(outcome.sha)
+
+
+def bot_review_comment(reviewers: Sequence[str]) -> str:
+    """The PR comment naming the automated reviewers whose changes-requested
+    review the merge goes over (#613)."""
+    who = ", ".join(f"`{name}`" for name in reviewers)
+    return (
+        f"Merged with a changes-requested review from an automated reviewer still "
+        f"standing: {who}. Its findings had one fix round and were answered on "
+        "their threads; bots do not dismiss their reviews, and only a person's "
+        "review blocks a merge."
+    )
+
+
+def _say(ops: GithubOps, repo: str, number: int, body: str) -> None:
+    """A best-effort PR comment: a refusal must not stop a merge every bar
+    has cleared."""
+    try:
+        ops.pr_issue_comment(repo, number, body)
+    except GithubOpsError:
+        log.warning("land.comment_unposted", repo=repo, pr=number, exc_info=True)
 
 
 def _undraft(ops: GithubOps, node_id: str | None) -> bool:

@@ -592,8 +592,11 @@ when it carries a loop reply at all. A human thread that lacks one is
 first *answered*, not waited on: no human asked for that wait, so landing
 replies itself ("noted — does not hold up the merge",
 `reconcile.acknowledge_human_threads`, emitted as `land.human_ack`; the
-thread is never resolved — closing it stays the human's call) and judges
-again on a fresh read. Whatever is still left over is
+thread is never resolved — closing it stays the human's call; at most 25
+per pass, `land.human_ack_capped`, the rest blocking truthfully with a
+note) and judges again on a fresh read. A thread a bot opened
+(`ReviewThread.opened_by_bot`, or a login in `[landing] ignore_reviewers`)
+is neither acknowledged nor a block: the gate is for people. Whatever is still left over is
 `Blocked("N review threads unreconciled: <anchors>")`, naming them. A
 thread listing that fails is retried before "could not be read" blocks — a
 one-off 502 must not strand a run that cleared every other bar — and a
@@ -605,6 +608,21 @@ from the credential itself (one cached `GET /app`; the user-token-only
 with the identity failure rather than misreading the loop's own threads as
 a human's.
 
+**Automated reviewers (#613).** Reviewers carry whether they are a bot —
+REST `user.type == "Bot"`, GraphQL `author.__typename` — read from GitHub,
+never guessed from a `[bot]` suffix; `[landing] ignore_reviewers` adds
+User-type accounts to treat the same way, and there is no reverse list. A
+bot's standing `CHANGES_REQUESTED` gets **one** dedicated fix round
+(`NeedsFix("bot")`, `fix.round` kind `bot`: its findings in the brief, its
+objections answered on their threads by the reconciliation after the fix;
+a CI round when one is left, else skipped and recorded as spent —
+`store.record_bot_round`, sentinel round `BOT_ROUND`). After that a bot
+review still standing is merged over, named in a PR comment ("bots do not
+dismiss their reviews") and reported as `land.bot_standing`; it never
+produces the terminal block. A person's review is untouched and outranks
+a bot's beside it. The principle it shares with #611: a signal no person
+gave gets one round and never blocks; people keep full authority.
+
 ## Landing
 
 A delivered PR is not done because it exists, and merging is not optional:
@@ -612,8 +630,9 @@ A delivered PR is not done because it exists, and merging is not optional:
 what each gate costs — the PR's own fate first (a human merging it is the
 acceptance; a human closing it unmerged fails the run), then un-drafting,
 then a human's standing `CHANGES_REQUESTED` (the loop's own reviews are
-excluded from that fold — our verdict lives in the run), then CI, then
-mergeability, and only then the merge:
+excluded from that fold — our verdict lives in the run; an automated
+reviewer's is a signal worth one fix round and never a block, below), then
+CI, then mergeability, and only then the merge:
 
 1. **Draft → ready.** REST cannot un-draft a pull request, so this one call is
    GraphQL (`markPullRequestReadyForReview`) through the same `raw.api`
@@ -839,12 +858,14 @@ were addressed, refuted and left unanswered, and how many threads were
 replied to and resolved) — also emitted when a later round confirms a
 carried-over finding in its own thread rather than restating it in a fresh
 review body, resolving the ones it confirms fixed, `fix.round` (the round, its kind
-— `review`, `gate`, `ci`, `conflict`, `human` — the task appended and the
-budget it spent), `ci.status` (the folded check-run state, emitted on change
+— `review`, `gate`, `ci`, `conflict`, `human`, `bot` — the task appended and
+the budget it spent), `ci.status` (the folded check-run state, emitted on change
 only), `landing.checks` (the judgment against the base, #611: the gating
 set and its source, what is pending, to fix, a regression, preexisting,
 advisory or ignored, and the baseline sha — emitted when it says more than
-"all green, all gating"), `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
+"all green, all gating"), `land.bot_standing` (an automated reviewer's
+changes-requested review the merge goes over, #613), `land.human_ack` /
+`land.human_ack_capped`, `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
 the PR and why. `run.state` fires on every stage entry — the state *is* the
 stage. These carry no information the agent's reply did not — they exist so
 a surface can show the decision without showing the agent's JSON, which is

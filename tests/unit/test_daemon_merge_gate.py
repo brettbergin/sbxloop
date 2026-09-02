@@ -19,7 +19,7 @@ from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch
 from sbxloop.daemon.model import WorkItem
 from sbxloop.gh.ops import ChecksVerdict
-from tests.fakes.fake_github import BLOCKED_405, FakeGithub
+from tests.fakes.fake_github import BLOCKED_405, FakeGithub, human_review
 from tests.unit.test_daemon_loop import (
     PR_URL,
     FakeSource,
@@ -182,6 +182,21 @@ class TestApprove:
         assert fake.merges
         assert any("`flaky` — already red on base123" in c for c in fake.issue_comments)
         assert any(p.endswith("/branches/release/2/protection") for _, p, _ in fake.raw_calls)
+
+    def test_approve_merges_over_a_bots_standing_review(self, tmp_path: Path) -> None:
+        """#613: the run already had its one bot round; on approve the
+        daemon reads that from the store and merges over the still-standing
+        bot review rather than asking for a round it cannot run."""
+        h, fake, run_id = self.approve_ready(tmp_path)
+        h.store.record_bot_round(run_id)
+        fake.reviews_payload = [
+            human_review("coderabbitai[bot]", "CHANGES_REQUESTED", "nits", id=41, bot=True)
+        ]
+        gate = h.dstore.merge_gate_for(run_id)
+        assert gate is not None and h.dstore.claim_merge_gate(run_id)
+        h.loop._complete_landing(gate, "Discord user `brett`")
+        assert fake.merges
+        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments)
 
     def test_approve_merge_spawns_and_answers(self, tmp_path: Path) -> None:
         h, _fake, _run_id = self.approve_ready(tmp_path)

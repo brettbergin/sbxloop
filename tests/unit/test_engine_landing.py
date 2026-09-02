@@ -278,6 +278,27 @@ class TestHumanObjections:
         fake.reviews_payload = [human_review(LOGIN, "CHANGES_REQUESTED", "ours", id=1)]
         assert human_objections(fake, REPO, 7, login=LOGIN) == []
 
+    def test_an_objection_knows_whether_a_bot_raised_it(self) -> None:
+        """REST says ``user.type == "Bot"`` for a GitHub App; the objection
+        carries it so landing can tell a machine's review from a person's
+        (#613) and #622 can read it without a second lookup."""
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review("coderabbitai[bot]", "CHANGES_REQUESTED", "nits", id=41, bot=True),
+            human_review("alice", "CHANGES_REQUESTED", "no", id=42),
+        ]
+        fake.comments_payload = [
+            human_comment("coderabbitai[bot]", "here", path="a.py", line=3, id=91, bot=True),
+            human_comment("alice", "and here", path="a.py", line=9, id=92),
+        ]
+        found = {o.key: o.is_bot for o in human_objections(fake, REPO, 7, login=LOGIN)}
+        assert found == {
+            "human:review:41": True,
+            "human:comment:91": True,
+            "human:review:42": False,
+            "human:comment:92": False,
+        }
+
 
 class Landing:
     """One ``land`` call with its bookkeeping in reach."""
@@ -298,6 +319,7 @@ class Landing:
         answered: Container[str] = frozenset(),
         review_posted: bool = True,
         policy_for: PolicyFor = no_policy,
+        bot_round_spent: bool = False,
     ) -> Any:
         return land(
             self.fake,
@@ -315,6 +337,7 @@ class Landing:
             answered=answered,
             review_posted=review_posted,
             policy_for=policy_for,
+            bot_round_spent=bot_round_spent,
         )
 
     def against_base(self, *, advisory_spent: Container[str] = frozenset()) -> PolicyFor:
@@ -760,3 +783,123 @@ class TestLandAgainstTheBase:
         assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
         assert [t for t, _ in lp.rec.events if t == "landing.checks"] == []
         assert fake.issue_comments == []
+
+
+BOT = "coderabbitai[bot]"
+
+
+class TestBotReviewers:
+    """#613: a bot's CHANGES_REQUESTED is a signal worth one fix round and
+    never an authority — only a person's review blocks a merge."""
+
+    def test_a_bots_changes_requested_buys_one_dedicated_fix_round(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review(BOT, "CHANGES_REQUESTED", "unused import", id=41, bot=True)
+        ]
+        fake.comments_payload = [
+            human_comment(BOT, "drop this", path="a.py", line=3, id=91, bot=True)
+        ]
+        fake.feedback = "- a.py:3 drop this"
+        outcome = Landing(fake).run()
+        assert isinstance(outcome, NeedsFix)
+        assert outcome.kind == "bot"
+        assert outcome.why == "an automated reviewer requested changes on the pull request"
+        assert outcome.objections == fake.feedback
+        assert [o.key for o in outcome.human] == ["human:review:41", "human:comment:91"]
+        assert all(o.is_bot for o in outcome.human)
+        assert fake.merges == []
+
+    def test_after_its_round_a_standing_bot_review_is_merged_over_and_named(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(BOT, "CHANGES_REQUESTED", "still", id=41, bot=True)]
+        lp = Landing(fake)
+        assert isinstance(lp.run(bot_round_spent=True), Landed)
+        assert fake.merges == [(7, "squash", "commit0")]
+        assert len(fake.issue_comments) == 1
+        comment = fake.issue_comments[0]
+        assert f"`{BOT}`" in comment
+        assert "bots do not dismiss their reviews" in comment
+        assert [d for t, d in lp.rec.events if t == "land.bot_standing"] == [
+            {"pr": 7, "reviewers": [BOT]}
+        ]
+
+    def test_a_bots_review_never_becomes_the_terminal_block(self) -> None:
+        """Every objection answered, review still standing — a human's
+        would hand over here; a bot's is merged over."""
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(BOT, "CHANGES_REQUESTED", "still", id=41, bot=True)]
+        outcome = Landing(fake).run(answered={"human:review:41"}, bot_round_spent=True)
+        assert isinstance(outcome, Landed)
+
+    def test_an_unanswered_bot_objection_after_the_round_is_not_a_second_round(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(BOT, "CHANGES_REQUESTED", "more", id=41, bot=True)]
+        fake.comments_payload = [
+            human_comment(BOT, "new nit", path="b.py", line=1, id=92, bot=True)
+        ]
+        assert isinstance(Landing(fake).run(bot_round_spent=True), Landed)
+
+    def test_the_bot_comment_is_posted_once_across_polls(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(BOT, "CHANGES_REQUESTED", "still", id=41, bot=True)]
+        fake.checks = [PENDING, PENDING, GREEN]
+        lp = Landing(fake)
+        assert isinstance(lp.run(bot_round_spent=True), Landed)
+        assert lp.rec.waits == ["ci", "ci"]
+        assert len(fake.issue_comments) == 1
+        assert len([t for t, _ in lp.rec.events if t == "land.bot_standing"]) == 1
+
+    def test_a_refused_bot_comment_does_not_stop_the_merge(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(BOT, "CHANGES_REQUESTED", "still", id=41, bot=True)]
+        fake.fail_always["pr_issue_comment"] = GithubOpsError("nope", http_status=403)
+        assert isinstance(Landing(fake).run(bot_round_spent=True), Landed)
+        assert fake.merges == [(7, "squash", "commit0")]
+
+    def test_a_person_standing_beside_a_bot_keeps_full_authority(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review(BOT, "CHANGES_REQUESTED", "nits", id=41, bot=True),
+            human_review("alice", "CHANGES_REQUESTED", "no", id=42),
+        ]
+        first = Landing(fake).run()
+        assert isinstance(first, NeedsFix) and first.kind == "human"
+        assert [o.key for o in first.human] == ["human:review:42"], "the bot rides no human round"
+        after = Landing(fake).run(answered={"human:review:42"}, bot_round_spent=True)
+        assert isinstance(after, Blocked)
+        assert "only they can dismiss it" in after.why
+        assert fake.merges == []
+
+    def test_a_human_review_is_untouched_by_the_bot_round_state(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("alice", "CHANGES_REQUESTED", "no", id=42)]
+        outcome = Landing(fake).run(bot_round_spent=True)
+        assert isinstance(outcome, NeedsFix) and outcome.kind == "human"
+
+    def test_ignore_reviewers_treats_a_user_account_as_a_bot(self) -> None:
+        """A bot reviewing from a personal token is a User to GitHub; the
+        operator names it and it gets a bot's one round, not a person's
+        veto."""
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review("Review-Robot", "CHANGES_REQUESTED", "hm", id=41)]
+        lp = Landing(fake, ignore_reviewers=["review-robot"])
+        first = lp.run()
+        assert isinstance(first, NeedsFix) and first.kind == "bot"
+        assert isinstance(
+            Landing(fake, ignore_reviewers=["review-robot"]).run(bot_round_spent=True), Landed
+        )
+
+    def test_there_is_no_reverse_list(self) -> None:
+        """Nothing in config turns an App into a person."""
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(BOT, "CHANGES_REQUESTED", "x", id=41, bot=True)]
+        outcome = Landing(fake, ignore_reviewers=[]).run()
+        assert isinstance(outcome, NeedsFix) and outcome.kind == "bot"
+
+    def test_a_bot_round_still_needs_the_loops_identity(self) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [human_review(BOT, "CHANGES_REQUESTED", "x", id=41, bot=True)]
+        outcome = Landing(fake).run(login="")
+        assert isinstance(outcome, Blocked)
+        assert "identity could not be resolved" in outcome.why

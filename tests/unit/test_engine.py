@@ -53,6 +53,7 @@ from tests.fakes.fake_github import (
     RED,
     STALE_409,
     FakeGithub,
+    human_comment,
     human_review,
 )
 
@@ -2391,6 +2392,91 @@ class TestPipeline:
         assert "hi is too casual" in brief
         # The loop read its own login to tell alice's review from its own.
         assert ("GET", "/user", None) in fake.raw_calls
+
+    def test_a_bots_objection_gets_one_round_and_is_then_merged_over(
+        self, harness: Harness
+    ) -> None:
+        """#613: an automated reviewer's CHANGES_REQUESTED buys one fix
+        round with its findings in the brief and a reply on its thread;
+        the review still standing afterwards (bots do not dismiss) is
+        merged over and named on the PR — never the terminal Blocked."""
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review("coderabbitai[bot]", "CHANGES_REQUESTED", "nits", id=41, bot=True)
+        ]
+        fake.comments_payload = [
+            human_comment(
+                "coderabbitai[bot]", "say hello", path="hello.txt", line=1, id=91, bot=True
+            )
+        ]
+        fake.feedback = "nits\n\n- `hello.txt:1`: say hello"
+        fixed = {
+            "text": "Greeting corrected.\n\naddressed: hello.txt:1 — says hello now",
+            "files": {"hello.txt": "hello\n"},
+        }
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, fixed, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("land it")
+        assert result.state == "merged"
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "bot"
+        brief = result.tasks[1].spec.description
+        assert "Review comments an automated reviewer left on the PR" in brief
+        assert "say hello" in brief
+        assert engine.store.bot_round_spent(result.run_id)
+        # The bot's inline finding got its one reply from the fix round's
+        # reconciliation; the merge went over the still-standing review.
+        assert [(cid, body.split("\n")[0]) for cid, body in fake.replies] == [
+            (91, "**addressed in commit2**: says hello now")
+        ]
+        assert fake.merges, "a bot's standing review is not a block"
+        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments)
+        assert any("`coderabbitai[bot]`" in c for c in fake.issue_comments)
+
+    def test_a_bot_with_no_ci_round_left_is_merged_over_without_a_round(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review("coderabbitai[bot]", "CHANGES_REQUESTED", "nits", id=41, bot=True)
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 0})
+        result = engine.start("land it")
+        assert result.state == "merged"
+        assert [t.spec.id for t in result.tasks] == ["t1"]
+        assert self._events(harness, HostEventTypes.FIX_ROUND) == []
+        assert engine.store.bot_round_spent(result.run_id)
+        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments)
+
+    def test_a_bot_round_spends_a_ci_round_not_a_review_round(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review("coderabbitai[bot]", "CHANGES_REQUESTED", "nits", id=41, bot=True)
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 3})
+        result = engine.start("land it")
+        assert result.state == "merged"
+        run = engine.store.get_run(result.run_id)
+        assert (run.ci_rounds, run.review_rounds) == (1, 0)
+
+    def test_a_person_beside_a_bot_keeps_the_human_round_and_the_veto(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        fake.reviews_payload = [
+            human_review("coderabbitai[bot]", "CHANGES_REQUESTED", "nits", id=41, bot=True),
+            human_review("alice", "CHANGES_REQUESTED", "no", id=42),
+        ]
+        fake.feedback = "no"
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("land it")
+        assert result.state != "merged"
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "human"
+        assert fake.merges == []
 
     def test_the_loops_own_review_never_objects_to_itself(self, harness: Harness) -> None:
         fake = FakeGithub()

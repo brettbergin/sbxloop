@@ -986,6 +986,17 @@ standing `REQUEST_CHANGES` on the PR is honoured — it costs a fix round on
 the CI budget — and a human merging the PR themselves is the acceptance,
 while a human closing it unmerged fails the run.
 
+**Bots that review.** A GitHub App reviewing the PR (CodeRabbit, Copilot,
+Sourcery…) leaves a `CHANGES_REQUESTED` it never dismisses. That is a
+signal, not a veto: it buys **one** dedicated fix round with the bot's
+findings in the brief and a reply on each of its threads, and a bot review
+still standing afterwards is merged over and named in a PR comment — it
+never blocks the landing. A person's review keeps full authority, and a
+person beside a bot still wins. Who is a bot is read from GitHub
+(`user.type`, `author.__typename`), never guessed from a name;
+`ignore_reviewers` adds User-type accounts to treat the same way (a
+reviewer bot on a personal token). There is no reverse list.
+
 **Whose red is it.** A red check on the delivered head is judged against
 the commit the PR is built on (its merge base with the base branch, never
 the base's current head) and against what the base's protection and
@@ -1025,6 +1036,7 @@ delete_branch_on_merge = true
 merge_update_attempts = 3       # update-branch calls when protection wants "up to date"; 0 disables
 required_checks = []            # the checks that gate the merge; empty = what the base's protection/rulesets declare, else all
 ignore_checks = []              # fnmatch patterns never waited on, fixed or reported (e.g. "codecov/*")
+ignore_reviewers = []           # User-type logins treated as automated reviewers: one fix round, never a block
 followups = "issues"            # after the merge, the review's out-of-scope notes: issues | comment | off
 followup_label = "sbxloop:follow-up"  # never the trigger label — a human promotes a follow-up to work
 max_followups_per_run = 5
@@ -1322,7 +1334,7 @@ came from. The notable knobs:
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
 | `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public` beside it.                                                                                                                                                                                                                   |
-| `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`.                                                                         |
+| `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`, `ignore_reviewers`.                                                     |
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
 | `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                                                                                                                                                                                                |
 | `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                                                                                                                                                                                                    |

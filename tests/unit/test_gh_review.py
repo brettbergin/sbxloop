@@ -17,6 +17,7 @@ from sbxloop.gh.ops import (
     fold_check_runs,
     fold_reviews,
     fold_statuses,
+    is_bot_user,
     review_payload,
 )
 
@@ -242,3 +243,21 @@ class TestSubmittedReview:
         assert SubmittedReview("u", "REQUEST_CHANGES").gates_merge
         assert SubmittedReview("u", "APPROVE").gates_merge
         assert not SubmittedReview("u", "COMMENT").gates_merge
+
+
+class TestIsBotUser:
+    """REST marks a GitHub App with ``user.type == "Bot"`` (#613)."""
+
+    def test_an_app_is_a_bot(self) -> None:
+        assert is_bot_user({"login": "coderabbitai[bot]", "type": "Bot"})
+
+    def test_a_person_is_not(self) -> None:
+        assert not is_bot_user({"login": "alice", "type": "User"})
+
+    def test_a_missing_or_odd_type_is_not_a_bot(self) -> None:
+        """Fail toward "a person": a review the loop cannot classify keeps
+        its full authority rather than being merged over."""
+        assert not is_bot_user({"login": "alice"})
+        assert not is_bot_user({"login": "x", "type": "bot"})
+        assert not is_bot_user(None)
+        assert not is_bot_user("nonsense")

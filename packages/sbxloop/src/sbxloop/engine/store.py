@@ -771,6 +771,16 @@ class StateStore:
         """The advisory checks this run has already spent a round on."""
         return frozenset(self.reconciliations(run_id, self.ADVISORY_ROUND))
 
+    # An automated reviewer's changes-requested review buys one fix round
+    # per run (#613); the same sentinel pattern says whether it was spent.
+    BOT_ROUND = -3
+
+    def record_bot_round(self, run_id: str) -> None:
+        self.record_reconciliation(run_id, self.BOT_ROUND, "bot", "spent")
+
+    def bot_round_spent(self, run_id: str) -> bool:
+        return "bot" in self.reconciliations(run_id, self.BOT_ROUND)
+
     # Round n+1's confirmations of carried-over findings share the table too,
     # under their own negative rounds: they are keyed by the *same* anchors a
     # reconciliation pass uses, so mixing them would make one look like the
