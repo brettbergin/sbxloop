@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 from ..errors import GithubOpsError
-from ..gh.ops import GithubOps, ReviewThread, logins_match
+from ..gh.ops import GithubOps, ReviewThread, identities_match
 from ..log import get_logger
 from .review import (
     BLOCKING_SEVERITIES,
@@ -165,6 +165,8 @@ def reconcile_round(
     repo: str,
     number: int,
     *,
+    login: str,
+    is_bot: bool | None = None,
     run_id: str,
     round: int,
     head_sha: str | None,
@@ -231,7 +233,7 @@ def reconcile_round(
             continue
         if thread is None:
             thread = live_threads()[0].get(comment_id)
-        if thread is not None and thread.has_reply_marked(stamp):
+        if thread is not None and thread.has_reply_marked(stamp, login, is_bot):
             skipped += 1
             if record is not None:
                 record(anchor=rec.anchor, status=item.status, resolved=thread.is_resolved)
@@ -338,6 +340,8 @@ def post_confirmations(
     repo: str,
     number: int,
     *,
+    login: str,
+    is_bot: bool | None = None,
     run_id: str,
     round: int,
     items: Sequence[CarriedVerdict],
@@ -403,7 +407,7 @@ def post_confirmations(
             continue
         if thread is None:
             thread = live_threads()[0].get(comment_id)
-        if thread is not None and thread.has_reply_marked(stamp):
+        if thread is not None and thread.has_reply_marked(stamp, login, is_bot):
             skipped += 1
             if record is not None:
                 record(anchor=item.anchor, status=item.status, resolved=thread.is_resolved)
@@ -527,6 +531,8 @@ def reconcile_human(
     repo: str,
     number: int,
     *,
+    login: str,
+    is_bot: bool | None = None,
     run_id: str,
     round: int,
     head_sha: str | None,
@@ -579,7 +585,7 @@ def reconcile_human(
                 log.warning("review.reconcile_threads_failed", run=run_id, pr=number, exc_info=True)
                 live = {}
         thread = live.get(objection.comment_id)
-        if thread is not None and thread.has_reply_marked(stamp):
+        if thread is not None and thread.has_reply_marked(stamp, login, is_bot):
             skipped += 1
             answered.append(objection.key)
             if record is not None:
@@ -694,6 +700,8 @@ def note_nonblocking(
     repo: str,
     number: int,
     *,
+    login: str,
+    is_bot: bool | None = None,
     run_id: str,
     round: int,
     findings: Mapping[str, str],
@@ -744,7 +752,7 @@ def note_nonblocking(
                 live = {}
         assert rec.comment_id is not None
         thread = live.get(rec.comment_id)
-        if thread is not None and thread.has_reply_marked(stamp):
+        if thread is not None and thread.has_reply_marked(stamp, login, is_bot):
             skipped += 1
             if record is not None:
                 record(anchor=rec.anchor, status="noted", resolved=thread.is_resolved)
@@ -825,6 +833,7 @@ def acknowledge_human_threads(
     run_id: str,
     login: str,
     threads: Sequence[ReviewThread],
+    is_bot: bool | None = None,
 ) -> int:
     """Reply once in each human thread that has no loop reply yet.
 
@@ -840,9 +849,9 @@ def acknowledge_human_threads(
     stamp = ack_marker(run_id)
     replied = 0
     for thread in threads:
-        if not thread.comments or logins_match(thread.comments[0].login, login):
+        if not thread.comments or identities_match(thread.comments[0].identity, (login, is_bot)):
             continue
-        if thread.has_reply_from(login) or thread.has_reply_marked(stamp):
+        if thread.has_reply_from(login, is_bot) or thread.has_reply_marked(stamp, login, is_bot):
             continue
         comment_id = thread.root_comment_id
         if comment_id is None:

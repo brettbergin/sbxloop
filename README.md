@@ -195,7 +195,10 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   Actions job the token cannot see) is briefed with its link and an
   instruction to reproduce with the project gate. "Nothing has reported"
   on either API only counts as "no CI" once it has persisted for
-  `ci_settle_s`.
+  `ci_settle_s` — after a delivery, and again at landing for a head no
+  poll has waited on (a resume at the landing stage, a merge-gate
+  approve, the head an update-branch makes), so a slow CI's first run
+  is never merged ahead of.
 - **Land** — un-draft, update the branch if protection wants it current,
   merge with the head the review actually judged (a push that landed since
   loses the race rather than being merged over). Then, and only then, the
@@ -1067,7 +1070,7 @@ max_review_rounds = 3           # how many times the review may request changes
 max_ci_rounds = 2               # rounds for the mechanical failures: red gate, red CI, conflict, human objection
 retry_rounds = 2                # daemon: an exhausted run resumes its own PR once with this many more; 0 hands it to a human
 ci_poll_interval_s = 60         # how often the delivered head's check runs are polled
-ci_settle_s = 90                # "no check runs yet" must persist this long to mean "this repo has no CI"
+ci_settle_s = 90                # "no check runs yet" must persist this long to mean "this repo has no CI"; calibrated to Actions' registration latency — raise for CI that registers later
 ci_timeout_s = 3600             # per wait, not charged to max_wall_clock_s; exceeding it ends the run blocked
 merge_method = "auto"           # auto | squash | merge | rebase — auto: the first the repository allows
 delete_branch_on_merge = true
@@ -1110,6 +1113,19 @@ sandbox still sees no GitHub credential. Every operation — issue claims,
 comments, labels, PRs, reviews, merges — is attributed on GitHub to the
 app (`<app-name>[bot]`) rather than to a personal account, with no
 personal-token expiry to babysit.
+
+That attribution is also how the loop tells its own review threads and
+reviews from a person's. The identity comes from the credential — the
+App's slug, or `GET /user` on a PAT — and carries whether it is an App,
+so a person whose login happens to be `foo` is never mistaken for the
+App `foo[bot]` (GitHub lets both exist; the two spell the same once the
+`[bot]` suffix REST adds and GraphQL omits is folded). When neither
+source can answer — a fine-grained token that cannot call `GET /user` —
+set `[github] bot_login` (per repository in `[[github.repos]]`) to the
+login GitHub attributes the loop's writes to; the delivered PR's author
+is a last resort only because the same credential opened it. A
+reconciliation reply counts only when the loop wrote it: a person
+quoting the loop's marker back does not make a thread answered.
 
 Tokens refresh themselves: before each github job the loop re-mints when
 less than ten minutes of lifetime remain and rewrites the sandbox's env
@@ -1373,7 +1389,7 @@ came from. The notable knobs:
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
-| `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix` beside it.                                                                                                                                                  |
+| `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix`, `bot_login` beside it.                                                                                                                                     |
 | `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`, `ignore_reviewers`.                                                     |
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
 | `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                                                                                                                                                                                                |

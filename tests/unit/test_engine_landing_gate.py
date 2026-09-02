@@ -18,17 +18,20 @@ import pytest
 from sbxloop.config import LandingConfig
 from sbxloop.engine.landing import (
     ACK_CAP,
+    UNKNOWN_IDENTITY,
     Blocked,
     Gated,
     Landed,
+    LoopIdentity,
     UpdateState,
     land,
+    resolve_identity,
     resolve_login,
     unreconciled_threads,
 )
 from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import PaginationError, ReviewThread, ThreadComment
+from sbxloop.gh.ops import PaginationError, ReviewThread, ThreadComment, identities_match
 from tests.fakes.fake_github import FakeGithub, human_review
 
 REPO = "o/r"
@@ -510,6 +513,99 @@ class TestResolveLogin:
         fake.pr["user"] = None
         assert resolve_login(fake, REPO, 7) == ""
         assert resolve_login(fake, REPO, None) == ""
+
+
+class TestResolveIdentity:
+    """#622: the resolver answers with a kind alongside the login, and the
+    PR author is a source only when the delivering credential reviews."""
+
+    def test_an_app_slug_is_an_app(self) -> None:
+        fake = FakeGithub()
+        assert resolve_identity(fake, REPO, 7, bot_login="app[bot]") == LoopIdentity(
+            "app[bot]", True
+        )
+
+    def test_get_user_carries_its_type(self) -> None:
+        fake = FakeGithub()
+        assert resolve_identity(fake, REPO, 7) == LoopIdentity(fake.user_login, False)
+        fake.user_type = "Bot"
+        assert resolve_identity(fake, REPO, 7) == LoopIdentity(fake.user_login, True)
+        fake.user_type = None
+        assert resolve_identity(fake, REPO, 7) == LoopIdentity(fake.user_login, None)
+
+    def test_a_configured_login_outranks_the_pr_author(self) -> None:
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        got = resolve_identity(fake, REPO, 7, configured_login="reviewer-bot")
+        assert got == LoopIdentity("reviewer-bot", None)
+        got = resolve_identity(fake, REPO, 7, configured_login="reviewer[bot]")
+        assert got == LoopIdentity("reviewer[bot]", True), "brackets spell an App"
+
+    def test_the_pr_author_is_a_source_only_for_the_delivering_credential(self) -> None:
+        fake = FakeGithub()
+        fake.fail_user_lookup = GithubOpsError("HTTP 403", http_status=403)
+        fake.pr["user"] = {"login": "deliverer[bot]", "type": "Bot"}
+        assert resolve_identity(fake, REPO, 7) == LoopIdentity("deliverer[bot]", True)
+        assert resolve_identity(fake, REPO, 7, pr_author_is_loop=False) == UNKNOWN_IDENTITY
+        assert UNKNOWN_IDENTITY.login == ""
+
+
+class TestIdentitiesMatch:
+    """#622: a human ``foo`` and an App ``foo[bot]`` spell the same under
+    the suffix fold; the kind, when both sides know it, tells them apart."""
+
+    def test_same_login_and_kind(self) -> None:
+        assert identities_match(("sbxloop", True), ("sbxloop[bot]", True))
+        assert identities_match(("Alice", False), ("alice", False))
+
+    def test_a_human_and_an_app_of_the_same_name_never_match(self) -> None:
+        assert not identities_match(("foo", False), ("foo[bot]", True))
+        assert not identities_match(("foo[bot]", True), ("foo", False))
+
+    def test_an_unknown_kind_matches_on_the_login(self) -> None:
+        assert identities_match(("foo", None), ("foo[bot]", True))
+        assert identities_match(("foo", False), ("foo", None))
+        assert not identities_match(("foo", None), ("bar", None))
+
+    def test_empty_never_matches(self) -> None:
+        assert not identities_match(("", None), ("", None))
+        assert not identities_match(("", True), ("", True))
+
+    def test_a_same_named_human_thread_is_not_the_apps(self) -> None:
+        """The acceptance case: the loop is the App ``sbxloop[bot]``; a
+        person whose login is ``sbxloop`` opens a thread — it is theirs."""
+        human = thread(comments=(("sbxloop", "why this?"),))
+        loop_open, human_open = unreconciled_threads([human], login="sbxloop[bot]", is_bot=True)
+        assert (loop_open, human_open) == ([], ["a.py:12"]), "a person's thread, unanswered"
+        own = thread(comments=(("sbxloop", "[minor] x"),), bot=True)
+        loop_open, human_open = unreconciled_threads([own], login="sbxloop[bot]", is_bot=True)
+        assert (loop_open, human_open) == (["a.py:12"], []), "the App's own, unresolved"
+
+
+class TestMarkedReplies:
+    """#618: a marker counts only in the loop's own reply; a person quoting
+    it back does not make the thread answered."""
+
+    MARKER = "<!-- sbxloop:reconciled run=r1 -->"
+
+    def test_a_loop_reply_with_the_marker_counts(self) -> None:
+        t = thread(comments=(("alice", "why?"), (LOGIN, f"**addressed**: done\n\n{self.MARKER}")))
+        assert t.has_reply_marked(self.MARKER, LOGIN)
+        assert t.has_reply_marked(self.MARKER, f"{LOGIN}[bot]"), "either spelling of the loop"
+
+    def test_a_quoted_marker_from_someone_else_does_not(self) -> None:
+        t = thread(comments=(("alice", "why?"), ("bob", f"> {self.MARKER}\n\nstill why?")))
+        assert not t.has_reply_marked(self.MARKER, LOGIN)
+
+    def test_the_marker_in_the_root_comment_does_not_count(self) -> None:
+        t = thread(comments=((LOGIN, f"[minor] x {self.MARKER}"),))
+        assert not t.has_reply_marked(self.MARKER, LOGIN)
+
+    def test_a_same_named_account_of_the_other_kind_does_not(self) -> None:
+        t = thread(comments=(("alice", "why?"), (LOGIN, f"quoting: {self.MARKER}")))
+        assert not t.has_reply_marked(self.MARKER, LOGIN, is_bot=True), (
+            "the reply is a user's; the loop is an App"
+        )
 
 
 class TestBotSuffixIdentity:

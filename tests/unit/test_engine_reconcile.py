@@ -100,6 +100,7 @@ class TestReconcileRound:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -124,6 +125,7 @@ class TestReconcileRound:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -147,6 +149,7 @@ class TestReconcileRound:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=2,
             head_sha=HEAD,
             posted=posted,
@@ -174,6 +177,7 @@ class TestReconcileRound:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -193,6 +197,7 @@ class TestReconcileRound:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -215,6 +220,7 @@ class TestIdempotency:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -236,6 +242,7 @@ class TestIdempotency:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -254,10 +261,26 @@ class TestIdempotency:
         posted = seed(gh, ("a.py", 1))
         items = {"a.py:1": Reconciliation("addressed", "done")}
         reconcile_round(
-            gh, REPO, PR, run_id=RUN, round=1, head_sha=HEAD, posted=posted, items=items
+            gh,
+            REPO,
+            PR,
+            run_id=RUN,
+            login=gh.user_login,
+            round=1,
+            head_sha=HEAD,
+            posted=posted,
+            items=items,
         )
         reconcile_round(
-            gh, REPO, PR, run_id=RUN, round=2, head_sha=HEAD, posted=posted, items=items
+            gh,
+            REPO,
+            PR,
+            run_id=RUN,
+            login=gh.user_login,
+            round=2,
+            head_sha=HEAD,
+            posted=posted,
+            items=items,
         )
         assert len(gh.replies) == 2
 
@@ -271,6 +294,7 @@ class TestIdempotency:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -290,6 +314,7 @@ class TestIdempotency:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -315,6 +340,7 @@ class TestIdempotency:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=1,
             head_sha=HEAD,
             posted=posted,
@@ -362,7 +388,15 @@ class TestDeferred:
             "b.py:2": Reconciliation("unanswered", "", ""),
         }
         outcome = reconcile_round(
-            gh, "o/r", 7, run_id="r1", round=1, head_sha="abc", posted=posted, items=items
+            gh,
+            "o/r",
+            7,
+            run_id="r1",
+            login=gh.user_login,
+            round=1,
+            head_sha="abc",
+            posted=posted,
+            items=items,
         )
         assert (outcome.deferred, outcome.unanswered, outcome.resolved, outcome.replied) == (
             1,

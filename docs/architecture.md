@@ -614,7 +614,19 @@ identity: under App auth that is `<app-slug>[bot]`, resolved on the host
 from the credential itself (one cached `GET /app`; the user-token-only
 `GET /user` is skipped), and an empty login refuses to classify — blocking
 with the identity failure rather than misreading the loop's own threads as
-a human's.
+a human's. The identity is a login **and a kind** (`Identity`,
+`identities_match`, #622): an App from the slug or `user.type == "Bot"`,
+a user from `GET /user`, unknown when the payload does not say. Logins
+compare under the suffix fold; kinds must agree when both are known, so
+a person named `foo` is not the App `foo[bot]`, and an unknown kind
+still matches on the login alone. The sources, in order: the App slug;
+`GET /user`; `[github] bot_login` (the operator's word, per repository
+in `[[github.repos]]`); the delivered PR's author — a source only because
+one github-ops credential both opens and reviews the PR
+(`resolve_identity(pr_author_is_loop=True)`), never for a reviewer-only
+identity. Marker-stamped replies (`has_reply_marked`, #618) count only
+when the loop authored them: a person quoting the marker back leaves the
+thread unanswered.
 
 **Automated reviewers (#613).** Reviewers carry whether they are a bot —
 REST `user.type == "Bot"`, GraphQL `author.__typename` — read from GitHub,
@@ -659,7 +671,13 @@ CI, then mergeability, and only then the merge:
    racing another push fails rather than merging over it.
 3. **Conflicted, red, or objected to → a fix round**, on the CI budget. A
    re-delivery rebuilds the commit on the current base, so a real conflict
-   is genuinely fixable.
+   is genuinely fixable. A head with **nothing reported** on it is not
+   trusted on sight (#633): `land()` hands the read to `poll_checks` with
+   the settle counted from when it first saw that head, so a resume at
+   the landing stage, a merge-gate approve, and the head an update-branch
+   makes each wait out `ci_settle_s` before "no CI" means no CI — while
+   the engine, whose CI stage already settled the delivered head, passes
+   that delivery time along and pays nothing twice.
 4. **Reconciled?** Every review thread on the PR must be answered, and the
    approving review must actually have posted — see the section above.
 5. **The opt-in merge gate** (`[landing] merge_gate = "chat"`) — the one

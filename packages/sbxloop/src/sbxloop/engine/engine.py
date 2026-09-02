@@ -79,7 +79,7 @@ from sbxloop.engine.landing import (
     UpdateState,
     land,
     poll_checks,
-    resolve_login,
+    resolve_identity,
 )
 from sbxloop.engine.model import (
     PIPELINE_STAGES,
@@ -146,11 +146,13 @@ from sbxloop.gc import workspace_pruned
 from sbxloop.gh.ops import (
     FailedCheck,
     GithubOps,
+    Identity,
     PostedFinding,
     ReviewComment,
     SubmittedReview,
-    logins_match,
+    identities_match,
     raw_pages,
+    user_identity,
 )
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
@@ -204,6 +206,10 @@ class Pipeline:
     # The loop's own GitHub identity, read once and only when landing asks
     # (to tell a human's review objection from its own posted review).
     login: str | None = None
+    # Whether that identity is a GitHub App, when the source that answered
+    # said (#622): True from the App slug, the PAT's `GET /user` type,
+    # or the PR author's; None from `[github] bot_login` or an unknown.
+    is_bot: bool | None = None
     # App mode: ``<slug>[bot]``, resolved on the host from the credential
     # itself (one cached GET /app per process); None under a PAT, where
     # GET /user answers instead. See ``_login``.
@@ -1718,14 +1724,13 @@ class LoopEngine:
         """
         if p.self_review is None:
             assert p.ops is not None and p.repo is not None
-            author = ""
+            author: Identity = ("", None)
             try:
-                user = p.ops.pr_get(p.repo, number).get("user")
-                author = str(user.get("login") or "") if isinstance(user, dict) else ""
+                author = user_identity(p.ops.pr_get(p.repo, number).get("user"))
             except GithubOpsError:
                 log.warning("review.author_lookup_failed", run=p.run_id, pr=number, exc_info=True)
             login = self._login(p)
-            p.self_review = logins_match(author, login)
+            p.self_review = identities_match(author, (login, p.is_bot))
             if p.self_review:
                 log.info(
                     "review.self_review",
@@ -1791,6 +1796,8 @@ class LoopEngine:
                 repo,
                 run.pr_number,
                 run_id=run_id,
+                login=self._login(p),
+                is_bot=p.is_bot,
                 round=round_no,
                 items=carried,
                 posted=self.store.posted_findings(run_id),
@@ -1860,6 +1867,8 @@ class LoopEngine:
                 repo,
                 run.pr_number,
                 run_id=run_id,
+                login=self._login(p),
+                is_bot=p.is_bot,
                 round=round_no,
                 findings=severities,
                 posted=records,
@@ -1924,6 +1933,8 @@ class LoopEngine:
                     repo,
                     run.pr_number,
                     run_id=run_id,
+                    login=self._login(p),
+                    is_bot=p.is_bot,
                     round=round_.round,
                     head_sha=run.head_sha,
                     posted=records,
@@ -1969,6 +1980,8 @@ class LoopEngine:
                     repo,
                     run.pr_number,
                     run_id=run_id,
+                    login=self._login(p),
+                    is_bot=p.is_bot,
                     round=later.round,
                     head_sha=run.head_sha,
                     posted=[r for r in records if r.anchor in late],
@@ -2022,6 +2035,8 @@ class LoopEngine:
                 repo,
                 run.pr_number,
                 run_id=run_id,
+                login=self._login(p),
+                is_bot=p.is_bot,
                 round=round_no,
                 head_sha=run.head_sha,
                 objections=objections,
@@ -2482,6 +2497,10 @@ class LoopEngine:
             branch=run.branch,
             node_id=run.pr_node_id,
             login=login,
+            is_bot=p.is_bot,
+            # The CI stage settled this head from its delivery; a resume
+            # enters with None and the landing settles it itself (#633).
+            settle_from=p.delivered_at,
             update=update,
             on_update=on_update,
             tick=partial(self._tick, p),
@@ -2490,7 +2509,7 @@ class LoopEngine:
             answered=self.store.answered_objections(run_id),
             review_posted=self._review_posted(run_id) or self._repost_review_record(p, number),
             ack=lambda threads: acknowledge_human_threads(
-                ops, repo, number, run_id=run_id, login=login, threads=threads
+                ops, repo, number, run_id=run_id, login=login, threads=threads, is_bot=p.is_bot
             ),
             gate=self.config.landing.merge_gate == "chat",
             policy_for=check_policy_reader(
@@ -2734,8 +2753,10 @@ class LoopEngine:
         Resolution order: the App's own ``<slug>[bot]`` when the host
         resolved one (``Pipeline.bot_login`` — App mode skips ``GET
         /user``, which an installation token cannot call: 403, #581); then
-        ``GET /user`` (PAT mode); then the author of the delivered PR (the
-        same token opened it); then ``""`` with a plain log line. The empty
+        ``GET /user`` (PAT mode); then ``[github] bot_login``; then the
+        author of the delivered PR (the same token opened it); then ``""``
+        with a plain log line. The kind rides along (``Pipeline.is_bot``,
+        #622) so a same-named account of the other kind is not us. The empty
         degradation is **not** harmless for landing — classification would
         call every loop thread a human's — so landing refuses to classify
         with it (`_reconciliation_block`) instead of misclassifying.
@@ -2743,8 +2764,24 @@ class LoopEngine:
         if p.login is None:
             assert p.ops is not None and p.repo is not None
             number = self.store.get_run(p.run_id).pr_number
-            p.login = resolve_login(p.ops, p.repo, number, bot_login=p.bot_login)
-            log.info("engine.login_resolved", run=p.run_id, login=p.login or "(unknown)")
+            identity = resolve_identity(
+                p.ops,
+                p.repo,
+                number,
+                bot_login=p.bot_login,
+                configured_login=self.config.github.bot_login_for(p.repo),
+                # One github-ops sandbox, one credential, delivers and
+                # reviews: the delivered PR's author is this identity. A
+                # reviewer-only credential must say False here (#622).
+                pr_author_is_loop=True,
+            )
+            p.login, p.is_bot = identity.login, identity.is_bot
+            log.info(
+                "engine.login_resolved",
+                run=p.run_id,
+                login=p.login or "(unknown)",
+                is_bot=p.is_bot,
+            )
         return p.login
 
     def _tick(self, p: Pipeline, waiting: str) -> None:

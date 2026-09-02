@@ -168,6 +168,7 @@ class TestPostConfirmations:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=2,
             items=[CarriedVerdict(anchor="a.py:1", status="confirmed_fixed", note="fixed")],
             posted=posted,
@@ -185,6 +186,7 @@ class TestPostConfirmations:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=2,
             items=[CarriedVerdict(anchor="a.py:1", status="still_open", note="nope")],
             posted=posted,
@@ -201,6 +203,7 @@ class TestPostConfirmations:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=2,
             items=[CarriedVerdict(anchor="a.py:0", status="confirmed_fixed")],
             posted=[PostedRecord(1, "a.py:0")],
@@ -216,6 +219,7 @@ class TestPostConfirmations:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=2,
             items=[CarriedVerdict(anchor="a.py:1", status="confirmed_fixed")],
             posted=posted,
@@ -227,9 +231,13 @@ class TestPostConfirmations:
         gh = FakeGithub()
         posted = seed(gh, ("a.py", 1))
         item = CarriedVerdict(anchor="a.py:1", status="confirmed_fixed")
-        post_confirmations(gh, REPO, PR, run_id=RUN, round=2, items=[item], posted=posted)
+        post_confirmations(
+            gh, REPO, PR, run_id=RUN, login=gh.user_login, round=2, items=[item], posted=posted
+        )
         # The store record was lost between the reply and the write.
-        again = post_confirmations(gh, REPO, PR, run_id=RUN, round=2, items=[item], posted=posted)
+        again = post_confirmations(
+            gh, REPO, PR, run_id=RUN, login=gh.user_login, round=2, items=[item], posted=posted
+        )
         assert again.skipped == 1 and again.replied == 0
         assert len(gh.replies) == 1
 
@@ -243,6 +251,7 @@ class TestPostConfirmations:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=2,
             items=[CarriedVerdict(anchor="a.py:1", status="confirmed_fixed")],
             posted=posted,
@@ -259,6 +268,7 @@ class TestPostConfirmations:
             REPO,
             PR,
             run_id=RUN,
+            login=gh.user_login,
             round=2,
             items=[
                 CarriedVerdict(anchor="a.py:1", status="confirmed_fixed"),

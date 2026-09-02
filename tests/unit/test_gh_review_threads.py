@@ -374,8 +374,9 @@ class TestReviewThreadListing:
         assert thread.root_comment_id == 101
         assert thread.is_resolved is False
         assert thread.has_reply_from("sbxloop-bot") is True
-        assert thread.has_reply_marked("run=r1 round=1") is True
-        assert thread.has_reply_marked("run=r1 round=2") is False
+        assert thread.has_reply_marked("run=r1 round=1", "sbxloop-bot") is True
+        assert thread.has_reply_marked("run=r1 round=2", "sbxloop-bot") is False
+        assert thread.has_reply_marked("run=r1 round=1", "someone-else") is False, "#618"
         body = ops.calls[0][2]
         assert body is not None
         assert body["variables"] == {"owner": "o", "name": "r", "number": PR, "cursor": None}
@@ -425,7 +426,7 @@ class TestReviewThreadListing:
         assert [(c.login, c.is_bot) for c in folded.comments] == [
             ("coderabbitai", True),
             ("alice", False),
-            ("bob", False),
+            ("bob", None),  # no type reported: the kind is unknown, not "user" (#622)
         ]
         assert folded.opened_by_bot
 
