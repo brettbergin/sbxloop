@@ -457,6 +457,59 @@ class TestDaemonCtlCommand:
         finally:
             server.close()
 
+    def test_status_json_prints_the_structured_status(self, workdir: Path) -> None:
+        # #639: the deploy pipeline reads this dict with jq instead of
+        # grepping `current:` out of the prose.
+        state_dir = daemon_state(workdir)
+        floop = FakeLoop(_dstore(state_dir))
+        floop.holds.add("deploy-1")
+        floop.claiming = "gh:issue:7"
+        server = ControlServer(floop, state_dir, poll_s=0.02)
+        server.start()
+        try:
+            result = runner.invoke(app, ["daemon", "ctl", "status", "--json"])
+            assert result.exit_code == 0, result.output
+            status = json.loads(result.output)
+            assert status["current"] is None
+            assert status["claiming"] == "gh:issue:7"
+            assert status["holds"] == ["deploy-1"] and isinstance(status["paused"], bool)
+            assert status["queued"] == 2
+            # Not the prose.
+            assert "current:" not in result.output
+        finally:
+            server.close()
+
+    def test_json_is_for_status_only(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "ctl", "pause", "--json", "--timeout", "0.2"])
+        assert result.exit_code == 2
+        assert "--json applies to" in result.output
+
+    def test_json_against_an_older_daemon_exits_1_not_2(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A daemon from before #639 answers `status` with prose only. That
+        # is "answered, too old" (exit 1) — distinct from "no daemon" (exit
+        # 2), which a deploy treats as nothing to drain.
+        state_dir = daemon_state(workdir)
+        floop = FakeLoop(_dstore(state_dir))
+        server = ControlServer(floop, state_dir, poll_s=0.02)
+        answer = ControlServer._answer
+
+        def prose_only(self: ControlServer, request: Path, reply: CommandReply) -> None:
+            answer(self, request, reply._replace(status=None))
+
+        monkeypatch.setattr(ControlServer, "_answer", prose_only)
+        server.start()
+        try:
+            result = runner.invoke(app, ["daemon", "ctl", "status", "--json"])
+            assert result.exit_code == 1, result.output
+            assert "without a structured status" in result.output
+            # The prose form is unaffected.
+            result = runner.invoke(app, ["daemon", "ctl", "status"])
+            assert result.exit_code == 0 and "queued: 2" in result.output
+        finally:
+            server.close()
+
     def test_pending_reply_exits_1_and_says_so(self, workdir: Path) -> None:
         state_dir = daemon_state(workdir)
         floop = FakeLoop(_dstore(state_dir))

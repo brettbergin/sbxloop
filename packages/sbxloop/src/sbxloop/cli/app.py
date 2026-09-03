@@ -2108,12 +2108,23 @@ def daemon_ctl(
             "executing and is reported as pending (exit 1).",
         ),
     ] = DEFAULT_TIMEOUT_S,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="With `status`: print the daemon's status as one JSON object (current, "
+            "claiming, holds, paused, …) instead of prose, for scripts.",
+        ),
+    ] = False,
 ) -> None:
     """Send a command to the daemon running against this state_dir — the
     programmatic twin of Discord's `!sbx`, for scripts, cron and remote
     operators (the bot ignores its own messages by design)."""
     from sbxloop.daemon.control import ControlClient, plain
 
+    if as_json and (not command or command[0].lower() != "status"):
+        console.print("[bold red]--json applies to[/] [cyan]ctl status[/] only.")
+        raise typer.Exit(2)
     state_dir = _daemon_state_dir()
     reply = ControlClient(state_dir).submit(" ".join(command), timeout_s=timeout)
     if reply is None:
@@ -2125,9 +2136,47 @@ def daemon_ctl(
     if reply.pending:
         console.print(f"pending: {plain(reply.text)}", markup=False, highlight=False)
         raise typer.Exit(1)
+    if as_json:
+        if reply.ok and reply.status is None:
+            # A daemon from before #639 answered with prose only. Say so
+            # rather than print prose to a jq: exit 1, not 2, so a script
+            # can tell "answered, too old" from "no daemon".
+            console.print(
+                "[bold red]the daemon answered without a structured status[/] — it predates "
+                "`ctl status --json`; upgrade and restart it, then retry."
+            )
+            raise typer.Exit(1)
+        if reply.ok:
+            typer.echo(json.dumps(reply.status, sort_keys=True))
+            return
     console.print(plain(reply.text), markup=False, highlight=False)
     if not reply.ok:
         raise typer.Exit(1)
+
+
+@daemon_app.command("notify")
+def daemon_notify(
+    text: Annotated[
+        str,
+        typer.Argument(help="The notice, in the chat's Markdown (bold, `code`, [label](url))."),
+    ],
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="Seconds to wait for the chat service.")
+    ] = 30.0,
+) -> None:
+    """Post one message to the daemon's control channel through the configured
+    `[chat] backend` — from the host, without the daemon, for deploy scripts
+    and cron. The bot token comes from the environment / .env, as for the
+    daemon; nothing else about the channel is read outside sbxloop.toml."""
+    from sbxloop.daemon.notify import post_notice
+
+    try:
+        config = load_config()
+        posted = post_notice(config, text, timeout_s=timeout)
+    except SbxloopError as exc:
+        console.print(f"[bold red]notify failed:[/] {exc}")
+        raise typer.Exit(2) from exc
+    console.print(f"posted to {posted.backend} channel {posted.channel_id}", highlight=False)
 
 
 @app.command()

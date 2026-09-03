@@ -291,7 +291,8 @@ letting in-VM tooling fail confusingly on a full disk.
 | `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                                                      |
 | `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to chat (Discord or Slack). Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--slack-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`. |
 | `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                                                                 |
-| `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status`, `pause`, `resume`, `cancel`, `queue` — the same verbs as chat's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                                                                     |
+| `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status` (`--json` for one machine-readable object), `pause`, `resume`, `cancel`, `queue` — the same verbs as chat's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                          |
+| `sbxloop daemon notify TEXT`                    | Post one message to the control channel through the configured `[chat] backend` — from the host, without the daemon, for deploy scripts and cron.                                                                                                                                                   |
 | `sbxloop resume RUN`                            | Re-provision sandboxes and continue a checkpointed run under its persisted config — at the task graph, or at the pipeline stage it stopped in (the retry path for a failed delivery or a `blocked` landing).                                                                                        |
 | `sbxloop cancel RUN`                            | Cancel an in-flight run.                                                                                                                                                                                                                                                                            |
 | `sbxloop status [RUN]`                          | List runs, or show one run's task/phase detail.                                                                                                                                                                                                                                                     |
@@ -601,7 +602,7 @@ warning and a `sbxloop doctor` row to make that edit unhurried
 (`auto_merge = true` simply goes: landing is always on). A pre-1.0
 `state.db` is moved aside to `state.db.pre-1.0` on first start rather than
 migrated, and the old lanes' issues and labels are closed by hand;
-[docs/deploy.md → 1.0 cutover](docs/deploy.md#10-cutover) has the steps.
+[CHANGELOG → 1.0 cutover](CHANGELOG.md#10-cutover) has the steps.
 
 ### Chat: chronology out, steering in — Discord or Slack
 
@@ -678,7 +679,11 @@ request no daemon picks up within `--timeout` (30s) is withdrawn, so a stale
 `cancel` never fires when the daemon starts later. Timing out is not "not
 executed": once the daemon has taken a request it keeps running (item verbs
 cross the ops sandbox), and `ctl` reports it as pending (exit 1) rather than
-absent (exit 2).
+absent (exit 2). Scripts that need the state rather than the prose read
+`sbxloop daemon ctl status --json` — one JSON object with `current`, `claiming`,
+`holds`, `paused` and the rest — and post their own notices with
+`sbxloop daemon notify "<text>"`, which goes through the configured chat backend
+from the host even while the daemon is down ([docs/deploy.md](docs/deploy.md)).
 
 **Chat with the daemon.** @mention the bot in the control channel (or reply
 to one of its messages) and the **concierge** answers — the channel's own
@@ -1523,7 +1528,8 @@ The real-sbx end-to-end suite runs in CI via a manually dispatched workflow.
 
 - [Architecture](docs/architecture.md) — layers, the sandbox-pair security model, the loop, persistence/resume, landing, the daemon
 - [Worker protocol](docs/worker-protocol.md) — the host↔worker contract: job kinds, events, transports
-- [Deploying the daemon](docs/deploy.md) — merge to `main` releases, then deploys itself to the daemon host: drain, upgrade, restart, health check, roll back
+- [Running the daemon as a service and upgrading it](docs/deploy.md) — systemd, the two-command upgrade, and the optional workflow that keeps a host current from PyPI: drain, upgrade, restart, health check, roll back
+- [How sbxloop deploys itself](docs/self-deploy.md) — this repository's own host and pipeline, and its cutover notes
 - [Spike: agent-session backend](docs/spikes/46-agent-session-backend.md) — feasibility study for proxy-held secrets via sbx native sessions (issue #46)
 - [Changelog](CHANGELOG.md)
 

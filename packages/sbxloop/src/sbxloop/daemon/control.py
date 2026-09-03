@@ -156,9 +156,9 @@ def _dispatch(
         s = loop.status()
         cur = s["current"]
         claiming = s.get("claiming")
-        # `current:` is the line the deploy pipeline greps for idleness; a
-        # claim in progress is reported there too, so a restart is never
-        # timed into the claim window (#530).
+        # A claim in progress is reported as current too, so a reader never
+        # times a restart into the claim window (#530). Scripts read the
+        # structured dict (`ctl status --json`, #639), never this prose.
         if cur:
             current = f"{cur['run_id']} — {cur['title']}"
         elif claiming:
@@ -350,10 +350,14 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
 def _reply_from(data: dict[str, Any]) -> CommandReply:
     """Decode a reply file. ``stale`` defaults False so a reply written by an
     older daemon (which had no such field) reads as a normal refusal rather
-    than sending the client into a resend loop."""
+    than sending the client into a resend loop; ``status`` is the structured
+    status dict when the daemon wrote one (#639) — a daemon from before that
+    answers ``status`` with prose only, and the client says so."""
+    status = data.get("status")
     return CommandReply(
         str(data.get("text", "")),
         bool(data.get("ok", True)),
+        status=status if isinstance(status, dict) else None,
         stale=bool(data.get("stale", False)),
     )
 
@@ -591,15 +595,17 @@ class ControlServer:
     def _answer(self, request: Path, reply: CommandReply) -> None:
         stem = request.name.removesuffix(_CLAIMED_SUFFIX).removesuffix(_REQUEST_SUFFIX)
         reply_path = request.with_name(stem + _REPLY_SUFFIX)
-        _write_atomic(
-            reply_path,
-            {
-                "ok": reply.ok,
-                "text": reply.text,
-                "answered_at": time.time(),
-                "stale": reply.stale,
-            },
-        )
+        payload: dict[str, Any] = {
+            "ok": reply.ok,
+            "text": reply.text,
+            "answered_at": time.time(),
+            "stale": reply.stale,
+        }
+        if reply.status is not None:
+            # The structured twin of the prose, so `ctl status --json` (#639)
+            # gives scripts the same dict the chat card renders from.
+            payload["status"] = json.loads(json.dumps(reply.status, default=str))
+        _write_atomic(reply_path, payload)
         request.unlink(missing_ok=True)
 
     def _sweep_replies(self) -> None:
