@@ -24,6 +24,7 @@ from rich.table import Table
 
 import sbxloop
 from sbxloop import toolchains
+from sbxloop.backends import backend_for
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
@@ -34,9 +35,8 @@ from sbxloop.gh.protection import read_base_requirements
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
-from sbxloop.sbx.provision import AGENT_TOKEN_HOSTS, CLAUDE_TOKEN_HOSTS, gh_credential_status
+from sbxloop.sbx.provision import gh_credential_status
 from sbxloop.sbx.prune import count_orphans
-from sbxloop.sbx.secretstate import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import (
     SDK_PERMISSION_KINDS,
@@ -559,8 +559,7 @@ def collect_checks(
                 )
 
         # network policy reachable for the chosen agent backend's hosts
-        agent_hosts = CLAUDE_TOKEN_HOSTS if config.agent.backend == "claude" else AGENT_TOKEN_HOSTS
-        for host in agent_hosts:
+        for host in backend_for(config).token_hosts:
             report(f"checking network policy for {host}")
             try:
                 allowed = cli.policy_check(host)
@@ -698,29 +697,16 @@ def collect_checks(
                 )
             )
 
-    # tokens — the agent credential row follows [agent] backend (#533)
-    if config.agent.backend == "claude":
-        checks.append(
-            Check(
-                f"{ANTHROPIC_TOKEN_ENV} (agent backend: claude)",
-                bool(env.get(ANTHROPIC_TOKEN_ENV)),
-                "set"
-                if env.get(ANTHROPIC_TOKEN_ENV)
-                else "not set — create an Anthropic API key and export "
-                f'{ANTHROPIC_TOKEN_ENV}, or switch [agent] backend back to "copilot"',
-            )
+    # tokens — the agent credential row follows [agent] backend (#533),
+    # read off the backend descriptor (#617)
+    agent = backend_for(config)
+    checks.append(
+        Check(
+            agent.doctor_check_name,
+            agent.has_token(env),
+            "set" if agent.has_token(env) else agent.missing_token_detail,
         )
-    else:
-        checks.append(
-            Check(
-                COPILOT_TOKEN_ENV,
-                bool(env.get(COPILOT_TOKEN_ENV)),
-                "set"
-                if env.get(COPILOT_TOKEN_ENV)
-                else 'not set — create a fine-grained PAT with the "Copilot Requests" '
-                f"permission and export {COPILOT_TOKEN_ENV}",
-            )
-        )
+    )
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;
@@ -778,9 +764,12 @@ def collect_checks(
     # barrier is an allowlist over these kinds and fails closed on drift, so
     # a vocabulary change never grants write access — but it can silently
     # cost the critic a read capability. Surface drift here on SDK bumps
-    # instead of as degraded reviews in the field.
-    sdk_kinds = installed_sdk_permission_kinds()
-    if sdk_kinds is None:
+    # instead of as degraded reviews in the field. Only meaningful where
+    # that SDK runs the agent: another backend gets no row (#617).
+    sdk_kinds = installed_sdk_permission_kinds() if agent.name == "copilot" else None
+    if agent.name != "copilot":
+        pass
+    elif sdk_kinds is None:
         checks.append(
             Check(
                 "copilot sdk permission kinds",
@@ -855,10 +844,8 @@ def collect_checks(
         # backend, so naming COPILOT_GITHUB_TOKEN here warned that "mentions
         # will fail" on a host where nothing was wrong.
         if config.concierge.enabled:
-            token_env = (
-                ANTHROPIC_TOKEN_ENV if config.agent.backend == "claude" else COPILOT_TOKEN_ENV
-            )
-            has_token = bool(env.get(token_env))
+            token_env = agent.token_env
+            has_token = agent.has_token(env)
             checks.append(
                 Check(
                     "chat concierge",

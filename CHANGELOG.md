@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Host commands follow `[agent] backend`** (#617). One descriptor
+  (`sbxloop.backends`) says what each backend needs — credential env var
+  and sbx binding host, the network hosts that credential path reaches,
+  the missing-credential wording, where its model ids come from — and
+  `sbxloop doctor`, `sbxloop secrets list|clean|rotate`, `sbxloop list-models`, `--model` help, provisioning and sandbox pruning read it.
+  Under `backend = "claude"`: doctor's credential, network-policy and
+  concierge rows name `ANTHROPIC_API_KEY` / `api.anthropic.com` and the
+  Copilot-SDK permission-kinds row is not emitted; `secrets` manage the
+  Anthropic registration (`rotate` reads/prompts for `ANTHROPIC_API_KEY`);
+  `list-models` lists the Anthropic Models API (`GET /v1/models`, all
+  pages, stdlib only; FIELD-UNVERIFIED against a live key); prune removes
+  either backend's agent registration since the backend may have changed
+  since the sandbox was provisioned. The copilot path is byte-identical.
+
 - **Run clones are single-branch and tagless** (#632). Every per-run
   clone — of a host checkout or of the remote — is cut
   `--single-branch --no-tags`, so a repository's whole branch and tag

@@ -67,7 +67,11 @@ fails fast: an unknown backend fails config loading, and a missing
 after switching backends so a baked template carries the right runtime; the
 daemon's long-lived concierge sandbox rebuilds itself, since its reuse check
 asks whether the box is equipped for the configured backend and not only
-whether the worker version matches.
+whether the worker version matches. Every host-side command that is *about*
+the backend reads one descriptor (`sbxloop.backends`, #617): `sbxloop doctor` checks the configured credential and network hosts (and skips the
+Copilot-SDK rows under claude), `sbxloop secrets list|clean|rotate` manage
+that credential's registration, `sbxloop list-models` lists that backend's
+models, and `--model` help says so.
 
 ## Quickstart
 
@@ -113,14 +117,18 @@ say — keeps the baked worker and provisions the missing toolchain on top, and
 the `sandbox.prebaked` event and `sbxloop doctor` both say so, so you know
 when a re-bake would stop paying for that per provision.
 
-Wondering what to put in `model = "..."` (or `--model`)? Ask the Copilot SDK
-which models your subscription can actually use:
+Wondering what to put in `model = "..."` (or `--model`)? Ask the configured
+backend which models your credential can actually use:
 
 ```bash
-pip install 'sbxloop[copilot]'   # the SDK is optional on the host
+pip install 'sbxloop[copilot]'   # copilot: the SDK is optional on the host
 sbxloop list-models              # id, billing multiplier, context, reasoning, policy
 sbxloop list-models --json       # machine-readable, for scripting
 ```
+
+Under `[agent] backend = "claude"` the same command asks the Anthropic Models
+API with `ANTHROPIC_API_KEY` (id, name, release date; no SDK needed on the
+host).
 
 Or as a library:
 
@@ -1410,9 +1418,9 @@ behavior. Ordinary runs feed the same cache, so verdicts stay fresh for free.
 `sbxloop doctor --fail-on-drift` turns that warning into an exit code (any
 drifted, errored, or unprobed probe fails) — the CI e2e lane uses it, and the
 scheduled `sbx-conformance` workflow runs it against the newest sbx release
-ahead of adoption. Doctor also checks the installed Copilot SDK's
-permission-kind vocabulary against the field-verified snapshot backing the
-read-only critic barrier.
+ahead of adoption. Under the copilot backend doctor also checks the
+installed Copilot SDK's permission-kind vocabulary against the
+field-verified snapshot backing the read-only critic barrier.
 
 ### Secret registration hygiene
 
@@ -1424,7 +1432,8 @@ automatically, and `sbxloop secrets` manages the same state proactively:
 ```bash
 sbxloop secrets list             # registrations + pre-collision warnings
 sbxloop secrets clean            # dry-run removal of stale entries (--apply to execute)
-sbxloop secrets rotate           # replace the COPILOT_GITHUB_TOKEN registration
+sbxloop secrets rotate           # replace the agent credential's registration
+                                 # (COPILOT_GITHUB_TOKEN, or ANTHROPIC_API_KEY under claude)
                                  # (token from env/.env or --prompt, never argv)
 ```
 
@@ -1443,7 +1452,7 @@ came from. The notable knobs:
 
 | Key                                                       | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                            |
 | --------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `model`                                                   | `auto`             | Copilot model id (`--model` overrides per run).                                                                                                                                                                                                                                                                                                                    |
+| `model`                                                   | `auto`             | Model id for the configured `[agent] backend` (`--model` overrides per run; `sbxloop list-models` lists them).                                                                                                                                                                                                                                                     |
 | `state_dir`                                               | `~/.sbxloop`       | Runs, workspaces, artifacts, SQLite state, event logs.                                                                                                                                                                                                                                                                                                             |
 | `keep_sandboxes` / `keep_on_failure`                      | `false`            | Sandbox retention for debugging (see above).                                                                                                                                                                                                                                                                                                                       |
 | `secret_strategy`                                         | `proxy`            | `proxy` keeps token values out of the VM; `plain-env` skips the sbx proxy — tokens are piped per job over worker stdin when this sbx supports it, else written to an in-VM env file. On current sbx the cached exec-visibility verdict makes the non-proxy / env-file fallback the common case even under `proxy`, not an edge case (#46; interim hardening #592). |
