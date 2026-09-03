@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, "sbx/**"]
+    # main alone: working branches get CI through their pull request, and a
+    # push filter that also matched them would run every job twice per PR.
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -45,6 +47,7 @@ jobs:
           enable-cache: true
       - run: uv sync --all-packages
       - run: uv run ruff check .
+      - run: python3 scripts/check_self_references.py
 
   typecheck:
     runs-on: ubuntu-latest

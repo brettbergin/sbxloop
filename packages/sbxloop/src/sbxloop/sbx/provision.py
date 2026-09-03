@@ -803,7 +803,7 @@ class Provisioner:
                 f"no workspace is configured for {repo}, and cloning it from "
                 f"{url} failed: {exc}. The host holds no git credential, so this "
                 "path only works for a public repository; configure a workspace "
-                "for this repository in its [[github.repos]] entry (see #46)"
+                "for this repository in its [[github.repos]] entry"
             ) from exc
         self._emit_clone(run_id, url, clone_dir, sha, branch)
         return clone_dir

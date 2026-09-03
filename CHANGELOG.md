@@ -8,6 +8,22 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **No bare sbxloop issue numbers reach users** (#635). A provisioning
+  error ended "(see #46)", doctor's conformance drift rows carried
+  "(#57)", "(#250)", "(issue #122)", "(#592)", and the files
+  `sbxloop init` writes into the user's project said "(#533)" and
+  "(#568)" — references into sbxloop's tracker that read as noise, or as
+  the user's own repository's #N, to anyone not developing sbxloop. All
+  stripped; code comments and docstrings keep theirs.
+
+- **CI runs once per pull request** (#643). `ci.yml`'s push trigger was
+  `[main, "sbx/**"]` — a personal branch convention, and one that made
+  every job run twice on such a branch's PR (push and `pull_request`
+  both fire). It is `[main]` alone now; working branches are built
+  through their pull request. The loop's own `sbxloop/<run>` delivery
+  branches were never in the filter and stay that way, for the same
+  reason.
+
 - **Rollback keeps both chat extras** (#619). The deploy pipeline's rollback
   reinstalled `sbxloop[discord]` while the upgrade installs
   `sbxloop[discord,slack]`, so a rolled-back Slack host would have lost its
@@ -128,6 +144,19 @@ All notable changes to sbxloop are documented here. The project adheres to
   1.0 cutover steps moved from `docs/deploy.md` to this file (below).
 
 ### Added
+
+- **A gate against self-references in user-facing surfaces** (#645).
+  `scripts/check_self_references.py` (stdlib only; run by `make lint` and
+  the CI lint job, and by the unit suite) fails with `path:line: rule: text` on a bare `#N` in a prompt body below its contract header, in any
+  `raise`'s message in either package, in the CLI package's and the
+  conformance table's string literals, or in a file `sbxloop init`
+  writes; on an sbxloop source path inside a prompt body; and on a
+  maintainer or deploy-host identifier in any tracked file outside
+  `contrib/`, `docs/`, `.github/`, package metadata and tests. Comments
+  and docstrings are not surfaces. Deliberate exceptions live in one
+  reviewed file, `scripts/self-references.allow` (today: the concierge
+  prompt's worked-example numbers); an entry that matches nothing fails
+  the gate too, so the list cannot rot.
 
 - **`[daemon] version_check` and `[daemon] upgrade_command`** (#641, #638).
   `version_check = false` switches the PyPI release lookup off for the

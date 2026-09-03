@@ -41,7 +41,7 @@ secret_strategy = "proxy"
 # install_workers = true
 
 # [agent]
-# Which SDK runs the agent personas inside the agent sandbox (#533):
+# Which SDK runs the agent personas inside the agent sandbox:
 # "copilot" (the default) runs the GitHub Copilot SDK and needs
 # COPILOT_GITHUB_TOKEN; "claude" runs the Claude Agent SDK (the Claude Code
 # harness) and needs ANTHROPIC_API_KEY — provisioning then installs Node and
