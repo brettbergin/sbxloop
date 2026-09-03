@@ -30,6 +30,10 @@ from http.client import HTTPMessage
 from typing import IO, Any, Protocol
 
 API_ROOT = "https://api.github.com"
+# The host exports this (with a matching GH_HOST for gh) when the configured
+# GitHub is not github.com (`[github] api_url`, #623); both transports then
+# read the one value the host derived, so they cannot disagree.
+API_URL_ENV = "SBXLOOP_GITHUB_API_URL"
 API_VERSION = "2022-11-28"
 USER_AGENT = "sbxloop-worker"
 
@@ -84,8 +88,16 @@ class Transport(Protocol):
         ...
 
 
+def api_root() -> str:
+    """The REST root the stdlib transport prefixes bare paths with."""
+    return os.environ.get(API_URL_ENV, "").strip().rstrip("/") or API_ROOT
+
+
 class GhCliTransport:
-    """Executes REST calls through ``gh api``."""
+    """Executes REST calls through ``gh api``. gh picks the site from
+    ``GH_HOST`` in its environment — exported by the host next to
+    :data:`API_URL_ENV`, so a bare ``/repos/...`` path lands on the same
+    server :class:`RestTransport` would send it to."""
 
     def __init__(self, gh: str = "gh") -> None:
         self.gh = gh
@@ -162,15 +174,16 @@ _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 class RestTransport:
     """Pure-stdlib GitHub REST client using the injected token."""
 
-    def __init__(self, token: str | None = None) -> None:
+    def __init__(self, token: str | None = None, *, api_url: str | None = None) -> None:
         self.token = token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
         if not self.token:
             raise GithubOpError(
                 "no GitHub token available: GH_TOKEN/GITHUB_TOKEN are not set and gh is absent"
             )
+        self.api_url = (api_url or api_root()).rstrip("/")
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
-        url = path if path.startswith("http") else f"{API_ROOT}{path}"
+        url = path if path.startswith("http") else f"{self.api_url}{path}"
         # The bearer token rides on every request: never let it travel over
         # anything but HTTPS (also rules out file:// and custom schemes).
         if not url.startswith("https://"):
@@ -204,7 +217,7 @@ class RestTransport:
         return parsed
 
     def request_text(self, method: str, path: str) -> str:
-        url = path if path.startswith("http") else f"{API_ROOT}{path}"
+        url = path if path.startswith("http") else f"{self.api_url}{path}"
         if not url.startswith("https://"):
             raise GithubOpError(f"refusing non-HTTPS GitHub API URL: {url}")
         opener = urllib.request.build_opener(_NoRedirect)

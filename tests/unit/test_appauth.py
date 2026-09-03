@@ -261,6 +261,31 @@ class TestAppTokenSource:
         assert minted == [0.0, 3001.0]
 
 
+class TestApiUrl:
+    """App auth talks to the configured GitHub (#623), not a pinned one."""
+
+    def test_mint_and_slug_use_the_given_api_url(
+        self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        urls: list[str] = []
+
+        def fake_urlopen(request: Any, timeout: float) -> _Resp:
+            urls.append(request.full_url)
+            if request.full_url.endswith("/app"):
+                return _Resp({"slug": "loop"})
+            return _Resp({"token": "ghs_x", "expires_at": "2026-08-30T22:14:10Z"})
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        creds = AppCredentials("12345", "678", rsa_key.read_text())
+        source = AppTokenSource(creds, api_url="https://ghe.example.com/api/v3")
+        assert source.current() == "ghs_x"
+        assert source.bot_login() == "loop[bot]"
+        assert urls == [
+            "https://ghe.example.com/api/v3/app/installations/678/access_tokens",
+            "https://ghe.example.com/api/v3/app",
+        ]
+
+
 class TestBotLogin:
     """The App's own ``<slug>[bot]`` identity (#569 x #536): resolved on
     the host so landing can tell the loop's threads from a human's."""

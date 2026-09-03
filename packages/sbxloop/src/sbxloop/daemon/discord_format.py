@@ -1320,7 +1320,10 @@ def format_for_discord(
     if t == HostEventTypes.RUN_DELIVER:
         if data.get("created"):
             repo = str(data.get("repo") or "")
-            return [line(f"📦 created repository {link(repo, f'https://github.com/{repo}')}")]
+            # The API's own html_url when the event carries it (#623);
+            # github.com is only the fallback for events written before it did.
+            url = str(data.get("url") or f"https://github.com/{repo}")
+            return [line(f"📦 created repository {link(repo, url)}")]
         if data.get("error"):
             return [line(f"⚠ **delivery failed:** {_one_line(data['error'], 300)}", flush=True)]
         if data.get("url"):

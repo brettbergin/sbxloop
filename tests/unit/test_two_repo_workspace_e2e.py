@@ -176,7 +176,7 @@ def field(tmp_path: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch) ->
     # o/b has no workspace of its own here, so resolution falls through to
     # the clone-from-remote mode; o/b is not a real repository, so stand in
     # for the network with the failure that mode would report.
-    def unreachable(url: str, target: Path, branch: str, *, existing: bool = False) -> str:
+    def unreachable(url: str, target: Path, branch: str, **kwargs: object) -> str:
         raise ProvisionError(f"cloning {url} failed: repository not found")
 
     monkeypatch.setattr(hostgit, "clone_from_remote", unreachable)

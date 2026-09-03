@@ -111,6 +111,17 @@ class RepositoryProbe(NamedTuple):
     #: are disabled — follow-ups then land as a PR comment, since
     #: ``POST /issues`` answers 410 Gone. None when the payload did not say.
     has_issues: bool | None
+    #: The repository's ``html_url`` as GitHub reports it — the one link
+    #: that is right on any GitHub host (#623). None when the payload did
+    #: not carry it.
+    url: str | None = None
+
+
+def _html_url(data: object) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get("html_url")
+    return value if isinstance(value, str) and value else None
 
 
 def _has_issues(data: object) -> bool | None:
@@ -137,7 +148,7 @@ def ensure_repository(
     """
     data = ops.repo_lookup(repo)
     if data is not None:
-        return RepositoryProbe(created=False, has_issues=_has_issues(data))
+        return RepositoryProbe(created=False, has_issues=_has_issues(data), url=_html_url(data))
     if not create:
         raise DeliveryError(
             f"repository {repo} does not exist — create it first, or pass "
@@ -167,7 +178,7 @@ def ensure_repository(
         made = ops.raw("POST", "/user/repos", body)
     else:
         made = ops.raw("POST", f"/orgs/{owner}/repos", body)
-    return RepositoryProbe(created=True, has_issues=_has_issues(made))
+    return RepositoryProbe(created=True, has_issues=_has_issues(made), url=_html_url(made))
 
 
 @dataclass

@@ -263,6 +263,12 @@ class TestFormat:
         assert texts(format_for_discord(ev("run.deliver", repo="o/r", created=True))) == [
             "📦 created repository [o/r](https://github.com/o/r)"
         ]
+        # The API's own html_url wins when the event carries it (#623).
+        assert texts(
+            format_for_discord(
+                ev("run.deliver", repo="o/r", created=True, url="https://ghe.example.com/o/r")
+            )
+        ) == ["📦 created repository [o/r](https://ghe.example.com/o/r)"]
         assert texts(
             format_for_discord(
                 ev("sandbox.workspace_clone", branch="sbxloop/r1", source="/p", target="/t")

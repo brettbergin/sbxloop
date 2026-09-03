@@ -240,6 +240,21 @@ class TestGhCliTransport:
 
 
 class TestRestTransport:
+    def test_api_root_comes_from_the_hosts_export(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: dict[str, str] = {}
+
+        def fake_urlopen(request: Any, timeout: float = 0) -> Any:
+            seen["url"] = request.full_url
+            return io.BytesIO(b"{}")
+
+        monkeypatch.setattr(githubops.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.delenv(githubops.API_URL_ENV, raising=False)
+        RestTransport(token="t").request("GET", "/repos/o/r")
+        assert seen["url"] == "https://api.github.com/repos/o/r"
+        monkeypatch.setenv(githubops.API_URL_ENV, "https://ghe.example.com/api/v3/")
+        RestTransport(token="t").request("GET", "/repos/o/r")
+        assert seen["url"] == "https://ghe.example.com/api/v3/repos/o/r"
+
     def test_http_error_carries_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_urlopen(request: Any, timeout: float = 0) -> Any:
             raise urllib.error.HTTPError(
@@ -374,6 +389,47 @@ class TestGithubOpsSandboxScoping:
         )
         assert provisioner.github_repo_env(None) == {}
         assert provisioner.gh_token(None) == "global"
+
+    def test_enterprise_host_is_exported_to_the_github_sandbox(self, tmp_path: Path) -> None:
+        """Both worker transports read what the host derived from
+        [github] api_url (#623): GH_HOST for gh, the API URL for stdlib."""
+        from sbxloop.config import Config
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.provision import Provisioner
+
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "github": {"repos": [{"repo": "o/a"}], "api_url": "https://ghe.example.com/api/v3"},
+            }
+        )
+        provisioner = Provisioner(SbxCLI(binary="/bin/true"), config, env={"GH_TOKEN": "t"})
+        assert provisioner.github_repo_env("o/a") == {
+            "GH_HOST": "ghe.example.com",
+            "SBXLOOP_GITHUB_API_URL": "https://ghe.example.com/api/v3",
+            "GH_REPO": "o/a",
+            "SBXLOOP_GITHUB_REPO": "o/a",
+        }
+        agent, github = provisioner.build_specs("r1", tmp_path, "o/a")
+        # The github sandbox reaches the enterprise host and nothing on
+        # github.com; the agent sandbox gains the enterprise host alongside
+        # its Copilot hosts (the Copilot exchange stays a github.com affair).
+        assert github.policy_allows == ["ghe.example.com"]
+        assert "ghe.example.com" in agent.policy_allows
+        assert [(s.host, s.env) for s in agent.secrets] == [
+            ("api.github.com", "COPILOT_GITHUB_TOKEN")
+        ]
+
+    def test_dotcom_exports_no_host_and_keeps_the_storage_hosts(self, tmp_path: Path) -> None:
+        provisioner = self._provisioner(tmp_path, [{"repo": "o/a"}], {"GH_TOKEN": "t"})
+        assert "GH_HOST" not in provisioner.github_repo_env("o/a")
+        _, github = provisioner.build_specs("r1", tmp_path, "o/a")
+        assert github.policy_allows == [
+            "api.github.com",
+            "github.com",
+            "uploads.github.com",
+            "objects.githubusercontent.com",
+        ]
 
     def test_single_repo_config_scopes_by_default(self, tmp_path: Path) -> None:
         provisioner = self._provisioner(

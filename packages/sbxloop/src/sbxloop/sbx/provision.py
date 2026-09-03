@@ -306,8 +306,26 @@ def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
     return dedupe_domains(
         [
             *AGENT_ALLOW_DOMAINS,
+            # The repository's own GitHub (#623): github.com is in the
+            # constant above; an Enterprise Server host is not.
+            *config.github.allow_domains,
             *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
+            *config.sandbox.extra_allow_domains,
+        ]
+    )
+
+
+def github_policy_allows(config: Config) -> list[str]:
+    """The github sandbox's network allowlist: the API and web hosts of the
+    configured GitHub (#623) plus, on github.com, the storage hosts uploads
+    and release assets redirect to; an Enterprise Server serves those from
+    its one host. Deduped: ``extra_allow_domains`` may repeat a baseline
+    host and sbx fails the whole policy call on a repeat."""
+    return dedupe_domains(
+        [
+            *config.github.allow_domains,
+            *(GITHUB_ALLOW_DOMAINS if config.github.is_dotcom else ()),
             *config.sandbox.extra_allow_domains,
         ]
     )
@@ -371,7 +389,6 @@ class Provisioner:
         :meth:`resolve_languages`); None means the config's own answer,
         which is what callers without a workspace to detect from get.
         """
-        extra = tuple(self.config.sandbox.extra_allow_domains)
         template = self.config.sandbox.template
         if languages is None:
             languages = self.config.sandbox.effective_languages
@@ -389,7 +406,7 @@ class Provisioner:
             role="github",
             workspace=workspace,
             template=template,
-            policy_allows=[*GITHUB_ALLOW_DOMAINS, *extra],
+            policy_allows=github_policy_allows(self.config),
             secrets=[SecretSpec(kind="service", service="github")],
             persistent_env=self.github_repo_env(repo),
         )
@@ -495,7 +512,7 @@ class Provisioner:
             )
         if app is not None:
             if self._app_source is None:
-                self._app_source = AppTokenSource(app)
+                self._app_source = AppTokenSource(app, api_url=self.config.github.api_url)
             return GhApp(self._app_source)
         if pat:
             return GhPat(pat)
@@ -555,10 +572,21 @@ class Provisioner:
         run's repository rather than a globally configured one. No credential
         is carried here — the token is registered as a secret.
         """
+        env = self.github_host_env()
         entry = self._repo_entry(repo)
         if entry is None:
+            return env
+        return {**env, "GH_REPO": entry.repo, "SBXLOOP_GITHUB_REPO": entry.repo}
+
+    def github_host_env(self) -> dict[str, str]:
+        """Which GitHub the github sandbox talks to (#623): ``GH_HOST`` for
+        gh, ``SBXLOOP_GITHUB_API_URL`` for the worker's stdlib transport —
+        both derived from ``[github] api_url``, so the two transports cannot
+        disagree. Empty on github.com, where both default to it anyway."""
+        github = self.config.github
+        if github.is_dotcom:
             return {}
-        return {"GH_REPO": entry.repo, "SBXLOOP_GITHUB_REPO": entry.repo}
+        return {"GH_HOST": github.web_host, "SBXLOOP_GITHUB_API_URL": github.api_url}
 
     # -- provisioning ------------------------------------------------------
 
@@ -757,18 +785,25 @@ class Provisioner:
                 f"no workspace is configured for {repo} and no git binary is on "
                 "PATH to clone it from its remote"
             )
-        url = f"https://github.com/{repo}"
+        url = f"{self.config.github.web_url}/{repo}"
         continue_branch = self.config.sandbox.continue_branch
         branch = continue_branch or self._branch_name(run_id, repo)
+        clone_filter = self.config.sandbox.clone_filter
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
-            sha = hostgit.clone_from_remote(url, clone_dir, branch, existing=bool(continue_branch))
+            sha = hostgit.clone_from_remote(
+                url,
+                clone_dir,
+                branch,
+                existing=bool(continue_branch),
+                clone_filter=clone_filter,
+            )
         except ProvisionError as exc:
             if continue_branch and self.config.sandbox.continue_branch_optional:
                 # The offered branch is not on the remote any more: start
                 # fresh rather than fail the run (#600).
                 branch = self._fresh_after_missing_continue(run_id, continue_branch, exc, clone_dir)
-                sha = hostgit.clone_from_remote(url, clone_dir, branch)
+                sha = hostgit.clone_from_remote(url, clone_dir, branch, clone_filter=clone_filter)
                 self._emit_clone(run_id, url, clone_dir, sha, branch)
                 return clone_dir
             raise ProvisionError(
@@ -1047,7 +1082,7 @@ class Provisioner:
             role="github",
             workspace=workspace,
             template=self.config.sandbox.template,
-            policy_allows=[*GITHUB_ALLOW_DOMAINS, *self.config.sandbox.extra_allow_domains],
+            policy_allows=github_policy_allows(self.config),
             secrets=[SecretSpec(kind="service", service="github")],
             persistent_env=self.github_repo_env(repo),
         )

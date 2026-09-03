@@ -602,3 +602,75 @@ def test_concierge_clarify_ttl_bounds() -> None:
         Config.model_validate({"concierge": {"clarify_ttl_s": 10}})
     with pytest.raises(ValidationError):
         Config.model_validate({"concierge": {"clarify_ttl_s": 100_000}})
+
+
+class TestGithubApiUrl:
+    """One source of truth for *which* GitHub (#623): every host-shaped value
+    derives from `[github] api_url`, and a GH_HOST that names another site
+    fails at load rather than letting gh and the REST transport disagree."""
+
+    def test_default_is_dotcom(self, tmp_path: Path) -> None:
+        github = load_config(cwd=tmp_path, env={}).github
+        assert github.api_url == "https://api.github.com"
+        assert github.is_dotcom
+        assert github.api_host == "api.github.com"
+        assert github.web_host == "github.com"
+        assert github.web_url == "https://github.com"
+        assert github.allow_domains == ("api.github.com", "github.com")
+
+    def test_enterprise_server_derives_one_host(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[github]\napi_url = "https://ghe.example.com/api/v3/"\n'
+        )
+        github = load_config(cwd=tmp_path, env={}).github
+        assert github.api_url == "https://ghe.example.com/api/v3"  # trailing slash dropped
+        assert not github.is_dotcom
+        assert github.api_host == "ghe.example.com"
+        assert github.web_host == "ghe.example.com"
+        assert github.web_url == "https://ghe.example.com"
+        assert github.allow_domains == ("ghe.example.com",)
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["http://ghe.example.com/api/v3", "ghe.example.com", "https://u:p@ghe.example.com", ""],
+    )
+    def test_refuses_anything_but_a_plain_https_url(self, tmp_path: Path, bad: str) -> None:
+        (tmp_path / "sbxloop.toml").write_text(f'[github]\napi_url = "{bad}"\n')
+        with pytest.raises(ConfigError, match="api_url must be a plain https URL"):
+            load_config(cwd=tmp_path, env={})
+
+    def test_gh_host_disagreeing_with_api_url_fails_at_load(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match=r"GH_HOST='ghe\.example\.com'.*disagrees"):
+            load_config(cwd=tmp_path, env={"GH_HOST": "ghe.example.com"})
+        (tmp_path / "sbxloop.toml").write_text(
+            '[github]\napi_url = "https://ghe.example.com/api/v3"\n'
+        )
+        with pytest.raises(ConfigError, match=r"GH_HOST='github\.com'.*disagrees"):
+            load_config(cwd=tmp_path, env={"GH_HOST": "github.com"})
+
+    def test_gh_host_naming_the_same_site_is_fine(self, tmp_path: Path) -> None:
+        assert load_config(cwd=tmp_path, env={"GH_HOST": "GitHub.com"}).github.is_dotcom
+        (tmp_path / "sbxloop.toml").write_text(
+            '[github]\napi_url = "https://ghe.example.com/api/v3"\n'
+        )
+        config = load_config(cwd=tmp_path, env={"GH_HOST": "ghe.example.com"})
+        assert config.github.web_host == "ghe.example.com"
+
+
+class TestCloneFilter:
+    def test_off_by_default(self, tmp_path: Path) -> None:
+        assert load_config(cwd=tmp_path, env={}).sandbox.clone_filter is None
+
+    def test_opt_in_spec(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[sandbox]\nclone_filter = "blob:none"\n')
+        assert load_config(cwd=tmp_path, env={}).sandbox.clone_filter == "blob:none"
+
+    def test_blank_means_off(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[sandbox]\nclone_filter = "  "\n')
+        assert load_config(cwd=tmp_path, env={}).sandbox.clone_filter is None
+
+    @pytest.mark.parametrize("bad", ["blob:none --depth 1", "--filter=blob:none"])
+    def test_refuses_anything_but_one_filter_spec(self, tmp_path: Path, bad: str) -> None:
+        (tmp_path / "sbxloop.toml").write_text(f'[sandbox]\nclone_filter = "{bad}"\n')
+        with pytest.raises(ConfigError, match="clone_filter must be a git filter spec"):
+            load_config(cwd=tmp_path, env={})

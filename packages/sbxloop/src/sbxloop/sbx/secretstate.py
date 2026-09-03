@@ -45,6 +45,12 @@ COPILOT_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"  # nosec B105 - env var name, not a s
 # need network allows - never an env rewrite. One env var also cannot be
 # registered twice: sbx keys custom secrets by env name, so binding the same
 # env to two hosts fails with "already exists".
+#
+# Deliberately NOT derived from `[github] api_url` (#623): Copilot is a
+# github.com service even for Enterprise Server customers (licensed and
+# served through GitHub Connect), so the credential it exchanges is a
+# github.com credential whichever host the repository lives on.
+# FIELD-UNVERIFIED on GHES — recorded as the known unknown it is.
 COPILOT_TOKEN_HOST = "api.github.com"  # nosec B105 - hostname, not a secret
 
 # The claude agent backend's credential (#533): an Anthropic API key, sent
