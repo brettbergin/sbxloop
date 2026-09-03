@@ -8,6 +8,13 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Rollback keeps both chat extras** (#619). The deploy pipeline's rollback
+  reinstalled `sbxloop[discord]` while the upgrade installs
+  `sbxloop[discord,slack]`, so a rolled-back Slack host would have lost its
+  bridge. Both lines now install `[discord,slack]`, and
+  `test_deploy_workflow.py` asserts the two stay in step — in the
+  repository's own workflow and in the contrib example alike.
+
 - **Host commands follow `[agent] backend`** (#617). One descriptor
   (`sbxloop.backends`) says what each backend needs — credential env var
   and sbx binding host, the network hosts that credential path reaches,
@@ -60,7 +67,56 @@ All notable changes to sbxloop are documented here. The project adheres to
   instruction. No new knob: `[sandbox] extra_allow_domains` is where a CI
   host worth reading goes.
 
+### Changed
+
+- **The deploy pipeline reads structured control, not files** (#639).
+  `deploy.yml` drives the daemon with `ctl status --json` + `jq` and posts
+  with `daemon notify`; no step sources `secrets.env`, parses
+  `sbxloop.toml` or calls the Discord API — a Slack-backend host deploys
+  unchanged. **Cutover:** the drain step fails closed when the running
+  daemon answers without a structured status, which a daemon older than
+  this release does, so the first deploy after it lands stops at "Wait for
+  the daemon to go idle" *before installing anything*. Upgrade once by hand
+  (contrib/systemd/README.md, "Upgrading"); every deploy after that is
+  unattended again.
+- **The deploy host is one variable** (#640). `deploy.yml` targets
+  `runs-on: [self-hosted, "${{ vars.SBXLOOP_DEPLOY_HOST || 'db' }}"]` and
+  derives every path from `$HOME` (job-level `env:` values are literals, so
+  a first step writes them to `$GITHUB_ENV`); moving the daemon is setting
+  the repository variable and registering a runner with that label — no
+  edit to the workflow, nothing `make check` runs. The
+  drain/hold/upgrade/health-check/rollback pattern ships as
+  `contrib/workflows/deploy-daemon.yml.example` (`schedule` +
+  `workflow_dispatch`, installs from PyPI, names nothing), and
+  `test_deploy_workflow.py` checks both files for the security invariant,
+  the extras parity and the absence of names.
+- **Deploy docs split** (#642). `docs/deploy.md` is now the generic "run the
+  daemon as a service and upgrade it" guide — no hostnames, usernames or
+  repository slugs, enforced by a test — and `docs/self-deploy.md` the
+  clearly labelled reference for how sbxloop deploys its own host, with the
+  cutover notes. The systemd README's upgrade section leads with the
+  two-command manual path (hold, wait for idle via `ctl status --json`,
+  pin, `reset-failed` + restart) and mentions the workflow as optional
+  automation; `github-runner.service` is marked as needed only for it. The
+  1.0 cutover steps moved from `docs/deploy.md` to this file (below).
+
 ### Added
+
+- **`sbxloop daemon ctl status --json`** (#639) — the daemon's status as one
+  JSON object (`current`, `claiming`, `holds`, `paused`, `queued`, …) for
+  scripts, instead of grepping the prose, which is now free to change. The
+  reply carries the structured dict alongside the text; a daemon that
+  predates the flag answers prose only and `ctl` exits 1 ("answered without
+  a structured status") — distinct from exit 2, no daemon.
+
+- **`sbxloop daemon notify "<text>"`** (#639) — post one message to the
+  control channel through the configured `[chat] backend`, from the host
+  and without the daemon, so a deploy script can say "rollback also failed"
+  while the daemon is down. Reads the channel from `sbxloop.toml` and the
+  bot token from the environment (`DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN`,
+  the working directory's `.env` included); Slack text is re-dialected the
+  way the bridge does it; link previews and pings are suppressed; a
+  headless daemon cannot notify and says so.
 
 - **`[github] api_url`** (#623) — the GitHub REST root
   (`https://api.github.com`; `https://ghe.example.com/api/v3` for GitHub
@@ -1166,7 +1222,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   that tolerance — `Config.retired_keys`, the `config.retired_keys`
   warning, the `retired config keys` doctor row — is gone, and an unknown
   key fails config loading like any other. Edit `sbxloop.toml` before
-  upgrading a 0.7.x host straight to 1.0 (docs/deploy.md, "1.0 cutover").
+  upgrading a 0.7.x host straight to 1.0 ("1.0 cutover", below).
 
 - **The run thread follows the pipeline.** The per-run status line now says
   which stage the run is in once its tasks are built — `🚦 gate`,
@@ -1245,7 +1301,7 @@ All notable changes to sbxloop are documented here. The project adheres to
 - **State cutover.** The daemon's tables changed shape (no PR-state,
   review, audit, post-mortem or backlog tables; one item kind). A pre-1.0
   `state.db` is moved aside to `state.db.pre-1.0` on first start rather
-  than migrated (docs/deploy.md, "1.0 cutover").
+  than migrated ("1.0 cutover", below).
 
 - **Removed with the above:** `sbxloop deliver` (resume at `delivering` is
   the retry path), `sbxloop run --report/--deliver/--deliver-draft`, the
@@ -1254,6 +1310,35 @@ All notable changes to sbxloop are documented here. The project adheres to
   `checks.failed_logs` (Actions job logs for failed check runs; the REST
   transport does not forward the bearer token on the redirect to blob
   storage) and `GithubOps.checks_failed_logs` / `pr_review_feedback`.
+
+### 1.0 cutover
+
+The 1.0 pipeline (one run from issue to merged PR; no self-filed audits,
+post-mortems or backlog issues; landing under `[landing]`) changes what the
+daemon keeps on disk and which config keys exist. Because a daemon host may
+deploy unattended, none of that may fail the restart:
+
+- **State.** A pre-1.0 `state.db` carries the old lanes' tables and item
+  kinds. On its first start the new daemon moves the whole file aside to
+  `state.db.pre-1.0` (plus `-wal`/`-shm`; a timestamp is appended if that
+  name is taken), logs `store.archived_legacy`, tells the control channel, and starts
+  with empty tables. Engine run history goes with it — both stores share the
+  file. Nothing is migrated; renaming the file back restores the old world
+  for a 0.7.x rollback.
+- **Config.** The retired keys — `[daemon] inbox_dir, backlog*, audits, audit_dir, audit_label, backlog_label, delivered_label, postmortems*, review_deliveries, await_review, review_rounds, tool_repo, tracking_issue, close_on_success, auto_merge` and `[github] report, deliver` — are unknown keys since 1.0.0 and fail config loading like any
+  other (`Extra inputs are not permitted`). The `deliver_draft`,
+  `merge_method`, `delete_branch_on_merge` and `merge_update_attempts`
+  knobs live under `[landing]`. The two releases before 1.0.0 (0.7.55,
+  0.7.56) tolerated them with a `config.retired_keys` warning and a
+  `sbxloop doctor` row precisely so an unattended deploy could not fail on
+  them; a host that skipped those releases must edit `sbxloop.toml` before
+  installing 1.0, or the daemon will not start (an automated deploy's
+  health check then rolls back).
+- **Issues and labels.** The old loop's `sbxloop:backlog` / `sbxloop:audit`
+  issues are closed by hand at cutover (`gh issue close --reason "not planned"`), those two labels and `sbxloop:delivered` deleted, and
+  `sbxloop:blocked` created. Any of the old loop's PRs still open
+  (`gh pr list --search "head:sbxloop/ is:open"`) are merged or closed by
+  hand — their items went with the archived state.
 
 ### Added
 
