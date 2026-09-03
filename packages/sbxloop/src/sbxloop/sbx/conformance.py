@@ -126,7 +126,7 @@ def _probe_secret_value_stdin(ctx: ProbeContext) -> tuple[str, str]:
     result = ctx.cli.run("secret", "set-custom", "--help", check=False)
     text = f"{result.stdout}\n{result.stderr}"
     if "stdin" in text.lower():
-        return "stdin-available", "set-custom --help mentions a stdin path — adopt it (#57)"
+        return "stdin-available", "set-custom --help mentions a stdin path — adopt it"
     if "--value" not in text:
         return "help-drifted", "set-custom --help no longer describes --value"
     return "argv-only", "no stdin path in set-custom --help; --value on argv is the only option"
@@ -443,7 +443,7 @@ CATALOG: tuple[Probe, ...] = (
         expected="argv-only",
         depends="secret_set_custom passes the Copilot PAT via --value on argv (ps-visible "
         "for the subprocess lifetime; every observable argv copy is redacted). A stdin "
-        "path appearing means sbxloop should switch to it and close the ps window (#57)",
+        "path appearing means sbxloop should switch to it and close the ps window",
         run=_probe_secret_value_stdin,
     ),
     Probe(
@@ -487,7 +487,7 @@ CATALOG: tuple[Probe, ...] = (
         summary=f"the sandbox template's python3 against the pinned {PYTHON_SERIES} series",
         tier="sandbox",
         expected=None,  # the Python toolchain installs the pin through uv either way
-        depends="the Python toolchain's separate python3.13 guarantee (#250): its "
+        depends="the Python toolchain's separate python3.13 guarantee: its "
         "probe-first install adds uv and a uv-managed interpreter only when the "
         "template lacks them, whatever the template's own python3 reports here",
         run=_probe_python_version,
@@ -500,7 +500,7 @@ CATALOG: tuple[Probe, ...] = (
         depends="the bundled-ripgrep page-size guard (worker sets "
         "USE_BUILTIN_RIPGREP=false on non-4-KiB guests) and provisioning's ripgrep "
         "ensure exist because 16 KiB-page guests abort the bundled search binary "
-        "(issue #122); a non-4k-degraded verdict means glob/grep are dead in this "
+        "— a non-4k-degraded verdict means glob/grep are dead in this "
         "template until ripgrep installs",
         run=_probe_page_size,
     ),
@@ -519,7 +519,7 @@ CATALOG: tuple[Probe, ...] = (
         summary="whether stdin piped through `sbx exec` reaches the in-VM launch shell",
         tier="sandbox",
         expected=None,  # both answers are handled; see _deliver_env in provisioning
-        depends="per-job stdin secret delivery (#592): 'delivers' keeps credentials off "
+        depends="per-job stdin secret delivery: 'delivers' keeps credentials off "
         "the sandbox filesystem when the proxy cannot feed exec'd workers; 'no-delivery' "
         "falls back to the 0600 in-VM env file exactly as before",
         run=_probe_exec_stdin_env,

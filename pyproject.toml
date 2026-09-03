@@ -37,6 +37,8 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["T20"]
 "packages/*/tests/**" = ["T20"]
+# Repository tooling reports on stdout by design.
+"scripts/**" = ["T20"]
 # The worker communicates over stdout by design.
 "packages/sbxloop-worker/src/sbxloop_worker/**" = ["T20"]
 

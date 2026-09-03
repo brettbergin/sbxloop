@@ -1530,6 +1530,17 @@ make check      # ruff format --check + ruff check + mypy --strict + pytest --co
 make build      # build both wheels
 ```
 
+`make lint` also runs `scripts/check_self_references.py`, the gate against
+sbxloop leaking into what users see: a bare `#N` from this tracker in an
+error message, a doctor row, a prompt body or a file `sbxloop init` writes,
+an sbxloop source path quoted into a prompt, or a maintainer/host identifier
+outside `contrib/`, `docs/`, `.github/`, package metadata and tests. It fails
+with `path:line: rule: text`; the deliberate exceptions live in one reviewed
+file, `scripts/self-references.allow`, and an entry that no longer matches
+anything fails the gate too. CI's push trigger is `main` alone — working
+branches are built through their pull request, and a push filter that also
+matched them would run every job twice.
+
 Unit and contract tests run against a **fake sbx CLI** — no Docker Sandboxes
 install is required for development. The suite runs parallel by default
 (pytest-xdist; pass `-n0` for a serial run when debugging with `-s`/`--pdb`).

@@ -1,0 +1,11 @@
+# Reviewed exceptions for scripts/check_self_references.py — one per line,
+# `<path relative to the repository root> <matched text>`. An entry covers
+# every match of that text in that file; an entry matching nothing fails
+# the gate, so remove it when the reference goes.
+#
+# The concierge prompt's worked examples use small issue/PR numbers as
+# placeholders for the operator's own repository ("Reply on #12 that …",
+# "How is PR #41 doing?"); they are not references into sbxloop's tracker.
+packages/sbxloop/src/sbxloop/engine/prompts/concierge.md #12
+packages/sbxloop/src/sbxloop/engine/prompts/concierge.md #7
+packages/sbxloop/src/sbxloop/engine/prompts/concierge.md #41
