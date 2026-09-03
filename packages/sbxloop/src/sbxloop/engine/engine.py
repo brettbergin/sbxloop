@@ -947,7 +947,13 @@ class LoopEngine:
             ops, entry.repo, create=entry.create_repo, public=entry.create_public
         )
         if probe.created:
-            self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=entry.repo, created=True)
+            self.bus.emit(
+                HostEventTypes.RUN_DELIVER,
+                run_id,
+                repo=entry.repo,
+                created=True,
+                **({"url": probe.url} if probe.url else {}),
+            )
         if probe.has_issues is False:
             log.info("run.issues_disabled", run=run_id, repo=entry.repo)
         return probe.has_issues

@@ -14,6 +14,35 @@ is self-contained.
 in-place when no git binary exists rather than erroring, so the import of
 GitPython's ``Repo`` (which raises at *use* when git is missing) stays
 behind that probe.
+
+Clone size (#632)
+-----------------
+Every run clone is ``--single-branch --no-tags`` (:data:`CLONE_OPTIONS`):
+a run works on one branch, and on a repository with years of release tags
+and hundreds of branches the rest is dead weight copied per run. This is
+safe because nothing downstream reads another branch out of the clone —
+:func:`merge_from_base` fetches the base branch *explicitly* before every
+fix round, and :func:`resolve_diff_base` then finds the merge base through
+that fetch, the ``CLONE_BASE_REF`` pin, or ``origin/HEAD``.
+
+What is deliberately NOT done:
+
+* ``--depth 1``. A shallow clone has no history for ``git merge-base`` to
+  walk, so the delivery diff could not be anchored (the base the branch
+  forked from is exactly what a shallow clone throws away) and
+  ``merge_from_base`` would have nothing to merge against.
+* ``--filter=blob:none`` by default. A partial clone keeps history but
+  fetches blobs *lazily*, from inside the sandbox VM, the moment the agent
+  touches a file whose blob is missing (``git checkout``, ``git diff``,
+  ``git log -p`` …). The VM holds no git credential, so on a private
+  remote that is a mid-task git failure with no useful message; even on a
+  public one every such blob is a network round trip in the agent's
+  critical path. It is therefore opt-in — ``[sandbox] clone_filter =
+  "blob:none"`` — and applies only to :func:`clone_from_remote`, the
+  credential-free public-remote path where lazy fetches can succeed at
+  all (git ignores filters on local path clones anyway). A git too old to
+  know ``--filter`` falls back to an unfiltered clone with a log line
+  rather than failing the run.
 """
 
 from __future__ import annotations
@@ -39,6 +68,9 @@ log = get_logger(__name__)
 # own .git so it survives resumes and travels nowhere else (refs outside
 # heads/tags are not pushed or listed as branches).
 CLONE_BASE_REF = "refs/sbxloop/base"
+
+# Options every run clone carries; see "Clone size" in the module docstring.
+CLONE_OPTIONS = ("--single-branch", "--no-tags")
 
 ChangeStatus = Literal["added", "modified", "deleted"]
 
@@ -211,7 +243,7 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
     raw_upstream = origin_url(source)
     upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
     try:
-        with Repo.clone_from(str(source), str(target)) as clone:
+        with Repo.clone_from(str(source), str(target), multi_options=list(CLONE_OPTIONS)) as clone:
             clone.git.checkout("-b", branch)
             if upstream is not None:
                 clone.git.remote("set-url", "origin", upstream)
@@ -226,7 +258,14 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
         ) from exc
 
 
-def clone_from_remote(repo_url: str, target: Path, branch: str, *, existing: bool = False) -> str:
+def clone_from_remote(
+    repo_url: str,
+    target: Path,
+    branch: str,
+    *,
+    existing: bool = False,
+    clone_filter: str | None = None,
+) -> str:
     """Clone a *remote* URL into ``target`` on a fresh ``branch``; return sha.
 
     The no-local-checkout path of per-repo workspace resolution: a repo
@@ -236,6 +275,17 @@ def clone_from_remote(repo_url: str, target: Path, branch: str, *, existing: boo
     (#46) — so the clone runs with terminal and credential-helper prompting
     disabled and fails loudly rather than hanging on an auth prompt.
 
+    With ``existing`` the clone is cut *on* ``branch`` (``--branch``): under
+    ``--single-branch`` that is the only way ``origin/<branch>`` exists in
+    the clone at all, and a branch the remote does not have fails the clone
+    — the right outcome for a fix round, which must not rebuild from the
+    default branch (see :func:`clone_existing_branch`).
+
+    ``clone_filter`` is a git partial-clone filter (``blob:none``); read the
+    module docstring before reaching for it. A git that does not know
+    ``--filter`` gets one retry without it, logged as
+    ``workspace.clone_filter_unsupported``.
+
     ``ProvisionError`` on any failure; a half-created target is removed so a
     retry starts clean. Never falls back to another tree.
     """
@@ -244,8 +294,11 @@ def clone_from_remote(repo_url: str, target: Path, branch: str, *, existing: boo
         "GIT_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
     }
+    options = list(CLONE_OPTIONS)
+    if existing:
+        options.append(f"--branch={branch}")
     try:
-        with Repo.clone_from(repo_url, str(target), env=env) as clone:
+        with _clone_remote(repo_url, target, env, options, clone_filter) as clone:
             if existing:
                 # A fix round continuing its own pull request: start from what
                 # the remote branch actually has.
@@ -261,6 +314,38 @@ def clone_from_remote(repo_url: str, target: Path, branch: str, *, existing: boo
         raise ProvisionError(
             f"cloning {public_remote_url(repo_url)} into {target} failed: {_describe(exc)}"
         ) from exc
+
+
+def _clone_remote(
+    repo_url: str, target: Path, env: dict[str, str], options: list[str], clone_filter: str | None
+) -> Repo:
+    if clone_filter is None:
+        return Repo.clone_from(repo_url, str(target), env=env, multi_options=options)
+    try:
+        return Repo.clone_from(
+            repo_url, str(target), env=env, multi_options=[*options, f"--filter={clone_filter}"]
+        )
+    except GitCommandError as exc:
+        if not _unknown_filter_option(exc):
+            raise
+        # A server that cannot filter merely warns and sends everything; only
+        # a client too old for --filter refuses outright. Either way the run
+        # gets a full clone, never an error.
+        log.warning(
+            "workspace.clone_filter_unsupported",
+            repo=public_remote_url(repo_url),
+            clone_filter=clone_filter,
+            detail=_describe(exc),
+            hint="git does not support --filter; cloning without it",
+        )
+        if target.exists() and not (target / ".git").is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        return Repo.clone_from(repo_url, str(target), env=env, multi_options=options)
+
+
+def _unknown_filter_option(exc: GitCommandError) -> bool:
+    text = _describe(exc).lower()
+    return "unknown option" in text and "filter" in text
 
 
 def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
@@ -283,26 +368,16 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
     upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
     remote_ref = f"origin/{branch}"
     try:
-        with Repo.clone_from(str(source), str(target)) as clone:
+        with Repo.clone_from(str(source), str(target), multi_options=list(CLONE_OPTIONS)) as clone:
             if remote_ref not in {r.name for r in clone.refs}:
-                # Cloning a clone copies the source's *local* branches into
-                # `origin/*`, not its remote-tracking refs — and the branch a
-                # PR lives on is only ever remote-tracking in the daemon's
-                # checkout (it fetched it; it never checked it out). Ask the
-                # source for that exact ref rather than mutating it.
-                try:
-                    clone.git.fetch(
-                        "origin", f"refs/remotes/origin/{branch}:refs/remotes/origin/{branch}"
-                    )
-                except GitCommandError as exc:
-                    raise ProvisionError(
-                        f"branch {branch!r} is not on {source} (neither a local branch "
-                        f"nor a fetched origin ref): {_describe(exc)}. Refusing to "
-                        "continue work on a branch that is not there — a fix round "
-                        "starting from the default branch would deliver a tree that "
-                        "never contained the pull request's work, and updating the "
-                        "branch with it destroys that work"
-                    ) from exc
+                # A single-branch clone of a clone carries only the source's
+                # HEAD branch as `origin/<head>`, never its remote-tracking
+                # refs — and the branch a PR lives on is only ever
+                # remote-tracking in the daemon's checkout (it fetched it; it
+                # never checked it out). Ask the source for that exact ref
+                # rather than mutating it; a local branch of that name on the
+                # source (a hand-made checkout) is the second place to look.
+                _fetch_branch_from_source(clone, source, branch)
             clone.git.checkout("-B", branch, remote_ref)
             if upstream is not None:
                 clone.git.remote("set-url", "origin", upstream)
@@ -547,6 +622,24 @@ def _describe_change(repo_path: Path, path: str, git_status: str) -> WorkspaceCh
     return WorkspaceChange(path=path, status=status, mode="100755" if executable else "100644")
 
 
+def _fetch_branch_from_source(clone: Repo, source: Path, branch: str) -> None:
+    last: GitCommandError | None = None
+    for src_ref in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}"):
+        try:
+            clone.git.fetch("origin", f"{src_ref}:refs/remotes/origin/{branch}")
+            return
+        except GitCommandError as exc:
+            last = exc
+    raise ProvisionError(
+        f"branch {branch!r} is not on {source} (neither a local branch "
+        f"nor a fetched origin ref): {_describe(last) if last else 'no ref'}. Refusing to "
+        "continue work on a branch that is not there — a fix round "
+        "starting from the default branch would deliver a tree that "
+        "never contained the pull request's work, and updating the "
+        "branch with it destroys that work"
+    ) from last
+
+
 def refresh_from_origin(repo_path: Path) -> RefreshResult:
     """``git fetch`` and fast-forward the checked-out branch to its
     upstream, so an unattended run starts from current ``<remote>/<branch>``
@@ -685,7 +778,13 @@ def merge_from_base(repo_path: Path, base_branch: str, *, remote: str = "origin"
             if remote not in {r.name for r in repo.remotes}:
                 return MergeResult(False, (), f"{repo_path}: no {remote} remote")
             try:
-                repo.remote(remote).fetch(base_branch)
+                # An explicit refspec: the clone is single-branch (#632), so
+                # its configured fetch refspec covers only the branch it was
+                # cut on, and a bare `fetch origin <base>` would update
+                # FETCH_HEAD but never `<remote>/<base>`.
+                repo.git.fetch(
+                    remote, f"+refs/heads/{base_branch}:refs/remotes/{remote}/{base_branch}"
+                )
             except GitCommandError as exc:
                 raise ProvisionError(
                     f"git fetch {remote} {base_branch} failed in {repo_path}: {_describe(exc)}"

@@ -83,6 +83,14 @@ secret_strategy = "proxy"
 # continue_branch_optional = false
 # Extra network allow rules applied to both sandboxes.
 # extra_allow_domains = []
+# Git partial-clone filter for the credential-free remote clone a repository
+# WITHOUT a host checkout gets. Every run clone is already single-branch and
+# tagless; this additionally defers file contents until first checkout,
+# which is worth it only for a very large repository. Lazy fetches then
+# happen wherever git next needs a blob — the VM included, which holds no
+# git credential — so it stays opt-in, and only the public-repo remote
+# clone honours it. A git without --filter support clones in full and logs.
+# clone_filter = "blob:none"
 # Toolchains preinstalled in the agent sandbox. Unset = whatever the
 # workspace's manifests declare (go.mod, package.json, Cargo.toml, ...),
 # Python when nothing is recognized. Setting it replaces detection.
@@ -149,6 +157,16 @@ secret_strategy = "proxy"
 # the loop's writes to; `<slug>[bot]` for an App. Overridable per
 # repository below.
 # bot_login = "my-app[bot]"
+#
+# WHERE GitHub is. The REST root; everything else derives from it — the web
+# host the clones and PR links use, GH_HOST for gh in the github sandbox,
+# the App-auth endpoints, and both sandboxes' network allows. GitHub
+# Enterprise Server is the /api/v3 form. A GH_HOST already in the daemon's
+# environment that names a different host is refused at load. Copilot
+# tokens are still exchanged at api.github.com regardless (Copilot is
+# served from github.com even for GHES). FIELD-UNVERIFIED against a GHES.
+# api_url = "https://api.github.com"
+# api_url = "https://ghe.example.com/api/v3"
 #
 # Several repositories: declare them as an array of tables instead of the
 # single `repo` above. The daemon polls every enabled entry for the trigger

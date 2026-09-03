@@ -1392,7 +1392,7 @@ def config_policy() -> None:
         WELL_KNOWN_REGISTRY_DOMAINS,
         baseline_allows,
     )
-    from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, GITHUB_ALLOW_DOMAINS
+    from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, github_policy_allows
 
     try:
         config = load_config()
@@ -1401,7 +1401,9 @@ def config_policy() -> None:
         raise typer.Exit(2) from exc
 
     extra = list(config.sandbox.extra_allow_domains)
-    baseline = ", ".join([*AGENT_ALLOW_DOMAINS, *extra])
+    baseline = ", ".join(
+        dict.fromkeys([*AGENT_ALLOW_DOMAINS, *config.github.allow_domains, *extra])
+    )
     # What provisioning actually seeds, deny applied — an operator reading
     # this needs the effective set, not the constant.
     registries = ", ".join(baseline_allows(BASELINE_REGISTRY_DOMAINS, config.policy.deny))
@@ -1446,7 +1448,7 @@ def config_policy() -> None:
     console.print(bounds)
 
     if config.github.enabled:
-        gh_domains = ", ".join([*GITHUB_ALLOW_DOMAINS, *extra])
+        gh_domains = ", ".join(github_policy_allows(config))
         console.print(f"github sandbox (all phases, no task grants): {gh_domains}")
     console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
 

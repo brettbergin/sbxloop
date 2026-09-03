@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from git import Repo
+from git import GitCommandError, Repo
 
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
@@ -864,3 +864,184 @@ class TestMergeFromBase:
     def test_not_a_repo_raises_provision_error(self, tmp_path: Path) -> None:
         with pytest.raises(ProvisionError, match="cannot merge into"):
             hostgit.merge_from_base(tmp_path / "nope", "main")
+
+
+def git_out(*argv: str, cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *argv], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def clone_config(clone: Path, key: str) -> str:
+    return git_out("config", "--get", key, cwd=clone)
+
+
+def remote_branches(clone: Path) -> list[str]:
+    """Remote-tracking branches, without the ``origin/HEAD -> …`` pointer."""
+    return [
+        line.strip() for line in git_out("branch", "-r", cwd=clone).splitlines() if "->" not in line
+    ]
+
+
+class TestCloneSize:
+    """Every run clone is single-branch and tag-free (#632): a run works on
+    one branch, and nothing downstream reads another branch out of the
+    clone — merge_from_base fetches the base explicitly."""
+
+    def _upstream_with_baggage(self, tmp_path: Path) -> tuple[Path, Path]:
+        """A bare upstream carrying a second branch and a tag, plus the
+        daemon's checkout of it (which has both)."""
+        seed = make_repo(tmp_path, "seed")
+        git("tag", "v1", cwd=seed)
+        git("checkout", "-q", "-b", "other", cwd=seed)
+        (seed / "other.txt").write_text("other\n")
+        git("add", ".", cwd=seed)
+        git("commit", "-q", "-m", "other work", cwd=seed)
+        git("checkout", "-q", "main", cwd=seed)
+        upstream = tmp_path / "upstream.git"
+        git("clone", "--bare", "-q", str(seed), str(upstream), cwd=tmp_path)
+        git("config", "uploadpack.allowFilter", "true", cwd=upstream)
+        checkout = tmp_path / "checkout"
+        git("clone", "-q", str(upstream), str(checkout), cwd=tmp_path)
+        assert "v1" in git_out("tag", cwd=checkout)
+        assert "origin/other" in git_out("branch", "-r", cwd=checkout)
+        return upstream, checkout
+
+    def test_run_clone_of_a_checkout_carries_one_branch_and_no_tags(self, tmp_path: Path) -> None:
+        _, checkout = self._upstream_with_baggage(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(checkout, clone, "sbxloop/r1")
+        assert git_out("tag", cwd=clone) == ""
+        assert remote_branches(clone) == ["origin/main"]
+        assert (
+            clone_config(clone, "remote.origin.fetch")
+            == "+refs/heads/main:refs/remotes/origin/main"
+        )
+        assert clone_config(clone, "remote.origin.tagopt") == "--no-tags"
+        assert (clone / "hello.txt").read_text() == "hi\n"
+
+    def test_remote_clone_carries_one_branch_and_no_tags(self, tmp_path: Path) -> None:
+        upstream, _ = self._upstream_with_baggage(tmp_path)
+        clone = tmp_path / "run"
+        sha = hostgit.clone_from_remote(f"file://{upstream}", clone, "sbxloop/r1")
+        assert sha == rev(upstream, "main")
+        assert git_out("tag", cwd=clone) == ""
+        assert remote_branches(clone) == ["origin/main"]
+        assert clone_config(clone, "remote.origin.tagopt") == "--no-tags"
+        assert "partialclonefilter" not in git_out("config", "--list", cwd=clone)
+
+    def test_existing_branch_remote_clone_is_cut_on_that_branch(self, tmp_path: Path) -> None:
+        """A fix round with no local checkout: --branch is the only way
+        origin/<branch> exists in a single-branch clone at all."""
+        upstream, _ = self._upstream_with_baggage(tmp_path)
+        clone = tmp_path / "run"
+        sha = hostgit.clone_from_remote(f"file://{upstream}", clone, "other", existing=True)
+        assert sha == rev(upstream, "other")
+        assert remote_branches(clone) == ["origin/other"]
+        with Repo(clone) as repo:
+            assert repo.active_branch.name == "other"
+        assert (clone / "other.txt").read_text() == "other\n"
+
+    def test_existing_branch_the_remote_lacks_fails_the_clone(self, tmp_path: Path) -> None:
+        upstream, _ = self._upstream_with_baggage(tmp_path)
+        target = tmp_path / "run"
+        with pytest.raises(ProvisionError, match="cloning"):
+            hostgit.clone_from_remote(f"file://{upstream}", target, "sbxloop/nope", existing=True)
+        assert not target.exists() or not (target / ".git").is_dir()
+
+    def test_base_that_is_not_the_clone_branch_still_merges_and_anchors(
+        self, tmp_path: Path
+    ) -> None:
+        """The safety argument for --single-branch, end to end: a fix round on
+        a PR against `other` merges from a base the clone never fetched at
+        clone time, and the delivery diff then anchors on that base."""
+        upstream, _ = self._upstream_with_baggage(tmp_path)
+        author = tmp_path / "author"
+        git("clone", "-q", str(upstream), str(author), cwd=tmp_path)
+        git("checkout", "-q", "-b", "sbxloop/r1", "origin/other", cwd=author)
+        (author / "pr.txt").write_text("pr\n")
+        git("add", ".", cwd=author)
+        git("commit", "-q", "-m", "pr", cwd=author)
+        git("push", "-q", "origin", "sbxloop/r1", cwd=author)
+        # The base moves on after the PR branched.
+        git("checkout", "-q", "other", cwd=author)
+        (author / "base-moved.txt").write_text("moved\n")
+        git("add", ".", cwd=author)
+        git("commit", "-q", "-m", "base moves", cwd=author)
+        git("push", "-q", "origin", "other", cwd=author)
+        new_base = rev(author)
+
+        clone = tmp_path / "run"
+        hostgit.clone_from_remote(f"file://{upstream}", clone, "sbxloop/r1", existing=True)
+        assert remote_branches(clone) == ["origin/sbxloop/r1"]
+        assert hostgit.resolve_diff_base(clone, new_base) != new_base  # not fetched yet
+
+        result = hostgit.merge_from_base(clone, "other")
+        assert result.merged, result.message
+        assert "origin/other" in remote_branches(clone)
+        assert (clone / "base-moved.txt").read_text() == "moved\n"
+        assert hostgit.resolve_diff_base(clone, new_base) == new_base
+        # The PR's own work is what the diff against the base shows.
+        assert {c.path for c in hostgit.changes_since(clone, new_base)} == {"pr.txt"}
+
+    def test_clone_filter_is_opt_in_and_recorded(self, tmp_path: Path) -> None:
+        upstream, _ = self._upstream_with_baggage(tmp_path)
+        clone = tmp_path / "run"
+        sha = hostgit.clone_from_remote(
+            f"file://{upstream}", clone, "sbxloop/r1", clone_filter="blob:none"
+        )
+        assert sha == rev(upstream, "main")
+        assert clone_config(clone, "remote.origin.partialclonefilter") == "blob:none"
+        assert clone_config(clone, "remote.origin.promisor") == "true"
+        assert clone_config(clone, "remote.origin.tagopt") == "--no-tags"
+        assert (clone / "hello.txt").read_text() == "hi\n"
+
+    def test_a_git_without_filter_support_gets_a_full_clone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An old client refuses the option outright; the run gets an
+        unfiltered clone and a log line, never an error."""
+        upstream, _ = self._upstream_with_baggage(tmp_path)
+        real = Repo.clone_from
+        calls: list[list[str]] = []
+
+        def old_git(url: str, path: str, **kwargs: object) -> Repo:
+            options = list(kwargs.get("multi_options") or [])  # type: ignore[call-overload]
+            calls.append(options)
+            if any(o.startswith("--filter=") for o in options):
+                raise GitCommandError(
+                    ["git", "clone"], 129, stderr="error: unknown option `filter=blob:none'"
+                )
+            return real(url, path, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(hostgit.Repo, "clone_from", staticmethod(old_git))
+        clone = tmp_path / "run"
+        sha = hostgit.clone_from_remote(
+            f"file://{upstream}", clone, "sbxloop/r1", clone_filter="blob:none"
+        )
+        assert sha == rev(upstream, "main")
+        assert len(calls) == 2
+        assert "partialclonefilter" not in git_out("config", "--list", cwd=clone)
+        assert "--single-branch" in calls[1] and "--no-tags" in calls[1]
+
+    def test_another_clone_failure_with_a_filter_is_not_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ProvisionError, match="cloning"):
+            hostgit.clone_from_remote(
+                f"file://{tmp_path / 'gone.git'}", tmp_path / "run", "r", clone_filter="blob:none"
+            )
+        assert not (tmp_path / "run").exists()
+
+    def test_existing_branch_found_on_the_sources_local_branches(self, tmp_path: Path) -> None:
+        """A single-branch clone of a checkout no longer copies the source's
+        other local branches as origin/*; the branch is fetched from the
+        source's heads instead."""
+        _, checkout = self._upstream_with_baggage(tmp_path)
+        git("branch", "sbxloop/r1", "origin/other", cwd=checkout)
+        clone = tmp_path / "run"
+        sha = hostgit.clone_existing_branch(checkout, clone, "sbxloop/r1")
+        assert sha == rev(checkout, "sbxloop/r1")
+        assert (clone / "other.txt").read_text() == "other\n"
+        with Repo(clone) as repo:
+            assert repo.active_branch.name == "sbxloop/r1"

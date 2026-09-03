@@ -115,7 +115,7 @@ credential:
 | name       | `sbxloop-<run>-agent`                                                                                                                                                   | `sbxloop-<run>-github`                                                                                             |
 | credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default) or `ANTHROPIC_API_KEY` (`"claude"`, #533)                    | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
 | injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
-| network    | balanced policy + copilot hosts + plan-declared grants                                                                                                                  | balanced policy + github hosts                                                                                     |
+| network    | balanced policy + copilot hosts + the `[github] api_url` hosts + plan-declared grants                                                                                   | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
 | runs       | agent SDK sessions (Copilot SDK, or the Claude Agent SDK + Claude Code CLI with the claude backend), shell checks                                                       | `github.op` jobs (gh CLI or REST)                                                                                  |
 
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
@@ -186,6 +186,23 @@ polling sandbox. PAT and App credentials are
 mutually exclusive and a partial App set is refused, both validated before
 any microVM boots; a `[[github.repos]] token_env` remains an explicit
 per-repo PAT override.
+
+`[github] api_url` (#623) is the one place the GitHub host is written down.
+`GithubConfig` derives the API host, the web host (`api.github.com` →
+`github.com`; a GitHub Enterprise Server keeps its own host with `/api/v3`
+stripped) and the allowlist from it; the host-side REST transport, App-auth
+minting, the credential-free remote clone and PR links all read those.
+The sandboxes learn the host through the environment the provisioner
+exports only when it is not dotcom — `GH_HOST` for `gh`, and
+`SBXLOOP_GITHUB_API_URL` for the worker's stdlib transport — so a dotcom
+deployment's environment is byte-identical to before. A `GH_HOST` already
+set in the daemon's environment that disagrees with `api_url` is refused at
+config load rather than letting `gh` and the REST transport talk to two
+servers. Two things are deliberately *not* derived: the Copilot token
+exchange host (`COPILOT_TOKEN_HOST`) stays `api.github.com`, since Copilot
+is served from github.com even for GHES customers, and sbx's built-in
+`github` service secret is keyed to github.com by sbx itself. All of it is
+FIELD-UNVERIFIED — no GHES was available to test against.
 
 Both sandboxes run under sbx's **balanced** network policy (default-deny plus
 a curated allowlist), with per-sandbox allow rules added for exactly the

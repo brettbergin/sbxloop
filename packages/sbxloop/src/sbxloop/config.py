@@ -27,6 +27,7 @@ import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -130,8 +131,31 @@ class SandboxConfig(_ConfigModel):
     # failing. Nothing is destroyed either way: a fresh start only ever
     # delivers a tree diffed against base.
     continue_branch_optional: bool = False
+    # A git partial-clone filter (`blob:none`) for run clones cut from a
+    # *remote* — the no-local-checkout `[[github.repos]]` path (#632). Off by
+    # default on purpose: a partial clone fetches blobs lazily from inside
+    # the sandbox, which holds no git credential and pays a network round
+    # trip per touched file; see the "Clone size" note in `sbxloop.hostgit`.
+    # Every run clone is already `--single-branch --no-tags` regardless.
+    clone_filter: str | None = None
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
+
+    @field_validator("clone_filter")
+    @classmethod
+    def _check_clone_filter(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        # A filter spec is one token handed to `git clone --filter=<spec>`;
+        # anything with whitespace or a leading dash is not one.
+        if any(ch.isspace() for ch in value) or value.startswith("-"):
+            raise ValueError(
+                f"sandbox.clone_filter must be a git filter spec such as 'blob:none', got {value!r}"
+            )
+        return value
 
     @field_validator("languages")
     @classmethod
@@ -210,6 +234,7 @@ def _valid_repo(value: str) -> bool:
 # `{title}` is the model-authored title when the plan gave one, else the
 # outcome; the rest are the run's own facts.
 NAMING_FIELDS = frozenset({"title", "outcome", "run_id", "repo"})
+DEFAULT_GITHUB_API_URL = "https://api.github.com"
 DEFAULT_PR_TITLE_TEMPLATE = "sbxloop: {title}"
 DEFAULT_COMMIT_MESSAGE_TEMPLATE = "sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}"
 # Bytes git refuses in a ref name, plus the sequences `git check-ref-format`
@@ -386,6 +411,17 @@ class GithubConfig(_ConfigModel):
     repo: str | None = None
     repos: list[RepoConfig] = Field(default_factory=list)
     deliver_base: str | None = None  # base branch; None → the repo's default
+    # Where the GitHub REST API lives (#623). github.com by default; GitHub
+    # Enterprise Server serves it at `https://<host>/api/v3`. Everything
+    # host-shaped derives from this one value — the REST transports, App
+    # token minting, clone URLs, the sandboxes' network allowlists and the
+    # `GH_HOST` the github sandbox's gh runs with — so a set `GH_HOST` on
+    # the host that names a different site is refused at config load rather
+    # than letting two sources of truth drift apart. FIELD-UNVERIFIED
+    # against a real GHES deployment: the sbx `github` service secret and
+    # the Copilot token exchange are github.com-keyed regardless (Copilot is
+    # served from github.com even for GHES customers, via GitHub Connect).
+    api_url: str = DEFAULT_GITHUB_API_URL
     # Create `repo` when it does not exist (probed right after provisioning,
     # so a missing repo fails the run before any work). Opt-in so a typo'd
     # repo errors instead of silently delivering into a fresh repository;
@@ -425,6 +461,51 @@ class GithubConfig(_ConfigModel):
         if value is not None and not _valid_repo(value):
             raise ValueError(f"github.repo must be owner/name, got {value!r}")
         return value
+
+    @field_validator("api_url")
+    @classmethod
+    def _check_api_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        parts = urlsplit(value)
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or parts.username is not None
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError(
+                "github.api_url must be a plain https URL such as "
+                f"'https://api.github.com' or 'https://ghe.example.com/api/v3', got {value!r}"
+            )
+        return value
+
+    @property
+    def api_host(self) -> str:
+        """The hostname the REST API answers on (``api.github.com``)."""
+        return str(urlsplit(self.api_url).hostname)
+
+    @property
+    def is_dotcom(self) -> bool:
+        return self.api_host == "api.github.com"
+
+    @property
+    def web_host(self) -> str:
+        """The site itself — clone URLs, PR links, gh's ``GH_HOST``.
+        github.com's API lives on its own subdomain; an Enterprise Server
+        serves both from one host."""
+        return "github.com" if self.is_dotcom else self.api_host
+
+    @property
+    def web_url(self) -> str:
+        return f"https://{self.web_host}"
+
+    @property
+    def allow_domains(self) -> tuple[str, ...]:
+        """The hosts a sandbox must reach to talk to this GitHub: the API
+        host and the web host (git over https, release redirects), deduped
+        for an Enterprise Server where they coincide."""
+        return tuple(dict.fromkeys((self.api_host, self.web_host)))
 
     @field_validator("pr_title_template", "commit_message_template")
     @classmethod
@@ -1530,6 +1611,17 @@ def load_config_with_sources(
         config = Config.model_validate(merged)
     except ValidationError as exc:
         raise ConfigError(f"invalid sbxloop configuration: {exc}") from exc
+
+    gh_host = (env.get("GH_HOST") or "").strip()
+    if gh_host and gh_host.casefold() != config.github.web_host.casefold():
+        # gh reads GH_HOST; sbxloop's own transports read api_url. Two
+        # answers to "which GitHub" is exactly the drift #623 removes.
+        raise ConfigError(
+            f"GH_HOST={gh_host!r} in the environment disagrees with [github] api_url "
+            f"{config.github.api_url!r} (host {config.github.web_host!r}): sbxloop "
+            "derives the GitHub host from api_url and exports GH_HOST to its sandboxes "
+            "itself — unset GH_HOST, or point api_url at that server"
+        )
 
     if not config.state_dir.is_absolute():
         # An explicit relative state_dir means project-scoped state: pin it

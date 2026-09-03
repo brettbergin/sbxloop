@@ -89,7 +89,7 @@ def test_legacy_workspace_not_used_for_another_repo(
 
     from sbxloop import hostgit
 
-    def boom(url: str, target: Path, branch: str, *, existing: bool = False) -> str:
+    def boom(url: str, target: Path, branch: str, **kwargs: object) -> str:
         raise ProvisionError(f"cloning {url} failed: repository not found")
 
     monkeypatch.setattr(hostgit, "clone_from_remote", boom)
@@ -114,7 +114,7 @@ def test_no_workspace_no_credential_fails_explicitly(
 
     from sbxloop import hostgit
 
-    def boom(url: str, target: Path, branch: str, *, existing: bool = False) -> str:
+    def boom(url: str, target: Path, branch: str, **kwargs: object) -> str:
         raise ProvisionError(f"cloning {url} failed: Authentication failed")
 
     monkeypatch.setattr(hostgit, "clone_from_remote", boom)
@@ -138,16 +138,65 @@ def test_no_workspace_public_repo_clones_from_remote(
 
     from sbxloop import hostgit
 
-    seen: dict[str, str] = {}
+    seen: dict[str, object] = {}
 
-    def fake_clone(url: str, target: Path, branch: str, *, existing: bool = False) -> str:
+    def fake_clone(
+        url: str,
+        target: Path,
+        branch: str,
+        *,
+        existing: bool = False,
+        clone_filter: str | None = None,
+    ) -> str:
         seen["url"] = url
+        seen["clone_filter"] = clone_filter
         return hostgit.clone_for_run(upstream, target, branch)
 
     monkeypatch.setattr(hostgit, "clone_from_remote", fake_clone)
     ws = provisioner._resolve_workspace("r1", "o/public")
     assert seen["url"] == "https://github.com/o/public"
+    assert seen["clone_filter"] is None  # opt-in (#632)
     assert (ws / "README.md").read_text() == "# o/public\n"
+
+
+def test_remote_clone_follows_api_url_and_clone_filter(
+    fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clone URL derives from [github] api_url (#623) and the partial
+    clone filter from [sandbox] clone_filter (#632)."""
+    legacy = _checkout(tmp_path / "sbxloop", "o/one")
+    upstream = _checkout(tmp_path / "upstream", "o/public")
+    config = Config.model_validate(
+        {
+            "state_dir": str(tmp_path / "state"),
+            "github": {
+                "repos": [{"repo": "o/one", "workspace": str(legacy)}, {"repo": "o/public"}],
+                "api_url": "https://ghe.example.com/api/v3",
+            },
+            "sandbox": {"workspace_isolation": "clone", "clone_filter": "blob:none"},
+        }
+    )
+    provisioner = _provisioner(fake_sbx, config)
+
+    from sbxloop import hostgit
+
+    seen: dict[str, object] = {}
+
+    def fake_clone(
+        url: str,
+        target: Path,
+        branch: str,
+        *,
+        existing: bool = False,
+        clone_filter: str | None = None,
+    ) -> str:
+        seen["url"] = url
+        seen["clone_filter"] = clone_filter
+        return hostgit.clone_for_run(upstream, target, branch)
+
+    monkeypatch.setattr(hostgit, "clone_from_remote", fake_clone)
+    provisioner._resolve_workspace("r1", "o/public")
+    assert seen == {"url": "https://ghe.example.com/o/public", "clone_filter": "blob:none"}
 
 
 def test_single_repo_legacy_workspace_still_clones(fake_sbx: FakeSbx, tmp_path: Path) -> None:
@@ -219,7 +268,7 @@ def test_narrowed_config_still_refuses_other_repos_tree(
 
     from sbxloop import hostgit
 
-    def boom(url: str, target: Path, branch: str, *, existing: bool = False) -> str:
+    def boom(url: str, target: Path, branch: str, **kwargs: object) -> str:
         raise ProvisionError(f"cloning {url} failed: repository not found")
 
     monkeypatch.setattr(hostgit, "clone_from_remote", boom)

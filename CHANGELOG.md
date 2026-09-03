@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Run clones are single-branch and tagless** (#632). Every per-run
+  clone — of a host checkout or of the remote — is cut
+  `--single-branch --no-tags`, so a repository's whole branch and tag
+  history no longer travels into each run. Safe because
+  `merge_from_base` now fetches the delivery base by explicit refspec
+  before merging and diffing, so a base that is not the clone's branch
+  still resolves; continuing an existing branch fetches that branch the
+  same way. Shallow clones stay off the table: a `--depth 1` clone has no
+  history to compute a merge base from.
+
+- **The "created repository" link is host-correct**: the Discord embed
+  uses the repository's `html_url` from the probe instead of assuming
+  `github.com`.
+
 - **Follow-ups on a repository with Issues disabled are not lost** (#631).
   `POST /issues` answers 410 Gone there, and the filing's best-effort
   guard logged it and moved on — the review's out-of-scope notes were
@@ -33,6 +47,25 @@ All notable changes to sbxloop are documented here. The project adheres to
   host worth reading goes.
 
 ### Added
+
+- **`[github] api_url`** (#623) — the GitHub REST root
+  (`https://api.github.com`; `https://ghe.example.com/api/v3` for GitHub
+  Enterprise Server) is the one source of truth for the REST transport,
+  App-auth minting, the remote clone URL, PR links and both sandboxes'
+  network allows. The github sandbox receives `GH_HOST` (for `gh`) and the
+  worker `SBXLOOP_GITHUB_API_URL` only when the host is not github.com. A
+  `GH_HOST` in the daemon's environment that disagrees with `api_url`
+  fails config load with a message naming both. Deliberately not derived:
+  the Copilot token exchange host stays `api.github.com` (Copilot is served
+  from github.com even for GHES), and sbx's built-in `github` service
+  secret stays github.com-keyed. FIELD-UNVERIFIED — no GHES to test
+  against.
+
+- **`[sandbox] clone_filter`** (#632) — opt-in git partial-clone filter
+  (`"blob:none"`) for the credential-free remote clone of a repository
+  with no host checkout. Off by default because lazy blob fetches happen
+  wherever git next needs one, the VM included; a git without `--filter`
+  logs `workspace.clone_filter_unsupported` and clones in full.
 
 - **`sbxloop init-repo owner/name`** creates the labels the loop relies
   on (#630): the six lifecycle labels and `[landing] followup_label`, each

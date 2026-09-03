@@ -379,6 +379,22 @@ the same filesystem, so isolation is cheap; the working tree itself is
 copied. If the agent commits inside the VM it needs `git config user.name` /
 `user.email` — agents typically set these themselves.
 
+Every run clone is cut `--single-branch --no-tags` (#632): it carries the
+run's branch and its history, not every branch and tag the repository has
+ever pushed. That is safe because the loop fetches the delivery base
+explicitly before every merge-from-base and diff, so a base that is not the
+clone's branch still resolves. Shallow clones are deliberately not used —
+a `--depth 1` clone has no history to compute a merge base from, and a
+wrong base is silently the wrong diff. For a very large repository without a
+host checkout, `[sandbox] clone_filter = "blob:none"` opts the remote clone
+into git's partial-clone filter: history and trees come down, file contents
+are fetched lazily on first checkout. The hazard is that lazy fetch happens
+wherever git next needs a blob, including inside the VM, which holds no git
+credential — fine for the public repositories that mode is limited to, and
+the reason the filter is opt-in and applies only there. A git without
+partial-clone support logs `workspace.clone_filter_unsupported` and clones
+in full rather than failing.
+
 ## The daemon: an always-on outer loop
 
 `sbxloop daemon` is deliberately small. It polls the one configured
@@ -929,10 +945,13 @@ back to another repository's tree, ever — silently building `you/two` from
 
 **No workspace.** An entry with no `workspace` (and no legacy one that
 belongs to it) has no host tree, so its runs clone the repository from its
-own remote into the run directory. The host deliberately holds no git
-credential, so **this mode only works for a public repository**; for a
-private one the clone fails the run with that reason, rather than falling
-back to anything. Give private repositories a checkout of their own.
+own remote into the run directory (from the server `[github] api_url`
+names, single-branch, optionally blob-filtered — see
+[Working against an existing checkout](#working-against-an-existing-checkout)).
+The host deliberately holds no git credential, so **this mode only works
+for a public repository**; for a private one the clone fails the run with
+that reason, rather than falling back to anything. Give private
+repositories a checkout of their own.
 
 **Migration.** A single-repo deployment's `[sandbox] workspace` keeps
 working exactly as before. When you add a second repository, **move
@@ -1432,10 +1451,12 @@ came from. The notable knobs:
 | `[sandbox] workspace`                                     | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                                                                                                                                                                                                                                                                            |
 | `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                                                                                                                                                                                                            |
 | `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                                                                                                                                                                                                                   |
+| `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the credential-free remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                      |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
 | `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix`, `bot_login` beside it.                                                                                                                                     |
+| `[github] api_url`                                        | api.github.com     | The GitHub REST root — GitHub Enterprise Server: `https://ghe.example.com/api/v3`. One source of truth for the REST transport, App auth, `gh` (`GH_HOST`) and both sandboxes' network allows; a `GH_HOST` in the daemon's environment that names another host is refused at config load. FIELD-UNVERIFIED on GHES.                                                 |
 | `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`, `ignore_reviewers`.                                                     |
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
 | `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                                                                                                                                                                                                |

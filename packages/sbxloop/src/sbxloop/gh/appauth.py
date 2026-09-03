@@ -208,7 +208,8 @@ def mint_installation_token(
     now: float | None = None,
     api_url: str = _API_URL,
 ) -> InstallationToken:
-    """Exchange an App JWT for an installation token at api.github.com."""
+    """Exchange an App JWT for an installation token at ``api_url`` — the
+    configured GitHub's REST root (``[github] api_url``, #623)."""
     started = time.time() if now is None else now
     token_jwt = app_jwt(creds, now=started)
     url = f"{api_url}/app/installations/{creds.installation_id}/access_tokens"
@@ -323,11 +324,13 @@ class AppTokenSource:
         mint: Callable[[AppCredentials], InstallationToken] | None = None,
         margin_s: float = REFRESH_MARGIN_S,
         fetch: Callable[[AppCredentials], str] | None = None,
+        api_url: str = _API_URL,
     ) -> None:
         self.creds = creds
+        self.api_url = api_url
         self._clock = clock
-        self._mint = mint or (lambda c: mint_installation_token(c, now=clock()))
-        self._fetch = fetch or (lambda c: fetch_app_slug(c, now=clock()))
+        self._mint = mint or (lambda c: mint_installation_token(c, now=clock(), api_url=api_url))
+        self._fetch = fetch or (lambda c: fetch_app_slug(c, now=clock(), api_url=api_url))
         self._margin_s = margin_s
         self._lock = threading.Lock()
         self._token: InstallationToken | None = None
