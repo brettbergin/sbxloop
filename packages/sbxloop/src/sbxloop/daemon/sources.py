@@ -222,7 +222,10 @@ class GitHubIssueSource:
         self._add_labels(ops, number, [label])
 
     def _add_labels(self, ops: GithubOps, number: str, labels: Sequence[str]) -> None:
-        ops.raw("POST", f"{self._issue_path(number)}/labels", {"labels": list(labels)})
+        try:
+            ops.raw("POST", f"{self._issue_path(number)}/labels", {"labels": list(labels)})
+        except GithubOpsError as exc:
+            raise self._label_error(exc, number, "add", labels) from exc
 
     def _remove_label(self, ops: GithubOps, number: str, label: str) -> None:
         try:
@@ -234,7 +237,30 @@ class GitHubIssueSource:
                 exc.http_status == 404 if exc.http_status is not None else "HTTP 404" in str(exc)
             )
             if not missing:
-                raise
+                raise self._label_error(exc, number, "remove", [label]) from exc
+
+    def _label_error(
+        self, exc: GithubOpsError, number: str, verb: str, labels: Sequence[str]
+    ) -> GithubOpsError:
+        """A label write's failure, named for what it means (#630).
+
+        A 403 here is a *permission* gap on an otherwise working token: a
+        triage-only token (or an App installed with Issues: read) can read
+        issues and comment — every earlier step of the claim succeeded —
+        but cannot write labels, so without this the daemon's log would
+        show a bare 403 on a request the operator had no reason to expect.
+        Anything else passes through as it was.
+        """
+        if exc.http_status != 403:
+            return exc
+        names = ", ".join(f"`{label}`" for label in labels)
+        return GithubOpsError(
+            f"cannot {verb} label(s) {names} on {self.repo}#{number}: the token lacks "
+            "the permission to write issue labels (fine-grained token or GitHub App: "
+            "Issues → read and write; classic PAT: `repo`) — a triage-only token can "
+            f"read and comment but not label. {exc}",
+            http_status=403,
+        )
 
     def _comment(self, ops: GithubOps, number: str, body: str) -> None:
         ops.issue_comment(self.repo, int(number), body)
@@ -395,6 +421,7 @@ class GitHubIssueSource:
                 "github.claim_failed",
                 item=item.item_id,
                 repo=self.repo,
+                error=str(exc),
                 rolling_back_label=added_in_progress,
                 duration_s=round(time.monotonic() - started, 2),
                 exc_info=True,
@@ -1103,14 +1130,14 @@ def build_github_source(
 
 
 def _repo_labels(labels: GitHubLabels, entry: RepoConfig) -> GitHubLabels:
-    """The daemon labels, with the repository's trigger override applied."""
-    if not entry.trigger_label:
-        return labels
+    """The daemon labels with the repository's overrides applied — a
+    straight merge of the entry's six ``<kind>_label`` fields over the
+    daemon-wide set (#630)."""
     return GitHubLabels(
-        entry.trigger_label,
-        labels.in_progress,
-        labels.failed,
-        labels.completed,
-        labels.blocked,
-        labels.gated,
+        entry.trigger_label or labels.trigger,
+        entry.in_progress_label or labels.in_progress,
+        entry.failed_label or labels.failed,
+        entry.completed_label or labels.completed,
+        entry.blocked_label or labels.blocked,
+        entry.gated_label or labels.gated,
     )

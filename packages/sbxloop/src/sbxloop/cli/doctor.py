@@ -27,7 +27,9 @@ from sbxloop import toolchains
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
+from sbxloop.gh.labels import lifecycle_specs, missing_labels
+from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.protection import read_base_requirements
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
@@ -98,6 +100,12 @@ class RepoProbe:
     # The merge methods the repository allows, in the loop's order of
     # preference (#620). None = the payload did not say.
     merge_methods: tuple[MergeMethod, ...] | None = None
+    # The lifecycle (and follow-up) labels the repository does not carry
+    # (#630) — `sbxloop init-repo` creates them. None = not listed.
+    missing_labels: tuple[str, ...] | None = None
+    # Whether the repository has Issues enabled (#631): the daemon polls
+    # issues for work, and follow-ups are filed as issues. None = unknown.
+    issues_enabled: bool | None = None
 
 
 def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
@@ -231,6 +239,30 @@ def repo_checks(
         rows.append(Check(name, True, "; ".join(notes)))
         if merge_row is not None:
             rows.append(merge_row)
+        if result.issues_enabled is False:
+            rows.append(
+                Check(
+                    f"{name} issues",
+                    False,
+                    "Issues are disabled on this repository — the daemon polls issues "
+                    "for work, so nothing can be queued here, and a run's follow-ups "
+                    "are listed on its pull request instead of filed",
+                    hard=False,
+                )
+            )
+        if result.missing_labels:
+            rows.append(
+                Check(
+                    f"{name} labels",
+                    False,
+                    "missing "
+                    + ", ".join(f"`{label}`" for label in result.missing_labels)
+                    + f" — `sbxloop init-repo {entry.repo}` creates them (with colors "
+                    "and descriptions); GitHub attaches an unknown label name without "
+                    "creating it, so the loop's states would show as bare text",
+                    hard=False,
+                )
+            )
         if result.review_protected:
             rows.append(
                 Check(
@@ -433,15 +465,31 @@ def sandbox_repo_probe(
             )
         missing = _missing_permissions(data)
         base = entry.deliver_base or str(data.get("default_branch") or "")
+        has_issues = data.get("has_issues")
         return RepoProbe(
             reachable=True,
             detail="reachable, token has the required permissions" if not missing else "reachable",
             missing_permissions=missing,
             review_protected=_requires_approving_reviews(ops, entry.repo, base) if base else None,
             merge_methods=allowed_merge_methods(data),
+            missing_labels=_missing_repo_labels(ops, config, entry),
+            issues_enabled=has_issues if isinstance(has_issues, bool) else None,
         )
 
     return probe
+
+
+def _missing_repo_labels(
+    ops: GithubOps, config: Config, entry: RepoConfig
+) -> tuple[str, ...] | None:
+    """The sbxloop labels ``entry`` does not carry (#630); None when the
+    list could not be read (a token without issue read, a 5xx) — that is
+    "unknown", not "all present"."""
+    specs = lifecycle_specs(config.labels_for(entry.repo), config.landing.followup_label)
+    try:
+        return tuple(missing_labels(ops, entry.repo, specs))
+    except GithubOpsError:
+        return None
 
 
 def collect_checks(

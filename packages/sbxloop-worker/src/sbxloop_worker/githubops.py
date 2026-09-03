@@ -510,6 +510,38 @@ def _list_pages(t: Transport, path: str, key: str) -> list[Any]:
     raise GithubOpError(f"GET {path} has more than {_MAX_PAGES * _PAGE_SIZE} entries")
 
 
+# Content types a check's ``details_url`` may answer with and still be a log
+# worth reading. Most CI providers serve an HTML dashboard there; a few
+# (Jenkins ``consoleText``, a raw-log endpoint, a JSON status document)
+# serve the text itself, and that text is what the brief wants (#629).
+DETAILS_TEXT_TYPES = ("text/plain", "application/json", "text/x-log")
+DETAILS_MAX_BYTES = 256 * 1024
+
+
+def fetch_details_text(url: str, max_bytes: int = DETAILS_MAX_BYTES) -> str:
+    """The body behind a check's ``details_url`` when it is readable text.
+
+    Best-effort and unauthenticated: the URL belongs to whichever CI
+    provider ran the check, so the GitHub token never travels with the
+    request, and any failure — no egress to that host from the github-ops
+    sandbox, an auth wall, an HTML dashboard, a network error — returns
+    ``""`` so the brief falls back to the check name and URL. Only https
+    URLs are followed, and the body is read up to ``max_bytes``.
+    """
+    if not url.startswith("https://"):
+        return ""
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # nosec B310 - https enforced above
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if not content_type.startswith(DETAILS_TEXT_TYPES):
+                return ""
+            body: bytes = response.read(max_bytes)
+            return body.decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
+
+
 def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
     """The failing check runs and commit statuses on a commit, each with the
     text that explains it.
@@ -520,9 +552,13 @@ def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
     whose logs are gone — expired, or a token without ``actions:read``)
     fall back to what the check itself reported. A red commit status (the
     older Status API — #610) carries only a one-line ``description`` and a
-    ``target_url``; both are passed through, and the host's brief tells the
-    agent the log is not readable from here. Each excerpt is clipped
-    head+tail to ``max_chars`` so a chatty build cannot flood the brief.
+    ``target_url``; both are passed through. When a check leaves no text
+    behind on GitHub, its ``details_url`` is followed once, unauthenticated
+    (:func:`fetch_details_text`): providers that serve a plain-text or JSON
+    log there yield it, dashboards and unreachable hosts yield nothing, and
+    the host's brief then tells the agent the log is not readable from
+    here. Each excerpt is clipped head+tail to ``max_chars`` so a chatty
+    build cannot flood the brief.
     """
     _require(p, "repo", "sha")
     repo, sha = p["repo"], p["sha"]
@@ -546,11 +582,14 @@ def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
                 excerpt = f"(logs unavailable: {reason})\n{_check_output_excerpt(run)}"
         if not excerpt.strip():
             excerpt = _check_output_excerpt(run)
+        details_url = str(run.get("details_url") or "")
+        if not excerpt.strip() and details_url:
+            excerpt = fetch_details_text(details_url)
         checks.append(
             {
                 "name": str(run.get("name") or "check"),
                 "conclusion": str(conclusion),
-                "details_url": str(run.get("details_url") or ""),
+                "details_url": details_url,
                 "excerpt": _clip_head_tail(excerpt, head, tail),
             }
         )
@@ -560,14 +599,16 @@ def _checks_failed_logs(t: Transport, p: dict[str, Any]) -> JsonValue:
         state = str(status.get("state") or "").lower()
         if state in NON_RED_STATUS_STATES:
             continue
+        target_url = str(status.get("target_url") or "")
+        excerpt = str(status.get("description") or "").strip()
+        if not excerpt and target_url:
+            excerpt = fetch_details_text(target_url)
         checks.append(
             {
                 "name": str(status.get("context") or "status"),
                 "conclusion": state or "unknown",
-                "details_url": str(status.get("target_url") or ""),
-                "excerpt": _clip_head_tail(
-                    str(status.get("description") or "").strip(), head, tail
-                ),
+                "details_url": target_url,
+                "excerpt": _clip_head_tail(excerpt, head, tail),
             }
         )
     return {"checks": checks}

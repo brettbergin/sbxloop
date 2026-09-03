@@ -8,6 +8,47 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Follow-ups on a repository with Issues disabled are not lost** (#631).
+  `POST /issues` answers 410 Gone there, and the filing's best-effort
+  guard logged it and moved on — the review's out-of-scope notes were
+  silently dropped. The delivery probe now reads `has_issues` off the
+  repository payload it already fetched and downgrades
+  `[landing] followups = "issues"` to the PR checklist comment, recorded
+  on the `run.followups` event (`downgraded_from = "issues"`,
+  `reason = "issues_disabled"`); a payload that did not say downgrades on
+  the 410 itself. The crash-window dedup skipped nothing the issues
+  endpoint listed — including pull requests — so a labelled PR quoting a
+  marker suppressed the issue; PRs are now filtered out. The issue body
+  names the trigger label only when a daemon dispatched the run; under
+  `sbxloop run` nothing polls the repository and the old sentence pointed
+  at a label that did nothing.
+
+- **A red non-Actions check's own log reaches the fix brief** (#629). The
+  worker now follows the check's `details_url` / `target_url` best-effort
+  — unauthenticated, https only, `text/*` or JSON bodies, the Actions log
+  size clamp — when the check reported no output of its own. Any failure
+  (a host the sandbox policy does not allow, an HTML page, an auth wall)
+  leaves the brief at the check's name, link and reproduce-locally
+  instruction. No new knob: `[sandbox] extra_allow_domains` is where a CI
+  host worth reading goes.
+
+### Added
+
+- **`sbxloop init-repo owner/name`** creates the labels the loop relies
+  on (#630): the six lifecycle labels and `[landing] followup_label`, each
+  with a color and a description, idempotently, through one github-ops
+  sandbox. Nothing created the trigger label a human was told to apply,
+  and the lifecycle labels auto-created on first attach with a random
+  color and no description. `sbxloop doctor` gained advisory rows for missing labels (pointing
+  at `init-repo`) and for a repository with Issues disabled; it stays
+  advisory. Every lifecycle label (`trigger_label`, `in_progress_label`,
+  `failed_label`, `completed_label`, `blocked_label`, `gated_label`) can
+  now be renamed per `[[github.repos]]` entry — `Config.labels_for(repo)`
+  is the one merge, and a repository's six must stay distinct. A claim
+  that GitHub refuses with 403 on the label write now fails with an error
+  naming the permission (Issues → read and write; classic PAT `repo`)
+  instead of a bare status.
+
 - **The agent sandbox's allowlist never names a host twice** (#616).
   `sbx policy allow` refuses a rule it already holds — including one
   created moments earlier from the same argv — and the refusal fails the

@@ -174,7 +174,10 @@ secret_strategy = "proxy"
 # enabled = false              # registered but not polled
 # token_env = "GH_TOKEN_TWO"   # unset uses the daemon-wide GH_TOKEN
 # trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
+# in_progress_label = "loop:wip" # every lifecycle label can be renamed per repo:
+# failed_label = "loop:failed"   # in_progress, failed, completed, blocked, gated
 # labels = ["team:core"]       # extra labels for issues/PRs in this repo
+# `sbxloop init-repo you/other-repo` creates the labels (colored, described).
 
 # [landing]
 # What happens after the tasks are built: the PR opens as a draft, the run
@@ -278,6 +281,8 @@ secret_strategy = "proxy"
 # completed_label = "sbxloop:completed"  # applied when the PR merges
 # blocked_label = "sbxloop:blocked"      # the loop could not land the PR; a human looks
 # gated_label = "sbxloop:awaiting-merge"  # parked by merge_gate; awaiting approval
+# `sbxloop init-repo owner/name` creates all six (plus [landing] followup_label)
+# on a repository, with colors and descriptions; `doctor` reports missing ones.
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # max_attempts_per_item = 2

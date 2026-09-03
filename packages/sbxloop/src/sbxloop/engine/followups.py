@@ -121,8 +121,15 @@ def issue_body(
     pr_number: int,
     pr_url: str,
     closes: int | None,
+    trigger_label: str | None = None,
 ) -> str:
-    """The follow-up issue's body: the note, then where it came from."""
+    """The follow-up issue's body: the note, then where it came from.
+
+    ``trigger_label`` is the daemon's trigger for this repository when a
+    daemon dispatched the run; the "add the trigger label" instruction is
+    only written then (#631) — on a repository nothing polls, it would
+    point at a label that does nothing.
+    """
     lines = [candidate.followup.body.strip() or candidate.followup.title.strip(), ""]
     if candidate.followup.anchor:
         lines.append(f"Where: `{candidate.followup.anchor}`")
@@ -140,31 +147,37 @@ def issue_body(
         else f"a review finding of round {candidate.round} the fix round deferred"
     )
     lines.append(f"{origin}, {how}; run `{run_id}` on `{repo}`.")
-    lines.append(
-        "Filed by sbxloop after that pull request merged. It is **not** queued for the loop: "
-        "add the trigger label if you want it run."
-    )
+    queued = "Filed by sbxloop after that pull request merged. It is **not** queued for the loop"
+    if trigger_label:
+        queued += f": add the `{trigger_label}` label if you want it run."
+    else:
+        queued += "."
+    lines.append(queued)
     lines.append("")
     lines.append(followup_marker(run_id, candidate.key))
     return "\n".join(lines)
 
 
 def checklist_comment(
-    candidates: Sequence[Candidate], *, run_id: str, filed: Sequence[tuple[str, str]] = ()
+    candidates: Sequence[Candidate],
+    *,
+    run_id: str,
+    filed: Sequence[tuple[str, str]] = (),
+    reason: str | None = None,
 ) -> str:
     """The PR comment listing follow-ups — the whole record when filing is
     off (``[landing] followups = "comment"``), or a pointer to the issues
-    when they were filed (``filed`` is ``(title, url)``)."""
+    when they were filed (``filed`` is ``(title, url)``). ``reason`` names
+    why nothing was filed when it is not the configuration — Issues
+    disabled on the repository (#631)."""
     lines = ["## Follow-ups", ""]
     if filed:
         lines.append("Real but out of scope here; filed as issues (not queued for the loop):")
         lines.append("")
         lines.extend(f"- [{title}]({url})" for title, url in filed)
     else:
-        lines.append(
-            "Real but out of scope here. Not filed as issues (`[landing] followups = "
-            '"comment"`); a human may:'
-        )
+        why = reason or '`[landing] followups = "comment"`'
+        lines.append(f"Real but out of scope here. Not filed as issues ({why}); a human may:")
         lines.append("")
         lines.extend(f"- [ ] {c.followup.render()[2:]}" for c in candidates)
     lines.append("")

@@ -1378,7 +1378,7 @@ def config_repos(
             "yes" if entry.enabled else "no",
             effective.deliver_base or "(repo default)",
             entry.token_env or "GH_TOKEN",
-            entry.trigger_label or config.daemon.trigger_label,
+            config.labels_for(entry.repo).trigger,
         )
     console.print(table)
 
@@ -1475,6 +1475,24 @@ def init(
         raise typer.Exit(2)
     path.write_text(DEFAULT_CONFIG_TOML)
     console.print(f"wrote {path}")
+
+
+@app.command("init-repo")
+def init_repo_command(
+    repo: Annotated[str, typer.Argument(help="The repository, owner/name.")],
+) -> None:
+    """Create the labels sbxloop relies on in a repository (idempotent).
+
+    The six lifecycle labels (with this repository's renames from
+    `[[github.repos]]` applied) and the follow-up label, each with a color
+    and a description; existing labels are left alone. Boots one github-ops
+    sandbox for the writes, as `doctor --probe` does.
+    """
+    from sbxloop.cli.initrepo import init_repo
+
+    config = load_config()
+    ok = init_repo(config, SbxCLI(app_name=config.app_name or None), repo, console=console)
+    raise typer.Exit(0 if ok else 1)
 
 
 @daemon_app.callback()

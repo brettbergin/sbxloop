@@ -56,7 +56,7 @@ import base64
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from sbxloop import hostgit
 from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, exclusion_hit, scan_artifacts
@@ -102,12 +102,30 @@ def _is_pr_collision(exc: GithubOpsError) -> bool:
     return exc.http_status == 422 or "HTTP 422" in str(exc)
 
 
+class RepositoryProbe(NamedTuple):
+    """What :func:`ensure_repository` learned about the delivery repository."""
+
+    #: Whether this call created it.
+    created: bool
+    #: ``has_issues`` off the repository payload (#631): False when Issues
+    #: are disabled — follow-ups then land as a PR comment, since
+    #: ``POST /issues`` answers 410 Gone. None when the payload did not say.
+    has_issues: bool | None
+
+
+def _has_issues(data: object) -> bool | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get("has_issues")
+    return value if isinstance(value, bool) else None
+
+
 def ensure_repository(
     ops: GithubOps, repo: str, *, create: bool = False, public: bool = False
-) -> bool:
+) -> RepositoryProbe:
     """Probe the delivery repository; create it when explicitly allowed.
 
-    Returns True when the repository was created. Creation is opt-in
+    ``created`` is True when this call made the repository. Creation is opt-in
     (``create``) rather than automatic on 404 so a typo'd ``--repo`` fails
     loudly instead of silently delivering into a brand-new repository. New
     repositories are private unless ``public``, and ``auto_init`` so the
@@ -117,8 +135,9 @@ def ensure_repository(
     404: three field runs showed the expected miss painted as a red error
     panel in the transcript before this code got to say it was fine (#222).
     """
-    if ops.repo_lookup(repo) is not None:
-        return False
+    data = ops.repo_lookup(repo)
+    if data is not None:
+        return RepositoryProbe(created=False, has_issues=_has_issues(data))
     if not create:
         raise DeliveryError(
             f"repository {repo} does not exist — create it first, or pass "
@@ -145,10 +164,10 @@ def ensure_repository(
     login = str(user.get("login", "")) if isinstance(user, dict) else ""
     body = {"name": name, "private": not public, "auto_init": True}
     if login.lower() == owner.lower():
-        ops.raw("POST", "/user/repos", body)
+        made = ops.raw("POST", "/user/repos", body)
     else:
-        ops.raw("POST", f"/orgs/{owner}/repos", body)
-    return True
+        made = ops.raw("POST", f"/orgs/{owner}/repos", body)
+    return RepositoryProbe(created=True, has_issues=_has_issues(made))
 
 
 @dataclass

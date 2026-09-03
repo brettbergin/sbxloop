@@ -22,6 +22,7 @@ from sbxloop.engine.followups import (
 )
 from sbxloop.engine.review import Followup, ReviewFinding, ReviewRound, ReviewVerdict, review_body
 from sbxloop.errors import GithubOpsError
+from sbxloop.events import HostEventTypes
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
 from tests.fakes.github_errors import github_error
@@ -29,6 +30,7 @@ from tests.unit.test_engine import (
     FILES_BUILD,
     FINDING,
     Harness,
+    new_run_id_for,
     review,
     task,
     taskgraph,
@@ -166,8 +168,21 @@ class TestRendering:
             "Out of scope for [PR #7](https://x/pull/7) (issue #511), noted by the review "
             "in round 2; run `r1` on `o/r`." in body
         )
+        # No daemon dispatched this run: nothing polls the repository, so
+        # the body must not point at a trigger label (#631).
+        assert "It is **not** queued for the loop." in body and "label" not in body
+        queued = issue_body(
+            cand,
+            run_id="r1",
+            repo="o/r",
+            pr_number=7,
+            pr_url="https://x/pull/7",
+            closes=511,
+            trigger_label="loop:go",
+        )
         assert (
-            "It is **not** queued for the loop: add the trigger label if you want it run." in body
+            "It is **not** queued for the loop: add the `loop:go` label if you want it run."
+            in queued
         )
         assert body.endswith(followup_marker("r1", cand.key))
         assert marker_key(body) == ("r1", cand.key)
@@ -203,6 +218,8 @@ class TestRendering:
         assert 'Not filed as issues (`[landing] followups = "comment"`)' in listed
         assert "- [ ] **A** — a\n- [ ] **B**" in listed
         assert listed.endswith("<!-- sbxloop-followups run=r1 -->")
+        downgraded = checklist_comment(cands, run_id="r1", reason="Issues are disabled here")
+        assert "Not filed as issues (Issues are disabled here)" in downgraded
 
 
 class FakeOps:
@@ -376,3 +393,106 @@ class TestFilingWithExistingLabels:
         assert [
             r for r in caplog.records if r.levelno >= logging.WARNING and "label" in r.getMessage()
         ] == []
+
+
+class TestIssuesDisabled:
+    """#631: a repository with Issues turned off cannot take follow-up
+    issues — they land as the PR checklist instead, and the run says so."""
+
+    def _run(self, harness: Harness, fake: FakeGithub) -> Any:
+        harness.script(followup_script())
+        return harness.pipeline(fake).start("ship hello")
+
+    @staticmethod
+    def _followup_events(harness: Harness) -> list[Any]:
+        return [e for e in harness.events if e.type == HostEventTypes.RUN_FOLLOWUPS]
+
+    def test_has_issues_false_downgrades_to_the_pr_comment(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.has_issues = False
+        result = self._run(harness, fake)
+        assert result.state == "merged"
+        assert fake.issues_created == []
+        # Nothing was even attempted: no label ensure, no issue list.
+        assert not any(path.endswith("/labels") for _m, path, _b in fake.raw_calls)
+        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        assert "Not filed as issues (Issues are disabled on this repository)" in listed
+        assert "- [ ] **the greeting is not documented**" in listed
+        (event,) = self._followup_events(harness)
+        assert event.data["mode"] == "comment"
+        assert event.data["downgraded_from"] == "issues"
+        assert event.data["reason"] == "issues_disabled"
+        assert len(event.data["listed"]) == 3
+
+    def test_a_silent_payload_downgrades_on_the_410(self, harness: Harness) -> None:
+        """The probe did not say (no ``has_issues`` key): the first filing's
+        410 Gone decides, and the checklist still lands."""
+
+        class SilentPayload(FakeGithub):
+            def repo_lookup(self, repo: str) -> dict[str, Any] | None:
+                payload = super().repo_lookup(repo)
+                assert payload is not None
+                payload.pop("has_issues", None)
+                return payload
+
+        fake = SilentPayload()
+        fake.has_issues = False
+        result = self._run(harness, fake)
+        assert result.state == "merged"
+        assert fake.issues_created == []
+        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        assert "Issues are disabled on this repository" in listed
+        (event,) = self._followup_events(harness)
+        assert event.data["mode"] == "comment" and event.data["reason"] == "issues_disabled"
+        # The 410 is a downgrade, not a failed filing.
+        assert fake.failed_jobs == []
+
+    def test_issues_enabled_files_as_before(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        result = self._run(harness, fake)
+        assert result.state == "merged"
+        assert len(fake.issues_created) == 3
+        (event,) = self._followup_events(harness)
+        assert event.data["mode"] == "issues" and "downgraded_from" not in event.data
+
+    def test_a_labelled_pull_request_does_not_count_as_filed(self, harness: Harness) -> None:
+        """The issues list includes pull requests; one carrying this run's
+        marker (a PR body that quoted a follow-up) must not suppress the
+        issue (#631)."""
+        fake = FakeGithub()
+        harness.script(followup_script())
+        engine = harness.pipeline(fake)
+        run_id = new_run_id_for(engine)
+        fake.existing_issues = [
+            {
+                "html_url": "https://x/pull/2",
+                "pull_request": {"url": "https://api/pulls/2"},
+                "body": "…\n" + followup_marker(run_id, followup_key(FOLLOWUP_B["title"])),
+            },
+            {
+                "html_url": "https://x/issues/3",
+                "body": "…\n" + followup_marker(run_id, followup_key(FOLLOWUP_A["title"])),
+            },
+        ]
+        result = engine.start("ship hello", run_id=run_id)
+        assert result.state == "merged"
+        assert sorted(t for t, _, _ in fake.issues_created) == [
+            FOLLOWUP_B["title"],
+            "the greeting is not documented",
+        ]
+
+    def test_a_daemon_dispatched_run_names_its_trigger_label(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script(followup_script())
+        engine = harness.pipeline(fake)
+        engine.trigger_label = "sbxloop:run"
+        assert engine.start("ship hello").state == "merged"
+        for _, body, _ in fake.issues_created:
+            assert "add the `sbxloop:run` label if you want it run" in body
+
+    def test_a_cli_run_omits_the_trigger_instruction(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        result = self._run(harness, fake)
+        assert result.state == "merged"
+        for _, body, _ in fake.issues_created:
+            assert "not** queued for the loop." in body and "trigger label" not in body

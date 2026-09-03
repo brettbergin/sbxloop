@@ -340,7 +340,7 @@ class MissingRepoOps(StubOps):
 class TestEnsureRepository:
     def test_existing_repo_is_left_alone(self) -> None:
         ops = StubOps()
-        assert ensure_repository(ops, "o/r") is False  # type: ignore[arg-type]
+        assert ensure_repository(ops, "o/r").created is False  # type: ignore[arg-type]
         assert ops.raw_calls == []
 
     def test_missing_repo_without_create_refuses(self) -> None:
@@ -353,7 +353,7 @@ class TestEnsureRepository:
     def test_missing_repo_created_under_user(self) -> None:
         # owner match is case-insensitive (GitHub logins are)
         ops = MissingRepoOps(login="Me")
-        assert ensure_repository(ops, "me/proj", create=True) is True  # type: ignore[arg-type]
+        assert ensure_repository(ops, "me/proj", create=True).created is True  # type: ignore[arg-type]
         posts = [call for call in ops.raw_calls if call[0] == "POST"]
         assert posts == [
             ("POST", "/user/repos", {"name": "proj", "private": True, "auto_init": True})
@@ -361,7 +361,7 @@ class TestEnsureRepository:
 
     def test_missing_repo_created_under_org(self) -> None:
         ops = MissingRepoOps(login="me")
-        assert ensure_repository(ops, "acme/proj", create=True) is True  # type: ignore[arg-type]
+        assert ensure_repository(ops, "acme/proj", create=True).created is True  # type: ignore[arg-type]
         posts = [call for call in ops.raw_calls if call[0] == "POST"]
         assert posts and posts[0][1] == "/orgs/acme/repos"
 
@@ -371,7 +371,7 @@ class TestEnsureRepository:
         the identity lookup."""
         ops = MissingRepoOps()
         ops.user_forbidden = True
-        assert ensure_repository(ops, "acme/proj", create=True) is True  # type: ignore[arg-type]
+        assert ensure_repository(ops, "acme/proj", create=True).created is True  # type: ignore[arg-type]
         posts = [call for call in ops.raw_calls if call[0] == "POST"]
         assert posts and posts[0][1] == "/orgs/acme/repos"
 

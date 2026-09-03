@@ -480,7 +480,7 @@ class Concierge:
         for entry in self.config.github.repo_list():
             base = entry.deliver_base or "(repo default)"
             state = "enabled" if entry.enabled else "disabled"
-            trigger = entry.trigger_label or self.config.daemon.trigger_label
+            trigger = self.config.labels_for(entry.repo).trigger
             line = f"{entry.repo} — {state}, base {base}, trigger label `{trigger}`"
             row = health.get(entry.repo.casefold())
             if row and row.get("state") == "suspended":
@@ -1453,7 +1453,7 @@ class Concierge:
             return str(exc)
         if not title or not body:
             return "both title and body are required"
-        trigger = self.config.daemon.trigger_label
+        trigger = self.config.labels_for(repo).trigger
         queue = args.get("queue")
         queued = True if queue is None else bool(queue)
         labels = [trigger] if queued else []
@@ -1502,7 +1502,7 @@ class Concierge:
         repo, repo_error = self._resolve_repo(args)
         if repo_error is not None:
             return repo_error
-        daemon = self.config.daemon
+        lifecycle = self.config.labels_for(repo)
         limit = _int_arg(args, "limit", 20, 1, 50)
         label = str(args.get("label") or "").strip()
         include_all = bool(args.get("all"))
@@ -1522,12 +1522,12 @@ class Concierge:
         state_arg = str(args.get("state") or "").strip().lower()
         subset_parts: list[str] = []
         state_labels = {
-            daemon.trigger_label,
-            daemon.in_progress_label,
-            daemon.failed_label,
-            daemon.blocked_label,
+            lifecycle.trigger,
+            lifecycle.in_progress,
+            lifecycle.failed,
+            lifecycle.blocked,
         }
-        active_labels = {daemon.trigger_label, daemon.in_progress_label}
+        active_labels = {lifecycle.trigger, lifecycle.in_progress}
         if queued_arg is not None:
             want_queued = bool(queued_arg)
 
@@ -1538,10 +1538,10 @@ class Concierge:
             issues = [d for d in issues if _keep_queued(d)]
             subset_parts.append("queued" if want_queued else "not-queued")
         state_label_by_name = {
-            "queued": daemon.trigger_label,
-            "running": daemon.in_progress_label,
-            "failed": daemon.failed_label,
-            "blocked": daemon.blocked_label,
+            "queued": lifecycle.trigger,
+            "running": lifecycle.in_progress,
+            "failed": lifecycle.failed,
+            "blocked": lifecycle.blocked,
         }
         if state_arg == "backlog":
             issues = [d for d in issues if not (set(_label_names(d)) & state_labels)]
@@ -1564,13 +1564,13 @@ class Concierge:
         for issue in issues:
             labels = _label_names(issue)
             flags = []
-            if daemon.trigger_label in labels:
+            if lifecycle.trigger in labels:
                 flags.append("QUEUED for a run")
-            if daemon.in_progress_label in labels:
+            if lifecycle.in_progress in labels:
                 flags.append("RUNNING")
-            if daemon.failed_label in labels:
+            if lifecycle.failed in labels:
                 flags.append("FAILED before")
-            if daemon.blocked_label in labels:
+            if lifecycle.blocked in labels:
                 flags.append("BLOCKED — needs a human")
             if not flags:
                 flags.append("NOT QUEUED")
@@ -1583,7 +1583,7 @@ class Concierge:
                 + f" · {' / '.join(flags)}"
             )
         lines.append(
-            f"Issues without `{daemon.trigger_label}` are not queued: label_issue_for_run "
+            f"Issues without `{lifecycle.trigger}` are not queued: label_issue_for_run "
             "queues one that exists (only the ones the person names); create_issue files "
             "and queues a new one."
         )
@@ -1597,7 +1597,7 @@ class Concierge:
         number = _issue_number(args)
         if number <= 0:
             return "number is required"
-        trigger = self.config.daemon.trigger_label
+        trigger = self.config.labels_for(repo).trigger
         try:
             self.github.call(
                 lambda ops: ops.raw(
@@ -1670,7 +1670,7 @@ class Concierge:
                 "they answered as `confirmation`."
             )
         comment = str(args.get("comment", "")).strip()
-        daemon = self.config.daemon
+        lifecycle = self.config.labels_for(repo)
         path = f"/repos/{repo}/issues/{number}"
         try:
             data = self.github.call(lambda ops: ops.raw("GET", path))
@@ -1690,7 +1690,7 @@ class Concierge:
             issue_item_id(int(number))
         )
         running = item is not None and item.state == "running"
-        if daemon.in_progress_label in labels or running:
+        if lifecycle.in_progress in labels or running:
             run = f" (run `{item.run_id}`)" if item is not None and item.run_id else ""
             return (
                 f'#{number} "{title}" is being worked right now{run} — closing it would not '
@@ -1707,18 +1707,18 @@ class Concierge:
                     f"{_one_line(str(exc), 300)}"
                 )
             notes.append("posted the reason as a comment")
-        if daemon.trigger_label in labels:
+        if lifecycle.trigger in labels:
             # Removing it before the close also shuts the claim window: a poll
             # landing mid-sequence declines on either signal (sources.claim).
             try:
-                self.github.call(lambda ops: _remove_label(ops, path, daemon.trigger_label))
+                self.github.call(lambda ops: _remove_label(ops, path, lifecycle.trigger))
             except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
                 notes.append(
-                    f"could NOT remove `{daemon.trigger_label}` ({_one_line(str(exc), 120)}) — "
+                    f"could NOT remove `{lifecycle.trigger}` ({_one_line(str(exc), 120)}) — "
                     "reopening it would queue a run"
                 )
             else:
-                notes.append(f"removed `{daemon.trigger_label}`")
+                notes.append(f"removed `{lifecycle.trigger}`")
         try:
             self.github.call(
                 lambda ops: ops.raw("PATCH", path, {"state": "closed", "state_reason": reason})
