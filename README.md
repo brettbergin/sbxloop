@@ -299,7 +299,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | `sbxloop logs RUN`                              | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                                                                |
 | `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                                                          |
 | `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                                                      |
-| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints).                                                                                                                                                                                     |
+| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints, `--preset large-repo` appends the packaged budget preset).                                                                                                                           |
 | `sbxloop init-repo OWNER/NAME`                  | Create the labels the loop relies on in a repository — the six lifecycle labels (with that repository's renames applied) and the follow-up label, each colored and described. Idempotent; boots one github-ops sandbox; exits 1 when the token cannot write labels.                                 |
 | `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                                                                 |
 | `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                                                         |
@@ -586,6 +586,8 @@ refresh_workspace = true
 # state_dir = "~/.local/state/sbxloop/my-project"
 log_level = "INFO"
 log_format = "console"
+version_check = true                      # ask PyPI once at start; false = no request, no advice
+# upgrade_command = "pipx upgrade sbxloop"  # what the drift notice tells the operator to run
 ```
 
 #### Upgrading a pre-1.0 daemon
@@ -756,10 +758,14 @@ converting to money — and a run from before usage reporting answers "not
 recorded", never zero.
 Ask "are we up to date?" and it compares the installed `sbxloop` /
 `sbxloop-worker` / `sbx` versions against the latest releases on PyPI —
-every merge to `main` publishes a patch while upgrading this host is
-manual, so the daemon also says so once at startup when it is behind.
-(It only reports: upgrading is `pip install --upgrade sbxloop` plus a
-restart, by a human on the host.)
+sbxloop's releases ship frequently while upgrading a host is an operator's
+step, so the daemon also says so once at startup when it is behind. (It
+only reports: the advice names `[daemon] upgrade_command` when one is set
+and otherwise says the command depends on how sbxloop was installed; a
+restart follows either way. `[daemon] version_check = false` switches the
+PyPI lookup off entirely — no request leaves the host, no notice is posted
+— for an air-gapped or mirror-pinned host, or one a deploy pipeline keeps
+current.)
 Ask "what is the daemon doing?" or "why is nothing running?" and it quotes
 the daemon's own recent log lines — `daemon.idle`, `breaker`,
 `github.poll_failed` — through `daemon_log(tail, level, grep)`, the journal
@@ -1495,14 +1501,19 @@ test failure.
 
 ### Sizing budgets for a larger repository
 
-The `[budgets]` defaults (2 h wall clock, 40 tool calls per phase) suit a
-small greenfield project. A large existing repo — thousands of tests, several
-packages to orient in — wants more headroom: one verify pass alone can be
-minutes of test time, and 20 tasks × 3 attempts × verify presses on the wall
-clock. [`contrib/presets/large-repo.toml`](contrib/presets/large-repo.toml) is
-a starting point (4 h wall clock, tool cap 80). Verify output handed back to
-the builder keeps the first 2 KB and the last 4 KB of each command, so a long
-pytest run's first traceback and its failure summary both survive.
+The `[budgets]` defaults (2 h wall clock, 60 tool calls per phase) suit a
+project whose gate finishes in seconds. The signal that they are too small
+is measured gate duration, not repository size: when one run of the gate
+command — the test suite plus linters, what every verify pass executes —
+takes two minutes or more, 20 tasks × 3 attempts × verify presses on the wall
+clock and a multi-package tree eats the tool cap before any edit. `sbxloop init --preset large-repo` writes a starter file with the packaged preset
+appended (4 h wall clock, tool cap 80, `[limits]` with `mem_abort` on); the
+preset ships inside the wheel as
+[`sbxloop/data/presets/large-repo.toml`](packages/sbxloop/src/sbxloop/data/presets/large-repo.toml)
+and its header says how to apply the same sections to an existing file.
+Verify output handed back to the builder keeps the first 2 KB and the last
+4 KB of each command, so a long test run's first traceback and its failure
+summary both survive.
 
 ## Repository layout
 

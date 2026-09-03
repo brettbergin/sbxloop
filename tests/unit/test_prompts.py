@@ -246,7 +246,11 @@ def test_concierge_prompt_carries_contract() -> None:
     # the configured repositories reach the model, with their per-repo facts
     assert "owner/repo — enabled, base main" in text and "`list_repos`" in text
     # drift: the concierge reports versions, a human does the upgrading
-    assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
+    assert "`version_status`" in text and "**You cannot upgrade\n  anything**" in text
+    # #638: no claim that the user's repository publishes sbxloop on merge,
+    # and no guessed upgrade command — the report names it or nobody does
+    assert "publishes a release" not in text and "pip install" not in text
+    assert "operator's step" in text and "do\n  not guess a command" in text
     # #524: an ask that touches persisted state files with a migration section
     assert "**Migration of existing state** section" in text
     # #535: symptom-first filing; a fix named with no symptom gets one question

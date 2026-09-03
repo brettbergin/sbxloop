@@ -523,6 +523,25 @@ def test_daemon_log_level_and_format(tmp_path: Path) -> None:
         load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_FORMAT": "xml"})
 
 
+def test_daemon_version_check_and_upgrade_command(tmp_path: Path) -> None:
+    """#641: the release check is on by default and switchable off; #638: the
+    upgrade advice comes from `upgrade_command` when the operator sets one."""
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.version_check is True
+    assert config.daemon.upgrade_command is None
+    (tmp_path / "sbxloop.toml").write_text(
+        '[daemon]\nversion_check = false\nupgrade_command = "  pipx upgrade sbxloop "\n'
+    )
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.version_check is False
+    assert config.daemon.upgrade_command == "pipx upgrade sbxloop"
+    over = load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__VERSION_CHECK": "true"})
+    assert over.daemon.version_check is True
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\nupgrade_command = "   "\n')
+    with pytest.raises(ConfigError, match="upgrade_command"):
+        load_config(cwd=tmp_path, env={})
+
+
 def test_run_cap_timezone_defaults_to_utc(tmp_path: Path) -> None:
     config = load_config(cwd=tmp_path, env={})
     assert config.daemon.run_cap_timezone == "UTC"

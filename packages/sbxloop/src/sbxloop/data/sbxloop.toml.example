@@ -254,9 +254,9 @@ secret_strategy = "proxy"
 # harvest_mode = "per-task"
 
 # [budgets]
-# Sized for a small greenfield project. A large existing repo (thousands of
-# tests, a multi-package tree to orient in) wants a bigger wall clock and
-# tool cap — see contrib/presets/large-repo.toml.
+# Sized for a project whose gate finishes in seconds. When one run of the
+# gate command takes two minutes or more, the loop wants a bigger wall clock
+# and tool cap — `sbxloop init --preset large-repo` writes them.
 # max_revisions_per_task = 2
 # max_replans_per_task = 1
 # max_tasks = 20
@@ -320,6 +320,15 @@ secret_strategy = "proxy"
 # The daemon's own log stream (stderr → journald under systemd).
 # log_level = "INFO"               # DEBUG | INFO | WARNING | ERROR
 # log_format = "console"           # console (key=value) | json
+# Release drift: once at start the daemon asks pypi.org for the latest
+# sbxloop and posts a notice when this host is behind (the concierge's
+# `version_status` answers on demand). false = no request leaves the host
+# for it and no advice is given — for an air-gapped or mirror-pinned host,
+# or one a deploy pipeline keeps current.
+# version_check = true
+# What the notice tells the operator to run; unset, it says the command
+# depends on how sbxloop was installed (pip, pipx, uv tool, a container…).
+# upgrade_command = "pipx upgrade sbxloop"
 # Unattended workspace posture. Point [sandbox] workspace at a dedicated clone
 # nobody edits; before each run the daemon `git fetch`es it and fast-forwards
 # to origin (never merges/rebases), and daemon runs use `clone` isolation so a

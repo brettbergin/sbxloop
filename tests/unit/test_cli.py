@@ -544,6 +544,34 @@ class TestDaemonCommand:
         assert result.exit_code == 0, result.output
         assert started == []
 
+    def test_version_check_off_reaches_the_probe(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#641: `[daemon] version_check = false` is wired into the probe the
+        concierge's `version_status` uses too, so the whole daemon makes zero
+        release lookups — not just the startup drift check; #638: the
+        operator's `upgrade_command` rides along for the advice text."""
+        from sbxloop.cli import app as app_mod
+        from sbxloop.daemon.versions import VersionProbe
+
+        built: list[VersionProbe] = []
+
+        def capture(*args: object, **kwargs: object) -> VersionProbe:
+            probe = VersionProbe(*args, **kwargs)  # type: ignore[arg-type]
+            built.append(probe)
+            return probe
+
+        monkeypatch.setattr(app_mod, "VersionProbe", capture)
+        (workdir / "sbxloop.toml").write_text(
+            '[daemon]\nversion_check = false\nupgrade_command = "pipx upgrade sbxloop"\n'
+        )
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
+        assert result.exit_code == 0, result.output
+        (probe,) = built
+        assert probe.check_pypi is False
+        assert probe.upgrade_command == "pipx upgrade sbxloop"
+
     def test_state_dir_defaults_outside_cwd_and_is_announced(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:

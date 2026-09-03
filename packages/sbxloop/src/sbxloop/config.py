@@ -1069,6 +1069,26 @@ class DaemonConfig(_ConfigModel):
     # shippers; ``console`` is key=value for humans and journalctl.
     log_level: LogLevel = "INFO"
     log_format: LogFormat = "console"
+    # The release-drift check (#641): on start (not `--once`) the daemon asks
+    # pypi.org for the latest sbxloop once, off the startup path, and posts a
+    # notice to the control channel when this host is behind; the
+    # concierge's `version_status` answers the same question on demand.
+    # False makes zero outbound HTTP from the host for it — an air-gapped
+    # host, a mirror-pinned one, or one a deploy pipeline keeps current,
+    # where the advice would contradict the pipeline. Development builds
+    # skip it regardless.
+    version_check: bool = True
+    # What the drift notice tells the operator to run — `pipx upgrade
+    # sbxloop`, `uv tool upgrade sbxloop`, a deploy script. Unset, the notice
+    # says the exact command depends on how sbxloop was installed (#638).
+    upgrade_command: str | None = None
+
+    @field_validator("upgrade_command")
+    @classmethod
+    def _upgrade_command_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("upgrade_command must not be blank; omit it instead")
+        return value.strip() if value is not None else None
 
     @field_validator("log_level", mode="before")
     @classmethod

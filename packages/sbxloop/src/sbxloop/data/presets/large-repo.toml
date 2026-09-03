@@ -1,0 +1,37 @@
+# sbxloop budget preset for a repository whose gate takes minutes.
+#
+# The defaults `sbxloop init` writes are sized for a small project whose test
+# suite finishes in seconds. Reach for this preset when one run of the gate
+# command — the test suite plus linters, what every verify pass executes —
+# takes two minutes or more: up to 20 tasks x 3 attempts x verify then
+# presses on a 2 h wall clock, and 60 tool calls is thin for orienting in a
+# multi-package tree before touching anything. (Measured gate duration is the
+# signal; repository size is only a proxy for it.)
+#
+# `sbxloop init --preset large-repo` appends these sections to a fresh
+# sbxloop.toml. On an existing file, copy the sections you want as written.
+# In pyproject.toml the loader reads only the `[tool.sbxloop]` table, so the
+# same sections must be spelled `[tool.sbxloop.budgets]` and
+# `[tool.sbxloop.limits]` there — a top-level `[budgets]` in pyproject.toml
+# is silently ignored. Nothing here changes the sandbox's CPU/memory: sbxloop
+# passes no sizing flags to `sbx create` — the microVM is whatever size sbx
+# gives every sandbox — so the [limits] section is how memory pressure is
+# made visible instead of surfacing as a confusing test failure.
+
+[budgets]
+max_revisions_per_task = 2
+max_replans_per_task = 1
+max_tasks = 20
+max_wall_clock_s = 14400.0        # 4 h: room for verify-heavy revision cycles
+per_job_timeout_s = 1800.0        # each verify command still gets the full 30 min
+max_tool_calls_per_phase = 80     # two packages + tests to read before editing
+
+[limits]
+disk_warn = 85.0
+disk_abort = 95.0
+mem_warn = 90.0
+# Off by default because a parallel test run spikes MemAvailable for a
+# heartbeat; turn it on when an in-VM OOM has been showing up as an
+# inexplicable test failure — the task then fails with "sandbox memory
+# exhausted" naming the threshold.
+mem_abort = 97.0
