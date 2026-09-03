@@ -35,73 +35,69 @@ Two distributions ship from this repo in lockstep versions:
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
   host never installs the Copilot runtime.
 
-## System map
+## The credential split, in one picture
 
-The same picture as a graph, with every box named as the code names it.
-Two things are worth reading off it before anything else: **the host holds
-no credential and every arrow into a sandbox starts on the host**, and
-**the two run sandboxes have no edge between them** — the agent box has the
-toolchains and no GitHub token, the github box has the token and no
-toolchains.
+Two credentials exist in a deployment, and **no single VM ever holds both**.
+The green plane is the agent credential and the model traffic it buys; the
+red plane is the GitHub credential and the repository traffic it buys. They
+meet nowhere except on the host, which holds the token *sources* and injects
+each one into the box that needs it — never into the other.
 
 ```mermaid
 flowchart LR
-    human["operator"]
-    gh["GitHub<br/>issues · branches · PRs · checks"]
-    modelapi["Model API<br/>Copilot, or api.anthropic.com"]
-    chat["Discord or Slack<br/>gateway / Socket Mode WebSocket<br/>(dialled outbound by the host)"]
+    operator["operator<br/>chat, or a labelled issue"]
 
-    subgraph host["Host — one sbxloop daemon process, holds no agent or GitHub credential"]
-        direction TB
-        bridge["ChatBridge — daemon/chat.py<br/>+ DiscordBridge / SlackBridge<br/>run threads, steer notes, !sbx commands"]
-        loop["DaemonLoop — daemon/loop.py<br/>discover → claim → run → settle<br/>run cap · attempt cap · circuit breaker"]
-        engine["LoopEngine + PhaseRunner — engine/<br/>DECOMPOSE → BUILD ⇄ VERIFY → PR<br/>→ REVIEW → FIX → CI → MERGE"]
-        store[("SQLite — DaemonStore / StateStore<br/>work items, runs, checkpoints, event log")]
-        wc["WorkerClient + HostToolBroker — worker/<br/>sbx cp jobs/&lt;id&gt;.json · sbx exec ·<br/>read results/&lt;id&gt;.json · answer host tools"]
-        ws[("runs/&lt;run_id&gt;/workspace<br/>host git checkout, one per repository")]
+    host["<b>Host — sbxloop daemon</b><br/>holds both token sources, injects each<br/>into one box only · harvests the agent's tree<br/>· speaks typed github.op jobs · mediates<br/>every hop, no VM can address another"]
+
+    subgraph green["Agent plane — the model runs here, and there is no GitHub token in it"]
+        conc["concierge sandbox<br/>long-lived, chat's agent"]
+        agent["run agent sandbox<br/>ephemeral · dev toolchains<br/>· builds and tests the repo"]
     end
 
-    subgraph durable["Long-lived sandboxes — outside any run's pair, never pruned"]
-        conc["sbxloop-concierge-&lt;digest&gt;<br/>daemon/agentbox.py + concierge.py<br/>agent credential · no built-in SDK tools<br/>everything it does is a host tool<br/>SDK session store kept in-VM across restarts"]
-        dgh["sbxloop-daemon-github-&lt;digest&gt;<br/>daemon/github.py<br/>GH_TOKEN · issue polling, claim, labels<br/>also serves the concierge's GitHub tools"]
+    subgraph red["GitHub plane — the token lives here, and there is no model in it"]
+        dgh["daemon github-ops sandbox<br/>long-lived, issue lifecycle"]
+        ghbox["run github-ops sandbox<br/>ephemeral · branch, PR,<br/>review, CI, merge"]
     end
 
-    subgraph pair["Ephemeral pair — Provisioner.ensure_pair, one per run, torn down at run end"]
-        agent["sbxloop-&lt;run&gt;-agent<br/>agent credential ONLY — COPILOT_GITHUB_TOKEN<br/>or ANTHROPIC_API_KEY<br/>Copilot SDK, or Claude Agent SDK + Claude Code CLI<br/>the resolved dev toolchains + the workspace clone<br/>jobs: agent.session · shell.check · shell.batch"]
-        ghbox["sbxloop-&lt;run&gt;-github<br/>GH_TOKEN ONLY — PAT or host-minted App token<br/>no toolchains, no build tools, no model<br/>jobs: github.op only, gh CLI or stdlib REST"]
-    end
+    model["Model provider<br/>Copilot / Anthropic"]
+    gh["GitHub<br/>the one configured repository"]
 
-    human -->|"labels an issue sbxloop:run"| gh
-    human <-->|"asks, steers, reads run threads"| chat
-    chat <-->|"WebSocket"| bridge
-    bridge --> loop
-    loop <--> store
-    loop -->|"one engine run per claimed item"| engine
-    engine --> wc
-    engine -.->|"clones into"| ws
-    ws -.->|"mounted"| agent
+    operator --> host
+    host ==>|"agent credential<br/>COPILOT_GITHUB_TOKEN or ANTHROPIC_API_KEY"| conc
+    host ==> agent
+    conc ==> model
+    agent ==> model
+    host ==>|"GitHub credential<br/>GH_TOKEN PAT or App installation token"| dgh
+    host ==> ghbox
+    dgh ==> gh
+    ghbox ==> gh
+    agent -.->|"a tree of changes,<br/>no credential"| host
+    conc -.->|"a request to file or label an issue"| host
+    agent x-- "no channel, no route, no forwarded token" --x ghbox
 
-    wc ==>|"agent.session turns · host tools"| conc
-    wc ==>|"github.op — poll, claim, label, close"| dgh
-    wc ==>|"agent + shell jobs"| agent
-    wc ==>|"typed github.op jobs"| ghbox
+    linkStyle 1,2,3,4 stroke:#2e9e4f,stroke-width:3px
+    linkStyle 5,6,7,8 stroke:#d64545,stroke-width:3px
+    linkStyle 9,10 stroke:#c99a00,stroke-width:2px
+    linkStyle 11 stroke:#888,stroke-width:2px
 
-    conc -.->|"file / list / comment / label an issue,<br/>relayed host-side"| wc
-    agent -->|"models + toolchain registries<br/>on the balanced allowlist"| modelapi
-    conc --> modelapi
-    dgh -->|"REST"| gh
-    ghbox -->|"branch, PR, review, CI poll, merge"| gh
-    agent x-- "no channel — host mediation invariant" --x ghbox
+    style green fill:#eef8f1,stroke:#2e9e4f,stroke-width:2px
+    style red fill:#fdefef,stroke:#d64545,stroke-width:2px
+    style host fill:#f4f4f8,stroke:#555,stroke-width:2px
 ```
 
-Where the credentials come from: each sandbox is provisioned with **its own
-token and no other**. Delivery is one of three tiers, chosen per sandbox and
-cached per sbx version — sbx's secret proxy (values never enter the VM),
-per-job **stdin → env** (`export KEY=VALUE` piped into the launch shell,
-#592), or `~/.sbxloop/env.sh` chmod 600 as the last resort. The same ladder
-applies to all four boxes above; see
-[the security primitive](#the-security-primitive-one-run--two-sandboxes) for
-which tier actually runs on current sbx.
+Read three things off it:
+
+- **The agent side can never touch the repository.** It has no GitHub token
+  and no route to one. Everything that reaches GitHub was harvested by the
+  host and re-spoken as a typed `github.op` job — a closed vocabulary, not a
+  shell.
+- **The GitHub side can never be talked into anything.** It holds the token
+  but runs no model and has no dev tools; it executes named ops and nothing
+  else.
+- **The two never meet.** Not by convention — by construction: no VM can
+  address the host or another VM, so a direct agent↔github channel does not
+  exist to be misused. That is what makes the split worth having; the
+  credential being in a different VM is not, on its own, the control.
 
 ## Design principles
 
