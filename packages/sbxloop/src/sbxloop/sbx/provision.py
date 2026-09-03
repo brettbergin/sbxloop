@@ -49,7 +49,7 @@ from functools import partial
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from sbxloop import hostgit, toolchains
+from sbxloop import backends, hostgit, toolchains
 from sbxloop.config import Config, RepoConfig
 from sbxloop.errors import ProvisionError, SbxError
 from sbxloop.events import EventBus
@@ -87,10 +87,7 @@ from sbxloop.sbx.sandbox import (
     Sandbox,
 )
 from sbxloop.sbx.secretstate import (
-    ANTHROPIC_TOKEN_ENV,
     ANTHROPIC_TOKEN_HOST,
-    COPILOT_TOKEN_ENV,
-    COPILOT_TOKEN_HOST,
     custom_rm_candidates,
     service_rm_candidates,
     set_secret_replacing,
@@ -103,8 +100,10 @@ GH_TOKEN_ENVS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 # Hosts the agent sandbox must be able to reach (doctor checks these),
 # per agent backend (#533).
-AGENT_TOKEN_HOSTS = ("api.githubcopilot.com", "api.github.com")
-CLAUDE_TOKEN_HOSTS = (ANTHROPIC_TOKEN_HOST,)
+# The hosts each agent credential path must reach, from the descriptor
+# (#617); kept under their historical names for the doctor rows.
+AGENT_TOKEN_HOSTS = backends.COPILOT.token_hosts
+CLAUDE_TOKEN_HOSTS = backends.CLAUDE.token_hosts
 
 AGENT_ALLOW_DOMAINS = (
     "api.githubcopilot.com",
@@ -421,15 +420,13 @@ class Provisioner:
     # -- tokens ------------------------------------------------------------
 
     def copilot_token(self) -> str:
-        token = self.env.get(COPILOT_TOKEN_ENV, "")
-        if not token:
-            raise ProvisionError(
-                f"{COPILOT_TOKEN_ENV} is not set on the host. Create a fine-grained PAT "
-                'with the "Copilot Requests" permission and export it.'
-            )
-        return token
+        return self._backend_token(backends.COPILOT)
 
-    # -- the agent backend's credential (#533) -----------------------------
+    # -- the agent backend's credential (#533, descriptor #617) ------------
+
+    def backend(self) -> backends.AgentBackend:
+        """The descriptor for the SDK the agent sandbox runs."""
+        return backends.backend_for(self.config)
 
     def agent_backend(self) -> str:
         """Which SDK the agent sandbox runs (``[agent] backend``)."""
@@ -437,24 +434,21 @@ class Provisioner:
 
     def agent_token_env(self) -> str:
         """The env var carrying the agent sandbox's credential."""
-        return ANTHROPIC_TOKEN_ENV if self.agent_backend() == "claude" else COPILOT_TOKEN_ENV
+        return self.backend().token_env
 
     def agent_token(self) -> str:
         """The chosen agent backend's credential, read from the host env."""
-        if self.agent_backend() != "claude":
-            return self.copilot_token()
-        token = self.env.get(ANTHROPIC_TOKEN_ENV, "")
+        return self._backend_token(self.backend())
+
+    def _backend_token(self, backend: backends.AgentBackend) -> str:
+        token = self.env.get(backend.token_env, "")
         if not token:
-            raise ProvisionError(
-                f'{ANTHROPIC_TOKEN_ENV} is not set on the host but [agent] backend = "claude". '
-                "Create an Anthropic API key and export it, or switch back to "
-                'backend = "copilot".'
-            )
+            raise ProvisionError(backend.missing_token_error)
         return token
 
     def agent_token_hosts(self) -> tuple[str, ...]:
         """Hosts the agent sandbox's credential path needs (doctor rows)."""
-        return CLAUDE_TOKEN_HOSTS if self.agent_backend() == "claude" else AGENT_TOKEN_HOSTS
+        return self.backend().token_hosts
 
     def agent_persistent_env(self) -> dict[str, str]:
         """Non-secret env the agent sandbox needs for the chosen backend.
@@ -473,9 +467,8 @@ class Provisioner:
         }
 
     def _agent_secret_spec(self) -> SecretSpec:
-        if self.agent_backend() == "claude":
-            return SecretSpec(kind="custom", host=ANTHROPIC_TOKEN_HOST, env=ANTHROPIC_TOKEN_ENV)
-        return SecretSpec(kind="custom", host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV)
+        env, host = self.backend().secret
+        return SecretSpec(kind="custom", host=host, env=env)
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to

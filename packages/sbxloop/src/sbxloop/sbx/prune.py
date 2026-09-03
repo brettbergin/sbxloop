@@ -19,13 +19,13 @@ import time
 
 from pydantic import BaseModel, ConfigDict
 
+from sbxloop.backends import BACKENDS
 from sbxloop.engine.model import TERMINAL_RUN_STATES
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, StateError
 from sbxloop.ids import is_run_id
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxInfo, SandboxRole
-from sbxloop.sbx.secretstate import COPILOT_TOKEN_ENV, COPILOT_TOKEN_HOST
 
 # A run in a terminal state has already had (or never needed) its teardown:
 # any of its sandboxes still present are leaked. The resumable terminal
@@ -207,14 +207,18 @@ def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole) -> Non
     name: replace-on-exists cannot replace, keeps the stale entry, and the
     agent sandbox ends up with the proxy sentinel instead of a usable token
     (field failure rgn9ccjam — a daemon recovery resumed a killed run and
-    the Copilot SDK got 401). Agent sandboxes carry the Copilot custom
-    secret; github sandboxes the built-in ``github`` service secret.
+    the Copilot SDK got 401). Agent sandboxes carry the configured
+    backend's custom secret — and since the backend may have changed since
+    the sandbox was provisioned, every backend's registration is tried
+    (#617); github sandboxes the built-in ``github`` service secret.
     """
-    with contextlib.suppress(SbxError):
-        if role == "agent":
-            cli.secret_rm(host=COPILOT_TOKEN_HOST, env=COPILOT_TOKEN_ENV, sandbox=name)
-        else:
+    if role != "agent":
+        with contextlib.suppress(SbxError):
             cli.secret_rm(service="github", sandbox=name)
+        return
+    for backend in BACKENDS:
+        with contextlib.suppress(SbxError):
+            cli.secret_rm(host=backend.token_host, env=backend.token_env, sandbox=name)
 
 
 def remove_run_sandbox(cli: SbxCLI, name: str, role: SandboxRole) -> None:

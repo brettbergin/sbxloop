@@ -23,6 +23,7 @@ from rich.table import Table
 from rich.tree import Tree
 
 import sbxloop
+from sbxloop.backends import backend_for
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
 from sbxloop.config import (
@@ -60,7 +61,6 @@ from sbxloop.sbx.prune import (
     remove_sandbox,
 )
 from sbxloop.sbx.secretstate import (
-    COPILOT_TOKEN_ENV,
     SANDBOX_SCOPE_PREFIX,
     assess,
     inspect_custom_secret,
@@ -567,7 +567,13 @@ def run(
             help="Make a repository created via --create-repo public.",
         ),
     ] = None,
-    model: Annotated[str | None, typer.Option("--model", help="Copilot model id.")] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Model id for the configured [agent] backend (`sbxloop list-models`).",
+        ),
+    ] = None,
     keep_sandboxes: Annotated[
         bool | None,
         typer.Option(
@@ -971,10 +977,10 @@ def sandbox_rm(
 _STATUS_STYLES = {"ok": "[green]ok[/]", "warn": "[yellow]warn[/]", "unknown": "[dim]?[/]"}
 
 
-def _secrets_context() -> tuple[Config, SbxCLI, set[str]]:
+def _secrets_context(config: Config | None = None) -> tuple[Config, SbxCLI, set[str]]:
     """Config, an sbx handle, and the live sbxloop sandbox names (for
     telling in-use registration scopes from stale ones)."""
-    config = load_config()
+    config = load_config() if config is None else config
     cli = SbxCLI(app_name=config.app_name or None)
     live = {i.name for i in cli.ls() if i.name.startswith(SANDBOX_SCOPE_PREFIX)}
     return config, cli, live
@@ -1096,7 +1102,8 @@ def secrets_rotate(
         typer.Option(
             "--prompt",
             help="Read the new token from a hidden interactive prompt instead of "
-            f"the {COPILOT_TOKEN_ENV} environment variable / ./.env.",
+            "the configured agent backend's environment variable "
+            "(COPILOT_GITHUB_TOKEN, or ANTHROPIC_API_KEY under the claude backend) / ./.env.",
         ),
     ] = False,
     verify: Annotated[
@@ -1108,26 +1115,30 @@ def secrets_rotate(
         ),
     ] = True,
 ) -> None:
-    """Rotate the Copilot token's sbx registration in one step.
+    """Rotate the agent credential's sbx registration in one step.
 
-    Replaces the existing registration (wherever its scope) with a global
-    one carrying the canonical host binding — the rm + set-custom dance
-    provisioning would otherwise perform mid-run. The token is read from
-    the environment/.env or an interactive prompt, never from argv.
+    Which credential follows `[agent] backend` (the Copilot token by
+    default, the Anthropic key under the claude backend). Replaces the
+    existing registration (wherever its scope) with a global one carrying
+    the canonical host binding — the rm + set-custom dance provisioning
+    would otherwise perform mid-run. The token is read from the
+    environment/.env or an interactive prompt, never from argv.
     """
-    if prompt:
-        token = typer.prompt(f"new {COPILOT_TOKEN_ENV}", hide_input=True)
-    else:
-        token = os.environ.get(COPILOT_TOKEN_ENV, "")
-        if not token:
-            console.print(
-                f"[bold red]{COPILOT_TOKEN_ENV} is not set.[/] Export the new token "
-                "(or put it in ./.env), or pass [cyan]--prompt[/] to type it — "
-                "it is never accepted as a command-line argument."
-            )
-            raise typer.Exit(2)
     try:
-        config, cli, live = _secrets_context()
+        config = load_config()
+        token_env = backend_for(config).token_env
+        if prompt:
+            token = typer.prompt(f"new {token_env}", hide_input=True)
+        else:
+            token = os.environ.get(token_env, "")
+            if not token:
+                console.print(
+                    f"[bold red]{token_env} is not set.[/] Export the new token "
+                    "(or put it in ./.env), or pass [cyan]--prompt[/] to type it — "
+                    "it is never accepted as a command-line argument."
+                )
+                raise typer.Exit(2)
+        config, cli, live = _secrets_context(config)
         for env, host in tracked_custom_secrets(config):
             replace_registration(cli, env=env, host=host, token=token)
             console.print(f"[green]rotated:[/] {env} registered @ {host} (global scope)")
@@ -1139,7 +1150,7 @@ def secrets_rotate(
             )
         if prompt:
             console.print(
-                f"[yellow]runs read {COPILOT_TOKEN_ENV} from the environment at "
+                f"[yellow]runs read {token_env} from the environment at "
                 "provision time[/] — update your export / ./.env with the new value too"
             )
         if config.secret_strategy == "plain-env":  # nosec B105 - strategy label
@@ -1152,7 +1163,7 @@ def secrets_rotate(
             workspace.mkdir(parents=True, exist_ok=True)
             visible = verify_secret_visibility(
                 cli,
-                env=COPILOT_TOKEN_ENV,
+                env=token_env,
                 workspace=workspace,
                 template=config.sandbox.template,
             )
@@ -2182,20 +2193,28 @@ def list_models(
     ] = False,
     timeout_s: Annotated[
         float,
-        typer.Option("--timeout", help="Seconds to wait for the Copilot runtime and API."),
+        typer.Option("--timeout", help="Seconds to wait for the backend's runtime and API."),
     ] = 60.0,
 ) -> None:
-    """List the models the GitHub Copilot SDK gives this host access to.
+    """List the models the configured [agent] backend gives this host access to.
 
-    Queries the SDK directly on the host (no sandbox) with the same auth
-    chain agent sessions use, so the ids shown here are valid values for
-    `model` in sbxloop.toml and `sbxloop run --model`.
+    Queries the backend directly on the host (no sandbox) with the same
+    credential agent sessions use — the Copilot SDK by default, the
+    Anthropic Models API under `[agent] backend = "claude"` — so the ids
+    shown here are valid values for `model` in sbxloop.toml and
+    `sbxloop run --model`.
     """
-    from sbxloop.cli.models import fetch_models, format_context, format_efforts, model_row
+    from sbxloop.cli.models import (
+        fetch_backend_rows,
+        format_context,
+        format_efforts,
+        table_columns,
+    )
 
     config = load_config()
+    backend = backend_for(config)
     try:
-        rows = [model_row(info) for info in fetch_models(timeout_s=timeout_s)]
+        rows = fetch_backend_rows(backend, timeout_s=timeout_s)
     except SbxloopError as exc:
         # escape(): the install hint (`sbxloop[copilot]`) and arbitrary SDK
         # error text must not be parsed as rich markup.
@@ -2205,27 +2224,32 @@ def list_models(
         # bare JSON on stdout, nothing else — `sbxloop list-models --json | jq`
         typer.echo(json.dumps([row.raw or {"id": row.id, "name": row.name} for row in rows]))
         return
-    table = Table(title="copilot models")
-    for column in ("model", "name", "billing", "context", "vision", "reasoning", "policy"):
+    table = Table(title=f"{backend.label} models")
+    columns = table_columns(backend)
+    for column in columns:
         table.add_column(column)
     for row in rows:
         configured = row.id == config.model
         # SDK-provided text is escaped: a model name with brackets must not
         # be parsed as rich markup.
-        table.add_row(
-            f"[bold cyan]{rich_escape(row.id)}[/] ◀" if configured else rich_escape(row.id),
-            rich_escape(row.name),
-            f"{row.multiplier:g}x" if row.multiplier is not None else "",
-            format_context(row.context_window),
-            "yes" if row.vision else "",
-            format_efforts(row),
-            row.policy_state or "",
-        )
+        cells = {
+            "model": f"[bold cyan]{rich_escape(row.id)}[/] ◀"
+            if configured
+            else rich_escape(row.id),
+            "name": rich_escape(row.name),
+            "billing": f"{row.multiplier:g}x" if row.multiplier is not None else "",
+            "context": format_context(row.context_window),
+            "vision": "yes" if row.vision else "",
+            "reasoning": format_efforts(row),
+            "policy": row.policy_state or "",
+            "created": row.created or "",
+        }
+        table.add_row(*(cells[column] for column in columns))
     console.print(table)
     if not rows:
         console.print(
-            "[yellow]the SDK returned no models[/] — the subscription may have "
-            "no model access, or model policy blocks them all"
+            f"[yellow]{backend.models_source} returned no models[/] — the subscription "
+            "may have no model access, or model policy blocks them all"
         )
     marker = (
         f"◀ = configured model ({config.model})"
@@ -2233,7 +2257,8 @@ def list_models(
         else f"configured model: {config.model}"
         + (" (the SDK picks one per session)" if config.model == "auto" else " — not in this list!")
     )
-    console.print(f"[dim]{marker}; * = default reasoning effort[/]")
+    footnote = "; * = default reasoning effort" if "reasoning" in columns else ""
+    console.print(f"[dim]{marker}{footnote}[/]")
 
 
 @app.command()

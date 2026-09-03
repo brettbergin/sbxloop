@@ -118,6 +118,12 @@ credential:
 | network    | balanced policy + copilot hosts + the `[github] api_url` hosts + plan-declared grants                                                                                   | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
 | runs       | agent SDK sessions (Copilot SDK, or the Claude Agent SDK + Claude Code CLI with the claude backend), shell checks                                                       | `github.op` jobs (gh CLI or REST)                                                                                  |
 
+What the agent credential *is* — its env var, the host sbx binds it to, the
+hosts it must reach, how doctor names it when missing, where its model ids
+are listed — lives on one descriptor per backend in `sbxloop.backends`
+(#617); provisioning, doctor, `sbxloop secrets`, `sbxloop list-models` and
+sandbox pruning read it rather than assuming Copilot.
+
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
 Field reality (sbx 0.35): that injection feeds only the interactive agent

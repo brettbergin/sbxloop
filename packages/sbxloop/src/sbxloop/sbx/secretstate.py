@@ -30,6 +30,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from sbxloop.backends import (
+    ANTHROPIC_TOKEN_ENV,
+    ANTHROPIC_TOKEN_HOST,
+    COPILOT_TOKEN_ENV,
+    COPILOT_TOKEN_HOST,
+    backend_for,
+)
 from sbxloop.config import Config
 from sbxloop.errors import SbxError, SecretStateError
 from sbxloop.log import get_logger
@@ -38,26 +45,15 @@ from sbxloop.sbx.models import SandboxSpec
 
 log = get_logger(__name__)
 
-COPILOT_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"  # nosec B105 - env var name, not a secret
-
-# The PAT is exchanged for a Copilot API token at api.github.com; the
-# exchanged token lives in SDK process memory, so the copilot API hosts only
-# need network allows - never an env rewrite. One env var also cannot be
-# registered twice: sbx keys custom secrets by env name, so binding the same
-# env to two hosts fails with "already exists".
-#
-# Deliberately NOT derived from `[github] api_url` (#623): Copilot is a
-# github.com service even for Enterprise Server customers (licensed and
-# served through GitHub Connect), so the credential it exchanges is a
-# github.com credential whichever host the repository lives on.
-# FIELD-UNVERIFIED on GHES — recorded as the known unknown it is.
-COPILOT_TOKEN_HOST = "api.github.com"  # nosec B105 - hostname, not a secret
-
-# The claude agent backend's credential (#533): an Anthropic API key, sent
-# directly to the API host by the Claude Code CLI the Claude Agent SDK
-# spawns.
-ANTHROPIC_TOKEN_ENV = "ANTHROPIC_API_KEY"  # nosec B105 - env var name, not a secret
-ANTHROPIC_TOKEN_HOST = "api.anthropic.com"  # nosec B105 - hostname, not a secret
+# The agent credentials' env names and binding hosts live on the backend
+# descriptor (#617); re-exported here because this is where every
+# secret-handling module has always imported them from.
+__all__ = [
+    "ANTHROPIC_TOKEN_ENV",
+    "ANTHROPIC_TOKEN_HOST",
+    "COPILOT_TOKEN_ENV",
+    "COPILOT_TOKEN_HOST",
+]
 
 # Every sbxloop sandbox (and therefore every sandbox-scoped registration
 # sbxloop creates) is named with this prefix.
@@ -80,12 +76,13 @@ RmCandidates = Callable[[str], list[Callable[[], bool]]]
 def tracked_custom_secrets(config: Config) -> list[tuple[str, str]]:
     """The (env, canonical host) custom secrets provisioning registers.
 
-    Today that is exactly the Copilot token; config declares no additional
-    custom secrets (the github sandbox uses sbx's built-in ``github``
-    service secret, which is never managed here).
+    Exactly the configured agent backend's credential (#617): the Copilot
+    token by default, the Anthropic key under ``[agent] backend =
+    "claude"``. Config declares no additional custom secrets (the github
+    sandbox uses sbx's built-in ``github`` service secret, which is never
+    managed here).
     """
-    del config
-    return [(COPILOT_TOKEN_ENV, COPILOT_TOKEN_HOST)]
+    return [backend_for(config).secret]
 
 
 def parsed_scope(stderr: str) -> str | None:
