@@ -258,6 +258,28 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **The toolchain series a run provisions comes from the workspace** (#627).
+  Every Python project got Python 3.13 and every Node project Node 24,
+  whatever they declared; a `requires-python = ">=3.11,<3.12"` project's
+  own `uv sync` then refused the interpreter it was handed. `Toolchain`
+  entries with a series now read the declaration — Python from
+  `.python-version` then `[project] requires-python` (PEP 440, via
+  `packaging`, a new runtime dependency), Node from `.nvmrc` /
+  `.node-version` (a major, a full version or an `lts/<codename>` alias)
+  then `engines.node` (node-semver ranges) — and provision the default
+  series when it satisfies the declaration, else the highest series this
+  host can install that does (Python 3.8–3.14; Node 18, 20, 22, 24, each a
+  pinned, checksum-verified tarball), else the default with a
+  `toolchains.version_unsatisfiable` warning. Each choice is a
+  `sandbox.toolchain` run event carrying the series, its source (the file
+  read, or `default`) and the constraint, so a probe failure reads against
+  the interpreter the project asked for. `[sandbox] languages` still
+  decides *which* toolchains; the workspace decides the series either way.
+  A prebaked template is topped up to the declared series rather than
+  trusted at the default. An undeclared project provisions exactly what it
+  did before. Go needs none of this: `go.mod`'s `toolchain` directive
+  already makes `go` fetch what the module declares.
+
 - **The config-override lint reads TypeScript and Ruby projects** (#628).
   `verifylint.CONFIG_SCOPED_TOOLS` entries now say how their tool treats
   an explicit path: the Python entries keep their include-set rule (a path

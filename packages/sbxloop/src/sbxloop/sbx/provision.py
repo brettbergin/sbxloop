@@ -588,6 +588,19 @@ class Provisioner:
             source=languages.source,
             signals={k: list(v) for k, v in languages.signals.items()},
         )
+        # The series each versioned toolchain provisions at and why (#627):
+        # a declaration the workspace made, or the registry default. The
+        # constraint rides along so an unsatisfiable one is on the record
+        # next to the default it fell back to.
+        for name, version in languages.versions.items():
+            self.bus.emit(
+                "sandbox.toolchain",
+                run_id,
+                toolchain=name,
+                series=version.series,
+                source=version.source,
+                constraint=version.constraint,
+            )
         return self._provision_pair(run_id, workspace, repo, languages=languages)
 
     def _run_repo(self, repo: str | None) -> str | None:

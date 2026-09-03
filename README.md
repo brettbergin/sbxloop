@@ -1201,23 +1201,37 @@ The run log records the answer and its provenance as a `sandbox.languages`
 event (`source` is `config`, `detected`, or `default`, and `signals` names the
 manifests that matched), so "why did this run install Go?" has an answer.
 
+**Which series** a toolchain provisions is read from the workspace too. Python
+honours `.python-version` (an exact pin) and then `[project] requires-python`
+in `pyproject.toml` (a PEP 440 specifier); Node honours `.nvmrc` /
+`.node-version` (a major, a full version, or an `lts/<codename>` alias) and
+then `engines.node` in `package.json` (a node-semver range). The rule is the
+same for both: the default series when it satisfies the declaration, else the
+highest series this host can install that does, else the default with a
+`toolchains.version_unsatisfiable` warning. Every choice is a
+`sandbox.toolchain` event naming the `series`, its `source` (the file read,
+or `default`) and the `constraint` it was read from — so a probe failure is
+read against the interpreter the project asked for. Go needs none of this:
+its own `toolchain` directive in `go.mod` makes `go` fetch what the module
+declares.
+
 ```toml
 [sandbox]
 languages = ["python"]   # optional; unset = detect from the workspace
 ```
 
-| Value        | Also accepts               | Detected from                                                                                      | Installs                                                         |
-| ------------ | -------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `python`     | `py`, `python3`            | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile`, `uv.lock`, `poetry.lock` | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 (pinned) |
-| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `CMakeLists.txt`, `meson.build`, `configure.ac`                                                    | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)    |
-| `ruby`       | `rb`                       | `Gemfile`, `Rakefile`, `*.gemspec`                                                                 | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)      |
-| `java`       | `jdk`, `jvm`               | `pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`                                           | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                |
-| `php`        | —                          | `composer.json`                                                                                    | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)       |
-| `javascript` | `js`, `node`, `nodejs`     | `package.json`                                                                                     | Node LTS + npm/npx (pinned tarball from `nodejs.org`)            |
-| `typescript` | `ts`                       | `tsconfig.json`                                                                                    | `tsc` from npm, on top of `javascript`                           |
-| `go`         | `golang`                   | `go.mod`                                                                                           | Go toolchain (pinned tarball from `go.dev`)                      |
-| `rust`       | `rs`, `cargo`              | `Cargo.toml`                                                                                       | cargo, rustc, rustfmt, clippy (pinned rustup)                    |
-| `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`       |
+| Value        | Also accepts               | Detected from                                                                                      | Installs                                                                                     |
+| ------------ | -------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `python`     | `py`, `python3`            | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile`, `uv.lock`, `poetry.lock` | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 by default (3.8–3.14 by declaration) |
+| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `CMakeLists.txt`, `meson.build`, `configure.ac`                                                    | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)                                |
+| `ruby`       | `rb`                       | `Gemfile`, `Rakefile`, `*.gemspec`                                                                 | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)                                  |
+| `java`       | `jdk`, `jvm`               | `pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`                                           | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                                            |
+| `php`        | —                          | `composer.json`                                                                                    | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)                                   |
+| `javascript` | `js`, `node`, `nodejs`     | `package.json`                                                                                     | Node 24 + npm/npx by default (18/20/22 by declaration; pinned tarballs from `nodejs.org`)    |
+| `typescript` | `ts`                       | `tsconfig.json`                                                                                    | `tsc` from npm, on top of `javascript`                                                       |
+| `go`         | `golang`                   | `go.mod`                                                                                           | Go toolchain (pinned tarball from `go.dev`)                                                  |
+| `rust`       | `rs`, `cargo`              | `Cargo.toml`                                                                                       | cargo, rustc, rustfmt, clippy (pinned rustup)                                                |
+| `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`                                   |
 
 Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
 

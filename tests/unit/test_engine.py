@@ -24,7 +24,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from sbxloop import hostgit
+from sbxloop import hostgit, toolchains
 from sbxloop.config import Config
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import (
@@ -1242,6 +1242,54 @@ class TestLanguageResolution:
         assert events[0].data["source"] == "default"
         assert tuple(captured["install"]["languages"]) == ("python",)
 
+    def test_bare_workspace_provisions_the_default_series(self, harness: Harness) -> None:
+        # #627: no declaration → exactly what was provisioned before, and
+        # the run says so.
+        _result, captured = self._run_capturing(harness)
+        events = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_TOOLCHAIN]
+        assert [e.data for e in events] == [
+            {
+                "toolchain": "python",
+                "series": toolchains.PYTHON_SERIES,
+                "source": "default",
+                "constraint": None,
+            }
+        ]
+        versions = captured["install"]["versions"]
+        assert versions["python"] == toolchains.ToolchainVersion(
+            toolchains.PYTHON_SERIES, "default"
+        )
+
+    def test_requires_python_selects_the_series_the_install_provisions(
+        self, harness: Harness
+    ) -> None:
+        from tests.unit.test_hostgit import git, make_repo
+
+        source = make_repo(harness.tmp_path)
+        (source / "pyproject.toml").write_text(
+            '[project]\nname = "x"\nrequires-python = ">=3.11,<3.12"\n'
+        )
+        git("add", "pyproject.toml", cwd=source)
+        git("commit", "-m", "py", cwd=source)
+        _result, captured = self._run_capturing(harness, sandbox={"workspace": str(source)})
+
+        events = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_TOOLCHAIN]
+        assert [e.data for e in events] == [
+            {
+                "toolchain": "python",
+                "series": "3.11",
+                "source": "pyproject.toml",
+                "constraint": ">=3.11,<3.12",
+            }
+        ]
+        # the declared series reached the install, whose toolchain entry
+        # now probes and provisions 3.11 rather than the registry default
+        versions = captured["install"]["versions"]
+        assert versions["python"].series == "3.11"
+        python = toolchains.resolve(["python"], versions)[0]
+        assert "python3.11 --version" in python.probe
+        assert "uv python install 3.11" in (python.install_script or "")
+
 
 class TestPrebakedTemplate:
     """[sandbox].template + a baked template: install verifies and skips the
@@ -1274,7 +1322,6 @@ class TestPrebakedTemplate:
         """The prebaked path probes the run's toolchains in one batched
         `sh -c` (#615); unscripted it runs on the host. The sandbox name is
         not known before the run, so answer at the client instead."""
-        from sbxloop import toolchains
         from sbxloop.worker.client import WorkerClient
 
         def answer(self: WorkerClient, selected: Any) -> list[toolchains.Toolchain]:

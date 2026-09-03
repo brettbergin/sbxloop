@@ -41,10 +41,19 @@ failing the run.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+import json
+import re
+import tomllib
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, NamedTuple
+
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import Version
+
+from sbxloop.log import get_logger
 
 __all__ = [
     "BASELINE_TOOLS",
@@ -53,13 +62,33 @@ __all__ = [
     "TOOLCHAINS",
     "LanguageResolution",
     "Toolchain",
+    "ToolchainVersion",
     "detect_languages",
     "install_domains",
     "normalize_language",
     "resolve",
     "resolve_languages",
     "supported_languages",
+    "toolchain_versions",
 ]
+
+log = get_logger(__name__)
+
+
+class ToolchainVersion(NamedTuple):
+    """The version series one run provisions for a toolchain, and why.
+
+    ``source`` is ``"default"`` or the workspace file the declaration was
+    read from (``pyproject.toml``, ``.python-version``, ``.nvmrc``,
+    ``package.json``); ``constraint`` is the declaration as written. Both
+    survive when the declaration could not be honoured — ``source`` is then
+    ``"default"`` with ``constraint`` still set — so the ``sandbox.toolchain``
+    event says what was asked for as well as what was installed (#627).
+    """
+
+    series: str
+    source: str
+    constraint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +122,35 @@ class Toolchain:
     # Workspace files that identify a project of this language. A plain
     # name matches exactly; a ``*.ext`` pattern matches by suffix.
     manifests: tuple[str, ...] = ()
+    # The version series this entry installs and its probe requires; None
+    # for an entry with no version of its own (apt-only, or one that
+    # self-serves like Go — see the GOTOOLCHAIN note). A project may
+    # declare another (#627): ``declared_series`` reads the workspace's own
+    # pin and ``rebuild`` produces the entry for it, so ``version_from`` /
+    # ``for_version`` are the whole per-project story.
+    series: str | None = None
+    declared_series: Callable[[Path], ToolchainVersion | None] | None = field(
+        default=None, compare=False, repr=False
+    )
+    rebuild: Callable[[str], Toolchain] | None = field(default=None, compare=False, repr=False)
+
+    def version_from(self, workspace: Path | None) -> ToolchainVersion | None:
+        """The series to provision for ``workspace``: its own declaration
+        when it has one the entry can honour, else the default. None for
+        an entry that has no version of its own."""
+        if self.series is None:
+            return None
+        if workspace is not None and self.declared_series is not None:
+            declared = self.declared_series(workspace)
+            if declared is not None:
+                return declared
+        return ToolchainVersion(self.series, "default")
+
+    def for_version(self, series: str) -> Toolchain:
+        """This entry rebuilt for ``series`` (itself when that is its own)."""
+        if series == self.series or self.rebuild is None:
+            return self
+        return self.rebuild(series)
 
 
 def _arch_dispatch(cases: dict[str, tuple[str, str]]) -> str:
@@ -132,10 +190,15 @@ def _arch_dispatch(cases: dict[str, tuple[str, str]]) -> str:
 # reaches one vendor's hosts rather than needing a second in the baseline.
 UV_VERSION = "0.12.5"
 PYTHON_SERIES = "3.13"
+# The series uv can install as managed interpreters, newest first — what a
+# project's `requires-python` is matched against (#627). The default stays
+# 3.13 whenever it satisfies the declaration, so a project that is happy
+# with 3.13 is provisioned exactly like an undeclared one; only a
+# declaration 3.13 fails moves the pick, to the highest series that passes.
+PYTHON_SERIES_CANDIDATES = ("3.14", "3.13", "3.12", "3.11", "3.10", "3.9", "3.8")
 # The canonical python-build-standalone release prefix, given to uv as its
 # install mirror so the download stays on GitHub hosts (see above).
 UV_PYTHON_INSTALL_MIRROR = "https://github.com/astral-sh/python-build-standalone/releases/download"
-_PYTHON_SERIES_PATTERN = PYTHON_SERIES.replace(".", "\\.")
 _UV_TARBALL = "/tmp/uv.tar.gz"  # nosec B108 - path inside the sandbox VM, not host tmp
 _UV_DIGESTS = {
     "amd64": (
@@ -147,54 +210,137 @@ _UV_DIGESTS = {
         "9bf43b4d1a07665bf64d4c4e710930b382321a785e0eb10aac07f46471f86a31",
     ),
 }
+_PYTHON_VERSION_FILE = re.compile(r"^(?:cpython[@-])?(\d+\.\d+)")
 
-PYTHON = Toolchain(
-    name="python",
-    wanted=f"python3, pip, venv, uv, python{PYTHON_SERIES}",
-    # The historical ensurepip probe stays: templates ship a system python3
-    # but Debian/Ubuntu split ensurepip into python3-venv, and it is exactly
-    # that split that made the agent's `python3 -m venv` die with
-    # "ensurepip is not available" on every revision (field failure, 0.4.0).
-    # Added to it: uv on PATH and the pinned series answering to its
-    # versioned name — like Node and Go, checking the version rather than
-    # mere presence, so a template with an older python3.x cannot satisfy
-    # the probe and leave the agent with the interpreter #250 says fails.
-    probe=(
-        "python3 -c 'import ensurepip, pip' && command -v uv >/dev/null "
-        f"&& python{PYTHON_SERIES} --version 2>/dev/null "
-        f'| grep -q "^Python {_PYTHON_SERIES_PATTERN}\\."'
-    ),
-    apt_packages=("python3-venv", "python3-pip", "curl", "ca-certificates"),
-    # uv and uvx go straight into /usr/local/bin (no profile edits to
-    # source). The managed interpreter lives under the agent's home so
-    # `uv run`/`uv sync` find it without sudo; its versioned name is linked
-    # onto PATH so `python3.13 -m venv` and the probe work without uv. The
-    # system `python3` is deliberately left alone — the worker runs on it.
-    install_script=(
-        "set -e; " + _arch_dispatch(_UV_DIGESTS) + "; "
-        f'curl -fsSL -o {_UV_TARBALL} "https://github.com/astral-sh/uv/releases/download'
-        f'/{UV_VERSION}/uv-$arch.tar.gz"; '
-        f"printf '%s  {_UV_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
-        f"sudo -n tar -xzf {_UV_TARBALL} -C /usr/local/bin --strip-components=1 "
-        '"uv-$arch/uv" "uv-$arch/uvx"; '
-        f"rm -f {_UV_TARBALL}; "
-        f'UV_PYTHON_INSTALL_MIRROR="{UV_PYTHON_INSTALL_MIRROR}" uv python install {PYTHON_SERIES}; '
-        f'sudo -n ln -sf "$(uv python find {PYTHON_SERIES})" /usr/local/bin/python{PYTHON_SERIES}'
-    ),
-    # The uv tarball and uv's managed interpreter are both GitHub release
-    # assets; github.com answers with a redirect to release-assets.
-    install_domains=("github.com", "release-assets.githubusercontent.com"),
-    manifests=(
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "requirements.txt",
-        "Pipfile",
-        "uv.lock",
-        "poetry.lock",
-    ),
-    aliases=("py", "python3"),
-)
+
+def _series_satisfying(
+    constraint: str,
+    satisfies: Callable[[str], bool],
+    default: str,
+    candidates: Sequence[str],
+    source: str,
+) -> ToolchainVersion:
+    """The default series when ``satisfies`` accepts it, else the highest
+    candidate it accepts; the default, named as unhonoured, when none is."""
+    if satisfies(default):
+        return ToolchainVersion(default, source, constraint)
+    for series in candidates:
+        if satisfies(series):
+            return ToolchainVersion(series, source, constraint)
+    log.warning(
+        "toolchains.version_unsatisfiable",
+        source=source,
+        constraint=constraint,
+        candidates=list(candidates),
+        hint=f"no series this host can install satisfies the declaration; "
+        f"provisioning the default {default}",
+    )
+    return ToolchainVersion(default, "default", constraint)
+
+
+def _python_series_from(workspace: Path) -> ToolchainVersion | None:
+    """The Python series the workspace pins: ``.python-version`` first (an
+    exact pin uv itself honours ahead of the range), then ``[project]
+    requires-python``. A series is taken to satisfy a range when any of its
+    releases could — the range is checked at ``X.Y.0`` and ``X.Y.99``, so
+    ``>=3.11.4`` still selects 3.11, whose latest patch uv installs."""
+    pin = workspace / ".python-version"
+    try:
+        first = pin.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    except (OSError, IndexError):
+        first = ""
+    if first:
+        match = _PYTHON_VERSION_FILE.match(first)
+        if match is not None:
+            series = match.group(1)
+            return _series_satisfying(
+                first, lambda s: s == series, PYTHON_SERIES, PYTHON_SERIES_CANDIDATES, pin.name
+            )
+    try:
+        data = tomllib.loads((workspace / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    project = data.get("project")
+    constraint = project.get("requires-python") if isinstance(project, dict) else None
+    if not isinstance(constraint, str) or not constraint.strip():
+        return None
+    try:
+        spec = SpecifierSet(constraint)
+    except InvalidSpecifier:
+        log.warning(
+            "toolchains.version_unreadable",
+            source="pyproject.toml",
+            constraint=constraint,
+            hint=f"requires-python is not a PEP 440 specifier; provisioning {PYTHON_SERIES}",
+        )
+        return None
+
+    def satisfies(series: str) -> bool:
+        return any(spec.contains(Version(f"{series}.{patch}")) for patch in ("0", "99"))
+
+    return _series_satisfying(
+        constraint.strip(), satisfies, PYTHON_SERIES, PYTHON_SERIES_CANDIDATES, "pyproject.toml"
+    )
+
+
+def _python_toolchain(series: str) -> Toolchain:
+    pattern = series.replace(".", "\\.")
+    return Toolchain(
+        name="python",
+        wanted=f"python3, pip, venv, uv, python{series}",
+        # The historical ensurepip probe stays: templates ship a system
+        # python3 but Debian/Ubuntu split ensurepip into python3-venv, and
+        # it is exactly that split that made the agent's `python3 -m venv`
+        # die with "ensurepip is not available" on every revision (field
+        # failure, 0.4.0). Added to it: uv on PATH and the pinned series
+        # answering to its versioned name — like Node and Go, checking the
+        # version rather than mere presence, so a template with an older
+        # python3.x cannot satisfy the probe and leave the agent with the
+        # interpreter #250 says fails.
+        probe=(
+            "python3 -c 'import ensurepip, pip' && command -v uv >/dev/null "
+            f"&& python{series} --version 2>/dev/null "
+            f'| grep -q "^Python {pattern}\\."'
+        ),
+        apt_packages=("python3-venv", "python3-pip", "curl", "ca-certificates"),
+        # uv and uvx go straight into /usr/local/bin (no profile edits to
+        # source). The managed interpreter lives under the agent's home so
+        # `uv run`/`uv sync` find it without sudo; its versioned name is
+        # linked onto PATH so `python3.13 -m venv` and the probe work
+        # without uv. The system `python3` is deliberately left alone — the
+        # worker runs on it.
+        install_script=(
+            "set -e; " + _arch_dispatch(_UV_DIGESTS) + "; "
+            f'curl -fsSL -o {_UV_TARBALL} "https://github.com/astral-sh/uv/releases/download'
+            f'/{UV_VERSION}/uv-$arch.tar.gz"; '
+            f"printf '%s  {_UV_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+            f"sudo -n tar -xzf {_UV_TARBALL} -C /usr/local/bin --strip-components=1 "
+            '"uv-$arch/uv" "uv-$arch/uvx"; '
+            f"rm -f {_UV_TARBALL}; "
+            f'UV_PYTHON_INSTALL_MIRROR="{UV_PYTHON_INSTALL_MIRROR}" uv python install {series}; '
+            f'sudo -n ln -sf "$(uv python find {series})" /usr/local/bin/python{series}'
+        ),
+        # The uv tarball and uv's managed interpreter are both GitHub
+        # release assets; github.com answers with a redirect to
+        # release-assets.
+        install_domains=("github.com", "release-assets.githubusercontent.com"),
+        manifests=(
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+            "Pipfile",
+            "uv.lock",
+            "poetry.lock",
+        ),
+        aliases=("py", "python3"),
+        series=series,
+        declared_series=_python_series_from,
+        rebuild=_python_toolchain,
+    )
+
+
+PYTHON = _python_toolchain(PYTHON_SERIES)
 
 
 CPP = Toolchain(
@@ -355,36 +501,218 @@ _NODE_DIGESTS = {
     "amd64": ("x64", "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"),
     "arm64": ("arm64", "58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6"),
 }
-
-NODE = Toolchain(
-    name="javascript",
-    wanted=f"node {NODE_MAJOR}.x, npm, npx",
-    # Check the pinned major, not merely that node exists: a template
-    # carrying an older Node would otherwise satisfy the probe and leave
-    # the agent with the very version #147 says breaks modern `engines`.
-    probe=(
-        "command -v npm >/dev/null && command -v npx >/dev/null "
-        f'&& node -v 2>/dev/null | grep -q "^v{NODE_MAJOR}\\."'
+# One pinned release per LTS line a project may ask for through `.nvmrc`,
+# `.node-version` or `engines.node` (#627), newest first; the default major
+# is the head. Digests are upstream's SHASUMS256.txt entries, like the
+# default's. A major outside this table cannot be honoured — the default is
+# provisioned and the `sandbox.toolchain` event names the declaration.
+NODE_RELEASES: dict[str, tuple[str, dict[str, tuple[str, str]]]] = {
+    NODE_MAJOR: (NODE_VERSION, _NODE_DIGESTS),
+    "22": (
+        "22.23.2",
+        {
+            "amd64": ("x64", "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307"),
+            "arm64": ("arm64", "fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8"),
+        },
     ),
-    apt_packages=("curl", "ca-certificates", "xz-utils"),
-    # Extracted into /usr/local with the leading directory stripped, which
-    # also makes /usr/local npm's global prefix — so a later `npm i -g` (the
-    # TypeScript entry, or the agent itself) lands on PATH without further
-    # wiring. The three top-level doc files the tarball carries are removed
-    # rather than left loose in /usr/local.
-    install_script=(
-        "set -e; " + _arch_dispatch(_NODE_DIGESTS) + "; "
-        f'curl -fsSL -o {_NODE_TARBALL} "https://nodejs.org/dist/v{NODE_VERSION}'
-        f'/node-v{NODE_VERSION}-linux-$arch.tar.xz"; '
-        f"printf '%s  {_NODE_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
-        f"sudo -n tar -xJf {_NODE_TARBALL} -C /usr/local --strip-components=1; "
-        "sudo -n rm -f /usr/local/CHANGELOG.md /usr/local/LICENSE /usr/local/README.md; "
-        f"rm -f {_NODE_TARBALL}"
+    "20": (
+        "20.20.2",
+        {
+            "amd64": ("x64", "df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d"),
+            "arm64": ("arm64", "73093db209e4e9e09dd7d15a47aeaab1b74833830df03efa5f942a1122c5fa71"),
+        },
     ),
-    install_domains=("nodejs.org",),
-    manifests=("package.json",),
-    aliases=("js", "node", "nodejs", "javascript-node"),
+    "18": (
+        "18.20.8",
+        {
+            "amd64": ("x64", "5467ee62d6af1411d46b6a10e3fb5cacc92734dbcef465fea14e7b90993001c9"),
+            "arm64": ("arm64", "224e569dbe7b0ea4628ce383d9d482494b57ee040566583f1c54072c86d1116b"),
+        },
+    ),
+}
+NODE_MAJOR_CANDIDATES = tuple(NODE_RELEASES)
+# nvm's `lts/<codename>` spellings for the lines above.
+_NODE_LTS_CODENAMES = {"hydrogen": "18", "iron": "20", "jod": "22", "krypton": "24"}
+_SEMVER_PART = re.compile(
+    r"^v?(\d+|x|X|\*)(?:\.(\d+|x|X|\*))?(?:\.(\d+|x|X|\*))?(?:[-+][0-9A-Za-z.-]*)?$"
 )
+_SEMVER_OP = re.compile(r"^(>=|<=|>|<|=|\^|~)?\s*(.*)$")
+
+
+def _semver_triple(text: str) -> tuple[list[int], int] | None:
+    """``(parts, given)``: the numeric parts of a semver-ish version with
+    wildcards cut off, and how many were given; None when unparseable."""
+    match = _SEMVER_PART.match(text)
+    if match is None:
+        return None
+    parts: list[int] = []
+    for group in match.groups():
+        if group is None or not group.isdigit():
+            break
+        parts.append(int(group))
+    return parts, len(parts)
+
+
+_SEMVER_ZERO = (0, 0, 0)
+
+
+def _semver_bounds(comparator: str) -> tuple[tuple[int, ...], tuple[int, ...] | None] | None:
+    """A node-semver comparator as ``(lower inclusive, upper exclusive)``,
+    upper None = unbounded; None when the comparator cannot be read."""
+    match = _SEMVER_OP.match(comparator.strip())
+    if match is None:
+        return None
+    op, rest = match.group(1) or "", match.group(2).strip()
+    parsed = _semver_triple(rest)
+    if parsed is None:
+        return None
+    parts, given = parsed
+    if given == 0:  # `*`, `x`, empty: anything
+        return _SEMVER_ZERO, None
+    pad = [0] * (3 - given)
+    full = (*parts, *pad)
+    # The release after the last given part: `1.2.3` → 1.2.4, `1.2` →
+    # 1.3.0, `1` → 2.0.0 — what a partial version means as an upper bound.
+    after = (*parts[:-1], parts[-1] + 1, *pad)
+    if op in ("", "="):
+        return full, after
+    if op == ">=":
+        return full, None
+    if op == ">":
+        return after, None
+    if op == "<":
+        return _SEMVER_ZERO, full
+    if op == "<=":
+        return _SEMVER_ZERO, after
+    if op == "^":
+        if parts[0]:
+            return full, (parts[0] + 1, 0, 0)
+        return full, (0, (parts[1] if given > 1 else 0) + 1, 0)
+    # `~`: patch-level changes when a minor is given, else minor-level.
+    return full, (parts[0], parts[1] + 1, 0) if given > 1 else (parts[0] + 1, 0, 0)
+
+
+def _semver_range_admits(range_text: str, major: str) -> bool | None:
+    """Whether some release of ``major`` can satisfy a node-semver range.
+
+    Enough of node-semver for `engines.node` in the wild: ``||``
+    alternatives, space-joined comparators, ``^``/``~``, ``x`` wildcards
+    and hyphen ranges. Each alternative intersects to one interval; the
+    major is admitted when that interval meets ``[M.0.0, M+1.0.0)``. None
+    when no alternative can be read.
+    """
+    span = ((int(major), 0, 0), (int(major) + 1, 0, 0))
+    readable = False
+    for alternative in range_text.split("||"):
+        text = alternative.strip()
+        if " - " in text:
+            low, high = text.split(" - ", 1)
+            text = f">={low.strip()} <={high.strip()}"
+        bounds = [_semver_bounds(c) for c in text.split() or ["*"]]
+        if any(b is None for b in bounds):
+            continue
+        readable = True
+        lower = max(b[0] for b in bounds if b is not None)
+        uppers = [b[1] for b in bounds if b is not None and b[1] is not None]
+        upper = min(uppers) if uppers else None
+        if lower < span[1] and (upper is None or (upper > span[0] and lower < upper)):
+            return True
+    return False if readable else None
+
+
+def _node_major_from(workspace: Path) -> ToolchainVersion | None:
+    """The Node major the workspace pins: ``.nvmrc`` / ``.node-version``
+    first (an exact pin), then ``package.json`` ``engines.node``."""
+    for name in (".nvmrc", ".node-version"):
+        try:
+            first = (workspace / name).read_text(encoding="utf-8").strip().splitlines()[0]
+        except (OSError, IndexError):
+            continue
+        first = first.strip()
+        if not first:
+            continue
+        lowered = first.lower()
+        major: str | None
+        if lowered in ("node", "stable", "lts/*", "lts"):
+            return ToolchainVersion(NODE_MAJOR, name, first)
+        if lowered.startswith("lts/"):
+            major = _NODE_LTS_CODENAMES.get(lowered[4:])
+        else:
+            parsed = _semver_triple(lowered)
+            major = str(parsed[0][0]) if parsed is not None and parsed[1] else None
+        if major is None:
+            log.warning(
+                "toolchains.version_unreadable",
+                source=name,
+                constraint=first,
+                hint=f"not a Node version this host recognises; provisioning {NODE_MAJOR}",
+            )
+            return None
+        return _series_satisfying(first, major.__eq__, NODE_MAJOR, NODE_MAJOR_CANDIDATES, name)
+    try:
+        data = json.loads((workspace / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    engines = data.get("engines") if isinstance(data, dict) else None
+    constraint = engines.get("node") if isinstance(engines, dict) else None
+    if not isinstance(constraint, str) or not constraint.strip():
+        return None
+    verdicts = {major: _semver_range_admits(constraint, major) for major in NODE_MAJOR_CANDIDATES}
+    if all(v is None for v in verdicts.values()):
+        log.warning(
+            "toolchains.version_unreadable",
+            source="package.json",
+            constraint=constraint,
+            hint=f"engines.node is not a semver range this host reads; provisioning {NODE_MAJOR}",
+        )
+        return None
+    return _series_satisfying(
+        constraint.strip(),
+        lambda m: bool(verdicts.get(m)),
+        NODE_MAJOR,
+        NODE_MAJOR_CANDIDATES,
+        "package.json",
+    )
+
+
+def _node_toolchain(major: str) -> Toolchain:
+    version, digests = NODE_RELEASES[major]
+    return Toolchain(
+        name="javascript",
+        wanted=f"node {major}.x, npm, npx",
+        # Check the pinned major, not merely that node exists: a template
+        # carrying an older Node would otherwise satisfy the probe and
+        # leave the agent with the very version #147 says breaks modern
+        # `engines`.
+        probe=(
+            "command -v npm >/dev/null && command -v npx >/dev/null "
+            f'&& node -v 2>/dev/null | grep -q "^v{major}\\."'
+        ),
+        apt_packages=("curl", "ca-certificates", "xz-utils"),
+        # Extracted into /usr/local with the leading directory stripped,
+        # which also makes /usr/local npm's global prefix — so a later
+        # `npm i -g` (the TypeScript entry, or the agent itself) lands on
+        # PATH without further wiring. The three top-level doc files the
+        # tarball carries are removed rather than left loose in /usr/local.
+        install_script=(
+            "set -e; " + _arch_dispatch(digests) + "; "
+            f'curl -fsSL -o {_NODE_TARBALL} "https://nodejs.org/dist/v{version}'
+            f'/node-v{version}-linux-$arch.tar.xz"; '
+            f"printf '%s  {_NODE_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+            f"sudo -n tar -xJf {_NODE_TARBALL} -C /usr/local --strip-components=1; "
+            "sudo -n rm -f /usr/local/CHANGELOG.md /usr/local/LICENSE /usr/local/README.md; "
+            f"rm -f {_NODE_TARBALL}"
+        ),
+        install_domains=("nodejs.org",),
+        manifests=("package.json",),
+        aliases=("js", "node", "nodejs", "javascript-node"),
+        series=major,
+        declared_series=_node_major_from,
+        rebuild=_node_toolchain,
+    )
+
+
+NODE = _node_toolchain(NODE_MAJOR)
 
 
 # There is no meaningful distro package for the TypeScript compiler — it is
@@ -660,12 +988,16 @@ def normalize_language(name: str) -> str | None:
     return None if toolchain is None else toolchain.name
 
 
-def resolve(names: Sequence[str]) -> tuple[Toolchain, ...]:
+def resolve(
+    names: Sequence[str], versions: Mapping[str, ToolchainVersion] | None = None
+) -> tuple[Toolchain, ...]:
     """Map selected language names onto toolchains, deduped, registry order.
 
     Unknown names are dropped rather than raised on: config validation is
     where a typo gets rejected with a helpful message, and the ensure must
-    never be the thing that fails a run.
+    never be the thing that fails a run. ``versions`` — a run's per-project
+    series (:attr:`LanguageResolution.versions`) — rebuilds the entries it
+    names for that series; without it every entry is its default.
     """
     wanted: set[str] = set()
     pending = [normalize_language(name) for name in names]
@@ -675,7 +1007,12 @@ def resolve(names: Sequence[str]) -> tuple[Toolchain, ...]:
             continue
         wanted.add(key)
         pending.extend(_BY_KEY[key].requires)
-    return tuple(toolchain for toolchain in TOOLCHAINS if toolchain.name in wanted)
+    selected = (toolchain for toolchain in TOOLCHAINS if toolchain.name in wanted)
+    if not versions:
+        return tuple(selected)
+    return tuple(
+        tc.for_version(versions[tc.name].series) if tc.name in versions else tc for tc in selected
+    )
 
 
 def apt_packages(toolchains: Iterable[Toolchain]) -> tuple[str, ...]:
@@ -789,6 +1126,25 @@ class LanguageResolution(NamedTuple):
     # manifest names per detected language — empty unless source is
     # "detected"
     signals: dict[str, tuple[str, ...]]
+    # the version series each versioned toolchain in the set provisions,
+    # by toolchain name — the workspace's own pin where it has one the
+    # host can honour, else the default (#627); what `resolve(languages,
+    # versions)` rebuilds the entries for
+    versions: Mapping[str, ToolchainVersion] = MappingProxyType({})
+
+
+def toolchain_versions(
+    languages: Sequence[str], workspace: Path | None
+) -> dict[str, ToolchainVersion]:
+    """Each versioned toolchain in ``languages`` (requirements included)
+    and the series ``workspace`` picks for it — see
+    :meth:`Toolchain.version_from`."""
+    versions: dict[str, ToolchainVersion] = {}
+    for toolchain in resolve(languages):
+        version = toolchain.version_from(workspace)
+        if version is not None:
+            versions[toolchain.name] = version
+    return versions
 
 
 def resolve_languages(explicit: Sequence[str], workspace: Path | None) -> LanguageResolution:
@@ -799,10 +1155,17 @@ def resolve_languages(explicit: Sequence[str], workspace: Path | None) -> Langua
     default applies only when nothing was detected either. The result is
     the ONE language set every consumer — egress allowlist, toolchain
     install, verify-command lint — reads, resolved once per run (#624).
+    The workspace's version pins are read for whichever set won: an
+    operator choosing the language does not choose to ignore the project's
+    `requires-python` (#627).
     """
+    source: LanguageSource
     if explicit:
-        return LanguageResolution(tuple(explicit), "config", {})
-    detected = detect_languages(workspace) if workspace is not None else {}
-    if detected:
-        return LanguageResolution(tuple(detected), "detected", detected)
-    return LanguageResolution(DEFAULT_LANGUAGES, "default", {})
+        languages, source, signals = tuple(explicit), "config", {}
+    else:
+        detected = detect_languages(workspace) if workspace is not None else {}
+        if detected:
+            languages, source, signals = tuple(detected), "detected", detected
+        else:
+            languages, source, signals = DEFAULT_LANGUAGES, "default", {}
+    return LanguageResolution(languages, source, signals, toolchain_versions(languages, workspace))

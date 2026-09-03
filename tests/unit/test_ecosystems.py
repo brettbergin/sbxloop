@@ -2,8 +2,9 @@
 must not mistake for a Python repo, walked through every generalization
 surface that has landed.
 
-Today's columns: language detection (#624), the installer allowlist
-(#616), the project gate (#625/#626) and the config-override lint (#628).
+Today's columns: language detection (#624), the toolchain series each
+declares (#627), the installer allowlist (#616), the project gate
+(#625/#626) and the config-override lint (#628).
 Later work adds its column here rather than a test of its own, so "does a
 Go repo work?" stays one table, and a regression names the decision that
 changed.
@@ -29,6 +30,9 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "ecosystems"
 class Expectation(NamedTuple):
     languages: tuple[str, ...]
     source: str
+    # the series each versioned toolchain provisions at and where it came
+    # from (#627); a toolchain with no series (go, rust, …) has no row
+    versions: dict[str, tuple[str, str]]
     # installer hosts the agent sandbox must be created with, and one it
     # must NOT be — a language nobody selected opens nothing (#616)
     allowed: tuple[str, ...]
@@ -46,6 +50,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "python-uv": Expectation(
         ("python",),
         "detected",
+        versions={"python": ("3.13", "pyproject.toml")},
         allowed=("release-assets.githubusercontent.com",),
         not_allowed=("nodejs.org", "go.dev"),
         gate=None,
@@ -60,6 +65,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "node-pnpm": Expectation(
         ("javascript", "typescript"),
         "detected",
+        versions={"javascript": ("22", "package.json")},
         allowed=("nodejs.org", "registry.npmjs.org"),
         not_allowed=("go.dev", "static.rust-lang.org"),
         gate="pnpm run check",
@@ -74,6 +80,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "go": Expectation(
         ("go",),
         "detected",
+        versions={},
         allowed=("go.dev", "dl.google.com"),
         not_allowed=("nodejs.org", "static.rust-lang.org"),
         gate="go vet ./... && go test ./...",
@@ -87,6 +94,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "rust": Expectation(
         ("rust",),
         "detected",
+        versions={},
         allowed=("static.rust-lang.org",),
         not_allowed=("nodejs.org", "go.dev"),
         gate="cargo test",
@@ -96,6 +104,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "java-gradle": Expectation(
         ("java",),
         "detected",
+        versions={},
         allowed=(),
         not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
         gate="./gradlew check",
@@ -104,6 +113,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "ruby": Expectation(
         ("ruby",),
         "detected",
+        versions={},
         allowed=(),
         not_allowed=("nodejs.org", "go.dev"),
         gate="bundle exec rake default",
@@ -117,6 +127,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "polyglot": Expectation(
         ("python", "javascript"),
         "detected",
+        versions={"python": ("3.13", "default"), "javascript": ("24", "default")},
         allowed=("release-assets.githubusercontent.com", "nodejs.org"),
         not_allowed=("go.dev",),
         gate=None,
@@ -131,6 +142,7 @@ EXPECTATIONS: dict[str, Expectation] = {
     "none": Expectation(
         ("python",),
         "default",
+        versions={"python": ("3.13", "default")},
         allowed=("release-assets.githubusercontent.com",),
         not_allowed=("nodejs.org",),
         gate=None,
@@ -156,6 +168,7 @@ def test_detection(fixture: str) -> None:
         assert all(resolved.signals[lang] for lang in expected.languages)
     else:
         assert resolved.signals == {}
+    assert {k: (v.series, v.source) for k, v in resolved.versions.items()} == expected.versions
 
 
 @pytest.mark.parametrize("fixture", sorted(EXPECTATIONS))

@@ -1510,6 +1510,7 @@ name = "sbxloop"
 source = { editable = "packages/sbxloop" }
 dependencies = [
     { name = "gitpython" },
+    { name = "packaging" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -1537,6 +1538,7 @@ requires-dist = [
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.3" },
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
     { name = "gitpython", specifier = ">=3.1.59" },
+    { name = "packaging", specifier = ">=24" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },

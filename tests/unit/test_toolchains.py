@@ -7,6 +7,7 @@ and never raises, and apt packages pool instead of duplicating.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -529,7 +530,292 @@ def test_resolve_languages_explicit_wins_over_manifests(tmp_path: Path) -> None:
 
 
 def test_resolve_languages_falls_back_to_default_last(tmp_path: Path) -> None:
-    assert toolchains.resolve_languages((), tmp_path) == toolchains.LanguageResolution(
-        toolchains.DEFAULT_LANGUAGES, "default", {}
-    )
+    resolved = toolchains.resolve_languages((), tmp_path)
+    assert resolved[:3] == (toolchains.DEFAULT_LANGUAGES, "default", {})
+    assert resolved.versions == {"python": toolchains.ToolchainVersion("3.13", "default")}
     assert toolchains.resolve_languages((), None).source == "default"
+
+
+# -- toolchain versions from the workspace (#627) ---------------------------
+
+
+PY_DEFAULT = toolchains.ToolchainVersion(toolchains.PYTHON_SERIES, "default")
+NODE_DEFAULT = toolchains.ToolchainVersion(toolchains.NODE_MAJOR, "default")
+
+
+def pyproject(tmp_path: Path, requires: str) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "x"\nrequires-python = "{requires}"\n'
+    )
+
+
+def package_json(tmp_path: Path, engines: str) -> None:
+    (tmp_path / "package.json").write_text(json.dumps({"name": "x", "engines": {"node": engines}}))
+
+
+def test_version_from_without_a_workspace_or_declaration_is_the_default(tmp_path: Path) -> None:
+    # Undeclared projects behave exactly as before #627: the pinned series.
+    assert toolchains.PYTHON.version_from(None) == PY_DEFAULT
+    assert toolchains.PYTHON.version_from(tmp_path) == PY_DEFAULT
+    assert toolchains.NODE.version_from(tmp_path) == NODE_DEFAULT
+    # a toolchain without a series has no version to speak of
+    assert toolchains.resolve(["rust"])[0].version_from(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("requires", "series"),
+    [
+        (">=3.11,<3.12", "3.11"),  # the acceptance case: the only series that fits
+        ("==3.10.*", "3.10"),
+        (">=3.9", toolchains.PYTHON_SERIES),  # default satisfies → default
+        (">=3.14", "3.14"),  # default does not → the highest that does
+        ("<3.12", "3.11"),
+    ],
+)
+def test_requires_python_selects_a_series(tmp_path: Path, requires: str, series: str) -> None:
+    pyproject(tmp_path, requires)
+    assert toolchains.PYTHON.version_from(tmp_path) == toolchains.ToolchainVersion(
+        series, "pyproject.toml", requires
+    )
+
+
+def test_requires_python_nobody_can_satisfy_keeps_the_default_on_the_record(
+    tmp_path: Path,
+) -> None:
+    # Fail loud, then provision what was always provisioned: the event
+    # names the constraint next to the default it fell back to.
+    pyproject(tmp_path, ">=2.7,<3")
+    assert toolchains.PYTHON.version_from(tmp_path) == toolchains.ToolchainVersion(
+        toolchains.PYTHON_SERIES, "default", ">=2.7,<3"
+    )
+
+
+def test_requires_python_that_is_not_pep_440_reads_as_undeclared(tmp_path: Path) -> None:
+    pyproject(tmp_path, "three point eleven")
+    assert toolchains.PYTHON.version_from(tmp_path) == PY_DEFAULT
+
+
+def test_pyproject_without_requires_python_reads_as_undeclared(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    assert toolchains.PYTHON.version_from(tmp_path) == PY_DEFAULT
+    (tmp_path / "pyproject.toml").write_text("this is not toml = = =\n")
+    assert toolchains.PYTHON.version_from(tmp_path) == PY_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("pin", "series"),
+    [("3.11\n", "3.11"), ("3.11.4", "3.11"), ("cpython@3.12", "3.12"), ("cpython-3.10.2", "3.10")],
+)
+def test_python_version_file_pins_a_series(tmp_path: Path, pin: str, series: str) -> None:
+    (tmp_path / ".python-version").write_text(pin)
+    assert toolchains.PYTHON.version_from(tmp_path) == toolchains.ToolchainVersion(
+        series, ".python-version", pin.strip()
+    )
+
+
+def test_python_version_file_wins_over_requires_python(tmp_path: Path) -> None:
+    # The pin is the developer's exact choice; the specifier is the range.
+    pyproject(tmp_path, ">=3.9")
+    (tmp_path / ".python-version").write_text("3.11\n")
+    assert toolchains.PYTHON.version_from(tmp_path).series == "3.11"  # type: ignore[union-attr]
+
+
+def test_python_version_file_outside_the_candidates_falls_to_the_default(tmp_path: Path) -> None:
+    (tmp_path / ".python-version").write_text("2.7\n")
+    assert toolchains.PYTHON.version_from(tmp_path) == toolchains.ToolchainVersion(
+        toolchains.PYTHON_SERIES, "default", "2.7"
+    )
+    (tmp_path / ".python-version").write_text("pypy3.10\n")
+    assert toolchains.PYTHON.version_from(tmp_path) == PY_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("pin", "major"),
+    [
+        ("18", "18"),
+        ("v20.5.0\n", "20"),
+        ("22.1", "22"),
+        ("lts/iron", "20"),
+        ("lts/hydrogen", "18"),
+        ("lts/*", toolchains.NODE_MAJOR),
+        ("node", toolchains.NODE_MAJOR),
+    ],
+)
+def test_nvmrc_pins_a_node_major(tmp_path: Path, pin: str, major: str) -> None:
+    (tmp_path / ".nvmrc").write_text(pin)
+    assert toolchains.NODE.version_from(tmp_path) == toolchains.ToolchainVersion(
+        major, ".nvmrc", pin.strip()
+    )
+
+
+def test_node_version_file_is_read_like_nvmrc(tmp_path: Path) -> None:
+    (tmp_path / ".node-version").write_text("20.11.0\n")
+    assert toolchains.NODE.version_from(tmp_path) == toolchains.ToolchainVersion(
+        "20", ".node-version", "20.11.0"
+    )
+
+
+def test_nvmrc_for_a_major_this_host_cannot_install_keeps_the_default(tmp_path: Path) -> None:
+    (tmp_path / ".nvmrc").write_text("16\n")
+    assert toolchains.NODE.version_from(tmp_path) == toolchains.ToolchainVersion(
+        toolchains.NODE_MAJOR, "default", "16"
+    )
+    (tmp_path / ".nvmrc").write_text("lts/argon\n")  # a codename nobody ships any more
+    assert toolchains.NODE.version_from(tmp_path) == NODE_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("engines", "major"),
+    [
+        (">=18", toolchains.NODE_MAJOR),  # default satisfies → default
+        (">=18 <21", "20"),  # the highest that fits
+        ("^22", "22"),
+        ("~18.17.0", "18"),
+        ("18.x", "18"),
+        ("=20.5.0", "20"),
+        ("18 || 20", "20"),
+        ("16 - 20", "20"),
+        (">=16.0.0 <19", "18"),
+    ],
+)
+def test_engines_node_selects_the_highest_admitted_major(
+    tmp_path: Path, engines: str, major: str
+) -> None:
+    package_json(tmp_path, engines)
+    assert toolchains.NODE.version_from(tmp_path) == toolchains.ToolchainVersion(
+        major, "package.json", engines
+    )
+
+
+def test_engines_node_nobody_can_satisfy_keeps_the_default_on_the_record(tmp_path: Path) -> None:
+    package_json(tmp_path, "14.x")
+    assert toolchains.NODE.version_from(tmp_path) == toolchains.ToolchainVersion(
+        toolchains.NODE_MAJOR, "default", "14.x"
+    )
+
+
+def test_engines_node_this_host_cannot_read_is_undeclared(tmp_path: Path) -> None:
+    package_json(tmp_path, "latest-and-greatest")
+    assert toolchains.NODE.version_from(tmp_path) == NODE_DEFAULT
+    (tmp_path / "package.json").write_text("{not json")
+    assert toolchains.NODE.version_from(tmp_path) == NODE_DEFAULT
+    (tmp_path / "package.json").write_text(json.dumps({"engines": {"npm": ">=9"}}))
+    assert toolchains.NODE.version_from(tmp_path) == NODE_DEFAULT
+
+
+def test_nvmrc_wins_over_engines_node(tmp_path: Path) -> None:
+    package_json(tmp_path, ">=18")
+    (tmp_path / ".nvmrc").write_text("18\n")
+    assert toolchains.NODE.version_from(tmp_path).series == "18"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("range_text", "major", "verdict"),
+    [
+        ("*", "18", True),
+        ("", "24", True),
+        (">=18", "18", True),
+        (">18", "18", False),  # node-semver reads `>18` as >=19.0.0
+        (">18", "19", True),
+        ("<21", "20", True),
+        ("<21", "21", False),
+        ("<=20.2.0", "20", True),
+        ("^18.12", "18", True),
+        ("^18.12", "19", False),
+        ("~20.11", "20", True),
+        ("18.x", "18", True),
+        ("18.*", "20", False),
+        ("v20", "20", True),
+        ("18 - 20", "19", True),
+        ("18 - 20", "21", False),
+        (">=18 <21 || >=24", "22", False),
+        (">=18 <21 || >=24", "24", True),
+        (">=99", "24", False),
+    ],
+)
+def test_semver_range_admits(range_text: str, major: str, verdict: bool) -> None:
+    assert toolchains._semver_range_admits(range_text, major) is verdict
+
+
+@pytest.mark.parametrize("range_text", ["banana", ">=", "1.2.3.4", "18.0.0.beta", "latest"])
+def test_semver_range_this_host_cannot_read_is_none(range_text: str) -> None:
+    assert toolchains._semver_range_admits(range_text, "20") is None
+
+
+def test_for_version_rebuilds_the_python_entry_for_the_series() -> None:
+    py311 = toolchains.PYTHON.for_version("3.11")
+    assert py311.name == "python"
+    assert py311.series == "3.11"
+    assert "python3.11 --version" in py311.probe
+    assert 'grep -q "^Python 3\\.11\\.' in py311.probe
+    assert py311.install_script is not None
+    assert "uv python install 3.11" in py311.install_script
+    assert "/usr/local/bin/python3.11" in py311.install_script
+    assert "3.13" not in py311.probe and "3.13" not in py311.install_script
+    # the same declaration readers ride along, so a rebuilt entry resolves
+    # the next workspace exactly like the registry's
+    assert py311.declared_series is toolchains.PYTHON.declared_series
+    # everything else is untouched: hosts, apt packages, aliases
+    assert py311.install_domains == toolchains.PYTHON.install_domains
+    assert py311.apt_packages == toolchains.PYTHON.apt_packages
+    assert py311.aliases == toolchains.PYTHON.aliases
+
+
+def test_for_version_at_the_default_is_the_registry_entry_itself() -> None:
+    assert toolchains.PYTHON.for_version(toolchains.PYTHON_SERIES) is toolchains.PYTHON
+    assert toolchains.NODE.for_version(toolchains.NODE_MAJOR) is toolchains.NODE
+    # an entry with no series has nothing to rebuild
+    rust = toolchains.resolve(["rust"])[0]
+    assert rust.for_version("1.90") is rust
+
+
+@pytest.mark.parametrize("major", sorted(toolchains.NODE_RELEASES))
+def test_every_node_release_is_pinned_and_checksum_verified(major: str) -> None:
+    version, digests = toolchains.NODE_RELEASES[major]
+    assert version.split(".")[0] == major
+    node = toolchains.NODE.for_version(major)
+    assert node.series == major
+    assert node.install_script is not None
+    assert f"node-v{version}-linux-" in node.install_script
+    assert f'grep -q "^v{major}\\.' in node.probe
+    for arch in ("amd64", "arm64"):
+        _folder, digest = digests[arch]
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), (major, arch)
+        assert digest in node.install_script
+    assert "sha256sum -c" in node.install_script
+
+
+def test_resolve_takes_the_versions_it_is_handed() -> None:
+    versions = {
+        "python": toolchains.ToolchainVersion("3.11", "pyproject.toml", "<3.12"),
+        "javascript": toolchains.ToolchainVersion("18", ".nvmrc", "18"),
+    }
+    python, node, ts, rust = toolchains.resolve(["python", "typescript", "rust"], versions)
+    assert (python.series, node.series) == ("3.11", "18")
+    # typescript's requirement on javascript picks up the declared major too
+    assert node.name == "javascript" and ts.name == "typescript"
+    assert rust.series is None
+    # a version for a toolchain that was not selected is ignored
+    assert [tc.name for tc in toolchains.resolve(["rust"], versions)] == ["rust"]
+
+
+def test_toolchain_versions_reads_every_versioned_toolchain_once(tmp_path: Path) -> None:
+    pyproject(tmp_path, ">=3.11,<3.12")
+    (tmp_path / ".nvmrc").write_text("20\n")
+    versions = toolchains.toolchain_versions(["python", "typescript", "rust"], tmp_path)
+    assert versions == {
+        "python": toolchains.ToolchainVersion("3.11", "pyproject.toml", ">=3.11,<3.12"),
+        "javascript": toolchains.ToolchainVersion("20", ".nvmrc", "20"),
+    }
+
+
+def test_resolve_languages_carries_versions_for_explicit_config_too(tmp_path: Path) -> None:
+    # `[sandbox] languages` decides WHICH toolchains; the workspace still
+    # decides which series, so a config-pinned python project's
+    # requires-python is honoured.
+    pyproject(tmp_path, ">=3.12,<3.13")
+    resolved = toolchains.resolve_languages(["python"], tmp_path)
+    assert resolved.source == "config"
+    assert resolved.versions["python"].series == "3.12"
+    # positional construction (the pre-#627 shape) still works
+    assert toolchains.LanguageResolution(("go",), "detected", {"go": ("go.mod",)}).versions == {}
