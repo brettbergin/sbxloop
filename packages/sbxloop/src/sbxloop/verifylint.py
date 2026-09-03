@@ -656,6 +656,27 @@ def runs_gate(command: str, gate: str) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class ConfigOverrideExample:
+    """The prompts' worked example of a config-override, for one ecosystem.
+
+    The decomposer and the reviewer each read exactly one of these — the one
+    for the run's resolved toolchain (#634) — so the anchor they pattern-
+    match against is correct for the repository in front of them rather than
+    a story about some other project's build. ``config`` is the excerpt of
+    the project file; ``story`` says what the gate runs, what the verify
+    command ran instead, what that dragged in, and the remedy.
+    """
+
+    language: str
+    fence: str
+    config: str
+    story: str
+
+    def render(self) -> str:
+        return f"```{self.fence}\n{self.config}\n```\n\n{self.story}"
+
+
 # Config-driven tools whose *file set* lives in the project's config. Field
 # failure rrhb28j7n (#387): the plan's verify command was `uv run mypy
 # packages`. The repo pins `[tool.mypy] files = [...]` in pyproject.toml, and
@@ -673,7 +694,9 @@ class ConfigScopedTool:
     """A tool whose configured file set explicit path arguments override."""
 
     name: str
-    # (config file, section, keys) triples consulted in order.
+    # (config file, section, keys) triples consulted in order. Empty for a
+    # tool the lint does not read yet: the entry then only carries the
+    # ecosystem's worked example for the prompts.
     sources: tuple[tuple[str, str, tuple[str, ...]], ...]
     # Flags that consume the next word, so it is not a positional path.
     value_flags: frozenset[str]
@@ -683,12 +706,34 @@ class ConfigScopedTool:
     # whole-tree invocation and ruff still applies its own include/exclude
     # underneath it, so flagging it would reject the canonical shape.
     benign_args: frozenset[str] = frozenset()
+    # The prompts' worked example of this tool's override, if it is the one
+    # that stands for its ecosystem.
+    example: ConfigOverrideExample | None = None
 
 
+_REMEDY = (
+    "Nothing in the diff caused it and nothing in a diff can fix it; the remedy "
+    "is re-authoring the command to the bare form"
+)
 _PYPROJECT = "pyproject.toml"
 CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
     "mypy": ConfigScopedTool(
         name="mypy",
+        example=ConfigOverrideExample(
+            language="python",
+            fence="toml",
+            config='[tool.mypy]\nfiles = ["src"]',
+            story=(
+                'The project gate runs `uv run mypy` and reports "Success: no issues '
+                "found in 118 source files\". The task's verify command runs "
+                "`uv run mypy .`; the explicit path overrides `files` and pulls in "
+                "`docs/conf.py`, which imports `sphinx` — a docs-only dependency "
+                'absent from the sandbox — so the command exits 1 with "Cannot find '
+                'implementation or library stub for module named sphinx" on every '
+                f"attempt. {_REMEDY}. The same shape reaches ruff (`include`/`src`) "
+                "and pytest (`testpaths`)."
+            ),
+        ),
         sources=(
             (_PYPROJECT, "tool.mypy", ("files",)),
             ("setup.cfg", "mypy", ("files",)),
@@ -766,7 +811,98 @@ CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
             }
         ),
     ),
+    # The entries below carry no `sources` yet — the lint reads only the
+    # Python project files today — so they never fire; they hold the worked
+    # example the prompts render for their ecosystem (#634).
+    "tsc": ConfigScopedTool(
+        name="tsc",
+        sources=(),
+        value_flags=frozenset({"--project", "-p", "--outDir", "--target", "--module"}),
+        example=ConfigOverrideExample(
+            language="typescript",
+            fence="json",
+            config=(
+                "{\n"
+                '  "compilerOptions": { "strict": true, "paths": { "@/*": ["src/*"] } },\n'
+                '  "include": ["src"]\n'
+                "}"
+            ),
+            story=(
+                "The project gate runs `npx tsc --noEmit` and is clean. The task's "
+                "verify command runs `npx tsc --noEmit src/index.ts`; naming input "
+                "files on the command line makes `tsc` ignore `tsconfig.json` "
+                "entirely — `include`, `paths` and `strict` alike — so every "
+                '`import ... from "@/lib/x"` fails with "Cannot find module '
+                "'@/lib/x' or its corresponding type declarations\" on every "
+                f"attempt. {_REMEDY}, which reads the project file."
+            ),
+        ),
+    ),
+    "rubocop": ConfigScopedTool(
+        name="rubocop",
+        sources=(),
+        value_flags=frozenset({"--config", "-c", "--only", "--except", "--format", "-f"}),
+        example=ConfigOverrideExample(
+            language="ruby",
+            fence="yaml",
+            config="AllCops:\n  Exclude:\n    - db/schema.rb",
+            story=(
+                'The project gate runs `bundle exec rubocop` and reports "no '
+                "offenses detected\". The task's verify command runs "
+                "`bundle exec rubocop app/models/order.rb db/schema.rb`; a file "
+                "named explicitly on the command line is inspected even when "
+                "`Exclude` lists it (that is what `--force-exclusion` exists to "
+                "switch off), so the generated `db/schema.rb` — rewritten by the "
+                "next `db:migrate` — reports offenses on every attempt. "
+                f"{_REMEDY} and letting `.rubocop.yml` choose the files."
+            ),
+        ),
+    ),
+    "go": ConfigScopedTool(
+        name="go",
+        sources=(),
+        value_flags=frozenset({"-tags", "-run", "-p", "-o", "-coverprofile"}),
+        subcommands=frozenset({"test", "vet", "build"}),
+        example=ConfigOverrideExample(
+            language="go",
+            fence="go",
+            config=(
+                "//go:build integration\n\n"
+                "package store_test // internal/store/postgres_integration_test.go"
+            ),
+            story=(
+                "The project gate runs `go test ./...` and passes: the build "
+                "constraint keeps that file out unless the tag is set. The task's "
+                "verify command runs `go test -tags integration ./...`, which pulls "
+                "the constrained files in; they dial a database the sandbox does "
+                'not have, so the command fails with "dial tcp 127.0.0.1:5432: '
+                f'connect: connection refused" on every attempt. {_REMEDY}. The '
+                "same shape reaches `go vet -tags` and `golangci-lint run "
+                "--build-tags`."
+            ),
+        ),
+    ),
 }
+
+
+def config_override_example(languages: Sequence[str] | None = None) -> str:
+    """The rendered config-override example for a run's resolved toolchains.
+
+    The first language in ``languages`` that has an example wins, so a mixed
+    repository reads the example for its primary toolchain; a run whose
+    languages carry none (or no languages at all) reads the Python one, the
+    ecosystem the lint itself checks.
+    """
+    by_language = {
+        tool.example.language: tool.example
+        for tool in CONFIG_SCOPED_TOOLS.values()
+        if tool.example is not None
+    }
+    for language in languages or ():
+        if language in by_language:
+            return by_language[language].render()
+    return by_language["python"].render()
+
 
 # Runner prefixes that stand in front of the tool word without changing it.
 _RUNNER_PREFIXES: tuple[tuple[str, ...], ...] = (

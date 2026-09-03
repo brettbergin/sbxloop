@@ -16,17 +16,24 @@ tests/unit/test_prompts.py):
   prompt reaches the model; everything below it is sent verbatim.
 
 Variables: $outcome, $pr_number, $round, $diff, $tasks_summary,
-$prior_rounds, $user_guidance, $project_gate; $retry_context (defaulted by
-render()).
+$prior_rounds, $user_guidance, $project_gate, $config_override_example
+(rendered by verifylint.config_override_example for the run's resolved
+toolchains, #634); $retry_context (defaulted by render()).
+Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
+path, state name or product vocabulary from the loop's own repository —
+tests anchor on the rule phrases, not the examples
+(test_prompt_bodies_stay_domain_neutral).
 Contract (test_review_prompt_carries_contract): the four lenses
 ("Concurrency and locking", "Failure ordering", "Input validation",
 "Cross-module interaction"), the phrases "read-only", "Do not modify",
 "refuted", "deferred", "UNANSWERED", "repro", "followups" and "ONLY the fenced JSON block", the round-1
 symptom-vs-mechanism check ("Symptom (as observed)", "not the mechanism", #535), the round-1
 plan-coverage question ("upgrade path for existing state", #524), and the
-verdict/severity vocabulary must stay. The wrong-check / verify-suspect section with its
-config-override worked example must stay too
-(test_review_prompt_describes_the_wrong_check_shape).
+verdict/severity vocabulary must stay. The wrong-check / verify-suspect section
+("When the work is right and the check is wrong", "config-override") with its
+rendered worked example must stay too
+(test_review_prompt_describes_the_wrong_check_shape,
+test_config_override_example_follows_the_resolved_toolchain).
 -->
 
 # Review the pull request
@@ -48,24 +55,25 @@ be gone (or present) with this change deployed? A PR that faithfully
 implements the **Requested change** but would not change what they saw is
 `request_changes` on the plan — anchor the finding to the code that
 implements the mechanism and say what would actually remove the symptom.
-That is the review that would have stopped PR #525: removing the bridge's
-embeds leaves Discord's link-preview unfurls exactly where they were.
+That is the review that stops the pull request which deletes the retry
+loop when the person is seeing duplicate emails: a second worker sends them,
+and the diff leaves it exactly where it was.
 
 ## The tasks the run built, with their acceptance criteria
 
 $tasks_summary
 
 In round 1, review the **plan** as well as the diff: if the change alters
-persisted state — a SQLite schema or the meaning of its rows, an id or key
-format, a config key the store echoes, a state-directory layout — then a
+persisted state — a database schema or the meaning of its rows, an id or
+key format, a config key the store echoes, a data-directory layout — then a
 deployed instance already holds data in the old shape, and one task must
 cover the **upgrade path for existing state**, with acceptance criteria
 that enumerate the row states and id forms it can hold and tests that
 start from a raw pre-change database. If the change needs that task and
 no task covers it, that is a `blocking` finding on the plan (anchor it to
-the schema or migration code), whatever the diff itself looks like: four
-daemon-killing bugs on one migration reached review one round at a time
-because the plan never named the path.
+the schema or migration code), whatever the diff itself looks like. A
+migration whose plan never named the path ships its bugs one review round
+at a time — each one a row shape nobody enumerated.
 
 ## The project's own gate
 
@@ -168,23 +176,10 @@ where that gets caught.
 
 The commonest shape is a **config-override**: a tool whose file set is pinned
 in the project's configuration, invoked in the verify command with an
-explicit path that overrides it. Worked example:
+explicit path that overrides it. Worked example, in this repository's
+ecosystem:
 
-```toml
-[tool.mypy]
-files = ["packages/sbxloop/src", "packages/sbxloop-worker/src"]
-```
-
-The project gate runs `uv run mypy` and reports "Success: no issues found in
-74 source files". The task's verify command runs `uv run mypy packages`; the
-explicit path overrides `files` and pulls in
-`packages/sbxloop/hatch_build.py`, which imports `hatchling` — a build-time
-dependency absent from the sandbox — so the command exits 1 with
-"Cannot find implementation or library stub for module named
-hatchling.builders.hooks.plugin.interface" on every attempt. Nothing in the
-diff caused it and nothing in a diff can fix it; the remedy is re-authoring
-the command to the bare form. The same shape reaches ruff
-(`include`/`src`) and pytest (`testpaths`).
+$config_override_example
 
 So when a verify command keeps failing while the code it checks is sound, do
 not turn it into a finding against the author. Approve the work if it is
@@ -236,16 +231,16 @@ Respond with exactly one fenced JSON block:
       "line": 42,
       "body": "what is wrong here and what would fix it",
       "severity": "major",
-      "repro": "setup: a stored row with id 'gh:7' and state 'running'; call migrate(); observed: the row is deleted; expected: it is re-keyed to 'gh:issue:7'"
+      "repro": "setup: a stored job row with id '7' and state 'running'; call migrate(); observed: the row is deleted; expected: it is re-keyed to 'order:7' and keeps its lease"
     }
   ],
   "confirmations": [
     {"anchor": "src/older.py:7", "status": "still_open", "note": "why"}
   ],
   "followups": [
-    {"title": "doctor boots one microVM per configured repo",
-     "body": "doctor --probe provisions a box per repository; one per credential would do. Out of scope: this PR adds repositories, not doctor.",
-     "path": "src/cli/doctor.py"}
+    {"title": "the health check opens one database connection per tenant",
+     "body": "healthcheck pings every tenant's database on each call; one pooled connection would do. Out of scope: this PR adds tenants, not the health check.",
+     "path": "src/health.py"}
   ]
 }
 ```

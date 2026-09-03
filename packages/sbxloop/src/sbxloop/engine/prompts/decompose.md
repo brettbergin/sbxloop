@@ -17,16 +17,24 @@ tests/unit/test_prompts.py):
 - This comment block is stripped by sbxloop.engine.prompts.render before the
   prompt reaches the model; everything below it is sent verbatim.
 
-Variables: $outcome, $max_tasks, $project_gate; $retry_context (defaulted to
-"" by render()); $baseline_registries and $declarable_registries are injected
-from policy.py, never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
+Variables: $outcome, $max_tasks, $project_gate, $config_override_example
+(rendered by verifylint.config_override_example for the run's resolved
+toolchains, #634); $retry_context (defaulted to "" by render());
+$baseline_registries and $declarable_registries are injected from policy.py,
+never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
+Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
+path, state name or product vocabulary from the loop's own repository —
+tests anchor on the rule phrases, not the examples, so an example may be
+swapped as long as the rule text stands
+(test_prompt_bodies_stay_domain_neutral).
 Section rules:
 - "workspace root", "cannot edit" and the sh-c portability rules must stay —
   the builder cannot fix a wrong exam, so authoring time is the only
   mitigation (test_decompose_carries_verify_authoring_rules). The
-  config-override warning (explicit paths overriding a tool's configured
-  file set, with the `uv run mypy packages` case) must stay too
-  (test_decompose_warns_against_config_overriding_verify_paths). The
+  config-override warning ("overrides the configured file set") and its
+  rendered worked example must stay too
+  (test_decompose_warns_against_config_overriding_verify_paths,
+  test_config_override_example_follows_the_resolved_toolchain). The
   persisted-state rule ("upgrade path for existing state", the row states /
   id forms enumeration, and the raw pre-change database verify) must stay
   (test_decompose_demands_an_upgrade_path_task_for_persisted_state, #524).
@@ -50,9 +58,9 @@ the specification: the work is done when what the person saw is gone (or
 present), and every acceptance criterion you write is a check on that. A
 **Requested change** section is the mechanism they asked for — a hint. If
 implementing it faithfully would not change what they saw, plan the change
-that does, and say so in the task description. A plan that removes the
-embeds when the person is seeing link-preview unfurls has done the wrong
-thing correctly.
+that does, and say so in the task description. A plan that deletes the
+retry loop when the person is seeing duplicate emails — sent by a second
+worker, not by retries — has done the wrong thing correctly.
 
 ## Rules
 
@@ -105,18 +113,16 @@ thing correctly.
   $project_gate
 - Never pass explicit paths to a config-driven tool whose file set is already
   pinned in the project's configuration (mypy `files`, ruff `include`/`src`,
-  pytest `testpaths` in `pyproject.toml`, `setup.cfg`, `mypy.ini` or
-  equivalent). An explicit path argument **overrides the configured file
-  set** and drags in modules the project deliberately excludes — build hooks,
-  generated code, vendored trees — whose dependencies are not installed, so
-  the command fails for reasons no revision can fix. Field case: the Makefile
-  gate runs `uv run mypy` and reports success, while the verify command
-  `uv run mypy packages` overrode `files` and pulled in
-  `packages/sbxloop/hatch_build.py`, which imports the build-time-only
-  `hatchling` — the same check, impossible to pass, three times over. Write
-  the bare form (`uv run mypy`, `uv run ruff check`, `uv run pytest -q`) and
-  let the configuration choose the files; name a path only when the tool has
-  no configured file set, or when the task is genuinely about that one path.
+  pytest `testpaths`; tsc's `include`; rubocop's `AllCops`/`Exclude`; a Go
+  build constraint and the tag that lifts it). An explicit path argument
+  **overrides the configured file set** and drags in modules the project
+  deliberately excludes — build hooks, generated code, vendored trees,
+  integration suites — whose dependencies are not installed, so the command
+  fails for reasons no revision can fix: the same check, impossible to pass,
+  on every attempt. Write the bare form and let the configuration choose the
+  files; name a path only when the tool has no configured file set, or when
+  the task is genuinely about that one path. The worked example below is
+  this repository's ecosystem.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Work happens in the current working directory of this sandbox.
 - Also give `pr_title`: the one-line title of the pull request this work
@@ -127,22 +133,27 @@ thing correctly.
   it was automated. Leave it `null` when the workspace has no history to
   learn from.
 
+## The config-override, worked
+
+$config_override_example
+
 ## Risk pass: what a deployed instance already holds
 
 Before you answer, ask of the outcome: **does it alter persisted state?** A
-SQLite schema or the meaning of its rows, an id or key format, a config key
-the store echoes, a state-directory layout, a file format read back later.
+database schema or the meaning of its rows, an id or key format, a config
+key the store echoes, a data-directory layout, a file format read back later.
 If so, a running deployment already holds data in the *old* shape, and the
 change is not done until that data survives the upgrade. Add a dedicated
 task — **upgrade path for existing state** — that is not an implementation
 detail of another task:
 
 - Its `acceptance_criteria` **enumerate** the shapes a deployed instance
-  can hold: every row state (queued, claimed, running, resume-pending,
-  terminal), every id or key form (old and new), every config shape — and
-  say what each becomes after the upgrade. "The legacy form still resolves"
-  is not a criterion; "a `running` row with a bare `gh:7` id is re-keyed to
-  `gh:issue:7`, keeps its run pin, and settles when that run ends" is.
+  can hold: every row state (for a job table: pending, leased, running,
+  retrying, terminal), every id or key form (old and new), every config
+  shape — and say what each becomes after the upgrade. "The legacy form
+  still resolves" is not a criterion; "a `running` job row with a bare
+  numeric `order_id` is re-keyed to `order:<n>`, keeps its lease, and
+  completes when that worker reports" is.
 - Its `verify_commands` run tests that **start from a raw pre-change
   database** (or file, or directory) written in the old shape by hand —
   never one produced by the new code, which normalises on write and so

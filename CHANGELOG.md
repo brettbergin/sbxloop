@@ -408,6 +408,24 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **Prompt examples no longer tell the loop's own story** (#634). The
+  decomposer's and reviewer's config-override worked example is rendered
+  per run from the resolved toolchains — a Python repository reads the
+  `[tool.mypy] files` story, a TypeScript one reads `tsc` ignoring
+  `tsconfig.json` when handed input files, a Ruby one reads rubocop
+  inspecting an `Exclude`d file named on the command line, a Go one reads
+  a build tag pulling an integration suite into `go test` — so the anchor
+  the model pattern-matches against is correct for the repository in front
+  of it, and it costs the same tokens as the one story every run used to
+  read. The ecosystem-agnostic examples (the persisted-state enumeration,
+  the symptom-versus-mechanism review, the repro and follow-up JSON, the
+  concierge's fix-shaped-ask walk-through) now come from a generic web
+  service, and no prompt body names an issue or PR number, a path, state
+  name or product vocabulary from this repository; the fix brief's test-id
+  example is no longer pytest syntax. `test_prompt_bodies_stay_domain_neutral`
+  holds the line, and the prompt tests anchor on rule phrases so any
+  example can be swapped while the rule text stands.
+
 - **Landing never waits on a human it never asked.** A human inline
   thread outside a standing changes-requested review — an aside on a
   COMMENT or approving review — used to block the merge forever: nothing

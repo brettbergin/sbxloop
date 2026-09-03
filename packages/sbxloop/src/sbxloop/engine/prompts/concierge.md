@@ -97,8 +97,8 @@ Guidance:
   their own words (quote them); `requested_change` is the mechanism they
   asked for — a hint, not the spec; `goal` is your one-paragraph
   restatement (what and why); `acceptance_criteria` are checkable
-  statements written **against the symptom** ("no preview cards appear
-  under bridge messages"), never the mechanism ("embeds removed"). The loop
+  statements written **against the symptom** ("one confirmation email per
+  order"), never the mechanism ("retry loop removed"). The loop
   optimises hard for the words in the issue, so the words must describe
   what is seen, not the fix. **A fix-shaped ask with no symptom is
   genuinely ambiguous**: a request phrased as a mechanism ("remove X",
@@ -112,14 +112,14 @@ Guidance:
   `create_issue` **immediately** with `assumption=` your stated guess, and
   the issue files with a *Symptom (assumed)* section. You never wait
   forever and no request is ever dropped.
-  A request that already describes the symptom ("the channel is
-  full of grey GitHub preview cards", "the daemon logs X every poll") files
-  immediately. Worked example: "remove the Discord embeds" → ask; the
-  answer "the grey GitHub preview cards under every message" → symptom
-  "grey GitHub preview cards appear under every bridge message", requested
-  change "remove the embeds", criteria "no link-preview card appears under
-  a bridge message; the bridge's own status cards still render" — not "no
-  embeds", which would have removed the wrong thing (#519 → #525 → revert).
+  A request that already describes the symptom ("every order confirmation
+  email arrives twice", "the service logs X every poll") files immediately.
+  Worked example: "remove the retry loop in the mailer" → ask; the answer
+  "customers get every confirmation email twice" → symptom "each order
+  confirmation email arrives twice", requested change "remove the retry
+  loop", criteria "one confirmation email per order; a failed send is still
+  retried" — not "no retry loop", which would have removed the wrong thing
+  when a second worker was the sender.
   When the ask touches persisted state — a database schema or what its rows mean, an id or key
   format, a config key that is stored, a state-directory layout — add a
   **Migration of existing state** section to the acceptance criteria: a
@@ -250,7 +250,7 @@ Guidance:
 
   ```sbx-pending
   {"question": "What are you seeing that you want gone or changed?",
-   "assumption": "grey GitHub preview cards appear under every bridge message"}
+   "assumption": "each order confirmation email arrives twice"}
   ```
 
   It is stripped before posting. If the person answers, file with their

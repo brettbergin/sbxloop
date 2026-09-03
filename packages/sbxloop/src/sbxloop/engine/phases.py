@@ -44,6 +44,7 @@ from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.verifylint import (
     UV_LOCKFILE,
+    config_override_example,
     gate_problems,
     gate_rule,
     lint_verify_commands,
@@ -490,6 +491,7 @@ class PhaseRunner:
                 "outcome": self.outcome,
                 "max_tasks": str(self.config.budgets.max_tasks),
                 "project_gate": gate_rule(self.project_gate()),
+                "config_override_example": config_override_example(self.languages),
             },
             check=self._check_taskgraph,
         )
@@ -649,6 +651,7 @@ class PhaseRunner:
                 "prior_rounds": history,
                 "user_guidance": self._guidance(),
                 "project_gate": gate_rule(self.project_gate()),
+                "config_override_example": config_override_example(self.languages),
             },
             permission_mode="read_only",
             check=ReviewGuard(refuted).check,

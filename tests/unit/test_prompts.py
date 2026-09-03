@@ -1,12 +1,19 @@
 """Prompt template rendering tests."""
 
+import re
 from importlib import resources
 
 import pytest
 
 from sbxloop.engine import prompts
-from sbxloop.engine.prompts import bullet_list, render
+from sbxloop.engine.prompts import _strip_contract_header, bullet_list, render
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
+from sbxloop.verifylint import config_override_example
+
+# The engine renders the config-override example for the run's resolved
+# toolchains (#634); tests that only care about the rest of a template take
+# the default (Python) one.
+EXAMPLE = {"config_override_example": config_override_example(None)}
 
 
 def build_context(**over: str) -> dict[str, str]:
@@ -26,7 +33,9 @@ def build_context(**over: str) -> dict[str, str]:
 
 
 def test_render_decompose() -> None:
-    text = render("decompose", outcome="Build the thing", max_tasks="5", project_gate="- gate")
+    text = render(
+        "decompose", outcome="Build the thing", max_tasks="5", project_gate="- gate", **EXAMPLE
+    )
     assert "Build the thing" in text
     assert "At most 5 tasks" in text
     assert "$outcome" not in text
@@ -35,7 +44,7 @@ def test_render_decompose() -> None:
 def test_decompose_asks_for_a_pr_title_in_the_repos_style() -> None:
     """#621: the plan names the pull request the way the repository names
     its commits, read from the workspace's own history."""
-    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate", **EXAMPLE)
     assert "`pr_title`" in text
     assert "git log --oneline" in text
     assert '"pr_title"' in text, "the JSON example carries the key"
@@ -45,7 +54,7 @@ def test_decompose_states_the_uv_project_convention() -> None:
     # #250: the decomposer writes ALL the verify commands, and the lint
     # holds them to the uv convention when a lockfile is present — so the
     # rule has to be stated where the decomposer reads it.
-    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate", **EXAMPLE)
     assert "uv.lock" in text
     assert "uv run pytest" in text
 
@@ -55,7 +64,7 @@ def test_decompose_carries_verify_authoring_rules() -> None:
     mitigation for the wrong-check failure class (formerly verify_suspect):
     the workspace-root/sh-c/portability facts that lived in plan.md must
     now reach the decomposer."""
-    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate", **EXAMPLE)
     assert "workspace root" in text
     assert "cannot edit" in text
     assert "`sh -c`" in text
@@ -67,12 +76,14 @@ def test_decompose_demands_an_upgrade_path_task_for_persisted_state() -> None:
     enumerate the shapes a deployed instance holds and whose verify starts
     from a raw pre-change database — the plan names the path, so review is
     not where it is discovered one row state at a time."""
-    text = render("decompose", outcome="add a column", max_tasks="3", project_gate="- gate rule")
+    text = render(
+        "decompose", outcome="add a column", max_tasks="3", project_gate="- gate rule", **EXAMPLE
+    )
     assert "## Risk pass: what a deployed instance already holds" in text
     assert "does it alter persisted state?" in text
     assert "**upgrade path for existing state**" in text
     assert "**enumerate** the shapes a deployed instance" in text
-    for shape in ("queued, claimed, running, resume-pending", "every id or key form"):
+    for shape in ("every row state", "every id or key form", "every config\n  shape"):
         assert shape in text, shape
     flat = " ".join(text.split())
     assert "**start from a raw pre-change database**" in flat
@@ -84,24 +95,26 @@ def test_decompose_demands_an_upgrade_path_task_for_persisted_state() -> None:
 def test_decompose_treats_the_symptom_as_the_spec() -> None:
     """#535: an issue filed symptom-first is planned against the symptom;
     the requested mechanism is a hint the decomposer may overrule."""
-    text = render("decompose", outcome="x", max_tasks="3", project_gate="- gate rule")
+    text = render("decompose", outcome="x", max_tasks="3", project_gate="- gate rule", **EXAMPLE)
     assert "**Symptom (as observed)** section, the symptom is\nthe specification" in text
     assert "**Requested change** section is the mechanism they asked for — a hint" in text
     assert "would not change what they saw, plan the change\nthat does" in text
 
 
 def test_decompose_warns_against_config_overriding_verify_paths() -> None:
-    """#387: `uv run mypy packages` overrides the `files` pinned in
-    pyproject.toml, drags in the hatchling build hook and can never pass,
-    while the bare `uv run mypy` the gate runs is clean. The decomposer
-    writes the verify commands, so the warning belongs in its prompt."""
-    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate")
-    assert "uv run mypy packages" in text
-    assert "`uv run mypy`" in text
-    assert "overrides the configured file" in text
-    for pinned in ("mypy `files`", "ruff `include`", "pytest `testpaths`"):
+    """#387: an explicit path handed to a config-driven tool overrides the
+    file set its configuration pins, drags in what the project excludes and
+    can never pass, while the bare form the gate runs is clean. The
+    decomposer writes the verify commands, so the warning belongs in its
+    prompt — the rule text, plus the worked example rendered for the
+    ecosystem (#634)."""
+    text = render("decompose", outcome="o", max_tasks="5", project_gate="- gate", **EXAMPLE)
+    assert "**overrides the configured file set**" in text
+    for pinned in ("mypy `files`", "ruff `include`", "pytest `testpaths`", "tsc's `include`"):
         assert pinned in text, pinned
-    assert "hatchling" in text
+    assert "Write the bare form" in text
+    assert "## The config-override, worked" in text
+    assert EXAMPLE["config_override_example"] in text
 
 
 def test_build_carries_environment_notes() -> None:
@@ -170,7 +183,7 @@ def test_prompts_carry_ecosystem_notes(ecosystem: str, markers: tuple[str, ...])
 # top of each prompts/*.md — that header is where an editor learns which
 # variables a template takes (#225).
 RENDER_CONTEXTS: dict[str, dict[str, str]] = {
-    "decompose": {"outcome": "o", "max_tasks": "3", "project_gate": "- gate rule"},
+    "decompose": {"outcome": "o", "max_tasks": "3", "project_gate": "- gate rule", **EXAMPLE},
     "build": build_context(),
     "steer": {
         "outcome": "o",
@@ -188,6 +201,7 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "prior_rounds": "(first review of this pull request)",
         "user_guidance": "(none)",
         "project_gate": "- gate rule",
+        **EXAMPLE,
     },
     "concierge": {
         "chat_name": "Discord",
@@ -239,7 +253,7 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "The issue\n  is **symptom-first**" in text
     assert "**A fix-shaped ask with no symptom is\n  genuinely ambiguous**" in text
     assert "What are you seeing that you want gone or changed?" in text
-    assert '"remove the Discord embeds" → ask' in text
+    assert "Worked example:" in text and "→ ask;" in text
     # #564: enumerable clarifying answers become clickable choices; open-ended
     # questions stay free text
     assert "sbx-choices" in text
@@ -273,6 +287,7 @@ def test_review_prompt_carries_contract() -> None:
         prior_rounds="### Round 1 — request_changes",
         user_guidance="- use uv",
         project_gate="- One task's `verify_commands` MUST run `make check`",
+        **EXAMPLE,
     )
     assert text.startswith("# Review the pull request")
     assert "pull request #42" in text and "round 2" in text
@@ -303,7 +318,8 @@ def test_review_prompt_carries_contract() -> None:
     assert "review the **plan** as well as the diff" in text
     # #535: the PR is judged against the symptom, not the requested mechanism.
     assert "judge the pull\nrequest against the symptom, not the mechanism" in text
-    assert "`request_changes` on the plan" in text and "PR #525" in text
+    assert "`request_changes` on the plan" in text
+    assert "say what would actually remove the symptom" in text
     # #517: out-of-scope notes are a first-class output, never a finding.
     assert "## Out of scope, but real: follow-ups" in text
     assert '"followups":' in text and "never\npromote one to a finding" in text
@@ -316,16 +332,88 @@ def test_review_prompt_carries_contract() -> None:
 def test_review_prompt_describes_the_wrong_check_shape() -> None:
     """#387: the scrutinizer passed the work 6/6 and never said the check
     itself was impossible, so the run burnt its whole revision and replan
-    budget. The prompt now carries the config-override worked example."""
+    budget. The prompt carries the wrong-check rule and the config-override
+    worked example rendered for the ecosystem (#634)."""
     text = render("review", **RENDER_CONTEXTS["review"])
     assert "When the work is right and the check is wrong" in text
     assert "config-override" in text
-    assert "uv run mypy packages" in text
-    assert "`uv run mypy`" in text
-    assert "[tool.mypy]" in text and 'files = ["packages/sbxloop/src"' in text
-    assert "hatchling" in text
-    assert "testpaths" in text
+    assert "can never go green" in text
+    assert EXAMPLE["config_override_example"] in text
     assert "name the misconfigured command and its remedy in the summary" in text
+
+
+def test_config_override_example_follows_the_resolved_toolchain() -> None:
+    """#634: the worked example is the one for the repository in front of
+    the model — a Go run reads a Go story, not a mypy one — and every
+    ecosystem's story carries the same shape: what the gate runs, the
+    command that overrode it, and the remedy."""
+    for name in ("decompose", "review"):
+        context = dict(RENDER_CONTEXTS[name])
+        context["config_override_example"] = config_override_example(["go"])
+        text = render(name, **context)
+        assert "go test ./..." in text and "-tags integration" in text, name
+        assert "[tool.mypy]" not in text, name
+    go = config_override_example(["go"])
+    assert "mypy" not in go
+    assert "```go" in go
+    for languages, marker in (
+        (None, "[tool.mypy]"),
+        ([], "[tool.mypy]"),
+        (["python"], "[tool.mypy]"),
+        (["typescript"], "tsconfig.json"),
+        (["node", "typescript"], "tsconfig.json"),
+        (["ruby"], "--force-exclusion"),
+        (["rust"], "[tool.mypy]"),
+        (["go", "python"], "go test ./..."),
+    ):
+        text = config_override_example(languages)
+        assert marker in text, (languages, marker)
+        assert "the remedy is re-authoring the command to the bare form" in text, languages
+        assert text.startswith("```"), languages
+
+
+DOMAIN_ANCHORS: tuple[str, ...] = (
+    # paths and build files of the loop's own repository
+    "packages/sbxloop",
+    "hatch_build",
+    "hatchling",
+    # the loop's chat bridge, and the field failure that used to be the example
+    "Discord",
+    "embeds",
+    "unfurl",
+    "preview card",
+    # issue and PR numbers from the loop's own history (a two-digit
+    # placeholder in a tool-call example is not one)
+    r"#\d{3,}",
+)
+# What only the pipeline templates may not say: the concierge is the loop's
+# own front desk and legitimately names its item ids and sandboxes.
+PIPELINE_ANCHORS: tuple[str, ...] = (
+    "sbxloop",
+    "resume-pending",
+    "gh:issue",
+    "gh:7",
+    "microVM",
+    "doctor",
+    "SQLite",
+)
+
+
+@pytest.mark.parametrize("name", sorted(RENDER_CONTEXTS))
+def test_prompt_bodies_stay_domain_neutral(name: str) -> None:
+    """#634: an example is a story the model pattern-matches against, and a
+    story about the loop's own repository is the wrong anchor for every
+    other one. No prompt body names an issue or PR number, a path or state
+    name from this repository, or its chat bridge; the rules stand on their
+    own phrasing, so any example can be swapped."""
+    source = (resources.files(prompts) / f"{name}.md").read_text()
+    body = _strip_contract_header(source)
+    anchors = DOMAIN_ANCHORS + (PIPELINE_ANCHORS if name != "concierge" else ())
+    for anchor in anchors:
+        hit = re.search(anchor, body)
+        assert hit is None, (
+            f"{name}.md: {anchor!r} at {body[max(0, hit.start() - 60) : hit.end() + 60]!r}"
+        )
 
 
 def test_render_contexts_cover_every_template_on_disk() -> None:
@@ -377,7 +465,9 @@ def test_registry_tiers_are_injected_not_hardcoded() -> None:
     hardcoded prompt list would drift, and a drifted list is a failed run —
     the decomposer either declares what needs no declaration or omits what
     does. Both tiers must reach both prompts from policy.py."""
-    decompose = render("decompose", outcome="o", max_tasks="3", project_gate="- gate rule")
+    decompose = render(
+        "decompose", outcome="o", max_tasks="3", project_gate="- gate rule", **EXAMPLE
+    )
     build = render("build", **build_context())
     for text in (decompose, build):
         for domain in BASELINE_REGISTRY_DOMAINS:
@@ -396,13 +486,14 @@ def test_render_missing_variable_fails_loudly() -> None:
 
 
 def test_retry_context_defaults_empty_and_substitutes() -> None:
-    base = render("decompose", outcome="o", max_tasks="3", project_gate="- gate rule")
+    base = render("decompose", outcome="o", max_tasks="3", project_gate="- gate rule", **EXAMPLE)
     retried = render(
         "decompose",
         outcome="o",
         max_tasks="3",
         project_gate="- gate rule",
         retry_context="TRY AGAIN",
+        **EXAMPLE,
     )
     assert "TRY AGAIN" not in base
     assert "TRY AGAIN" in retried

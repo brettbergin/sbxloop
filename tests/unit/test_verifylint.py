@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 
 from sbxloop.verifylint import (
+    CONFIG_SCOPED_TOOLS,
     GATE_DETECTORS,
     command_heads,
+    config_override_example,
+    config_override_problems,
     gate_rule,
     lint_verify_commands,
     node_script_runner,
@@ -906,3 +909,28 @@ class TestConfigOverrideRule:
         self._workspace(tmp_path, '[tool.mypy]\nfiles = ["src"]\n')
         monkeypatch.chdir(tmp_path)
         assert lint_verify_commands(["uv run mypy packages"], [])
+
+    def test_the_prompts_python_example_is_what_the_lint_flags(self, tmp_path: Path) -> None:
+        """#634: the worked example the decomposer reads (`uv run mypy .`
+        against `files = ["src"]`) is the very shape the lint rejects — the
+        prompt and the check tell one story."""
+        workspace = self._workspace(tmp_path, '[tool.mypy]\nfiles = ["src"]\n')
+        example = config_override_example(["python"])
+        assert '[tool.mypy]\nfiles = ["src"]' in example and "`uv run mypy .`" in example
+        (problem,) = lint_verify_commands(
+            ["uv run mypy ."], ["python"], uv_project=True, workspace=workspace
+        )
+        assert "OVERRIDES" in problem and "`uv run mypy`" in problem
+
+    def test_example_only_entries_never_fire(self, tmp_path: Path) -> None:
+        """The tsc / rubocop / go entries carry a worked example for their
+        ecosystem and no config sources: the lint reads none of their
+        project files yet, so a path handed to them is not a violation."""
+        (tmp_path / "tsconfig.json").write_text('{"include": ["src"]}', encoding="utf-8")
+        (tmp_path / ".rubocop.yml").write_text("AllCops:\n  Exclude:\n    - db/schema.rb\n")
+        for tool in ("tsc", "rubocop", "go"):
+            assert CONFIG_SCOPED_TOOLS[tool].sources == ()
+            assert CONFIG_SCOPED_TOOLS[tool].example is not None
+        assert config_override_problems("npx tsc --noEmit src/index.ts", tmp_path) == []
+        assert config_override_problems("bundle exec rubocop db/schema.rb", tmp_path) == []
+        assert config_override_problems("go test -tags integration ./...", tmp_path) == []
