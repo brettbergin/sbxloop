@@ -95,6 +95,13 @@ for the transport-level statement of the same rules.
 ## The security primitive: one run = two sandboxes
 
 Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`.
+Before either exists, the provisioner decides what the agent sandbox is *for*:
+`toolchains.resolve_languages` reads the workspace once — which toolchains
+(`[sandbox] languages`, else the manifests, else Python; `sandbox.languages`)
+and which series of each (`.python-version` / `requires-python`, `.nvmrc` /
+`engines.node`; one `sandbox.toolchain` event per versioned toolchain, #627).
+That single answer builds the installer allowlist, drives the worker
+install, and scopes the project gate, so none of them can disagree.
 The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
 without it, `pair.github` is `None`, `GH_TOKEN`

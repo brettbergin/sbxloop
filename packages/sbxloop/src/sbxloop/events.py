@@ -224,6 +224,11 @@ class HostEventTypes:
     # The language set this run provisions and where it came from
     # (config / detected from the workspace / the default) — #624.
     SANDBOX_LANGUAGES = "sandbox.languages"
+    # One per versioned toolchain the run provisions (#627): the series
+    # chosen and where it came from (a workspace declaration or the
+    # registry default), so a probe failure can be read against the
+    # interpreter the project asked for.
+    SANDBOX_TOOLCHAIN = "sandbox.toolchain"
     SANDBOX_READY = "sandbox.ready"
     SANDBOX_PREBAKED = "sandbox.prebaked"
     SANDBOX_CLEANUP = "sandbox.cleanup"

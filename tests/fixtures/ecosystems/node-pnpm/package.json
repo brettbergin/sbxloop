@@ -1,1 +1,1 @@
-{"name": "fixture", "packageManager": "pnpm@9.0.0", "scripts": {"check": "echo ok"}}
+{"name": "fixture", "packageManager": "pnpm@9.0.0", "engines": {"node": ">=20 <23"}, "scripts": {"check": "echo ok"}}

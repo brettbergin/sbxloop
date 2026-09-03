@@ -28,6 +28,9 @@ dependencies = [
     "structlog>=24.1",
     # `.rubocop.yml` / other YAML project files the verify lint reads (#628).
     "pyyaml>=6.0",
+    # `requires-python` is a PEP 440 specifier; the toolchain series a run
+    # provisions is chosen against it (#627).
+    "packaging>=24",
 ]
 
 [project.optional-dependencies]

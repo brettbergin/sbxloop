@@ -734,6 +734,9 @@ class LoopEngine:
                 # not the config's answer alone: the allowlist was built
                 # from it, and the install must match the allowlist.
                 languages=pair.languages.languages,
+                # And the series each was declared at (#627), so the
+                # install provisions the interpreter the project asked for.
+                versions=pair.languages.versions,
                 expect_prebaked=prebaked_expected,
             )
         ]
