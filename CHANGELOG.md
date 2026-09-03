@@ -258,6 +258,31 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **The config-override lint reads TypeScript and Ruby projects** (#628).
+  `verifylint.CONFIG_SCOPED_TOOLS` entries now say how their tool treats
+  an explicit path: the Python entries keep their include-set rule (a path
+  outside `[tool.mypy] files`, ruff `src`/`include` or pytest `testpaths`
+  overrides it; one inside only narrows the run), `rubocop` gains an
+  *exclude* rule (a file named on the command line is inspected even when
+  `AllCops/Exclude` in `.rubocop.yml` lists it — what `--force-exclusion`
+  exists to switch off — while a directory argument is still filtered) and
+  `tsc` a *whole* rule (any input file makes it ignore `tsconfig.json`
+  entirely; `-b`/`--build` takes projects and disarms it). Config sources
+  may be YAML (`pyyaml` is a new runtime dependency), a source with no key
+  is satisfied by the file's presence, `npx`/`npm exec`/`pnpm exec`/
+  `pnpm`/`yarn`/`bundle exec`/`dotnet` prefixes are seen through like
+  `uv run`, Go/Rust/TypeScript/Ruby/Java/C# file suffixes and directory
+  names (`cmd`, `pkg`, `internal`, `spec`, `crates`) read as paths, and
+  the suggested bare form keeps the command's flags (`uv run mypy --strict packages` → `uv run mypy --strict`). The worked example each entry
+  renders into the prompts (#634) is now asserted to be exactly what the
+  lint flags, and the ecosystem fixtures gain a `lint` column. Deliberately
+  *not* added: eslint and golangci-lint. The issue asked for `npx eslint src` against `eslint.config.js` and `golangci-lint run ./pkg/...` against
+  `.golangci.yml` to be flagged, but both tools keep applying their
+  configured ignores to command-line paths (eslint flat config's
+  `ignores`; golangci-lint v2's `exclusion_paths`, the v1 explicit-directory
+  carve-out is gone), so those commands are narrowings, and flagging them
+  would reject a correct verify command.
+
 - **Toolchains are detected from the workspace** (#624, #616, #644). A run
   with `[sandbox] languages` unset now provisions what the repository
   declares — `go.mod` selects Go, `package.json` JavaScript, `Cargo.toml`

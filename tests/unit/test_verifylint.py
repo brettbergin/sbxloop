@@ -821,7 +821,7 @@ class TestConfigOverrideRule:
         (problem,) = lint_verify_commands(
             ["uv run ruff check packages"], ["python"], uv_project=True, workspace=workspace
         )
-        assert "ruff" in problem and "`uv run ruff`" in problem
+        assert "ruff" in problem and "`uv run ruff check`" in problem
         assert (
             lint_verify_commands(
                 ["uv run ruff check"], ["python"], uv_project=True, workspace=workspace
@@ -922,15 +922,160 @@ class TestConfigOverrideRule:
         )
         assert "OVERRIDES" in problem and "`uv run mypy`" in problem
 
-    def test_example_only_entries_never_fire(self, tmp_path: Path) -> None:
-        """The tsc / rubocop / go entries carry a worked example for their
-        ecosystem and no config sources: the lint reads none of their
-        project files yet, so a path handed to them is not a violation."""
-        (tmp_path / "tsconfig.json").write_text('{"include": ["src"]}', encoding="utf-8")
-        (tmp_path / ".rubocop.yml").write_text("AllCops:\n  Exclude:\n    - db/schema.rb\n")
-        for tool in ("tsc", "rubocop", "go"):
-            assert CONFIG_SCOPED_TOOLS[tool].sources == ()
-            assert CONFIG_SCOPED_TOOLS[tool].example is not None
-        assert config_override_problems("npx tsc --noEmit src/index.ts", tmp_path) == []
-        assert config_override_problems("bundle exec rubocop db/schema.rb", tmp_path) == []
+    def test_every_story_is_what_the_lint_flags(self, tmp_path: Path) -> None:
+        """Each entry's worked example (rendered into the prompts, #634) must
+        be a command the lint actually rejects against the example's own
+        config — otherwise the prompt teaches a rule the lint does not
+        enforce. The Go entry is the one deliberate exception: its override
+        is a build tag, which no config file declares, so it stays inert."""
+        for name, tool in CONFIG_SCOPED_TOOLS.items():
+            example = tool.example
+            if example is None:
+                continue
+            if not tool.sources:
+                assert name == "go"
+                continue
+            workspace = tmp_path / name
+            workspace.mkdir()
+            filename = tool.sources[0][0]
+            (workspace / filename).write_text(example.config, encoding="utf-8")
+            # Every story opens "The project gate runs `<bare>` … the task's
+            # verify command runs `<overriding>`".
+            gate, overriding = example.story.split("`")[1], example.story.split("`")[3]
+            assert config_override_problems(gate, workspace) == [], (name, gate)
+            (problem,) = config_override_problems(overriding, workspace)
+            assert name in problem, (name, problem)
         assert config_override_problems("go test -tags integration ./...", tmp_path) == []
+
+
+class TestConfigOverrideAcrossEcosystems:
+    """#628: the config-override lint beyond Python. Each entry names how its
+    tool treats an explicit path — an *include* set to override (mypy, ruff,
+    pytest), an *exclude* list a named file escapes (rubocop), or a config
+    the tool drops entirely when handed input files (tsc) — and the fixture
+    matrix in test_ecosystems.py runs the same lint per ecosystem."""
+
+    def test_tsc_with_input_files_ignores_tsconfig(self, tmp_path: Path) -> None:
+        (tmp_path / "tsconfig.json").write_text('{"include": ["src"]}', encoding="utf-8")
+        (problem,) = config_override_problems("npx tsc --noEmit src/index.ts", tmp_path)
+        assert "IGNORE" in problem and "tsconfig.json" in problem
+        assert "`npx tsc --noEmit`" in problem
+        assert "--project <file>" in problem
+
+    def test_tsc_bare_project_and_build_forms_are_accepted(self, tmp_path: Path) -> None:
+        (tmp_path / "tsconfig.json").write_text("{}", encoding="utf-8")
+        assert config_override_problems("npx tsc --noEmit", tmp_path) == []
+        assert config_override_problems("npx tsc -p tsconfig.build.json", tmp_path) == []
+        assert config_override_problems("tsc --project tsconfig.json --noEmit", tmp_path) == []
+        # `-b` takes project directories, not input files — nothing is
+        # overridden.
+        assert config_override_problems("pnpm exec tsc -b packages/web", tmp_path) == []
+        assert config_override_problems("tsc --build packages/web", tmp_path) == []
+
+    def test_tsc_without_a_tsconfig_has_nothing_to_override(self, tmp_path: Path) -> None:
+        assert config_override_problems("npx tsc --noEmit src/index.ts", tmp_path) == []
+
+    def test_rubocop_named_file_escapes_exclude(self, tmp_path: Path) -> None:
+        (tmp_path / ".rubocop.yml").write_text(
+            "AllCops:\n  Exclude:\n    - db/schema.rb\n    - 'lib/**/*_pb.rb'\n", encoding="utf-8"
+        )
+        (problem,) = config_override_problems("bundle exec rubocop db/schema.rb", tmp_path)
+        assert "excluded" in problem and "--force-exclusion" in problem
+        assert "`bundle exec rubocop`" in problem
+        (problem,) = config_override_problems("bundle exec rubocop lib/proto/order_pb.rb", tmp_path)
+        assert "lib/proto/order_pb.rb" in problem
+
+    def test_rubocop_directory_and_included_file_are_narrowing(self, tmp_path: Path) -> None:
+        (tmp_path / ".rubocop.yml").write_text(
+            "AllCops:\n  Exclude:\n    - db/schema.rb\n", encoding="utf-8"
+        )
+        (tmp_path / "db").mkdir()
+        assert config_override_problems("bundle exec rubocop app", tmp_path) == []
+        assert config_override_problems("bundle exec rubocop db", tmp_path) == []
+        assert config_override_problems("bundle exec rubocop app/models/order.rb", tmp_path) == []
+        assert config_override_problems("bundle exec rubocop", tmp_path) == []
+        assert config_override_problems("bundle exec rubocop -a --only Style/Foo", tmp_path) == []
+
+    def test_rubocop_erb_and_unparseable_config_fail_quiet(self, tmp_path: Path) -> None:
+        # An ERB'd entry cannot be matched from outside Ruby; nothing else
+        # in the list is affected.
+        (tmp_path / ".rubocop.yml").write_text(
+            'AllCops:\n  Exclude:\n    - <%= `git ls-files -z vendor`.split("\\0") %>\n'
+            "    - db/schema.rb\n",
+            encoding="utf-8",
+        )
+        assert config_override_problems("bundle exec rubocop vendor/x.rb", tmp_path) == []
+        assert config_override_problems("bundle exec rubocop db/schema.rb", tmp_path)
+        (tmp_path / ".rubocop.yml").write_text("AllCops: [\n", encoding="utf-8")
+        assert config_override_problems("bundle exec rubocop db/schema.rb", tmp_path) == []
+
+    def test_rubocop_dotfiles_and_dot_slash_prefixes(self, tmp_path: Path) -> None:
+        (tmp_path / ".rubocop.yml").write_text(
+            "AllCops:\n  Exclude:\n    - ./db/schema.rb\n    - '.bundle/**/*'\n",
+            encoding="utf-8",
+        )
+        assert config_override_problems("bundle exec rubocop ./db/schema.rb", tmp_path)
+        assert config_override_problems("bundle exec rubocop .bundle/config.rb", tmp_path)
+        assert config_override_problems("bundle exec rubocop .rubocop_todo.yml", tmp_path) == []
+
+    def test_rubocop_without_an_exclude_list_declares_nothing(self, tmp_path: Path) -> None:
+        (tmp_path / ".rubocop.yml").write_text("AllCops:\n  NewCops: enable\n", encoding="utf-8")
+        assert config_override_problems("bundle exec rubocop db/schema.rb", tmp_path) == []
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "npx tsc --noEmit src/index.ts",
+            "npm exec tsc -- --noEmit src/index.ts",
+            "pnpm exec tsc --noEmit src/index.ts",
+            "pnpm tsc --noEmit src/index.ts",
+            "yarn tsc --noEmit src/index.ts",
+            "yarn run tsc --noEmit src/index.ts",
+            "node_modules/.bin/tsc --noEmit src/index.ts",
+        ],
+    )
+    def test_node_runner_prefixes_reach_the_tool(self, tmp_path: Path, command: str) -> None:
+        (tmp_path / "tsconfig.json").write_text("{}", encoding="utf-8")
+        assert config_override_problems(command, tmp_path), command
+
+    def test_ruby_runner_prefixes_reach_the_tool(self, tmp_path: Path) -> None:
+        (tmp_path / ".rubocop.yml").write_text(
+            "AllCops:\n  Exclude:\n    - db/schema.rb\n", encoding="utf-8"
+        )
+        assert config_override_problems("bundle exec rubocop db/schema.rb", tmp_path)
+        assert config_override_problems("bin/rubocop db/schema.rb", tmp_path)
+
+    def test_wider_path_vocabulary(self, tmp_path: Path) -> None:
+        workspace = tmp_path
+        (workspace / "pyproject.toml").write_text(
+            '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n', encoding="utf-8"
+        )
+        # A Go / Rust / TS-flavoured word or suffix reads as a path even
+        # without a slash.
+        for word in ("cmd", "pkg", "internal", "spec", "crates", "main.go", "lib.rs", "app.ts"):
+            assert config_override_problems(f"uv run pytest {word}", workspace), word
+        assert config_override_problems("uv run pytest -k order", workspace) == []
+
+    def test_bare_form_keeps_flags_and_drops_only_paths(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text(
+            '[tool.mypy]\nfiles = ["src"]\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+            encoding="utf-8",
+        )
+        (problem,) = config_override_problems("uv run mypy --strict packages", tmp_path)
+        assert "`uv run mypy --strict`" in problem
+        (problem,) = config_override_problems(
+            "uv run pytest -q -p no:cacheprovider packages -k order", tmp_path
+        )
+        assert "`uv run pytest -q -p no:cacheprovider -k order`" in problem
+
+    def test_python_behaviour_is_unchanged(self, tmp_path: Path) -> None:
+        """The three Python entries keep their include-set semantics and
+        message: the field-failure case, narrowing inside the set, and the
+        bare form."""
+        (tmp_path / "pyproject.toml").write_text(
+            '[tool.mypy]\nfiles = ["packages/sbxloop/src"]\n', encoding="utf-8"
+        )
+        (problem,) = config_override_problems("uv run mypy packages", tmp_path)
+        assert "OVERRIDES" in problem and "only narrows the run" in problem
+        assert config_override_problems("uv run mypy packages/sbxloop/src/sbxloop", tmp_path) == []
+        assert config_override_problems("uv run mypy", tmp_path) == []

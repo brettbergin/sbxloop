@@ -480,7 +480,18 @@ command line; a Go build tag pulling an integration suite into `go test`),
 Python when none does, and the engine passes it as
 `$config_override_example`. The stories live beside the lint's
 `CONFIG_SCOPED_TOOLS` entries so a tool the lint learns to read gains its
-example in the same place.
+example in the same place. The lint itself reads beyond Python (#628): each
+entry names how its tool treats an explicit path — `include` (mypy `files`,
+ruff `src`/`include`, pytest `testpaths`: a path outside the declared set
+overrides it, one inside only narrows the run), `exclude` (rubocop: a file
+named on the command line is inspected even when `AllCops/Exclude` lists it,
+a directory is still filtered) or `whole` (tsc: any input file makes it drop
+`tsconfig.json` entirely; `-b`/`--build` takes projects, not files). Sources
+are TOML or YAML, and a source with no key is satisfied by the file's
+presence. `npx`, `pnpm exec`, `yarn`, `bundle exec` and `dotnet` are seen
+through like `uv run`. eslint and golangci-lint deliberately have no entry:
+both keep applying their configured ignores to paths given on the command
+line, so an explicit path there is a narrowing the lint must not reject.
 
 ## Persistence and resume
 

@@ -43,7 +43,9 @@ import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
+
+import yaml
 
 
 @dataclass(frozen=True)
@@ -688,7 +690,30 @@ class ConfigOverrideExample:
 #
 # The rule only fires when the project actually declares the key: a tool with
 # no configured file set is *supposed* to be given paths, and flagging that
-# would reject the only correct shape.
+# would reject the only correct shape. The same test decides which tools get
+# an entry at all (#628): each one below was checked against the tool's own
+# behaviour, and the ones an explicit path merely *narrows* stay out —
+# eslint's flat-config `files`/`ignores` still apply to a directory or file
+# named on the command line (an ignored file is skipped with a warning),
+# and golangci-lint v2 applies `linters.exclusions.paths` whatever paths
+# `run` is given (the v1 skip-dirs carve-out for explicitly named
+# directories is gone from v2's exclusion_paths processor). Flagging
+# `eslint src` or `golangci-lint run ./pkg/...` would reject a correct
+# narrowing with a rule that is false for the tool.
+#
+# Three shapes of override:
+#   include — the config names the file set; a path outside it is dragged
+#             in (mypy `files`, ruff `include`/`src`, pytest `testpaths`).
+#   exclude — the config names what to skip; a *file* named explicitly is
+#             inspected anyway (rubocop `AllCops/Exclude`: only
+#             `--force-exclusion` stops that; a directory argument is still
+#             filtered, so it is a narrowing).
+#   whole   — any input file on the command line makes the tool ignore its
+#             project file entirely (tsc and tsconfig.json: `include`,
+#             `compilerOptions`, `paths` alike).
+OverrideMode = Literal["include", "exclude", "whole"]
+
+
 @dataclass(frozen=True)
 class ConfigScopedTool:
     """A tool whose configured file set explicit path arguments override."""
@@ -696,7 +721,8 @@ class ConfigScopedTool:
     name: str
     # (config file, section, keys) triples consulted in order. Empty for a
     # tool the lint does not read yet: the entry then only carries the
-    # ecosystem's worked example for the prompts.
+    # ecosystem's worked example for the prompts. Empty *keys* mean the
+    # file's presence is the configuration (tsconfig.json for `tsc`).
     sources: tuple[tuple[str, str, tuple[str, ...]], ...]
     # Flags that consume the next word, so it is not a positional path.
     value_flags: frozenset[str]
@@ -709,6 +735,10 @@ class ConfigScopedTool:
     # The prompts' worked example of this tool's override, if it is the one
     # that stands for its ecosystem.
     example: ConfigOverrideExample | None = None
+    mode: OverrideMode = "include"
+    # Flags under which the invocation is a different shape altogether and
+    # the rule does not apply (`tsc -b <project>` names projects, not files).
+    disarm_flags: frozenset[str] = frozenset()
 
 
 _REMEDY = (
@@ -811,13 +841,34 @@ CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
             }
         ),
     ),
-    # The entries below carry no `sources` yet — the lint reads only the
-    # Python project files today — so they never fire; they hold the worked
-    # example the prompts render for their ecosystem (#634).
     "tsc": ConfigScopedTool(
         name="tsc",
-        sources=(),
-        value_flags=frozenset({"--project", "-p", "--outDir", "--target", "--module"}),
+        # Presence is the configuration: tsc reads tsconfig.json for the
+        # whole program, and input files on the command line drop it.
+        sources=(("tsconfig.json", "", ()),),
+        value_flags=frozenset(
+            {
+                "--project",
+                "-p",
+                "--outDir",
+                "--outFile",
+                "--rootDir",
+                "--target",
+                "-t",
+                "--module",
+                "-m",
+                "--moduleResolution",
+                "--lib",
+                "--types",
+                "--typeRoots",
+                "--baseUrl",
+                "--jsx",
+                "--declarationDir",
+                "--tsBuildInfoFile",
+            }
+        ),
+        mode="whole",
+        disarm_flags=frozenset({"-b", "--build"}),
         example=ConfigOverrideExample(
             language="typescript",
             fence="json",
@@ -840,8 +891,31 @@ CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
     ),
     "rubocop": ConfigScopedTool(
         name="rubocop",
-        sources=(),
-        value_flags=frozenset({"--config", "-c", "--only", "--except", "--format", "-f"}),
+        sources=((".rubocop.yml", "AllCops", ("Exclude",)),),
+        value_flags=frozenset(
+            {
+                "--config",
+                "-c",
+                "--only",
+                "--except",
+                "--format",
+                "-f",
+                "--out",
+                "-o",
+                "--require",
+                "-r",
+                "--cache",
+                "--cache-root",
+                "--fail-level",
+                "--init",
+                "--regenerate-todo",
+                "--stdin",
+                "-s",
+                "--server",
+                "--parallel-workers",
+            }
+        ),
+        mode="exclude",
         example=ConfigOverrideExample(
             language="ruby",
             fence="yaml",
@@ -858,6 +932,10 @@ CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
             ),
         ),
     ),
+    # No config sources: Go's own tools have no configured file set (the
+    # override there is a build tag, a flag) and golangci-lint honours its
+    # exclusions whatever paths it is given — see the module notes. The
+    # entry carries the ecosystem's worked example.
     "go": ConfigScopedTool(
         name="go",
         sources=(),
@@ -911,9 +989,61 @@ _RUNNER_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("pdm", "run"),
     ("hatch", "run"),
     ("pipenv", "run"),
+    ("npx",),
+    ("npm", "exec"),
+    ("pnpm", "exec"),
+    ("pnpm",),
+    ("yarn", "run"),
+    ("yarn",),
+    ("bundle", "exec"),
+    ("dotnet", "tool", "run"),
+    ("dotnet",),
 )
 # Directory names that read as a path even without a separator or extension.
-_PATHY_WORDS = frozenset({"src", "tests", "test", "packages", "lib", "app", "docs", "scripts", "."})
+_PATHY_WORDS = frozenset(
+    {
+        "src",
+        "tests",
+        "test",
+        "packages",
+        "lib",
+        "app",
+        "docs",
+        "scripts",
+        "cmd",
+        "internal",
+        "pkg",
+        "spec",
+        "crates",
+        ".",
+    }
+)
+_PATH_SUFFIXES = (
+    ".py",
+    ".pyi",
+    ".toml",
+    ".cfg",
+    ".txt",
+    ".go",
+    ".rs",
+    ".ts",
+    ".tsx",
+    ".mts",
+    ".cts",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".rb",
+    ".rake",
+    ".java",
+    ".kt",
+    ".cs",
+    ".php",
+    ".yml",
+    ".yaml",
+    ".json",
+)
 _GLOB_CHARS = ("/", "\\", "*", "?", "[")
 
 
@@ -929,17 +1059,20 @@ def _config_tables(workspace: Path, filename: str) -> dict[str, dict[str, object
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    if filename.endswith(".toml"):
+    if filename.endswith((".toml", ".yml", ".yaml")):
+        data: object
         try:
-            data = tomllib.loads(text)
-        except tomllib.TOMLDecodeError:
+            data = tomllib.loads(text) if filename.endswith(".toml") else yaml.safe_load(text)
+        except (tomllib.TOMLDecodeError, yaml.YAMLError):
+            return None
+        if not isinstance(data, dict):
             return None
         tables: dict[str, dict[str, object]] = {}
 
         def walk(node: dict[str, object], prefix: str) -> None:
             tables[prefix] = node
             for key, value in node.items():
-                if isinstance(value, dict):
+                if isinstance(value, dict) and isinstance(key, str):
                     walk(value, f"{prefix}.{key}" if prefix else key)
 
         walk(data, "")
@@ -955,8 +1088,16 @@ def _config_tables(workspace: Path, filename: str) -> dict[str, dict[str, object
 def _configured_file_set(
     workspace: Path, tool: ConfigScopedTool
 ) -> tuple[str, str, tuple[str, ...]] | None:
-    """``(config file, key, declared entries)`` for ``tool``, or None."""
+    """``(config file, key, declared entries)`` for ``tool``, or None.
+
+    A source with no keys is satisfied by the file's presence alone (the
+    ``whole`` mode: tsc drops tsconfig.json whatever it says).
+    """
     for filename, section, keys in tool.sources:
+        if not keys:
+            if (workspace / filename).is_file():
+                return filename, "", ()
+            continue
         tables = _config_tables(workspace, filename)
         if tables is None:
             continue
@@ -1010,7 +1151,34 @@ def _looks_like_path(word: str) -> bool:
         return True
     if word in _PATHY_WORDS:
         return True
-    return word.endswith((".py", ".pyi", ".toml", ".cfg", ".txt"))
+    return word.endswith(_PATH_SUFFIXES)
+
+
+def _drop_dot_slash(path: str) -> str:
+    while path.startswith("./"):
+        path = path[2:]
+    return path or "."
+
+
+def _matches_exclusion(path: str, pattern: str, workspace: Path) -> bool:
+    """Whether an explicitly named *file* falls under an exclusion glob.
+
+    Rubocop's ``Exclude`` globs are relative to the config's directory and
+    use ``**``; an entry with ERB in it cannot be evaluated here and is
+    skipped. A directory argument is not an override — the tool expands it
+    and applies the exclusions inside — so it never matches.
+    """
+    if "<%" in pattern:
+        return False
+    clean = _drop_dot_slash(_normalise_path_arg(path))
+    if clean == "." or (workspace / clean).is_dir():
+        return False
+    target = PurePosixPath(clean)
+    glob = _drop_dot_slash(pattern.rstrip("/"))
+    try:
+        return target.full_match(glob) or target == PurePosixPath(glob)
+    except ValueError:
+        return False
 
 
 def _explicit_path_arguments(command: str, tool: ConfigScopedTool) -> list[str]:
@@ -1026,6 +1194,10 @@ def _explicit_path_arguments(command: str, tool: ConfigScopedTool) -> list[str]:
         if index is None:
             continue
         rest = words[index + 1 :]
+        if any(
+            word in tool.disarm_flags or word.split("=", 1)[0] in tool.disarm_flags for word in rest
+        ):
+            continue
         i = 0
         while i < len(rest):
             word = rest[i]
@@ -1078,6 +1250,43 @@ def config_override_problems(command: str, workspace: Path | None) -> list[str]:
         if declared is None:
             continue
         filename, key, entries = declared
+        bare = _bare_form(command, tool.name)
+        if tool.mode == "whole":
+            shown = ", ".join(f"`{path}`" for path in paths)
+            problems.append(
+                f"verify command `{command}` names input file(s) {shown} for "
+                f"`{tool.name}` — this project configures {tool.name} in "
+                f"`{filename}`, and input files on the command line make "
+                f"{tool.name} IGNORE that file entirely (its `include`, "
+                f"`compilerOptions` and `paths` alike), so the command checks a "
+                f"different program from the one the project builds and can fail "
+                f"on work that is correct. Drop the path(s) and use the bare "
+                f"form: `{bare}` (a different project file is `--project "
+                f"<file>`, never a list of inputs)"
+            )
+            continue
+        if tool.mode == "exclude":
+            overridden = [
+                path
+                for path in paths
+                if any(_matches_exclusion(path, entry, root) for entry in entries)
+            ]
+            if not overridden:
+                continue
+            shown = ", ".join(f"`{path}`" for path in overridden)
+            excluded = ", ".join(f"`{entry}`" for entry in entries)
+            problems.append(
+                f"verify command `{command}` names {shown} explicitly for "
+                f"`{tool.name}` — this project excludes it in `{filename}` "
+                f"(`{key}` = {excluded}), and a file named on the command line "
+                f"is inspected even when excluded (that is what "
+                f"`--force-exclusion` exists to switch off), so the command "
+                f"checks a file the project deliberately excludes — generated "
+                f"code, usually — and can fail on work that is correct. Drop the "
+                f"path and use the bare form: `{bare}` (a directory argument is "
+                f"fine — the exclusions still apply inside it)"
+            )
+            continue
         # A path already inside the configured set only narrows the run: it
         # cannot pull in a file the project excludes, which is the whole
         # failure this rule guards. `uv run pytest tests/unit` and `uv run
@@ -1087,7 +1296,6 @@ def config_override_problems(command: str, workspace: Path | None) -> list[str]:
         outside = [path for path in paths if not any(_is_inside(path, entry) for entry in entries)]
         if not outside:
             continue
-        bare = _bare_form(command, tool.name)
         shown = ", ".join(f"`{path}`" for path in outside)
         configured = ", ".join(f"`{entry}`" for entry in entries) or f"`{key}`"
         problems.append(
@@ -1104,15 +1312,35 @@ def config_override_problems(command: str, workspace: Path | None) -> list[str]:
 
 
 def _bare_form(command: str, tool: str) -> str:
-    """The command's own invocation of ``tool`` with its path arguments gone."""
+    """The command's own invocation of ``tool`` with its path arguments gone
+    — the flags stay (`npx tsc --noEmit src/index.ts` → `npx tsc --noEmit`),
+    so the remedy is the command the author meant, minus the override."""
+    scoped = CONFIG_SCOPED_TOOLS.get(tool)
     for segment in _SEGMENT_SPLIT.split(command):
         try:
             words = shlex.split(segment)
         except ValueError:
             words = segment.split()
         index = _tool_index(words, tool)
-        if index is not None:
-            return " ".join(words[: index + 1])
+        if index is None:
+            continue
+        kept = words[: index + 1]
+        rest = words[index + 1 :]
+        i = 0
+        while i < len(rest):
+            word = rest[i]
+            if word.startswith("-"):
+                kept.append(word)
+                if scoped is not None and "=" not in word and word in scoped.value_flags:
+                    kept.extend(rest[i + 1 : i + 2])
+                    i += 2
+                    continue
+            elif (
+                scoped is not None and (word in scoped.subcommands or word in scoped.benign_args)
+            ) or not _looks_like_path(word):
+                kept.append(word)
+            i += 1
+        return shlex.join(kept)
     return tool
 
 
