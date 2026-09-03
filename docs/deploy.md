@@ -189,11 +189,14 @@ is the control.
 ## Relationship to `version_status`
 
 The concierge's `version_status` tool and the startup drift line report when a host is
-behind PyPI; the upgrade paths above are what stops it happening. They stay complementary:
-the concierge deliberately cannot upgrade anything, and on a host without the workflow its
-`pip install --upgrade` advice is exactly right. On a host *with* the workflow, a drift line
-means the deploy did not run or did not succeed — check the workflow's last run before
-upgrading by hand, or the next scheduled deploy will roll you somewhere you did not expect.
+behind PyPI; the upgrade paths above are what stops it happening. The concierge deliberately
+cannot upgrade anything. On a host upgraded by hand, set `[daemon] upgrade_command` to the
+two-command path (or whatever wraps it) so the notice tells the operator exactly what to run.
+On a host *with* the workflow, set `[daemon] version_check = false`: the workflow is what
+keeps the host current, a hand upgrade in between would be rolled to wherever the next
+scheduled deploy lands, and the notice would only ever advise exactly that — so the host
+makes no PyPI request and gives no advice, and a stale host shows up in the workflow's run
+history instead.
 
 ## Multiple repositories on one host
 

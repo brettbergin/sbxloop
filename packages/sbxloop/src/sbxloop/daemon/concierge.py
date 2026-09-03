@@ -703,11 +703,12 @@ class Concierge:
                     description=(
                         "Is this daemon running current code? Reports the installed sbxloop, "
                         "sbxloop-worker and sbx versions, the latest sbxloop/sbxloop-worker "
-                        "releases on PyPI, and whether the host is behind. Every merge to the "
-                        "project's main branch publishes a patch, while deploying to this host "
-                        "is manual, so drift is normal and worth checking. You cannot upgrade "
-                        "anything — that is a human step on the daemon host — so report what "
-                        "you find and say who has to act."
+                        "releases on PyPI (unless the operator switched that check off), and "
+                        "whether the host is behind. sbxloop's own releases ship frequently, "
+                        "while upgrading this host is an operator's step, so drift is normal "
+                        "and worth checking. You cannot upgrade anything — the report says "
+                        "what upgrading takes on the daemon host — so report what you find "
+                        "and say who has to act."
                     ),
                     parameters=_schema({}),
                 ),

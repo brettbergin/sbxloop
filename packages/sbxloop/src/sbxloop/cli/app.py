@@ -1471,22 +1471,40 @@ def init(
         bool,
         typer.Option("--stdout", help="Print the template instead of writing sbxloop.toml."),
     ] = False,
+    preset: Annotated[
+        str | None,
+        typer.Option(
+            "--preset",
+            help=(
+                "Append a packaged preset's live sections to the template, e.g. "
+                "`large-repo` for a repository whose gate takes minutes."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Write a commented sbxloop.toml with the default configuration.
 
     The template is `sbxloop.toml.example`, shipped as package data and
     published at the repository root — one source of truth, so the example
-    file and this command cannot drift.
+    file and this command cannot drift. `--preset NAME` appends the packaged
+    `presets/NAME.toml` (live sections, every table in the template is
+    commented out) so the result is one self-contained file.
     """
+    try:
+        text = render_config_template(preset)
+    except KeyError:
+        available = ", ".join(sorted(config_presets())) or "none"
+        console.print(f"unknown preset {preset!r} (available: {available})")
+        raise typer.Exit(2) from None
     if to_stdout:
         # bare TOML on stdout, nothing else — `sbxloop init --stdout > f.toml`
-        sys.stdout.write(DEFAULT_CONFIG_TOML)
+        sys.stdout.write(text)
         return
     path = Path("sbxloop.toml")
     if path.exists() and not force:
         console.print("sbxloop.toml already exists (use --force to overwrite)")
         raise typer.Exit(2)
-    path.write_text(DEFAULT_CONFIG_TOML)
+    path.write_text(text)
     console.print(f"wrote {path}")
 
 
@@ -1838,7 +1856,11 @@ def daemon(
         source.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so
     # the concierge's first `version_status` answers without a network call.
-    versions = VersionProbe(sbx=sbx)
+    versions = VersionProbe(
+        sbx=sbx,
+        check_pypi=config.daemon.version_check,
+        upgrade_command=config.daemon.upgrade_command,
+    )
     bridge: ChatBridge | None = None
     concierge: Concierge | None = None
     bridge = build_bridge(config, dstore, loop_ref=loop)
@@ -1895,12 +1917,19 @@ def daemon(
             bridge.concierge = concierge
             concierge.warm_up()
 
-    if not once:
-        # Merges to main auto-release a patch; deploying here is manual, so a
-        # long-lived daemon drifts behind silently. Check once in the
-        # background (never on the startup path) and narrate it only when
-        # behind — nobody has to remember to ask. `sbx_control`'s concierge
-        # tool `version_status` answers the same question on demand.
+    if not once and not config.daemon.version_check:
+        # #641: the operator switched the PyPI half off — no request leaves
+        # the host for it, and no advice is given that a pipeline or a mirror
+        # pin would contradict. The concierge's `version_status` still
+        # answers with the installed half.
+        log.info("versions.check_disabled")
+    elif not once:
+        # sbxloop's releases ship often while upgrading a host is an
+        # operator's step, so a long-lived daemon drifts behind silently.
+        # Check once in the background (never on the startup path) and
+        # narrate it only when behind — nobody has to remember to ask.
+        # `sbx_control`'s concierge tool `version_status` answers the same
+        # question on demand.
         start_drift_check(
             versions,
             (
@@ -2350,6 +2379,33 @@ def doctor(
 DEFAULT_CONFIG_TOML = (
     resources.files("sbxloop.data").joinpath("sbxloop.toml.example").read_text(encoding="utf-8")
 )
+
+
+def config_presets() -> dict[str, str]:
+    """The packaged `init --preset` fragments by name, from `sbxloop/data/presets`.
+
+    Package data, not a checkout path, so `sbxloop init --preset` works from a
+    wheel (#636) and nothing `init` writes points outside the user's project.
+    """
+    folder = resources.files("sbxloop.data").joinpath("presets")
+    return {
+        entry.name.removesuffix(".toml"): entry.read_text(encoding="utf-8")
+        for entry in folder.iterdir()
+        if entry.name.endswith(".toml")
+    }
+
+
+def render_config_template(preset: str | None = None) -> str:
+    """The template `sbxloop init` writes, with a preset's sections appended.
+
+    Every table in the template is commented out, so appending a preset's
+    live `[budgets]`/`[limits]` yields valid TOML. Raises KeyError for a
+    preset name the package does not ship.
+    """
+    if preset is None:
+        return DEFAULT_CONFIG_TOML
+    fragment = config_presets()[preset]
+    return DEFAULT_CONFIG_TOML.rstrip("\n") + "\n\n" + fragment
 
 
 def main() -> None:

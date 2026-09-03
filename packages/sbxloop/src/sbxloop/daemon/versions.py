@@ -1,24 +1,31 @@
 """Installed versus latest: is this daemon running current code?
 
-Every merge to ``main`` auto-releases a patch of both distributions to PyPI
-(``RELEASING.md``) while deploying to a daemon host is manual, so a long-lived
-daemon drifts behind silently. This module is the one place that knows the
-difference: the concierge's ``version_status`` tool renders :meth:`
-VersionProbe.summary` on demand, and the daemon posts :meth:`
-VersionProbe.drift_notice` to the control channel once at startup when it is
-behind — a tool only helps the people who think to ask.
+sbxloop's own releases ship frequently (``RELEASING.md``) while upgrading a
+daemon host is an operator's step, so a long-lived daemon drifts behind
+silently. This module is the one place that knows the difference: the
+concierge's ``version_status`` tool renders :meth:`VersionProbe.summary` on
+demand, and the daemon posts :meth:`VersionProbe.drift_notice` to the control
+channel once at startup when it is behind — a tool only helps the people who
+think to ask.
 
 This is the **only outbound HTTP the host itself makes** apart from the
-optional Discord bridge; everything else, all GitHub access included, is
-deliberately proxied through a sandbox (see :mod:`sbxloop.gh.ops`). The
-request is unauthenticated and carries no credential, so the credential split
-is untouched. It is bounded by a short timeout and a response cap, memoised
-for :data:`PYPI_TTL_S`, and every failure degrades to "could not reach PyPI"
-rather than raising: a version report is a nicety, never a reason to break a
-turn or delay a daemon start.
+optional chat bridge and ``daemon notify``; everything else, all GitHub access
+included, is deliberately proxied through a sandbox (see :mod:`sbxloop.gh.ops`).
+The request is unauthenticated and carries no credential, so the credential
+split is untouched. It is bounded by a short timeout and a response cap,
+memoised for :data:`PYPI_TTL_S`, and every failure degrades to "could not reach
+PyPI" rather than raising: a version report is a nicety, never a reason to
+break a turn or delay a daemon start. ``[daemon] version_check = false``
+switches the PyPI half off entirely (#641) — an air-gapped or mirror-pinned
+host, or one a deploy pipeline keeps current, makes no request and hears no
+advice; the installed half still answers.
 
 Upgrading is deliberately not here. A daemon that upgrades and restarts
-itself mid-run is a different, riskier feature.
+itself mid-run is a different, riskier feature. What the operator runs to
+upgrade depends on how sbxloop was installed — pip in a venv, pipx, ``uv
+tool``, a container image, a deploy pipeline — so the advice names
+``[daemon] upgrade_command`` when the operator set one and otherwise says
+exactly that (#638).
 """
 
 from __future__ import annotations
@@ -211,11 +218,18 @@ class VersionProbe:
         clock: Callable[[], float] = time.monotonic,
         fetch: Callable[[str], str | None] = fetch_latest,
         sbx_timeout_s: float = 5.0,
+        check_pypi: bool = True,
+        upgrade_command: str | None = None,
     ) -> None:
         self.sbx = sbx
         self.clock = clock
         self.fetch = fetch
         self.sbx_timeout_s = sbx_timeout_s
+        # `[daemon] version_check`: False never calls `fetch`, so the host
+        # makes no request and every "latest" reads as unknown-by-choice.
+        self.check_pypi = check_pypi
+        # `[daemon] upgrade_command`: what the advice tells the operator to run.
+        self.upgrade_command = upgrade_command
         self._latest: dict[str, tuple[float, str]] = {}
         self._lock = threading.Lock()
 
@@ -250,6 +264,10 @@ class VersionProbe:
         return version, ""
 
     def latest(self, name: str) -> str | None:
+        """The newest release of ``name``, memoised; ``None`` when PyPI could
+        not be reached — or was never asked (``check_pypi`` off)."""
+        if not self.check_pypi:
+            return None
         now = self.clock()
         with self._lock:
             cached = self._latest.get(name)
@@ -278,7 +296,8 @@ class VersionProbe:
             newest = self.latest(name)
             if newest is None:
                 unreachable = True
-                lines.append(f"{name:<15} {mine} installed · could not reach PyPI")
+                why = "PyPI not checked" if not self.check_pypi else "could not reach PyPI"
+                lines.append(f"{name:<15} {mine} installed · {why}")
                 continue
             verdict = compare(mine, newest)
             note = {
@@ -301,18 +320,35 @@ class VersionProbe:
                 "The installed version reads 0.0.0, which means this tree was never built — "
                 "no upgrade advice follows from it."
             )
-        if unreachable:
+        if unreachable and not self.check_pypi:
+            lines.append(
+                "The release check is off on this host ([daemon] version_check = false), so "
+                "'latest' was not looked up; the installed versions are still accurate. Whether "
+                "an upgrade is due is the operator's call, not something to infer from here."
+            )
+        elif unreachable:
             lines.append(
                 "Could not reach PyPI, so 'latest' is unknown for the rows above that say so; "
                 "the installed versions are still accurate."
             )
         if stale:
             lines.append(
-                "This daemon keeps running the code it started with. Upgrading is a human step "
-                "on the daemon host — `pip install --upgrade sbxloop` (which pulls the pinned "
-                "worker with it), then restart the daemon. You cannot do it from here: say so."
+                "This daemon keeps running the code it started with. Upgrading is an "
+                f"operator's step on the daemon host — {self.upgrade_hint()}, then restart "
+                "the daemon. You cannot do it from here: say so."
             )
         return "\n".join(lines)
+
+    def upgrade_hint(self) -> str:
+        """What the operator runs to upgrade, as a clause. Names
+        ``[daemon] upgrade_command`` when one is set; otherwise says the
+        command depends on the install method rather than guessing one."""
+        if self.upgrade_command:
+            return f"run `{self.upgrade_command}`"
+        return (
+            "the exact command depends on how sbxloop was installed (pip in a venv, pipx, "
+            "`uv tool`, a container image, a deploy pipeline)"
+        )
 
     def drift_notice(self) -> str | None:
         """One line for the control channel at startup, or ``None`` when this
@@ -326,8 +362,8 @@ class VersionProbe:
         gap_text = f", {gap} patch release{'s' if gap != 1 else ''} behind" if gap else ""
         return (
             f"⚠️ this daemon is running sbxloop {mine}; PyPI has {newest}{gap_text}. "
-            "Upgrade on the host with `pip install --upgrade sbxloop` and restart the daemon "
-            "— it keeps running the code it started with until then."
+            f"Upgrading is an operator's step on the host — {self.upgrade_hint()} — then "
+            "restart the daemon; it keeps running the code it started with until then."
         )
 
 

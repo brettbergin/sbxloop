@@ -11,9 +11,10 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import pytest
 from pydantic import BaseModel
 
-from sbxloop.cli.app import DEFAULT_CONFIG_TOML
+from sbxloop.cli.app import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 from sbxloop.config import Config, load_dotenv_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +71,82 @@ def test_sbxloop_init_renders_the_example_file(tmp_path: Path, monkeypatch: Any)
     written = (tmp_path / "sbxloop.toml").read_text()
     assert _key_paths(tomllib.loads(written)) == _key_paths(tomllib.loads(EXAMPLE.read_text()))
     assert written == EXAMPLE.read_text()
+
+
+PRESETS_DIR = REPO_ROOT / "packages" / "sbxloop" / "src" / "sbxloop" / "data" / "presets"
+
+
+class TestPresets:
+    """#636: presets are package data, applied by `sbxloop init --preset`, so
+    they work from a wheel and nothing `init` writes points at a checkout."""
+
+    def test_presets_ship_as_package_data_and_the_contrib_path_is_an_alias(self) -> None:
+        assert (PRESETS_DIR / "large-repo.toml").is_file()
+        assert config_presets().keys() == {"large-repo"}
+        alias = REPO_ROOT / "contrib" / "presets" / "large-repo.toml"
+        assert alias.is_symlink()
+        assert alias.resolve() == (PRESETS_DIR / "large-repo.toml").resolve()
+
+    def test_every_preset_is_a_valid_config_on_its_own_and_appended(self) -> None:
+        for name, fragment in config_presets().items():
+            Config.model_validate(tomllib.loads(fragment))
+            merged = tomllib.loads(render_config_template(name))
+            Config.model_validate(merged)
+            # the template's own tables are all commented, so the preset's
+            # live sections are the only ones and survive the merge intact
+            for table, values in tomllib.loads(fragment).items():
+                assert merged[table] == values, (name, table)
+
+    def test_large_repo_preset_sizes_for_a_slow_gate(self) -> None:
+        config = Config.model_validate(tomllib.loads(render_config_template("large-repo")))
+        assert config.budgets.max_wall_clock_s == 14400.0
+        assert config.budgets.max_tool_calls_per_phase == 80
+        assert config.limits.mem_abort == 97.0
+        header = config_presets()["large-repo"]
+        assert "two minutes or more" in header  # framed by measured gate duration
+        assert "sbxloop init --preset large-repo" in header
+
+    def test_nothing_init_writes_references_a_path_outside_the_project(self) -> None:
+        for name in (None, *config_presets()):
+            text = render_config_template(name)
+            for needle in ("contrib/", "packages/sbxloop", "#25"):
+                assert needle not in text, (name, needle)
+
+    def test_unknown_preset_is_a_key_error(self) -> None:
+        with pytest.raises(KeyError):
+            render_config_template("not-a-preset")
+
+    def test_sbxloop_init_preset_writes_one_self_contained_file(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from sbxloop.cli.app import app
+
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(app, ["init", "--preset", "large-repo"])
+        assert result.exit_code == 0, result.output
+        written = (tmp_path / "sbxloop.toml").read_text()
+        assert written == render_config_template("large-repo")
+        assert written.startswith(EXAMPLE.read_text().rstrip("\n"))
+        assert Config.model_validate(tomllib.loads(written)).budgets.max_wall_clock_s == 14400.0
+        streamed = CliRunner().invoke(app, ["init", "--stdout", "--preset", "large-repo"])
+        assert streamed.exit_code == 0, streamed.output
+        assert streamed.output == written
+
+    def test_sbxloop_init_rejects_an_unknown_preset_before_writing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from sbxloop.cli.app import app
+
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(app, ["init", "--preset", "huge-repo"])
+        assert result.exit_code == 2, result.output
+        assert "unknown preset 'huge-repo'" in result.output
+        assert "large-repo" in result.output  # names what does exist
+        assert not (tmp_path / "sbxloop.toml").exists()
 
 
 # Derived internals the engine sets on a narrowed config; never configured.

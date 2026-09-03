@@ -94,8 +94,10 @@ Rolling back is just deploying the older version — the workflow pins exactly. 
 fails *and* its rollback fails, the job says `ROLLBACK ALSO FAILED — db needs a human`; fix
 by hand with the two commands in the generic guide, from `~/sbxloop-work`.
 
-A `version_status` drift line from the concierge on this host means the **Deploy the
-daemon** workflow did not run or did not succeed — check it before upgrading by hand.
+Set `[daemon] version_check = false` in this host's `sbxloop.toml` (#641): the pipeline keeps it current,
+so the daemon neither asks PyPI nor advises a hand upgrade the next deploy would undo. A
+stale host shows up as a failed or skipped **Deploy the daemon** run — check that, not the
+concierge.
 
 ## Cutovers
 

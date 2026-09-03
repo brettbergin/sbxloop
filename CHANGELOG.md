@@ -69,6 +69,31 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Changed
 
+- **The version story no longer assumes the user's repository publishes
+  sbxloop** (#638). The concierge prompt, the `version_status` tool
+  description and `daemon/versions.py` said "the main branch publishes a
+  release on every merge" and told the operator to
+  `pip install --upgrade` in a venv — sbxloop's own release cadence and its
+  own install layout, presented to every host. They now say that
+  sbxloop's releases ship frequently while upgrading a host is an
+  operator's step, and the upgrade instruction renders from
+  `[daemon] upgrade_command` when set — otherwise "the exact command
+  depends on how sbxloop was installed (pip in a venv, pipx, `uv tool`, a
+  container image, a deploy pipeline)". The prompt's "the configured
+  repository" is now "a configured repository" (there may be several).
+
+- **The large-repo preset is package data, framed by gate duration**
+  (#636). `contrib/presets/large-repo.toml` moved to
+  `sbxloop/data/presets/large-repo.toml` inside the wheel (the contrib
+  path is a symlink to it), and its header no longer cites sbxloop's own
+  numbers as the reference case: the trigger is a repository whose gate
+  command takes two minutes or more, whatever its size. The template's
+  `[budgets]` comment and the README point at
+  `sbxloop init --preset large-repo` instead of a checkout path, so
+  nothing `sbxloop init` writes references a file outside the user's
+  project. (Recording observed gate duration so a second run self-sizes
+  its budgets stays a separate follow-up.)
+
 - **The deploy pipeline reads structured control, not files** (#639).
   `deploy.yml` drives the daemon with `ctl status --json` + `jq` and posts
   with `daemon notify`; no step sources `secrets.env`, parses
@@ -79,6 +104,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   the daemon to go idle" *before installing anything*. Upgrade once by hand
   (contrib/systemd/README.md, "Upgrading"); every deploy after that is
   unattended again.
+
 - **The deploy host is one variable** (#640). `deploy.yml` targets
   `runs-on: [self-hosted, "${{ vars.SBXLOOP_DEPLOY_HOST || 'db' }}"]` and
   derives every path from `$HOME` (job-level `env:` values are literals, so
@@ -90,6 +116,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   `workflow_dispatch`, installs from PyPI, names nothing), and
   `test_deploy_workflow.py` checks both files for the security invariant,
   the extras parity and the absence of names.
+
 - **Deploy docs split** (#642). `docs/deploy.md` is now the generic "run the
   daemon as a service and upgrade it" guide — no hostnames, usernames or
   repository slugs, enforced by a test — and `docs/self-deploy.md` the
@@ -101,6 +128,28 @@ All notable changes to sbxloop are documented here. The project adheres to
   1.0 cutover steps moved from `docs/deploy.md` to this file (below).
 
 ### Added
+
+- **`[daemon] version_check` and `[daemon] upgrade_command`** (#641, #638).
+  `version_check = false` switches the PyPI release lookup off for the
+  whole daemon — no startup drift check, no drift notice, and the
+  concierge's `version_status` reports the installed versions without
+  looking "latest" up (zero outbound HTTP, alongside the existing `.dev`
+  skip) — for hosts a pipeline upgrades, which retires the contradiction
+  between `docs/deploy.md` and the drift notice. `upgrade_command`
+  (e.g. `"pipx upgrade sbxloop"`) is what the drift notice and the
+  concierge's report tell the operator to run; unset, they say the command
+  depends on how sbxloop was installed. Both are `SBXLOOP_DAEMON__*`
+  overridable; a blank `upgrade_command` is a config error. Operators of
+  the self-deploy pipeline in `docs/self-deploy.md`: set
+  `version_check = false` on that host.
+
+- **`sbxloop init --preset NAME`** (#636) appends a packaged preset's live
+  sections to the starter file (`--stdout` streams the same), so
+  `sbxloop init --preset large-repo` yields one self-contained
+  `sbxloop.toml` from a wheel with no checkout around. Every table in the
+  template is commented out, so the appended `[budgets]`/`[limits]` are
+  the only live ones. An unknown name exits 2 naming the presets that
+  exist.
 
 - **`sbxloop daemon ctl status --json`** (#639) — the daemon's status as one
   JSON object (`current`, `claiming`, `holds`, `paused`, `queued`, …) for
