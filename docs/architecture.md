@@ -363,7 +363,16 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   `followup_label`, **never** the trigger label — the 1.0 rule that the
   loop files no work of its own stands; a human promotes a follow-up.
   `followups = "comment"` posts one checklist comment on the PR instead;
-  `"off"` drops them.
+  `"off"` drops them. A repository with Issues disabled (#631) downgrades
+  `issues` to that comment — decided up front from `has_issues` on the
+  payload the delivery probe already fetched (`RepositoryProbe`), or on
+  the spot from the 410 GitHub answers the first filing with — and the
+  `run.followups` event carries `downgraded_from` / `reason`. The
+  crash-window dedup reads the label's issue list, which lists pull
+  requests too; those are skipped so a labelled PR never suppresses an
+  issue. The body's "add the trigger label" instruction is written only
+  when a daemon dispatched the run (`LoopEngine(trigger_label=…)`, set
+  by the daemon loop from the repository's effective label).
 
 Two round budgets bound the fix loop: `[landing] max_review_rounds` for
 verdicts that request changes, `max_ci_rounds` for the mechanical failures
@@ -792,8 +801,10 @@ the section carries delivery settings but names no repository at all.
 The split is deliberate and worth stating plainly:
 
 - **Per repository** — base branch (`deliver_base`), repo creation
-  (`create_repo`, `create_public`), the trigger label
-  (`trigger_label`), extra `labels`, the `enabled` switch, the token
+  (`create_repo`, `create_public`), every lifecycle label
+  (`trigger_label` … `gated_label`; `Config.labels_for(repo)` folds the
+  `[daemon]` defaults in and `sbxloop init-repo` creates them, #630),
+  extra `labels`, the `enabled` switch, the token
   environment variable (`token_env`), and the **workspace** the repo's
   runs clone from (`workspace`).
 - **Daemon-wide** — the calendar-day run cap (`max_runs_per_day`), the

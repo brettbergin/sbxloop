@@ -63,6 +63,7 @@ from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_doten
 from sbxloop.deliver import deliver_workspace, ensure_repository, render_naming
 from sbxloop.engine.checks import CheckJudgment, check_policy_reader, read_check_policy
 from sbxloop.engine.followups import (
+    Candidate,
     checklist_comment,
     collect_followups,
     issue_body,
@@ -143,6 +144,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gc import workspace_pruned
+from sbxloop.gh.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
 from sbxloop.gh.ops import (
     FailedCheck,
     GithubOps,
@@ -235,6 +237,10 @@ class Pipeline:
     # The previous attempt's still-open pull request, reattached to rather
     # than opening a second one for the same head.
     prior_pr: int | None = None
+    # Whether the repository has Issues enabled, from the up-front probe
+    # (#631): False downgrades follow-up filing to the PR comment; None when
+    # the probe could not say (the 410 on the first filing then decides).
+    issues_enabled: bool | None = None
 
 
 class LoopEngine:
@@ -250,11 +256,17 @@ class LoopEngine:
         install_workers: bool | None = None,
         clock: Callable[[], float] = time.monotonic,
         github_ops: GithubOpsFactory | None = None,
+        trigger_label: str | None = None,
     ) -> None:
         # Library parity with the CLI: a ./.env supplies tokens/settings even
         # when the caller passes a prebuilt Config (real env vars still win).
         load_dotenv_file()
         self.config = config or load_config()
+        # The daemon's trigger label for this run's repository, set only when
+        # a daemon dispatched the run (#631): follow-up issues then tell the
+        # reader which label queues them. None under `sbxloop run`, where no
+        # daemon watches the repository and the instruction would mislead.
+        self.trigger_label = trigger_label
         self.store = store or StateStore(self.config.state_dir / "state.db")
         self.bus = bus or EventBus()
         self.sbx = sbx or SbxCLI(app_name=self.config.app_name or None)
@@ -623,7 +635,7 @@ class LoopEngine:
                         if github is not None and repo_config is not None
                         else None
                     )
-                    self._ensure_delivery_repo(run_id, ops)
+                    issues_enabled = self._ensure_delivery_repo(run_id, ops)
                     phases = PhaseRunner(
                         agent,
                         self.config,
@@ -654,6 +666,7 @@ class LoopEngine:
                             if ops is not None
                             else None
                         ),
+                        issues_enabled=issues_enabled,
                     )
                     try:
                         self._adopt_prior_artifacts(pipeline)
@@ -917,22 +930,27 @@ class LoopEngine:
             **extra,
         )
 
-    def _ensure_delivery_repo(self, run_id: str, ops: GithubOps | None) -> None:
+    def _ensure_delivery_repo(self, run_id: str, ops: GithubOps | None) -> bool | None:
         """Probe (and, when allowed, create) the delivery repo up front.
 
         Runs right after worker install so a missing or typo'd repository
         fails the run before any planning or execution happens, not after
         the work is done. A creation is surfaced as a run.deliver event so
-        the transcript records where the artifacts will land.
+        the transcript records where the artifacts will land. Returns
+        whether the repository has Issues enabled (#631), read off the same
+        payload; None when there is no repository or the payload did not say.
         """
         entry = self.config.github.effective_repo(None)
         if ops is None or entry is None:
-            return
-        created = ensure_repository(
+            return None
+        probe = ensure_repository(
             ops, entry.repo, create=entry.create_repo, public=entry.create_public
         )
-        if created:
+        if probe.created:
             self.bus.emit(HostEventTypes.RUN_DELIVER, run_id, repo=entry.repo, created=True)
+        if probe.has_issues is False:
+            log.info("run.issues_disabled", run=run_id, repo=entry.repo)
+        return probe.has_issues
 
     def _provision_config(self) -> Config:
         """The config provisioning sees: a restart's offered branch pinned
@@ -2572,6 +2590,12 @@ class LoopEngine:
         a run/key marker, so a resume between filing and recording finds the
         issue on the repository rather than filing it twice. Never queued for
         the loop: the follow-up label, not the trigger label.
+
+        A repository with Issues disabled cannot take them (#631): the mode
+        downgrades to ``comment`` — one checklist on the PR — and the
+        ``run.followups`` event records the downgrade. Decided up front from
+        the repository payload, or on the spot from the 410 GitHub answers
+        the first filing with.
         """
         ops, repo, run_id = p.ops, p.repo, p.run_id
         cfg = self.config.landing
@@ -2584,56 +2608,33 @@ class LoopEngine:
         filed: list[tuple[str, str]] = []
         listed: list[str] = []
         started = time.time()
+        mode: str = cfg.followups
+        downgraded = False
+        if mode == "issues" and p.issues_enabled is False:
+            mode, downgraded = "comment", True
         try:
-            if cfg.followups == "issues":
-                on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
-                self._ensure_label(ops, repo, cfg.followup_label)
-                for cand in candidates:
-                    title = cand.followup.title.strip()
-                    if cand.key in already:
-                        filed.append((title, already[cand.key]))
-                        continue
-                    if cand.key in on_repo:
-                        url = on_repo[cand.key]
-                    else:
-                        ref = ops.issue_create(
-                            repo,
-                            title,
-                            issue_body(
-                                cand,
-                                run_id=run_id,
-                                repo=repo,
-                                pr_number=run.pr_number,
-                                pr_url=run.pr_url or "",
-                                closes=self.config.github.deliver_closes,
-                            ),
-                            labels=[cfg.followup_label],
-                        )
-                        url = ref.url
-                    filed.append((title, url))
-                    self.store.record_phase(
-                        run_id,
-                        "followup",
-                        task_id=None,
-                        attempt=len(already) + len(filed),
-                        status="filed",
-                        output_json=json.dumps({"key": cand.key, "title": title, "url": url}),
-                        started_at=started,
-                    )
-                    already[cand.key] = url
-                if filed and "(comment)" not in already:
-                    # One pointer on the PR, so the human sees them without
-                    # opening the tracker.
+            if mode == "issues":
+                try:
+                    self._file_followup_issues(p, run, candidates, already, filed, started)
+                except GithubOpsError as exc:
+                    if exc.http_status != 410:
+                        raise
+                    # "Issues are disabled for this repo" — the probe had
+                    # no `has_issues` to go on; downgrade now.
+                    log.info("run.followups_issues_gone", run=run_id, repo=repo, error=str(exc))
+                    mode, downgraded = "comment", True
+            if mode == "comment":
+                if "(comment)" not in already:
                     ops.pr_issue_comment(
                         repo,
                         run.pr_number,
-                        checklist_comment(candidates, run_id=run_id, filed=filed),
-                    )
-                    self._record_followup_comment(run_id, len(already) + 1, len(filed), started)
-            else:
-                if "(comment)" not in already:
-                    ops.pr_issue_comment(
-                        repo, run.pr_number, checklist_comment(candidates, run_id=run_id)
+                        checklist_comment(
+                            candidates,
+                            run_id=run_id,
+                            reason=(
+                                "Issues are disabled on this repository" if downgraded else None
+                            ),
+                        ),
                     )
                     self._record_followup_comment(
                         run_id, len(already) + 1, len(candidates), started
@@ -2643,22 +2644,87 @@ class LoopEngine:
             log.warning("run.followups_failed", run=run_id, pr=run.pr_number, exc_info=True)
         if not filed and not listed:
             return
+        extra: dict[str, Any] = {}
+        if downgraded:
+            extra = {"downgraded_from": "issues", "reason": "issues_disabled"}
         log.info(
             "run.followups",
             run=run_id,
             pr=run.pr_number,
-            mode=cfg.followups,
+            mode=mode,
             filed=[url for _, url in filed],
             listed=len(listed),
+            **extra,
         )
         self.bus.emit(
             HostEventTypes.RUN_FOLLOWUPS,
             run_id,
             pr=run.pr_number,
-            mode=cfg.followups,
+            mode=mode,
             filed=[{"title": t, "url": u} for t, u in filed],
             listed=listed,
+            **extra,
         )
+
+    def _file_followup_issues(
+        self,
+        p: Pipeline,
+        run: RunRecord,
+        candidates: Sequence[Candidate],
+        already: dict[str, str],
+        filed: list[tuple[str, str]],
+        started: float,
+    ) -> None:
+        """The ``issues`` mode of :meth:`_file_followups`: one issue per
+        candidate (recorded as filed as it goes) and one pointer comment on
+        the PR. ``filed`` is appended in place so a 410 midway leaves the
+        caller knowing what landed."""
+        ops, repo, run_id = p.ops, p.repo, p.run_id
+        assert ops is not None and repo is not None and run.pr_number is not None
+        cfg = self.config.landing
+        on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
+        self._ensure_label(ops, repo, cfg.followup_label)
+        for cand in candidates:
+            title = cand.followup.title.strip()
+            if cand.key in already:
+                filed.append((title, already[cand.key]))
+                continue
+            if cand.key in on_repo:
+                url = on_repo[cand.key]
+            else:
+                ref = ops.issue_create(
+                    repo,
+                    title,
+                    issue_body(
+                        cand,
+                        run_id=run_id,
+                        repo=repo,
+                        pr_number=run.pr_number,
+                        pr_url=run.pr_url or "",
+                        closes=self.config.github.deliver_closes,
+                        trigger_label=self.trigger_label,
+                    ),
+                    labels=[cfg.followup_label],
+                )
+                url = ref.url
+            filed.append((title, url))
+            self.store.record_phase(
+                run_id,
+                "followup",
+                task_id=None,
+                attempt=len(already) + len(filed),
+                status="filed",
+                output_json=json.dumps({"key": cand.key, "title": title, "url": url}),
+                started_at=started,
+            )
+            already[cand.key] = url
+        if filed and "(comment)" not in already:
+            # One pointer on the PR, so the human sees them without opening
+            # the tracker.
+            ops.pr_issue_comment(
+                repo, run.pr_number, checklist_comment(candidates, run_id=run_id, filed=filed)
+            )
+            self._record_followup_comment(run_id, len(already) + 1, len(filed), started)
 
     def _record_followup_comment(
         self, run_id: str, attempt: int, count: int, started: float
@@ -2701,7 +2767,10 @@ class LoopEngine:
             log.warning("run.followups_list_failed", repo=repo, exc_info=True)
             return out
         for issue in data:
-            if not isinstance(issue, dict):
+            # The issues endpoint lists pull requests too (#631): a labelled
+            # PR carrying an old marker in its body must not read as "this
+            # follow-up was filed" and suppress the issue.
+            if not isinstance(issue, dict) or issue.get("pull_request"):
                 continue
             found = marker_key(str(issue.get("body") or ""))
             if found and found[0] == run_id:
@@ -2710,45 +2779,12 @@ class LoopEngine:
 
     @staticmethod
     def _ensure_label(ops: GithubOps, repo: str, label: str) -> None:
-        """Make sure the repository carries the follow-up label.
-
-        A label that already exists is an expected condition, not an error:
-        we look it up first and return silently when it is there, so the run
-        never records a failed creation call. The lookup goes through
-        ``label_lookup``, which answers a 404 as data rather than as a failed
-        worker job — the same treatment ``ref_lookup`` gives an absent branch
-        (#518), so a repository *without* the label does not pay a red panel
-        for asking. Only a genuinely missing label is POSTed, and the 422
-        catch still covers the race between the two calls. A refusal must not
-        stop the filing — GitHub accepts an issue whose label it cannot find.
-
-        This is the only place that creates a *repository* label; the other
-        ``/labels`` calls (engine issue filing, daemon sources/concierge)
-        attach or remove labels on an issue, where an existing label is
-        already the happy path."""
-        try:
-            existing = ops.label_lookup(repo, label)
-        except GithubOpsError as exc:
-            # Not a 404 — no repo scope, or GitHub is unwell. One warning,
-            # and no doomed POST behind it.
-            log.warning("run.followup_label_failed", repo=repo, label=label, error=str(exc))
-            return
-        if existing:
-            log.debug("run.followup_label_present", repo=repo, label=label)
-            return
-        try:
-            ops.raw(
-                "POST",
-                f"/repos/{repo}/labels",
-                {"name": label, "color": "c5def5", "description": "filed by sbxloop after a merge"},
-            )
-        except GithubOpsError as exc:
-            text = str(exc)
-            exists = "already_exists" in text or "already exists" in text
-            if exc.http_status == 422 or exists:
-                log.debug("run.followup_label_present", repo=repo, label=label)
-                return
-            log.warning("run.followup_label_failed", repo=repo, label=label, error=text)
+        """Make sure the repository carries the follow-up label (best-effort:
+        a refusal must not stop the filing — GitHub accepts an issue whose
+        label it cannot find). See :func:`sbxloop.gh.labels.ensure_label`;
+        ``sbxloop init-repo`` creates this and the lifecycle labels up front
+        (#630)."""
+        ensure_label(ops, repo, LabelSpec(label, *FOLLOWUP_DESCRIPTOR))
 
     def _login(self, p: Pipeline) -> str:
         """The loop's own GitHub login, read once per drive.

@@ -183,6 +183,20 @@ def check_runs(*runs: dict[str, Any]) -> dict[str, Any]:
     return {"/repos/o/r/commits/abc/check-runs": {"check_runs": list(runs)}}
 
 
+@pytest.fixture(autouse=True)
+def no_details_fetch(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Keep ``details_url`` following off the network: record the URLs the
+    op would have followed and answer with nothing (#629)."""
+    followed: list[str] = []
+
+    def fake(url: str, max_bytes: int = githubops.DETAILS_MAX_BYTES) -> str:
+        followed.append(url)
+        return ""
+
+    monkeypatch.setattr(githubops, "fetch_details_text", fake)
+    return followed
+
+
 class TestChecksFailedLogs:
     """``checks.failed_logs``: the text behind each red check, clipped."""
 
@@ -254,6 +268,70 @@ class TestChecksFailedLogs:
         assert lines[0] == "(logs unavailable: HTTP 410)"
         assert "Job timed out" in check["excerpt"]
         assert "after 6h" in check["excerpt"]
+
+    def test_silent_non_actions_check_follows_its_details_url(
+        self, monkeypatch: pytest.MonkeyPatch, no_details_fetch: list[str]
+    ) -> None:
+        """#629 remainder: a red check that left no text on GitHub has its
+        ``details_url`` followed, and a provider that serves the log as
+        text gets it into the excerpt. A check that did leave text, and an
+        Actions job whose log was fetched, are not followed."""
+        monkeypatch.setattr(
+            githubops,
+            "fetch_details_text",
+            lambda url, max_bytes=0: (no_details_fetch.append(url), "FAIL test_x: boom\n")[1],
+        )
+        t = RecordingTransport(
+            check_runs(
+                check_run("circle", "failure", app="circleci"),
+                check_run("lint", "failure", app="some-bot", output={"title": "3 problems"}),
+                check_run("unit", "failure", run_id=77),
+            ),
+            texts={"/repos/o/r/actions/jobs/77/logs": "actions log\n"},
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        by_name = {c["name"]: c for c in out["checks"]}
+        assert by_name["circle"]["excerpt"] == "FAIL test_x: boom\n"
+        assert by_name["lint"]["excerpt"] == "3 problems"
+        assert by_name["unit"]["excerpt"] == "actions log\n"
+        assert no_details_fetch == ["https://ci/circle"]
+
+    def test_unreadable_details_url_leaves_the_excerpt_empty(
+        self, no_details_fetch: list[str]
+    ) -> None:
+        """The host brief then names the check and its URL (#629): nothing
+        is invented, and the op does not fail."""
+        t = RecordingTransport(check_runs(check_run("circle", "failure", app="circleci")))
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert out["checks"] == [
+            {
+                "name": "circle",
+                "conclusion": "failure",
+                "details_url": "https://ci/circle",
+                "excerpt": "",
+            }
+        ]
+        assert no_details_fetch == ["https://ci/circle"]
+
+    def test_status_without_description_follows_its_target_url(
+        self, no_details_fetch: list[str]
+    ) -> None:
+        t = RecordingTransport(
+            {
+                **check_runs(),
+                "/repos/o/r/commits/abc/status": {
+                    "statuses": [
+                        {"context": "ci/jenkins", "state": "failure", "target_url": "https://j/1"}
+                    ]
+                },
+            }
+        )
+        out = execute_op("checks.failed_logs", {"repo": "o/r", "sha": "abc"}, t)
+        assert isinstance(out, dict)
+        assert out["checks"][0]["details_url"] == "https://j/1"
+        assert no_details_fetch == ["https://j/1"]
 
     def test_check_runs_past_the_first_page_are_read(self) -> None:
         """#614 acceptance: 45 check runs at page size 30 used to hide a
@@ -559,6 +637,82 @@ class RedirectingOpener:
             hdrs["Location"] = self.location
             raise urllib.error.HTTPError(request.full_url, 302, "Found", hdrs, io.BytesIO(b""))
         return FakeResponse(self.body)
+
+
+# The real function, taken before the autouse fixture stubs it out on the
+# module: these tests exercise the fetch itself.
+fetch_details_text = githubops.fetch_details_text
+
+
+class DetailsResponse(io.BytesIO):
+    def __init__(self, body: bytes, content_type: str) -> None:
+        super().__init__(body)
+        self.headers = email.message.Message()
+        self.headers["Content-Type"] = content_type
+
+    def __enter__(self) -> DetailsResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+class TestFetchDetailsText:
+    """``fetch_details_text`` (#629): unauthenticated, text-only, harmless."""
+
+    def _serve(self, monkeypatch: pytest.MonkeyPatch, body: bytes, content_type: str) -> list[Any]:
+        seen: list[Any] = []
+
+        def fake_urlopen(request: Any, timeout: float = 0) -> DetailsResponse:
+            seen.append(request)
+            return DetailsResponse(body, content_type)
+
+        monkeypatch.setattr(githubops.urllib.request, "urlopen", fake_urlopen)
+        return seen
+
+    def test_plain_text_body_is_returned_without_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = self._serve(monkeypatch, b"line 1\nline \xff 2\n", "text/plain; charset=utf-8")
+        out = fetch_details_text("https://ci.example/job/1/consoleText")
+        assert out == "line 1\nline \ufffd 2\n"
+        (request,) = seen
+        headers = {k.lower(): v for k, v in request.header_items()}
+        assert headers == {"user-agent": githubops.USER_AGENT}
+
+    def test_json_body_is_returned_and_clamped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._serve(monkeypatch, b"x" * 100, "application/json")
+        assert fetch_details_text("https://ci.example/api/1", max_bytes=10) == "x" * 10
+
+    def test_html_dashboard_yields_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._serve(monkeypatch, b"<html>dashboard</html>", "text/html")
+        assert fetch_details_text("https://ci.example/build/1") == ""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            urllib.error.HTTPError("https://ci.example/x", 401, "auth", None, None),  # type: ignore[arg-type]
+            urllib.error.URLError("no route to host"),
+            OSError("timed out"),
+        ],
+    )
+    def test_failures_degrade_to_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, error: Exception
+    ) -> None:
+        """An auth wall, no egress from the sandbox, a timeout: the brief
+        falls back to the check name and URL, the op never fails."""
+
+        def fake_urlopen(request: Any, timeout: float = 0) -> Any:
+            raise error
+
+        monkeypatch.setattr(githubops.urllib.request, "urlopen", fake_urlopen)
+        assert fetch_details_text("https://ci.example/x") == ""
+
+    def test_non_https_is_not_followed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen = self._serve(monkeypatch, b"body", "text/plain")
+        assert fetch_details_text("http://ci.example/x") == ""
+        assert fetch_details_text("file:///etc/passwd") == ""
+        assert seen == []
 
 
 class TestRestTransportText:

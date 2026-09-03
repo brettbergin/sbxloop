@@ -17,7 +17,9 @@ import sbxloop
 from sbxloop.cli.app import app
 from sbxloop.cli.doctor import Check
 from sbxloop.daemon.model import WorkItem
+from sbxloop.deliver import RepositoryProbe
 from sbxloop.engine.store import StateStore
+from sbxloop.errors import GithubOpsError
 from sbxloop.events import Event
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
@@ -1605,9 +1607,11 @@ class TestRunCommand:
         self._delivery_env(workdir, monkeypatch)
         seen: dict[str, Any] = {}
 
-        def fake_ensure(ops: Any, repo: str, *, create: bool = False, public: bool = False) -> bool:
+        def fake_ensure(
+            ops: Any, repo: str, *, create: bool = False, public: bool = False
+        ) -> RepositoryProbe:
             seen.update(repo=repo, create=create, public=public)
-            return True
+            return RepositoryProbe(created=True, has_issues=True)
 
         monkeypatch.setattr(engine_mod, "ensure_repository", fake_ensure)
         result = runner.invoke(
@@ -2541,6 +2545,9 @@ class TestDoctorRepoChecks:
                 seen["looked_up"] = repo
                 return {"permissions": {"push": True}}
 
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                return []  # no labels on the repository
+
         class FakeBox:
             def __init__(self, *_a: Any, repo: str | None = None, **_kw: Any) -> None:
                 seen["scoped_to"] = repo
@@ -2621,6 +2628,9 @@ class TestDoctorProbeCost:
                     box.lookups.append(repo)
                     return {"permissions": {"push": True, "pull": True}}
 
+                def raw(self, method: str, path: str, body: Any = None) -> Any:
+                    return []
+
             return Ops()
 
         def close(self) -> None:
@@ -2670,8 +2680,16 @@ class TestDoctorProbeCost:
         assert boxes[""].ops_calls == 1, "not re-provisioned for the second repo"
         assert probe(entries[2]).reachable, "the other credential is unaffected"
         rows = repo_checks(config, {"GH_TOKEN": "tok", "GAMMA_TOKEN": "g"}, probe=probe)
-        assert [(r.ok, r.hard) for r in rows] == [(True, False), (True, False), (True, True)]
+        # gamma's box lists no labels, so its reachable row is followed by
+        # the advisory labels row (#630).
+        assert [(r.ok, r.hard) for r in rows] == [
+            (True, False),
+            (True, False),
+            (True, True),
+            (False, False),
+        ]
         assert "unverified" in rows[0].detail and "reachable" in rows[2].detail
+        assert rows[3].name == "github repo acme/gamma labels"
         # run_doctor's teardown closes every box it opened, boot or no boot.
         for box in boxes.values():
             box.close()
@@ -2849,9 +2867,11 @@ class TestDoctorBranchProtection:
                             "allow_rebase_merge": False,
                         }
 
-                    def raw(self, method: str, path: str) -> Any:
+                    def raw(self, method: str, path: str, body: Any = None) -> Any:
                         from sbxloop.errors import GithubOpsError
 
+                        if path.endswith("/labels?per_page=100&page=1"):
+                            return []
                         raise GithubOpsError("no protection", http_status=404)
 
                 return Ops()
@@ -2864,6 +2884,75 @@ class TestDoctorBranchProtection:
             probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
             result = probe(config.github.repo_list()[0])
         assert result.merge_methods == ("merge",)
+
+    def test_the_sandbox_probe_lists_missing_labels_and_issues_state(self, workdir: Path) -> None:
+        """#630/#631: the probe reads the repository's labels against the
+        effective (per-repo renamed) set and ``has_issues`` off the payload
+        it already fetched."""
+        from sbxloop.cli.doctor import sandbox_repo_probe
+
+        class Box:
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def ops(self) -> Any:
+                class Ops:
+                    def repo_lookup(self, repo: str) -> dict[str, Any]:
+                        return {"has_issues": False}
+
+                    def raw(self, method: str, path: str, body: Any = None) -> Any:
+                        assert path == "/repos/acme/alpha/labels?per_page=100&page=1"
+                        return [{"name": "SBXLOOP:RUN"}, {"name": "loop:done"}]
+
+                return Ops()
+
+        import sbxloop.daemon.github as github_module
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(github_module, "DaemonGithub", Box)
+            config = self._config(
+                '[[github.repos]]\nrepo = "acme/alpha"\ncompleted_label = "loop:done"\n', workdir
+            )
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            result = probe(config.github.repo_list()[0])
+        assert result.issues_enabled is False
+        assert result.missing_labels == (
+            "sbxloop:in-progress",
+            "sbxloop:failed",
+            "sbxloop:blocked",
+            "sbxloop:awaiting-merge",
+            "sbxloop:follow-up",
+        )
+
+    def test_missing_labels_and_disabled_issues_get_advisory_rows(self, workdir: Path) -> None:
+        """Doctor stays advisory (#630): the drift row points at
+        ``sbxloop init-repo`` rather than fixing anything itself."""
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        rows = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(
+                reachable=True,
+                missing_labels=("sbxloop:run", "sbxloop:failed"),
+                issues_enabled=False,
+            ),
+        )
+        by_name = {row.name: row for row in rows}
+        assert by_name["github repo acme/alpha"].ok
+        issues = by_name["github repo acme/alpha issues"]
+        assert not issues.ok and not issues.hard and "Issues are disabled" in issues.detail
+        labels = by_name["github repo acme/alpha labels"]
+        assert not labels.ok and not labels.hard
+        assert "`sbxloop:run`, `sbxloop:failed`" in labels.detail
+        assert "`sbxloop init-repo acme/alpha`" in labels.detail
+        clean = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(reachable=True, missing_labels=(), issues_enabled=True),
+        )
+        assert [row.name for row in clean] == ["github repo acme/alpha"]
 
     def test_requires_approving_reviews_reads_both_sources(self) -> None:
         from sbxloop.cli.doctor import _requires_approving_reviews
@@ -2890,3 +2979,113 @@ class TestDoctorBranchProtection:
         assert _requires_approving_reviews(ruleset, "o/r", "main") is True
         unknown = Ops(GithubOpsError("x", http_status=403), GithubOpsError("x", http_status=403))
         assert _requires_approving_reviews(unknown, "o/r", "main") is None
+
+
+class TestInitRepo:
+    """``sbxloop init-repo`` (#630): the six lifecycle labels plus the
+    follow-up label, colored and described, created through a github-ops
+    sandbox and left alone when already present."""
+
+    def _patch_box(self, mp: pytest.MonkeyPatch, fake: FakeGithub) -> list[str]:
+        import sbxloop.daemon.github as github_module
+
+        closed: list[str] = []
+
+        class Box:
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                self.repo = kw.get("repo")
+
+            def ops(self) -> Any:
+                return fake
+
+            def close(self) -> None:
+                closed.append(str(self.repo))
+
+        mp.setattr(github_module, "DaemonGithub", Box)
+        return closed
+
+    def test_creates_every_label_with_a_color_and_description(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[[github.repos]]\nrepo = "acme/alpha"\ncompleted_label = "loop:done"\n'
+        )
+        fake = FakeGithub()
+        fake.labels_existing = {"sbxloop:run"}
+        with pytest.MonkeyPatch.context() as mp:
+            closed = self._patch_box(mp, fake)
+            result = runner.invoke(app, ["init-repo", "acme/alpha"])
+        assert result.exit_code == 0, result.output
+        assert fake.labels_created == [
+            "sbxloop:in-progress",
+            "sbxloop:failed",
+            "loop:done",
+            "sbxloop:blocked",
+            "sbxloop:awaiting-merge",
+            "sbxloop:follow-up",
+        ]
+        created = [
+            body for (m, path, body) in fake.raw_calls if m == "POST" and path.endswith("/labels")
+        ]
+        assert all(body["color"] and body["description"] for body in created)
+        assert {body["color"] for body in created} == {
+            "fbca04",
+            "d73a4a",
+            "6f42c1",
+            "e99695",
+            "1d76db",
+            "c5def5",
+        }
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "6 label(s) created, 1 already present" in plain
+        assert closed == ["acme/alpha"], "the sandbox is torn down"
+
+    def test_a_second_run_creates_nothing(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text('[github]\nrepo = "acme/alpha"\n')
+        fake = FakeGithub()
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_box(mp, fake)
+            first = runner.invoke(app, ["init-repo", "acme/alpha"])
+            assert first.exit_code == 0, first.output
+            assert len(fake.labels_created) == 7
+            second = runner.invoke(app, ["init-repo", "acme/alpha"])
+        assert second.exit_code == 0, second.output
+        assert len(fake.labels_created) == 7
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", second.output)
+        assert "0 label(s) created, 7 already present" in plain
+
+    def test_a_repository_outside_the_config_gets_the_daemon_wide_labels(
+        self, workdir: Path
+    ) -> None:
+        (workdir / "sbxloop.toml").write_text(
+            '[github]\nrepo = "acme/alpha"\n[daemon]\ntrigger_label = "go"\n'
+        )
+        fake = FakeGithub()
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_box(mp, fake)
+            result = runner.invoke(app, ["init-repo", "acme/other"])
+        assert result.exit_code == 0, result.output
+        assert fake.labels_created[0] == "go"
+        assert all(path.startswith("/repos/acme/other/") for (_m, path, _b) in fake.raw_calls)
+
+    def test_a_label_the_token_cannot_write_fails_the_command(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text('[github]\nrepo = "acme/alpha"\n')
+
+        class Forbidden(FakeGithub):
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                if method == "POST" and path.endswith("/labels"):
+                    raise GithubOpsError("resource not accessible by integration", http_status=403)
+                return super().raw(method, path, body)
+
+        fake = Forbidden()
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_box(mp, fake)
+            result = runner.invoke(app, ["init-repo", "acme/alpha"])
+        assert result.exit_code == 1
+        plain = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", result.output).split())
+        assert "7 label(s) could not be created" in plain
+        assert "permission to write issue labels" in plain
+
+    def test_a_malformed_repository_is_rejected(self, workdir: Path) -> None:
+        (workdir / "sbxloop.toml").write_text('[github]\nrepo = "acme/alpha"\n')
+        result = runner.invoke(app, ["init-repo", "alpha"])
+        assert result.exit_code == 1
+        assert "expected owner/name" in result.output

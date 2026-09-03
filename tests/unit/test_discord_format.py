@@ -223,6 +223,31 @@ class TestFormat:
             ):
                 assert format_for_discord(ev(t, x=1), level=level) == []
 
+    def test_followups_name_the_issues_disabled_downgrade(self) -> None:
+        """#631: a listing forced by the repository (Issues disabled) says
+        so; a configured `comment` mode does not."""
+        downgraded = texts(
+            format_for_discord(
+                ev(
+                    "run.followups",
+                    pr=7,
+                    mode="comment",
+                    filed=[],
+                    listed=["a", "b"],
+                    downgraded_from="issues",
+                    reason="issues_disabled",
+                )
+            )
+        )
+        assert downgraded == [
+            "📌 2 follow-up(s) listed on the PR, not filed (Issues are disabled on the "
+            "repository): a; b"
+        ]
+        configured = texts(
+            format_for_discord(ev("run.followups", pr=7, mode="comment", filed=[], listed=["a"]))
+        )
+        assert configured == ["📌 1 follow-up(s) listed on the PR, not filed: a"]
+
     def test_tool_events_are_not_rendered_here(self) -> None:
         # the pump feeds them to ToolBatcher instead
         assert format_for_discord(ev("agent.tool_start", tool="bash", args="ls")) == []

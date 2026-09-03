@@ -196,7 +196,14 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   red fetches the failing jobs' logs into the next fix brief, and a check
   whose log cannot be read from the sandbox (a commit status, or an
   Actions job the token cannot see) is briefed with its link and an
-  instruction to reproduce with the project gate. "Nothing has reported"
+  instruction to reproduce with the project gate. For a red non-Actions
+  check the worker also follows its `details_url` / `target_url`
+  best-effort — unauthenticated, https only, text or JSON bodies, the
+  same size clamp as an Actions log — and puts what it reads in the
+  brief; the sandbox reaches only the hosts its policy allows, so a CI
+  host worth reading goes in `[sandbox] extra_allow_domains`, and a
+  failure to read leaves the brief at name, link and instruction.
+  "Nothing has reported"
   on either API only counts as "no CI" once it has persisted for
   `ci_settle_s` — after a delivery, and again at landing for a head no
   poll has waited on (a resume at the landing stage, a merge-gate
@@ -211,8 +218,13 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   they run; deduplicated by title within the run and by a body marker
   against the repository, capped by `max_followups_per_run`, and listed in
   one PR comment. `[landing] followups = "comment"` lists them on the PR
-  instead of filing; `"off"` drops them. A failed or blocked run files
-  nothing.
+  instead of filing; `"off"` drops them. A repository with Issues disabled
+  cannot take them: filing downgrades to that one PR comment and the
+  `run.followups` event records the downgrade (`downgraded_from`,
+  `reason = issues_disabled`) — nothing is dropped silently. The issue
+  body names the trigger label only when a daemon dispatched the run;
+  under `sbxloop run` nothing polls the repository, so it says only that
+  the follow-up is not queued. A failed or blocked run files nothing.
 
 **Budgets, not vibes.** Revisions, replans, task count and wall clock are
 bounded by `[budgets]` (defaults: 2 revisions and 1 replan per task, 20
@@ -279,6 +291,7 @@ letting in-VM tooling fail confusingly on a full disk.
 | `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                                                          |
 | `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                                                      |
 | `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints).                                                                                                                                                                                     |
+| `sbxloop init-repo OWNER/NAME`                  | Create the labels the loop relies on in a repository — the six lifecycle labels (with that repository's renames applied) and the follow-up label, each colored and described. Idempotent; boots one github-ops sandbox; exits 1 when the token cannot write labels.                                 |
 | `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                                                                 |
 | `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                                                         |
 | `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                                                                  |
@@ -532,6 +545,7 @@ in_progress_label = "sbxloop:in-progress"
 completed_label = "sbxloop:completed"     # the PR merged; the issue closes
 failed_label = "sbxloop:failed"           # the run gave up; re-trigger by hand
 blocked_label = "sbxloop:blocked"         # GitHub would not let the loop land the PR
+gated_label = "sbxloop:awaiting-merge"    # parked by [landing] merge_gate
 max_runs_per_day = 12                     # calendar-day cap, persisted across restarts
 run_cap_timezone = "UTC"                  # day boundary for the cap (resets at 00:00 there)
 max_attempts_per_item = 2
@@ -859,8 +873,23 @@ workspace = "~/src/two"
 enabled = false           # registered but not polled
 token_env = "GH_TOKEN_TWO"  # unset uses the daemon-wide GH_TOKEN
 trigger_label = "sbxloop:go" # unset uses [daemon] trigger_label
+in_progress_label = "loop:wip"  # any lifecycle label can be renamed per repo
 labels = ["team:core"]      # extra labels for this repository
 ```
+
+Every lifecycle label — `trigger_label`, `in_progress_label`, `failed_label`,
+`completed_label`, `blocked_label`, `gated_label` — can be renamed on an
+entry; unset ones take the `[daemon]` value, and the six must stay distinct
+(case-insensitively) per repository. Nothing creates the trigger label a
+human is told to apply, and GitHub creates the lifecycle labels on first
+attach with a random color and no description: **`sbxloop init-repo owner/name`** creates the six (plus `[landing] followup_label`) with colors
+and descriptions up front, idempotently, through one github-ops sandbox —
+run it again after renaming a label. `sbxloop doctor` reports missing labels and a
+repository whose Issues are disabled as advisory rows; it does not fix
+them. Claiming an issue needs a token that can write issue labels
+(fine-grained token or GitHub App: Issues → read and write; classic PAT:
+`repo`): a triage-only token can read and comment but not label, and the
+claim fails with an error that says so instead of a bare 403.
 
 A run's github-ops sandbox is provisioned **scoped to the repository its work
 item came from**: it is told which repository it acts on, and it is given that
@@ -1411,7 +1440,7 @@ came from. The notable knobs:
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
 | `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                                                                                                                                                                                                |
 | `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                                                                                                                                                                                                    |
-| `[daemon] trigger_label` … `blocked_label`                | `sbxloop:run` …    | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`.                                                                                                                                                                                                                                                        |
+| `[daemon] trigger_label` … `gated_label`                  | `sbxloop:run` …    | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`, `gated_label`; each can be renamed per `[[github.repos]]` entry. `sbxloop init-repo` creates them.                                                                                                                                                     |
 | `[daemon] max_runs_per_day`                               | `12`               | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there.                                                                                                                                                                                                                                                       |
 | `[daemon] run_cap_timezone`                               | `UTC`              | IANA timezone defining the run cap's day boundary.                                                                                                                                                                                                                                                                                                                 |
 | `[daemon] max_attempts_per_item` / `max_resumes_per_item` | `2` / `2`          | Per-item retry and resume caps; `retry_backoff_s`, `max_consecutive_failures`, `breaker_cooldown_s` beside them.                                                                                                                                                                                                                                                   |

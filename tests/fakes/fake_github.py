@@ -201,6 +201,10 @@ class FakeGithub(GithubOps):
         # Follow-up issues filed after the merge (#517), and the labels the
         # engine made sure exist; `existing_issues` seeds the label listing.
         self.issues_created: list[tuple[str, str, list[str]]] = []
+        # Whether the repository has Issues enabled (#631): False makes the
+        # payload say so and ``issue_create`` answer GitHub's 410; None
+        # leaves the payload silent (the 410 alone then decides).
+        self.has_issues: bool | None = True
         self.labels_created: list[str] = []
         # Labels the repository already carries before the run (#556): a
         # single-label GET finds these, and creating one is a 422.
@@ -276,7 +280,12 @@ class FakeGithub(GithubOps):
 
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         self._maybe_fail("repo_lookup")
-        return {"default_branch": "main"}
+        # The same payload ``repo_get`` answers with: the engine's up-front
+        # probe reads ``has_issues`` off it (#631).
+        payload = dict(self.repo_payload)
+        if self.has_issues is not None:
+            payload["has_issues"] = self.has_issues
+        return payload
 
     def ref_lookup(self, repo: str, ref: str) -> str | None:
         # A delivery branch (``sbxloop/<run>``) exists only once delivery
@@ -496,6 +505,13 @@ class FakeGithub(GithubOps):
         self, repo: str, title: str, body: str = "", labels: list[str] | None = None
     ) -> IssueRef:
         self._maybe_fail("issue_create")
+        if self.has_issues is False:
+            raise GithubOpsError(
+                "github op issue_create failed: GithubOpError: gh api POST "
+                f"/repos/{repo}/issues failed (rc=1): Issues are disabled for this repo "
+                "(HTTP 410)",
+                http_status=410,
+            )
         self.issues_created.append((title, body, list(labels or [])))
         number = 900 + len(self.issues_created)
         return IssueRef(number=number, url=f"https://github.com/{repo}/issues/{number}")

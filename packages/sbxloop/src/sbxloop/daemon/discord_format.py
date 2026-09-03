@@ -1406,9 +1406,14 @@ def format_for_discord(
             ]
         listed = _list(data, "listed")
         if listed:
+            why = (
+                " (Issues are disabled on the repository)"
+                if data.get("reason") == "issues_disabled"
+                else ""
+            )
             return [
                 line(
-                    f"📌 {len(listed)} follow-up(s) listed on the PR, not filed: "
+                    f"📌 {len(listed)} follow-up(s) listed on the PR, not filed{why}: "
                     + "; ".join(_one_line(str(t), 60) for t in listed),
                     flush=True,
                 )

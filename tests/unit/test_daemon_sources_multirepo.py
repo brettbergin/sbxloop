@@ -105,6 +105,38 @@ class TestBuild:
         assert isinstance(source, MultiRepoIssueSource)
         assert [s.labels.trigger for s in source.sources] == ["do-it", "sbxloop:run"]
 
+    def test_every_lifecycle_label_can_be_renamed_per_repo(self, router: RouterOps) -> None:
+        """#630: the entry's six ``<kind>_label`` fields merge straight over
+        the daemon-wide set; an unset one keeps the default."""
+        entries = [
+            RepoConfig(
+                repo="o/a",
+                in_progress_label="loop:working",
+                failed_label="loop:failed",
+                completed_label="loop:done",
+                blocked_label="loop:blocked",
+                gated_label="loop:gated",
+            ),
+            RepoConfig(repo="o/b"),
+        ]
+        source = build_github_source(lambda: router, entries, LABELS)  # type: ignore[arg-type]
+        assert isinstance(source, MultiRepoIssueSource)
+        a, b = source.sources
+        assert (a.labels.trigger, a.labels.in_progress, a.labels.failed) == (
+            "sbxloop:run",
+            "loop:working",
+            "loop:failed",
+        )
+        assert (a.labels.completed, a.labels.blocked, a.labels.gated) == (
+            "loop:done",
+            "loop:blocked",
+            "loop:gated",
+        )
+        assert (b.labels.in_progress, b.labels.gated) == (
+            "sbxloop:in-progress",
+            "sbxloop:awaiting-merge",
+        )
+
     def test_per_repo_extra_labels_are_applied_when_an_issue_is_claimed(
         self, router: RouterOps
     ) -> None:

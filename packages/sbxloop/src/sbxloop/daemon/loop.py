@@ -1058,6 +1058,9 @@ class DaemonLoop:
             sbx=self.sbx,
             worker_python=self.worker_python,
             install_workers=self.install_workers,
+            # This daemon watches the item's repository, so a follow-up issue
+            # can honestly say which label queues it (#631).
+            trigger_label=self.config.labels_for(self._item_repo(item)).trigger,
         )
         handle = RunHandle(item, run_id, engine, bus)
         with self._current_lock:

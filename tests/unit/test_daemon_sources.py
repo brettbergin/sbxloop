@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from urllib.parse import unquote
 
@@ -324,6 +325,47 @@ class TestGitHubSource:
         ops.fail_on = {"POST"}  # in-progress add fails
         assert self.make(ops).claim(item) is False
         assert ops.deleted_comments == [100]
+
+    def test_claim_403_on_the_label_write_names_the_label_permission(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#630: a triage-only token reads and comments fine, then 403s on
+        the in-progress label. The failure must say which permission is
+        missing rather than surface as a bare 403 on an unexpected request;
+        the claim still fails closed and rolls back its comment."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        real_raw = ops.raw
+
+        def raw(method: str, path: str, body: Any = None) -> Any:
+            if method == "POST" and path.endswith("/labels"):
+                raise GithubOpsError("POST -> forbidden: Resource not accessible", http_status=403)
+            return real_raw(method, path, body)
+
+        ops.raw = raw  # type: ignore[method-assign]
+        failures: list[BaseException] = []
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", on_failure=failures.append)  # type: ignore[arg-type]
+        with caplog.at_level(logging.WARNING):
+            assert src.claim(item) is False
+        assert ops.deleted_comments == [100]
+        (failure,) = failures
+        assert isinstance(failure, GithubOpsError) and failure.http_status == 403
+        text = str(failure)
+        assert "`sbxloop:in-progress`" in text and "o/r#4" in text
+        assert "permission to write issue labels" in text
+        assert "Issues → read and write" in text and "triage-only" in text
+        record = next(r for r in caplog.records if "github.claim_failed" in r.getMessage())
+        assert "permission to write issue labels" in record.getMessage()
+
+    def test_claim_non_403_label_failure_passes_through_unchanged(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        item = self.make(ops).poll()[0]
+        ops.fail_on = {"POST"}
+        failures: list[BaseException] = []
+        src = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db", on_failure=failures.append)  # type: ignore[arg-type]
+        assert src.claim(item) is False
+        (failure,) = failures
+        assert "HTTP 500: boom" in str(failure) and "permission" not in str(failure)
 
     def test_poll_raises_and_reports_failure_to_the_sandbox_owner(self) -> None:
         """poll used to swallow failures as an empty result; the loop needs

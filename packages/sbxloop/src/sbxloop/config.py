@@ -24,9 +24,9 @@ import os
 import re
 import string
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -261,6 +261,39 @@ def _check_login(value: str, key: str) -> str:
     return value
 
 
+# The six lifecycle labels, in the order `LabelSet` (and the daemon's
+# `GitHubLabels`) take them. Each is a `[daemon] <kind>_label` with a
+# `[[github.repos]] <kind>_label` override.
+LABEL_KINDS = ("trigger", "in_progress", "failed", "completed", "blocked", "gated")
+
+
+class LabelSet(NamedTuple):
+    """One repository's effective lifecycle labels (#630).
+
+    ``trigger`` queues an issue for the daemon; ``in_progress`` is the claim
+    marker; ``completed`` is the durable "sbxloop did this" mark applied when
+    the pull request merges; ``failed`` and ``blocked`` say the loop gave up
+    or was refused, both leaving the issue open for a human; ``gated`` marks
+    a run parked behind the opt-in merge gate.
+    """
+
+    trigger: str
+    in_progress: str
+    failed: str
+    completed: str
+    blocked: str
+    gated: str
+
+
+def _check_label_set(labels: Sequence[str], where: str) -> None:
+    if any(not label.strip() for label in labels):
+        raise ValueError(f"{where} labels must be non-empty")
+    # GitHub label names are case-insensitive: "sbxloop:run" and
+    # "SBXLOOP:RUN" are the same label, so they cannot mark two states.
+    if len({label.strip().casefold() for label in labels}) != len(labels):
+        raise ValueError(f"{where} labels must be distinct (case-insensitively)")
+
+
 class RepoConfig(_ConfigModel):
     """One repository sbxloop works with.
 
@@ -282,9 +315,15 @@ class RepoConfig(_ConfigModel):
     # Environment variable holding the token for this repository; None → the
     # daemon-wide GH_TOKEN.
     token_env: str | None = None
-    # Per-repo override of the daemon trigger label, plus extra labels applied
-    # to issues/PRs for this repository.
+    # Per-repo overrides of the six lifecycle labels (#630); None → the
+    # `[daemon]` value. `Config.labels_for` resolves the effective set.
     trigger_label: str | None = None
+    in_progress_label: str | None = None
+    failed_label: str | None = None
+    completed_label: str | None = None
+    blocked_label: str | None = None
+    gated_label: str | None = None
+    # Extra labels applied to issues/PRs for this repository.
     labels: list[str] = Field(default_factory=list)
     # Per-repo naming (#621); None → the `[github]` value.
     pr_title_template: str | None = None
@@ -319,6 +358,13 @@ class RepoConfig(_ConfigModel):
     @classmethod
     def _check_bot_login(cls, value: str | None) -> str | None:
         return None if value is None else _check_login(value, "github.repos[].bot_login")
+
+    @field_validator(*(f"{name}_label" for name in LABEL_KINDS))
+    @classmethod
+    def _check_label(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError(f"github.repos[].{info.field_name} must be non-empty when set")
+        return value
 
     @property
     def owner(self) -> str:
@@ -953,22 +999,21 @@ class DaemonConfig(_ConfigModel):
     def _lower_format(cls, value: Any) -> Any:
         return value.lower() if isinstance(value, str) else value
 
+    def labels_for(self, entry: RepoConfig | None = None) -> LabelSet:
+        """The lifecycle labels ``entry``'s issues carry: each per-repo
+        ``<kind>_label`` where set, else this section's (#630). A straight
+        merge — ``None`` (no entry) is the daemon-wide set."""
+        return LabelSet(
+            *(
+                (getattr(entry, f"{kind}_label", None) if entry is not None else None)
+                or getattr(self, f"{kind}_label")
+                for kind in LABEL_KINDS
+            )
+        )
+
     @model_validator(mode="after")
     def _check(self) -> DaemonConfig:
-        labels = [
-            self.trigger_label,
-            self.in_progress_label,
-            self.failed_label,
-            self.completed_label,
-            self.blocked_label,
-            self.gated_label,
-        ]
-        if any(not label.strip() for label in labels):
-            raise ValueError("daemon labels must be non-empty")
-        # GitHub label names are case-insensitive: "sbxloop:run" and
-        # "SBXLOOP:RUN" are the same label, so they cannot mark two states.
-        if len({label.strip().casefold() for label in labels}) != len(labels):
-            raise ValueError("daemon labels must be distinct (case-insensitively)")
+        _check_label_set(self.labels_for(), "daemon")
         for name in (
             "max_runs_per_day",
             "max_attempts_per_item",
@@ -1244,6 +1289,22 @@ class Config(_ConfigModel):
         # `state_dir = "~/.sbxloop"` in TOML must mean the home directory,
         # not a literal "~" directory under the project.
         return value.expanduser()
+
+    @model_validator(mode="after")
+    def _repo_labels_are_distinct(self) -> Config:
+        """A repository's *effective* six labels must be distinct: an entry
+        that renames one onto another (`failed_label = "sbxloop:blocked"`)
+        would mark two states with one label."""
+        for entry in self.github.repos:
+            _check_label_set(self.daemon.labels_for(entry), f"github.repos[{entry.repo}]")
+        return self
+
+    def labels_for(self, repo: str | None = None) -> LabelSet:
+        """The lifecycle labels for ``repo`` (its ``[[github.repos]]``
+        overrides over the ``[daemon]`` defaults, #630); ``None`` resolves
+        the default repository, and a repository with no entry gets the
+        daemon-wide set."""
+        return self.daemon.labels_for(self.github.effective_repo(repo))
 
     @model_validator(mode="after")
     def _chat_backend_is_consistent(self) -> Config:
