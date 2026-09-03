@@ -35,6 +35,74 @@ Two distributions ship from this repo in lockstep versions:
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
   host never installs the Copilot runtime.
 
+## System map
+
+The same picture as a graph, with every box named as the code names it.
+Two things are worth reading off it before anything else: **the host holds
+no credential and every arrow into a sandbox starts on the host**, and
+**the two run sandboxes have no edge between them** — the agent box has the
+toolchains and no GitHub token, the github box has the token and no
+toolchains.
+
+```mermaid
+flowchart LR
+    human["operator"]
+    gh["GitHub<br/>issues · branches · PRs · checks"]
+    modelapi["Model API<br/>Copilot, or api.anthropic.com"]
+    chat["Discord or Slack<br/>gateway / Socket Mode WebSocket<br/>(dialled outbound by the host)"]
+
+    subgraph host["Host — one sbxloop daemon process, holds no agent or GitHub credential"]
+        direction TB
+        bridge["ChatBridge — daemon/chat.py<br/>+ DiscordBridge / SlackBridge<br/>run threads, steer notes, !sbx commands"]
+        loop["DaemonLoop — daemon/loop.py<br/>discover → claim → run → settle<br/>run cap · attempt cap · circuit breaker"]
+        engine["LoopEngine + PhaseRunner — engine/<br/>DECOMPOSE → BUILD ⇄ VERIFY → PR<br/>→ REVIEW → FIX → CI → MERGE"]
+        store[("SQLite — DaemonStore / StateStore<br/>work items, runs, checkpoints, event log")]
+        wc["WorkerClient + HostToolBroker — worker/<br/>sbx cp jobs/&lt;id&gt;.json · sbx exec ·<br/>read results/&lt;id&gt;.json · answer host tools"]
+        ws[("runs/&lt;run_id&gt;/workspace<br/>host git checkout, one per repository")]
+    end
+
+    subgraph durable["Long-lived sandboxes — outside any run's pair, never pruned"]
+        conc["sbxloop-concierge-&lt;digest&gt;<br/>daemon/agentbox.py + concierge.py<br/>agent credential · no built-in SDK tools<br/>everything it does is a host tool<br/>SDK session store kept in-VM across restarts"]
+        dgh["sbxloop-daemon-github-&lt;digest&gt;<br/>daemon/github.py<br/>GH_TOKEN · issue polling, claim, labels<br/>also serves the concierge's GitHub tools"]
+    end
+
+    subgraph pair["Ephemeral pair — Provisioner.ensure_pair, one per run, torn down at run end"]
+        agent["sbxloop-&lt;run&gt;-agent<br/>agent credential ONLY — COPILOT_GITHUB_TOKEN<br/>or ANTHROPIC_API_KEY<br/>Copilot SDK, or Claude Agent SDK + Claude Code CLI<br/>the resolved dev toolchains + the workspace clone<br/>jobs: agent.session · shell.check · shell.batch"]
+        ghbox["sbxloop-&lt;run&gt;-github<br/>GH_TOKEN ONLY — PAT or host-minted App token<br/>no toolchains, no build tools, no model<br/>jobs: github.op only, gh CLI or stdlib REST"]
+    end
+
+    human -->|"labels an issue sbxloop:run"| gh
+    human <-->|"asks, steers, reads run threads"| chat
+    chat <-->|"WebSocket"| bridge
+    bridge --> loop
+    loop <--> store
+    loop -->|"one engine run per claimed item"| engine
+    engine --> wc
+    engine -.->|"clones into"| ws
+    ws -.->|"mounted"| agent
+
+    wc ==>|"agent.session turns · host tools"| conc
+    wc ==>|"github.op — poll, claim, label, close"| dgh
+    wc ==>|"agent + shell jobs"| agent
+    wc ==>|"typed github.op jobs"| ghbox
+
+    conc -.->|"file / list / comment / label an issue,<br/>relayed host-side"| wc
+    agent -->|"models + toolchain registries<br/>on the balanced allowlist"| modelapi
+    conc --> modelapi
+    dgh -->|"REST"| gh
+    ghbox -->|"branch, PR, review, CI poll, merge"| gh
+    agent x-- "no channel — host mediation invariant" --x ghbox
+```
+
+Where the credentials come from: each sandbox is provisioned with **its own
+token and no other**. Delivery is one of three tiers, chosen per sandbox and
+cached per sbx version — sbx's secret proxy (values never enter the VM),
+per-job **stdin → env** (`export KEY=VALUE` piped into the launch shell,
+#592), or `~/.sbxloop/env.sh` chmod 600 as the last resort. The same ladder
+applies to all four boxes above; see
+[the security primitive](#the-security-primitive-one-run--two-sandboxes) for
+which tier actually runs on current sbx.
+
 ## Design principles
 
 Two properties are the load-bearing walls of sbxloop's security model. They are
