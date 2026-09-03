@@ -8,6 +8,20 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **The agent sandbox's allowlist never names a host twice** (#616).
+  `sbx policy allow` refuses a rule it already holds — including one
+  created moments earlier from the same argv — and the refusal fails the
+  whole call, so a repeated host did not waste a rule but failed
+  provisioning outright. The tiers overlap by construction: the claude
+  backend pulls in the javascript toolchain for the Claude Code CLI, and
+  its installer host is the `registry.npmjs.org` the advertised baseline
+  already promises, so *every* claude-backend sandbox hit it — field
+  failure on `db`, where the concierge box could not provision at all
+  (`concierge.warm_up_failed`) and Discord mentions were dead. The union
+  is now deduped in `agent_policy_allows`, and again where any spec's
+  list is applied, so an operator naming a host in `extra_allow_domains`
+  that a toolchain or the baseline also opens is no longer fatal.
+
 - **A head with no checks is settled at landing too** (#633). `land()`
   trusted "nothing has reported" on sight; only the CI stage after a
   delivery waited out `ci_settle_s`. A resume at the landing stage, a
