@@ -2,9 +2,8 @@
 
 Small, offline project skeletons — one per ecosystem sbxloop must not
 mistake for a Python project. `tests/unit/test_ecosystems.py` walks them
-through the generalization surface (language detection and the installer
-allowlist today; the project gate and the lint table as later work lands)
-and asserts explicit expectations per fixture, so a regression names the
+through the generalization surface (language detection, the installer
+allowlist, the project gate and the config-override lint) and asserts explicit expectations per fixture, so a regression names the
 decision that changed rather than a snapshot that drifted.
 
 Every file here is a manifest or a minimal stand-in; nothing is meant to
