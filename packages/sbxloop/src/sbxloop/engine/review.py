@@ -422,7 +422,7 @@ class Reconciliation(NamedTuple):
         return f"{self.note} (test: `{self.test}`)" if self.note else f"test: `{self.test}`"
 
 
-# `addressed: <anchor> — what changed; test: tests/unit/test_x.py::test_y`
+# `addressed: <anchor> — what changed; test: <a test id, in the runner's own syntax>`
 _TEST_TAIL = re.compile(r"[;,(]?\s*\btest(?:s)?\s*:\s*(?P<test>[^;)]+)\)?\s*$", re.IGNORECASE)
 
 
@@ -860,7 +860,8 @@ def fix_brief(
     parts.append(
         "End your summary with one line per finding or objection above, in the form "
         "`addressed: <path:line> — what changed; test: <the regression test you added, "
-        "e.g. tests/test_x.py::test_y>`, `refuted: <path:line> — why it "
+        "named the way this project's test runner selects one test>`, "
+        "`refuted: <path:line> — why it "
         "is not a problem`, or `deferred: <path:line> — why it can wait` (non-blocking "
         "findings only). The next review reads that list; a finding you refuted "
         "with a stated reason or deferred will not be raised again without a rebuttal, "

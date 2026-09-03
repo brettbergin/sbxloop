@@ -465,7 +465,22 @@ opens every shape and proves each row survives. A change to persisted
 state adds the shape before it there and a case in the sweep. Each template opens with an HTML comment stating its own
 contract (variables, escaping, which test guards which section); `render` strips
 that header before the prompt reaches the model, so it costs no tokens and
-cannot be mistaken for instructions.
+cannot be mistaken for instructions. Examples are domain-neutral (#634): a
+worked example is the anchor the model pattern-matches against, and a story
+about this repository is the wrong anchor for every other one, so no prompt
+body names an issue or PR number, a path, state name or product term from
+sbxloop itself (`test_prompt_bodies_stay_domain_neutral`; the concierge, being
+the loop's own front desk, keeps its item ids and sandboxes). The one
+ecosystem-specific example — the config-override that decompose.md warns
+against and review.md's wrong-check section describes — is rendered per run:
+`verifylint.config_override_example` picks the story for the first resolved
+language that has one (mypy `files`; `tsc` ignoring `tsconfig.json` when
+handed input files; rubocop inspecting an `Exclude`d file named on the
+command line; a Go build tag pulling an integration suite into `go test`),
+Python when none does, and the engine passes it as
+`$config_override_example`. The stories live beside the lint's
+`CONFIG_SCOPED_TOOLS` entries so a tool the lint learns to read gains its
+example in the same place.
 
 ## Persistence and resume
 
