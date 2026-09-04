@@ -750,6 +750,147 @@ class TestCompiledAndScriptedEcosystems:
         assert project_gate(tmp_path) is None
 
 
+class TestGateBelowTheRoot:
+    """Language detection reads two levels down; the gate walk reads the
+    same levels (#687), root first — a monorepo whose packages carry the
+    gates provisioned toolchains and then had no gate, which fails open."""
+
+    def test_a_package_below_the_root_declares_the_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "packages/api/package.json", json.dumps({"scripts": {"check": "vitest"}}))
+        write(tmp_path, "packages/web/package.json", json.dumps({"scripts": {"dev": "vite"}}))
+        assert project_gate(tmp_path) == "cd packages/api && npm run check"
+
+    def test_a_package_runs_under_the_client_the_monorepo_root_pins(self, tmp_path: Path) -> None:
+        write(tmp_path, "pnpm-lock.yaml", "lockfileVersion: 9\n")
+        write(tmp_path, "pnpm-workspace.yaml", "packages:\n  - packages/*\n")
+        write(tmp_path, "packages/api/package.json", json.dumps({"scripts": {"check": "vitest"}}))
+        assert project_gate(tmp_path) == "cd packages/api && pnpm run check"
+
+    def test_a_package_that_pins_its_own_client_keeps_it(self, tmp_path: Path) -> None:
+        write(tmp_path, "pnpm-lock.yaml", "lockfileVersion: 9\n")
+        write(
+            tmp_path,
+            "packages/api/package.json",
+            json.dumps({"packageManager": "yarn@4.1.0", "scripts": {"check": "vitest"}}),
+        )
+        assert project_gate(tmp_path) == "cd packages/api && yarn run check"
+
+    def test_a_root_packagemanager_pin_reaches_the_packages(self, tmp_path: Path) -> None:
+        write(
+            tmp_path, "package.json", json.dumps({"packageManager": "bun@1.1.0", "private": True})
+        )
+        write(tmp_path, "packages/api/package.json", json.dumps({"scripts": {"check": "vitest"}}))
+        assert project_gate(tmp_path) == "cd packages/api && bun run check"
+        # ...unless the sandbox's resolved set lacks that client (#684)
+        assert (
+            project_gate(tmp_path, languages=["javascript"]) == "cd packages/api && npm run check"
+        )
+
+    def test_the_root_wins_over_every_package(self, tmp_path: Path) -> None:
+        write(tmp_path, "Makefile", "check:\n\tpnpm -r run check\n")
+        write(tmp_path, "packages/api/package.json", json.dumps({"scripts": {"check": "vitest"}}))
+        assert project_gate(tmp_path) == "make check"
+
+    def test_levels_are_read_in_order_and_names_sorted_within_one(self, tmp_path: Path) -> None:
+        write(tmp_path, "services/zeta/go.mod", "module z\n")
+        write(tmp_path, "packages/b/Makefile", "check:\n\t@echo\n")
+        write(tmp_path, "packages/a/Makefile", "ci:\n\t@echo\n")
+        write(tmp_path, "backend/Cargo.toml", "[package]\nname = 'x'\n")
+        # depth 1 (`backend`) before depth 2; `packages/a` before `packages/b`
+        assert project_gate(tmp_path) == "cd backend && cargo test"
+        (tmp_path / "backend/Cargo.toml").unlink()
+        assert project_gate(tmp_path) == "cd packages/a && make ci"
+
+    def test_a_solution_under_src(self, tmp_path: Path) -> None:
+        write(tmp_path, "src/App.sln", "")
+        write(tmp_path, "src/App/App.csproj", "<Project/>")
+        assert project_gate(tmp_path) == "cd src && dotnet test"
+
+    def test_a_go_workspace_is_one_gate_at_the_root(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.work", "go 1.22\n\nuse (\n\t./api\n\t./web\n)\n")
+        write(tmp_path, "api/go.mod", "module api\n")
+        assert project_gate(tmp_path) == "go vet ./... && go test ./..."
+
+    def test_the_third_level_is_not_read(self, tmp_path: Path) -> None:
+        write(tmp_path, "a/b/c/Makefile", "check:\n\t@echo\n")
+        assert project_gate(tmp_path) is None
+        write(tmp_path, "a/b/Makefile", "check:\n\t@echo\n")
+        assert project_gate(tmp_path) == "cd a/b && make check"
+
+    @pytest.mark.parametrize(
+        "directory",
+        ["node_modules/left-pad", ".github", "tests/fixtures/app", "examples/demo", "docs"],
+    )
+    def test_dependency_trees_dot_dirs_and_fixtures_are_not_gates(
+        self, tmp_path: Path, directory: str
+    ) -> None:
+        write(tmp_path, f"{directory}/package.json", json.dumps({"scripts": {"check": "x"}}))
+        write(tmp_path, f"{directory}/go.mod", "module x\n")
+        assert project_gate(tmp_path) is None
+
+    def test_a_directory_needing_quotes_is_quoted(self, tmp_path: Path) -> None:
+        write(tmp_path, "my app/Makefile", "check:\n\t@echo\n")
+        assert project_gate(tmp_path) == "cd 'my app' && make check"
+
+    def test_the_toolchain_bound_applies_below_the_root_too(self, tmp_path: Path) -> None:
+        write(tmp_path, "packages/api/package.json", json.dumps({"scripts": {"check": "x"}}))
+        assert project_gate(tmp_path, languages=["python"]) is None
+        assert project_gate(tmp_path, languages=["javascript"]) == (
+            "cd packages/api && npm run check"
+        )
+
+    def test_a_subshell_around_the_cd_gate_still_runs_it(self) -> None:
+        gate = "cd packages/api && npm run check"
+        assert runs_gate("(cd packages/api && npm run check)", gate)
+        assert runs_gate("cd packages/api && npm run lint && npm run check", gate)
+        assert not runs_gate("cd packages/web && npm run check", gate)
+        assert not runs_gate("npm run check", gate)
+
+
+class TestTargetsAreRulesNotVariables:
+    """`check := 1` assigns a variable in make and just; a Taskfile's
+    `includes:` lists other Taskfiles. Neither is a target (#687)."""
+
+    @pytest.mark.parametrize("line", ["check := 1", "check:=1", "check ::= 1", "ci := true"])
+    def test_a_variable_assignment_is_not_a_make_gate(self, tmp_path: Path, line: str) -> None:
+        write(tmp_path, "Makefile", f"{line}\n\nbuild:\n\t@echo\n")
+        assert project_gate(tmp_path) is None
+
+    def test_a_double_colon_rule_is_a_target(self, tmp_path: Path) -> None:
+        write(tmp_path, "Makefile", "check::\n\t@echo\n")
+        assert project_gate(tmp_path) == "make check"
+
+    def test_a_just_variable_is_not_a_gate(self, tmp_path: Path) -> None:
+        write(tmp_path, "justfile", 'check := "cargo check"\n\nbuild:\n    cargo build\n')
+        assert project_gate(tmp_path) is None
+        write(tmp_path, "justfile", 'check := "x"\n\ncheck:\n    cargo test\n')
+        assert project_gate(tmp_path) == "just check"
+
+    def test_a_taskfile_include_or_var_named_check_is_not_a_task(self, tmp_path: Path) -> None:
+        write(
+            tmp_path,
+            "Taskfile.yml",
+            "version: '3'\nincludes:\n  check:\n    taskfile: ./check/Taskfile.yml\n"
+            "vars:\n  ci: true\ntasks:\n  build:\n    cmds:\n      - go build\n",
+        )
+        assert project_gate(tmp_path) is None
+
+    def test_a_taskfile_task_named_check_is(self, tmp_path: Path) -> None:
+        write(
+            tmp_path,
+            "Taskfile.yml",
+            "version: '3'\nincludes:\n  lint:\n    taskfile: ./lint.yml\n"
+            "tasks:\n  check:\n    deps: [lint, test]\n",
+        )
+        assert project_gate(tmp_path) == "task check"
+
+    def test_a_taskfile_that_is_not_yaml_declares_nothing(self, tmp_path: Path) -> None:
+        write(tmp_path, "Taskfile.yml", "tasks: [\n  check: {\n")
+        assert project_gate(tmp_path) is None
+        write(tmp_path, "Taskfile.yml", "- just\n- a list\n")
+        assert project_gate(tmp_path) is None
+
+
 class TestGateNeedsItsToolchain:
     """Rule: a detector may only emit a command the resolved toolchains
     can run (#625). A language's own runner only when that language was

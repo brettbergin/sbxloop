@@ -1,0 +1,6 @@
+{
+  "name": "app",
+  "author": "René (latin-1 byte, not UTF-8)",
+  "engines": { "node": "22" },
+  "scripts": { "check": "vitest run" }
+}

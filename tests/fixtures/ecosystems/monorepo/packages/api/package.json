@@ -1,0 +1,5 @@
+{
+  "name": "@acme/api",
+  "private": true,
+  "scripts": { "check": "vitest run", "dev": "tsx watch src/index.ts" }
+}

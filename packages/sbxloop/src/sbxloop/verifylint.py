@@ -47,6 +47,8 @@ from typing import Any, Literal
 
 import yaml
 
+from sbxloop import toolchains
+
 
 @dataclass(frozen=True)
 class LanguageRule:
@@ -378,28 +380,55 @@ def _target_gate(
     return None
 
 
-def _make_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+# A rule is `name:` or `name::`; `name :=` / `name ::=` assign a variable
+# (make and just alike), and `check := 1` is not a gate (#687).
+_RULE_PATTERN = r"^{target}\s*:(?!:?=)"
+
+
+def _make_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # GNU make's own search order.
     return _target_gate(
-        workspace, ("GNUmakefile", "makefile", "Makefile"), r"^{target}\s*:", "make {target}"
+        workspace, ("GNUmakefile", "makefile", "Makefile"), _RULE_PATTERN, "make {target}"
     )
 
 
-def _just_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _just_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     return _target_gate(
-        workspace, ("justfile", ".justfile", "Justfile"), r"^{target}\s*:", "just {target}"
+        workspace, ("justfile", ".justfile", "Justfile"), _RULE_PATTERN, "just {target}"
     )
 
 
-def _task_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
-    # Taskfile targets are YAML keys under `tasks:`, so a two-space indent is
-    # the shape rather than a line start.
-    return _target_gate(
-        workspace, ("Taskfile.yml", "Taskfile.yaml"), r"^\s+{target}\s*:", "task {target}"
-    )
+def _task_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
+    # Taskfile targets are the keys of the `tasks:` mapping — parsed, not
+    # pattern-matched, so a `check:` under `includes:` (or `vars:`) is not
+    # taken for one (#687). The first file Task would read is the one read.
+    for name in ("Taskfile.yml", "Taskfile.yaml"):
+        text = _read(workspace / name)
+        if text is None:
+            continue
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, dict):
+            return None
+        for target in GATE_TARGETS:
+            if target in tasks:
+                return f"task {target}"
+        return None
+    return None
 
 
-def _rake_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _rake_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `task :ci do`, `task ci: [...]`, `task "check" => ...`, `task default:`.
     return _target_gate(
         workspace,
@@ -441,50 +470,60 @@ _LOCKFILE_CLIENTS: tuple[tuple[str, str], ...] = (
 _PACKAGE_MANAGER_CLIENTS = frozenset({"pnpm", "yarn", "bun", "npm"})
 
 
-def _node_package_client(workspace: Path) -> str:
+def _node_package_client(workspace: Path, top: Path | None = None) -> str:
     """The package-manager client the workspace names: the ``packageManager``
-    pin first (it is what corepack honours), then the lockfile."""
-    text = _read(workspace / "package.json")
-    if text is not None:
-        try:
-            declared = json.loads(text).get("packageManager")
-        except (ValueError, AttributeError):
-            declared = None
-        if isinstance(declared, str):
-            name = declared.split("@", 1)[0].strip()
-            if name in _PACKAGE_MANAGER_CLIENTS:
-                return name
-    for lockfile, client in _LOCKFILE_CLIENTS:
-        if (workspace / lockfile).is_file():
-            return client
+    pin first (it is what corepack honours), then the lockfile — read at the
+    package, then at ``top`` when the package is one of a monorepo's, since
+    a workspace pins its client and keeps its lockfile once, at the root."""
+    for directory in (workspace, top) if top is not None and top != workspace else (workspace,):
+        text = _read(directory / "package.json")
+        if text is not None:
+            try:
+                declared = json.loads(text).get("packageManager")
+            except (ValueError, AttributeError):
+                declared = None
+            if isinstance(declared, str):
+                name = declared.split("@", 1)[0].strip()
+                if name in _PACKAGE_MANAGER_CLIENTS:
+                    return name
+        for lockfile, client in _LOCKFILE_CLIENTS:
+            if (directory / lockfile).is_file():
+                return client
     return "npm"
 
 
-def node_script_runner(workspace: Path, languages: Sequence[str] | None = None) -> str:
+def node_script_runner(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str:
     """How to run a script declared in ``workspace``'s package.json.
 
     ``languages`` is the run's resolved toolchain set; a workspace naming
     bun on a sandbox whose set lacks it (an explicit ``languages`` that left
     it out) falls back to ``npm run``, the one client every Node sandbox
-    has. None consults nothing but the workspace.
+    has. None consults nothing but the workspace. ``top`` is the monorepo
+    root when ``workspace`` is a package below it (#687).
     """
-    client = _node_package_client(workspace)
+    client = _node_package_client(workspace, top)
     if client == "bun" and languages is not None and "bun" not in languages:
         client = "npm"
     return f"{client} run"
 
 
-def _npm_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _npm_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     scripts = _json_object(workspace / "package.json", "scripts")
     if scripts is None:
         return None
     for target in GATE_TARGETS:
         if target in scripts:
-            return f"{node_script_runner(workspace, languages)} {target}"
+            return f"{node_script_runner(workspace, languages, top)} {target}"
     return None
 
 
-def _composer_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _composer_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     scripts = _json_object(workspace / "composer.json", "scripts")
     if scripts is None:
         return None
@@ -494,17 +533,23 @@ def _composer_gate(workspace: Path, languages: Sequence[str] | None = None) -> s
     return None
 
 
-def _tox_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _tox_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # tox and nox declare the whole matrix in one file; running the bare
     # command IS the gate, so presence is the whole signal.
     return "tox" if (workspace / "tox.ini").is_file() else None
 
 
-def _nox_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _nox_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     return "nox" if (workspace / "noxfile.py").is_file() else None
 
 
-def _gradle_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _gradle_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `check` is Gradle's built-in lifecycle gate; the wrapper script is the
     # declaration of how to run it (and the only Gradle the sandbox has —
     # the java toolchain ships Maven, not Gradle).
@@ -515,7 +560,9 @@ def _gradle_gate(workspace: Path, languages: Sequence[str] | None = None) -> str
     return None
 
 
-def _maven_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _maven_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `verify` is Maven's lifecycle gate; a wrapper is preferred when the
     # project ships one, else the toolchain's mvn.
     if not (workspace / "pom.xml").is_file():
@@ -523,7 +570,9 @@ def _maven_gate(workspace: Path, languages: Sequence[str] | None = None) -> str 
     return "./mvnw -q verify" if (workspace / "mvnw").is_file() else "mvn -q verify"
 
 
-def _cargo_alias_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _cargo_alias_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     for name in (".cargo/config.toml", ".cargo/config"):
         text = _read(workspace / name)
         if text is None:
@@ -546,15 +595,25 @@ def _cargo_alias_gate(workspace: Path, languages: Sequence[str] | None = None) -
 # is the declaration, and the command is satisfiable by construction on the
 # toolchain that manifest resolved. Go has no task-runner convention at all,
 # which is why it is here and not above.
-def _go_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
-    return "go vet ./... && go test ./..." if (workspace / "go.mod").is_file() else None
+def _go_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
+    # A `go.work` makes `./...` span every module in the workspace, so the
+    # same command is the gate of a Go monorepo (#687).
+    if any((workspace / name).is_file() for name in ("go.mod", "go.work")):
+        return "go vet ./... && go test ./..."
+    return None
 
 
-def _cargo_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _cargo_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     return "cargo test" if (workspace / "Cargo.toml").is_file() else None
 
 
-def _dotnet_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
+def _dotnet_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `dotnet test` needs exactly one solution or project file in the
     # directory to know what to build.
     try:
@@ -582,9 +641,12 @@ class GateDetector:
     run — a gate the executor cannot invoke is unsatisfiable, not strict.
     Every detector receives the resolved set for that reason; only the
     npm one consults it (a bun lockfile on a sandbox without bun, #684).
+    Every detector also receives the workspace root, since it may be run
+    at a package below it (#687); again only the npm one reads it (the
+    client a monorepo pins at its root).
     """
 
-    detect: Callable[[Path, Sequence[str] | None], str | None]
+    detect: Callable[[Path, Sequence[str] | None, Path | None], str | None]
     language: str | None = None
 
 
@@ -636,6 +698,18 @@ def project_gate(
         return override.strip() or None
     if workspace is None:
         return None
+    for root in _gate_roots(workspace):
+        gate = _gate_at(root, languages, workspace)
+        if gate is None:
+            continue
+        if root == workspace:
+            return gate
+        return f"cd {shlex.quote(root.relative_to(workspace).as_posix())} && {gate}"
+    return None
+
+
+def _gate_at(root: Path, languages: Sequence[str] | None, top: Path) -> str | None:
+    """The first detector's gate at ``root``, under the resolved toolchains."""
     for detector in GATE_DETECTORS:
         if (
             languages is not None
@@ -643,10 +717,63 @@ def project_gate(
             and detector.language not in languages
         ):
             continue
-        gate = detector.detect(workspace, languages)
+        gate = detector.detect(root, languages, top)
         if gate:
             return gate
     return None
+
+
+# Directories the gate walk does not descend into, beyond the dependency
+# trees language detection skips: a fixture's package.json or a sample's
+# go.mod is a manifest, but its gate is not the project's, and a guessed
+# gate is unsatisfiable rather than strict.
+_GATE_SKIP_DIRS = frozenset(
+    {
+        "test",
+        "tests",
+        "testdata",
+        "fixtures",
+        "fixture",
+        "examples",
+        "example",
+        "samples",
+        "sample",
+        "docs",
+        "doc",
+        "benchmarks",
+    }
+)
+
+
+def _gate_roots(workspace: Path) -> list[Path]:
+    """The workspace root, then its subdirectories to the depth language
+    detection reads (#687) — level by level, sorted by name within a level,
+    skipping dot-directories, dependency trees and fixture-shaped names.
+
+    The root goes first because a monorepo with a real whole-project gate
+    declares it there (a Makefile, a root package.json script); the packages
+    below are consulted only when the root declares none.
+    """
+    roots = [workspace]
+    level = [workspace]
+    for _depth in range(toolchains.DETECT_DEPTH):
+        next_level: list[Path] = []
+        for directory in level:
+            try:
+                entries = sorted(directory.iterdir(), key=lambda p: p.name)
+            except OSError:
+                continue
+            next_level += [
+                entry
+                for entry in entries
+                if entry.is_dir()
+                and not entry.name.startswith(".")
+                and entry.name not in toolchains.SKIP_DIRS
+                and entry.name not in _GATE_SKIP_DIRS
+            ]
+        roots += next_level
+        level = next_level
+    return roots
 
 
 # Lockfiles and manifests a test-container dependency would be pinned in
@@ -755,7 +882,9 @@ def runs_gate(command: str, gate: str) -> bool:
     A single-word gate (``tox``, ``nox``) needs only its program.
     """
     try:
-        words = shlex.split(command)
+        # `(cd packages/api && npm run check)` runs `cd packages/api && npm
+        # run check` — the subshell's parentheses are not part of any word.
+        words = [word.strip("()") for word in shlex.split(command)]
         wanted = shlex.split(gate)
     except ValueError:
         return False
