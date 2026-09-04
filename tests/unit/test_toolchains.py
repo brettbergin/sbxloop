@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from sbxloop import toolchains
+from sbxloop.errors import ProvisionError
 
 
 def test_names_and_aliases_are_unique() -> None:
@@ -325,7 +326,8 @@ def test_dotnet_pins_the_sdk_major_and_verifies_sha512() -> None:
     assert dotnet.install_script is not None
     assert toolchains.DOTNET_SDK_VERSION in dotnet.install_script
     assert "sha512sum -c" in dotnet.install_script
-    assert f'grep -q "^{toolchains.DOTNET_SDK_MAJOR}\\.' in dotnet.probe
+    # the probe is the exact SDK: a `global.json` rollForward=patch demands it
+    assert f'grep -q "^{toolchains.DOTNET_SDK_VERSION.replace(".", "\\.")} "' in dotnet.probe
     for _deb_arch, (_upstream, digest) in toolchains._DOTNET_DIGESTS.items():
         assert len(digest) == 128, "sha512 digests are 128 hex chars"
         assert digest in dotnet.install_script
@@ -488,8 +490,26 @@ def test_installer_entries_declare_their_hosts() -> None:
 
 
 def test_apt_only_entries_open_no_hosts() -> None:
-    for name in ("cpp", "ruby", "java"):
-        assert toolchains.resolve([name])[0].install_domains == ()
+    assert toolchains.resolve(["cpp"])[0].install_domains == ()
+
+
+def test_default_ruby_and_java_fetch_nothing_but_carry_their_pinned_hosts() -> None:
+    # The default series come from apt. Their install_domains are still the
+    # hosts a pinned rebuild fetches from, because the sandbox allowlist is
+    # computed from the default entry before the workspace is read (#686).
+    for name in ("ruby", "java"):
+        entry = toolchains.resolve([name])[0]
+        assert "https://" not in (entry.install_script or ""), name
+        assert entry.install_domains, name
+        for series in (
+            toolchains.RUBY_SERIES_CANDIDATES
+            if name == "ruby"
+            else toolchains.JAVA_MAJOR_CANDIDATES
+        ):
+            assert entry.for_version(series).install_domains == entry.install_domains, (
+                name,
+                series,
+            )
 
 
 class TestTaskRunners:
@@ -702,15 +722,18 @@ def test_requires_python_selects_a_series(tmp_path: Path, requires: str, series:
     )
 
 
-def test_requires_python_nobody_can_satisfy_keeps_the_default_on_the_record(
-    tmp_path: Path,
-) -> None:
-    # Fail loud, then provision what was always provisioned: the event
-    # names the constraint next to the default it fell back to.
+def test_requires_python_nobody_can_satisfy_stops_the_run(tmp_path: Path) -> None:
+    # #686: a declaration no series honours is not softened into the
+    # default (which the project would refuse at the gate); the run stops
+    # at resolution, before any microVM, naming the constraint and what is
+    # installable.
     pyproject(tmp_path, ">=2.7,<3")
-    assert toolchains.PYTHON.version_from(tmp_path) == toolchains.ToolchainVersion(
-        toolchains.PYTHON_SERIES, "default", ">=2.7,<3"
-    )
+    with pytest.raises(toolchains.UnsatisfiablePin) as excinfo:
+        toolchains.PYTHON.version_from(tmp_path)
+    message = str(excinfo.value)
+    assert "pyproject.toml pins python to '>=2.7,<3'" in message
+    assert toolchains.PYTHON_SERIES in message and "3.11" in message
+    assert isinstance(excinfo.value, ProvisionError)
 
 
 def test_requires_python_that_is_not_pep_440_reads_as_undeclared(tmp_path: Path) -> None:
@@ -743,11 +766,13 @@ def test_python_version_file_wins_over_requires_python(tmp_path: Path) -> None:
     assert toolchains.PYTHON.version_from(tmp_path).series == "3.11"  # type: ignore[union-attr]
 
 
-def test_python_version_file_outside_the_candidates_falls_to_the_default(tmp_path: Path) -> None:
+def test_python_version_file_outside_the_candidates_stops_the_run(tmp_path: Path) -> None:
     (tmp_path / ".python-version").write_text("2.7\n")
-    assert toolchains.PYTHON.version_from(tmp_path) == toolchains.ToolchainVersion(
-        toolchains.PYTHON_SERIES, "default", "2.7"
-    )
+    with pytest.raises(
+        toolchains.UnsatisfiablePin, match=r"\.python-version pins python to '2\.7'"
+    ):
+        toolchains.PYTHON.version_from(tmp_path)
+    # An implementation this host does not read is undeclared, not unsatisfiable.
     (tmp_path / ".python-version").write_text("pypy3.10\n")
     assert toolchains.PYTHON.version_from(tmp_path) == PY_DEFAULT
 
@@ -778,11 +803,10 @@ def test_node_version_file_is_read_like_nvmrc(tmp_path: Path) -> None:
     )
 
 
-def test_nvmrc_for_a_major_this_host_cannot_install_keeps_the_default(tmp_path: Path) -> None:
+def test_nvmrc_for_a_major_this_host_cannot_install_stops_the_run(tmp_path: Path) -> None:
     (tmp_path / ".nvmrc").write_text("16\n")
-    assert toolchains.NODE.version_from(tmp_path) == toolchains.ToolchainVersion(
-        toolchains.NODE_MAJOR, "default", "16"
-    )
+    with pytest.raises(toolchains.UnsatisfiablePin, match=r"\.nvmrc pins javascript to '16'"):
+        toolchains.NODE.version_from(tmp_path)
     (tmp_path / ".nvmrc").write_text("lts/argon\n")  # a codename nobody ships any more
     assert toolchains.NODE.version_from(tmp_path) == NODE_DEFAULT
 
@@ -810,11 +834,12 @@ def test_engines_node_selects_the_highest_admitted_major(
     )
 
 
-def test_engines_node_nobody_can_satisfy_keeps_the_default_on_the_record(tmp_path: Path) -> None:
+def test_engines_node_nobody_can_satisfy_stops_the_run(tmp_path: Path) -> None:
     package_json(tmp_path, "14.x")
-    assert toolchains.NODE.version_from(tmp_path) == toolchains.ToolchainVersion(
-        toolchains.NODE_MAJOR, "default", "14.x"
-    )
+    with pytest.raises(
+        toolchains.UnsatisfiablePin, match=r"package\.json pins javascript to '14\.x'"
+    ):
+        toolchains.NODE.version_from(tmp_path)
 
 
 def test_engines_node_this_host_cannot_read_is_undeclared(tmp_path: Path) -> None:
@@ -942,3 +967,334 @@ def test_resolve_languages_carries_versions_for_explicit_config_too(tmp_path: Pa
     assert resolved.versions["python"].series == "3.12"
     # positional construction (the pre-#627 shape) still works
     assert toolchains.LanguageResolution(("go",), "detected", {"go": ("go.mod",)}).versions == {}
+
+
+# --- #686: dotnet / java / ruby pins ------------------------------------
+
+DOTNET_DEFAULT = toolchains.ToolchainVersion(toolchains.DOTNET_SDK_MAJOR, "default")
+JAVA_DEFAULT = toolchains.ToolchainVersion(toolchains.JAVA_JDK_MAJOR, "default")
+RUBY_DEFAULT = toolchains.ToolchainVersion(toolchains.RUBY_SERIES, "default")
+
+
+def global_json(tmp_path: Path, version: str, roll_forward: str | None = None) -> str:
+    sdk: dict[str, str] = {"version": version}
+    if roll_forward is not None:
+        sdk["rollForward"] = roll_forward
+    (tmp_path / "global.json").write_text(json.dumps({"sdk": sdk}))
+    return version if roll_forward is None else f"{version} rollForward={roll_forward}"
+
+
+@pytest.mark.parametrize(
+    ("version", "roll_forward", "major"),
+    [
+        ("8.0.400", None, "8"),  # default policy `patch`: same feature band, later patch
+        ("8.0.424", "disable", "8"),  # exact
+        ("8.0.100", "latestFeature", "8"),  # any later feature band of 8.0
+        ("8.0.100", "feature", "8"),
+        ("6.0.100", "latestMajor", toolchains.DOTNET_SDK_MAJOR),
+        ("9.0.300", "major", toolchains.DOTNET_SDK_MAJOR),
+        ("9.0.100", "latestMinor", "9"),
+        ("10.0.100", "latestFeature", toolchains.DOTNET_SDK_MAJOR),
+    ],
+)
+def test_global_json_selects_the_sdk_major_its_roll_forward_admits(
+    tmp_path: Path, version: str, roll_forward: str | None, major: str
+) -> None:
+    constraint = global_json(tmp_path, version, roll_forward)
+    assert toolchains.DOTNET.version_from(tmp_path) == toolchains.ToolchainVersion(
+        major, "global.json", constraint
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "roll_forward"),
+    [
+        ("8.0.100", None),  # `patch` stays in the 8.0.1xx band; this host ships 8.0.4xx
+        ("8.0.425", None),  # a patch newer than the pinned SDK
+        ("8.0.424", "latestPatch"),  # fine — but 8.0.425 below is not
+        ("6.0.100", "latestMinor"),  # no 6.x SDK here
+        ("11.0.100", "latestMajor"),  # nothing that new
+    ],
+)
+def test_global_json_nobody_can_satisfy_stops_the_run(
+    tmp_path: Path, version: str, roll_forward: str | None
+) -> None:
+    if (version, roll_forward) == ("8.0.424", "latestPatch"):
+        global_json(tmp_path, "8.0.425", roll_forward)
+    else:
+        global_json(tmp_path, version, roll_forward)
+    with pytest.raises(toolchains.UnsatisfiablePin) as excinfo:
+        toolchains.DOTNET.version_from(tmp_path)
+    message = str(excinfo.value)
+    assert "global.json pins dotnet" in message
+    assert "rollForward=latestFeature" in message  # the way out is named
+
+
+def test_global_json_this_host_cannot_read_is_undeclared(tmp_path: Path) -> None:
+    (tmp_path / "global.json").write_text('{"sdk": {"version": "10.0"}}')  # not x.y.znn
+    assert toolchains.DOTNET.version_from(tmp_path) == DOTNET_DEFAULT
+    (tmp_path / "global.json").write_text('{"msbuild-sdks": {}}')
+    assert toolchains.DOTNET.version_from(tmp_path) == DOTNET_DEFAULT
+    (tmp_path / "global.json").write_text("{not json")
+    assert toolchains.DOTNET.version_from(tmp_path) == DOTNET_DEFAULT
+    assert toolchains.DOTNET.version_from(tmp_path / "missing") == DOTNET_DEFAULT
+
+
+def test_global_json_with_comments_is_read(tmp_path: Path) -> None:
+    # The SDK tolerates JSON-with-comments in global.json; so does the reader.
+    (tmp_path / "global.json").write_text(
+        '{\n  // pinned for CI\n  "sdk": {\n    "version": "8.0.400", /* patch */\n'
+        '    "rollForward": "latestFeature"\n  }\n}\n'
+    )
+    assert toolchains.DOTNET.version_from(tmp_path).series == "8"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("major", sorted(toolchains.DOTNET_RELEASES))
+def test_every_dotnet_release_is_pinned_and_sha512_verified(major: str) -> None:
+    version, digests = toolchains.DOTNET_RELEASES[major]
+    assert version.split(".")[0] == major
+    dotnet = toolchains.DOTNET.for_version(major)
+    assert dotnet.series == major
+    assert dotnet.install_script is not None
+    assert f"/dotnet/Sdk/{version}/dotnet-sdk-{version}-linux-" in dotnet.install_script
+    assert f'grep -q "^{version.replace(".", "\\.")} "' in dotnet.probe
+    for arch in ("amd64", "arm64"):
+        _upstream, digest = digests[arch]
+        assert re.fullmatch(r"[0-9a-f]{128}", digest), (major, arch)
+        assert digest in dotnet.install_script
+    assert "sha512sum -c" in dotnet.install_script
+    assert dotnet.install_domains == toolchains.DOTNET.install_domains
+    assert dotnet.declared_series is toolchains.DOTNET.declared_series
+
+
+def test_for_version_at_the_default_is_the_registry_entry_for_the_new_three() -> None:
+    assert toolchains.DOTNET.for_version(toolchains.DOTNET_SDK_MAJOR) is toolchains.DOTNET
+    assert toolchains.JAVA.for_version(toolchains.JAVA_JDK_MAJOR) is toolchains.JAVA
+    assert toolchains.RUBY.for_version(toolchains.RUBY_SERIES) is toolchains.RUBY
+
+
+@pytest.mark.parametrize(
+    ("name", "body", "major"),
+    [
+        (".java-version", "17\n", "17"),
+        (".java-version", "17.0.9\n", "17"),
+        (".java-version", "temurin-17.0.9\n", "17"),
+        (".java-version", "1.8\n", "8"),
+        (".sdkmanrc", "# sdkman\njava=17.0.9-tem\nmaven=3.9.6\n", "17"),
+        (".tool-versions", "nodejs 20.11.0\njava temurin-11.0.22+7\n", "11"),
+        (
+            "build.gradle.kts",
+            "java {\n  toolchain {\n    languageVersion.set(JavaLanguageVersion.of(17))\n  }\n}\n",
+            "17",
+        ),
+        ("build.gradle.kts", "java.toolchain.languageVersion = JavaLanguageVersion.of(25)\n", "25"),
+        ("build.gradle", "sourceCompatibility = JavaVersion.VERSION_1_8\n", "8"),
+        ("build.gradle", "targetCompatibility = '11'\n", "11"),
+        ("build.gradle", "sourceCompatibility = 21\n", "21"),
+    ],
+)
+def test_java_exact_declarations_pin_the_major(
+    tmp_path: Path, name: str, body: str, major: str
+) -> None:
+    (tmp_path / name).write_text(body)
+    got = toolchains.JAVA.version_from(tmp_path)
+    assert got is not None
+    assert (got.series, got.source) == (major, name)
+    assert got.constraint  # the declaration as written, for the run record
+
+
+@pytest.mark.parametrize(
+    ("pom", "major"),
+    [
+        ("<maven.compiler.release>17</maven.compiler.release>", toolchains.JAVA_JDK_MAJOR),
+        ("<maven.compiler.source>1.8</maven.compiler.source>", toolchains.JAVA_JDK_MAJOR),
+        ("<java.version>25</java.version>", "25"),
+        ("<maven.compiler.target>25</maven.compiler.target>", "25"),
+    ],
+)
+def test_pom_compiler_level_is_a_floor_not_a_pin(tmp_path: Path, pom: str, major: str) -> None:
+    # A JDK 21 compiles `--release 17` sources; only a level ABOVE the
+    # default forces a newer JDK.
+    (tmp_path / "pom.xml").write_text(f"<project><properties>{pom}</properties></project>")
+    got = toolchains.JAVA.version_from(tmp_path)
+    assert got is not None
+    assert (got.series, got.source) == (major, "pom.xml")
+
+
+def test_java_version_file_wins_over_the_pom(tmp_path: Path) -> None:
+    (tmp_path / "pom.xml").write_text("<project><java.version>25</java.version></project>")
+    (tmp_path / ".java-version").write_text("17\n")
+    assert toolchains.JAVA.version_from(tmp_path).series == "17"  # type: ignore[union-attr]
+
+
+def test_java_major_this_host_cannot_install_stops_the_run(tmp_path: Path) -> None:
+    (tmp_path / ".java-version").write_text("15\n")
+    with pytest.raises(toolchains.UnsatisfiablePin, match=r"\.java-version pins java to '15'"):
+        toolchains.JAVA.version_from(tmp_path)
+    (tmp_path / ".java-version").write_text("graalvm\n")  # no major in it: undeclared
+    assert toolchains.JAVA.version_from(tmp_path) == JAVA_DEFAULT
+    (tmp_path / ".java-version").unlink()
+    (tmp_path / "pom.xml").write_text("<project><java.version>30</java.version></project>")
+    with pytest.raises(toolchains.UnsatisfiablePin, match=r"pom\.xml pins java"):
+        toolchains.JAVA.version_from(tmp_path)
+    (tmp_path / "pom.xml").write_text("<project><name>x</name></project>")
+    assert toolchains.JAVA.version_from(tmp_path) == JAVA_DEFAULT
+
+
+@pytest.mark.parametrize("major", sorted(toolchains.JAVA_RELEASES, key=int))
+def test_every_temurin_release_is_pinned_and_checksum_verified(major: str) -> None:
+    tag, build, digests = toolchains.JAVA_RELEASES[major]
+    assert major != toolchains.JAVA_JDK_MAJOR, "the default JDK comes from apt"
+    java = toolchains.JAVA.for_version(major)
+    assert java.series == major
+    assert java.install_script is not None
+    assert f"temurin{major}-binaries/releases/download/" in java.install_script
+    # the tag's `+` is percent-encoded in the URL (GitHub release asset paths)
+    assert tag.replace("+", "%2B") in java.install_script
+    assert f"OpenJDK{major}U-jdk_${{arch}}_linux_hotspot_{build}.tar.gz" in java.install_script
+    for deb_arch, upstream in (("amd64", "x64"), ("arm64", "aarch64")):
+        arch, digest = digests[deb_arch]
+        assert arch == upstream
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), (major, deb_arch)
+        assert digest in java.install_script
+    assert "sha256sum -c" in java.install_script
+    assert f"/opt/jdk-{major}" in java.install_script
+    assert f"^export JAVA_HOME=/opt/jdk-{major}$" in java.probe
+    pattern = "1\\.8\\." if major == "8" else f"{major}\\."
+    assert f'grep -q "^javac {pattern}"' in java.probe
+    # apt still provides maven; the JDK itself no longer comes from apt
+    assert "maven" in java.apt_packages and "openjdk" not in " ".join(java.apt_packages)
+    assert java.install_domains == toolchains.JAVA.install_domains
+    assert java.declared_series is toolchains.JAVA.declared_series
+
+
+def test_java_install_scripts_replace_java_home_and_the_usr_local_shadows() -> None:
+    # A sandbox that had a pinned JDK earlier must not keep its JAVA_HOME
+    # or its /usr/local/bin symlinks once the default (apt) JDK is asked
+    # for again — and vice versa.
+    default = toolchains.JAVA.install_script or ""
+    assert "sed -i '/^export JAVA_HOME=/d'" in default
+    assert "rm -f /usr/local/bin/java /usr/local/bin/javac" in default
+    pinned = toolchains.JAVA.for_version("17").install_script or ""
+    assert "sed -i '/^export JAVA_HOME=/d'" in pinned
+    assert "ln -sf /opt/jdk-17/bin/$b /usr/local/bin/$b" in pinned
+
+
+def test_persist_env_replace_rewrites_an_existing_line() -> None:
+    keep = toolchains._persist_env("X", '"1"')
+    assert keep.startswith("grep -qs '^export X=' ")
+    replace = toolchains._persist_env("X", '"1"', replace=True)
+    assert "sed -i '/^export X=/d'" in replace
+    assert "grep -qs" not in replace
+    assert replace.endswith(f"tee -a {toolchains.PERSISTENT_ENV} >/dev/null")
+
+
+@pytest.mark.parametrize(
+    ("name", "body", "series"),
+    [
+        (".ruby-version", "3.2.2\n", "3.2.2"),
+        (".ruby-version", "ruby-3.2.2\n", "3.2.2"),
+        (".ruby-version", "3.4\n", "3.4"),
+        (".ruby-version", "ruby-3.4\n", "3.4"),
+        (".tool-versions", "nodejs 20.11.0\nruby 3.3.12\n", "3.3.12"),
+        ("Gemfile", "source 'https://rubygems.org'\nruby '3.2.2'\n", "3.2.2"),
+        ("Gemfile", 'ruby "~> 3.2"\n', "3.4"),  # the highest series in the range
+        ("Gemfile", 'ruby "~> 3.2.2"\n', "3.2"),
+        ("Gemfile", 'ruby ">= 3.1", "< 3.4"\n', "3.3"),
+        ("Gemfile", 'ruby(">= 3.2")\n', "4.0"),
+        ("Gemfile", 'ruby "~> 3"\n', "3.4"),
+        ("Gemfile", 'ruby "3.3.0", engine: "ruby", engine_version: "3.3.0"\n', "3.3.0"),
+    ],
+)
+def test_ruby_declarations_pin_a_series(tmp_path: Path, name: str, body: str, series: str) -> None:
+    (tmp_path / name).write_text(body)
+    got = toolchains.RUBY.version_from(tmp_path)
+    assert got is not None
+    assert (got.series, got.source) == (series, name)
+
+
+def test_ruby_version_file_wins_over_the_gemfile(tmp_path: Path) -> None:
+    (tmp_path / "Gemfile").write_text('ruby "~> 3.2"\n')
+    (tmp_path / ".ruby-version").write_text("3.2.2\n")
+    assert toolchains.RUBY.version_from(tmp_path).series == "3.2.2"  # type: ignore[union-attr]
+
+
+def test_ruby_declarations_this_host_cannot_read_are_undeclared(tmp_path: Path) -> None:
+    (tmp_path / ".ruby-version").write_text("jruby-9.4.5.0\n")
+    assert toolchains.RUBY.version_from(tmp_path) == RUBY_DEFAULT
+    (tmp_path / ".ruby-version").unlink()
+    (tmp_path / "Gemfile").write_text('ruby file: ".ruby-version"\n')
+    assert toolchains.RUBY.version_from(tmp_path) == RUBY_DEFAULT
+    (tmp_path / "Gemfile").write_text("source 'https://rubygems.org'\ngem 'rake'\n")
+    assert toolchains.RUBY.version_from(tmp_path) == RUBY_DEFAULT
+
+
+def test_ruby_series_nobody_can_satisfy_stops_the_run(tmp_path: Path) -> None:
+    (tmp_path / ".ruby-version").write_text("2.7.8\n")
+    with pytest.raises(toolchains.UnsatisfiablePin, match=r"\.ruby-version pins ruby to '2\.7\.8'"):
+        toolchains.RUBY.version_from(tmp_path)
+    (tmp_path / ".ruby-version").unlink()
+    (tmp_path / "Gemfile").write_text('ruby "~> 2.7"\n')
+    with pytest.raises(toolchains.UnsatisfiablePin, match="Gemfile pins ruby"):
+        toolchains.RUBY.version_from(tmp_path)
+
+
+def test_pinned_ruby_is_compiled_with_ruby_build_and_probed_first() -> None:
+    assert toolchains.RUBY.install_script is None  # the distro series is apt
+    assert toolchains.RUBY.install_budget is None
+    exact = toolchains.RUBY.for_version("3.2.2")
+    assert exact.install_script is not None
+    assert exact.install_script.startswith(
+        'set -e; if ! ruby -v 2>/dev/null | grep -q "^ruby 3\\.2\\.2 "; then'
+    )
+    assert (
+        f"ruby-build/archive/refs/tags/v{toolchains.RUBY_BUILD_VERSION}.tar.gz"
+        in exact.install_script
+    )
+    assert toolchains._RUBY_BUILD_DIGEST in exact.install_script
+    assert re.fullmatch(r"[0-9a-f]{64}", toolchains._RUBY_BUILD_DIGEST)
+    assert "ruby-build --verbose 3.2.2 " in exact.install_script
+    assert "--disable-install-doc" in exact.install_script
+    assert 'grep -q "^ruby 3\\.2\\.2 "' in exact.probe
+    assert exact.install_budget == 1800.0
+    for tool in ("ruby", "gem", "bundle", "bundler"):
+        assert tool in toolchains._RUBY_TOOLS
+    assert 'ln -sf "$HOME/.rubies/3.2.2"/bin/$b /usr/local/bin/$b' in exact.install_script
+    # a series pin installs the table's release for that series
+    series = toolchains.RUBY.for_version("3.4")
+    assert series.install_script is not None
+    assert f"ruby-build --verbose {toolchains.RUBY_RELEASES['3.4']} " in series.install_script
+    assert 'grep -q "^ruby 3\\.4\\."' in series.probe
+    # ruby-build's own build deps ride on apt, next to the distro ruby
+    for package in ("libyaml-dev", "libssl-dev", "ruby-dev", "build-essential"):
+        assert package in series.apt_packages
+    assert series.install_domains == toolchains.RUBY.install_domains
+    assert series.declared_series is toolchains.RUBY.declared_series
+
+
+def test_every_ruby_series_candidate_has_a_release() -> None:
+    assert toolchains.RUBY_SERIES not in toolchains.RUBY_RELEASES
+    for series in toolchains.RUBY_SERIES_CANDIDATES:
+        assert toolchains.RUBY_RELEASES[series].startswith(series + ".")
+
+
+def test_toolchain_versions_rows_for_the_new_three(tmp_path: Path) -> None:
+    (tmp_path / "global.json").write_text('{"sdk": {"version": "8.0.400"}}')
+    (tmp_path / ".java-version").write_text("17\n")
+    (tmp_path / ".ruby-version").write_text("3.2.2\n")
+    versions = toolchains.toolchain_versions(["dotnet", "java", "ruby", "rust"], tmp_path)
+    assert versions == {
+        "dotnet": toolchains.ToolchainVersion("8", "global.json", "8.0.400"),
+        "java": toolchains.ToolchainVersion("17", ".java-version", "17"),
+        "ruby": toolchains.ToolchainVersion("3.2.2", ".ruby-version", "3.2.2"),
+    }
+    resolved = {tc.name: tc.series for tc in toolchains.resolve([*versions, "rust"], versions)}
+    assert resolved == {"dotnet": "8", "java": "17", "ruby": "3.2.2", "rust": None}
+
+
+def test_unsatisfiable_pin_surfaces_from_resolve_languages(tmp_path: Path) -> None:
+    # The provisioner resolves languages before it starts a microVM, so the
+    # error reaches the run as a ProvisionError with the pin in it.
+    (tmp_path / "Gemfile").write_text('ruby "~> 2.7"\n')
+    with pytest.raises(ProvisionError, match="Gemfile pins ruby"):
+        toolchains.resolve_languages(["ruby"], tmp_path)

@@ -49,10 +49,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, NamedTuple
+from urllib.parse import quote
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import Version
 
+from sbxloop.errors import ProvisionError
 from sbxloop.log import get_logger
 
 __all__ = [
@@ -63,6 +65,7 @@ __all__ = [
     "LanguageResolution",
     "Toolchain",
     "ToolchainVersion",
+    "UnsatisfiablePin",
     "detect_languages",
     "install_domains",
     "normalize_language",
@@ -80,15 +83,28 @@ class ToolchainVersion(NamedTuple):
 
     ``source`` is ``"default"`` or the workspace file the declaration was
     read from (``pyproject.toml``, ``.python-version``, ``.nvmrc``,
-    ``package.json``); ``constraint`` is the declaration as written. Both
-    survive when the declaration could not be honoured — ``source`` is then
-    ``"default"`` with ``constraint`` still set — so the ``sandbox.toolchain``
-    event says what was asked for as well as what was installed (#627).
+    ``package.json``, ``global.json``, ``.ruby-version``, ``.java-version``
+    …); ``constraint`` is the declaration as written, so the
+    ``sandbox.toolchain`` event says what was asked for as well as what was
+    installed (#627). A declaration no series can honour is not softened
+    into the default: it raises :class:`UnsatisfiablePin` (#686).
     """
 
     series: str
     source: str
     constraint: str | None = None
+
+
+class UnsatisfiablePin(ProvisionError):
+    """A workspace pins a version no series in the registry can honour.
+
+    Raised at language resolution, before any microVM exists, so the run
+    fails with the pin and the installable series named — never at the
+    gate, where a ``global.json`` the installed SDK does not satisfy makes
+    ``dotnet`` refuse to run at all and a Gemfile ``ruby`` line makes
+    ``bundle`` refuse likewise (#686). Provisioning the default instead
+    would only move that failure into the agent's turns.
+    """
 
 
 @dataclass(frozen=True)
@@ -133,6 +149,10 @@ class Toolchain:
         default=None, compare=False, repr=False
     )
     rebuild: Callable[[str], Toolchain] | None = field(default=None, compare=False, repr=False)
+    # Seconds ``install_script`` may take when that is more than the
+    # ensure's default budget: an entry that compiles from source (a pinned
+    # Ruby) needs minutes a tarball never does.
+    install_budget: float | None = None
 
     def version_from(self, workspace: Path | None) -> ToolchainVersion | None:
         """The series to provision for ``workspace``: its own declaration
@@ -219,23 +239,35 @@ def _series_satisfying(
     default: str,
     candidates: Sequence[str],
     source: str,
+    *,
+    toolchain: str,
+    hint: str = "",
 ) -> ToolchainVersion:
     """The default series when ``satisfies`` accepts it, else the highest
-    candidate it accepts; the default, named as unhonoured, when none is."""
+    candidate it accepts. None accepting is :class:`UnsatisfiablePin`: the
+    project asked for something this registry cannot install, and the run
+    says so now rather than after the default was provisioned and refused
+    (#686 — .NET's ``global.json`` and Bundler's ``ruby`` line both hard
+    fail on a mismatch; uv's ``requires-python`` does too)."""
     if satisfies(default):
         return ToolchainVersion(default, source, constraint)
     for series in candidates:
         if satisfies(series):
             return ToolchainVersion(series, source, constraint)
-    log.warning(
+    installable = ", ".join(candidates)
+    log.error(
         "toolchains.version_unsatisfiable",
+        toolchain=toolchain,
         source=source,
         constraint=constraint,
         candidates=list(candidates),
-        hint=f"no series this host can install satisfies the declaration; "
-        f"provisioning the default {default}",
     )
-    return ToolchainVersion(default, "default", constraint)
+    raise UnsatisfiablePin(
+        f"{source} pins {toolchain} to {constraint!r}, which no series this host can "
+        f"install satisfies (installable: {installable}); the run stops here rather "
+        f"than provisioning {default} for a project that would refuse it — pin an "
+        "installable series, or widen the declaration" + (f" ({hint})" if hint else "")
+    )
 
 
 def _python_series_from(workspace: Path) -> ToolchainVersion | None:
@@ -254,7 +286,12 @@ def _python_series_from(workspace: Path) -> ToolchainVersion | None:
         if match is not None:
             series = match.group(1)
             return _series_satisfying(
-                first, lambda s: s == series, PYTHON_SERIES, PYTHON_SERIES_CANDIDATES, pin.name
+                first,
+                lambda s: s == series,
+                PYTHON_SERIES,
+                PYTHON_SERIES_CANDIDATES,
+                pin.name,
+                toolchain="python",
             )
     try:
         data = tomllib.loads((workspace / "pyproject.toml").read_text(encoding="utf-8"))
@@ -279,7 +316,12 @@ def _python_series_from(workspace: Path) -> ToolchainVersion | None:
         return any(spec.contains(Version(f"{series}.{patch}")) for patch in ("0", "99"))
 
     return _series_satisfying(
-        constraint.strip(), satisfies, PYTHON_SERIES, PYTHON_SERIES_CANDIDATES, "pyproject.toml"
+        constraint.strip(),
+        satisfies,
+        PYTHON_SERIES,
+        PYTHON_SERIES_CANDIDATES,
+        "pyproject.toml",
+        toolchain="python",
     )
 
 
@@ -365,21 +407,248 @@ CPP = Toolchain(
 )
 
 
-RUBY = Toolchain(
-    name="ruby",
-    wanted="ruby, gem, bundle",
-    probe=(
-        "command -v ruby >/dev/null && command -v gem >/dev/null && command -v bundle >/dev/null"
-    ),
+# Ruby's version story (#686): the distro's `ruby-full` is complete and
+# current enough for ordinary work, so it stays the default — but a Ruby
+# project almost always pins, exactly, and Bundler enforces a Gemfile
+# `ruby "3.2.2"` line to the patch. Debian/Ubuntu ship one series each,
+# so a pin is honoured by compiling: ruby-build (pinned GitHub tarball,
+# checksum-verified) builds the exact release from cache.ruby-lang.org,
+# verifying the tarball against the sha256 in its own definition file.
+# That costs minutes, so the install probes first — the distro ruby
+# already answering to the pin is the fast path — and the build lands in
+# the agent's home (gems install without sudo) with `/usr/local/bin`
+# symlinks shadowing the distro binaries. Only a series the table knows
+# is admitted; anything older is unsatisfiable rather than a build
+# against an OpenSSL it predates.
+RUBY_SERIES = "distro"
+RUBY_BUILD_VERSION = "20260902"
+_RUBY_BUILD_TARBALL = "/tmp/ruby-build.tar.gz"  # nosec B108 - inside the sandbox VM, not host tmp
+_RUBY_BUILD_DIGEST = "c7a738bb6e6e06fa827c0d67d6c8e030ae766935400cf090dd8b8ddcddcfe818"
+# The release each series resolves to when only the series (or a range) is
+# pinned, newest first; an exact pin inside one of these series is built as
+# written. ruby-build's definition list is the other half of the contract —
+# bumping RUBY_BUILD_VERSION is what makes a newer patch buildable.
+RUBY_RELEASES = {"4.0": "4.0.6", "3.4": "3.4.10", "3.3": "3.3.12", "3.2": "3.2.11", "3.1": "3.1.7"}
+RUBY_SERIES_CANDIDATES = tuple(RUBY_RELEASES)
+_RUBY_TOOLS = ("ruby", "gem", "bundle", "bundler", "irb", "rake", "erb", "rdoc", "ri")
+_RUBY_VERSION_FILE = re.compile(r"^(?:ruby-)?(\d+\.\d+)(?:\.(\d+))?$")
+_GEMFILE_RUBY = re.compile(r"""^\s*ruby(?:\s+|\s*\(\s*)(['"][^\n]*)$""", re.M)
+_QUOTED = re.compile(r"""['"]([^'"]*)['"]""")
+_GEM_OP = re.compile(r"^(~>|>=|<=|!=|>|<|=)?\s*(\d+(?:\.\d+)*)$")
+
+
+def _ruby_pin(text: str) -> tuple[str, str | None] | None:
+    """``(series, patch)`` from ``3.2.2`` / ``3.2`` / ``ruby-3.2.2``."""
+    match = _RUBY_VERSION_FILE.match(text.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _ruby_series_for(pin: tuple[str, str | None], constraint: str, source: str) -> ToolchainVersion:
+    """An exact pin is built as written; a series pin resolves to the
+    table's release for it. Either way the series has to be one the
+    table knows."""
+    series, patch = pin
+    wanted = f"{series}.{patch}" if patch is not None else series
+    if series not in RUBY_RELEASES:
+        return _series_satisfying(
+            constraint,
+            lambda _: False,
+            RUBY_SERIES,
+            RUBY_SERIES_CANDIDATES,
+            source,
+            toolchain="ruby",
+        )
+    return ToolchainVersion(wanted, source, constraint)
+
+
+def _gem_requirement(text: str) -> SpecifierSet | None:
+    """RubyGems' requirement syntax as a PEP 440 specifier — the operators
+    are the same but for ``~>`` (``~=``) and ``=`` (``==``)."""
+    clauses: list[str] = []
+    for part in text.split(","):
+        match = _GEM_OP.match(part.strip())
+        if match is None:
+            return None
+        op, version = match.group(1) or "=", match.group(2)
+        if op == "~>" and "." not in version:
+            # `~> 3` is `>= 3, < 4`; PEP 440's `~=` wants two components.
+            clauses.extend((f">={version}", f"<{int(version) + 1}"))
+            continue
+        clauses.append({"~>": "~=", "=": "=="}.get(op, op) + version)
+    try:
+        return SpecifierSet(",".join(clauses))
+    except InvalidSpecifier:
+        return None
+
+
+def _ruby_series_from(workspace: Path) -> ToolchainVersion | None:
+    """The Ruby the workspace pins: ``.ruby-version`` first (rbenv's
+    file, and what a modern Gemfile's ``ruby file: ".ruby-version"``
+    reads), then ``.tool-versions``, then the Gemfile's ``ruby`` line —
+    an exact version, or a RubyGems requirement (``~> 3.2``, ``>= 3.1``)
+    that selects the newest series in the table satisfying it."""
+    pin = workspace / ".ruby-version"
+    try:
+        first = pin.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    except (OSError, IndexError):
+        first = ""
+    if first:
+        parsed = _ruby_pin(first)
+        if parsed is None:
+            log.warning(
+                "toolchains.version_unreadable",
+                source=pin.name,
+                constraint=first,
+                hint="not a Ruby release this host reads (a preview, or a non-MRI ruby); "
+                "provisioning the distro ruby",
+            )
+            return None
+        return _ruby_series_for(parsed, first, pin.name)
+    try:
+        lines = (workspace / ".tool-versions").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        words = line.split("#", 1)[0].split()
+        if len(words) >= 2 and words[0] == "ruby":
+            parsed = _ruby_pin(words[1])
+            if parsed is None:
+                log.warning(
+                    "toolchains.version_unreadable",
+                    source=".tool-versions",
+                    constraint=words[1],
+                    hint="not a Ruby release this host reads; provisioning the distro ruby",
+                )
+                return None
+            return _ruby_series_for(parsed, words[1], ".tool-versions")
+    try:
+        gemfile = (workspace / "Gemfile").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _GEMFILE_RUBY.search(gemfile)
+    if match is None:
+        return None
+    # `ruby "3.2.2"`, `ruby ">= 3.1", "< 3.4"`, `ruby "~> 3.2", engine: …`:
+    # the version strings are the quoted arguments before any keyword.
+    arguments = _QUOTED.findall(match.group(1).split(":", 1)[0])
+    constraint = ", ".join(a.strip() for a in arguments if a.strip())
+    if not constraint:
+        return None  # `ruby file: ".ruby-version"` — that file was read above
+    parsed = _ruby_pin(constraint)
+    if parsed is not None:
+        return _ruby_series_for(parsed, constraint, "Gemfile")
+    spec = _gem_requirement(constraint)
+    if spec is None:
+        log.warning(
+            "toolchains.version_unreadable",
+            source="Gemfile",
+            constraint=constraint,
+            hint="the ruby line is not a version or requirement this host reads; "
+            "provisioning the distro ruby",
+        )
+        return None
+
+    def satisfies(series: str) -> bool:
+        if series == RUBY_SERIES:
+            return False  # which ruby the distro ships is not known host-side
+        return any(spec.contains(Version(f"{series}.{patch}")) for patch in ("0", "99"))
+
+    return _series_satisfying(
+        constraint, satisfies, RUBY_SERIES, RUBY_SERIES_CANDIDATES, "Gemfile", toolchain="ruby"
+    )
+
+
+def _ruby_toolchain(series: str) -> Toolchain:
     # `ruby-dev` and `build-essential` are not optional in practice: gems
     # with native extensions (nokogiri, pg, ...) fail to build without
     # headers and a compiler, which is the common failure mode when only
     # `ruby` is installed. build-essential is shared with cpp and installs
     # once thanks to the pooled apt call.
-    apt_packages=("ruby-full", "ruby-dev", "bundler", "build-essential"),
-    manifests=("Gemfile", "Rakefile", "*.gemspec"),
-    aliases=("rb",),
+    apt = ("ruby-full", "ruby-dev", "bundler", "build-essential")
+    if series == RUBY_SERIES:
+        return Toolchain(
+            name="ruby",
+            wanted="ruby, gem, bundle",
+            probe=(
+                "command -v ruby >/dev/null && command -v gem >/dev/null "
+                "&& command -v bundle >/dev/null"
+            ),
+            apt_packages=apt,
+            install_domains=_RUBY_INSTALL_DOMAINS,
+            manifests=("Gemfile", "Rakefile", "*.gemspec"),
+            aliases=("rb",),
+            series=series,
+            declared_series=_ruby_series_from,
+            rebuild=_ruby_toolchain,
+        )
+    exact = series.count(".") == 2
+    version = series if exact else RUBY_RELEASES[series]
+    pattern = series.replace(".", "\\.") + (" " if exact else "\\.")
+    ruby_matches = f'ruby -v 2>/dev/null | grep -q "^ruby {pattern}"'
+    prefix = f'"$HOME/.rubies/{version}"'
+    return Toolchain(
+        name="ruby",
+        wanted=f"ruby {version if exact else series + '.x'}, gem, bundle",
+        probe=f"{ruby_matches} && command -v gem >/dev/null && command -v bundle >/dev/null",
+        # ruby-build's suggested build environment for Debian/Ubuntu, on
+        # top of the distro ruby (the fast path when it already matches).
+        apt_packages=(
+            *apt,
+            "autoconf",
+            "bison",
+            "curl",
+            "ca-certificates",
+            "libssl-dev",
+            "libyaml-dev",
+            "libreadline-dev",
+            "zlib1g-dev",
+            "libgmp-dev",
+            "libncurses-dev",
+            "libffi-dev",
+            "libgdbm-dev",
+        ),
+        install_script=(
+            f"set -e; if ! {ruby_matches}; then "
+            f'curl -fsSL -o {_RUBY_BUILD_TARBALL} "https://github.com/rbenv/ruby-build'
+            f'/archive/refs/tags/v{RUBY_BUILD_VERSION}.tar.gz"; '
+            f"printf '%s  {_RUBY_BUILD_TARBALL}\\n' {_RUBY_BUILD_DIGEST} "
+            "| sha256sum -c - >/dev/null; "
+            f"rm -rf /tmp/ruby-build; mkdir -p /tmp/ruby-build; "
+            f"tar -xzf {_RUBY_BUILD_TARBALL} -C /tmp/ruby-build --strip-components=1; "
+            "sudo -n env PREFIX=/usr/local sh /tmp/ruby-build/install.sh; "
+            f"rm -rf /tmp/ruby-build {_RUBY_BUILD_TARBALL}; "
+            # Docs are the slow, useless half of a ruby build; -j the rest.
+            'MAKE_OPTS="-j$(nproc)" RUBY_CONFIGURE_OPTS=--disable-install-doc '
+            f"ruby-build --verbose {version} {prefix}; "
+            f"for b in {' '.join(_RUBY_TOOLS)}; do "
+            f"[ -x {prefix}/bin/$b ] && sudo -n ln -sf {prefix}/bin/$b /usr/local/bin/$b || true; "
+            "done; fi"
+        ),
+        install_domains=_RUBY_INSTALL_DOMAINS,
+        manifests=("Gemfile", "Rakefile", "*.gemspec"),
+        aliases=("rb",),
+        series=series,
+        declared_series=_ruby_series_from,
+        rebuild=_ruby_toolchain,
+        # A from-source build of MRI on a two-core microVM is a matter of
+        # minutes, not the seconds a tarball takes.
+        install_budget=1800.0,
+    )
+
+
+# ruby-build's archive tarball is served by codeload; the ruby tarball it
+# fetches comes from cache.ruby-lang.org, and a definition may pull an
+# OpenSSL release asset from GitHub when the distro's is too old.
+_RUBY_INSTALL_DOMAINS = (
+    "github.com",
+    "codeload.github.com",
+    "release-assets.githubusercontent.com",
+    "cache.ruby-lang.org",
 )
+
+RUBY = _ruby_toolchain(RUBY_SERIES)
 
 
 # sbx documents /etc/sandbox-persistent.sh as where persistent sandbox env
@@ -391,55 +660,261 @@ RUBY = Toolchain(
 PERSISTENT_ENV = "/etc/sandbox-persistent.sh"
 
 
-def _persist_env(variable: str, value_expr: str) -> str:
+def _persist_env(variable: str, value_expr: str, *, replace: bool = False) -> str:
     """Shell that appends ``export VAR=...`` to the persistent env, once.
 
     ``value_expr`` is substituted into the shell unquoted, so it may be a
     command substitution. The grep guard keeps a re-run from stacking
-    duplicate exports.
+    duplicate exports; ``replace`` drops the recorded value first instead,
+    for a variable whose value legitimately changes between provisions
+    (``JAVA_HOME`` follows the JDK a project pins, #686).
     """
-    return (
-        f"grep -qs '^export {variable}=' {PERSISTENT_ENV} || "
+    record = (
         f'printf "export {variable}=%s\\n" "{value_expr}" '
         f"| sudo -n tee -a {PERSISTENT_ENV} >/dev/null"
     )
+    if replace:
+        return (
+            f"sudo -n touch {PERSISTENT_ENV}; "
+            f"sudo -n sed -i '/^export {variable}=/d' {PERSISTENT_ENV}; {record}"
+        )
+    return f"grep -qs '^export {variable}=' {PERSISTENT_ENV} || {record}"
 
 
 # Pinned rather than floating on `default-jdk`, which moves between distro
 # releases and would silently change the compiler under a project.
 JAVA_JDK_MAJOR = "21"
+# The majors a project may pin instead (#686), newest first. The default
+# comes from apt; every other major is an Eclipse Temurin JDK from its
+# GitHub release — the distros do not agree on which JDKs they package
+# (Debian trixie has no 8 or 11, Ubuntu noble no 25), and a pinned tarball
+# with a published sha256 is the same shape as every other entry here.
+# `tag` is the release, `build` the version as spelled in the asset name.
+_JDK_TARBALL = "/tmp/jdk.tar.gz"  # nosec B108 - path inside the sandbox VM, not host tmp
+JAVA_RELEASES: dict[str, tuple[str, str, dict[str, tuple[str, str]]]] = {
+    "25": (
+        "jdk-25.0.4.1+1",
+        "25.0.4.1_1",
+        {
+            "amd64": ("x64", "dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e"),
+            "arm64": (
+                "aarch64",
+                "69df11a02cfa3ef7d7ca645e03edce6778ec090e100f6ae2b42097865730ac52",
+            ),
+        },
+    ),
+    "17": (
+        "jdk-17.0.20.1+1",
+        "17.0.20.1_1",
+        {
+            "amd64": ("x64", "3808d1d15e3ec6bd5b84057fb5d84c33d8a1536a258146bcea2e603fc726e08e"),
+            "arm64": (
+                "aarch64",
+                "457b57af8f9c93ec39080bb8c764f559dc8c89a6da1a39d718a400b7890d3e41",
+            ),
+        },
+    ),
+    "11": (
+        "jdk-11.0.32.1+1",
+        "11.0.32.1_1",
+        {
+            "amd64": ("x64", "5c3f68887c325d36d852ba534303e1f5f1f5cae7d6cc1e951d73e0d8e98a058d"),
+            "arm64": (
+                "aarch64",
+                "f27033e6f7523c1b0b2565a78e9c0e0abe5596a854ce00ca04ec1b06ece7a935",
+            ),
+        },
+    ),
+    "8": (
+        "jdk8u504-b01",
+        "8u504b01",
+        {
+            "amd64": ("x64", "9c70e102f527ac674ac2fe9c7d47b9a04e2d19842ba5ab8e9b33f368bbadfaea"),
+            "arm64": (
+                "aarch64",
+                "57b7ed8af9d48542bb49ff7894448040b17bea0a48b41677d11ecaec6129768d",
+            ),
+        },
+    ),
+}
+JAVA_MAJOR_CANDIDATES = tuple(sorted({JAVA_JDK_MAJOR, *JAVA_RELEASES}, key=int, reverse=True))
+# The launchers a pinned JDK shadows in /usr/local/bin (ahead of apt's
+# /usr/bin on PATH); the default's install removes the shadows again.
+_JAVA_TOOLS = ("java", "javac", "jar", "javadoc", "jshell", "keytool")
+# `17`, `17.0.9`, `1.8`, `1.8.0_292`, `temurin-17.0.9+9`, `17.0.9-tem`,
+# `zulu-21.30.15`: the major is the first number after any vendor prefix,
+# with Java 8's legacy `1.8` spelling folded to 8.
+_JAVA_MAJOR = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]*-)?(?:1\.)?(\d+)")
+_GRADLE_TOOLCHAIN = re.compile(r"JavaLanguageVersion\.of\(\s*['\"]?(\d+)['\"]?\s*\)")
+_GRADLE_COMPATIBILITY = re.compile(
+    r"(?:sourceCompatibility|targetCompatibility)\s*=?\s*"
+    r"(?:JavaVersion\.VERSION_(?:1_)?(\d+)|['\"]?(?:1\.)?(\d+)(?:\.\d+)*['\"]?)"
+)
+_POM_RELEASE = re.compile(
+    r"<(?:maven\.compiler\.(?:release|source|target)|java\.version)>\s*(?:1\.)?(\d+)"
+)
+_GRADLE_FILES = ("build.gradle.kts", "build.gradle")
+_JAVA_MANIFESTS = (
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+)
+_JAVA_ALIASES = ("jdk", "jvm")
+# Gradle's foojay toolchain resolver, for a project that has its build
+# fetch a JDK itself: the API answers with a redirect to the vendor's
+# download (Temurin's is a GitHub release asset). The pinned JDKs come
+# from the same GitHub hosts, so one list serves every major.
+_JAVA_INSTALL_DOMAINS = ("api.foojay.io", "github.com", "release-assets.githubusercontent.com")
 
-JAVA = Toolchain(
-    name="java",
-    wanted="java, javac, mvn, JAVA_HOME",
+
+def _java_major_from(workspace: Path) -> ToolchainVersion | None:
+    """The JDK major the workspace pins. ``.java-version`` (jenv),
+    ``.sdkmanrc`` and ``.tool-versions`` name a JDK outright, as does a
+    Gradle toolchain block or ``sourceCompatibility`` — Gradle versions
+    are tied to the JDK they run on, so those are exact. A POM's
+    ``maven.compiler.release`` / ``source`` / ``java.version`` is a
+    *language level*: any JDK from that major up compiles it, so the
+    default is kept whenever it is new enough."""
+    # (source, the version text, the declaration as written)
+    exact_sources: list[tuple[str, str, str]] = []
+    try:
+        first = (workspace / ".java-version").read_text(encoding="utf-8").strip().splitlines()[0]
+    except (OSError, IndexError):
+        first = ""
+    if first.strip():
+        exact_sources.append((".java-version", first.strip(), first.strip()))
+    for name, key in ((".sdkmanrc", "java="), (".tool-versions", "java ")):
+        try:
+            lines = (workspace / name).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            body = line.split("#", 1)[0].strip()
+            if body.startswith(key) and body[len(key) :].strip():
+                exact_sources.append((name, body[len(key) :].strip(), body))
+                break
+    for name in _GRADLE_FILES:
+        try:
+            text = (workspace / name).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        match = _GRADLE_TOOLCHAIN.search(text) or _GRADLE_COMPATIBILITY.search(text)
+        if match is not None:
+            exact_sources.append((name, next(g for g in match.groups() if g), match.group(0)))
+            break
+    for source, declared, written in exact_sources:
+        match = _JAVA_MAJOR.match(declared)
+        if match is None:
+            log.warning(
+                "toolchains.version_unreadable",
+                source=source,
+                constraint=written,
+                hint=f"not a JDK version this host reads; provisioning {JAVA_JDK_MAJOR}",
+            )
+            return None
+        major = match.group(1)
+        return _series_satisfying(
+            written, major.__eq__, JAVA_JDK_MAJOR, JAVA_MAJOR_CANDIDATES, source, toolchain="java"
+        )
+    try:
+        pom = (workspace / "pom.xml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _POM_RELEASE.search(pom)
+    if match is None:
+        return None
+    floor = int(match.group(1))
+    return _series_satisfying(
+        match.group(0).strip(),
+        lambda m: int(m) >= floor,
+        JAVA_JDK_MAJOR,
+        JAVA_MAJOR_CANDIDATES,
+        "pom.xml",
+        toolchain="java",
+    )
+
+
+def _java_toolchain(major: str) -> Toolchain:
     # JAVA_HOME is part of the contract (#161: many build tools read it
     # directly), but it lives in a file rather than this probe's env — the
     # probe runs under a bare `sbx exec sh -c`, which sources nothing. So
     # check that the export was recorded, not that it is currently set.
-    probe=(
-        "command -v javac >/dev/null && command -v mvn >/dev/null "
-        f"&& grep -qs '^export JAVA_HOME=' {PERSISTENT_ENV}"
-    ),
-    # apt for the JDK and Maven, per #161. Distro Gradle is materially
-    # stale and most projects ship a `gradlew` wrapper anyway, so Gradle is
-    # deliberately absent — the wrapper fetches its own distribution, which
-    # is an egress question for #141 rather than a package to install.
-    apt_packages=(f"openjdk-{JAVA_JDK_MAJOR}-jdk", "maven"),
-    # Derive JAVA_HOME from the javac that apt just put on PATH rather than
-    # hardcoding /usr/lib/jvm/... — the directory name embeds the distro
-    # architecture (…-amd64 vs …-arm64) and would be wrong half the time.
-    install_script=_persist_env(
-        "JAVA_HOME", '$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")'
-    ),
-    manifests=(
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-    ),
-    aliases=("jdk", "jvm"),
-)
+    # The javac on PATH has to answer to the major too: a pinned JDK
+    # shadows the distro's, and either can be left over from a template.
+    javac_pattern = "1\\.8\\." if major == "8" else f"{major}\\."
+    javac_matches = f'javac -version 2>&1 | grep -q "^javac {javac_pattern}"'
+    if major == JAVA_JDK_MAJOR:
+        return Toolchain(
+            name="java",
+            wanted="java, javac, mvn, JAVA_HOME",
+            probe=(
+                f"{javac_matches} && command -v mvn >/dev/null "
+                f"&& grep -qs '^export JAVA_HOME=' {PERSISTENT_ENV}"
+            ),
+            # apt for the JDK and Maven, per #161. Distro Gradle is
+            # materially stale and most projects ship a `gradlew` wrapper
+            # anyway, so Gradle is deliberately absent — the wrapper
+            # fetches its own distribution, which is an egress question
+            # for #141 rather than a package to install.
+            apt_packages=(f"openjdk-{major}-jdk", "maven"),
+            # Derive JAVA_HOME from the javac that apt just put on PATH
+            # rather than hardcoding /usr/lib/jvm/... — the directory name
+            # embeds the distro architecture (…-amd64 vs …-arm64) and would
+            # be wrong half the time. Any pinned JDK's shadows go first, so
+            # that javac is apt's.
+            install_script=(
+                "set -e; "
+                f"sudo -n rm -f {' '.join(f'/usr/local/bin/{b}' for b in _JAVA_TOOLS)}; "
+                + _persist_env(
+                    "JAVA_HOME",
+                    '$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")',
+                    replace=True,
+                )
+            ),
+            manifests=_JAVA_MANIFESTS,
+            aliases=_JAVA_ALIASES,
+            install_domains=_JAVA_INSTALL_DOMAINS,
+            series=major,
+            declared_series=_java_major_from,
+            rebuild=_java_toolchain,
+        )
+    tag, build, digests = JAVA_RELEASES[major]
+    home = f"/opt/jdk-{major}"
+    return Toolchain(
+        name="java",
+        wanted=f"java {major} (Temurin), javac, mvn, JAVA_HOME",
+        probe=(
+            f"{javac_matches} && command -v mvn >/dev/null "
+            f"&& grep -qs '^export JAVA_HOME={home}$' {PERSISTENT_ENV}"
+        ),
+        # Maven from apt still — it runs on whatever JAVA_HOME names.
+        apt_packages=("maven", "curl", "ca-certificates"),
+        install_script=(
+            "set -e; " + _arch_dispatch(digests) + "; "
+            f'curl -fsSL -o {_JDK_TARBALL} "https://github.com/adoptium/temurin{major}-binaries'
+            f"/releases/download/{quote(tag, safe='')}"
+            f'/OpenJDK{major}U-jdk_${{arch}}_linux_hotspot_{build}.tar.gz"; '
+            f"printf '%s  {_JDK_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+            f"sudo -n rm -rf {home}; sudo -n mkdir -p {home}; "
+            f"sudo -n tar -xzf {_JDK_TARBALL} -C {home} --strip-components=1; "
+            f"rm -f {_JDK_TARBALL}; "
+            f"for b in {' '.join(_JAVA_TOOLS)}; do "
+            f"[ -x {home}/bin/$b ] && sudo -n ln -sf {home}/bin/$b /usr/local/bin/$b "
+            f"|| sudo -n rm -f /usr/local/bin/$b; done; "
+            + _persist_env("JAVA_HOME", home, replace=True)
+        ),
+        manifests=_JAVA_MANIFESTS,
+        aliases=_JAVA_ALIASES,
+        install_domains=_JAVA_INSTALL_DOMAINS,
+        series=major,
+        declared_series=_java_major_from,
+        rebuild=_java_toolchain,
+    )
+
+
+JAVA = _java_toolchain(JAVA_JDK_MAJOR)
 
 
 # Composer is not reliably packaged at a useful version, so it comes from
@@ -504,8 +979,8 @@ _NODE_DIGESTS = {
 # One pinned release per LTS line a project may ask for through `.nvmrc`,
 # `.node-version` or `engines.node` (#627), newest first; the default major
 # is the head. Digests are upstream's SHASUMS256.txt entries, like the
-# default's. A major outside this table cannot be honoured — the default is
-# provisioned and the `sandbox.toolchain` event names the declaration.
+# default's. A major outside this table cannot be honoured — the run stops
+# at resolution naming the declaration and this table (UnsatisfiablePin).
 NODE_RELEASES: dict[str, tuple[str, dict[str, tuple[str, str]]]] = {
     NODE_MAJOR: (NODE_VERSION, _NODE_DIGESTS),
     "22": (
@@ -648,7 +1123,9 @@ def _node_major_from(workspace: Path) -> ToolchainVersion | None:
                 hint=f"not a Node version this host recognises; provisioning {NODE_MAJOR}",
             )
             return None
-        return _series_satisfying(first, major.__eq__, NODE_MAJOR, NODE_MAJOR_CANDIDATES, name)
+        return _series_satisfying(
+            first, major.__eq__, NODE_MAJOR, NODE_MAJOR_CANDIDATES, name, toolchain="javascript"
+        )
     try:
         data = json.loads((workspace / "package.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -672,6 +1149,7 @@ def _node_major_from(workspace: Path) -> ToolchainVersion | None:
         NODE_MAJOR,
         NODE_MAJOR_CANDIDATES,
         "package.json",
+        toolchain="javascript",
     )
 
 
@@ -941,42 +1419,182 @@ _DOTNET_DIGESTS = {
         "f89b12573b92e9fb2f565dbe12016b4835f77c7d9a42b55a7494df21634cd5d6",
     ),
 }
+# One pinned SDK per major a `global.json` may ask for (#686), newest
+# first; the default major is the head. Digests are the `sha512` of the
+# linux-x64 / linux-arm64 `sdk` files in each channel's release metadata
+# (`builds.dotnet.microsoft.com/dotnet/release-metadata/<major>.0/releases.json`).
+DOTNET_RELEASES: dict[str, tuple[str, dict[str, tuple[str, str]]]] = {
+    DOTNET_SDK_MAJOR: (DOTNET_SDK_VERSION, _DOTNET_DIGESTS),
+    "9": (
+        "9.0.317",
+        {
+            "amd64": (
+                "x64",
+                "145bf69dcb88c4b905feb531cfdd7894a75fc875d2a030e958a13d1fb1131521"
+                "c8cebd8a8a6e0fbd1a433ebae9cde86356b6adad07b1ad81efb92b36ff8a3333",
+            ),
+            "arm64": (
+                "arm64",
+                "fdf30fe705c91304d890115e955f738055f8c0885ea9891e7df1153321120fa2"
+                "c38b6ae4dd132f871cb8facc0d1fabbd2b25ddd53d0a5b4293aa85d296e3b98d",
+            ),
+        },
+    ),
+    "8": (
+        "8.0.424",
+        {
+            "amd64": (
+                "x64",
+                "6503fd9f464d5e3a4f43a881d2b74afc6a2c46ceda74d027f1565b7239f4b3ec"
+                "884857c03c0dcd49eb52f384d5ae1fa5aaf135f0a6aabc5518103aceed643c74",
+            ),
+            "arm64": (
+                "arm64",
+                "bb19b6779ad93d146055583d644ef269bb42501f6c7fdef51e14026cde9d5fd7"
+                "26d370de098a8d8504867fb24bfcb5ab88cc22bec812461aede334de1aacf7b6",
+            ),
+        },
+    ),
+}
+DOTNET_MAJOR_CANDIDATES = tuple(DOTNET_RELEASES)
+# `global.json` `sdk.version` is a full `x.y.znn` — the SDK rejects
+# anything shorter — where `z` is the feature band and `nn` the patch.
+_DOTNET_SDK_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d)(\d\d)$")
+# `rollForward` policies as the number of leading (major, minor, band,
+# patch) components an installed SDK must share with the pin; it must be
+# at least the pin in every policy but `disable`, which is exact. The
+# `latest*` spellings differ from the plain ones only in which of several
+# installed SDKs wins — moot with one SDK per sandbox. The SDK's default
+# when `version` is set is `patch`.
+_DOTNET_ROLL_FORWARD = {
+    "disable": 4,
+    "patch": 3,
+    "latestPatch": 3,
+    "feature": 2,
+    "latestFeature": 2,
+    "minor": 1,
+    "latestMinor": 1,
+    "major": 0,
+    "latestMajor": 0,
+}
+_JSON_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
 
-DOTNET = Toolchain(
-    name="dotnet",
-    wanted=f"dotnet SDK {DOTNET_SDK_MAJOR}.x, DOTNET_ROOT",
-    # Pinned major, plus the DOTNET_ROOT export: a manual (non-package) SDK
-    # install is only half-done without it, and like JAVA_HOME it lives in
-    # a file this probe's bare shell never sources.
-    probe=(
-        f'dotnet --list-sdks 2>/dev/null | grep -q "^{DOTNET_SDK_MAJOR}\\." '
-        f"&& grep -qs '^export DOTNET_ROOT=' {PERSISTENT_ENV}"
-    ),
-    # libicu-dev is the version-agnostic way to get the ICU runtime the SDK
-    # needs for globalization; naming libicuNN directly would pin us to one
-    # Ubuntu release.
-    apt_packages=("curl", "ca-certificates", "libicu-dev"),
-    install_script=(
-        "set -e; " + _arch_dispatch(_DOTNET_DIGESTS) + "; "
-        f'curl -fsSL -o {_DOTNET_TARBALL} "https://builds.dotnet.microsoft.com/dotnet'
-        f'/Sdk/{DOTNET_SDK_VERSION}/dotnet-sdk-{DOTNET_SDK_VERSION}-linux-$arch.tar.gz"; '
-        f"printf '%s  {_DOTNET_TARBALL}\\n' \"$sum\" | sha512sum -c - >/dev/null; "
-        f"sudo -n rm -rf {DOTNET_ROOT}; sudo -n mkdir -p {DOTNET_ROOT}; "
-        f"sudo -n tar -xzf {_DOTNET_TARBALL} -C {DOTNET_ROOT}; "
-        f"sudo -n ln -sf {DOTNET_ROOT}/dotnet /usr/local/bin/dotnet; "
-        + _persist_env("DOTNET_ROOT", DOTNET_ROOT)
-        + "; "
-        # Telemetry would only ever be a blocked outbound request under a
-        # default-deny egress policy; opting out keeps the noise out of the
-        # agent's build logs.
-        + _persist_env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
-        + "; "
-        f"rm -f {_DOTNET_TARBALL}"
-    ),
-    install_domains=("builds.dotnet.microsoft.com",),
-    manifests=("global.json", "Directory.Build.props", "*.sln", "*.csproj", "*.fsproj"),
-    aliases=("csharp", "c#", "net", "dotnet-sdk"),
-)
+
+def _dotnet_sdk_tuple(version: str) -> tuple[int, int, int, int] | None:
+    match = _DOTNET_SDK_VERSION.match(version)
+    if match is None:
+        return None
+    major, minor, band, patch = (int(g) for g in match.groups())
+    return major, minor, band, patch
+
+
+def _dotnet_series_from(workspace: Path) -> ToolchainVersion | None:
+    """The .NET SDK major the workspace's ``global.json`` admits, read the
+    way the SDK itself reads it: the pinned ``sdk.version`` plus its
+    ``rollForward`` policy decide which installed SDK is acceptable, and
+    an SDK outside the policy makes ``dotnet`` refuse to run at all."""
+    try:
+        text = (workspace / "global.json").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        try:  # the SDK tolerates JavaScript-style comments here
+            data = json.loads(_JSON_COMMENT.sub("", text))
+        except ValueError:
+            log.warning(
+                "toolchains.version_unreadable",
+                source="global.json",
+                constraint=text.strip()[:80],
+                hint=f"not JSON; provisioning the default SDK {DOTNET_SDK_VERSION}",
+            )
+            return None
+    sdk = data.get("sdk") if isinstance(data, dict) else None
+    if not isinstance(sdk, dict):
+        return None
+    version = sdk.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None
+    pin = _dotnet_sdk_tuple(version.strip())
+    policy = sdk.get("rollForward", "patch")
+    shared = _DOTNET_ROLL_FORWARD.get(policy) if isinstance(policy, str) else None
+    if pin is None or shared is None:
+        log.warning(
+            "toolchains.version_unreadable",
+            source="global.json",
+            constraint=version.strip(),
+            hint=f"sdk.version must be a full x.y.znn and rollForward one of "
+            f"{', '.join(_DOTNET_ROLL_FORWARD)}; provisioning the default SDK "
+            f"{DOTNET_SDK_VERSION}",
+        )
+        return None
+    constraint = version.strip() + (f" rollForward={policy}" if "rollForward" in sdk else "")
+
+    def admits(major: str) -> bool:
+        installed = _dotnet_sdk_tuple(DOTNET_RELEASES[major][0])
+        assert installed is not None
+        return installed[:shared] == pin[:shared] and installed >= pin
+
+    return _series_satisfying(
+        constraint,
+        admits,
+        DOTNET_SDK_MAJOR,
+        DOTNET_MAJOR_CANDIDATES,
+        "global.json",
+        toolchain="dotnet",
+        hint="the installable SDKs are "
+        + ", ".join(release for release, _ in DOTNET_RELEASES.values())
+        + "; rollForward=latestFeature admits any later feature band of the pinned major",
+    )
+
+
+def _dotnet_toolchain(major: str) -> Toolchain:
+    version, digests = DOTNET_RELEASES[major]
+    return Toolchain(
+        name="dotnet",
+        wanted=f"dotnet SDK {version}, DOTNET_ROOT",
+        # The pinned SDK itself — `--list-sdks` prints `<version> [<dir>]` —
+        # plus the DOTNET_ROOT export: a manual (non-package) SDK install
+        # is only half-done without it, and like JAVA_HOME it lives in a
+        # file this probe's bare shell never sources. The exact version
+        # rather than the major: a `global.json` rolls forward within a
+        # feature band, so a template's other 8.0.x need not satisfy it.
+        probe=(
+            f'dotnet --list-sdks 2>/dev/null | grep -q "^{version.replace(".", "\\.")} " '
+            f"&& grep -qs '^export DOTNET_ROOT=' {PERSISTENT_ENV}"
+        ),
+        # libicu-dev is the version-agnostic way to get the ICU runtime the
+        # SDK needs for globalization; naming libicuNN directly would pin
+        # us to one Ubuntu release.
+        apt_packages=("curl", "ca-certificates", "libicu-dev"),
+        install_script=(
+            "set -e; " + _arch_dispatch(digests) + "; "
+            f'curl -fsSL -o {_DOTNET_TARBALL} "https://builds.dotnet.microsoft.com/dotnet'
+            f'/Sdk/{version}/dotnet-sdk-{version}-linux-$arch.tar.gz"; '
+            f"printf '%s  {_DOTNET_TARBALL}\\n' \"$sum\" | sha512sum -c - >/dev/null; "
+            f"sudo -n rm -rf {DOTNET_ROOT}; sudo -n mkdir -p {DOTNET_ROOT}; "
+            f"sudo -n tar -xzf {_DOTNET_TARBALL} -C {DOTNET_ROOT}; "
+            f"sudo -n ln -sf {DOTNET_ROOT}/dotnet /usr/local/bin/dotnet; "
+            + _persist_env("DOTNET_ROOT", DOTNET_ROOT)
+            + "; "
+            # Telemetry would only ever be a blocked outbound request under
+            # a default-deny egress policy; opting out keeps the noise out
+            # of the agent's build logs.
+            + _persist_env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            + "; "
+            f"rm -f {_DOTNET_TARBALL}"
+        ),
+        install_domains=("builds.dotnet.microsoft.com",),
+        manifests=("global.json", "Directory.Build.props", "*.sln", "*.csproj", "*.fsproj"),
+        aliases=("csharp", "c#", "net", "dotnet-sdk"),
+        series=major,
+        declared_series=_dotnet_series_from,
+        rebuild=_dotnet_toolchain,
+    )
+
+
+DOTNET = _dotnet_toolchain(DOTNET_SDK_MAJOR)
 
 
 # Registry order is the install order, and the order packages appear in the

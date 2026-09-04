@@ -703,9 +703,11 @@ class WorkerClient:
         for toolchain in missing:
             if toolchain.install_script is None:
                 continue
+            # A compile-from-source entry (ruby-build) declares how long it
+            # needs; the caller's budget is a floor, never a cap on it.
             result = self.sandbox.exec(
                 ["sh", "-c", toolchain.install_script],
-                timeout=timeout,
+                timeout=max(timeout, toolchain.install_budget or 0.0),
             )
             if not result.ok:
                 log.warning(

@@ -730,12 +730,12 @@ class TestInstallFallbacks:
         script_toolchain_probe(fake_sbx, "java", returncode=1)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
-        fake_sbx.script("exec boxa sh -c grep -qs", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; sudo -n rm -f /usr/local/bin/java", returncode=0)
         self._script_happy_install(fake_sbx)
         client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])
         execs = [" ".join(c) for c in fake_sbx.invocations("exec")]
         apt_idx = [i for i, c in enumerate(execs) if "apt-get" in c]
-        script_idx = [i for i, c in enumerate(execs) if "JAVA_HOME" in c and "grep -qs" in c]
+        script_idx = [i for i, c in enumerate(execs) if "JAVA_HOME" in c and "readlink -f" in c]
         assert apt_idx and script_idx, execs
         assert apt_idx[0] < script_idx[-1], "the install script must run after the apt batch"
         assert "openjdk" in execs[apt_idx[0]] and "maven" in execs[apt_idx[0]]
@@ -753,7 +753,11 @@ class TestInstallFallbacks:
         script_toolchain_probe(fake_sbx, "java", returncode=1)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
-        fake_sbx.script("exec boxa sh -c grep -qs", returncode=1, stderr="tee: permission denied")
+        fake_sbx.script(
+            "exec boxa sh -c set -e; sudo -n rm -f /usr/local/bin/java",
+            returncode=1,
+            stderr="tee: permission denied",
+        )
         self._script_happy_install(fake_sbx)
         with caplog.at_level("WARNING"):
             client.install(wheel=wheel, ensure_dev_tools=True, languages=["java"])

@@ -151,21 +151,44 @@ EXPECTATIONS: dict[str, Expectation] = {
         gate="cargo test",
         lint=(("cargo test -p fixture", False),),
     ),
-    # apt-only toolchain: nothing beyond the always-reachable mirrors
+    # The default JDK comes from apt; the allowlist still carries the hosts
+    # a pinned major fetches from, since it is computed from the default
+    # entry before the workspace is read (#686)
     "java-gradle": Expectation(
         ("java",),
         "detected",
-        versions={},
-        allowed=(),
+        versions={"java": ("21", "default")},
+        allowed=("api.foojay.io", "github.com"),
         not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
         gate="./gradlew check",
         lint=(("./gradlew check", False),),
     ),
+    # a Gradle toolchain block is an exact JDK major (#686)
+    "java-gradle-toolchain": Expectation(
+        ("java",),
+        "detected",
+        versions={"java": ("17", "build.gradle.kts")},
+        allowed=("api.foojay.io", "github.com"),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="./gradlew check",
+        lint=(("./gradlew check", False),),
+    ),
+    # `global.json` pins the SDK band; rollForward decides which pinned
+    # SDK admits it (#686)
+    "dotnet": Expectation(
+        ("dotnet",),
+        "detected",
+        versions={"dotnet": ("8", "global.json")},
+        allowed=("builds.dotnet.microsoft.com",),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="dotnet test",
+        lint=(("dotnet test", False),),
+    ),
     "ruby": Expectation(
         ("ruby",),
         "detected",
-        versions={},
-        allowed=(),
+        versions={"ruby": ("distro", "default")},
+        allowed=("github.com", "cache.ruby-lang.org"),
         not_allowed=("nodejs.org", "go.dev"),
         gate="bundle exec rake default",
         lint=(
@@ -173,6 +196,17 @@ EXPECTATIONS: dict[str, Expectation] = {
             ("bundle exec rubocop app", False),
             ("bundle exec rubocop", False),
         ),
+    ),
+    # `.ruby-version` is an exact release, compiled with ruby-build; the
+    # Gemfile's `ruby file:` defers to it (#686)
+    "ruby-pinned": Expectation(
+        ("ruby",),
+        "detected",
+        versions={"ruby": ("3.2.2", ".ruby-version")},
+        allowed=("github.com", "codeload.github.com", "cache.ruby-lang.org"),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="bundle exec rake default",
+        lint=(("bundle exec rake default", False),),
     ),
     # both, in registry order — union, never "best guess"
     "polyglot": Expectation(
