@@ -1091,9 +1091,16 @@ these paths. Migration for an existing single-repo daemon: move
 (reachable, token permissions), so one broken repo never masks the others'
 verdicts. The host never holds the PAT, so that check is made from a
 short-lived github-ops sandbox per repository, provisioned with exactly that
-repository's credentials (`repo.get`, whose `permissions` block says whether
-the token has write access). If no sandbox can be provisioned the row is a
-soft "reachability unverified" rather than a verdict against the repo. `sbxloop config repos` lists the registered repositories, and
+repository's credentials. The token is judged against the permission table
+in `sbxloop.gh.permissions` (`docs/permissions.md`, #696) from whichever
+source describes it — the App installation's grant carried on the minted
+token, a classic PAT's `X-OAuth-Scopes` (the worker's `token.scopes` op), or
+for a fine-grained PAT one read per permission plus the repository payload's
+`push` bit — and a required permission it lacks fails the row naming the
+feature that first needs it; `workflows:write` only warns, and a `ci` row
+reports the repository's Actions workflows and latest run on the base. If no
+sandbox can be provisioned the row is a soft "reachability unverified"
+rather than a verdict against the repo. `sbxloop config repos` lists the registered repositories, and
 `sbxloop status` / `sbxloop daemon items` carry a `repo` column. From chat,
 the concierge's `list_repos` tool answers "what projects are you configured
 to work on?" with each repository's enabled state, base branch and trigger

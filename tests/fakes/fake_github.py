@@ -381,6 +381,11 @@ class FakeGithub(GithubOps):
         self._record_failed_job(op, method, path, exc)
         return exc
 
+    def token_scopes(self) -> tuple[str, ...] | None:
+        # Only `sbxloop doctor` asks (#696); the fake's credential is a
+        # fine-grained one with nothing to report.
+        return None
+
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")

@@ -87,6 +87,12 @@ class Transport(Protocol):
         (Actions job logs) rather than JSON."""
         ...
 
+    def request_headers(self, method: str, path: str) -> dict[str, str]:
+        """The response headers of a request, lower-cased names, body
+        discarded — for what GitHub says only in headers (a classic PAT's
+        ``X-OAuth-Scopes``)."""
+        ...
+
 
 def api_root() -> str:
     """The REST root the stdlib transport prefixes bare paths with."""
@@ -102,7 +108,14 @@ class GhCliTransport:
     def __init__(self, gh: str = "gh") -> None:
         self.gh = gh
 
-    def _run(self, method: str, path: str, body: dict[str, Any] | None = None) -> str:
+    def _run(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        include_headers: bool = False,
+    ) -> str:
         argv = [
             self.gh,
             "api",
@@ -110,6 +123,7 @@ class GhCliTransport:
             method,
             "-H",
             f"X-GitHub-Api-Version: {API_VERSION}",
+            *(["--include"] if include_headers else []),
             path,
         ]
         stdin: str | None = None
@@ -144,6 +158,26 @@ class GhCliTransport:
         # gh follows the logs endpoint's redirect to blob storage itself and
         # prints the body verbatim, so nothing beyond "don't parse it" differs.
         return self._run(method, path)
+
+    def request_headers(self, method: str, path: str) -> dict[str, str]:
+        # ``gh api --include`` prints the status line and headers before the
+        # body, separated by a blank line.
+        return parse_http_headers(self._run(method, path, include_headers=True))
+
+
+def parse_http_headers(raw: str) -> dict[str, str]:
+    """The header block of an ``--include`` response as ``{lower-name:
+    value}`` — everything up to the first blank line, the status line
+    skipped. A response without a header block yields ``{}``."""
+    headers: dict[str, str] = {}
+    head = raw.replace("\r\n", "\n").split("\n\n", 1)[0]
+    if not head.startswith("HTTP/"):
+        return headers  # a bare body: nothing was included
+    for line in head.splitlines()[1:]:
+        name, sep, value = line.partition(":")
+        if sep:
+            headers[name.strip().lower()] = value.strip()
+    return headers
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -215,6 +249,31 @@ class RestTransport:
             return {}
         parsed: JsonValue = json.loads(raw)
         return parsed
+
+    def request_headers(self, method: str, path: str) -> dict[str, str]:
+        url = path if path.startswith("http") else f"{self.api_url}{path}"
+        if not url.startswith("https://"):
+            raise GithubOpError(f"refusing non-HTTPS GitHub API URL: {url}")
+        request = urllib.request.Request(
+            url,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": API_VERSION,
+                "User-Agent": USER_AGENT,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - https enforced above
+                return {name.lower(): value for name, value in response.headers.items()}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:2000]
+            raise GithubOpError(
+                f"{method} {url} -> HTTP {exc.code}: {detail}", http_status=exc.code
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise GithubOpError(f"{method} {url} failed: {exc.reason}") from exc
 
     def request_text(self, method: str, path: str) -> str:
         url = path if path.startswith("http") else f"{self.api_url}{path}"
@@ -466,6 +525,24 @@ def _raw_api(t: Transport, p: dict[str, Any]) -> JsonValue:
     return t.request(str(p["method"]).upper(), str(p["path"]), p.get("body"))
 
 
+# The header a classic (OAuth-scoped) PAT answers every request with. A
+# fine-grained PAT and a GitHub App installation token carry no such header:
+# their permissions are per-resource, and the header's absence is the
+# signal that the caller must find them out another way.
+SCOPES_HEADER = "x-oauth-scopes"
+
+
+def _token_scopes(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """The authenticated token's classic OAuth scopes, or ``None`` when the
+    token is not the kind that has them. Asked of ``/rate_limit``, which
+    every token may call and which does not count against the limit."""
+    headers = t.request_headers("GET", "/rate_limit")
+    if SCOPES_HEADER not in headers:
+        return {"scopes": None}
+    listed = [s.strip() for s in headers[SCOPES_HEADER].split(",")]
+    return {"scopes": [s for s in listed if s]}
+
+
 # Check-run conclusions that are not failures — the same set the host's
 # ``fold_check_runs`` uses to decide a PR is red (the worker cannot import
 # sbxloop, so the set is repeated here; keep the two aligned). ``neutral``
@@ -688,6 +765,7 @@ OPS: dict[str, OpImpl] = {
     "label.get": _label_get,
     "search.issues": _search_issues,
     "raw.api": _raw_api,
+    "token.scopes": _token_scopes,
     "checks.failed_logs": _checks_failed_logs,
 }
 

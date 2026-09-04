@@ -2722,6 +2722,20 @@ class TestMultiRepoCli:
         assert "unknown repository" in result.output
 
 
+class PatProvisioner:
+    """The provisioner a doctor Box stand-in carries: PAT mode, no bot
+    login, no App permissions to report (#696)."""
+
+    bot_login: str | None = None
+    app_permissions: dict[str, str] | None = None
+
+    def gh_bot_login(self, repo: str | None = None) -> str | None:
+        return self.bot_login
+
+    def gh_app_permissions(self, repo: str | None = None) -> dict[str, str] | None:
+        return self.app_permissions
+
+
 class TestDoctorRepoChecks:
     def _config(self, toml: str, workdir: Path) -> Any:
         from sbxloop.config import load_config
@@ -2809,7 +2823,7 @@ class TestDoctorRepoChecks:
         assert row.ok and not row.hard and "unverified" in row.detail
 
     def test_probe_reads_permissions_from_the_repo_payload(self) -> None:
-        from sbxloop.cli.doctor import _missing_permissions
+        from sbxloop.cli.doctor import _missing_from_push_bit as _missing_permissions
 
         assert _missing_permissions({"permissions": {"push": True}}) == ()
         assert _missing_permissions({"permissions": {"admin": True}}) == ()
@@ -2822,7 +2836,9 @@ class TestDoctorRepoChecks:
         # ...while a genuinely read-only token (pull works, push denied)
         # still flags.
         assert _missing_permissions({"permissions": {"pull": True, "push": False}}) != ()
-        missing = _missing_permissions({"permissions": {"pull": True, "push": False}})
+        missing = [
+            n.label for n in _missing_permissions({"permissions": {"pull": True, "push": False}})
+        ]
         assert "issues:write" in missing and "contents:write" in missing
 
     def test_sandbox_probe_calls_repo_lookup_in_a_scoped_box(
@@ -2840,10 +2856,15 @@ class TestDoctorRepoChecks:
                 seen["looked_up"] = repo
                 return {"permissions": {"push": True}}
 
+            def token_scopes(self) -> tuple[str, ...] | None:
+                return None  # a fine-grained PAT
+
             def raw(self, method: str, path: str, body: Any = None) -> Any:
-                return []  # no labels on the repository
+                return []  # no labels on the repository, every read allowed
 
         class FakeBox:
+            provisioner = PatProvisioner()
+
             def __init__(self, *_a: Any, repo: str | None = None, **_kw: Any) -> None:
                 seen["scoped_to"] = repo
                 self.closed = False
@@ -2904,6 +2925,8 @@ class TestDoctorProbeCost:
         instances: ClassVar[list[Any]] = []
         fail_names: ClassVar[set[str]] = set()
 
+        provisioner = PatProvisioner()
+
         def __init__(self, config: Any, cli: Any, bus: Any, **kw: Any) -> None:
             self.name = kw.get("name")
             self.repo = kw.get("repo")
@@ -2922,6 +2945,9 @@ class TestDoctorProbeCost:
                 def repo_lookup(self, repo: str) -> dict[str, Any]:
                     box.lookups.append(repo)
                     return {"permissions": {"push": True, "pull": True}}
+
+                def token_scopes(self) -> tuple[str, ...] | None:
+                    return None
 
                 def raw(self, method: str, path: str, body: Any = None) -> Any:
                     return []
@@ -3074,15 +3100,6 @@ class TestDoctorRepoHealthRow:
         assert got == {"acme/alpha": {"suspended": True, "reason": "x"}}
 
 
-class PatProvisioner:
-    """The provisioner a doctor Box stand-in carries: PAT mode, no bot login."""
-
-    bot_login: str | None = None
-
-    def gh_bot_login(self, repo: str | None = None) -> str | None:
-        return self.bot_login
-
-
 class TestDoctorBranchProtection:
     """Rules of the base the loop cannot satisfy 405 every loop merge:
     doctor lists them as advice (human-out-of-the-loop doctrine, #673)."""
@@ -3156,6 +3173,9 @@ class TestDoctorBranchProtection:
                 class Ops:
                     def repo_lookup(self, repo: str) -> dict[str, Any]:
                         return {"default_branch": "main"}
+
+                    def token_scopes(self) -> tuple[str, ...] | None:
+                        return None
 
                     def raw(self, method: str, path: str, body: Any = None) -> Any:
                         from sbxloop.errors import GithubOpsError
@@ -3243,6 +3263,9 @@ class TestDoctorBranchProtection:
                             "allow_rebase_merge": False,
                         }
 
+                    def token_scopes(self) -> tuple[str, ...] | None:
+                        return None
+
                     def raw(self, method: str, path: str, body: Any = None) -> Any:
                         from sbxloop.errors import GithubOpsError
 
@@ -3278,9 +3301,14 @@ class TestDoctorBranchProtection:
                     def repo_lookup(self, repo: str) -> dict[str, Any]:
                         return {"has_issues": False}
 
+                    def token_scopes(self) -> tuple[str, ...] | None:
+                        return None
+
                     def raw(self, method: str, path: str, body: Any = None) -> Any:
-                        assert path == "/repos/acme/alpha/labels?per_page=100&page=1"
-                        return [{"name": "SBXLOOP:RUN"}, {"name": "loop:done"}]
+                        if path == "/repos/acme/alpha/labels?per_page=100&page=1":
+                            return [{"name": "SBXLOOP:RUN"}, {"name": "loop:done"}]
+                        assert path.startswith("/repos/acme/alpha/"), path
+                        return []  # the permission reads (#696): every one allowed
 
                 return Ops()
 
@@ -3419,6 +3447,195 @@ class TestDoctorBranchProtection:
             ),
         )
         assert rules.detail.startswith("the base's rulesets could not be read;")
+
+
+class TestDoctorPermissions:
+    """Doctor names the permission a run's credential lacks and the
+    feature that first needs it, from whichever source describes the token
+    (#696) — so the failure is a doctor row, not a mid-run 403."""
+
+    FULL_APP: ClassVar[dict[str, str]] = {
+        "metadata": "read",
+        "contents": "write",
+        "pull_requests": "write",
+        "issues": "write",
+        "checks": "read",
+        "actions": "read",
+        "workflows": "write",
+    }
+    ONE_WORKFLOW: ClassVar[dict[str, Any]] = {
+        "total_count": 1,
+        "workflows": [{"name": "ci", "state": "active"}],
+    }
+
+    def _config(self, workdir: Path) -> Any:
+        from sbxloop.config import load_config
+
+        (workdir / "sbxloop.toml").write_text('[[github.repos]]\nrepo = "acme/alpha"\n')
+        return load_config()
+
+    def _rows(
+        self,
+        workdir: Path,
+        *,
+        scopes: tuple[str, ...] | None = None,
+        app_permissions: dict[str, str] | None = None,
+        forbidden: tuple[str, ...] = (),
+        workflows: Any = None,
+        latest_run: Any = None,
+        private: bool = True,
+        push: bool = True,
+    ) -> tuple[list[Any], list[str]]:
+        """Doctor's repo rows for a token described by ``scopes`` (classic),
+        ``app_permissions`` (App) or neither (fine-grained), whose reads of
+        the paths in ``forbidden`` 403; plus the GET paths asked."""
+        from sbxloop.cli.doctor import repo_checks, sandbox_repo_probe
+        from sbxloop.errors import GithubOpsError
+
+        asked: list[str] = []
+        listing = self.ONE_WORKFLOW if workflows is None else workflows
+
+        class Ops:
+            def repo_lookup(self, repo: str) -> dict[str, Any]:
+                return {
+                    "default_branch": "main",
+                    "permissions": {"push": push, "pull": True},
+                    "private": private,
+                }
+
+            def token_scopes(self) -> tuple[str, ...] | None:
+                asked.append("token.scopes")
+                return scopes
+
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                asked.append(path)
+                if any(path.endswith(suffix) for suffix in forbidden):
+                    raise GithubOpsError("Resource not accessible", http_status=403)
+                if path.endswith("/labels?per_page=100&page=1"):
+                    return [{"name": "sbxloop:run"}]
+                if path.endswith("/rules/branches/main"):
+                    return []
+                if path.endswith("/actions/workflows?per_page=100"):
+                    return listing
+                if path.endswith("/actions/runs?branch=main&per_page=1"):
+                    return {"workflow_runs": [latest_run] if latest_run else []}
+                if path.endswith("/protection"):
+                    raise GithubOpsError("admin only", http_status=403)
+                return []
+
+        class Box:
+            provisioner = PatProvisioner()
+            provisioner.app_permissions = app_permissions
+
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def ops(self) -> Ops:
+                return Ops()
+
+        import sbxloop.daemon.github as github_module
+
+        config = self._config(workdir)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(github_module, "DaemonGithub", Box)
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            return repo_checks(config, {"GH_TOKEN": "tok"}, probe=probe), asked
+
+    def test_a_fine_grained_pat_lacking_checks_read_fails_naming_the_feature(
+        self, workdir: Path
+    ) -> None:
+        """Acceptance (#696): a token that cannot read check runs would have
+        hung the CI stage; doctor says which permission and which stage."""
+        rows, asked = self._rows(workdir, forbidden=("/commits/main/check-runs?per_page=1",))
+        repo = rows[0]
+        assert repo.name == "github repo acme/alpha" and not repo.ok and repo.hard
+        assert (
+            "token missing checks:read (waiting for check runs at the CI and landing" in repo.detail
+        )
+        assert "docs/permissions.md" in repo.detail and "fine-grained PAT" in repo.detail
+        assert "actions:read" not in repo.detail, "only the read that failed is named"
+        # A fine-grained PAT is asked one read per permission.
+        assert "/repos/acme/alpha/issues?per_page=1" in asked
+        assert "/repos/acme/alpha/actions/runs?per_page=1" in asked
+
+    def test_a_fine_grained_pat_with_every_read_passes(self, workdir: Path) -> None:
+        rows, _asked = self._rows(workdir)
+        repo = rows[0]
+        assert repo.ok and "token has the required permissions" in repo.detail
+        assert not any(r.name.endswith(" workflows") for r in rows), "nothing to warn about"
+        assert rows[-1].name == "github repo acme/alpha ci", "the CI row closes the repository"
+
+    def test_an_app_missing_workflows_write_warns(self, workdir: Path) -> None:
+        """Acceptance (#696): the loop runs without it, but a delivery that
+        touches a workflow file is refused — a WARN row says so up front."""
+        granted = {k: v for k, v in self.FULL_APP.items() if k != "workflows"}
+        rows, asked = self._rows(workdir, app_permissions=granted)
+        repo = rows[0]
+        assert repo.ok and "App installation" in repo.detail
+        assert "token.scopes" not in asked, "the App's grant answers; no header read"
+        assert "/repos/acme/alpha/issues?per_page=1" not in asked, "no read probes either"
+        (warn,) = [r for r in rows if r.name == "github repo acme/alpha workflows"]
+        assert not warn.ok and not warn.hard
+        assert "workflows:write" in warn.detail and ".github/workflows" in warn.detail
+        assert "docs/permissions.md" in warn.detail
+
+    def test_an_app_missing_a_required_permission_fails(self, workdir: Path) -> None:
+        granted = {k: v for k, v in self.FULL_APP.items() if k != "actions"}
+        rows, _asked = self._rows(workdir, app_permissions=granted)
+        repo = rows[0]
+        assert not repo.ok and repo.hard
+        assert "actions:read (reading workflow runs and failed-job logs" in repo.detail
+
+    def test_a_classic_pat_is_judged_by_its_scopes(self, workdir: Path) -> None:
+        rows, asked = self._rows(workdir, scopes=("repo", "workflow"))
+        assert rows[0].ok and "classic PAT's scopes repo, workflow" in rows[0].detail
+        assert "/repos/acme/alpha/issues?per_page=1" not in asked, "scopes answer; no probes"
+        rows, _asked = self._rows(workdir, scopes=("repo",))
+        assert rows[0].ok
+        assert any(r.name.endswith(" workflows") and not r.ok and not r.hard for r in rows)
+        rows, _asked = self._rows(workdir, scopes=("public_repo",))
+        assert not rows[0].ok and "contents:write" in rows[0].detail
+        rows, _asked = self._rows(workdir, scopes=("public_repo",), private=False)
+        assert rows[0].ok, "public_repo is enough for a public repository"
+
+    def test_a_classic_pat_is_also_capped_by_its_users_access(self, workdir: Path) -> None:
+        """`repo` on the token, read-only on the repository: the scopes
+        pass, the push bit fails — the write needs are still named."""
+        rows, _asked = self._rows(workdir, scopes=("repo", "workflow"), push=False)
+        assert not rows[0].ok and rows[0].hard
+        assert "contents:write" in rows[0].detail and "checks:read" not in rows[0].detail
+
+    def test_zero_workflows_says_the_ci_stage_has_nothing_to_wait_for(self, workdir: Path) -> None:
+        """Acceptance (#696): a repository without Actions is not a failure
+        — the CI stage passes on the delivered head — but doctor says so,
+        so an empty CI stage is not a surprise on the first run."""
+        rows, _asked = self._rows(workdir, workflows={"total_count": 0, "workflows": []})
+        (ci,) = [r for r in rows if r.name == "github repo acme/alpha ci"]
+        assert ci.ok and not ci.hard
+        assert "no active Actions workflows" in ci.detail and "nothing" in ci.detail
+        assert "another app" in ci.detail
+
+    def test_the_ci_row_names_the_latest_run_on_the_base(self, workdir: Path) -> None:
+        rows, _asked = self._rows(
+            workdir,
+            latest_run={"name": "ci", "status": "completed", "conclusion": "failure"},
+        )
+        (ci,) = [r for r in rows if r.name == "github repo acme/alpha ci"]
+        assert ci.ok and ci.hard
+        assert ci.detail == "1 active Actions workflow(s); latest run on main: ci failure"
+        rows, _asked = self._rows(workdir)
+        (ci,) = [r for r in rows if r.name == "github repo acme/alpha ci"]
+        assert ci.detail == "1 active Actions workflow(s); no run yet on main"
+
+    def test_a_listing_the_token_cannot_read_drops_the_ci_row(self, workdir: Path) -> None:
+        """actions:read missing is the permission row's finding; the CI row
+        does not guess."""
+        rows, _asked = self._rows(
+            workdir,
+            forbidden=("/actions/workflows?per_page=100", "/actions/runs?per_page=1"),
+        )
+        assert not rows[0].ok and "actions:read" in rows[0].detail
+        assert not any(r.name.endswith(" ci") for r in rows)
 
 
 class TestInitRepo:

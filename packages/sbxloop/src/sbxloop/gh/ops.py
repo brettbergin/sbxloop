@@ -1652,6 +1652,17 @@ class GithubOps:
             params["body"] = body
         return self._op("raw.api", params)
 
+    def token_scopes(self) -> tuple[str, ...] | None:
+        """The credential's classic OAuth scopes (``repo``, ``workflow``,
+        ...), or ``None`` for a token that has none to report — a
+        fine-grained PAT or an App installation token, whose permissions
+        are per-resource (#696)."""
+        result = self._op("token.scopes", {})
+        scopes = result.get("scopes") if isinstance(result, dict) else None
+        if scopes is None:
+            return None
+        return tuple(str(s) for s in scopes)
+
     # Extra seconds of job timeout granted per file in a blob batch: the
     # batch job makes one REST call per file, so the flat per-op timeout
     # would starve large manifests.

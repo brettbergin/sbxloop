@@ -88,6 +88,11 @@ class AppCredentials:
 class InstallationToken(NamedTuple):
     value: str
     expires_at: float  # unix seconds
+    # The ``permissions`` map GitHub returns with the mint (``{"contents":
+    # "write", ...}``) — what this installation may do, which `sbxloop
+    # doctor` checks against what a run needs (#696). ``None`` when the
+    # response carried none (a fake, or an older API).
+    permissions: Mapping[str, str] | None = None
 
 
 def app_credentials(env: Mapping[str, str]) -> AppCredentials | None:
@@ -250,13 +255,22 @@ def mint_installation_token(
             f"got keys {sorted(data)!r}"
         )
     expires_at = _parse_expires_at(data.get("expires_at"), now=started)
+    permissions = _parse_permissions(data.get("permissions"))
     log.info(
         "github.app_token_minted",
         app_id=creds.app_id,
         installation_id=creds.installation_id,
         expires_at=datetime.fromtimestamp(expires_at).isoformat(timespec="seconds"),
     )
-    return InstallationToken(value=value, expires_at=expires_at)
+    return InstallationToken(value=value, expires_at=expires_at, permissions=permissions)
+
+
+def _parse_permissions(raw: object) -> Mapping[str, str] | None:
+    """The mint response's ``permissions`` map, string values only, or
+    ``None`` when the response had no usable map."""
+    if not isinstance(raw, dict):
+        return None
+    return {str(k): v for k, v in raw.items() if isinstance(v, str)}
 
 
 def fetch_app_slug(
@@ -355,6 +369,17 @@ class AppTokenSource:
             token = self._token
             assert token is not None  # _stale(None) is True, so it was just minted
             return token.value
+
+    def permissions(self) -> Mapping[str, str] | None:
+        """What the installation may do, as GitHub reported it with the
+        current token's mint — ``None`` when the mint carried no map.
+        Mints when nothing is cached yet, so a fresh source answers too."""
+        with self._lock:
+            if self._stale(self._token):
+                self._token = self._mint(self.creds)
+            token = self._token
+            assert token is not None  # as in current()
+            return token.permissions
 
     def bot_login(self) -> str | None:
         """The login GitHub attributes this installation's writes to
