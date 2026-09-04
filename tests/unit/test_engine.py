@@ -2476,7 +2476,7 @@ class TestPipeline:
             "does not enqueue it",
         ]
         assert all(f"\n- {b}" in result.reason for b in blockers)
-        assert '`[landing] merge_gate = "chat"`' in result.reason
+        assert "merge_gate" not in result.reason
 
     def test_landing_405_blocks_and_a_resume_finishes(self, harness: Harness) -> None:
         """A protection rule no round can satisfy hands the PR to a human;

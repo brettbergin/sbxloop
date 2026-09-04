@@ -862,6 +862,20 @@ class TestEmbeds:
         assert texts(
             format_for_discord(ev("run.deliver", repo="o/r", pr=9, url="https://x/pull/9", round=2))
         ) == ["🔀 PR [#9 · o/r](https://x/pull/9) (round 2)"]
+        waiting = format_for_discord(
+            ev(
+                "run.awaiting_review",
+                pr=9,
+                url="https://x/pull/9",
+                approvals_required=2,
+                code_owners=True,
+            )
+        )
+        assert texts(waiting) == [
+            "👀 **awaiting review** PR [#9](https://x/pull/9) — the base requires 2 approving "
+            "review(s) from a code owner (0/2 so far); waiting for a reviewer on GitHub"
+        ]
+        assert waiting[0].flush
 
 
 def tev(ts: float, type: str, **data: Any) -> Event:

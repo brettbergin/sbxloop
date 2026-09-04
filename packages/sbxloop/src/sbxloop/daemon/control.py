@@ -44,7 +44,7 @@ log = get_logger(__name__)
 COMMANDS: tuple[str, ...] = (
     "status",
     "pause [--hold NAME]",
-    "resume [--hold NAME|--all]",
+    "resume [<item|run>|--hold NAME|--all]",
     "cancel [--retry]",
     "queue",
     "items",
@@ -201,6 +201,13 @@ def _dispatch(
             f"nothing new is claimed. holds: {', '.join(holds)}"
         )
     if word in ("resume", "unpause"):
+        if len(args) == 1 and not args[0].startswith("-"):
+            # `resume <item|run>`: a PR waiting for a review (#675) — check
+            # it now, or re-arm a wait that paused. Not the daemon's holds.
+            try:
+                return CommandReply(loop.resume_review(args[0], by))
+            except ValueError as exc:
+                return CommandReply(f"resume failed: {exc.args[0] if exc.args else exc}", ok=False)
         hold, err = _hold_arg(args, word, prefix, allow_all=True)
         if err is not None:
             return err
@@ -292,7 +299,9 @@ def _hold_arg(
     name, ``"--all"``, or ``None`` for the operator's default hold — or a
     not-ok reply for anything else, so a typo can never become a silent
     bare pause/resume of the wrong hold."""
-    usage_line = f"usage: `{prefix} {word} [--hold NAME" + ("|--all]`" if allow_all else "]`")
+    usage_line = f"usage: `{prefix} {word} [" + (
+        "<item|run>|--hold NAME|--all]`" if allow_all else "--hold NAME]`"
+    )
     if not args:
         return None, None
     if allow_all and args == ["--all"]:

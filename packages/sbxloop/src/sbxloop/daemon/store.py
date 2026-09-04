@@ -201,6 +201,38 @@ CREATE TABLE IF NOT EXISTS daemon_merge_gates (
 CREATE INDEX IF NOT EXISTS idx_merge_gates_state ON daemon_merge_gates(state);
 CREATE INDEX IF NOT EXISTS idx_merge_gates_item  ON daemon_merge_gates(item_id);
 
+-- A run parked on a base that requires an approving review the loop
+-- cannot give its own PR (#675). The row is the wait: the daemon polls
+-- the PR every [landing] review_poll_interval_s while it is `open`,
+-- `approving` is the landing in progress, `fixing` hands the run back
+-- to the engine for a reviewer's changes, `paused` is the wait past
+-- [landing] review_wait_s (nothing polls; `resume <item>` re-opens it),
+-- `merged` / `dismissed` are the ends. login/is_bot are the loop's own
+-- identity on this PR, resolved once so a poll costs no identity read;
+-- since_at is when the current wait began (a resume restarts it).
+CREATE TABLE IF NOT EXISTS daemon_review_holds (
+    run_id             TEXT PRIMARY KEY,
+    item_id            TEXT NOT NULL,
+    repo               TEXT NOT NULL,
+    pr_number          INTEGER NOT NULL,
+    pr_url             TEXT NOT NULL DEFAULT '',
+    branch             TEXT,
+    login              TEXT NOT NULL DEFAULT '',
+    is_bot             INTEGER,
+    approvals_required INTEGER NOT NULL DEFAULT 1,
+    notify_ids         TEXT NOT NULL DEFAULT '[]',
+    state              TEXT NOT NULL DEFAULT 'open',
+    created_at         REAL NOT NULL,
+    since_at           REAL NOT NULL,
+    next_poll_at       REAL NOT NULL,
+    polls              INTEGER NOT NULL DEFAULT 0,
+    resolved_at        REAL,
+    resolved_by        TEXT,
+    detail             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_review_holds_state ON daemon_review_holds(state);
+CREATE INDEX IF NOT EXISTS idx_review_holds_item  ON daemon_review_holds(item_id);
+
 -- A filing-blocking clarifying question with the concierge's own fallback
 -- (ask, never block): if the asker never answers, the bridge tells the
 -- concierge to proceed on the stated assumption instead of dropping the
@@ -226,8 +258,12 @@ CREATE INDEX IF NOT EXISTS idx_pending_clarify_due
 # States from which nothing more happens on its own. A row in one of
 # these is *finished*: re-adding the trigger label to its issue re-queues
 # it (#600). ``gated`` is deliberately absent — a parked merge is still
-# live work awaiting one human approval.
+# live work awaiting one human approval — and so are ``awaiting_review``
+# and ``paused_review`` (#675): the PR is open and its run is pinned.
 TERMINAL_ITEM_STATES: frozenset[str] = frozenset({"done", "failed", "blocked", "cancelled"})
+# The two review-wait states (#675), as one set for the callers that
+# treat them alike (``resume``, ``abandon``, the operator's listings).
+REVIEW_WAIT_STATES: frozenset[str] = frozenset({"awaiting_review", "paused_review"})
 
 
 class PriorAttempt(NamedTuple):
@@ -257,6 +293,57 @@ class MergeGate(NamedTuple):
     resolved_at: float | None
     resolved_by: str | None
     detail: str | None
+
+
+class ReviewHold(NamedTuple):
+    """One run waiting for an approving review on GitHub (#675)."""
+
+    run_id: str
+    item_id: str
+    repo: str
+    pr_number: int
+    pr_url: str
+    branch: str | None
+    login: str
+    is_bot: bool | None
+    approvals_required: int
+    notify_ids: tuple[str, ...]
+    state: str  # open | approving | fixing | paused | merged | dismissed
+    created_at: float
+    since_at: float
+    next_poll_at: float
+    polls: int
+    resolved_at: float | None
+    resolved_by: str | None
+    detail: str | None
+
+
+def _row_to_hold(row: sqlite3.Row) -> ReviewHold:
+    try:
+        notify = tuple(str(v) for v in json.loads(row["notify_ids"] or "[]"))
+    except ValueError:
+        notify = ()
+    is_bot = row["is_bot"]
+    return ReviewHold(
+        run_id=row["run_id"],
+        item_id=normalize_item_id(str(row["item_id"])),
+        repo=row["repo"],
+        pr_number=int(row["pr_number"]),
+        pr_url=row["pr_url"] or "",
+        branch=row["branch"],
+        login=str(row["login"] or ""),
+        is_bot=None if is_bot is None else bool(is_bot),
+        approvals_required=int(row["approvals_required"] or 0),
+        notify_ids=notify,
+        state=row["state"],
+        created_at=row["created_at"],
+        since_at=row["since_at"],
+        next_poll_at=row["next_poll_at"],
+        polls=int(row["polls"] or 0),
+        resolved_at=row["resolved_at"],
+        resolved_by=row["resolved_by"],
+        detail=row["detail"],
+    )
 
 
 def _row_to_gate(row: sqlite3.Row) -> MergeGate:
@@ -1229,7 +1316,8 @@ class DaemonStore:
     # -- operator controls (#229) ------------------------------------------------
 
     def abandon(self, item_id: str, reason: str, now: float) -> WorkItem:
-        """Operator abandon: queued/running/blocked/gated → failed. ``run_id`` is
+        """Operator abandon: queued/running/blocked/gated/awaiting_review/
+        paused_review → failed. ``run_id`` is
         kept so the ledger and ``sbxloop logs`` still tie the item to the run
         that made the operator give up on it; the loop treats "abandoned
         while pinned to my run" as its cue to cancel that run. The source is
@@ -1239,7 +1327,7 @@ class DaemonStore:
         return self._transition(
             item_id,
             now,
-            ("queued", "running", "blocked", "gated"),
+            ("queued", "running", "blocked", "gated", "awaiting_review", "paused_review"),
             lambda item: f"{item_id} is already {item.state}",
             state="failed",
             last_error=reason[:2000],
@@ -1265,7 +1353,14 @@ class DaemonStore:
             ("failed", "blocked", "cancelled", "queued"),
             lambda item: (
                 f"{item_id} is {item.state}; only failed, blocked, cancelled or queued items "
-                "can be retried" + (" (abandon it first)" if item.state == "running" else "")
+                "can be retried"
+                + (" (abandon it first)" if item.state == "running" else "")
+                + (
+                    f" — its PR is waiting for a review; `resume {item_id}` keeps that PR "
+                    "and checks it now, `abandon` gives it up"
+                    if item.state in REVIEW_WAIT_STATES
+                    else ""
+                )
             ),
             state="queued",
             attempts=0,
@@ -1481,6 +1576,36 @@ class DaemonStore:
         ``approve_merge`` or ``abandon`` resolves it. The source is owed the
         park announcement (label + how-to comment)."""
         self._update(item_id, now, state="gated", last_error=None, pending_report="gated")
+
+    def mark_awaiting_review(self, item_id: str, now: float) -> None:
+        """The run parked for an approving review (#675): a waiting state
+        like ``gated`` — run pinned, invisible to dispatch — ended by the
+        review poll, ``resume`` or ``abandon``. The source hears nothing:
+        the issue is still in progress."""
+        self._update(item_id, now, state="awaiting_review", last_error=None, not_before=None)
+
+    def mark_paused_review(self, item_id: str, reason: str, now: float) -> None:
+        """The review wait ran past ``[landing] review_wait_s`` (#675): the
+        run stays pinned and nothing polls until ``resume <item>``."""
+        self._update(item_id, now, state="paused_review", last_error=reason[:2000])
+
+    def resume_for_fix(self, item_id: str, run_id: str, now: float, reason: str) -> WorkItem:
+        """A reviewer requested changes on a parked PR (#675): the item goes
+        back to the queue with its run *pinned* and no backoff, so the next
+        tick resumes it at the landing stage and the fix round runs. The
+        attempt count is untouched — a resume is the same attempt."""
+        item = self._require(item_id)
+        if item.run_id != run_id:
+            raise ValueError(f"{item_id} is not pinned to run {run_id} (its run is {item.run_id})")
+        return self._transition(
+            item_id,
+            now,
+            ("awaiting_review", "paused_review"),
+            lambda it: f"{item_id} is {it.state}; only a review-wait item resumes for a fix",
+            state="queued",
+            not_before=None,
+            last_error=reason[:2000],
+        )
 
     def mark_failed(self, item_id: str, error: str, now: float, *, requeue: bool) -> None:
         # A requeued item must not keep its run pinned: queued + run_id
@@ -1923,6 +2048,160 @@ class DaemonStore:
                 (_text_or_none(channel_id), _text_or_none(message_id), run_id),
             )
             self._conn.commit()
+
+    # -- review holds (#675) -----------------------------------------------------
+
+    def create_review_hold(
+        self,
+        run_id: str,
+        item_id: str,
+        repo: str,
+        pr_number: int,
+        pr_url: str,
+        branch: str | None,
+        *,
+        login: str,
+        is_bot: bool | None,
+        approvals_required: int,
+        notify_ids: Sequence[str],
+        now: float,
+        next_poll_at: float,
+    ) -> None:
+        """Persist a review wait, its first poll due at ``next_poll_at`` (the
+        run just looked: nothing to see yet). A run that parks again after
+        a fix round re-opens its own row (the wait starts over; the notify
+        list is the fresh one); a decision already taken on a finished row
+        stands."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO daemon_review_holds (run_id, item_id, repo, pr_number, pr_url, "
+                "branch, login, is_bot, approvals_required, notify_ids, state, created_at, "
+                "since_at, next_poll_at, polls) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 0) "
+                "ON CONFLICT(run_id) DO UPDATE SET state = 'open', since_at = excluded.since_at, "
+                "next_poll_at = excluded.next_poll_at, notify_ids = excluded.notify_ids, "
+                "approvals_required = excluded.approvals_required, login = excluded.login, "
+                "is_bot = excluded.is_bot, detail = NULL, resolved_at = NULL, resolved_by = NULL "
+                "WHERE daemon_review_holds.state IN ('open', 'fixing', 'paused', 'approving')",
+                (
+                    run_id,
+                    normalize_item_id(item_id),
+                    repo,
+                    pr_number,
+                    pr_url,
+                    branch,
+                    login,
+                    None if is_bot is None else int(is_bot),
+                    approvals_required,
+                    json.dumps(list(notify_ids)),
+                    now,
+                    now,
+                    next_poll_at,
+                ),
+            )
+            self._conn.commit()
+        log.info("store.review_hold_created", run=run_id, item=item_id, pr=pr_number)
+
+    def review_hold_for(self, target: str) -> ReviewHold | None:
+        """The hold for a run id or an item id (either spelling); the newest
+        when an item had several runs."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM daemon_review_holds WHERE run_id = ?", (target,)
+            ).fetchone()
+            if row is None:
+                where, ids = _id_match(target)
+                row = self._conn.execute(
+                    f"SELECT * FROM daemon_review_holds WHERE {where} "  # nosec B608
+                    "ORDER BY created_at DESC LIMIT 1",
+                    ids,
+                ).fetchone()
+            return _row_to_hold(row) if row else None
+
+    def review_holds(self, states: Sequence[str] = ("open",)) -> list[ReviewHold]:
+        """Holds in ``states``, oldest first."""
+        marks = ", ".join("?" for _ in states)
+        with self._lock:
+            return [
+                _row_to_hold(row)
+                for row in self._conn.execute(
+                    f"SELECT * FROM daemon_review_holds WHERE state IN ({marks}) "  # nosec B608
+                    "ORDER BY created_at",
+                    tuple(states),
+                )
+            ]
+
+    def due_review_holds(self, now: float) -> list[ReviewHold]:
+        """The open holds whose next poll is due."""
+        with self._lock:
+            return [
+                _row_to_hold(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM daemon_review_holds WHERE state = 'open' AND next_poll_at <= ? "
+                    "ORDER BY next_poll_at",
+                    (now,),
+                )
+            ]
+
+    def review_hold_polled(self, run_id: str, next_poll_at: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_review_holds SET polls = polls + 1, next_poll_at = ? "
+                "WHERE run_id = ?",
+                (next_poll_at, run_id),
+            )
+            self._conn.commit()
+
+    def claim_review_hold(self, run_id: str, state: str) -> bool:
+        """CAS ``open → approving|fixing``: the poll that saw the review
+        acts on it exactly once."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE daemon_review_holds SET state = ? WHERE run_id = ? AND state = 'open'",
+                (state, run_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def reopen_review_hold(
+        self, run_id: str, now: float, detail: str | None = None, *, restart: bool = False
+    ) -> bool:
+        """Put the wait back up from any unfinished state: a failed landing,
+        an interrupted one, or a pause an operator ends. ``restart`` begins
+        the wait over (``since_at``); the next poll is due at once."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE daemon_review_holds SET state = 'open', detail = ?, next_poll_at = ?, "
+                "since_at = CASE WHEN ? THEN ? ELSE since_at END "
+                "WHERE run_id = ? AND state IN ('open', 'approving', 'fixing', 'paused')",
+                (detail, now, int(restart), now, run_id),
+            )
+            self._conn.commit()
+        log.info("store.review_hold_reopened", run=run_id, detail=detail, restart=restart)
+        return cursor.rowcount == 1
+
+    def pause_review_hold(self, run_id: str, now: float, detail: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_review_holds SET state = 'paused', detail = ? "
+                "WHERE run_id = ? AND state = 'open'",
+                (detail, run_id),
+            )
+            self._conn.commit()
+        log.info("store.review_hold_paused", run=run_id, detail=detail)
+
+    def resolve_review_hold(
+        self, run_id: str, state: str, by: str | None, now: float, detail: str | None = None
+    ) -> None:
+        """End the wait: ``merged`` or ``dismissed``."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_review_holds SET state = ?, resolved_at = ?, resolved_by = ?, "
+                "detail = ? WHERE run_id = ?",
+                (state, now, by, detail, run_id),
+            )
+            self._conn.commit()
+        log.info("store.review_hold_resolved", run=run_id, state=state, by=by)
 
     # -- circuit breaker ---------------------------------------------------------
 

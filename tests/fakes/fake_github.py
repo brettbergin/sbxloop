@@ -487,6 +487,14 @@ class FakeGithub(GithubOps):
             return {"name": body["name"]}
         if method == "GET" and path.endswith("/issues") and "labels=" in query:
             return list(self.existing_issues)
+        if method == "POST" and path.endswith("/requested_reviewers"):
+            # A review request (#675): recorded on the PR as GitHub does.
+            assert body is not None
+            requested = self.pr.setdefault("requested_reviewers", [])
+            requested.extend({"login": login} for login in body.get("reviewers", ()))
+            teams = self.pr.setdefault("requested_teams", [])
+            teams.extend({"slug": slug} for slug in body.get("team_reviewers", ()))
+            return dict(self.pr)
         if method == "POST" and path.endswith("/pulls/" + str(self.number) + "/comments"):
             # One review comment, standalone (#513): a thread of its own.
             assert body is not None

@@ -649,6 +649,15 @@ Discord — and `!sbx merge <item>` (here or in the control
 channel; `sbxloop daemon ctl merge <item>` works headless) completes the
 landing, while `!sbx abandon <item>` declines and leaves the PR open. No
 deadline; the park, its prompt and its button survive restarts.
+A base branch that *requires* an approving review is not a block: the run
+parks `awaiting_review` — PR un-drafted, `[github] reviewers` requested,
+`👀 awaiting review` in the run's thread @mentioning the requester and
+`[landing] review_notify` — and the daemon polls the PR every
+`review_poll_interval_s`. A human's approval (or a human merging it) lands
+the run; a changes-requested review resumes it for a fix round; the PR
+closed abandons it. After `review_wait_s` without a verdict the item goes
+`paused_review` (one more mention, no more polling) until
+`!sbx resume <item>` picks it up again. The park survives restarts.
 Mentions are otherwise always disabled, so model output can never ping the
 channel, and Discord's automatic link previews (unfurls) are suppressed on
 every send *and* every edit, so no message sprouts a grey preview card — the
@@ -1136,18 +1145,20 @@ needs, with no fix round spent. A real red beside it is fixed first.
 **Branch protection.** "Require branches to be up to date" is handled: the
 landing stage calls update-branch (bounded by `merge_update_attempts`, each
 one API call) and re-judges the new head. A rule the loop cannot satisfy —
-most often a required approval its identity cannot give — shows as a
+signed commits or approval of the last push, say — shows as a
 `blocked` mergeability once the checks are green, or as a 405 on merge,
 which no retry fixes; the run ends `blocked` with the PR open and out of
 draft for a human, and the reason is read from the base's rulesets and
 classic protection in full — one line per rule the loop cannot satisfy:
-the approving reviews still required (and the `merge_gate = "chat"`
-pointer when a review is the gate), a CODEOWNERS review, approval of the
-last push (never satisfiable: the loop is always the last pusher), signed
+approval of the last push (never satisfiable: the loop is always the last
+pusher), signed
 commits (satisfied by a GitHub App credential, whose API commits GitHub
 signs), a linear-history rule against `merge_method = "merge"`, a merge
 queue, a required deployment. The `run.blocked` event carries the same
-list, and `sbxloop doctor` reports it per repository before any run.
+list, and `sbxloop doctor` reports it per repository before any run. When
+the *only* unmet rules are review rules — N approving reviews, a
+CODEOWNERS review — the run does not block at all: it parks
+`awaiting_review` and waits for the human (see the daemon section).
 Conversation resolution is not a blocker: the loop resolves the threads it
 answers. A 409 is a race with a push that landed since; the next poll
 re-judges.

@@ -358,6 +358,13 @@ class RepoConfig(_ConfigModel):
     # The loop's own login on this repository, for when neither the App
     # slug nor `GET /user` can say (#622); None → `[github] bot_login`.
     bot_login: str | None = None
+    # Who is asked to review a PR the base will not merge without an
+    # approving review (#675); None → `[github] reviewers`. Logins, or
+    # `org/team` slugs.
+    reviewers: list[str] | None = None
+    # Chat user ids to @mention when such a PR waits (#675); None →
+    # `[landing] review_notify`. The requester is always mentioned.
+    review_notify: list[str] | None = None
 
     @field_validator("repo")
     @classmethod
@@ -448,6 +455,13 @@ class GithubConfig(_ConfigModel):
     # (the same credential opened it), else the identity is unknown and
     # landing hands over rather than guess.
     bot_login: str | None = None
+    # Who GitHub asks to review a PR whose base requires an approving
+    # review the loop cannot give (#675): user logins, or `org/team` slugs.
+    # Requested once, when the run parks `awaiting_review`, so the PR shows
+    # up in their review queue; write access suffices. Overridable per
+    # `[[github.repos]]` entry. Empty asks nobody — the chat notice still
+    # names the requester.
+    reviewers: list[str] = Field(default_factory=list)
     # How many repositories were enabled in the *un-narrowed* config this was
     # derived from. `for_repo` cuts `repos` down to a single entry, so the
     # list length downstream says nothing about the deployment's shape; the
@@ -639,6 +653,14 @@ class GithubConfig(_ConfigModel):
         if entry is not None and entry.branch_prefix:
             return entry.branch_prefix
         return self.branch_prefix
+
+    def reviewers_for(self, repo: str | None = None) -> list[str]:
+        """Who to request reviews from on ``repo``'s pull requests (#675):
+        the entry's own list when set, else `[github] reviewers`."""
+        entry = self.effective_repo(repo)
+        if entry is not None and entry.reviewers is not None:
+            return list(entry.reviewers)
+        return list(self.reviewers)
 
     def bot_login_for(self, repo: str | None = None) -> str | None:
         """The operator-declared login for ``repo``'s runs: the entry's own,
@@ -884,6 +906,17 @@ class LandingConfig(_ConfigModel):
     merges publish (sbxloop's own does), every merged run is therefore an
     unattended release.
 
+    A base that requires an approving review is not a block (#675): the
+    loop cannot approve its own pull request and no second identity
+    should, so the run parks ``awaiting_review`` — no sandbox kept, the
+    PR open with its reviewers requested (`[github] reviewers`), the
+    requester and ``review_notify`` mentioned in chat once — and the
+    daemon polls the PR every ``review_poll_interval_s`` with two GitHub
+    requests. An approval completes the landing with gh ops alone; a
+    changes-requested review resumes the run for a fix round; after
+    ``review_wait_s`` without either the item pauses (``paused_review``)
+    and ``resume <item>`` re-arms the wait — nothing is deleted.
+
     ``merge_gate`` is the ONE opt-in human touchpoint of the pipeline:
     ``"chat"`` makes a run that cleared every bar — review, CI,
     reconciliation — park ``gated`` instead of merging, with an approval
@@ -947,6 +980,12 @@ class LandingConfig(_ConfigModel):
     ci_poll_interval_s: float = Field(default=60.0, gt=0)
     ci_settle_s: float = Field(default=90.0, ge=0)
     ci_timeout_s: float = Field(default=3600.0, gt=0)
+    # The wait for a human review (#675): how often the parked PR is read
+    # (two requests per read per parked run), how long before the item
+    # pauses, and which chat user ids are mentioned besides the requester.
+    review_poll_interval_s: float = Field(default=600.0, gt=0)
+    review_wait_s: float = Field(default=14400.0, gt=0)
+    review_notify: list[str] = Field(default_factory=list)
     merge_method: MergeMethod = "auto"
     delete_branch_on_merge: bool = True
     merge_update_attempts: int = Field(default=3, ge=0)
@@ -1400,6 +1439,15 @@ class Config(_ConfigModel):
         for entry in self.github.repos:
             _check_label_set(self.daemon.labels_for(entry), f"github.repos[{entry.repo}]")
         return self
+
+    def review_notify_for(self, repo: str | None = None) -> list[str]:
+        """The chat user ids mentioned when ``repo``'s PR waits for a review
+        (#675): the entry's own list when set, else `[landing]
+        review_notify`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.review_notify is not None:
+            return list(entry.review_notify)
+        return list(self.landing.review_notify)
 
     def labels_for(self, repo: str | None = None) -> LabelSet:
         """The lifecycle labels for ``repo`` (its ``[[github.repos]]``

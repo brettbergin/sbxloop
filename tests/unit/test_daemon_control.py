@@ -153,7 +153,7 @@ class TestDispatch:
         assert not reply.ok and not reply.known
         assert reply.text == usage("sbxloop daemon ctl")
         assert (
-            "sbxloop daemon ctl status|pause [--hold NAME]|resume [--hold NAME|--all]|"
+            "sbxloop daemon ctl status|pause [--hold NAME]|resume [<item|run>|--hold NAME|--all]|"
             "cancel [--retry]|queue|items|" in reply.text
         )
 

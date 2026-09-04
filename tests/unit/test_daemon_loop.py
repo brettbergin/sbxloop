@@ -177,9 +177,20 @@ class Harness:
                 reason=reason,
                 exhausted="review",
             )
-        if kind in ("merged", "blocked", "gated"):
+        if kind in ("merged", "blocked", "gated", "awaiting_review"):
             self.store.set_run_pr(
                 run_id, number=9, url=PR_URL, branch=f"sbxloop/{run_id}", head_sha="abc"
+            )
+        if kind == "awaiting_review":
+            # The engine's record of the park (#675): what the base wants.
+            self.store.append_event(
+                Event(
+                    ts=self.clock(),
+                    run_id=run_id,
+                    job_id=None,
+                    type="run.awaiting_review",
+                    data={"pr": 9, "approvals_required": 2, "code_owners": False},
+                )
             )
         if kind == "blocked":
             reason = "GitHub would not merge it: a protection rule wants an approval"

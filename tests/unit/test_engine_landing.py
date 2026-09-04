@@ -18,6 +18,7 @@ import pytest
 from sbxloop.config import LandingConfig
 from sbxloop.engine.checks import PolicyFor, check_policy_reader, no_policy
 from sbxloop.engine.landing import (
+    AwaitingReview,
     Blocked,
     CiTimeout,
     Closed,
@@ -1138,16 +1139,72 @@ class TestBlockedWithGreenChecks:
     def test_a_blocked_state_is_reread_once_then_named(self) -> None:
         fake = FakeGithub()
         fake.pr["mergeable_state"] = "blocked"
-        fake.protection = {"required_pull_request_reviews": {"required_approving_review_count": 1}}
+        fake.protection = {
+            "required_pull_request_reviews": {"required_approving_review_count": 1},
+            "required_signatures": {"enabled": True},
+        }
         lp = Landing(fake)
         outcome = lp.run(policy_for=lp.against_base())
         assert isinstance(outcome, Blocked)
         assert "requires an approving review" in outcome.why
-        assert '`[landing] merge_gate = "chat"`' in outcome.why
+        assert "requires signed commits" in outcome.why
+        assert "merge_gate" not in outcome.why
         assert fake.merges == []
         assert lp.rec.waits == ["mergeability"], (
             "read again: the first state may predate the checks"
         )
+
+    def test_a_blocked_state_whose_only_want_is_a_review_awaits_one(self) -> None:
+        """#675: a base that wants nothing the loop cannot supply *except*
+        an approving review is a wait for a person, not a block — with the
+        standing human approvals counted (the loop's own excluded)."""
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "blocked"
+        fake.protection = {"required_pull_request_reviews": {"required_approving_review_count": 2}}
+        fake.reviews_payload = [
+            human_review("alice", "APPROVED", "lgtm", id=90),
+            human_review("sbxloop-bot", "APPROVED", "own", id=91),
+            human_review("ci-bot", "APPROVED", "bot", id=92, bot=True),
+        ]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, AwaitingReview)
+        assert outcome.approvals_required == 2
+        assert outcome.approvals_have == 1
+        assert not outcome.code_owners
+        assert outcome.head == fake.pr["head"]["sha"]
+        assert outcome.wanted == "2 approving reviews"
+        assert fake.merges == []
+
+    def test_a_code_owner_review_alone_is_also_a_wait(self) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "blocked"
+        fake.protection = {
+            "required_pull_request_reviews": {
+                "required_approving_review_count": 0,
+                "require_code_owner_reviews": True,
+            }
+        }
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, AwaitingReview)
+        assert outcome.code_owners and outcome.approvals_required == 0
+        assert outcome.wanted == "an approving review from a code owner"
+
+    def test_a_review_wait_still_blocks_on_the_last_push_rule(self) -> None:
+        # The fatal rule stays fatal: no review can ever satisfy it.
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "blocked"
+        fake.protection = {
+            "required_pull_request_reviews": {
+                "required_approving_review_count": 1,
+                "require_last_push_approval": True,
+            }
+        }
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert "approval of the last push" in outcome.why
 
     def test_a_blocked_state_that_clears_on_the_reread_merges(self) -> None:
         fake = FakeGithub()
@@ -1189,8 +1246,9 @@ class TestBlockedWithGreenChecks:
 
     def test_the_reason_lists_every_blocker_one_per_line(self) -> None:
         """#673: each rule of the base the loop cannot satisfy is its own
-        line; the fatal last-push rule comes first, and the merge-gate hint
-        is one more line when a review is among them."""
+        line; the fatal last-push rule comes first. (The merge-gate hint that
+        used to follow a review rule is gone with #675: a review wait is a
+        wait, not something to configure around.)"""
         from sbxloop.gh.protection import BaseRequirements
 
         rules = BaseRequirements(
@@ -1212,7 +1270,7 @@ class TestBlockedWithGreenChecks:
         assert lines[4].startswith("- the base requires signed commits")
         assert lines[5].startswith("- the base uses a merge queue")
         assert lines[6].startswith("- the base requires a successful deployment to staging")
-        assert lines[7].startswith('- set `[landing] merge_gate = "chat"`')
+        assert len(lines) == 7 and "merge_gate" not in why
         assert why.endswith("(GitHub: HTTP 405)")
         # Signing is the credential's to satisfy; a linear-history rule only
         # blocks a merge commit.
@@ -1240,9 +1298,20 @@ class TestBlockedWithGreenChecks:
     def test_a_405_on_the_merge_is_rewritten_with_the_bases_rules(self) -> None:
         fake = FakeGithub()
         fake.merge_outcomes = [BLOCKED_405]
-        fake.protection = {"required_pull_request_reviews": {"required_approving_review_count": 1}}
+        fake.protection = {"required_signatures": {"enabled": True}}
         lp = Landing(fake)
         outcome = lp.run(policy_for=lp.against_base())
         assert isinstance(outcome, Blocked)
-        assert "requires an approving review" in outcome.why
+        assert "requires signed commits" in outcome.why
         assert outcome.why.endswith("(GitHub: Pull Request is not mergeable (HTTP 405))")
+
+    def test_a_405_on_the_merge_for_a_review_alone_awaits_one(self) -> None:
+        # The same #675 judgment on the other refusal path: a merge GitHub
+        # refused with 405 when the base only wants a review.
+        fake = FakeGithub()
+        fake.merge_outcomes = [BLOCKED_405]
+        fake.protection = {"required_pull_request_reviews": {"required_approving_review_count": 1}}
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, AwaitingReview)
+        assert outcome.approvals_have == 0 and outcome.approvals_required == 1
