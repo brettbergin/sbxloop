@@ -847,10 +847,14 @@ class Provisioner:
         """Clone the run's repository from its remote into the run dir.
 
         The explicit no-workspace path: this repository has no host checkout,
-        so its tree comes from its own remote. Only credential-free (public)
-        remotes can succeed — the host holds no git credential by design
-        (#46) — and a failure is raised with that reason rather than falling
-        back to another repository's tree or to an empty directory.
+        so its tree comes from its own remote. The clone authenticates with
+        the run's own GitHub credential — the PAT or App installation token
+        the github sandbox delivers with — through a one-shot helper that
+        lives only in the clone's environment (#683); the host still holds
+        no git credential of its own (#46). With no credential configured
+        at all only a public remote can succeed. A failure is raised with
+        that reason rather than falling back to another repository's tree
+        or to an empty directory.
         """
         if (clone_dir / ".git").exists():
             self.bus.emit(
@@ -874,6 +878,7 @@ class Provisioner:
         continue_branch = self.config.sandbox.continue_branch
         branch = continue_branch or self._branch_name(run_id, repo)
         clone_filter = self.config.sandbox.clone_filter
+        token = self._clone_token(repo)
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
             sha = hostgit.clone_from_remote(
@@ -882,23 +887,49 @@ class Provisioner:
                 branch,
                 existing=bool(continue_branch),
                 clone_filter=clone_filter,
+                token=token,
             )
         except ProvisionError as exc:
             if continue_branch and self.config.sandbox.continue_branch_optional:
                 # The offered branch is not on the remote any more: start
                 # fresh rather than fail the run (#600).
                 branch = self._fresh_after_missing_continue(run_id, continue_branch, exc, clone_dir)
-                sha = hostgit.clone_from_remote(url, clone_dir, branch, clone_filter=clone_filter)
-                self._emit_clone(run_id, url, clone_dir, sha, branch)
+                sha = hostgit.clone_from_remote(
+                    url, clone_dir, branch, clone_filter=clone_filter, token=token
+                )
+                self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
                 return clone_dir
+            if token:
+                why = (
+                    "The clone authenticated with the run's GitHub credential; check "
+                    "that it has contents:read on this repository"
+                )
+            else:
+                why = (
+                    "No GitHub credential is configured on the host, so only a public "
+                    "repository can be cloned this way; export GH_TOKEN or configure a "
+                    "GitHub App"
+                )
             raise ProvisionError(
                 f"no workspace is configured for {repo}, and cloning it from "
-                f"{url} failed: {exc}. The host holds no git credential, so this "
-                "path only works for a public repository; configure a workspace "
-                "for this repository in its [[github.repos]] entry"
+                f"{url} failed: {exc}. {why}, or configure a workspace for this "
+                "repository in its [[github.repos]] entry"
             ) from exc
-        self._emit_clone(run_id, url, clone_dir, sha, branch)
+        self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
         return clone_dir
+
+    def _clone_token(self, repo: str) -> str | None:
+        """The token the remote clone authenticates with, or ``None`` when
+        the host has no GitHub credential configured at all (a public
+        remote still clones). A *misconfigured* credential — a per-repo
+        ``token_env`` that is unset, both a PAT and App credentials — is
+        raised here exactly as it would be for the github sandbox, so the
+        run fails naming the fix instead of at the remote."""
+        entry = self.config.github.effective_repo(repo)
+        status = gh_credential_status(self.env, token_env=entry.token_env if entry else None)
+        if status.mode == "none":
+            return None
+        return self.gh_token(repo)
 
     def _fresh_after_missing_continue(
         self, run_id: str, branch: str, exc: Exception, clone_dir: Path
@@ -917,7 +948,17 @@ class Provisioner:
             shutil.rmtree(clone_dir, ignore_errors=True)
         return self._branch_name(run_id)
 
-    def _emit_clone(self, run_id: str, source: str, clone_dir: Path, sha: str, branch: str) -> None:
+    def _emit_clone(
+        self,
+        run_id: str,
+        source: str,
+        clone_dir: Path,
+        sha: str,
+        branch: str,
+        *,
+        authenticated: bool,
+    ) -> None:
+        how = "with the run's GitHub credential" if authenticated else "unauthenticated"
         self.bus.emit(
             "sandbox.workspace_clone",
             run_id,
@@ -927,7 +968,8 @@ class Provisioner:
             branch=branch,
             dirty=False,
             reused=False,
-            message=f"cloned {source} at {sha[:12]} onto branch {branch}",
+            authenticated=authenticated,
+            message=f"cloned {source} at {sha[:12]} onto branch {branch} ({how})",
         )
 
     def _branch_name(self, run_id: str, repo: str | None = None) -> str:

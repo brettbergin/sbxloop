@@ -994,11 +994,16 @@ repository:
 
 Remote URLs are compared as normalised `owner/name` (scp-style ssh, https
 with or without embedded userinfo, `.git` suffix, case). A repository with
-no workspace at all clones **from its own remote** into the run directory;
-because the host holds no git credential by design (#46) that mode is
-public-repository-only and a private repository fails the run explicitly.
-There is no fallback to another repository's checkout in any of these
-paths. Migration for an existing single-repo daemon: move
+no workspace at all clones **from its own remote** into the run directory,
+authenticating with the run's GitHub credential (#683): the same PAT or App
+installation token the github sandbox delivers with, handed to git through
+a `credential.helper` set in the clone's environment (`GIT_CONFIG_COUNT`,
+git ≥ 2.31) so it never touches argv, `.git/config` or the URL, with the
+host user's own helpers cleared for that process. The host still holds no
+git credential of its own (#46). With no credential configured only a
+public repository clones; a private one fails the run explicitly, naming
+the case. There is no fallback to another repository's checkout in any of
+these paths. Migration for an existing single-repo daemon: move
 `[sandbox] workspace` into the matching `[[github.repos]]` entry.
 
 `sbxloop doctor` checks each configured repository on its own line

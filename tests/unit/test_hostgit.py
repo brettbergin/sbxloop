@@ -16,6 +16,7 @@ from git import GitCommandError, Repo
 
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
+from tests.fakes.gitserver import PrivateGitServer, bare_from
 
 
 def git(*argv: str, cwd: Path) -> None:
@@ -1045,6 +1046,73 @@ class TestCloneSize:
         assert (clone / "other.txt").read_text() == "other\n"
         with Repo(clone) as repo:
             assert repo.active_branch.name == "sbxloop/r1"
+
+
+class TestPrivateRemoteClone:
+    """#683: the run's token — and only it — authenticates a private remote,
+    through a helper that leaves no trace in the clone."""
+
+    TOKEN = "ghs_test-installation-token"
+
+    @pytest.fixture
+    def remote(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        seed = make_repo(tmp_path)
+        bare_from(seed, tmp_path / "srv", "o/private.git")
+        with PrivateGitServer(
+            tmp_path / "srv", username="x-access-token", token=self.TOKEN
+        ) as server:
+            yield server
+
+    def test_clones_with_the_token_and_leaves_no_trace(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        clone = tmp_path / "run"
+        url = f"{remote.url}/o/private.git"
+        sha = hostgit.clone_from_remote(url, clone, "sbxloop/r1", token=self.TOKEN)
+        assert sha == rev(tmp_path / "src", "main")
+        assert (clone / "hello.txt").read_text() == "hi\n"
+        # The first request is unauthenticated (git only sends a credential
+        # once challenged); the retry carried the run's token.
+        assert remote.requests[0] is None
+        assert any(r is not None for r in remote.requests)
+        # git remote -v shows the bare URL; the token is nowhere in the clone.
+        assert git_out("remote", "-v", cwd=clone).count(url) == 2
+        assert self.TOKEN not in (clone / ".git" / "config").read_text()
+        assert "credential" not in git_out("config", "--list", "--local", cwd=clone)
+
+    def test_without_a_token_the_private_remote_refuses(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        target = tmp_path / "run"
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.clone_from_remote(f"{remote.url}/o/private.git", target, "sbxloop/r1")
+        assert "cloning" in str(excinfo.value)
+        assert not (target / ".git").is_dir()
+
+    def test_a_wrong_token_fails_without_leaking_it(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        target = tmp_path / "run"
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.clone_from_remote(
+                f"{remote.url}/o/private.git", target, "sbxloop/r1", token="ghs_wrong"
+            )
+        message = str(excinfo.value)
+        assert "Authentication failed" in message
+        assert "ghs_wrong" not in message
+        assert not (target / ".git").is_dir()
+
+    def test_the_helper_lives_only_in_the_clone_environment(self) -> None:
+        env = hostgit._clone_env("s3cr3t-value")
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert env[hostgit.CLONE_TOKEN_ENV] == "s3cr3t-value"
+        # The host user's own helpers are cleared before ours is added, so a
+        # keychain never answers for the run.
+        assert (env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]) == ("credential.helper", "")
+        assert env["GIT_CONFIG_KEY_1"] == "credential.helper"
+        assert "x-access-token" in env["GIT_CONFIG_VALUE_1"]
+        assert "s3cr3t-value" not in env["GIT_CONFIG_VALUE_1"]
+        assert "GIT_CONFIG_COUNT" not in hostgit._clone_env(None)
 
 
 class TestIsTracked:
