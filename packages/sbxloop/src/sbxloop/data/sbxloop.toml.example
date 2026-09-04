@@ -166,6 +166,13 @@ secret_strategy = "proxy"
 # repository below.
 # bot_login = "my-app[bot]"
 #
+# REVIEWERS. When the base branch requires an approving review the loop
+# cannot give itself (it authored the PR), the run parks `awaiting_review`
+# with the PR un-drafted and these requested as reviewers — logins, or
+# `org/team` for a team. Overridable per repository below; unset requests
+# nobody and relies on CODEOWNERS or a human noticing the PR.
+# reviewers = ["a-maintainer", "my-org/reviewers"]
+#
 # WHERE GitHub is. The REST root; everything else derives from it — the web
 # host the clones and PR links use, GH_HOST for gh in the github sandbox,
 # the App-auth endpoints, and both sandboxes' network allows. GitHub
@@ -195,6 +202,8 @@ secret_strategy = "proxy"
 # commit_message_template = "{title}"
 # branch_prefix = "bot/"
 # bot_login = "other-app[bot]"     # identity override; unset uses [github]'s
+# reviewers = ["their-lead"]       # review requests; unset uses [github]'s, [] requests nobody
+# review_notify = ["<chat user id>"] # pinged when a PR waits for a review; unset uses [landing]'s
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled
@@ -215,7 +224,18 @@ secret_strategy = "proxy"
 # cleared every bar (`gated`) and asks for one approval in the run's chat
 # thread — `!sbx merge <item>` or `sbxloop daemon ctl merge <item>` lands
 # it; `!sbx abandon <item>` declines. No deadline; survives restarts.
+# A base branch that REQUIRES an approving review is not a block: the run
+# parks `awaiting_review` (PR un-drafted, [github] reviewers requested,
+# the requester and review_notify mentioned once) and the daemon polls
+# the PR. A human's approval — or a human merging it — lands the run; a
+# changes-requested review resumes it for a fix round; the PR closed
+# abandons it. After review_wait_s without a verdict the item goes
+# `paused_review` (one more mention, no more polling) until
+# `!sbx resume <item>` picks it up again. Survives restarts.
 # merge_gate = "off"         # off | chat
+# review_poll_interval_s = 600  # how often a parked PR is checked (2 API requests per check)
+# review_wait_s = 14400      # how long to keep checking before pausing the wait
+# review_notify = []         # chat user ids mentioned when a PR parks for review; overridable per repo
 # deliver_draft = true
 # max_review_rounds = 3      # times the review may request changes
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds

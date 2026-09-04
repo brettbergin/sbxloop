@@ -31,6 +31,7 @@ RunState = Literal[
     "blocked",
     "cancelled",
     "gated",
+    "awaiting_review",
 ]
 
 # The post-build stages in order. `runs.stage` records the last non-terminal
@@ -67,8 +68,13 @@ TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
 # cleared every bar and parked awaiting one human approval; the daemon's
 # approve path completes the landing with gh ops alone — no engine is
 # resurrected — so the state is terminal and deliberately NOT resumable.
+# `awaiting_review` (#675) is the run parked on a base that requires an
+# approving review the loop cannot give its own PR: every bar it can clear
+# is cleared, no sandbox is kept, and a person on GitHub ends the wait.
+# Terminal for liveness; resumable, because a reviewer's changes-requested
+# is a fix round the engine runs (`resume` re-enters the landing stage).
 TERMINAL_RUN_STATES: frozenset[str] = frozenset(
-    {"merged", "completed", "failed", "blocked", "cancelled", "gated"}
+    {"merged", "completed", "failed", "blocked", "cancelled", "gated", "awaiting_review"}
 )
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {
@@ -80,6 +86,7 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
         "failed",
         "blocked",
         "cancelled",
+        "awaiting_review",
     }
 )
 

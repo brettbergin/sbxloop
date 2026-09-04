@@ -96,7 +96,8 @@ class BaseRequirements(NamedTuple):
         one reason per rule, in the order a reader would fix them.
 
         ``can_approve`` says an approving review will come from somewhere
-        (a person approving from chat, say); ``can_sign`` that the loop's
+        (a person on GitHub the loop waits for, #675), which covers the
+        code-owner review too; ``can_sign`` that the loop's
         commits arrive signed — GitHub signs commits created through its
         API only when the credential is a GitHub App; ``merge_method`` is
         the configured way to merge, so a linear-history rule blocks only
@@ -119,7 +120,7 @@ class BaseRequirements(NamedTuple):
             out.append(
                 f"the base requires {count}, which the loop cannot give its own pull request"
             )
-        if self.code_owner_review:
+        if self.code_owner_review and not can_approve:
             out.append(
                 "the base requires a review from a code owner (CODEOWNERS), which the loop "
                 "cannot give its own pull request"

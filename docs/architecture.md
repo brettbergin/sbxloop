@@ -762,6 +762,33 @@ CI, then mergeability, and only then the merge:
 6. **Merge**, sending the head sha the loop actually judged. A push that
    landed since loses the race with a 409 rather than being merged over.
 
+A base whose *only* unmet rules are review rules — N approving reviews, a
+CODEOWNERS review — is a wait, not a block (#675): `land()` returns
+`AwaitingReview` (the `blocked` mergeability, or the 405, is read against
+the base's rulesets and classic protection; any rule the loop can never
+satisfy still makes it `Blocked`). The daemon parks the run
+`awaiting_review` (a terminal, resumable run state): the PR is already out
+of draft, `[github] reviewers` are requested once (logins, or `org/team`),
+a `daemon_review_holds` row is persisted, the sandboxes are freed and the
+breaker reset, and one `run.awaiting_review` notice @mentions the
+requester, the run's watchers and `review_notify`. Every tick — before the
+paused gate, so an approval during a pause still lands — `_review_tick`
+polls each due hold with two requests (the PR, and its reviews folded to
+one verdict per human login, latest wins, dismissed dropped): closed →
+the hold is dismissed and the item abandoned; a human's
+`CHANGES_REQUESTED` → the hold is claimed `fixing` and the run resumed for
+a fix round (the same tick may dispatch it; the resume budget is not
+charged); merged, or the required number of human approvals → the hold is
+claimed `approving` and the same gh-ops-only `land()` the merge gate uses
+finishes the landing, so a review left during the park is honoured. A
+landing that comes back anything but `Landed`/`Closed` reopens the hold
+with the detail (`review.merge_failed`). Past `review_wait_s` without a
+verdict the hold pauses — item `paused_review`, one `run.review_paused`
+mention, no more polling — until `resume <item>` reopens it; a restart
+reopens holds caught mid-approval. A human's changes-requested review that
+the fix round answered but that still stands ends the resumed run
+`Blocked`, as #520 decided.
+
 Two answers come back as *data* rather than as exceptions, and the difference
 matters: **405** is GitHub's blanket "not mergeable right now" — a protection
 rule wanting an approval this identity cannot give, most often — which no

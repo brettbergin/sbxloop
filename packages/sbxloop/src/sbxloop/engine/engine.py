@@ -70,12 +70,14 @@ from sbxloop.engine.followups import (
     marker_key,
 )
 from sbxloop.engine.landing import (
+    AwaitingReview,
     Blocked,
     CiTimeout,
     Closed,
     Gated,
     HumanObjection,
     Landed,
+    LandingOutcome,
     NeedsFix,
     UpdateState,
     land,
@@ -709,7 +711,7 @@ class LoopEngine:
                     # gets diagnosed in-sandbox; decide keep before pair exit.
                     self._keep_on_failure(run_id, pair)
                     raise
-                if state not in ("merged", "completed", "gated"):
+                if state not in ("merged", "completed", "gated", "awaiting_review"):
                     self._keep_on_failure(run_id, pair)
         except SbxloopError:
             # State is already persisted; the exception is the kill signal.
@@ -1225,6 +1227,12 @@ class LoopEngine:
                 if isinstance(outcome, Gated):
                     return "gated", (
                         "parked by [landing] merge_gate — ready to merge, awaiting human approval"
+                    )
+                if isinstance(outcome, AwaitingReview):
+                    return "awaiting_review", (
+                        f"ready to merge — the base requires {outcome.wanted} "
+                        f"({outcome.approvals_have}/{outcome.approvals_required} so far), "
+                        "awaiting a reviewer on GitHub"
                     )
                 if isinstance(outcome, Blocked):
                     return "blocked", outcome.why
@@ -2530,7 +2538,7 @@ class LoopEngine:
             )
         return None
 
-    def _stage_land(self, p: Pipeline) -> Landed | Gated | Blocked | NeedsFix | Closed:
+    def _stage_land(self, p: Pipeline) -> LandingOutcome:
         run_id, ops, repo = p.run_id, p.ops, p.repo
         assert ops is not None and repo is not None
         self._set_run_state(run_id, "landing")
@@ -2611,6 +2619,31 @@ class LoopEngine:
             # the follow-ups are filed now, while the machinery that builds
             # them is alive. Gate is not blocked: every bar was cleared, and
             # follow-ups carry the follow-up label, never the trigger label.
+            self._file_followups(p, run)
+        elif isinstance(outcome, AwaitingReview):
+            log.info(
+                "run.awaiting_review",
+                run=run_id,
+                pr=number,
+                head=outcome.head,
+                approvals_required=outcome.approvals_required,
+                approvals_have=outcome.approvals_have,
+            )
+            self.bus.emit(
+                HostEventTypes.RUN_AWAITING_REVIEW,
+                run_id,
+                pr=number,
+                url=run.pr_url,
+                sha=outcome.head,
+                approvals_required=outcome.approvals_required,
+                approvals_have=outcome.approvals_have,
+                code_owners=outcome.code_owners,
+                review_rounds=run.review_rounds,
+                ci_rounds=run.ci_rounds,
+            )
+            # As for the gate: the daemon finishes an approved landing with
+            # gh ops alone, so the follow-ups are filed while the machinery
+            # is alive. Idempotent — a resume that merges files nothing twice.
             self._file_followups(p, run)
         elif isinstance(outcome, Blocked):
             log.warning(

@@ -205,6 +205,11 @@ class HostEventTypes:
     # awaiting one human approval (`pr`, `url`, `sha`, `review_rounds`,
     # `ci_rounds`).
     RUN_GATED = "run.gated"
+    # The base requires an approving review the loop cannot give its own
+    # PR (#675): every bar it can clear is cleared; the run parks and the
+    # daemon waits for a person on GitHub (`pr`, `url`, `sha`,
+    # `approvals_required`, `approvals_have`, `code_owners`).
+    RUN_AWAITING_REVIEW = "run.awaiting_review"
     # Follow-up issues filed (or listed on the PR) after the merge (#517):
     # `pr`, `mode`, `filed` [{number, url, title}], `listed` (titles).
     RUN_FOLLOWUPS = "run.followups"

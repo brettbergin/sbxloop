@@ -99,6 +99,32 @@ class Gated(NamedTuple):
     head: str
 
 
+class AwaitingReview(NamedTuple):
+    """Every bar the loop can clear is cleared, and the base wants an
+    approving review the loop cannot give its own pull request (#675). Not
+    a block: a person on GitHub ends it. ``approvals_have`` counts the
+    standing human approvals (the loop's own excluded) — informational,
+    GitHub's ``mergeable_state`` is the authority."""
+
+    approvals_required: int
+    approvals_have: int
+    code_owners: bool
+    head: str
+
+    @property
+    def wanted(self) -> str:
+        """The bar, in words: "an approving review", "2 approving reviews",
+        with the code-owner review named when it is one."""
+        if self.approvals_required <= 1 and not self.code_owners:
+            return "an approving review"
+        count = (
+            "an approving review"
+            if self.approvals_required <= 1
+            else f"{self.approvals_required} approving reviews"
+        )
+        return f"{count} from a code owner" if self.code_owners else count
+
+
 class Blocked(NamedTuple):
     why: str
     # The base's rules the loop cannot satisfy, one per rule (#673) —
@@ -143,7 +169,7 @@ class Closed(NamedTuple):
     why: str
 
 
-LandingOutcome = Landed | Gated | Blocked | NeedsFix | Closed
+LandingOutcome = Landed | Gated | AwaitingReview | Blocked | NeedsFix | Closed
 
 
 class CiTimeout(Exception):
@@ -615,10 +641,12 @@ def land(
 
     Returns ``Landed`` (merged — by the loop or, if someone beat it to it,
     by a human), ``Blocked`` (GitHub will not finish it and no round would
-    change that), ``NeedsFix`` (something a fix round can change: red CI, a
-    conflict with the base, a human's objection) or ``Closed`` (someone
-    closed the PR unmerged). ``ci_timeout_s`` bounds the whole wait; a
-    landing that has not settled by then is ``Blocked`` too.
+    change that), ``AwaitingReview`` (the only bar left is a review the
+    loop cannot give its own PR, #675 — a person on GitHub ends it),
+    ``NeedsFix`` (something a fix round can change: red CI, a conflict
+    with the base, a human's objection) or ``Closed`` (someone closed the
+    PR unmerged). ``ci_timeout_s`` bounds the whole wait; a landing that
+    has not settled by then is ``Blocked`` too.
 
     ``review_posted`` is whether the round that approved this PR actually
     got its review onto GitHub. False blocks the merge: a run whose review
@@ -827,7 +855,9 @@ def land(
                 blocked_at = head
                 tick("mergeability")
                 continue
-            return blocked_by_base(policy.requirements, cfg, can_sign=bool(is_bot))
+            return refused_by_base(
+                ops, repo, number, policy.requirements, cfg, head=head, login=login, is_bot=is_bot
+            )
         # #520 step 5: the last gates before the merge are about the review
         # record itself. A run that could not post its approving review has
         # no review on the PR at all (#503), and a PR whose findings are
@@ -883,8 +913,16 @@ def land(
         if outcome.blocked:
             # A bare 405 says "not mergeable" and nothing more. The base's
             # rules say what (#620); GitHub's own words ride along.
-            return blocked_by_base(
-                policy.requirements, cfg, detail=outcome.reason, can_sign=bool(is_bot)
+            return refused_by_base(
+                ops,
+                repo,
+                number,
+                policy.requirements,
+                cfg,
+                head=head,
+                login=login,
+                is_bot=is_bot,
+                detail=outcome.reason,
             )
         if cfg.delete_branch_on_merge and branch:
             try:
@@ -955,6 +993,40 @@ def _repo_payload(ops: GithubOps, repo: str) -> dict[str, Any] | None:
         return None
 
 
+def refused_by_base(
+    ops: GithubOps,
+    repo: str,
+    number: int,
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    head: str,
+    login: str,
+    is_bot: bool | None,
+    detail: str = "",
+) -> AwaitingReview | Blocked:
+    """GitHub will not merge a PR whose checks are green: the base's rules
+    want something. When the *only* thing they want is a review the loop
+    cannot give its own pull request — an approval count, a code owner —
+    that is a wait for a person, not a block (#675): :class:`AwaitingReview`,
+    with the standing human approvals counted so the caller can say how
+    far along it is. Anything else the loop cannot supply, or rules it
+    could not read, is :func:`blocked_by_base` as before."""
+    can_sign = bool(is_bot)
+    if (requirements.approvals_required or requirements.code_owner_review) and not base_blockers(
+        requirements, cfg, can_sign=can_sign, can_approve=True
+    ):
+        verdicts = ops.pr_review_verdicts(repo, number, exclude=(login, is_bot))
+        have = sum(1 for v in verdicts if v.state == "APPROVED" and not v.is_bot)
+        return AwaitingReview(
+            approvals_required=requirements.approvals_required or 0,
+            approvals_have=have,
+            code_owners=requirements.code_owner_review,
+            head=head,
+        )
+    return blocked_by_base(requirements, cfg, detail=detail, can_sign=can_sign)
+
+
 def blocked_by_base(
     requirements: BaseRequirements,
     cfg: LandingConfig,
@@ -970,11 +1042,19 @@ def blocked_by_base(
 
 
 def base_blockers(
-    requirements: BaseRequirements, cfg: LandingConfig, *, can_sign: bool = False
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    can_sign: bool = False,
+    can_approve: bool = False,
 ) -> tuple[str, ...]:
-    """The base's rules the loop as configured cannot satisfy (#673)."""
+    """The base's rules the loop as configured cannot satisfy (#673).
+    ``can_approve`` leaves out the review rules a person on GitHub
+    satisfies (#675)."""
     return tuple(
-        requirements.blockers(can_approve=False, can_sign=can_sign, merge_method=cfg.merge_method)
+        requirements.blockers(
+            can_approve=can_approve, can_sign=can_sign, merge_method=cfg.merge_method
+        )
     )
 
 
@@ -990,15 +1070,13 @@ def blocked_reason(
 ) -> str:
     """Why GitHub will not merge a PR whose checks are green (#620): every
     rule of the base the loop is known not to satisfy, one per line
-    (#673); else the usual suspects — and the one knob that helps when a
-    review is the bar."""
+    (#673); else the usual suspects. A review alone is never the reason —
+    that is a wait, not a block (:func:`refused_by_base`, #675)."""
     blockers = base_blockers(requirements, cfg, can_sign=can_sign)
     if blockers:
         why = "the base branch's rules require what the loop cannot supply:\n" + "\n".join(
             f"- {reason}" for reason in blockers
         )
-        if requirements.approvals_required and cfg.merge_gate != "chat":
-            why += '\n- set `[landing] merge_gate = "chat"` to have a person approve from chat'
     elif requirements.source == "unknown" or requirements.unread:
         unread = " and ".join(_UNREAD_NAMES.get(name, name) for name in requirements.unread)
         why = (

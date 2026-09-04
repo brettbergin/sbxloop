@@ -364,6 +364,44 @@ class ChecksVerdict(NamedTuple):
         return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
 
 
+class ReviewVerdict(NamedTuple):
+    """One reviewer's standing verdict on a pull request (#675)."""
+
+    login: str
+    state: str  # APPROVED | CHANGES_REQUESTED
+    is_bot: bool
+
+
+def fold_review_verdicts(
+    payload: Any, *, exclude: Identity | None = None
+) -> tuple[ReviewVerdict, ...]:
+    """Every reviewer's *standing* verdict from the reviews payload (#675):
+    the latest APPROVED / CHANGES_REQUESTED per reviewer, a DISMISSED
+    clearing it, COMMENT reviews skipped — the same fold as
+    :func:`fold_reviews`, kept per reviewer so a caller can count the
+    approvals and name who objects. ``exclude`` drops the loop's own
+    identity: its review lives in the run, and GitHub would not count it
+    toward the base's approvals anyway."""
+    if not isinstance(payload, list):
+        return ()
+    latest: dict[str, tuple[str, bool]] = {}
+    for review in payload:
+        if not isinstance(review, dict):
+            continue
+        state = str(review.get("state") or "").upper()
+        if state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            continue
+        identity = user_identity(review.get("user"))
+        if not identity[0] or (exclude is not None and identities_match(identity, exclude)):
+            continue
+        latest[identity[0]] = (state, bool(identity[1]))
+    return tuple(
+        ReviewVerdict(login, state, is_bot)
+        for login, (state, is_bot) in latest.items()
+        if state != "DISMISSED"
+    )
+
+
 class FailedCheck(NamedTuple):
     """One red check run or commit status, with the text that explains it.
 
@@ -799,6 +837,31 @@ class GithubOps:
         merge_base = data.get("merge_base_commit") if isinstance(data, dict) else None
         sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
         return str(sha) if sha else None
+
+    def pr_review_verdicts(
+        self, repo: str, number: int, *, exclude: Identity | None = None
+    ) -> tuple[ReviewVerdict, ...]:
+        """Each reviewer's standing verdict (#675), the loop's own excluded.
+        One request per page of reviews."""
+        return fold_review_verdicts(
+            raw_pages(self, f"/repos/{repo}/pulls/{number}/reviews"), exclude=exclude
+        )
+
+    def pr_request_reviewers(self, repo: str, number: int, reviewers: Sequence[str]) -> None:
+        """Ask GitHub for reviews from ``reviewers`` (#675): user logins,
+        or ``org/team`` slugs for team reviewers. Write access suffices.
+        A login GitHub refuses (not a collaborator, the PR's own author)
+        fails the whole request; the caller decides how loud to be."""
+        users = [name for name in reviewers if "/" not in name]
+        teams = [name.split("/", 1)[1] for name in reviewers if "/" in name]
+        body: dict[str, Any] = {}
+        if users:
+            body["reviewers"] = users
+        if teams:
+            body["team_reviewers"] = teams
+        if not body:
+            return
+        self.raw("POST", f"/repos/{repo}/pulls/{number}/requested_reviewers", body)
 
     def pr_review_state(self, repo: str, number: int, *, login: str | None = None) -> str:
         """``APPROVED`` / ``CHANGES_REQUESTED`` / ``NONE`` — each reviewer's

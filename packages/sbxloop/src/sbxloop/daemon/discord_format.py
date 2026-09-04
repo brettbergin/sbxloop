@@ -96,6 +96,7 @@ STATE_MARKER = {
     "blocked": "🚧",
     "cancelled": "⏹",
     "gated": "⏸",
+    "awaiting_review": "👀",
 }
 STATE_COLOR = {
     "merged": COLOR_OK,
@@ -104,6 +105,7 @@ STATE_COLOR = {
     "blocked": COLOR_WARN,
     "cancelled": COLOR_DIM,
     "gated": COLOR_WARN,
+    "awaiting_review": COLOR_WARN,
 }
 # How a post-build stage reads in the chronology when the run enters it.
 STAGE_MARKER = {
@@ -1394,6 +1396,19 @@ def format_for_discord(
                 flush=True,
             )
         ]
+    if t == HostEventTypes.RUN_AWAITING_REVIEW:
+        label = f"#{data.get('pr')}"
+        need = data.get("approvals_required") or 1
+        have = data.get("approvals_have") or 0
+        owners = " from a code owner" if data.get("code_owners") else ""
+        return [
+            line(
+                f"👀 **awaiting review** PR {link(label, data.get('url'))} — the base requires "
+                f"{need} approving review(s){owners} ({have}/{need} so far); waiting for a "
+                "reviewer on GitHub",
+                flush=True,
+            )
+        ]
     if t == HostEventTypes.RUN_MERGED:
         label = f"#{data.get('pr')}"
         who = " (by a human)" if data.get("by_human") else ""
@@ -1995,6 +2010,8 @@ ITEM_STATE_MARKER = {
     "blocked": "🚧",
     "cancelled": "⏹",
     "gated": "⏸",
+    "awaiting_review": "👀",
+    "paused_review": "💤",
 }
 
 

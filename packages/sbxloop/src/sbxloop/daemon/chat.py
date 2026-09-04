@@ -1899,19 +1899,22 @@ class ChatBridge(ABC):
         known: ChatThread | None = None
         if notice.run_id and self.chat.thread_per_run:
             known = self.dstore.chat_thread(notice.run_id)
-        text = daemon_notice(notice)
+        # A notice with people to address (#675: a PR waiting for their
+        # review) pings them where it lands — the ask has to reach them.
+        prefix = " ".join(self.mention_user(uid) for uid in notice.mention_ids)
+        pings = bool(prefix)
+        text = f"{prefix} {daemon_notice(notice)}" if pings else daemon_notice(notice)
         if known is not None:
             try:
                 thread = await self._thread_handle(known.thread_id)
                 if thread is not None:
-                    await self._send(thread, text)
+                    await self._send(thread, text, mention_users=pings)
             except Exception:
                 self.log.warning("chat.notice_thread_failed", run=notice.run_id, exc_info=True)
             if notice.kind not in TERMINAL_NOTICE_KINDS:
                 return
-        await self._send_channel(
-            daemon_notice(notice, thread_ref=self.thread_link(known) if known else None)
-        )
+        mirrored = daemon_notice(notice, thread_ref=self.thread_link(known) if known else None)
+        await self._send_channel(f"{prefix} {mirrored}" if pings else mirrored, mentions=pings)
 
     async def _finish(self, payload: tuple[Any, ...]) -> None:
         _, item, state, report = payload

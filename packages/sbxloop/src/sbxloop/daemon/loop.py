@@ -54,13 +54,15 @@ from sbxloop.daemon.model import (
     WorkItem,
 )
 from sbxloop.daemon.sources import WorkSource
-from sbxloop.daemon.store import DaemonStore, MergeGate
+from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
 from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.landing import (
+    AwaitingReview,
     Blocked,
     Closed,
     Landed,
+    LandingOutcome,
     NeedsFix,
     UpdateState,
     land,
@@ -369,6 +371,16 @@ class DaemonLoop:
                     f"🚪 {item_id}: merge gate dismissed ({why}); the PR stays open",
                     item=item_id,
                     run=before.run_id,
+                )
+        if before is not None and before.state in ("awaiting_review", "paused_review"):
+            hold = self.dstore.review_hold_for(before.run_id or item_id)
+            if hold is not None and hold.state in ("open", "approving", "paused", "fixing"):
+                self.dstore.resolve_review_hold(hold.run_id, "dismissed", None, now, why)
+                self._notice(
+                    "review.dismissed",
+                    f"🚪 {item_id}: no longer waiting for a review ({why}); the PR stays open",
+                    item=item_id,
+                    run=hold.run_id,
                 )
         if self._cancel_if_current(item_id):
             self._notice(
@@ -709,6 +721,9 @@ class DaemonLoop:
         # Liveness safety net for phantom active runs (#374); sweeps even while
         # paused, the very state the field report was filed from.
         self._reconcile_stale_runs(now)
+        # A parked PR's review poll (#675) is not new work: it runs even
+        # paused, so an approval given during a pause still lands.
+        self._review_tick(now)
         if self.paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -797,6 +812,22 @@ class DaemonLoop:
         forever (#234)."""
         run_id = item.run_id
         assert run_id is not None
+        hold = self.dstore.review_hold_for(run_id)
+        if hold is not None and hold.state == "fixing":
+            # Not an interruption either (#675): a reviewer asked for
+            # changes on the parked PR and the run resumes at its landing
+            # stage to make them. Bounded by the run's own fix rounds.
+            self._remove_stale_run_sandboxes(run_id)
+            self._notice(
+                "run.review_resumed",
+                f"🔁 resuming {run_id} for {item.item_id} on its own PR #{hold.pr_number} — "
+                "a reviewer requested changes",
+                item=item.item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+            )
+            return self._dispatch(item, resume_run_id=run_id)
         granted = self._granted_retry(run_id)
         if granted is not None:
             # Not an interruption (#523): the run ended one fix round short
@@ -1283,6 +1314,19 @@ class DaemonLoop:
         state = result.state if result is not None else None
         if state == "gated":
             return self._settle_gated(item, run_id, report, now)
+        if state == "awaiting_review":
+            return self._settle_awaiting_review(item, run_id, report, now)
+        hold = self.dstore.review_hold_for(run_id)
+        if hold is not None and hold.state in ("open", "approving", "paused", "fixing"):
+            # The run came back from a review fix round (#675) and ended
+            # some other way: the wait is over, one way or the other.
+            self.dstore.resolve_review_hold(
+                run_id,
+                "merged" if state == "merged" else "dismissed",
+                None,
+                now,
+                None if state == "merged" else f"run ended {state}",
+            )
         # Without a repository there is nothing to land: the engine ends
         # `completed` after its gate, and that is the whole job.
         landed = state == "merged" or (state == "completed" and not self.config.github.enabled)
@@ -1509,6 +1553,366 @@ class DaemonLoop:
         )
         return "gated"
 
+    def _settle_awaiting_review(
+        self, item: WorkItem, run_id: str, report: RunReport, now: float
+    ) -> TickOutcome:
+        """The run cleared every bar of its own and the base wants a review
+        the loop cannot give its own PR (#675): free the machinery, persist
+        the hold, ask the configured reviewers, tell the humans, move on.
+
+        Like a gate, not a failure — the breaker resets — and not done: the
+        item waits in ``awaiting_review`` (invisible to dispatch) while the
+        review tick polls the PR; an approval finishes the landing with gh
+        ops alone, a request for changes resumes the run for a fix round."""
+        self.dstore.finish_ledger(run_id, "awaiting_review", now)
+        if self._consecutive_failures:
+            log.info("breaker.reset", after_failures=self._consecutive_failures)
+        self._set_breaker(None, 0)
+        try:
+            record = self.store.get_run(run_id)
+        except SbxloopError:
+            record = None
+        pr_number = record.pr_number if record is not None else None
+        pr_url = (record.pr_url if record is not None else None) or ""
+        if pr_number is None and report.pr is not None:
+            pr_number, pr_url = report.pr
+        if pr_number is None:
+            log.error("review.no_pr", run=run_id, item=item.item_id)
+            self.dstore.mark_blocked(item.item_id, "run ended awaiting_review without a PR", now)
+            fresh = self.dstore.get(item.item_id) or item
+            self._deliver_report(fresh)
+            self._frontend_finished(item, report)
+            return "blocked"
+        repo = item.repo or self.config.github.repo or ""
+        # What the base wants, from the run's own record of the park.
+        required, code_owners = 1, False
+        for _seq, event in self.store.events(run_id, type_prefix="run.awaiting_review"):
+            required = max(1, int(event.data.get("approvals_required") or 0))
+            code_owners = bool(event.data.get("code_owners"))
+        notify = self._review_notify(item, run_id)
+        # The loop's identity on this PR, resolved once: the poll excludes
+        # its own reviews without an identity read per poll.
+        login, is_bot = "", None
+        first_park = self.dstore.review_hold_for(run_id) is None
+        if self.github is not None:
+            try:
+                ops = self.github.ops()
+                identity = resolve_identity(
+                    ops,
+                    repo,
+                    pr_number,
+                    bot_login=self.github.provisioner.gh_bot_login(repo),
+                    configured_login=self.config.github.bot_login_for(repo),
+                )
+                login, is_bot = identity.login, identity.is_bot
+                reviewers = self.config.github.reviewers_for(repo)
+                if first_park and reviewers:
+                    ops.pr_request_reviewers(repo, pr_number, reviewers)
+                    log.info("review.requested", run=run_id, pr=pr_number, reviewers=reviewers)
+            except Exception as exc:
+                # A missed identity costs nothing but an own-review the
+                # poll would exclude anyway; a failed request is one
+                # notification the mention below covers.
+                self.github.note_failure(exc)
+                log.warning("review.setup_failed", run=run_id, pr=pr_number, exc_info=True)
+        self.dstore.create_review_hold(
+            run_id,
+            item.item_id,
+            repo,
+            pr_number,
+            pr_url,
+            record.branch if record is not None else report.branch,
+            login=login,
+            is_bot=is_bot,
+            approvals_required=required,
+            notify_ids=notify,
+            now=now,
+            next_poll_at=now + self.config.landing.review_poll_interval_s,
+        )
+        self.dstore.mark_awaiting_review(item.item_id, now)
+        fresh = self.dstore.get(item.item_id) or item
+        self._deliver_report(fresh)
+        self._frontend_finished(item, report)
+        what = f"{required} approving review{'s' if required != 1 else ''}" + (
+            " from a code owner" if code_owners else ""
+        )
+        wait_h = self.config.landing.review_wait_s / 3600
+        self._notice(
+            "run.awaiting_review",
+            f"👀 {item.item_id} ready to merge — the base requires {what}; awaiting a "
+            f"reviewer on GitHub · PR #{pr_number} — I'll merge once it is approved, or "
+            f"make the changes a reviewer asks for (checking every "
+            f"{self.config.landing.review_poll_interval_s / 60:.0f} min for {wait_h:.0f} h)",
+            item=item.item_id,
+            run=run_id,
+            url=pr_url or None,
+            pr=pr_number,
+            approvals_required=required,
+            code_owners=code_owners,
+            mention_ids=notify,
+        )
+        return "awaiting_review"
+
+    def _review_notify(self, item: WorkItem, run_id: str) -> list[str]:
+        """Who hears that a PR waits for a review: whoever asked for the
+        work, the run's watchers, and ``[landing] review_notify`` for the
+        repository (#675)."""
+        notify: list[str] = []
+        for who in [
+            item.requested_by,
+            *self.dstore.run_watchers(run_id),
+            *self.config.review_notify_for(item.repo or self.config.github.repo or ""),
+        ]:
+            if who and who not in notify:
+                notify.append(who)
+        return notify
+
+    # -- review holds: the poll and its exits (#675) ---------------------------------
+
+    def _review_tick(self, now: float) -> None:
+        """Poll each parked PR whose poll is due: two requests (the PR and
+        its reviews) per hold per ``[landing] review_poll_interval_s``. An
+        approval by enough humans finishes the landing on a thread with gh
+        ops alone; a human's request for changes hands the run back to the
+        engine; a PR closed by hand settles; a wait past ``review_wait_s``
+        pauses the hold until ``resume <item>``."""
+        if self.github is None:
+            return
+        for hold in self.dstore.due_review_holds(now):
+            try:
+                self._poll_review_hold(hold, now)
+            except Exception:
+                log.warning("review.poll_failed", run=hold.run_id, exc_info=True)
+
+    def _poll_review_hold(self, hold: ReviewHold, now: float) -> None:
+        assert self.github is not None
+        cfg = self.config.landing
+        run_id, item_id = hold.run_id, hold.item_id
+        if now - hold.since_at >= cfg.review_wait_s:
+            waited = (now - hold.since_at) / 3600
+            why = f"no review after {waited:.0f} h; resume {item_id} to keep waiting"
+            self.dstore.pause_review_hold(run_id, now, why)
+            self.dstore.mark_paused_review(item_id, why, now)
+            self._notice(
+                "run.review_paused",
+                f"💤 {item_id}: PR #{hold.pr_number} has waited {waited:.0f} h for a review with "
+                f"no verdict; I've stopped checking — `resume {item_id}` re-arms the wait, "
+                "`abandon` gives the PR up (it stays open either way)",
+                level="warning",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+                mention_ids=hold.notify_ids,
+            )
+            return
+        self.dstore.review_hold_polled(run_id, now + cfg.review_poll_interval_s)
+        ops = self.github.ops()
+        try:
+            pr = ops.pr_get(hold.repo, hold.pr_number)
+            verdicts = ops.pr_review_verdicts(
+                hold.repo, hold.pr_number, exclude=(hold.login, hold.is_bot)
+            )
+        except Exception as exc:
+            self.github.note_failure(exc)
+            log.warning("review.poll_failed", run=run_id, pr=hold.pr_number, exc_info=True)
+            return
+        merged = bool(pr.get("merged"))
+        closed = str(pr.get("state") or "").lower() == "closed" and not merged
+        changes = [v.login for v in verdicts if v.state == "CHANGES_REQUESTED" and not v.is_bot]
+        approvals = [v.login for v in verdicts if v.state == "APPROVED" and not v.is_bot]
+        log.debug(
+            "review.polled",
+            run=run_id,
+            pr=hold.pr_number,
+            approvals=approvals,
+            changes_requested=changes,
+            merged=merged,
+            closed=closed,
+        )
+        if closed:
+            if not self.dstore.claim_review_hold(run_id, "approving"):
+                return
+            self.dstore.resolve_review_hold(
+                run_id, "dismissed", None, now, "PR closed unmerged while awaiting review"
+            )
+            try:
+                self.dstore.abandon(item_id, "PR closed unmerged while awaiting review", now)
+            except ValueError:
+                log.warning("review.abandon_failed", item=item_id, exc_info=True)
+            fresh = self.dstore.get(item_id)
+            if fresh is not None:
+                self._deliver_report(fresh)
+            self._notice(
+                "review.dismissed",
+                f"🚪 {item_id}: PR #{hold.pr_number} was closed unmerged while awaiting review",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+            )
+            return
+        if changes and not merged:
+            if not self.dstore.claim_review_hold(run_id, "fixing"):
+                return
+            who = ", ".join(changes)
+            try:
+                self.dstore.resume_for_fix(
+                    item_id, run_id, now, f"changes requested by {who}; resuming for a fix round"
+                )
+            except ValueError:
+                log.warning("review.resume_failed", item=item_id, exc_info=True)
+                self.dstore.reopen_review_hold(run_id, now, "could not re-queue the item")
+                return
+            self._notice(
+                "review.changes_requested",
+                f"✏️ {item_id}: {who} requested changes on PR #{hold.pr_number} — "
+                "resuming the run for a fix round at the next tick",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+                by=who,
+            )
+            return
+        if merged or len(approvals) >= hold.approvals_required:
+            if not self.dstore.claim_review_hold(run_id, "approving"):
+                return
+            by = ", ".join(approvals) or "GitHub"
+            self._notice(
+                "review.approved",
+                f"✅ {item_id}: PR #{hold.pr_number} approved by {by} — completing the landing",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+                by=by,
+            )
+            threading.Thread(
+                target=self._complete_review_landing,
+                args=(hold, by),
+                daemon=True,
+                name=f"sbxloop-review-{run_id}",
+            ).start()
+
+    def resume_review(self, target: str, by: str | None = None) -> str:
+        """Operator ``resume <item|run>`` on a review wait (#675): check the
+        PR now and start the wait over — the way to re-arm a paused hold,
+        or to poll at once instead of at the next interval."""
+        hold = self.dstore.review_hold_for(target.strip())
+        if hold is None:
+            raise ValueError(f"{target!r} is not waiting for a review")
+        if hold.state in ("merged", "dismissed"):
+            raise ValueError(
+                f"{hold.item_id}'s review wait ended ({hold.state}); `retry {hold.item_id}` "
+                "runs the item again from scratch"
+            )
+        if hold.state in ("approving", "fixing"):
+            raise ValueError(
+                f"{hold.item_id} is already past the wait ({hold.state}); nothing to resume"
+            )
+        now = self.clock()
+        self.dstore.reopen_review_hold(hold.run_id, now, None, restart=True)
+        if hold.state == "paused":
+            self.dstore.mark_awaiting_review(hold.item_id, now)
+        who = by or "operator"
+        self._notice(
+            "run.review_resumed",
+            f"👀 {hold.item_id}: waiting for a review on PR #{hold.pr_number} again "
+            f"({who}); checking it now",
+            item=hold.item_id,
+            run=hold.run_id,
+            url=hold.pr_url or None,
+            pr=hold.pr_number,
+            by=who,
+        )
+        return (
+            f"{hold.item_id} is waiting for a review on PR #{hold.pr_number} again; "
+            "I'll check it at the next tick."
+        )
+
+    def _complete_review_landing(self, hold: ReviewHold, by: str) -> None:
+        """Finish an approved review wait: :func:`land` with gh ops alone,
+        as for a merge gate. A landing GitHub still refuses (a review that
+        went stale, a check that turned red) puts the hold back up."""
+        run_id, item_id = hold.run_id, hold.item_id
+        try:
+            outcome = self._land_parked(hold.repo, hold.pr_number, hold.branch, run_id)
+        except RunCancelledError as exc:
+            self.dstore.reopen_review_hold(run_id, self.clock(), str(exc))
+            return
+        except Exception as exc:
+            assert self.github is not None
+            self.github.note_failure(exc)
+            self.dstore.reopen_review_hold(run_id, self.clock(), f"landing failed: {exc}")
+            self._notice(
+                "review.merge_failed",
+                f"⚠ landing {item_id} after its approval did not merge: {exc} — still "
+                "waiting; I'll try again at the next approval check",
+                level="warning",
+                item=item_id,
+                run=run_id,
+            )
+            return
+        now = self.clock()
+        if isinstance(outcome, Landed):
+            try:
+                self.store.reconcile_run(run_id, "merged", f"merged after approval by {by}")
+            except SbxloopError:
+                log.warning("review.record_update_failed", run=run_id, exc_info=True)
+            self.dstore.resolve_review_hold(run_id, "merged", by, now)
+            self.dstore.mark_done(item_id, now, pending_report="merged")
+            self.dstore.finish_ledger(run_id, "done", now)
+            fresh = self.dstore.get(item_id)
+            if fresh is not None:
+                self._deliver_report(fresh)
+            self._notice(
+                "run.done",
+                f"🎉 {item_id} merged after approval by {by} · PR #{hold.pr_number}",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+                by=by,
+                mention_ids=hold.notify_ids,
+            )
+        elif isinstance(outcome, Closed):
+            self.dstore.resolve_review_hold(
+                run_id, "dismissed", by, now, "PR closed unmerged while awaiting review"
+            )
+            try:
+                self.dstore.abandon(item_id, "PR closed unmerged while awaiting review", now)
+            except ValueError:
+                log.warning("review.abandon_failed", item=item_id, exc_info=True)
+            fresh = self.dstore.get(item_id)
+            if fresh is not None:
+                self._deliver_report(fresh)
+            self._notice(
+                "review.dismissed",
+                f"🚪 {item_id}: PR #{hold.pr_number} was closed unmerged while awaiting review",
+                item=item_id,
+                run=run_id,
+            )
+        else:
+            why = (
+                f"the base now wants {outcome.wanted}"
+                if isinstance(outcome, AwaitingReview)
+                else outcome.why
+                if isinstance(outcome, Blocked | NeedsFix)
+                else str(outcome)
+            )
+            self.dstore.reopen_review_hold(run_id, now, why)
+            self._notice(
+                "review.merge_failed",
+                f"⚠ landing {item_id} after its approval did not merge: {why} — still "
+                "waiting; I'll try again at the next approval check",
+                level="warning",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+            )
+
     def approve_merge(self, target: str, by: str | None = None) -> str:
         """One human approval for a parked merge (``[landing] merge_gate``).
 
@@ -1565,57 +1969,7 @@ class DaemonLoop:
         )
         assert self.github is not None  # approve_merge refused without one
         try:
-            ops = self.github.ops()
-            identity = resolve_identity(
-                ops,
-                gate.repo,
-                gate.pr_number,
-                bot_login=self.github.provisioner.gh_bot_login(gate.repo),
-                configured_login=self.config.github.bot_login_for(gate.repo),
-            )
-            login = identity.login
-            base = ops.pr_get(gate.repo, gate.pr_number).get("base")
-            base_ref = str(base.get("ref") or "") if isinstance(base, dict) else ""
-            if not base_ref:
-                base_ref = self.config.github.for_repo(
-                    gate.repo
-                ).deliver_base or ops.default_branch(gate.repo)
-            outcome = land(
-                ops,
-                gate.repo,
-                gate.pr_number,
-                cfg=self.config.landing,
-                branch=gate.branch,
-                node_id=None,
-                login=login,
-                is_bot=identity.is_bot,
-                update=UpdateState(),
-                on_update=lambda state: None,
-                tick=self._merge_tick,
-                emit=lambda type, **data: log.info(type, run=run_id, **data),
-                answered=self.store.answered_objections(run_id),
-                review_posted=True,
-                ack=lambda threads: acknowledge_human_threads(
-                    ops,
-                    gate.repo,
-                    gate.pr_number,
-                    run_id=run_id,
-                    login=login,
-                    threads=threads,
-                    is_bot=identity.is_bot,
-                ),
-                # The same judgment the run's landing made (#611): the PR's
-                # own base, its merge base, and the advisory rounds spent.
-                policy_for=check_policy_reader(
-                    ops,
-                    gate.repo,
-                    base_ref,
-                    cfg=self.config.landing,
-                    advisory_spent=self.store.advisory_rounds(run_id),
-                    number=gate.pr_number,
-                ),
-                bot_round_spent=self.store.bot_round_spent(run_id),
-            )
+            outcome = self._land_parked(gate.repo, gate.pr_number, gate.branch, run_id)
         except RunCancelledError as exc:
             self.dstore.reopen_merge_gate(run_id, str(exc))
             return
@@ -1693,6 +2047,65 @@ class DaemonLoop:
                 run=run_id,
             )
 
+    def _land_parked(
+        self, repo: str, number: int, branch: str | None, run_id: str
+    ) -> LandingOutcome:
+        """The gh-ops-only landing a parked run finishes with — a merge gate
+        approved, a review wait approved (#675). ``land()`` re-runs every
+        bar (undraft, objections, CI, update-branch, reconciliation) against
+        the live PR, so a review or comment left during the park is
+        honoured, never merged over."""
+        assert self.github is not None
+        ops = self.github.ops()
+        identity = resolve_identity(
+            ops,
+            repo,
+            number,
+            bot_login=self.github.provisioner.gh_bot_login(repo),
+            configured_login=self.config.github.bot_login_for(repo),
+        )
+        login = identity.login
+        base = ops.pr_get(repo, number).get("base")
+        base_ref = str(base.get("ref") or "") if isinstance(base, dict) else ""
+        if not base_ref:
+            base_ref = self.config.github.for_repo(repo).deliver_base or ops.default_branch(repo)
+        return land(
+            ops,
+            repo,
+            number,
+            cfg=self.config.landing,
+            branch=branch,
+            node_id=None,
+            login=login,
+            is_bot=identity.is_bot,
+            update=UpdateState(),
+            on_update=lambda state: None,
+            tick=self._merge_tick,
+            emit=lambda type, **data: log.info(type, run=run_id, **data),
+            answered=self.store.answered_objections(run_id),
+            review_posted=True,
+            ack=lambda threads: acknowledge_human_threads(
+                ops,
+                repo,
+                number,
+                run_id=run_id,
+                login=login,
+                threads=threads,
+                is_bot=identity.is_bot,
+            ),
+            # The same judgment the run's landing made (#611): the PR's
+            # own base, its merge base, and the advisory rounds spent.
+            policy_for=check_policy_reader(
+                ops,
+                repo,
+                base_ref,
+                cfg=self.config.landing,
+                advisory_spent=self.store.advisory_rounds(run_id),
+                number=number,
+            ),
+            bot_round_spent=self.store.bot_round_spent(run_id),
+        )
+
     def _reconcile_gates(self) -> None:
         """An ``approving`` gate at boot is an approval a dead process took
         and never finished: put the gate back up and say so — the click or
@@ -1712,6 +2125,16 @@ class DaemonLoop:
                 item=gate.item_id,
                 run=gate.run_id,
             )
+
+    def _reconcile_review_holds(self) -> None:
+        """An ``approving`` review hold at boot is a landing a dead process
+        started and never finished (#675): put the wait back up; the next
+        poll sees the approval again (or ``merged``) and lands."""
+        for hold in self.dstore.review_holds(("approving",)):
+            self.dstore.reopen_review_hold(
+                hold.run_id, self.clock(), "landing interrupted by a restart"
+            )
+            log.warning("review.landing_interrupted", run=hold.run_id, item=hold.item_id)
 
     def _frontend_gate_opened(self, item: WorkItem, run_id: str, gate: MergeGate) -> None:
         if self.frontend is not None:
@@ -2090,6 +2513,7 @@ class DaemonLoop:
         row a dead process left non-terminal (#374)."""
         self._settle_half_claims()
         self._reconcile_gates()
+        self._reconcile_review_holds()
         for item in self.dstore.running_items():
             now = self.clock()
             if item.run_id is None:
@@ -2112,7 +2536,7 @@ class DaemonLoop:
                     reason="run record missing; starting over",
                 )
                 continue
-            if record.state in ("merged", "blocked", "completed", "gated"):
+            if record.state in ("merged", "blocked", "completed", "gated", "awaiting_review"):
                 self._notice(
                     "recovery.settling",
                     f"recovery: {item.run_id} had ended {record.state}; settling {item.item_id}",
@@ -2365,17 +2789,34 @@ class DaemonLoop:
         run: str | None = None,
         url: str | None = None,
         level: NoticeLevel = "info",
+        mention_ids: Sequence[str] = (),
         **fields: Any,
     ) -> None:
         """Narrate to the humans (Discord) *and* the journal: ``text`` is the
         prose the frontend shows, routed by ``item``/``run``; ``kind`` and
         ``fields`` are the structured record the log keeps (``level`` picks
-        its severity)."""
-        getattr(log, level)(kind, text=text, item=item, run=run, **fields)
+        its severity). ``mention_ids`` are the chat users the frontend
+        should address by name (#675)."""
+        getattr(log, level)(
+            kind,
+            text=text,
+            item=item,
+            run=run,
+            **({"mentions": list(mention_ids)} if mention_ids else {}),
+            **fields,
+        )
         if self.frontend is not None:
             try:
                 self.frontend.daemon_notice(
-                    DaemonNotice(kind, text, item_id=item, run_id=run, url=url, level=level)
+                    DaemonNotice(
+                        kind,
+                        text,
+                        item_id=item,
+                        run_id=run,
+                        url=url,
+                        level=level,
+                        mention_ids=tuple(mention_ids),
+                    )
                 )
             except Exception:
                 log.warning("frontend.daemon_notice_failed", notice=kind, exc_info=True)

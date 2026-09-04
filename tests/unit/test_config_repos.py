@@ -226,3 +226,47 @@ class TestNaming:
             tmp_path, '[github]\nrepo = "o/r"\npr_title_template = "[{repo}] {title} {title!s}"\n'
         )
         assert load_config(cwd=tmp_path, env={}).github.pr_title_template.startswith("[{repo}]")
+
+
+def test_reviewers_and_review_notify_fall_back_per_repo(tmp_path: Path) -> None:
+    """#675: a repo entry's own `reviewers`/`review_notify` win; an entry
+    without them inherits `[github] reviewers` / `[landing] review_notify`."""
+    _write(
+        tmp_path,
+        "[github]\n"
+        'reviewers = ["alice", "o/reviewers"]\n'
+        "\n"
+        "[[github.repos]]\n"
+        'repo = "o/one"\n'
+        "\n"
+        "[[github.repos]]\n"
+        'repo = "o/two"\n'
+        'reviewers = ["bob"]\n'
+        'review_notify = ["u2"]\n'
+        "\n"
+        "[landing]\n"
+        'review_notify = ["u1"]\n',
+    )
+    cfg = load_config(cwd=tmp_path, env={})
+    assert cfg.github.reviewers_for("o/one") == ["alice", "o/reviewers"]
+    assert cfg.github.reviewers_for("o/two") == ["bob"]
+    assert cfg.review_notify_for("o/one") == ["u1"]
+    assert cfg.review_notify_for("o/two") == ["u2"]
+    # An empty per-repo list is a real override: request nobody, ping nobody.
+    _write(
+        tmp_path,
+        '[github]\nreviewers = ["alice"]\n\n[[github.repos]]\nrepo = "o/one"\nreviewers = []\n'
+        'review_notify = []\n\n[landing]\nreview_notify = ["u1"]\n',
+    )
+    cfg = load_config(cwd=tmp_path, env={})
+    assert cfg.github.reviewers_for("o/one") == []
+    assert cfg.review_notify_for("o/one") == []
+
+
+def test_review_wait_timings_must_be_positive(tmp_path: Path) -> None:
+    _write(tmp_path, '[[github.repos]]\nrepo = "o/one"\n\n[landing]\nreview_wait_s = 0\n')
+    with pytest.raises(Exception, match="review_wait_s"):
+        load_config(cwd=tmp_path, env={})
+    _write(tmp_path, '[[github.repos]]\nrepo = "o/one"\n\n[landing]\nreview_poll_interval_s = -1\n')
+    with pytest.raises(Exception, match="review_poll_interval_s"):
+        load_config(cwd=tmp_path, env={})
