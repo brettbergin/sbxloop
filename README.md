@@ -1520,20 +1520,32 @@ declares.
 languages = ["python"]   # optional; unset = detect from the workspace
 ```
 
-| Value        | Also accepts               | Detected from                                                                                      | Installs                                                                                     |
-| ------------ | -------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `python`     | `py`, `python3`            | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile`, `uv.lock`, `poetry.lock` | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 by default (3.8–3.14 by declaration) |
-| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `CMakeLists.txt`, `meson.build`, `configure.ac`                                                    | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)                                |
-| `ruby`       | `rb`                       | `Gemfile`, `Rakefile`, `*.gemspec`                                                                 | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)                                  |
-| `java`       | `jdk`, `jvm`               | `pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`                                           | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                                            |
-| `php`        | —                          | `composer.json`                                                                                    | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)                                   |
-| `javascript` | `js`, `node`, `nodejs`     | `package.json`                                                                                     | Node 24 + npm/npx by default (18/20/22 by declaration; pinned tarballs from `nodejs.org`)    |
-| `typescript` | `ts`                       | `tsconfig.json`                                                                                    | `tsc` from npm, on top of `javascript`                                                       |
-| `go`         | `golang`                   | `go.mod`                                                                                           | Go toolchain (pinned tarball from `go.dev`)                                                  |
-| `rust`       | `rs`, `cargo`              | `Cargo.toml`                                                                                       | cargo, rustc, rustfmt, clippy (pinned rustup)                                                |
-| `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`                                   |
+| Value        | Also accepts               | Detected from                                                                                      | Installs                                                                                                                     |
+| ------------ | -------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `python`     | `py`, `python3`            | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile`, `uv.lock`, `poetry.lock` | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 by default (3.8–3.14 by declaration)                                 |
+| `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `CMakeLists.txt`, `meson.build`, `configure.ac`                                                    | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)                                                                |
+| `ruby`       | `rb`                       | `Gemfile`, `Rakefile`, `*.gemspec`                                                                 | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)                                                                  |
+| `java`       | `jdk`, `jvm`               | `pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`                                           | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                                                                            |
+| `php`        | —                          | `composer.json`                                                                                    | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)                                                                   |
+| `javascript` | `js`, `node`, `nodejs`     | `package.json`                                                                                     | Node 24 + npm/npx by default (18/20/22 by declaration; pinned tarballs from `nodejs.org`), plus `pnpm`/`yarn` corepack shims |
+| `typescript` | `ts`                       | `tsconfig.json`                                                                                    | `tsc` from npm, on top of `javascript`                                                                                       |
+| `bun`        | —                          | `bun.lock`, `bun.lockb`                                                                            | bun (pinned, from npm; the `packageManager` pin by declaration), on top of `javascript`                                      |
+| `go`         | `golang`                   | `go.mod`                                                                                           | Go toolchain (pinned tarball from `go.dev`)                                                                                  |
+| `rust`       | `rs`, `cargo`              | `Cargo.toml`                                                                                       | cargo, rustc, rustfmt, clippy (pinned rustup)                                                                                |
+| `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`                                                                   |
 
 Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
+
+The `javascript` entry covers the package managers too. `corepack enable`
+puts `pnpm` and `yarn` shims on PATH; each shim runs the version the
+workspace's `package.json` `packageManager` field pins (a lockfile alone
+selects the client with corepack's default version), fetched from the npm
+registry on first use. `bun` is not a corepack client, so it is an entry of
+its own, selected by its lockfile. The verify-command lint requires the
+project's scripts to run through the client the lockfile names (`pnpm run …`, `yarn run …`, `bun run …`), and a bare JavaScript dev binary (`eslint`,
+`jest`, `vitest`, `tsc`, `prettier`, `mocha`) is rejected in favour of
+`npx --no-install <bin>` or the package.json script — a bare binary resolves
+to whatever global the sandbox carries, not the version the project pins.
 
 The `python` entry is uv-aware: when the workspace carries a `uv.lock`, the
 prompts steer the agent to `uv sync` / `uv run …` instead of a hand-made
@@ -1567,8 +1579,9 @@ over an installer host (the toolchain then fails to provision, loudly).
 | ------------ | ---------------------------------------------------- |
 | `python`     | `github.com`, `release-assets.githubusercontent.com` |
 | `php`        | `getcomposer.org`                                    |
-| `javascript` | `nodejs.org`                                         |
+| `javascript` | `nodejs.org`, `registry.npmjs.org`                   |
 | `typescript` | `nodejs.org`, `registry.npmjs.org`                   |
+| `bun`        | `nodejs.org`, `registry.npmjs.org`                   |
 | `go`         | `go.dev`, `dl.google.com`                            |
 | `rust`       | `static.rust-lang.org`                               |
 | `dotnet`     | `builds.dotnet.microsoft.com`                        |

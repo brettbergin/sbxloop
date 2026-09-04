@@ -777,13 +777,13 @@ class TestInstallFallbacks:
         script_probes_for(fake_sbx, ["ts"])
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
-        fake_sbx.script("exec boxa sh -c set -e; case", returncode=0)
+        fake_sbx.script("exec boxa sh -c set -e; if ! node", returncode=0)
         fake_sbx.script("exec boxa sh -c set -e; sudo -n npm", returncode=0)
         self._script_happy_install(fake_sbx)
         client.install(wheel=wheel, ensure_dev_tools=True, languages=["ts"])
         execs = [" ".join(c) for c in fake_sbx.invocations("exec")]
         node_idx = [i for i, c in enumerate(execs) if "nodejs.org" in c]
-        tsc_idx = [i for i, c in enumerate(execs) if "npm install -g" in c]
+        tsc_idx = [i for i, c in enumerate(execs) if "typescript@" in c]
         assert node_idx and tsc_idx, execs
         assert node_idx[0] < tsc_idx[0], "the node runtime must install before tsc"
 

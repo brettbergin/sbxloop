@@ -352,6 +352,7 @@ def test_every_language_in_the_agreed_set_is_registered() -> None:
         "php",
         "javascript",
         "typescript",
+        "bun",
         "go",
         "rust",
         "dotnet",
@@ -491,6 +492,68 @@ def test_apt_only_entries_open_no_hosts() -> None:
 def test_install_domains_pools_without_duplicates() -> None:
     domains = toolchains.install_domains(toolchains.resolve(["typescript", "javascript"]))
     assert domains == ("nodejs.org", "registry.npmjs.org")
+
+
+class TestJavascriptPackageManagers:
+    """#684: pnpm and yarn come with the Node entry through corepack; bun
+    is an entry of its own, selected by its lockfile."""
+
+    def test_node_enables_corepack_and_wants_the_shims(self) -> None:
+        node = toolchains.resolve(["javascript"])[0]
+        assert node.install_script is not None
+        assert "corepack enable --install-directory /usr/local/bin" in node.install_script
+        assert f"corepack@{toolchains.COREPACK_VERSION}" in node.install_script
+        assert "COREPACK_ENABLE_DOWNLOAD_PROMPT" in node.install_script
+        # a template baked before the shims re-runs the (now cheap) install
+        assert "command -v pnpm" in node.probe and "command -v yarn" in node.probe
+        assert "registry.npmjs.org" in node.install_domains
+
+    def test_node_install_skips_the_tarball_when_the_major_is_present(self) -> None:
+        # The top-up on an older template must not re-download Node.
+        node = toolchains.resolve(["javascript"])[0]
+        assert node.install_script is not None
+        assert node.install_script.startswith('set -e; if ! node -v 2>/dev/null | grep -q "^v')
+        assert "; fi; command -v corepack" in node.install_script
+
+    def test_no_pnpm_or_yarn_entry_exists(self) -> None:
+        # Both ride on corepack; a separate global install would shadow
+        # the version the project's `packageManager` pins.
+        assert toolchains.normalize_language("pnpm") is None
+        assert toolchains.normalize_language("yarn") is None
+        assert toolchains.normalize_language("bun") == "bun"
+
+    def test_bun_layers_on_node_and_is_pinned(self) -> None:
+        resolved = toolchains.resolve(["bun"])
+        assert [tc.name for tc in resolved] == ["javascript", "bun"]
+        bun = resolved[1]
+        assert bun.install_script is not None
+        assert f"bun@{toolchains.BUN_VERSION}" in bun.install_script
+        assert bun.install_domains == ("registry.npmjs.org",)
+        assert bun.manifests == ("bun.lock", "bun.lockb")
+        assert bun.series == toolchains.BUN_VERSION
+        assert toolchains.BUN_VERSION in bun.probe
+
+    def test_bun_is_detected_from_its_lockfile(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text("{}\n")
+        (tmp_path / "bun.lockb").write_bytes(b"\x00")
+        resolved = toolchains.resolve_languages((), tmp_path)
+        assert resolved.languages == ("javascript", "bun")
+        assert resolved.signals["bun"] == ("bun.lockb",)
+
+    def test_bun_takes_the_package_manager_pin(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text('{"packageManager": "bun@1.2.3"}\n')
+        (tmp_path / "bun.lock").write_text("{}\n")
+        versions = toolchains.toolchain_versions(["bun"], tmp_path)
+        assert versions["bun"] == toolchains.ToolchainVersion("1.2.3", "package.json", "bun@1.2.3")
+        bun = toolchains.resolve(["bun"], versions)[1]
+        assert bun.series == "1.2.3"
+        assert "bun@1.2.3" in bun.install_script and '"1.2.3"' in bun.probe
+
+    def test_a_pin_for_another_client_leaves_bun_at_its_default(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text('{"packageManager": "pnpm@9.0.0"}\n')
+        assert toolchains.toolchain_versions(["bun"], tmp_path)[
+            "bun"
+        ] == toolchains.ToolchainVersion(toolchains.BUN_VERSION, "default", None)
 
 
 def test_detect_reads_root_and_two_levels_only(tmp_path: Path) -> None:

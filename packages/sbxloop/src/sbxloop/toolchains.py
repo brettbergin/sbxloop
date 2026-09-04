@@ -675,18 +675,41 @@ def _node_major_from(workspace: Path) -> ToolchainVersion | None:
     )
 
 
+# pnpm and yarn come through corepack, which every Node line in
+# NODE_RELEASES bundles (#684): `corepack enable` puts `pnpm` and `yarn`
+# shims on PATH, and the shim runs whatever version the project's
+# package.json `packageManager` field pins — downloading it from the npm
+# registry (always reachable) on first use, with the interactive download
+# prompt switched off for the sandbox. That is the whole point of using
+# corepack rather than `npm i -g pnpm`: a workspace pinning `pnpm@9.0.0`
+# gets exactly that. The npm install of corepack is a fallback for a Node
+# that ships without it (25+ dropped the bundle).
+COREPACK_VERSION = "0.36.0"
+_COREPACK_SHIMS = "/usr/local/bin"
+_COREPACK_ENABLE = (
+    "command -v corepack >/dev/null || "
+    f"sudo -n npm install -g --no-fund --no-audit corepack@{COREPACK_VERSION}; "
+    f"sudo -n corepack enable --install-directory {_COREPACK_SHIMS}; "
+    + _persist_env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+)
+
+
 def _node_toolchain(major: str) -> Toolchain:
     version, digests = NODE_RELEASES[major]
+    node_present = f'node -v 2>/dev/null | grep -q "^v{major}\\."'
     return Toolchain(
         name="javascript",
-        wanted=f"node {major}.x, npm, npx",
+        wanted=f"node {major}.x, npm, npx, pnpm, yarn (corepack shims)",
         # Check the pinned major, not merely that node exists: a template
         # carrying an older Node would otherwise satisfy the probe and
         # leave the agent with the very version #147 says breaks modern
-        # `engines`.
+        # `engines`. The corepack shims are part of "present" too, so a
+        # template baked before #684 tops them up rather than handing a
+        # pnpm workspace `pnpm: command not found`.
         probe=(
             "command -v npm >/dev/null && command -v npx >/dev/null "
-            f'&& node -v 2>/dev/null | grep -q "^v{major}\\."'
+            "&& command -v pnpm >/dev/null && command -v yarn >/dev/null "
+            f"&& {node_present}"
         ),
         apt_packages=("curl", "ca-certificates", "xz-utils"),
         # Extracted into /usr/local with the leading directory stripped,
@@ -694,16 +717,21 @@ def _node_toolchain(major: str) -> Toolchain:
         # `npm i -g` (the TypeScript entry, or the agent itself) lands on
         # PATH without further wiring. The three top-level doc files the
         # tarball carries are removed rather than left loose in /usr/local.
+        # The tarball step is skipped when this major is already installed
+        # (a top-up that only needs the shims costs no download).
         install_script=(
-            "set -e; " + _arch_dispatch(digests) + "; "
+            f"set -e; if ! {node_present}; then " + _arch_dispatch(digests) + "; "
             f'curl -fsSL -o {_NODE_TARBALL} "https://nodejs.org/dist/v{version}'
             f'/node-v{version}-linux-$arch.tar.xz"; '
             f"printf '%s  {_NODE_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
             f"sudo -n tar -xJf {_NODE_TARBALL} -C /usr/local --strip-components=1; "
             "sudo -n rm -f /usr/local/CHANGELOG.md /usr/local/LICENSE /usr/local/README.md; "
-            f"rm -f {_NODE_TARBALL}"
+            f"rm -f {_NODE_TARBALL}; fi; " + _COREPACK_ENABLE
         ),
-        install_domains=("nodejs.org",),
+        # corepack's own fallback install and every pnpm/yarn download it
+        # makes resolve through the npm registry, which is in the
+        # always-reachable baseline; listed so the entry is self-describing.
+        install_domains=("nodejs.org", "registry.npmjs.org"),
         manifests=("package.json",),
         aliases=("js", "node", "nodejs", "javascript-node"),
         series=major,
@@ -741,6 +769,48 @@ TYPESCRIPT = Toolchain(
     manifests=("tsconfig.json",),
     aliases=("ts",),
 )
+
+
+# bun is the one JavaScript client corepack does not carry, so it has an
+# entry of its own (#684), selected by its lockfile. Installed from the npm
+# registry — the `bun` package pulls the platform binary from its own
+# optional dependency (`@oven/bun-linux-<arch>`), so no host beyond the
+# baseline is contacted — and pinned. A project's `packageManager =
+# "bun@x.y.z"` declaration selects that version instead (#627).
+BUN_VERSION = "1.4.1"
+_PACKAGE_MANAGER_PIN = re.compile(r"^bun@(\d+\.\d+\.\d+)")
+
+
+def _bun_series_from(workspace: Path) -> ToolchainVersion | None:
+    try:
+        data = json.loads((workspace / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    declared = data.get("packageManager") if isinstance(data, dict) else None
+    if not isinstance(declared, str):
+        return None
+    match = _PACKAGE_MANAGER_PIN.match(declared.strip())
+    if match is None:
+        return None
+    return ToolchainVersion(match.group(1), "package.json", declared.strip())
+
+
+def _bun_toolchain(version: str) -> Toolchain:
+    return Toolchain(
+        name="bun",
+        wanted=f"bun {version}",
+        probe=f'bun --version 2>/dev/null | grep -qx "{version}"',
+        requires=("javascript",),
+        install_script=(f"set -e; sudo -n npm install -g --no-fund --no-audit bun@{version}"),
+        install_domains=("registry.npmjs.org",),
+        manifests=("bun.lock", "bun.lockb"),
+        series=version,
+        declared_series=_bun_series_from,
+        rebuild=_bun_toolchain,
+    )
+
+
+BUN = _bun_toolchain(BUN_VERSION)
 
 
 # Debian/Ubuntu ship `golang-go`, but it commonly lags upstream and Go
@@ -920,6 +990,7 @@ TOOLCHAINS: tuple[Toolchain, ...] = (
     PHP,
     NODE,
     TYPESCRIPT,
+    BUN,
     GO,
     RUST,
     DOTNET,

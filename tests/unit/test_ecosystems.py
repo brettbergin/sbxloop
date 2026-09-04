@@ -77,6 +77,28 @@ EXPECTATIONS: dict[str, Expectation] = {
             ("pnpm exec tsc -b packages/web", False),
         ),
     ),
+    # yarn rides on the corepack shim the javascript toolchain enables; the
+    # lockfile alone selects the client (#684)
+    "node-yarn": Expectation(
+        ("javascript",),
+        "detected",
+        versions={"javascript": ("24", "package.json")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="yarn run ci",
+        lint=(("yarn run ci", False),),
+    ),
+    # bun is its own toolchain, selected by the lockfile and pinned to the
+    # packageManager declaration (#684)
+    "node-bun": Expectation(
+        ("javascript", "bun"),
+        "detected",
+        versions={"javascript": ("24", "default"), "bun": ("1.3.5", "package.json")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="bun run check",
+        lint=(("bun run check", False),),
+    ),
     "go": Expectation(
         ("go",),
         "detected",

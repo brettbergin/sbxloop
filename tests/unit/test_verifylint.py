@@ -159,6 +159,38 @@ class TestRubyAndPhpRules:
         )
 
 
+class TestJavascriptRule:
+    """#684: the dev binaries a project pins resolve through the project,
+    never through whatever global the sandbox carries."""
+
+    @pytest.mark.parametrize("binary", ["eslint", "jest", "vitest", "tsc", "prettier", "mocha"])
+    def test_bare_dev_binary_is_flagged(self, binary: str) -> None:
+        problems = lint_verify_commands([f"{binary} ."], ["javascript"])
+        assert len(problems) == 1
+        assert f"bare `{binary}`" in problems[0]
+        assert "npx --no-install" in problems[0]
+        assert "pnpm run lint" in problems[0] and "bun run lint" in problems[0]
+
+    def test_the_rule_needs_the_javascript_toolchain(self) -> None:
+        assert lint_verify_commands(["tsc --noEmit"], ["typescript"]) == []
+        assert lint_verify_commands(["eslint ."], ["go"]) == []
+
+    def test_project_paths_and_runners_are_clean(self) -> None:
+        commands = [
+            "npx --no-install eslint .",
+            "npx tsc --noEmit",
+            "npm run lint",
+            "pnpm run lint",
+            "pnpm exec vitest run",
+            "yarn run lint",
+            "bun run lint",
+            "bunx vitest run",
+            "node_modules/.bin/jest",
+            "node scripts/check.js",
+        ]
+        assert lint_verify_commands(commands, ["javascript", "typescript", "bun"]) == []
+
+
 class TestBareIsCorrectElsewhere:
     def test_go_rust_dotnet_node_commands_are_clean(self) -> None:
         commands = [
@@ -572,7 +604,7 @@ class TestNodeScriptRunner:
         ("lockfile", "gate"),
         [
             ("pnpm-lock.yaml", "pnpm run check"),
-            ("yarn.lock", "yarn check"),
+            ("yarn.lock", "yarn run check"),
             ("bun.lockb", "bun run check"),
             ("bun.lock", "bun run check"),
         ],
@@ -598,7 +630,27 @@ class TestNodeScriptRunner:
             json.dumps({"packageManager": "volta@1", "scripts": {"check": "x"}}),
         )
         write(tmp_path, "yarn.lock")
-        assert node_script_runner(tmp_path) == "yarn"
+        assert node_script_runner(tmp_path) == "yarn run"
+
+    def test_bun_needs_the_bun_toolchain(self, tmp_path: Path) -> None:
+        # #684: bun is its own toolchain entry. A workspace naming it on a
+        # sandbox whose resolved set left it out (an explicit `languages`)
+        # cannot be handed `bun run` — the one client every Node sandbox
+        # has is npm. None (no resolution at hand) trusts the workspace.
+        write(tmp_path, "package.json", json.dumps({"scripts": {"check": "x"}}))
+        write(tmp_path, "bun.lock")
+        assert node_script_runner(tmp_path) == "bun run"
+        assert node_script_runner(tmp_path, ["javascript", "bun"]) == "bun run"
+        assert node_script_runner(tmp_path, ["javascript"]) == "npm run"
+        assert project_gate(tmp_path, languages=["javascript", "bun"]) == "bun run check"
+        assert project_gate(tmp_path, languages=["javascript"]) == "npm run check"
+
+    def test_pnpm_and_yarn_ride_on_the_javascript_toolchain(self, tmp_path: Path) -> None:
+        # corepack shims come with the javascript entry, so no extra
+        # language has to be in the set for them.
+        write(tmp_path, "package.json", json.dumps({"scripts": {"check": "x"}}))
+        write(tmp_path, "pnpm-lock.yaml")
+        assert project_gate(tmp_path, languages=["javascript"]) == "pnpm run check"
 
     def test_a_malformed_declaration_falls_through(self, tmp_path: Path) -> None:
         write(tmp_path, "package.json", json.dumps({"packageManager": 7}))
