@@ -54,6 +54,10 @@ def render(name: str, **context: str) -> str:
     # The repository's PR conventions (#678) are a paragraph only when the
     # workspace declares some; most render calls have none to give.
     context.setdefault("pr_conventions", "")
+    # The repository's own instruction files (#688): a heading and their
+    # text when the workspace has any, else nothing — a render call with
+    # no workspace (a unit test, the concierge) gives none.
+    context.setdefault("repo_conventions", "")
     # What the sandbox's verification did not decide (#682): advisory
     # failures, or that nothing ran under `ci-only`. Empty under `full`.
     context.setdefault("verification", "")

@@ -297,6 +297,17 @@ class TestOptions:
             "append": "be terse",
         }
 
+    def test_filesystem_settings_are_declared_off_not_inherited(
+        self, sdk: types.ModuleType
+    ) -> None:
+        """#688: the repository's CLAUDE.md reaches the model through the
+        prompt's conventions block, so the session loads no filesystem
+        settings — stated, not left to whatever the SDK's default is."""
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        _, emit = collect_emit()
+        ClaudeBackend().run_session(job(), emit)
+        assert sdk.opened_with[0].kwargs["setting_sources"] == []
+
     def test_auto_model_is_left_to_the_sdk(self, sdk: types.ModuleType) -> None:
         sdk.script = [ResultMessage(session_id="s", result="ok")]
         _, emit = collect_emit()

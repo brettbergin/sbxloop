@@ -1246,6 +1246,20 @@ only the draft it made: a PR *a person* converts to draft — before the
 landing, or after the loop's own un-draft — is a hold, not a block (see
 `awaiting_review` in the daemon section).
 
+**Repository conventions.** What the repository says about itself reaches
+every phase: `AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
+`.github/copilot-instructions.md`, `CONTRIBUTING.md` and `CODEOWNERS` (the
+locations GitHub reads them from) are read from the workspace and handed to
+the planner, the builder and the reviewer under one heading — "Repository
+conventions (from the repository itself — follow them over the defaults
+below)" — so "run `make lint` before committing", "never touch
+`generated/`" or "PRs need a changelog entry" shape the plan and the review,
+not just the build. A file symlinked or copied under two names is rendered
+once. The block is capped at `[budgets] repo_context_max_chars` (12,000
+characters; the cut is marked, and 0 hands the prompts none of it). Neither
+agent backend is left to find these files by its own convention: the block
+is the one route, the same on both.
+
 **Naming.** The branch, the PR title and the commit message are rendered
 from `[github]` templates — `branch_prefix` (default `sbxloop/`, the run id
 appended), `pr_title_template` (default `sbxloop: {title}`) and
@@ -1799,7 +1813,7 @@ The notable knobs:
 | `[github] api_url`                                        | api.github.com     | The GitHub REST root — GitHub Enterprise Server: `https://ghe.example.com/api/v3`. One source of truth for the REST transport, App auth, `gh` (`GH_HOST`) and both sandboxes' network allows; a `GH_HOST` in the daemon's environment that names another host is refused at config load. FIELD-UNVERIFIED on GHES.                                                 |
 | `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`, `ignore_reviewers`.                                                     |
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
-| `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`.                                                                                                                                                                                                                                |
+| `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`, `max_parallel_tasks`, `repo_context_max_chars`.                                                                                                                                                                                |
 | `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                                                                                                                                                                                                    |
 | `[daemon] trigger_label` … `gated_label`                  | `sbxloop:run` …    | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`, `gated_label`; each can be renamed per `[[github.repos]]` entry. `sbxloop init-repo` creates them.                                                                                                                                                     |
 | `[daemon] max_runs_per_day`                               | `12`               | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there.                                                                                                                                                                                                                                                       |

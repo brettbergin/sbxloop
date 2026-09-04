@@ -19,7 +19,8 @@ tests/unit/test_prompts.py):
 
 Variables: $outcome, $task_id, $task_title, $task_description,
 $acceptance_criteria, $verify_commands, $prior_attempt, $feedback,
-$user_guidance; $baseline_registries and $declarable_registries are injected
+$user_guidance, $repo_conventions (engine.repocontext, #688 — defaulted to ""
+by render()); $baseline_registries and $declarable_registries are injected
 from policy.py, never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
 Section rules:
 - Each ECOSYSTEM_NOTES row must keep its markers under "Ecosystem notes"
@@ -116,6 +117,8 @@ destroyed.
 ## Overall outcome
 
 $outcome
+
+$repo_conventions
 
 ## Task $task_id: $task_title
 

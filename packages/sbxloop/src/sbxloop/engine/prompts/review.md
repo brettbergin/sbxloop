@@ -20,7 +20,8 @@ $prior_rounds, $user_guidance, $project_gate, $config_override_example
 (rendered by verifylint.config_override_example for the run's resolved
 toolchains, #634); $retry_context and $verification (what the sandbox's
 checks did not decide under an advisory or ci-only verify mode, #682;
-both defaulted by render()).
+both defaulted by render()); $repo_conventions (engine.repocontext, #688 —
+defaulted to "" by render()).
 Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
 path, state name or product vocabulary from the loop's own repository —
 tests anchor on the rule phrases, not the examples
@@ -60,6 +61,8 @@ implements the mechanism and say what would actually remove the symptom.
 That is the review that stops the pull request which deletes the retry
 loop when the person is seeing duplicate emails: a second worker sends them,
 and the diff leaves it exactly where it was.
+
+$repo_conventions
 
 ## The tasks the run built, with their acceptance criteria
 

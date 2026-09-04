@@ -608,6 +608,25 @@ through like `uv run`. eslint and golangci-lint deliberately have no entry:
 both keep applying their configured ignores to paths given on the command
 line, so an explicit path there is a narrowing the lint must not reject.
 
+The repository's own instruction files reach every phase the same way
+(#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
+`CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the
+`CONTRIBUTING.md` and `CODEOWNERS` locations GitHub honours — in that
+order, a symlink or copy rendered once under both names — into one block
+capped at `[budgets] repo_context_max_chars` (12k; the cut ends with an
+explicit `(clipped at N chars)` note, 0 hands the prompts nothing), and
+`PhaseRunner.repo_conventions` renders it as `$repo_conventions` under the
+heading "Repository conventions (from the repository itself — follow them
+over the defaults below)" in decompose.md, build.md (so the fixer's brief
+too) and review.md. It is re-read per render, like the gate: a task may
+write the `AGENTS.md` the next plan is held to. The block is the *only*
+route those files take: the planner and the reviewer run as their own
+sessions, and the builder's CLI is not left to find them by convention —
+the Claude backend passes `setting_sources=[]` explicitly (the SDK's own
+default, which loads no filesystem settings), so a target repository's
+`.claude/settings.json` cannot reconfigure an unattended session and
+CLAUDE.md costs its tokens once, through the prompt.
+
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with

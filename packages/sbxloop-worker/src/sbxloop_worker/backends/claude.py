@@ -298,6 +298,13 @@ class ClaudeBackend:
                 if job.system_message
                 else {"type": "preset", "preset": "claude_code"}
             ),
+            # No filesystem settings — the SDK's own default, declared
+            # rather than inherited (#688): the repository's CLAUDE.md
+            # reaches every phase through the prompt's repository
+            # conventions block, capped by the host, and a target repo's
+            # `.claude/settings.json` (hooks, permission rules) must not
+            # reconfigure an unattended session under it.
+            "setting_sources": [],
         }
         if job.model and job.model != "auto":
             kwargs["model"] = job.model

@@ -21,7 +21,10 @@ Variables: $outcome, $max_tasks, $project_gate, $config_override_example
 (rendered by verifylint.config_override_example for the run's resolved
 toolchains, #634); $pr_conventions (deliver.pr_conventions, #678 — defaulted
 to "" by render(), a paragraph only when the workspace has a title lint or a
-pull request template); $retry_context (defaulted to "" by render());
+pull request template); $repo_conventions (engine.repocontext, #688 —
+defaulted to "" by render(), the repository's own instruction files under a
+heading when the workspace has any); $retry_context (defaulted to "" by
+render());
 $baseline_registries and $declarable_registries are injected from policy.py,
 never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
 Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
@@ -65,6 +68,8 @@ implementing it faithfully would not change what they saw, plan the change
 that does, and say so in the task description. A plan that deletes the
 retry loop when the person is seeing duplicate emails — sent by a second
 worker, not by retries — has done the wrong thing correctly.
+
+$repo_conventions
 
 ## Rules
 
