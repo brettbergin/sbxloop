@@ -9,7 +9,7 @@ from urllib.parse import unquote
 import pytest
 
 from sbxloop.daemon.model import RunReport, WorkItem
-from sbxloop.daemon.sources import CLAIM_MARKER, GitHubIssueSource, GitHubLabels
+from sbxloop.daemon.sources import CLAIM_MARKER, STATUS_MARKER, GitHubIssueSource, GitHubLabels
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import IssueRef
 
@@ -105,10 +105,18 @@ class RecordingOps:
             return self.issues.get(number, {"state": "closed", "labels": []})
         return {}
 
-    def add_comment(self, body: str, created_at: str = "2026-08-15T10:00:00Z") -> int:
+    def add_comment(
+        self,
+        body: str,
+        created_at: str = "2026-08-15T10:00:00Z",
+        user: dict[str, Any] | None = None,
+    ) -> int:
         cid = self._next_comment_id
         self._next_comment_id += 1
-        self.comment_rows.append({"id": cid, "body": body, "created_at": created_at})
+        row: dict[str, Any] = {"id": cid, "body": body, "created_at": created_at}
+        if user is not None:
+            row["user"] = user
+        self.comment_rows.append(row)
         return cid
 
     def issue_comment(self, repo: str, number: int, body: str) -> str:
@@ -1029,3 +1037,149 @@ class TestRelabelRestartsDiscovery:
         body = ops.comments[-1][1]
         assert "re-add `sbxloop:run`" in body
         assert "deduplicated" not in body and "only re-runs it if the issue was" not in body
+
+
+class TestIssueContext:
+    """The issue beyond its body (#691): the discussion minus the loop's
+    own comments, and the issues it links to."""
+
+    def make(self, ops: RecordingOps) -> GitHubIssueSource:
+        return GitHubIssueSource(
+            lambda: ops,  # type: ignore[arg-type]
+            "o/r",
+            LABELS,
+            host="db",
+            clock=lambda: FIXTURE_NOW,
+        )
+
+    def thread(self) -> RecordingOps:
+        ops = RecordingOps(
+            {
+                "4": issue(4, "sbxloop:run"),
+                "123": {**issue(123), "title": "The earlier fix", "body": "We did it\nthis way."},
+                "9": {**issue(9), "pull_request": {"url": "https://x/pulls/9"}, "body": ""},
+            }
+        )
+        ops.issues["4"]["body"] = "Do it like #123 did. Not like o/x#77."
+        ops.add_comment(
+            "Actually the repro is `make check`.",
+            "2026-08-30T10:00:00Z",
+            {"login": "alice", "type": "User"},
+        )
+        ops.add_comment(
+            f"{CLAIM_MARKER}{'a' * 32} host=db pid=1 started=2026-08-30T10:01:00Z -->",
+            "2026-08-30T10:01:00Z",
+            {"login": "sbxloop[bot]", "type": "Bot"},
+        )
+        ops.add_comment(
+            f"Run `r1` started.\n\n{STATUS_MARKER}",
+            "2026-08-30T10:02:00Z",
+            {"login": "sbxloop[bot]", "type": "Bot"},
+        )
+        ops.add_comment(
+            "Keep the API shape from https://github.com/o/r/pull/9 please.",
+            "2026-08-31T10:00:00Z",
+            {"login": "bob", "type": "User"},
+        )
+        return ops
+
+    def test_the_discussion_carries_the_humans_and_the_links(self) -> None:
+        ops = self.thread()
+        item = self.make(ops).poll()[0]
+        context = self.make(ops).issue_context(item, own=("sbxloop[bot]", True))
+        assert [(c.author, c.created) for c in context.comments] == [
+            ("alice", "2026-08-30"),
+            ("bob", "2026-08-31"),
+        ]
+        assert context.comments[0].body == "Actually the repro is `make check`."
+        assert context.omitted == 0
+        assert [(li.number, li.kind, li.state) for li in context.linked] == [
+            (123, "issue", "open"),
+            (9, "pull request", "open"),
+        ]
+        assert context.linked[0].title == "The earlier fix"
+        assert context.linked[0].excerpt == "We did it this way."
+        # o/x#77 is another repository's; the issue itself is never its own link
+        assert all(li.number != 77 for li in context.linked)
+        assert ("GET", "/repos/o/r/issues/4") not in [c[:2] for c in ops.raw_calls]
+
+    def test_the_loops_own_comments_stay_out_even_without_an_identity(self) -> None:
+        """A claim is a bare marker and a status comment carries the stamp:
+        neither needs the identity to be recognised. A plain comment from
+        the loop's account does — an unknown identity keeps it, since a
+        guess would drop a human's words."""
+        ops = self.thread()
+        ops.add_comment(
+            "Unmarked note from the loop's account.",
+            "2026-08-31T11:00:00Z",
+            {"login": "sbxloop[bot]", "type": "Bot"},
+        )
+        item = self.make(ops).poll()[0]
+        anonymous = self.make(ops).issue_context(item)
+        assert [c.author for c in anonymous.comments] == ["alice", "bob", "sbxloop[bot]"]
+        known = self.make(ops).issue_context(item, own=("sbxloop", True))
+        assert [c.author for c in known.comments] == ["alice", "bob"]
+
+    def test_markers_inside_a_kept_comment_are_stripped(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        ops.add_comment(
+            "Please also cover the CLI.\n<!-- sbxloop-followups abc -->",
+            "2026-08-30T10:00:00Z",
+            {"login": "alice"},
+        )
+        item = self.make(ops).poll()[0]
+        context = self.make(ops).issue_context(item)
+        assert [c.body for c in context.comments] == ["Please also cover the CLI."]
+        assert context.comments[0].author == "alice"
+
+    def test_a_long_thread_keeps_the_latest_and_counts_the_rest(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        for n in range(25):
+            ops.add_comment(f"note {n}", f"2026-08-{1 + n // 24:02d}T{n % 24:02d}:00:00Z")
+        item = self.make(ops).poll()[0]
+        context = self.make(ops).issue_context(item, max_comments=20)
+        assert context.omitted == 5
+        assert [c.body for c in context.comments][:2] == ["note 5", "note 6"]
+        assert context.comments[-1].body == "note 24"
+        assert context.comments[0].author == "unknown"  # no user on the row
+
+    def test_linked_issues_are_capped_and_a_missing_one_is_skipped(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run"), "2": issue(2), "3": issue(3)})
+        ops.issues["4"]["body"] = "See #2, #3 and #5 (gone) and #2 again."
+        item = self.make(ops).poll()[0]
+        context = self.make(ops).issue_context(item, max_linked=2)
+        assert [li.number for li in context.linked] == [2, 3]
+        ops.issues["5"] = {"state": "closed", "labels": []}  # no title: not an issue payload
+        context = self.make(ops).issue_context(item)
+        assert [li.number for li in context.linked] == [2, 3]
+        excerpt = "x" * 500
+        ops.issues["2"]["body"] = excerpt
+        context = self.make(ops).issue_context(item)
+        assert context.linked[0].excerpt == "x" * 400 + "…"
+
+    def test_a_failed_comment_read_raises_and_notes_the_failure(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        failures: list[BaseException] = []
+        source = GitHubIssueSource(
+            lambda: ops,  # type: ignore[arg-type]
+            "o/r",
+            LABELS,
+            host="db",
+            on_failure=failures.append,
+            clock=lambda: FIXTURE_NOW,
+        )
+        item = source.poll()[0]
+        ops.fail_on.add("GET")
+        with pytest.raises(GithubOpsError):
+            source.issue_context(item)
+        assert len(failures) == 1
+
+    def test_status_comments_are_stamped_and_claims_are_not_stamped_twice(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run")})
+        source = self.make(ops)
+        item = source.poll()[0]
+        assert source.claim(item) is True
+        source.report_started(item, "r1")
+        claim_body, started_body = ops.comments[0][1], ops.comments[1][1]
+        assert CLAIM_MARKER in claim_body and STATUS_MARKER not in claim_body
+        assert started_body == f"Run `r1` started.\n\n{STATUS_MARKER}"

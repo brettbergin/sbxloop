@@ -963,6 +963,16 @@ its backoff), `sbxloop:blocked` when GitHub would not let the loop finish. Re-ad
 `sbxloop:run` to an issue whose attempt finished re-queues it on the next
 poll even if the issue text is unchanged, and the new run resumes the
 branch and PR the previous attempt pushed to origin (#600).
+The outcome a run is handed is the issue as a human would read it (#691):
+title, body, then a `## Discussion` block of the comments — the loop's own
+left out, by the hidden stamp on every status comment it posts and by its
+resolved identity (App slug, `GET /user`, or `[github] bot_login`) for
+anything unstamped — the last twenty of a long thread with the count
+omitted named, then `## Linked issues`: every `#N` and same-repository
+issue/PR URL the body and kept comments mention, read for its title,
+state and the head of its body. The block is what `[budgets] outcome_max_chars` cuts, with a note naming the budget; the title, body
+and provenance are always whole. A comment read that fails becomes one
+explicit line in the outcome — the run goes on with the ask itself.
 It never files work of its own: only a human labelling an issue — directly,
 or by asking the Discord concierge, which files the issue *with* the label —
 starts a run. Everything else the daemon does is a guardrail or a

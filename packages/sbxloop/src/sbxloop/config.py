@@ -1189,6 +1189,12 @@ class Budgets(_ConfigModel):
     # phase prompt carries, in characters; the block is cut at the budget
     # with an explicit note. 0 hands the prompts none of it.
     repo_context_max_chars: int = Field(default=12_000, ge=0)
+    # How large the outcome handed to the planner may grow once the
+    # issue's discussion and linked issues are added to its title and
+    # body (#691), in characters. The title, body and provenance are
+    # always carried whole; the discussion block is cut at what is left
+    # of the budget, with an explicit note.
+    outcome_max_chars: int = Field(default=16_000, ge=1_000)
 
 
 # How a landed PR is written onto the base branch. "auto" (the default)

@@ -19,6 +19,7 @@ from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
 from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.daemon.sources import IssueComment, IssueContext, LinkedIssue
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
 from sbxloop.engine.store import StateStore
@@ -526,6 +527,146 @@ class TestOutcomeAndConfig:
         assert "GitHub issue #4 in o/r (https://x/issues/4)" in text
         assert "sbxloop-claim" not in text
         assert "backlog" not in text and "AUDIT" not in text
+        # A source with no discussion to offer changes nothing.
+        assert "Discussion" not in text and "Linked" not in text
+
+
+class ContextSource(FakeSource):
+    """A source whose issues carry a discussion (#691)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.context = IssueContext(
+            comments=(
+                IssueComment("alice", "2026-08-30", "Actually the repro is `make check`."),
+                IssueComment("bob", "2026-08-31", "Keep the API shape from #9."),
+                IssueComment("carol", "2026-09-01", "Agreed; ship it."),
+            ),
+            omitted=0,
+            linked=(
+                LinkedIssue(123, "The earlier fix", "closed", "We did it this way.", "issue"),
+                LinkedIssue(9, "API reshape", "open", "", "pull request"),
+            ),
+        )
+        self.asked: list[tuple[str, Any]] = []
+        self.fail: Exception | None = None
+
+    def issue_context(self, item: WorkItem, **kwargs: Any) -> IssueContext:
+        self.asked.append((item.item_id, kwargs.get("own")))
+        if self.fail is not None:
+            raise self.fail
+        return self.context
+
+
+class TestOutcomeContext:
+    """The outcome carries the issue's discussion and linked issues (#691):
+    the substance of a real tracker's issue is in its comments."""
+
+    def harness(self, tmp_path: Path, **budgets: Any) -> Harness:
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "github": {"repo": "o/r"}, "budgets": budgets}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source = ContextSource()
+        h.loop.source = h.source
+        return h
+
+    def test_the_discussion_and_the_links_follow_the_body(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path)
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body="details"))
+        assert text.startswith("Fix it\n\ndetails\n\n## Discussion (3 comments)\n\n")
+        assert "**@alice** (2026-08-30): Actually the repro is `make check`." in text
+        assert "**@carol** (2026-09-01): Agreed; ship it." in text
+        assert "## Linked issues\n- #123 (closed) — The earlier fix: We did it this way.\n" in text
+        assert "- #9 (open pull request) — API reshape\n" in text
+        assert text.endswith(
+            "---\nThis work item came from: GitHub issue #4 in o/r (https://x/issues/4)."
+        )
+        # Without a GitHub client the loop has no identity to hand the
+        # source: it asks with the unknown one rather than not at all.
+        assert h.source.asked == [("gh:issue:4", ("", None))]
+
+    def test_the_loops_identity_is_handed_to_the_source(self, tmp_path: Path) -> None:
+        """With a GitHub client the loop resolves who it is — the App slug
+        here — so the source can leave its comments out; a client that
+        cannot answer costs the run nothing but that exclusion."""
+
+        class Provisioner:
+            login: str | None = "sbxloop[bot]"
+
+            def gh_bot_login(self, repo: str | None = None) -> str | None:
+                return self.login
+
+        class Ops:
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                raise WorkerError("sandbox gone")
+
+        class Github:
+            provisioner = Provisioner()
+            failures: list[str] = []  # noqa: RUF012 - per-test scripting
+
+            def ops(self) -> Any:
+                return Ops()
+
+            def note_failure(self, exc: BaseException) -> bool:
+                self.failures.append(str(exc))
+                return False
+
+        h = self.harness(tmp_path)
+        h.loop.github = Github()  # type: ignore[assignment]
+        h.loop.outcome_text(gh_item("4"))
+        assert h.source.asked[-1] == ("gh:issue:4", ("sbxloop[bot]", True))
+        assert Github.failures == []
+        Github.provisioner.login = None
+        text = h.loop.outcome_text(gh_item("4"))
+        assert h.source.asked[-1] == ("gh:issue:4", ("", None))
+        assert Github.failures == ["sandbox gone"]
+        assert "**@alice**" in text
+
+    def test_omitted_comments_are_counted(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path)
+        h.source.context = h.source.context._replace(omitted=7, linked=())
+        text = h.loop.outcome_text(gh_item("4"))
+        assert (
+            "## Discussion (10 comments)\n\n(7 earlier comments omitted; the latest are shown)"
+            in text
+        )
+        assert "Linked issues" not in text
+
+    def test_the_budget_cuts_the_discussion_and_says_so(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path, outcome_max_chars=1_000)
+        h.source.context = h.source.context._replace(
+            comments=tuple(IssueComment("alice", "2026-08-30", "x" * 300) for _ in range(6))
+        )
+        body = "b" * 200
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body=body))
+        assert len(text) <= 1_000
+        assert text.startswith(f"Fix it\n\n{body}\n\n## Discussion (6 comments)")
+        assert "(discussion clipped by [budgets] outcome_max_chars=1000: " in text
+        assert "chars not shown — the issue on GitHub has the rest)" in text
+        assert text.endswith(
+            "This work item came from: GitHub issue #4 in o/r (https://x/issues/4)."
+        )
+        # Linked issues sit after the discussion, so they are what the cut takes first.
+        assert "Linked issues" not in text
+
+    def test_the_body_is_never_cut_even_past_the_budget(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path, outcome_max_chars=1_000)
+        body = "b" * 1_500
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body=body))
+        assert body in text
+        assert "(discussion clipped by [budgets] outcome_max_chars=1000: " in text
+        assert "**@alice**" not in text
+
+    def test_an_unreadable_discussion_is_said_not_hidden(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path)
+        h.source.fail = SbxError("github op raw.api failed: HTTP 502")
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body="details"))
+        assert text.startswith(
+            "Fix it\n\ndetails\n\n(The issue's comments could not be read — SbxError: "
+        )
+        assert "HTTP 502" in text and "the title and body above are the whole ask" in text
+        assert text.endswith("(https://x/issues/4).")
 
     def test_item_config_pins_the_issue_and_nothing_else(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(

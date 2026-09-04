@@ -883,7 +883,15 @@ bug into work in **one hop**: `create_issue` files the issue in the
 configured repo with a self-contained title and body *and* the
 `sbxloop:run` label, and the daemon claims it on its next poll (backlog
 capture, triage notes and canaries take the explicit opt-in path instead —
-filed with no trigger label, left for `label_issue_for_run`). There is
+filed with no trigger label, left for `label_issue_for_run`). What the run
+then reads is the whole issue, not just its title and body: the comments
+under it (minus the loop's own claim and status comments, and its identity's
+where it can resolve one) and the issues and pull requests they link to — on
+a real tracker the body is a one-liner and the repro, the maintainer's
+scoping and "do it the way #123 did" live in the thread. The discussion is
+capped at `[budgets] outcome_max_chars` (16,000 characters; the body is
+never cut, and the cut is marked), and a thread that could not be read is
+said so in the outcome rather than silently missing. There is
 no triage lane in between — which is why the concierge writes a body a
 fresh clone can act on, and why the channel is the access boundary. That
 body is **symptom-first**: what the person observes today in their own
@@ -1822,7 +1830,7 @@ The notable knobs:
 | `[github] api_url`                                        | api.github.com     | The GitHub REST root — GitHub Enterprise Server: `https://ghe.example.com/api/v3`. One source of truth for the REST transport, App auth, `gh` (`GH_HOST`) and both sandboxes' network allows; a `GH_HOST` in the daemon's environment that names another host is refused at config load. FIELD-UNVERIFIED on GHES.                                                 |
 | `[landing]`                                               | see above          | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`, `ignore_reviewers`.                                                     |
 | `[artifacts] exclude`                                     | see above          | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                            |
-| `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`, `max_parallel_tasks`, `repo_context_max_chars`.                                                                                                                                                                                |
+| `[budgets]`                                               | see above          | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`, `max_parallel_tasks`, `repo_context_max_chars`, `outcome_max_chars`.                                                                                                                                                           |
 | `[limits]`                                                | `85` / `95` / `90` | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                                                                                                                                                                                                    |
 | `[daemon] trigger_label` … `gated_label`                  | `sbxloop:run` …    | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`, `gated_label`; each can be renamed per `[[github.repos]]` entry. `sbxloop init-repo` creates them.                                                                                                                                                     |
 | `[daemon] max_runs_per_day`                               | `12`               | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there.                                                                                                                                                                                                                                                       |
