@@ -75,9 +75,13 @@ destroyed.
     gets added, not `pip install`.
   - **JavaScript/Node** — install from the directory holding
     `package.json`; `node_modules/` is project-local, so nothing needs a
-    global install. `npm ci` is the reproducible install but fails without
-    a lockfile — use `npm install` when you are creating the project and no
-    lockfile exists yet.
+    global install. Use the client the lockfile names: `pnpm-lock.yaml` →
+    `pnpm install`, `yarn.lock` → `yarn install`, `bun.lock` → `bun install`, otherwise `npm ci` — installing with a different client
+    ignores the lockfile and rewrites it. `pnpm` and `yarn` are on PATH
+    through corepack and run the version `packageManager` pins. `npm ci`
+    is the reproducible install but fails without a lockfile — use `npm install` when you are creating the project and no lockfile exists yet.
+    Run project dev binaries through the project (`npx --no-install eslint .`, or the package.json script via `npm run` / `pnpm run` /
+    `yarn run` / `bun run`), never bare `eslint`/`jest`/`tsc`.
   - **TypeScript** — run `npx tsc --noEmit` from the directory holding
     `tsconfig.json`; run anywhere else it checks nothing and still exits 0.
     A passing type-check and a passing test run are two different things —

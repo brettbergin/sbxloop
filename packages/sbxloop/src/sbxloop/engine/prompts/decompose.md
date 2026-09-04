@@ -106,8 +106,12 @@ worker, not by retries — has done the wrong thing correctly.
   flips — `uv run pytest` (`uv run …`) is required and `.venv/bin/...` is
   rejected, because uv builds the locked environment itself. Ruby:
   `bundle exec rspec`, never bare `rspec`/`rake`. PHP:
-  `./vendor/bin/phpunit`, never bare `phpunit`. Go/Rust/.NET/Node commands
-  are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
+  `./vendor/bin/phpunit`, never bare `phpunit`. JavaScript: the client
+  and its scripts (`npm test`, `pnpm run lint`, `yarn run lint`,
+  `bun run lint` — whichever client the lockfile names) or
+  `npx --no-install <bin>`, never bare `eslint`/`jest`/`vitest`/`tsc`/
+  `prettier`/`mocha`. Go/Rust/.NET commands are correctly bare
+  (`go test`, `cargo test`, `dotnet test`).
   Never `sudo` or `apt` in a verify command: verification checks the work,
   it does not build the environment. Never `gh`, and never `curl`/`wget`
   against anything but a local address: a verify command judges the

@@ -84,6 +84,20 @@ LANGUAGE_RULES: dict[str, LanguageRule] = {
             "binaries are not on PATH"
         ),
     ),
+    # The package-manager clients themselves (npm, npx, pnpm, yarn, bun,
+    # node) are the prefix, so they stay bare-legal; the dev binaries a
+    # project pins in devDependencies are what must not be (#684).
+    "javascript": LanguageRule(
+        commands=frozenset({"eslint", "jest", "vitest", "tsc", "prettier", "mocha"}),
+        remedy=(
+            "run it through the project's own dependencies: `npx --no-install "
+            "<bin>` or the package.json script via its runner (`npm run lint`, "
+            "`pnpm run lint`, `yarn run lint`, `bun run lint` — whichever "
+            "client the lockfile names). A bare binary resolves to a global "
+            "(the sandbox's global `tsc`, or nothing at all) instead of the "
+            "version the project pins"
+        ),
+    ),
 }
 
 # The uv-project variant of the Python rule. Same bare names are wrong, the
@@ -364,20 +378,20 @@ def _target_gate(
     return None
 
 
-def _make_gate(workspace: Path) -> str | None:
+def _make_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     # GNU make's own search order.
     return _target_gate(
         workspace, ("GNUmakefile", "makefile", "Makefile"), r"^{target}\s*:", "make {target}"
     )
 
 
-def _just_gate(workspace: Path) -> str | None:
+def _just_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     return _target_gate(
         workspace, ("justfile", ".justfile", "Justfile"), r"^{target}\s*:", "just {target}"
     )
 
 
-def _task_gate(workspace: Path) -> str | None:
+def _task_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     # Taskfile targets are YAML keys under `tasks:`, so a two-space indent is
     # the shape rather than a line start.
     return _target_gate(
@@ -385,7 +399,7 @@ def _task_gate(workspace: Path) -> str | None:
     )
 
 
-def _rake_gate(workspace: Path) -> str | None:
+def _rake_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     # `task :ci do`, `task ci: [...]`, `task "check" => ...`, `task default:`.
     return _target_gate(
         workspace,
@@ -412,17 +426,24 @@ def _json_object(path: Path, key: str) -> dict[str, Any] | None:
 # first: corepack's `packageManager` declaration, then the lockfile. `npm
 # run` in a pnpm workspace fails outright on `workspace:` dependencies, so
 # it would be a gate the executor cannot satisfy.
+# The client each lockfile names, and the explicit `<client> run` form for
+# each: `yarn run lint` rather than `yarn lint`, so the script name can never
+# collide with a yarn subcommand (#684). pnpm and yarn ride on the corepack
+# shims the `javascript` toolchain enables; bun is its own toolchain entry
+# (`bun` in the resolved language set), which is why the runner takes the
+# set — a `bun run` on a sandbox that has no bun is not a runnable gate.
 _LOCKFILE_CLIENTS: tuple[tuple[str, str], ...] = (
-    ("pnpm-lock.yaml", "pnpm run"),
+    ("pnpm-lock.yaml", "pnpm"),
     ("yarn.lock", "yarn"),
-    ("bun.lockb", "bun run"),
-    ("bun.lock", "bun run"),
+    ("bun.lockb", "bun"),
+    ("bun.lock", "bun"),
 )
-_PACKAGE_MANAGER_CLIENTS = {"pnpm": "pnpm run", "yarn": "yarn", "bun": "bun run", "npm": "npm run"}
+_PACKAGE_MANAGER_CLIENTS = frozenset({"pnpm", "yarn", "bun", "npm"})
 
 
-def node_script_runner(workspace: Path) -> str:
-    """How to run a script declared in ``workspace``'s package.json."""
+def _node_package_client(workspace: Path) -> str:
+    """The package-manager client the workspace names: the ``packageManager``
+    pin first (it is what corepack honours), then the lockfile."""
     text = _read(workspace / "package.json")
     if text is not None:
         try:
@@ -432,24 +453,38 @@ def node_script_runner(workspace: Path) -> str:
         if isinstance(declared, str):
             name = declared.split("@", 1)[0].strip()
             if name in _PACKAGE_MANAGER_CLIENTS:
-                return _PACKAGE_MANAGER_CLIENTS[name]
+                return name
     for lockfile, client in _LOCKFILE_CLIENTS:
         if (workspace / lockfile).is_file():
             return client
-    return "npm run"
+    return "npm"
 
 
-def _npm_gate(workspace: Path) -> str | None:
+def node_script_runner(workspace: Path, languages: Sequence[str] | None = None) -> str:
+    """How to run a script declared in ``workspace``'s package.json.
+
+    ``languages`` is the run's resolved toolchain set; a workspace naming
+    bun on a sandbox whose set lacks it (an explicit ``languages`` that left
+    it out) falls back to ``npm run``, the one client every Node sandbox
+    has. None consults nothing but the workspace.
+    """
+    client = _node_package_client(workspace)
+    if client == "bun" and languages is not None and "bun" not in languages:
+        client = "npm"
+    return f"{client} run"
+
+
+def _npm_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     scripts = _json_object(workspace / "package.json", "scripts")
     if scripts is None:
         return None
     for target in GATE_TARGETS:
         if target in scripts:
-            return f"{node_script_runner(workspace)} {target}"
+            return f"{node_script_runner(workspace, languages)} {target}"
     return None
 
 
-def _composer_gate(workspace: Path) -> str | None:
+def _composer_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     scripts = _json_object(workspace / "composer.json", "scripts")
     if scripts is None:
         return None
@@ -459,17 +494,17 @@ def _composer_gate(workspace: Path) -> str | None:
     return None
 
 
-def _tox_gate(workspace: Path) -> str | None:
+def _tox_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     # tox and nox declare the whole matrix in one file; running the bare
     # command IS the gate, so presence is the whole signal.
     return "tox" if (workspace / "tox.ini").is_file() else None
 
 
-def _nox_gate(workspace: Path) -> str | None:
+def _nox_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     return "nox" if (workspace / "noxfile.py").is_file() else None
 
 
-def _gradle_gate(workspace: Path) -> str | None:
+def _gradle_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     # `check` is Gradle's built-in lifecycle gate; the wrapper script is the
     # declaration of how to run it (and the only Gradle the sandbox has —
     # the java toolchain ships Maven, not Gradle).
@@ -480,7 +515,7 @@ def _gradle_gate(workspace: Path) -> str | None:
     return None
 
 
-def _maven_gate(workspace: Path) -> str | None:
+def _maven_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     # `verify` is Maven's lifecycle gate; a wrapper is preferred when the
     # project ships one, else the toolchain's mvn.
     if not (workspace / "pom.xml").is_file():
@@ -488,7 +523,7 @@ def _maven_gate(workspace: Path) -> str | None:
     return "./mvnw -q verify" if (workspace / "mvnw").is_file() else "mvn -q verify"
 
 
-def _cargo_alias_gate(workspace: Path) -> str | None:
+def _cargo_alias_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     for name in (".cargo/config.toml", ".cargo/config"):
         text = _read(workspace / name)
         if text is None:
@@ -511,15 +546,15 @@ def _cargo_alias_gate(workspace: Path) -> str | None:
 # is the declaration, and the command is satisfiable by construction on the
 # toolchain that manifest resolved. Go has no task-runner convention at all,
 # which is why it is here and not above.
-def _go_gate(workspace: Path) -> str | None:
+def _go_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     return "go vet ./... && go test ./..." if (workspace / "go.mod").is_file() else None
 
 
-def _cargo_gate(workspace: Path) -> str | None:
+def _cargo_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     return "cargo test" if (workspace / "Cargo.toml").is_file() else None
 
 
-def _dotnet_gate(workspace: Path) -> str | None:
+def _dotnet_gate(workspace: Path, languages: Sequence[str] | None = None) -> str | None:
     # `dotnet test` needs exactly one solution or project file in the
     # directory to know what to build.
     try:
@@ -542,9 +577,11 @@ class GateDetector:
     the run's resolved set (#624) for the command to be runnable at all.
     Rule: a detector may only emit a command the resolved toolchain can
     run — a gate the executor cannot invoke is unsatisfiable, not strict.
+    Every detector receives the resolved set for that reason; only the
+    npm one consults it (a bun lockfile on a sandbox without bun, #684).
     """
 
-    detect: Callable[[Path], str | None]
+    detect: Callable[[Path, Sequence[str] | None], str | None]
     language: str | None = None
 
 
@@ -603,7 +640,7 @@ def project_gate(
             and detector.language not in languages
         ):
             continue
-        gate = detector.detect(workspace)
+        gate = detector.detect(workspace, languages)
         if gate:
             return gate
     return None
@@ -1063,11 +1100,16 @@ _RUNNER_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("hatch", "run"),
     ("pipenv", "run"),
     ("npx",),
+    ("npx", "--no-install"),
     ("npm", "exec"),
     ("pnpm", "exec"),
+    ("pnpm", "run"),
     ("pnpm",),
     ("yarn", "run"),
     ("yarn",),
+    ("bun", "run"),
+    ("bun", "x"),
+    ("bunx",),
     ("bundle", "exec"),
     ("dotnet", "tool", "run"),
     ("dotnet",),
