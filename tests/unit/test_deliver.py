@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,13 @@ from typing import Any
 import pytest
 
 from sbxloop import hostgit
-from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
+from sbxloop.deliver import (
+    _plan_git_diff,
+    _plan_snapshot,
+    branch_name,
+    deliver_workspace,
+    ensure_repository,
+)
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
@@ -771,6 +778,71 @@ class TestGitDiffDelivery:
         deliver(ops, clone)
         assert "keep.txt" in [e["path"] for e in tree_entries(ops)]
         assert "**Files (" in ops.pr_kwargs["body"]
+
+
+class TestSnapshotModes:
+    """#695: a snapshot delivery records what is on disk — exec bits and
+    symlinks — the same way the git-diff plan does, instead of writing
+    ``100644`` for everything and de-linking every symlink."""
+
+    def make_workspace(self, tmp_path: Path) -> Path:
+        root = tmp_path / "ws"
+        (root / "bin").mkdir(parents=True)
+        (root / "bin" / "run").write_text("#!/bin/sh\necho hi\n")
+        (root / "bin" / "run").chmod(0o755)
+        (root / "config.yml").write_text("a: 1\n")
+        (root / "shared").mkdir()
+        (root / "shared" / "settings.yml").write_text("b: 2\n")
+        (root / "config.link.yml").symlink_to("config.yml")
+        (root / "settings").symlink_to("shared")  # a directory symlink
+        (root / "dangling").symlink_to("nowhere")
+        return root
+
+    def test_snapshot_keeps_exec_bits_and_symlinks(self, tmp_path: Path) -> None:
+        root = self.make_workspace(tmp_path)
+        ops = StubOps()
+        deliver(ops, root)
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert set(by_path) == {
+            "bin/run",
+            "config.link.yml",
+            "config.yml",
+            "dangling",
+            "settings",
+            "shared/settings.yml",
+        }
+        assert by_path["bin/run"]["mode"] == "100755"
+        assert by_path["config.yml"]["mode"] == "100644"
+        assert by_path["config.link.yml"]["mode"] == "120000"
+        assert by_path["settings"]["mode"] == "120000"
+        assert by_path["dangling"]["mode"] == "120000"
+        # a symlink uploads its target string, not what it points at
+        uploaded = {
+            e["path"]: base64.b64decode(e["content_b64"])
+            for batch in ops.blob_batches
+            for e in batch
+        }
+        assert uploaded["config.link.yml"] == b"config.yml"
+        assert uploaded["settings"] == b"shared"
+        assert uploaded["dangling"] == b"nowhere"
+        assert uploaded["config.yml"] == b"a: 1\n"
+        assert "**Files (6):**" in ops.pr_kwargs["body"]
+
+    def test_the_two_plans_agree_on_modes(self, tmp_path: Path) -> None:
+        """The same tree delivered as a snapshot and as a git diff produces
+        the same modes and contents — one builder, not two."""
+        root = self.make_workspace(tmp_path)
+        snapshot = _plan_snapshot(root, [])
+        clone, base_sha = make_clone_workspace(tmp_path)
+        for name in ("bin", "shared"):
+            shutil.copytree(root / name, clone / name)
+        for name in ("config.yml", "config.link.yml", "settings", "dangling"):
+            shutil.copy(root / name, clone / name, follow_symlinks=False)
+        diff = _plan_git_diff(clone, base_sha, [])
+        assert diff is not None
+        snap = {e["path"]: e["mode"] for e in snapshot.entries}
+        assert {e["path"]: e["mode"] for e in diff.entries if e["path"] in snap} == snap
+        assert {p: diff.uploads[p] for p in snap} == snapshot.uploads
 
 
 class TestSubmoduleDelivery:

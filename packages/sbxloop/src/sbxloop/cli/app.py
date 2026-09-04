@@ -468,7 +468,7 @@ def _artifacts_tree(root: Path, files: list[Path], cap: int = _TREE_MAX_FILES) -
             if child not in nodes:
                 nodes[child] = nodes[parent].add(f"{part}/")
             parent = child
-        nodes[parent].add(f"{rel.name} [dim]({_human_size(path.stat().st_size)})[/]")
+        nodes[parent].add(f"{rel.name} [dim]({_human_size(path.lstat().st_size)})[/]")
     if len(files) > cap:
         tree.add(f"[dim]… +{len(files) - cap} more[/]")
     return tree
@@ -1016,7 +1016,8 @@ def artifacts(
         console.print(_artifacts_tree(target, files))
     else:
         for file in files:
-            size = _human_size(file.stat().st_size)
+            # lstat: a symlink lists as itself, even one that does not resolve
+            size = _human_size(file.lstat().st_size)
             console.print(f"  {file.relative_to(target)}  [dim]{size}[/]")
     if scan.excluded_note:
         console.print(f"  [dim]{scan.excluded_note}[/]")
