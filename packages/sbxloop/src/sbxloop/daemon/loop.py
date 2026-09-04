@@ -1612,6 +1612,7 @@ class DaemonLoop:
                     base_ref,
                     cfg=self.config.landing,
                     advisory_spent=self.store.advisory_rounds(run_id),
+                    number=gate.pr_number,
                 ),
                 bot_round_spent=self.store.bot_round_spent(run_id),
             )

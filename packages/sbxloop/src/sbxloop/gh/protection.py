@@ -16,6 +16,14 @@ required checks and the review count: a base that wants a code-owner
 review, approval of the last push, signed commits, linear history, a
 merge queue or a deployment refuses the loop's merge with a bare 405, and
 :meth:`BaseRequirements.blockers` is how the loop and doctor say *which*.
+
+Classic protection being admin-only to read is the common case for an
+organization bot — write, not admin — and "unknown" there used to gate on
+every check, undoing the baseline comparison on exactly the repositories
+it was built for (#674). GitHub itself says which of a pull request's
+checks it holds the merge for, readable with pull access:
+:func:`with_pr_rollup` fills the required set from the PR's own rollup
+when a source could not be read.
 """
 
 from __future__ import annotations
@@ -53,6 +61,10 @@ class BaseRequirements(NamedTuple):
     the last pusher, so no approval can ever satisfy it.
     ``required_deployments`` names the environments a deployment must
     succeed in before the merge.
+
+    ``unread`` names the sources that could not be read (``protection``,
+    ``rulesets``), so a reason or a doctor row can say which — and why:
+    classic protection needs admin.
     """
 
     required_contexts: tuple[str, ...] | None
@@ -66,6 +78,7 @@ class BaseRequirements(NamedTuple):
     signed_commits: bool = False
     merge_queue: bool = False
     required_deployments: tuple[str, ...] = ()
+    unread: tuple[str, ...] = ()
 
     @property
     def requires_reviews(self) -> bool | None:
@@ -166,7 +179,10 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
     approvals: int | None = max(counts) if counts else (0 if both else None)
     flags = _pool(classic.requirements, rules.requirements)
     if not both:
-        return BaseRequirements(None, approvals, "unknown", *flags)
+        unread = tuple(
+            name for name, r in (("protection", classic), ("rulesets", rules)) if not r.known
+        )
+        return BaseRequirements(None, approvals, "unknown", *flags)._replace(unread=unread)
     contexts = tuple(dict.fromkeys([*classic.contexts, *rules.contexts]))
     sources = [
         name
@@ -174,6 +190,31 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
         if found
     ]
     return BaseRequirements(contexts, approvals, "+".join(sources) or "none", *flags)
+
+
+def with_pr_rollup(
+    ops: Any, repo: str, number: int, requirements: BaseRequirements
+) -> BaseRequirements:
+    """``requirements`` with the required checks GitHub reports on the pull
+    request itself when a source could not be read (#674).
+
+    ``ops`` needs ``pr_required_checks(repo, number)``. The rollup lists
+    only what has reported on the head, so this is asked again as checks
+    arrive, and an empty answer gates on everything as before — the
+    fallback in the safe direction. Rules other than checks stay as the
+    readable source declared them; ``source`` becomes ``pr-rollup``.
+    Nothing here raises: an unreadable rollup leaves the requirements
+    unknown, as they were.
+    """
+    if requirements.required_contexts is not None:
+        return requirements
+    try:
+        contexts = ops.pr_required_checks(repo, number)
+    except Exception as exc:  # nosec B110 - advisory probe; the fallback is "gate on all"
+        log.info("protection.rollup_unreadable", repo=repo, pr=number, error=str(exc))
+        return requirements
+    log.info("protection.required_from_pr", repo=repo, pr=number, required=list(contexts))
+    return requirements._replace(required_contexts=tuple(contexts), source="pr-rollup")
 
 
 def _pool(a: BaseRequirements, b: BaseRequirements) -> tuple[Any, ...]:

@@ -14,7 +14,10 @@ merge decision need, and it has two halves:
 
 * **Does it gate?** The base's protection and rulesets say which contexts
   must be green (:mod:`sbxloop.gh.protection`); the rest are advisory.
-  A base that declares none — or whose rules cannot be read — gates on
+  When those cannot be read — classic protection is admin-only, and an
+  organization bot is rarely admin — the pull request's own rollup says
+  which of its checks GitHub holds the merge for (#674). A base that
+  declares none — or that cannot be read either way — gates on
   everything, which is what the loop always did. Gating reds get the full
   ``max_ci_rounds``; an advisory regression gets one round and is then
   merged over and named, so a non-human signal never blocks a landing.
@@ -34,7 +37,7 @@ from typing import Any, NamedTuple
 from sbxloop.config import LandingConfig
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import CheckState, ChecksVerdict, GithubOps, approval_summary
-from sbxloop.gh.protection import BaseRequirements, read_base_requirements
+from sbxloop.gh.protection import BaseRequirements, read_base_requirements, with_pr_rollup
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -259,18 +262,26 @@ def check_policy_reader(
     *,
     cfg: LandingConfig,
     advisory_spent: Container[str] = frozenset(),
+    number: int | None = None,
 ) -> PolicyFor:
     """A :data:`PolicyFor` that reads the base's requirements once and the
     baseline once per head it is asked about — ``land()`` asks per poll,
-    and the head only moves on a re-delivery or an update-branch."""
+    and the head only moves on a re-delivery or an update-branch.
+
+    When the base's rules could not be read and ``number`` names the pull
+    request, the required set comes from the PR's own rollup instead
+    (#674) — re-read on every ask, since the rollup only lists what has
+    reported on the head so far and a required check may still be on its
+    way.
+    """
     requirements: BaseRequirements | None = None
     policies: dict[str, CheckPolicy] = {}
 
     def policy_for(head: str) -> CheckPolicy:
         nonlocal requirements
+        if requirements is None:
+            requirements = read_base_requirements(ops, repo, base)
         if head not in policies:
-            if requirements is None:
-                requirements = read_base_requirements(ops, repo, base)
             policies[head] = read_check_policy(
                 ops,
                 repo,
@@ -280,7 +291,10 @@ def check_policy_reader(
                 advisory_spent=advisory_spent,
                 requirements=requirements,
             )
-        return policies[head]
+        policy = policies[head]
+        if number is not None and requirements.required_contexts is None:
+            return policy._replace(requirements=with_pr_rollup(ops, repo, number, requirements))
+        return policy
 
     return policy_for
 

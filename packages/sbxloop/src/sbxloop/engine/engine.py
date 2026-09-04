@@ -61,7 +61,7 @@ from pydantic import ValidationError
 from sbxloop import hostgit
 from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_dotenv_file
 from sbxloop.deliver import deliver_workspace, ensure_repository, render_naming
-from sbxloop.engine.checks import CheckJudgment, check_policy_reader, read_check_policy
+from sbxloop.engine.checks import CheckJudgment, check_policy_reader
 from sbxloop.engine.followups import (
     Candidate,
     checklist_comment,
@@ -2494,14 +2494,6 @@ class LoopEngine:
                 HostEventTypes.CI_STATUS, run_id, pr=run.pr_number, round=round_no, **data
             )
 
-        policy = read_check_policy(
-            ops,
-            repo,
-            self._base_branch(p),
-            run.head_sha,
-            cfg=self.config.landing,
-            advisory_spent=self.store.advisory_rounds(run_id),
-        )
         try:
             checks = poll_checks(
                 ops,
@@ -2512,7 +2504,14 @@ class LoopEngine:
                 emit=emit,
                 clock=self.clock,
                 settle_from=p.delivered_at,
-                policy=policy,
+                policy_for=check_policy_reader(
+                    ops,
+                    repo,
+                    self._base_branch(p),
+                    cfg=self.config.landing,
+                    advisory_spent=self.store.advisory_rounds(run_id),
+                    number=run.pr_number,
+                ),
             )
         except CiTimeout as exc:
             return Blocked(str(exc))
@@ -2577,6 +2576,7 @@ class LoopEngine:
                 self._base_branch(p),
                 cfg=self.config.landing,
                 advisory_spent=self.store.advisory_rounds(run_id),
+                number=number,
             ),
             bot_round_spent=self.store.bot_round_spent(run_id),
         )

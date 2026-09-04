@@ -561,6 +561,47 @@ def _review_threads_connection(payload: Any) -> dict[str, Any]:
     return nodes if isinstance(nodes, dict) else {}
 
 
+def _rollup_connection(payload: Any) -> dict[str, Any]:
+    """The ``statusCheckRollup.contexts`` connection of the PR's last
+    commit, or ``{}`` when the commit has no rollup yet (nothing has
+    reported on it — GitHub serves ``null``, not an empty connection)."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repository = data.get("repository") if isinstance(data, dict) else None
+    pr = repository.get("pullRequest") if isinstance(repository, dict) else None
+    commits = pr.get("commits") if isinstance(pr, dict) else None
+    nodes = commits.get("nodes") if isinstance(commits, dict) else None
+    first = nodes[0] if isinstance(nodes, list) and nodes else None
+    commit = first.get("commit") if isinstance(first, dict) else None
+    rollup = commit.get("statusCheckRollup") if isinstance(commit, dict) else None
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    return contexts if isinstance(contexts, dict) else {}
+
+
+def rollup_next_cursor(payload: Any) -> str | None:
+    """The cursor of the rollup page after this one, or ``None`` on the last."""
+    info = _rollup_connection(payload).get("pageInfo")
+    if not isinstance(info, dict) or not info.get("hasNextPage"):
+        return None
+    cursor = info.get("endCursor")
+    return str(cursor) if cursor else None
+
+
+def fold_required_contexts(payload: Any) -> list[str]:
+    """The names of one rollup page's contexts GitHub marks ``isRequired``
+    for the pull request (#674): a check run's ``name`` or a status'
+    ``context`` — the shared namespace of #610. A node in a shape not
+    understood is skipped; it cannot be named, so it cannot be gated on."""
+    out: list[str] = []
+    entries = _rollup_connection(payload).get("nodes")
+    for node in entries if isinstance(entries, list) else []:
+        if not isinstance(node, dict) or node.get("isRequired") is not True:
+            continue
+        name = node.get("name") or node.get("context")
+        if name:
+            out.append(str(name))
+    return out
+
+
 def review_threads_next_cursor(payload: Any) -> str | None:
     """The cursor of the page after this one, or ``None`` on the last."""
     info = _review_threads_connection(payload).get("pageInfo")
@@ -1134,6 +1175,60 @@ class GithubOps:
         raise PaginationError(
             f"{repo}#{number} has more than {MAX_PAGES * 100} review threads; "
             "the list was not read to its end"
+        )
+
+    # Which of the checks on the PR's head GitHub itself would hold the
+    # merge for (#674). ``isRequired`` is evaluated against the pull
+    # request's base rules — classic protection and rulesets both — and is
+    # readable with pull access, unlike classic protection itself (admin
+    # only). Field-unverified beyond GitHub's schema: the argument is
+    # ``pullRequestNumber`` on both ``CheckRun`` and ``StatusContext``.
+    _ROLLUP_QUERY = (
+        "query($owner: String!, $name: String!, $number: Int!, $cursor: String) { "
+        "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+        "commits(last: 1) { nodes { commit { oid statusCheckRollup { "
+        "contexts(first: 100, after: $cursor) { "
+        "pageInfo { hasNextPage endCursor } "
+        "nodes { __typename "
+        "... on CheckRun { name isRequired(pullRequestNumber: $number) } "
+        "... on StatusContext { context isRequired(pullRequestNumber: $number) } "
+        "} } } } } } } }"
+    )
+
+    def pr_required_checks(self, repo: str, number: int) -> tuple[str, ...]:
+        """The checks on the PR's last commit that GitHub marks required
+        for this pull request, across every page of the rollup (#674).
+
+        Only what has *reported* on the head appears in a rollup: a
+        required check that has not started yet is not in the answer, and
+        an empty tuple means "none of what has reported is required" —
+        which, before anything reports, is no answer at all. Callers ask
+        again as checks arrive.
+        """
+        owner, _, name = repo.partition("/")
+        required: list[str] = []
+        cursor: str | None = None
+        for _ in range(MAX_PAGES):
+            data = self.raw(
+                "POST",
+                "/graphql",
+                {
+                    "query": self._ROLLUP_QUERY,
+                    "variables": {"owner": owner, "name": name, "number": number, "cursor": cursor},
+                },
+            )
+            if not isinstance(data, dict):
+                raise GithubOpsError(f"statusCheckRollup returned a malformed result: {data!r}")
+            errors = data.get("errors")
+            if errors:
+                raise GithubOpsError(f"statusCheckRollup failed: {errors!r}")
+            required.extend(fold_required_contexts(data))
+            cursor = rollup_next_cursor(data)
+            if cursor is None:
+                return tuple(dict.fromkeys(required))
+        raise PaginationError(
+            f"{repo}#{number} has more than {MAX_PAGES * 100} checks on its head; "
+            "the required set was not read to its end"
         )
 
     # -- landing a pull request ---------------------------------------------

@@ -2327,6 +2327,47 @@ class TestPipeline:
         assert engine.store.advisory_rounds(result.run_id) == frozenset({"lint"})
         assert len(fake.issue_comments) >= 1
 
+    def test_a_non_admin_token_gates_only_on_what_the_pr_says_is_required(
+        self, harness: Harness
+    ) -> None:
+        """#674: classic protection 403s for a bot without admin and the
+        rulesets declare nothing; the PR's own rollup marks one of three
+        checks required, so only that one gates — the others are advisory,
+        as the baseline comparison of #611 intends."""
+        fake = FakeGithub()
+        fake.protection_forbidden = True
+        fake.rules = []
+        fake.rollup_required = ("ci",)
+        fake.checks = [ChecksVerdict("red", 3, ("docs",), ("lint",), ("ci",))]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 0})
+        result = engine.start("write, not admin")
+        assert result.state == "merged", result.reason
+        assert fake.rollup_calls >= 1
+        (status, *_rest) = self._events(harness, HostEventTypes.CI_STATUS)
+        assert status.data["source"] == "pr-rollup"
+        assert status.data["required"] == ["ci"]
+        assert status.data["regressions"] == ["lint"], "red, but the PR's own and not gating"
+        assert status.data["pending"] == [], "the advisory `docs` is not waited on"
+        assert any(
+            "`lint` — went red on this PR but is not required" in c for c in fake.issue_comments
+        )
+
+    def test_a_non_admin_token_without_a_rollup_gates_on_everything(self, harness: Harness) -> None:
+        """#674, the last fallback: nothing readable at all keeps the old
+        doctrine — every check gates, the red `lint` is the PR's to fix."""
+        fake = FakeGithub()
+        fake.protection_forbidden = True
+        fake.rollup_required = None
+        fake.checks = [ChecksVerdict("red", 3, ("docs",), ("lint",), ("ci",))]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 0})
+        result = engine.start("write, not admin, no rollup")
+        assert result.state != "merged"
+        assert "ci fix rounds exhausted" in result.reason
+        (status, *_rest) = self._events(harness, HostEventTypes.CI_STATUS)
+        assert status.data["source"] == "all"
+
     def test_a_required_check_red_on_the_base_is_fixed_and_the_brief_says_so(
         self, harness: Harness
     ) -> None:
