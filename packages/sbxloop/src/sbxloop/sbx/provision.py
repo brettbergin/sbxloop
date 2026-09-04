@@ -934,6 +934,7 @@ class Provisioner:
                 )
                 self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
                 self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
+                self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
                 return clone_dir
             if token:
                 why = (
@@ -953,7 +954,62 @@ class Provisioner:
             ) from exc
         self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
         self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
+        self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
         return clone_dir
+
+    def _populate_lfs(
+        self,
+        run_id: str,
+        clone_dir: Path,
+        *,
+        source: Path | None,
+        repo: str | None,
+        token: Callable[[], str | None],
+    ) -> None:
+        """Populate a fresh clone's Git LFS objects (#693) when its
+        ``.gitattributes`` route files through LFS, and say where they came
+        from. Never for a reused clone. ``token`` is asked for only when
+        something has to be fetched from the repository's LFS endpoint —
+        the endpoint being the run's repository on the configured GitHub;
+        a workspace-only run with no repository can only populate from the
+        host checkout's store."""
+        attributes = toolchains.lfs_attribute_files(clone_dir)
+        if not attributes:
+            return
+        if not self.config.sandbox.clone_lfs:
+            log.info(
+                "workspace.lfs_skipped",
+                run=run_id,
+                target=str(clone_dir),
+                attributes=list(attributes),
+                reason="[sandbox] clone_lfs = false; LFS-tracked files are pointer files",
+            )
+            return
+        lfs_url = (
+            hostgit.lfs_endpoint(f"{self.config.github.web_url}/{repo}")
+            if repo is not None
+            else None
+        )
+        population = hostgit.populate_lfs(
+            clone_dir,
+            source=source,
+            lfs_url=lfs_url,
+            token=token() if lfs_url is not None else None,
+        )
+        self.bus.emit(
+            "sandbox.workspace_lfs",
+            run_id,
+            target=str(clone_dir),
+            attributes=list(attributes),
+            files=population.files,
+            linked=population.linked,
+            fetched=population.fetched,
+            message=(
+                f"populated Git LFS: {population.files} tracked file(s), "
+                f"{population.linked} object(s) from the host checkout, "
+                f"{population.fetched} fetched" + (f" from {lfs_url}" if population.fetched else "")
+            ),
+        )
 
     def _populate_submodules(
         self,
@@ -1114,6 +1170,13 @@ class Provisioner:
             run_id,
             clone_dir,
             source=source,
+            token=lambda: self._clone_token(repo) if repo is not None else None,
+        )
+        self._populate_lfs(
+            run_id,
+            clone_dir,
+            source=source,
+            repo=repo,
             token=lambda: self._clone_token(repo) if repo is not None else None,
         )
         return clone_dir

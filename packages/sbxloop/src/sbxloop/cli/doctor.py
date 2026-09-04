@@ -378,6 +378,36 @@ def workspace_origin_checks(config: Config) -> list[Check]:
     ]
 
 
+def host_lfs_check(config: Config) -> Check:
+    """Whether the host can populate a Git LFS checkout (#693).
+
+    A repository whose ``.gitattributes`` routes files through
+    ``filter=lfs`` provisions from the host's git-lfs; without it the run
+    fails closed at clone time. Soft: repositories that never use LFS are
+    unaffected, and ``[sandbox] clone_lfs = false`` opts out explicitly.
+    """
+    from sbxloop import hostgit
+
+    version = hostgit.lfs_version()
+    if version is not None:
+        return Check("host git-lfs", True, f"found {version}", hard=False)
+    if not config.sandbox.clone_lfs:
+        return Check(
+            "host git-lfs",
+            True,
+            "not on PATH; [sandbox] clone_lfs = false, so LFS-tracked files stay pointer files",
+            hard=False,
+        )
+    return Check(
+        "host git-lfs",
+        False,
+        "not on PATH — a repository whose .gitattributes uses filter=lfs fails to provision "
+        "until git-lfs is installed (apt install git-lfs / brew install git-lfs); set "
+        "[sandbox] clone_lfs = false to run with pointer files instead",
+        hard=False,
+    )
+
+
 REQUIRED_REPO_PERMISSIONS = ("issues", "contents", "pull_requests")
 
 
@@ -960,6 +990,8 @@ def collect_checks(
             hard=False,
         )
     )
+
+    checks.append(host_lfs_check(config))
 
     # state dir writable
     try:

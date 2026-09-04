@@ -680,22 +680,23 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         return None
     excluded: dict[str, int] = {}
     kept: list[hostgit.WorkspaceChange] = []
-    submodule_notes: list[str] = []
-    for change in hostgit.changes_since(source_dir, diff_base, notes=submodule_notes):
+    skipped_notes: list[str] = []
+    for change in hostgit.changes_since(source_dir, diff_base, notes=skipped_notes):
         hit = exclusion_hit(change.path.split("/"), exclude)
         if hit is None:
             kept.append(change)
         else:
             excluded[hit] = excluded.get(hit, 0) + 1
-    for note in submodule_notes:
+    for note in skipped_notes:
         # Work inside a submodule, or a gitlink at a commit nobody else can
         # fetch (#692): not the superproject's to deliver, said in the PR
         # body and the log rather than dropped in silence.
         log.warning("deliver.submodule_change_skipped", detail=note)
+    kept = _without_lfs_changes(source_dir, kept, skipped_notes)
     if not kept:
         why = f"{source_dir} has no changes relative to {diff_base[:12]}"
-        if submodule_notes:
-            why += " that can be delivered: " + "; ".join(submodule_notes)
+        if skipped_notes:
+            why += " that can be delivered: " + "; ".join(skipped_notes)
         raise DeliveryError(f"nothing to deliver: {why}")
     entries: list[dict[str, Any]] = []
     uploads: dict[str, bytes] = {}
@@ -726,7 +727,7 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         not_delivered.append(
             f"{sum(excluded.values())} file(s) excluded ({', '.join(sorted(excluded))})"
         )
-    not_delivered.extend(submodule_notes)
+    not_delivered.extend(skipped_notes)
     return DeliveryPlan(
         mode="git-diff",
         entries=entries,
@@ -735,6 +736,35 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         excluded_note="; ".join(not_delivered) or None,
         note=f"delivered as the workspace's git diff against `{diff_base[:12]}`",
     )
+
+
+def _without_lfs_changes(
+    source_dir: Path, changes: list[hostgit.WorkspaceChange], notes: list[str]
+) -> list[hostgit.WorkspaceChange]:
+    """Drop added/modified files that ``.gitattributes`` routes through
+    ``filter=lfs`` (#693). The delivery API writes blobs; a real-bytes
+    upload of an LFS-tracked path would commit the asset itself where the
+    repository expects a pointer, and this run pushes nothing to the LFS
+    store. Refused with a note rather than delivered wrong. Deletions still
+    deliver — dropping a pointer needs no object behind it."""
+    candidates = [c.path for c in changes if c.status != "deleted" and not c.is_gitlink]
+    if not candidates:
+        return changes
+    tracked = set(hostgit.lfs_tracked(source_dir, candidates))
+    if not tracked:
+        return changes
+    kept: list[hostgit.WorkspaceChange] = []
+    for change in changes:
+        if change.path not in tracked:
+            kept.append(change)
+            continue
+        note = (
+            f"LFS-tracked file `{change.path}` is not delivered: .gitattributes routes it "
+            "through filter=lfs, and this run does not push objects to the repository's LFS store"
+        )
+        notes.append(note)
+        log.warning("deliver.lfs_change_skipped", path=change.path, status=change.status)
+    return kept
 
 
 def _bootstrap_empty_repo(

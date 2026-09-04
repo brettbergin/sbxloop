@@ -8,6 +8,7 @@ independent of the code under test.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -1460,3 +1461,153 @@ class TestSubmoduleHosts:
     )
     def test_url_host(self, url: str, host: str | None) -> None:
         assert hostgit.url_host(url) == host
+
+
+# -- Git LFS (#693) ----------------------------------------------------------
+
+
+needs_git_lfs = pytest.mark.skipif(
+    hostgit.lfs_version() is None, reason="git-lfs is not installed on this host"
+)
+
+
+def make_lfs_repo(tmp_path: Path, name: str = "app") -> tuple[Path, bytes]:
+    """A checkout whose ``*.bin`` files live in Git LFS, one committed
+    asset in its store. Returns (checkout, the asset's real bytes)."""
+    root = tmp_path / name
+    root.mkdir()
+    git("init", "-b", "main", cwd=root)
+    git("lfs", "install", "--local", cwd=root)
+    (root / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+    payload = bytes(range(256)) * 4
+    (root / "asset.bin").write_bytes(payload)
+    (root / "README").write_text("hi\n")
+    git("add", "-A", cwd=root)
+    git("commit", "-q", "-m", "init", cwd=root)
+    return root, payload
+
+
+def is_pointer(path: Path) -> bool:
+    return path.read_bytes().startswith(b"version https://git-lfs.github.com/spec/v1")
+
+
+@needs_git_lfs
+class TestLfs:
+    """#693: a run clone is cut with pointer files and populated from the
+    host checkout's store first, the repository's LFS endpoint second —
+    with the run's token, never the host's global git-lfs setup."""
+
+    @pytest.fixture
+    def remote(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_lfs"
+        ) as srv:
+            yield srv
+
+    def test_endpoint_is_the_dot_git_info_lfs_of_the_clone_url(self) -> None:
+        assert (
+            hostgit.lfs_endpoint("https://github.com/o/r") == "https://github.com/o/r.git/info/lfs"
+        )
+        assert (
+            hostgit.lfs_endpoint("https://github.com/o/r.git/")
+            == "https://github.com/o/r.git/info/lfs"
+        )
+
+    def test_a_run_clone_starts_on_pointer_files(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert is_pointer(clone / "asset.bin")
+
+    def test_populates_from_the_host_checkout_without_the_network(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, payload = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        population = hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert population == hostgit.LfsPopulation(files=1, linked=1, fetched=0)
+        assert (clone / "asset.bin").read_bytes() == payload
+        assert remote.lfs_requests == []
+        # the clone's own config carries the filters; the source is untouched
+        assert 'filter "lfs"' in (clone / ".git" / "config").read_text()
+        assert not hostgit.is_dirty(app)
+
+    def test_fetches_what_the_host_store_lacks_with_the_runs_token(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, payload = make_lfs_repo(tmp_path)
+        bare_from(app, tmp_path / "remotes", "o/app.git")
+        remote.seed_lfs(app)
+        url = f"{remote.url}/o/app.git"
+        clone = tmp_path / "run"
+        hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_lfs")
+        assert is_pointer(clone / "asset.bin")
+        population = hostgit.populate_lfs(
+            clone, source=None, lfs_url=hostgit.lfs_endpoint(url), token="ghs_lfs"
+        )
+        assert population == hostgit.LfsPopulation(files=1, linked=0, fetched=1)
+        assert (clone / "asset.bin").read_bytes() == payload
+        assert [p.rsplit("/", 1)[-1] for p in remote.lfs_requests][:1] == ["batch"]
+        assert "ghs_lfs" not in (clone / ".git" / "config").read_text()
+
+    def test_a_wrong_token_fails_closed(self, tmp_path: Path, remote: PrivateGitServer) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        bare_from(app, tmp_path / "remotes", "o/app.git")
+        remote.seed_lfs(app)
+        url = f"{remote.url}/o/app.git"
+        clone = tmp_path / "run"
+        hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_lfs")
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_lfs(
+                clone, source=None, lfs_url=hostgit.lfs_endpoint(url), token="wrong"
+            )
+        assert "1 Git LFS object(s)" in str(excinfo.value)
+        assert "clone_lfs = false" in str(excinfo.value)
+
+    def test_missing_objects_with_no_endpoint_fail_closed(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        shutil.rmtree(app / ".git" / "lfs")  # a host checkout that never pulled
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert "asset.bin" in str(excinfo.value)
+        assert "no GitHub repository" in str(excinfo.value)
+
+    def test_without_git_lfs_on_the_host_it_names_the_package(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: None)
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert "apt install git-lfs" in str(excinfo.value)
+        assert "clone_lfs = false" in str(excinfo.value)
+
+    def test_a_populated_asset_is_not_a_change(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF)) == []
+        # a build that touches the file's mtime re-runs the clean filter,
+        # which hashes the bytes back to the committed pointer
+        os.utime(clone / "asset.bin")
+        assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF)) == []
+
+    def test_lfs_tracked_names_the_paths_gitattributes_routes(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        (clone / "new.bin").write_bytes(b"\x00" * 16)
+        (clone / "README").write_text("more\n")
+        assert hostgit.lfs_tracked(clone, ["new.bin", "README", "asset.bin"]) == [
+            "new.bin",
+            "asset.bin",
+        ]
+        assert hostgit.lfs_tracked(clone, []) == []

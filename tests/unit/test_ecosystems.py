@@ -60,6 +60,18 @@ EXPECTATIONS: dict[str, Expectation] = {
             ("uv run pytest -q", False),
         ),
     ),
+    # A Python project whose .gitattributes routes *.png through Git LFS
+    # (#693): git-lfs rides along as a workspace tool — resolved for the
+    # sandbox and the LFS hosts opened — without being a language.
+    "python-lfs": Expectation(
+        ("python", "git-lfs"),
+        "detected",
+        versions={"python": ("3.13", "pyproject.toml")},
+        allowed=("release-assets.githubusercontent.com", "github-cloud.githubusercontent.com"),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate=None,
+        lint=(("uv run pytest -q", False),),
+    ),
     # A pnpm monorepo: the root package.json fires javascript; the
     # workspace package's tsconfig.json, two levels down, fires typescript.
     "node-pnpm": Expectation(

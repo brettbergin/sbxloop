@@ -113,6 +113,19 @@ secret_strategy = "proxy"
 # repository); a submodule moved to a commit its remote has is delivered as
 # the moved pointer.
 # clone_submodules = true
+# Whether a run clone's Git LFS objects are populated. Default true: a
+# repository whose .gitattributes routes files through filter=lfs keeps its
+# fixtures and assets in LFS, and a run on the pointer files fails on the
+# first test that opens one. Objects come from the host checkout's own LFS
+# store where it has them, else from the repository's LFS endpoint with the
+# run's GitHub credential. Needs git-lfs installed on the host (apt install
+# git-lfs); a repository that uses LFS fails provisioning by name without
+# it. The agent sandbox gets git-lfs and egress to GitHub's LFS hosts
+# whenever the workspace uses LFS. Set false to run on the pointer files.
+# Either way a file the run adds or changes under an LFS attribute is left
+# out of the pull request and named in its "Not delivered" line rather than
+# committed as a plain blob.
+# clone_lfs = true
 # Toolchains preinstalled in the agent sandbox. Unset = whatever the
 # workspace's manifests declare (go.mod, package.json, Cargo.toml, ...),
 # Python when nothing is recognized. Setting it replaces detection.

@@ -62,8 +62,10 @@ __all__ = [
     "DEFAULT_LANGUAGES",
     "DETECT_DEPTH",
     "GIT",
+    "GIT_LFS",
     "SKIP_DIRS",
     "TOOLCHAINS",
+    "WORKSPACE_TOOLS",
     "LanguageResolution",
     "Toolchain",
     "ToolchainVersion",
@@ -71,6 +73,7 @@ __all__ = [
     "describe",
     "detect_languages",
     "install_domains",
+    "lfs_attribute_files",
     "normalize_language",
     "resolve",
     "resolve_languages",
@@ -1731,6 +1734,34 @@ GIT = Toolchain(
 
 BASELINE_TOOLS: tuple[Toolchain, ...] = (GIT,)
 
+# Workspace tooling (#693): provisioned when the *workspace* calls for it,
+# whatever `[sandbox] languages` says, and not selectable through it any
+# more than git is. A repository whose `.gitattributes` routes files
+# through `filter=lfs` keeps its binaries in Git LFS; the sandbox needs
+# `git lfs` for the clean filter behind `git status`/`git diff` in the run
+# clone (the host populates the objects before the run, see
+# `hostgit.populate_lfs`) and for whatever the agent does with those files.
+# `install_domains` here are not an installer's — the apt mirrors cover
+# that — but the hosts `git lfs` itself talks to on github.com: the batch
+# API answers on github.com (allowed already) and hands out object URLs on
+# these. An Enterprise Server serves its LFS store from its one host.
+GIT_LFS = Toolchain(
+    name="git-lfs",
+    wanted="git-lfs",
+    probe="git lfs version >/dev/null 2>&1",
+    apt_packages=("git-lfs",),
+    install_domains=(
+        "lfs.github.com",
+        "github-cloud.githubusercontent.com",
+        "media.githubusercontent.com",
+    ),
+)
+
+WORKSPACE_TOOLS: tuple[Toolchain, ...] = (GIT_LFS,)
+
+# The attribute a `.gitattributes` line carries for an LFS-tracked pattern.
+LFS_FILTER = "filter=lfs"
+
 # The claude agent backend's in-sandbox runtime (#533): the Claude Agent SDK
 # spawns the Claude Code CLI, which is not bundled with the pip package. Not
 # a `[sandbox] languages` entry — it is a backend prerequisite the worker
@@ -1764,6 +1795,10 @@ _BY_KEY: dict[str, Toolchain] = {}
 for _toolchain in TOOLCHAINS:
     for _key in (_toolchain.name, *_toolchain.aliases):
         _BY_KEY[_key] = _toolchain
+# What `resolve` answers to: the languages, plus the workspace tools a
+# resolution added by name (`resolve_languages`) — those are never in
+# `_BY_KEY`, so `[sandbox] languages` cannot name them.
+_RESOLVABLE: dict[str, Toolchain] = {**_BY_KEY, **{tool.name: tool for tool in WORKSPACE_TOOLS}}
 
 
 def supported_languages() -> tuple[str, ...]:
@@ -1789,14 +1824,19 @@ def resolve(
     names for that series; without it every entry is its default.
     """
     wanted: set[str] = set()
-    pending = [normalize_language(name) for name in names]
+    pending = [
+        name if name in _RESOLVABLE and name not in _BY_KEY else normalize_language(name)
+        for name in names
+    ]
     while pending:
         key = pending.pop()
         if key is None or key in wanted:
             continue
         wanted.add(key)
-        pending.extend(_BY_KEY[key].requires)
-    selected = (toolchain for toolchain in TOOLCHAINS if toolchain.name in wanted)
+        pending.extend(_RESOLVABLE[key].requires)
+    selected = (
+        toolchain for toolchain in (*TOOLCHAINS, *WORKSPACE_TOOLS) if toolchain.name in wanted
+    )
     if not versions:
         return tuple(selected)
     return tuple(
@@ -1876,6 +1916,49 @@ def _candidate_files(workspace: Path) -> list[str]:
     return names
 
 
+def lfs_attribute_files(workspace: Path) -> tuple[str, ...]:
+    """The ``.gitattributes`` files under ``workspace`` that route a pattern
+    through Git LFS (#693), as paths relative to the root — the evidence
+    the ``git-lfs`` workspace tool is provisioned on.
+
+    Same bounds as :func:`detect_languages`: the root and ``DETECT_DEPTH``
+    levels below it, dependency trees skipped. A repository declares LFS
+    at its root or in the directory that holds the assets (``assets/
+    .gitattributes``); deeper files are somebody else's vendored tree.
+    """
+    found: list[str] = []
+    pending = [(workspace, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name == ".gitattributes" and entry.is_file() and _mentions_lfs(entry):
+                found.append(entry.relative_to(workspace).as_posix())
+            elif (
+                depth < DETECT_DEPTH
+                and entry.is_dir()
+                and not entry.name.startswith(".")
+                and entry.name not in SKIP_DIRS
+            ):
+                pending.append((entry, depth + 1))
+    return tuple(sorted(found))
+
+
+def _mentions_lfs(attributes: Path) -> bool:
+    try:
+        text = attributes.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        body = line.split("#", 1)[0]
+        if LFS_FILTER in body.split():
+            return True
+    return False
+
+
 def detect_languages(workspace: Path) -> dict[str, tuple[str, ...]]:
     """Which registry languages ``workspace`` declares, and on what evidence.
 
@@ -1913,7 +1996,8 @@ class LanguageResolution(NamedTuple):
     languages: tuple[str, ...]
     source: LanguageSource
     # manifest names per detected language — empty unless source is
-    # "detected"
+    # "detected" — plus, whatever the source, the `.gitattributes` files
+    # that added the git-lfs workspace tool (#693)
     signals: dict[str, tuple[str, ...]]
     # the version series each versioned toolchain in the set provisions,
     # by toolchain name — the workspace's own pin where it has one the
@@ -1977,4 +2061,13 @@ def resolve_languages(explicit: Sequence[str], workspace: Path | None) -> Langua
             languages, source, signals = tuple(detected), "detected", detected
         else:
             languages, source, signals = DEFAULT_LANGUAGES, "default", {}
+    # The one addition explicit-wins does not cover (#693): an operator's
+    # language choice says nothing about where the repository keeps its
+    # binaries, and a run without `git lfs` sees every LFS-tracked file as
+    # modified. The workspace's own `.gitattributes` decides, whatever
+    # `source` is.
+    lfs = lfs_attribute_files(workspace) if workspace is not None else ()
+    if lfs:
+        languages = (*languages, GIT_LFS.name)
+        signals = {**signals, GIT_LFS.name: lfs}
     return LanguageResolution(languages, source, signals, toolchain_versions(languages, workspace))

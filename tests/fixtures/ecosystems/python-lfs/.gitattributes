@@ -1,0 +1,4 @@
+# Design sources live in Git LFS; text files stay in git. (No file in this
+# fixture matches the pattern: the attribute must not fire inside sbxloop's
+# own checkout, where a host git-lfs would act on it.)
+*.psd filter=lfs diff=lfs merge=lfs -text

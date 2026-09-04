@@ -1230,6 +1230,50 @@ class TestDoctor:
         assert "novel-kind" in check.detail
         assert "read" in check.detail
 
+    def _lfs_check(self, fake_sbx: FakeSbx) -> Check:
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        checks = collect_checks(
+            {"COPILOT_GITHUB_TOKEN": "tok"}, cli=SbxCLI(binary=str(fake_sbx.binary))
+        )
+        return {c.name: c for c in checks}["host git-lfs"]
+
+    def test_doctor_host_git_lfs_found(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import hostgit
+
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: "git-lfs/3.8.0 (GitHub; linux amd64)")
+        check = self._lfs_check(fake_sbx)
+        assert check.ok and not check.hard
+        assert "git-lfs/3.8.0" in check.detail
+
+    def test_doctor_host_git_lfs_missing_is_soft_warn_naming_the_package(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #693: a repository on LFS fails to provision without it — said
+        # here, before a run finds out; soft because most repositories
+        # never use LFS.
+        from sbxloop import hostgit
+
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: None)
+        check = self._lfs_check(fake_sbx)
+        assert not check.ok and not check.hard
+        assert "apt install git-lfs" in check.detail
+        assert "clone_lfs = false" in check.detail
+
+    def test_doctor_host_git_lfs_missing_is_fine_when_opted_out(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import hostgit
+
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: None)
+        (workdir / "sbxloop.toml").write_text("[sandbox]\nclone_lfs = false\n")
+        check = self._lfs_check(fake_sbx)
+        assert check.ok and not check.hard
+        assert "pointer files" in check.detail
+
     def test_doctor_without_sbx(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PATH", str(workdir))  # nothing on PATH
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")

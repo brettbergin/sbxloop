@@ -1356,3 +1356,82 @@ class TestDescribe:
         (tmp_path / ".python-version").write_text("3.13\n")
         versions = toolchains.toolchain_versions(["python"], tmp_path)
         assert toolchains.describe(["python"], versions) == "python 3.13 (from .python-version)"
+
+
+# -- git-lfs as a workspace tool (#693) --------------------------------------
+
+
+LFS_LINE = "*.png filter=lfs diff=lfs merge=lfs -text\n"
+
+
+class TestGitLfs:
+    """#693: git-lfs rides along whenever a ``.gitattributes`` routes files
+    through LFS — a workspace tool, not a language."""
+
+    def test_is_a_workspace_tool_not_a_language(self) -> None:
+        assert toolchains.GIT_LFS in toolchains.WORKSPACE_TOOLS
+        assert toolchains.GIT_LFS not in toolchains.TOOLCHAINS
+        assert toolchains.GIT_LFS not in toolchains.BASELINE_TOOLS
+        assert toolchains.normalize_language("git-lfs") is None
+        assert "git-lfs" not in toolchains.supported_languages()
+
+    def test_resolves_by_name_with_its_egress_hosts(self) -> None:
+        (tool,) = toolchains.resolve(["git-lfs"])
+        assert tool is toolchains.GIT_LFS
+        assert "lfs.github.com" in tool.install_domains
+        assert tool.apt_packages == ("git-lfs",)
+        assert tool.install_script is None
+        # registry order holds across languages and tools, and unknown
+        # names still drop rather than raise
+        assert [t.name for t in toolchains.resolve(["git-lfs", "python", "nope"])] == [
+            "python",
+            "git-lfs",
+        ]
+
+    def test_attribute_files_are_found_at_the_root_and_below(self, tmp_path: Path) -> None:
+        (tmp_path / ".gitattributes").write_text(LFS_LINE)
+        (tmp_path / "assets").mkdir()
+        (tmp_path / "assets" / ".gitattributes").write_text("*.psd filter=lfs\n")
+        assert toolchains.lfs_attribute_files(tmp_path) == (
+            ".gitattributes",
+            "assets/.gitattributes",
+        )
+
+    def test_attribute_files_without_lfs_do_not_count(self, tmp_path: Path) -> None:
+        (tmp_path / ".gitattributes").write_text("* text=auto\n*.sh eol=lf\n")
+        assert toolchains.lfs_attribute_files(tmp_path) == ()
+
+    def test_a_commented_out_lfs_line_does_not_count(self, tmp_path: Path) -> None:
+        (tmp_path / ".gitattributes").write_text("# *.png filter=lfs\n*.png binary\n")
+        assert toolchains.lfs_attribute_files(tmp_path) == ()
+
+    def test_dependency_trees_and_deep_paths_are_not_walked(self, tmp_path: Path) -> None:
+        deep = tmp_path / "a" / "b" / "c" / "d"
+        deep.mkdir(parents=True)
+        (deep / ".gitattributes").write_text(LFS_LINE)
+        vendored = tmp_path / "node_modules" / "pkg"
+        vendored.mkdir(parents=True)
+        (vendored / ".gitattributes").write_text(LFS_LINE)
+        assert toolchains.lfs_attribute_files(tmp_path) == ()
+
+    def test_detection_appends_git_lfs_with_its_evidence(self, tmp_path: Path) -> None:
+        (tmp_path / "go.mod").write_text("module x\n")
+        (tmp_path / ".gitattributes").write_text(LFS_LINE)
+        resolved = toolchains.resolve_languages((), tmp_path)
+        assert resolved.languages == ("go", "git-lfs")
+        assert resolved.source == "detected"
+        assert resolved.signals["git-lfs"] == (".gitattributes",)
+
+    def test_explicit_config_still_gets_git_lfs(self, tmp_path: Path) -> None:
+        # The one exception to explicit-wins: the operator picks languages,
+        # the repository's .gitattributes decides whether LFS is in play.
+        (tmp_path / ".gitattributes").write_text(LFS_LINE)
+        resolved = toolchains.resolve_languages(["rust"], tmp_path)
+        assert resolved.languages == ("rust", "git-lfs")
+        assert resolved.source == "config"
+        assert resolved.signals == {"git-lfs": (".gitattributes",)}
+
+    def test_no_attributes_means_no_git_lfs(self, tmp_path: Path) -> None:
+        (tmp_path / "go.mod").write_text("module x\n")
+        assert toolchains.resolve_languages((), tmp_path).languages == ("go",)
+        assert toolchains.resolve_languages(["rust"], tmp_path).languages == ("rust",)
