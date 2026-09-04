@@ -1576,6 +1576,10 @@ class DaemonLoop:
             login = identity.login
             base = ops.pr_get(gate.repo, gate.pr_number).get("base")
             base_ref = str(base.get("ref") or "") if isinstance(base, dict) else ""
+            if not base_ref:
+                base_ref = self.config.github.for_repo(
+                    gate.repo
+                ).deliver_base or ops.default_branch(gate.repo)
             outcome = land(
                 ops,
                 gate.repo,
@@ -1605,7 +1609,7 @@ class DaemonLoop:
                 policy_for=check_policy_reader(
                     ops,
                     gate.repo,
-                    base_ref or self.config.github.for_repo(gate.repo).deliver_base or "main",
+                    base_ref,
                     cfg=self.config.landing,
                     advisory_spent=self.store.advisory_rounds(run_id),
                 ),

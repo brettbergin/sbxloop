@@ -158,6 +158,21 @@ class TestGithubOpsFacade:
         # (callers then fall back to message matching, see deliver tests).
         assert info.value.http_status is None
 
+    def test_default_branch_is_what_the_repository_reports(self) -> None:
+        ops, client = make_ops({"repo.get": {"full_name": "o/r", "default_branch": "develop"}})
+        assert ops.default_branch("o/r") == "develop"
+        assert [j.op for j in client.jobs] == ["repo.get"]
+
+    def test_default_branch_is_never_guessed(self) -> None:
+        """#672: a repository whose payload carries no default branch gets
+        an error naming `deliver_base`, not a silent `main`."""
+        ops, _ = make_ops({"repo.get": {"full_name": "o/r"}})
+        with pytest.raises(GithubOpsError, match="did not report a default branch for o/r"):
+            ops.default_branch("o/r")
+        ops, _ = make_ops({"repo.get": {"full_name": "o/r", "default_branch": ""}})
+        with pytest.raises(GithubOpsError, match="deliver_base"):
+            ops.default_branch("o/r")
+
     def test_error_http_status_is_carried_onto_host_error(self) -> None:
         class StatusClient(StubWorkerClient):
             def submit(self, job: JobRequest) -> JobResult:

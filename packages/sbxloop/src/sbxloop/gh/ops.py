@@ -1289,6 +1289,23 @@ class GithubOps:
         assert isinstance(data, dict)
         return data
 
+    def default_branch(self, repo: str) -> str:
+        """The branch GitHub reports as the repository's default.
+
+        The one place the loop learns which branch a repository lives on
+        when no ``deliver_base`` is configured. There is no guess when the
+        field is missing: a ``main`` assumed against a ``master`` or
+        ``develop`` repository would deliver, merge from and gate against
+        a branch that does not exist (#672).
+        """
+        name = self.repo_get(repo).get("default_branch")
+        if not isinstance(name, str) or not name:
+            raise GithubOpsError(
+                f"GitHub did not report a default branch for {repo}; "
+                "set [github] deliver_base to name the branch to deliver against"
+            )
+        return name
+
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         """Probe a repository: its data, or None when it does not exist.
 
