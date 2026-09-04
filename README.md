@@ -1530,6 +1530,12 @@ make check      # ruff format --check + ruff check + mypy --strict + pytest --co
 make build      # build both wheels
 ```
 
+[`AGENTS.md`](AGENTS.md) (also reachable as `CLAUDE.md`) is the working
+agreement for this repository — what sbxloop is for, the principles each
+change is held to, where things live and the gate sequence — written for a
+contributor's coding agent as much as for the contributor. Read it before
+opening a pull request.
+
 `make lint` also runs `scripts/check_self_references.py`, the gate against
 sbxloop leaking into what users see: a bare `#N` from this tracker in an
 error message, a doctor row, a prompt body or a file `sbxloop init` writes,
