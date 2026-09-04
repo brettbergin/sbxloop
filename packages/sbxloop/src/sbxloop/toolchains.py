@@ -982,6 +982,80 @@ DOTNET = Toolchain(
 # Registry order is the install order, and the order packages appear in the
 # batched apt call — keep it stable so the command is reproducible. New
 # languages append; nothing depends on the position of an existing entry.
+# Task runners (#685). The gate detector emits `make check` / `just check` /
+# `task check` for a repository fronted by one, and "any sandbox has a task
+# runner" was never true: `make` only arrived with build-essential (the
+# cpp, ruby and rust entries), `just` and `task` never did. So each is a
+# toolchain the manifest selects — a Makefile in a Go repo provisions make
+# — and the detector names it (`GateDetector.language`), so the existing
+# "emit only what the resolved set can run" rule applies. A runner is a
+# runner: selection is by manifest, like every other entry, not by whether
+# the file happens to declare a gate target — the agent runs `make build`
+# too, and under default-deny egress it could not fetch `just` itself.
+MAKE = Toolchain(
+    name="make",
+    wanted="make",
+    probe="command -v make >/dev/null",
+    apt_packages=("make",),
+    # GNU make's own search order, so the case variants count too.
+    manifests=("GNUmakefile", "makefile", "Makefile"),
+    aliases=("gnumake",),
+)
+
+# Pinned musl builds from the project's GitHub releases; github.com answers
+# with a redirect to release-assets, the same pair the Python entry lists.
+# The tarball is flat (the binary beside docs and completions), so only the
+# binary is extracted.
+JUST_VERSION = "1.58.0"
+_JUST_TARBALL = "/tmp/just.tar.gz"  # nosec B108 - path inside the sandbox VM, not host tmp
+_JUST_DIGESTS = {
+    "amd64": ("x86_64", "4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d"),
+    "arm64": ("aarch64", "748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df"),
+}
+
+JUST = Toolchain(
+    name="just",
+    wanted=f"just {JUST_VERSION}",
+    probe="command -v just >/dev/null",
+    apt_packages=("curl", "ca-certificates"),
+    install_script=(
+        "set -e; " + _arch_dispatch(_JUST_DIGESTS) + "; "
+        f'curl -fsSL -o {_JUST_TARBALL} "https://github.com/casey/just/releases/download/'
+        f'{JUST_VERSION}/just-{JUST_VERSION}-$arch-unknown-linux-musl.tar.gz"; '
+        f"printf '%s  {_JUST_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+        f"sudo -n tar -xzf {_JUST_TARBALL} -C /usr/local/bin just; "
+        f"rm -f {_JUST_TARBALL}"
+    ),
+    install_domains=("github.com", "release-assets.githubusercontent.com"),
+    manifests=("justfile", ".justfile", "Justfile"),
+)
+
+TASK_VERSION = "3.53.1"
+_TASK_TARBALL = "/tmp/task.tar.gz"  # nosec B108 - path inside the sandbox VM, not host tmp
+_TASK_DIGESTS = {
+    "amd64": ("amd64", "a54a408f6861ff921f6e87774180db31bacd8c1e7c944ca696db9fea49a82fc7"),
+    "arm64": ("arm64", "e3ad19101493a0112e1f22ae8ccc54bf03e533b1076a0ca1e6c782a09ad2e588"),
+}
+
+TASK = Toolchain(
+    name="task",
+    wanted=f"task (go-task) {TASK_VERSION}",
+    probe="command -v task >/dev/null",
+    apt_packages=("curl", "ca-certificates"),
+    install_script=(
+        "set -e; " + _arch_dispatch(_TASK_DIGESTS) + "; "
+        f'curl -fsSL -o {_TASK_TARBALL} "https://github.com/go-task/task/releases/download/'
+        f'v{TASK_VERSION}/task_linux_$arch.tar.gz"; '
+        f"printf '%s  {_TASK_TARBALL}\\n' \"$sum\" | sha256sum -c - >/dev/null; "
+        f"sudo -n tar -xzf {_TASK_TARBALL} -C /usr/local/bin task; "
+        f"rm -f {_TASK_TARBALL}"
+    ),
+    install_domains=("github.com", "release-assets.githubusercontent.com"),
+    manifests=("Taskfile.yml", "Taskfile.yaml"),
+    aliases=("go-task", "taskfile"),
+)
+
+
 TOOLCHAINS: tuple[Toolchain, ...] = (
     PYTHON,
     CPP,
@@ -994,6 +1068,9 @@ TOOLCHAINS: tuple[Toolchain, ...] = (
     GO,
     RUST,
     DOTNET,
+    MAKE,
+    JUST,
+    TASK,
 )
 
 # Baseline agent tooling: provisioned on every agent sandbox regardless of

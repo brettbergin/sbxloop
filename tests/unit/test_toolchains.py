@@ -356,6 +356,9 @@ def test_every_language_in_the_agreed_set_is_registered() -> None:
         "go",
         "rust",
         "dotnet",
+        "make",
+        "just",
+        "task",
     }
 
 
@@ -487,6 +490,63 @@ def test_installer_entries_declare_their_hosts() -> None:
 def test_apt_only_entries_open_no_hosts() -> None:
     for name in ("cpp", "ruby", "java"):
         assert toolchains.resolve([name])[0].install_domains == ()
+
+
+class TestTaskRunners:
+    """#685: the gate detector emits `make`/`just`/`task check`, so each is
+    a toolchain the manifest selects rather than one assumed present."""
+
+    def test_make_is_an_apt_package_selected_by_any_makefile_spelling(self, tmp_path: Path) -> None:
+        make = toolchains.resolve(["make"])[0]
+        assert make.apt_packages == ("make",) and make.install_script is None
+        assert make.install_domains == ()
+        for name in ("Makefile", "makefile", "GNUmakefile"):
+            (tmp_path / name).write_text("check:\n")
+            assert toolchains.detect_languages(tmp_path) == {"make": (name,)}
+            (tmp_path / name).unlink()
+
+    def test_a_makefile_without_a_gate_target_still_selects_make(self, tmp_path: Path) -> None:
+        # Selection is by manifest like every other entry: the agent runs
+        # `make build` too, and a runner that costs one apt package is not
+        # worth a second detection rule.
+        (tmp_path / "go.mod").write_text("module x\n")
+        (tmp_path / "Makefile").write_text("build:\n\tgo build ./...\n")
+        assert toolchains.resolve_languages((), tmp_path).languages == ("go", "make")
+
+    @pytest.mark.parametrize(
+        ("name", "version", "manifests", "asset"),
+        [
+            ("just", toolchains.JUST_VERSION, ("justfile", ".justfile", "Justfile"), "casey/just"),
+            ("task", toolchains.TASK_VERSION, ("Taskfile.yml", "Taskfile.yaml"), "go-task/task"),
+        ],
+    )
+    def test_just_and_task_are_pinned_github_release_binaries(
+        self, name: str, version: str, manifests: tuple[str, ...], asset: str
+    ) -> None:
+        runner = toolchains.resolve([name])[0]
+        assert runner.manifests == manifests
+        assert runner.install_script is not None
+        assert f"github.com/{asset}/releases/download/" in runner.install_script
+        assert version in runner.install_script
+        assert "sha256sum -c" in runner.install_script
+        assert "dpkg --print-architecture" in runner.install_script
+        assert f"-C /usr/local/bin {name}; " in runner.install_script
+        assert "install.sh" not in runner.install_script, "pinned tarballs, not curl | sh"
+        assert runner.install_domains == ("github.com", "release-assets.githubusercontent.com")
+
+    def test_runner_digests_are_per_architecture(self) -> None:
+        for digests in (toolchains._JUST_DIGESTS, toolchains._TASK_DIGESTS):
+            assert set(digests) == {"amd64", "arm64"}
+            for _upstream, digest in digests.values():
+                assert len(digest) == 64
+
+    def test_runners_are_never_the_default(self, tmp_path: Path) -> None:
+        assert not set(toolchains.DEFAULT_LANGUAGES) & {"make", "just", "task"}
+        # a repo carrying nothing but a justfile provisions just — and not
+        # the Python default, which "detected" replaces
+        (tmp_path / "justfile").write_text("check:\n    echo\n")
+        resolved = toolchains.resolve_languages((), tmp_path)
+        assert resolved.languages == ("just",) and resolved.source == "detected"
 
 
 def test_install_domains_pools_without_duplicates() -> None:

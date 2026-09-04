@@ -99,6 +99,35 @@ EXPECTATIONS: dict[str, Expectation] = {
         gate="bun run check",
         lint=(("bun run check", False),),
     ),
+    # task runners are toolchains the manifest selects (#685): the gate the
+    # detector emits is one the resolved set can run
+    "python-make": Expectation(
+        ("python", "make"),
+        "detected",
+        versions={"python": ("3.13", "pyproject.toml")},
+        allowed=("release-assets.githubusercontent.com",),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="make check",
+        lint=(("make check", False),),
+    ),
+    "go-just": Expectation(
+        ("go", "just"),
+        "detected",
+        versions={},
+        allowed=("go.dev", "github.com", "release-assets.githubusercontent.com"),
+        not_allowed=("nodejs.org",),
+        gate="just ci",
+        lint=(("just ci", False),),
+    ),
+    "node-task": Expectation(
+        ("javascript", "task"),
+        "detected",
+        versions={"javascript": ("24", "default")},
+        allowed=("nodejs.org", "github.com", "release-assets.githubusercontent.com"),
+        not_allowed=("go.dev",),
+        gate="task verify",
+        lint=(("task verify", False),),
+    ),
     "go": Expectation(
         ("go",),
         "detected",
