@@ -761,6 +761,25 @@ CI, then mergeability, and only then the merge:
    skips straight to the merge.
 6. **Merge**, sending the head sha the loop actually judged. A push that
    landed since loses the race with a 409 rather than being merged over.
+   On a base that merges through a **merge queue** (#676 — the ruleset's
+   `merge_queue` rule, or a 405 that names the queue when the rules could
+   not be read) this step is an enqueue instead: `enqueuePullRequest`
+   with the judged head as `expectedHeadOid` (the same race guard), then
+   the queue is polled — `mergeQueueEntry`, `merged`, and the PR's
+   `RemovedFromMergeQueueEvent` count — until it merges the PR (`Landed`),
+   removes it, or `ci_timeout_s` runs out. A removal is judged by the red
+   checks on the queue's *own* merge-group commit (`headCommit` of the
+   entry, where the queue's checks report), which become a `ci`
+   `NeedsFix` under the usual budget; a removal with no red check to name
+   is `Blocked` — a fix round with nothing to fix is budget burn. A
+   timeout leaves the PR queued (the queue merges or removes it on its
+   own) and ends `Blocked` saying so. A PR found already queued — a
+   resume, a parked landing re-entering — is watched, not enqueued
+   twice. The queue's own merge method applies; `merge_method` is not
+   consulted. Field-unverified against a live queue: `expectedHeadOid`,
+   `headCommit`, the removal event's `reason`, and whether GitHub reports
+   a queue-bound PR `blocked` before it is queued (the enqueue is
+   attempted either way and its refusal is the block).
 
 A base whose *only* unmet rules are review rules — N approving reviews, a
 CODEOWNERS review — is a wait, not a block (#675): `land()` returns

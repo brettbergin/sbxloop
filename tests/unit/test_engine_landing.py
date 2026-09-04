@@ -34,7 +34,7 @@ from sbxloop.engine.landing import (
     resolve_merge_method,
 )
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ChecksVerdict, FailedCheck, MergeOutcome
+from sbxloop.gh.ops import ChecksVerdict, FailedCheck, MergeOutcome, QueueEntry, QueueState
 from tests.fakes.fake_github import (
     BLOCKED_405,
     GREEN,
@@ -1268,9 +1268,9 @@ class TestBlockedWithGreenChecks:
         assert lines[2].startswith("- the base requires 2 approving reviews")
         assert lines[3].startswith("- the base requires a review from a code owner")
         assert lines[4].startswith("- the base requires signed commits")
-        assert lines[5].startswith("- the base uses a merge queue")
-        assert lines[6].startswith("- the base requires a successful deployment to staging")
-        assert len(lines) == 7 and "merge_gate" not in why
+        assert lines[5].startswith("- the base requires a successful deployment to staging")
+        # The merge queue is not on the list (#676): the loop enqueues.
+        assert len(lines) == 6 and "merge_gate" not in why and "merge queue" not in why
         assert why.endswith("(GitHub: HTTP 405)")
         # Signing is the credential's to satisfy; a linear-history rule only
         # blocks a merge commit.
@@ -1285,14 +1285,17 @@ class TestBlockedWithGreenChecks:
         fake.pr["mergeable_state"] = "blocked"
         fake.rules = [
             {"type": "pull_request", "parameters": {"require_last_push_approval": True}},
-            {"type": "merge_queue"},
+            {
+                "type": "required_deployments",
+                "parameters": {"required_deployment_environments": ["staging"]},
+            },
         ]
         lp = Landing(fake)
         outcome = lp.run(policy_for=lp.against_base())
         assert isinstance(outcome, Blocked)
         assert len(outcome.blockers) == 2
         assert outcome.blockers[0].startswith("the base requires approval of the last push")
-        assert outcome.blockers[1].startswith("the base uses a merge queue")
+        assert outcome.blockers[1].startswith("the base requires a successful deployment")
         assert all(f"- {b}" in outcome.why for b in outcome.blockers)
 
     def test_a_405_on_the_merge_is_rewritten_with_the_bases_rules(self) -> None:
@@ -1315,3 +1318,190 @@ class TestBlockedWithGreenChecks:
         outcome = lp.run(policy_for=lp.against_base())
         assert isinstance(outcome, AwaitingReview)
         assert outcome.approvals_have == 0 and outcome.approvals_required == 1
+
+
+QUEUED = QueueState(
+    merged=False, closed=False, entry=QueueEntry("MQE_1", "AWAITING_CHECKS", 1, "queue0")
+)
+QUEUE_MERGED = QueueState(merged=True, closed=False, entry=None, merge_sha="queued0001")
+NOT_QUEUED = QueueState(merged=False, closed=False, entry=None)
+
+
+class TestMergeQueue:
+    """#676: a base that merges through a merge queue is entered, not
+    merged — where the merge would happen, after every other bar."""
+
+    def _fake(self) -> FakeGithub:
+        fake = FakeGithub()
+        fake.rules = [{"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}]
+        return fake
+
+    def test_a_queued_pr_lands_when_the_queue_merges_it(self) -> None:
+        fake = self._fake()
+        fake.queue_states = [NOT_QUEUED, QUEUED, QUEUED, QUEUE_MERGED]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert outcome == Landed("queued0001", by_human=False)
+        assert fake.merges == [], "PUT /merge is never sent on a merge-queue base"
+        assert fake.enqueued == [("PR_node7", "commit0")], "the judged head guards the enqueue"
+        assert lp.rec.waits == ["queue", "queue", "queue"]
+        kinds = [t for t, _ in lp.rec.events]
+        assert kinds.count("land.enqueued") == 1 and "land.dequeued" not in kinds
+        enqueued = next(d for t, d in lp.rec.events if t == "land.enqueued")
+        assert enqueued == {"pr": 7, "head": "commit0", "position": 1, "resumed": False}
+        assert fake.deleted_branches == [], "the queue owns the branch's fate"
+
+    def test_the_queue_is_entered_only_after_every_other_bar(self) -> None:
+        """A review the base wants comes first: the wait is for the human,
+        and the enqueue happens on the landing that follows their approval."""
+        fake = self._fake()
+        fake.pr["mergeable_state"] = "blocked"
+        fake.rules.append(
+            {"type": "pull_request", "parameters": {"required_approving_review_count": 1}}
+        )
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, AwaitingReview)
+        assert fake.enqueued == []
+
+    def test_a_blocked_state_with_only_the_queue_left_is_enqueued(self) -> None:
+        """Whether GitHub reports a queue-bound PR `blocked` before it is
+        queued is field-unverified; either way the enqueue is GitHub's own
+        verdict, so the loop asks rather than hands over."""
+        fake = self._fake()
+        fake.pr["mergeable_state"] = "blocked"
+        fake.queue_states = [NOT_QUEUED, QUEUE_MERGED]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert outcome == Landed("queued0001", by_human=False)
+        assert len(fake.enqueued) == 1
+
+    def test_a_refused_enqueue_blocks_with_githubs_words(self) -> None:
+        fake = self._fake()
+        fake.enqueue_ok = False
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert "refused to enqueue" in outcome.why and "not mergeable" in outcome.why
+        assert fake.merges == []
+
+    def test_a_refused_enqueue_with_a_review_rule_left_is_the_rules_verdict(self) -> None:
+        """The queue's 405: when the base's other rules say what GitHub
+        wants, the outcome is theirs — a review wait here, GitHub's words
+        riding along in the blocked case — not a bare block."""
+        fake = self._fake()
+        fake.enqueue_ok = False
+        fake.rules = [
+            {"type": "merge_queue"},
+            {"type": "pull_request", "parameters": {"required_approving_review_count": 1}},
+        ]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, AwaitingReview)
+        assert outcome.approvals_required == 1 and fake.merges == []
+        fake = self._fake()
+        fake.enqueue_ok = False
+        fake.rules = [{"type": "merge_queue"}, {"type": "required_signatures"}]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert "signed commits" in outcome.why and "not mergeable" in outcome.why
+
+    def test_a_removal_with_red_checks_on_the_queue_commit_is_a_ci_round(self) -> None:
+        """The queue's checks ran on its own merge-group commit; those reds
+        are what the fix round gets, not the PR head's (green) ones."""
+        fake = self._fake()
+        removed = QueueState(
+            merged=False, closed=False, entry=None, removals=1, removed_reason="CI_FAILED"
+        )
+        fake.queue_states = [NOT_QUEUED, QUEUED, removed]
+        fake.failed_logs = [FailedCheck("integration", "failure", "boom", "https://x/logs")]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, NeedsFix) and outcome.kind == "ci"
+        assert "removed the pull request (CI_FAILED)" in outcome.why
+        assert "integration" in outcome.why
+        assert [c.name for c in outcome.failed_checks] == ["integration"]
+        assert fake.failed_logs_calls[-1] == "queue0", "the queue's commit, not the PR head"
+        dequeued = next(d for t, d in lp.rec.events if t == "land.dequeued")
+        assert dequeued["reason"] == "CI_FAILED" and dequeued["failed"] == ["integration"]
+
+    def test_a_removal_with_nothing_to_fix_blocks(self) -> None:
+        """A human dequeued it, or the queue said something the loop cannot
+        read: a fix round with nothing to fix is budget burn."""
+        fake = self._fake()
+        fake.queue_states = [NOT_QUEUED, QUEUED, NOT_QUEUED]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert "removed the pull request, with no failing check" in outcome.why
+        # No removal event the loop did not already know of: no reason.
+        assert "(" not in outcome.why.split(",")[0]
+
+    def test_a_removal_from_before_this_landing_is_not_this_landings_reason(self) -> None:
+        """The removal count seen at enqueue time is the baseline: an older
+        removal's reason is not attributed to this one."""
+        fake = self._fake()
+        earlier = QueueState(
+            merged=False, closed=False, entry=None, removals=1, removed_reason="MANUAL"
+        )
+        fake.queue_states = [earlier, QUEUED, earlier]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked) and "MANUAL" not in outcome.why
+
+    def test_a_pr_already_in_the_queue_is_watched_not_enqueued_twice(self) -> None:
+        fake = self._fake()
+        fake.queue_states = [QUEUED, QUEUE_MERGED]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert outcome == Landed("queued0001", by_human=False)
+        assert fake.enqueued == []
+        enqueued = next(d for t, d in lp.rec.events if t == "land.enqueued")
+        assert enqueued["resumed"] is True
+
+    def test_a_pr_the_queue_already_merged_is_landed_by_human(self) -> None:
+        fake = self._fake()
+        fake.queue_states = [QUEUE_MERGED]
+        lp = Landing(fake)
+        assert lp.run(policy_for=lp.against_base()) == Landed("queued0001", by_human=True)
+
+    def test_closed_while_queued(self) -> None:
+        fake = self._fake()
+        fake.queue_states = [NOT_QUEUED, QueueState(merged=False, closed=True, entry=None)]
+        lp = Landing(fake)
+        assert isinstance(lp.run(policy_for=lp.against_base()), Closed)
+
+    def test_the_timeout_leaves_the_pr_in_the_queue(self) -> None:
+        fake = self._fake()
+        fake.queue_states = [NOT_QUEUED, QUEUED]
+        lp = Landing(fake, per_tick=100.0, ci_timeout_s=250.0)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert "still in the merge queue after ci_timeout_s=250s" in outcome.why
+        assert lp.rec.waits == ["queue", "queue", "queue"]
+
+    def test_a_405_naming_the_queue_enters_it_when_the_rules_were_unread(self) -> None:
+        """The rules are the primary signal; GitHub's own refusal wording
+        is the fallback when they could not be read."""
+        fake = FakeGithub()
+        fake.merge_outcomes = [
+            MergeOutcome(
+                False,
+                "",
+                "HTTP 405: This branch must be merged through the merge queue",
+                blocked=True,
+            )
+        ]
+        fake.queue_states = [NOT_QUEUED, QUEUE_MERGED]
+        lp = Landing(fake)
+        outcome = lp.run()
+        assert outcome == Landed("queued0001", by_human=False)
+        assert len(fake.merges) == 1 and len(fake.enqueued) == 1
+
+    def test_a_plain_405_still_blocks(self) -> None:
+        fake = FakeGithub()
+        fake.merge_outcomes = [BLOCKED_405]
+        lp = Landing(fake)
+        assert isinstance(lp.run(), Blocked)
+        assert fake.enqueued == []

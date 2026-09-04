@@ -1153,12 +1153,21 @@ classic protection in full — one line per rule the loop cannot satisfy:
 approval of the last push (never satisfiable: the loop is always the last
 pusher), signed
 commits (satisfied by a GitHub App credential, whose API commits GitHub
-signs), a linear-history rule against `merge_method = "merge"`, a merge
-queue, a required deployment. The `run.blocked` event carries the same
-list, and `sbxloop doctor` reports it per repository before any run. When
-the *only* unmet rules are review rules — N approving reviews, a
-CODEOWNERS review — the run does not block at all: it parks
-`awaiting_review` and waits for the human (see the daemon section).
+signs), a linear-history rule against `merge_method = "merge"`, a
+required deployment. The `run.blocked` event carries the same list, and
+`sbxloop doctor` reports it per repository before any run. When the *only*
+unmet rules are review rules — N approving reviews, a CODEOWNERS review —
+the run does not block at all: it parks `awaiting_review` and waits for
+the human (see the daemon section). A **merge queue** is not a blocker
+either: on a base that merges through one, the loop never sends the merge
+itself — where the merge would happen, every other bar cleared, it
+enqueues the PR (`land.enqueued`) and polls the queue every
+`ci_poll_interval_s` until the queue merges it, removes it, or
+`ci_timeout_s` runs out. A removal whose checks failed on the queue's own
+merge commit is one CI fix round with those checks named (the usual
+`max_ci_rounds` budget); a removal with nothing to fix — a human dequeued
+it — ends the run `blocked`; a timeout leaves the PR in the queue and says
+so.
 Conversation resolution is not a blocker: the loop resolves the threads it
 answers. A 409 is a race with a push that landed since; the next poll
 re-judges.

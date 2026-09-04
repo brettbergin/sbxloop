@@ -2998,8 +2998,8 @@ class TestDoctorBranchProtection:
                 base_blockers=(
                     "the base requires an approving review, which the loop cannot give "
                     "its own pull request",
-                    "the base uses a merge queue; the loop merges its pull request "
-                    "directly and does not enqueue it",
+                    "the base requires signed commits; GitHub signs commits the loop "
+                    "creates through its API only when it authenticates as a GitHub App",
                 ),
             ),
         )
@@ -3010,7 +3010,7 @@ class TestDoctorBranchProtection:
         assert "HTTP 405" in protection.detail
         # One blocker per line, every one of them.
         assert "\n- the base requires an approving review" in protection.detail
-        assert "\n- the base uses a merge queue" in protection.detail
+        assert "\n- the base requires signed commits" in protection.detail
 
     def test_unverifiable_protection_adds_no_row(self, workdir: Path) -> None:
         from sbxloop.cli.doctor import RepoProbe, repo_checks

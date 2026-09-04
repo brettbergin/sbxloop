@@ -2452,7 +2452,9 @@ class TestPipeline:
         lists each rule the loop cannot satisfy, one per line, and the
         `run.blocked` event carries them as a list."""
         fake = FakeGithub()
-        fake.merge_outcomes = [BLOCKED_405]
+        # The queue's own 405 (#676): GitHub refuses to enqueue a PR the
+        # base's other rules do not allow; those rules are the verdict.
+        fake.enqueue_ok = False
         fake.rules = [
             {
                 "type": "pull_request",
@@ -2467,16 +2469,84 @@ class TestPipeline:
         engine = harness.pipeline(fake)
         result = engine.start("land it")
         assert result.state == "blocked"
+        assert fake.merges == [] and fake.enqueued == [("PR_node7", "commit1")]
         (blocked,) = self._events(harness, HostEventTypes.RUN_BLOCKED)
         blockers = blocked.data["blockers"]
         assert [b.split(",")[0] for b in blockers] == [
             "the base requires approval of the last push (require_last_push_approval)",
             "the base requires an approving review",
-            "the base uses a merge queue; the loop merges its pull request directly and "
-            "does not enqueue it",
         ]
         assert all(f"\n- {b}" in result.reason for b in blockers)
         assert "merge_gate" not in result.reason
+        # A merge queue is not a blocker (#676); GitHub's refusal rides along.
+        assert "not mergeable" in result.reason
+
+    def test_a_merge_queue_base_is_entered_and_a_removal_gets_its_ci_round(
+        self, harness: Harness
+    ) -> None:
+        """#676: the loop never PUTs a merge on a merge-queue base. The
+        queue's removal for a red check on its own commit is one CI round
+        with that check named; the fix is re-enqueued and the queue merges."""
+        from sbxloop.gh.ops import QueueEntry, QueueState
+
+        fake = FakeGithub()
+        fake.rules = [{"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}]
+        queued = QueueState(False, False, QueueEntry("MQE_1", "AWAITING_CHECKS", 1, "queue0"))
+        removed = QueueState(False, False, None, removals=1, removed_reason="CI_FAILED")
+        merged = QueueState(True, False, None, removals=1, merge_sha="queued0001")
+        # First landing: not queued → queued → removed. Second: the fix's
+        # head is enqueued and merged.
+        fake.queue_states = [
+            QueueState(False, False, None),
+            queued,
+            removed,
+            removed,
+            queued,
+            merged,
+        ]
+        fake.failed_logs = [
+            FailedCheck("integration", "failure", "assert 1 == 2", "https://x/logs")
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("through the queue")
+        assert result.state == "merged", result.reason
+        assert fake.merges == [], "never PUT /merge"
+        assert [head for _, head in fake.enqueued] == ["commit1", "commit2"]
+        fix = result.tasks[1].spec
+        assert "assert 1 == 2" in fix.description and "#### `integration` (failure)" in (
+            fix.description
+        )
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "ci"
+        assert "removed the pull request (CI_FAILED)" in fix_round.data["why"]
+        assert "integration" in fix_round.data["why"]
+        kinds = [e.type for e in harness.events]
+        assert kinds.count(HostEventTypes.LAND_ENQUEUED) == 2
+        assert kinds.count(HostEventTypes.LAND_DEQUEUED) == 1
+        run = engine.store.get_run(result.run_id)
+        assert run.ci_rounds == 1
+
+    def test_a_queue_removal_past_the_ci_budget_fails_naming_the_check(
+        self, harness: Harness
+    ) -> None:
+        from sbxloop.gh.ops import QueueEntry, QueueState
+
+        fake = FakeGithub()
+        fake.rules = [{"type": "merge_queue"}]
+        fake.queue_states = [
+            QueueState(False, False, None),
+            QueueState(False, False, QueueEntry("MQE_1", "QUEUED", 1, "queue0")),
+            QueueState(False, False, None, removals=1, removed_reason="CI_FAILED"),
+        ]
+        fake.failed_logs = [FailedCheck("integration", "failure", "boom", "")]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake, landing={"max_ci_rounds": 0}).start("queue")
+        assert result.state == "failed"
+        assert result.reason is not None
+        assert "ci fix rounds exhausted (0 allowed by [landing] ci_rounds)" in result.reason
+        assert "integration" in result.reason
+        assert fake.merges == []
 
     def test_landing_405_blocks_and_a_resume_finishes(self, harness: Harness) -> None:
         """A protection rule no round can satisfy hands the PR to a human;

@@ -277,12 +277,13 @@ class TestBlockers:
         (why,) = rules.blockers(merge_method="merge")
         assert "linear history" in why and "squash or rebase" in why
 
-    def test_merge_queue_and_deployments(self) -> None:
+    def test_deployments_block_and_a_merge_queue_does_not(self) -> None:
+        """#676: the loop enqueues on a merge-queue base, so the queue is
+        no longer a rule it cannot satisfy."""
         rules = BaseRequirements(
             (), 0, "rulesets", merge_queue=True, required_deployments=("staging", "prod")
         )
-        queue, deploy = rules.blockers()
-        assert "merge queue" in queue
+        (deploy,) = rules.blockers()
         assert "deployment to staging, prod" in deploy
 
     def test_rules_the_loop_satisfies_itself_are_not_blockers(self) -> None:
