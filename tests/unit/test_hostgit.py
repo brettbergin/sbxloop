@@ -1611,3 +1611,97 @@ class TestLfs:
             "asset.bin",
         ]
         assert hostgit.lfs_tracked(clone, []) == []
+
+
+# -- tags (#694) ------------------------------------------------------------
+
+
+def describe(cwd: Path) -> str:
+    return git_out("describe", "--tags", "--always", cwd=cwd)
+
+
+class TestFetchTags:
+    """#694: a ``--no-tags`` run clone can be given the repository's tags —
+    from the host checkout when it has them, from origin under the run's
+    credential otherwise — so a build that reads ``git describe`` sees the
+    version the repository actually has."""
+
+    def test_a_run_clone_starts_without_tags(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        git("tag", "-a", "v1.2.3", "-m", "release", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.tag_count(clone) == 0
+        assert hostgit.tag_count(app) == 1
+
+    def test_tags_come_from_the_host_checkout_without_the_network(self, tmp_path: Path) -> None:
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(tmp_path / "remotes", username="x", token="y") as private:
+            app = make_repo(tmp_path, "app")
+            git("tag", "-a", "v1.2.3", "-m", "release", cwd=app)
+            git("remote", "add", "origin", f"{private.url}/o/app.git", cwd=app)
+            clone = tmp_path / "run"
+            hostgit.clone_for_run(app, clone, "sbxloop/r1")
+            fetched = hostgit.fetch_tags(clone, source=app, token=None)
+            assert fetched == hostgit.TagFetch(tags=1, source="local")
+            assert describe(clone) == "v1.2.3"
+            assert private.requests == []
+
+    def test_a_host_checkout_without_tags_falls_back_to_origin(self, tmp_path: Path) -> None:
+        upstream = make_repo(tmp_path, "upstream")
+        git("tag", "-a", "v2.0.0", "-m", "release", cwd=upstream)
+        (tmp_path / "remotes").mkdir()
+        bare_from(upstream, tmp_path / "remotes", "o/app.git")
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_tags"
+        ) as private:
+            url = f"{private.url}/o/app.git"
+            # the host checkout is itself a --no-tags clone
+            host = tmp_path / "host"
+            hostgit.clone_from_remote(url, host, "main", existing=True, token="ghs_tags")
+            assert hostgit.tag_count(host) == 0
+            clone = tmp_path / "run"
+            hostgit.clone_for_run(host, clone, "sbxloop/r1")
+            fetched = hostgit.fetch_tags(clone, source=host, token="ghs_tags")
+            assert fetched == hostgit.TagFetch(tags=1, source="remote")
+            assert describe(clone) == "v2.0.0"
+            assert private.requests
+            assert "ghs_tags" not in (clone / ".git" / "config").read_text()
+
+    def test_a_remote_clone_fetches_under_the_runs_token(self, tmp_path: Path) -> None:
+        upstream = make_repo(tmp_path, "upstream")
+        git("tag", "v0.9", cwd=upstream)  # lightweight tags count too
+        (tmp_path / "remotes").mkdir()
+        bare_from(upstream, tmp_path / "remotes", "o/app.git")
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_tags"
+        ) as private:
+            url = f"{private.url}/o/app.git"
+            clone = tmp_path / "run"
+            hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_tags")
+            with pytest.raises(ProvisionError) as excinfo:
+                hostgit.fetch_tags(clone, source=None, token="wrong")
+            assert 'fetch_tags = "never"' in str(excinfo.value)
+            assert hostgit.tag_count(clone) == 0
+            fetched = hostgit.fetch_tags(clone, source=None, token="ghs_tags")
+            assert fetched == hostgit.TagFetch(tags=1, source="remote")
+            assert describe(clone) == "v0.9"
+
+    def test_a_repository_without_tags_is_not_an_error(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.fetch_tags(clone, source=app, token=None) == hostgit.TagFetch(0, "remote")
+
+    def test_a_tag_off_the_branch_brings_its_commit(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        git("checkout", "-q", "-b", "release", cwd=app)
+        (app / "rel.txt").write_text("r\n")
+        git("add", ".", cwd=app)
+        git("commit", "-q", "-m", "release only", cwd=app)
+        git("tag", "v3.0.0", cwd=app)
+        git("checkout", "-q", "main", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.fetch_tags(clone, source=app, token=None) == hostgit.TagFetch(1, "local")
+        assert git_out("cat-file", "-t", "v3.0.0^{commit}", cwd=clone) == "commit"

@@ -111,7 +111,12 @@ fetch from join that allowlist (`sandbox.submodule_hosts`). A clone whose
 repository's LFS endpoint under the run's credential second — with the
 `git-lfs` workspace tool and its hosts riding along into the sandbox; an
 LFS-tracked add or edit is refused at delivery rather than committed as a
-blob.
+blob. A clone whose manifests name a tag-derived versioning tool
+(`toolchains.tag_version_markers`, #694) also gets the repository's tags
+(`hostgit.fetch_tags`) — the run clone is cut `--no-tags`, and a build that
+runs `git describe` on it would otherwise report the wrong version — from the
+host checkout when it has them, else from origin under the run's credential;
+`[sandbox] fetch_tags` overrides the detection.
 The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
 without it, `pair.github` is `None`, `GH_TOKEN`

@@ -23,7 +23,8 @@ and hundreds of branches the rest is dead weight copied per run. This is
 safe because nothing downstream reads another branch out of the clone —
 :func:`merge_from_base` fetches the base branch *explicitly* before every
 fix round, and :func:`resolve_diff_base` then finds the merge base through
-that fetch, the ``CLONE_BASE_REF`` pin, or ``origin/HEAD``.
+that fetch, the ``CLONE_BASE_REF`` pin, or ``origin/HEAD``. The one thing
+a clone does read from tags is its own version — see "Tags" below.
 
 What is deliberately NOT done:
 
@@ -102,6 +103,20 @@ Delivery does not push LFS objects. A file the run added or changed under
 an ``filter=lfs`` attribute is left out of the pull request and named in
 its **Not delivered** line (:func:`lfs_tracked`): committing the bytes as a
 plain blob is exactly the mistake such repositories forbid.
+
+Tags (#694)
+-----------
+A ``--no-tags`` clone has no tags for a build that derives its version from
+them — ``setuptools_scm``, ``hatch-vcs``, ``GitVersion``, a Makefile's
+``git describe`` — and such a build fails or, worse, quietly reports
+``0.0.0``. :func:`fetch_tags` brings the repository's tags into a fresh
+clone when :func:`sbxloop.toolchains.tag_version_markers` finds such a
+marker in the workspace's manifests (or ``[sandbox] fetch_tags = "always"``
+says so): from the host checkout when it has tags — its tags are consistent
+with the clone's history and cost no network — else ``git fetch --tags
+origin`` under the run's credential. A tag that points off the branch's
+history brings its objects along; that is the price of a correct
+``git describe`` and still far short of a full clone.
 """
 
 from __future__ import annotations
@@ -955,6 +970,58 @@ def lfs_tracked(repo_path: Path, paths: Sequence[str]) -> list[str]:
         if value == "lfs" and path not in tracked:
             tracked.append(path)
     return tracked
+
+
+# ---------------------------------------------------------------------------
+# Tags (#694)
+
+
+@dataclass(frozen=True)
+class TagFetch:
+    """What :func:`fetch_tags` did: how many tags the clone holds now and
+    where they came from — ``local`` (the host checkout), ``remote`` (the
+    clone's origin under the run's credential)."""
+
+    tags: int
+    source: str
+
+
+def fetch_tags(clone: Path, *, source: Path | None, token: str | None) -> TagFetch:
+    """Give a ``--no-tags`` run ``clone`` the repository's tags (#694).
+
+    Local first: when ``source`` — the host checkout the clone was cut
+    from — has tags, they are fetched from it (no network, no credential;
+    its tags are consistent with the history the clone has). Otherwise
+    from the clone's ``origin``, which :func:`clone_for_run` points at the
+    upstream URL, with ``token`` answering the credential challenge as a
+    remote clone does. Tags whose commits the single branch lacks bring
+    those objects along; that is the price of a build that reads
+    ``git describe``, and paid only by projects that do.
+
+    A remote with no tags is not an error — a project on setuptools-scm
+    before its first release is legitimately ``0.1.dev``. A fetch that
+    fails is ``ProvisionError``: the build that needs the tags would fail
+    later and worse, and ``[sandbox] fetch_tags = "never"`` is the opt-out.
+    """
+    try:
+        with Repo(clone) as repo:
+            if source is not None and tag_count(source):
+                repo.git.fetch("--tags", str(source), env=_local_clone_env())
+                return TagFetch(tag_count(clone), "local")
+            repo.git.fetch("--tags", "origin", env=_clone_env(token))
+            return TagFetch(tag_count(clone), "remote")
+    except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError, OSError) as exc:
+        raise ProvisionError(
+            f"fetching tags into {clone} failed: {_describe(exc)}. The workspace derives its "
+            'version from git tags; set [sandbox] fetch_tags = "never" to run without them'
+        ) from exc
+
+
+def tag_count(repo_path: Path) -> int:
+    """How many tags ``repo_path`` holds."""
+    with Repo(repo_path) as repo:
+        listing: str = repo.git.tag("--list")
+    return len(listing.split()) if listing else 0
 
 
 def gitignored_files(root: Path) -> frozenset[str] | None:

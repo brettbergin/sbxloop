@@ -103,6 +103,7 @@ WorkerTransport = Literal["stream", "poll"]
 WorkspaceSource = Literal["configured", "remote", "none"]
 SecretStrategy = Literal["proxy", "plain-env"]
 HarvestMode = Literal["per-task", "final"]
+FetchTags = Literal["auto", "always", "never"]
 WorkspaceIsolation = Literal["auto", "clone", "in-place"]
 # How much the in-sandbox verify phase decides (#682). `full`: a task's
 # verify commands and the project gate must pass (a failure spends
@@ -190,7 +191,8 @@ class SandboxConfig(_ConfigModel):
     # default on purpose: a partial clone fetches blobs lazily from inside
     # the sandbox, which holds no git credential and pays a network round
     # trip per touched file; see the "Clone size" note in `sbxloop.hostgit`.
-    # Every run clone is already `--single-branch --no-tags` regardless.
+    # Every run clone is already `--single-branch --no-tags` regardless;
+    # `fetch_tags` below is how a tag-versioned build gets its tags back.
     clone_filter: str | None = None
     # Whether a run clone's submodules are populated (#692). On by default:
     # a repository that vendors a dependency as a submodule does not build
@@ -213,6 +215,16 @@ class SandboxConfig(_ConfigModel):
     # the run's credential cannot read. Either way a file the run adds or
     # changes under an LFS attribute is never delivered as a plain blob.
     clone_lfs: bool = True
+    # Whether a fresh run clone gets the repository's tags (#694). Every
+    # run clone is cut `--no-tags` for size; a project whose build derives
+    # its version from the nearest tag (setuptools-scm, hatch-vcs,
+    # versioningit, Gradle's axion-release, Rust's vergen, a Makefile's
+    # `git describe`) then builds as 0.0.0 or not at all. `auto` fetches
+    # tags when a manifest names such a tool, from the host checkout's own
+    # tags where it has them and from the remote with the run's credential
+    # otherwise; `always` fetches them for every repository; `never` keeps
+    # the bare clone.
+    fetch_tags: FetchTags = "auto"
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
     # Operator environment for the agent sandbox (#679). `env` holds plain

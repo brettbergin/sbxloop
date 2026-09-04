@@ -472,6 +472,22 @@ refusing — and is named in the PR body's **Not delivered** line
 (`deliver.lfs_change_skipped` in the log); deleting one delivers, since a
 dropped pointer needs no object behind it.
 
+**Tags** come back when the build needs them (#694). A `--no-tags` clone has
+nothing for a build that derives its version from git tags — `setuptools_scm`,
+`hatch-vcs`, `versioningit`, `poetry-dynamic-versioning`, `vergen`, Gradle's
+`axion-release` / `nebula.release` / `git-version`, `MinVer`, `GitVersion`,
+`Nerdbank.GitVersioning`, or a `git describe` in a Makefile — and such a
+build fails, or quietly reports `0.0.0`. When a fresh clone's manifests
+(`pyproject.toml`, `Cargo.toml`, `build.gradle`, `*.csproj`, `Makefile`,
+`.goreleaser.yml`, …) name one of those, the loop fetches the repository's
+tags into the clone: from the host checkout when it has tags (no network, no
+credential), else with `git fetch --tags origin` under the run's GitHub
+credential. A failed fetch fails provisioning by name rather than starting
+a run whose version is wrong. `sandbox.workspace_tags` records what was
+detected and how many tags came from where; `[sandbox] fetch_tags` is
+`"auto"` by default, `"always"` for a build whose marker the loop does not
+recognise, `"never"` to keep the clone tag-free.
+
 ### Environment for the agent sandbox
 
 A project's test suite often reads its environment — `RAILS_ENV`,
@@ -1867,6 +1883,7 @@ The notable knobs:
 | `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                                      |
 | `[sandbox] clone_submodules`                              | `true`             | Whether a fresh run clone's submodules are populated — from the host checkout's copy when it has the recorded commit, else from the `.gitmodules` URL with the run's credential; a submodule neither can populate fails provisioning by name. `false` leaves them empty.                                                                                           |
 | `[sandbox] clone_lfs`                                     | `true`             | Whether a fresh run clone's Git LFS pointer files are populated — from the host checkout's LFS store when it holds the object, else from the repository's LFS endpoint with the run's credential; needs `git-lfs` on the host, and an object neither can supply fails provisioning by name. `false` leaves the pointer files.                                      |
+| `[sandbox] fetch_tags`                                    | `"auto"`           | Whether a fresh run clone fetches the repository's tags — from the host checkout when it has them, else from origin with the run's credential. `auto` fetches when a manifest names a tag-derived versioning tool (`setuptools_scm`, `hatch-vcs`, `GitVersion`, `git describe`, …); `always` fetches regardless; `never` leaves the `--no-tags` clone as it is.    |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
 | `[sandbox] apt_packages` / `setup_commands`               | `[]` / `[]`        | OS packages ensured beside the toolchains (fail closed), and commands run in the workspace before the first phase, each a `sandbox.setup` event. Per-repo overridable; see "OS packages and setup commands".                                                                                                                                                       |
