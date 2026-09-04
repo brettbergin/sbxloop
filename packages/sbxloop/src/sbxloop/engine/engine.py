@@ -675,6 +675,7 @@ class LoopEngine:
                     )
                     if self.install_workers:
                         self._install_workers(run_id, pair, agent, github)
+                    self._run_setup_commands(run_id, pair, agent)
                     repo_config = self.config.github.effective_repo(None)
                     ops = (
                         self._github_ops(github, run_id)
@@ -802,6 +803,9 @@ class LoopEngine:
                 # install provisions the interpreter the project asked for.
                 versions=pair.languages.versions,
                 expect_prebaked=prebaked_expected,
+                # The operator's OS packages (#681) beside the toolchains;
+                # a template baked with them makes this a dpkg probe.
+                apt_packages=self.config.apt_packages_for(self.config.github.repo),
             )
         ]
         if github is not None:
@@ -832,6 +836,32 @@ class LoopEngine:
                     raise errors[0]
         if prebaked_expected:
             self._emit_prebaked(run_id, pair, agent, github)
+        if agent.apt_installed:
+            self.bus.emit(
+                HostEventTypes.SANDBOX_SETUP,
+                run_id,
+                sandbox=pair.agent.name,
+                apt_packages=list(agent.apt_installed),
+                rc=0,
+                message=f"installed apt packages {', '.join(agent.apt_installed)}"
+                + (
+                    " the template lacked (re-run `sbxloop bake` to stop paying this "
+                    "on every provision)"
+                    if prebaked_expected
+                    else ""
+                ),
+            )
+
+    def _run_setup_commands(self, run_id: str, pair: SandboxPair, agent: WorkerClient) -> None:
+        """The operator's `setup_commands` (#681) in the cloned workspace,
+        after the toolchains, registries and environment are in place and
+        before the first phase. A failure raises out of provisioning — the
+        sandbox is kept under keep_on_failure like any install failure, and
+        the run's events name the command and its output."""
+        commands = self.config.setup_commands_for(self.config.github.repo)
+        if not commands:
+            return
+        agent.run_setup(commands, run_id=run_id, cwd=pair.agent_workdir)
 
     def _emit_prebaked(
         self,

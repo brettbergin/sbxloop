@@ -34,7 +34,7 @@ import sbxloop
 from sbxloop import toolchains
 from sbxloop.config import Limits, WorkerTransport
 from sbxloop.errors import SbxError, WorkerError, WorkerTimeoutError
-from sbxloop.events import EventBus
+from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.log import get_logger
 from sbxloop.sbx.models import ExecResult
 from sbxloop.sbx.sandbox import (
@@ -167,6 +167,15 @@ def _output_tail(result: ExecResult, limit: int = 2000) -> str:
     return combined[-limit:] if combined else "(no output)"
 
 
+def _scrub(text: str, secrets: Sequence[str]) -> str:
+    """Blank delivered secret values out of an output tail before it becomes
+    an event: an operator's setup command is free to `env` or echo a URL
+    with the token in it, and events are the run's public record."""
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        text = text.replace(secret, "***")
+    return text
+
+
 class WorkerClient:
     def __init__(
         self,
@@ -196,6 +205,10 @@ class WorkerClient:
         # provisioned on top of it (#615) — what the sandbox.prebaked event
         # and doctor's advice are built from.
         self.prebake_topup: list[str] = []
+        # The operator's `apt_packages` (#681) that install() found missing
+        # and installed — what the sandbox.setup event reports; empty when
+        # the template already carried them all.
+        self.apt_installed: list[str] = []
         # Sandbox role for enriching resource telemetry (the worker doesn't
         # know which sandbox it lives in), and guardrail thresholds to pass
         # through to the worker's heartbeat sampler.
@@ -239,6 +252,7 @@ class WorkerClient:
         languages: Sequence[str] = (),
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
         expect_prebaked: bool = False,
+        apt_packages: Sequence[str] = (),
     ) -> None:
         """Install sbxloop-worker into the sandbox, venv-first with fallbacks.
 
@@ -273,6 +287,10 @@ class WorkerClient:
         (#627): the workspace's ``requires-python`` / ``.nvmrc`` verdicts
         that ``toolchains.resolve_languages`` read on the host. Absent, or
         for a toolchain it does not name, the registry default is used.
+        ``apt_packages`` are the operator's own OS packages (#681), ensured
+        after the toolchains on both the prebaked and the ladder path — see
+        :meth:`_ensure_apt_packages` for why they, unlike the toolchains,
+        are not best-effort.
         """
         started = time.monotonic()
         log.info(
@@ -288,6 +306,7 @@ class WorkerClient:
             self.prebaked = True
             if ensure_dev_tools:
                 self._top_up_prebaked(timeout, languages, versions)
+                self._ensure_apt_packages(apt_packages, timeout)
             self._ensure_backend_runtime(extras, timeout)
             log.info(
                 "worker.installed",
@@ -299,6 +318,7 @@ class WorkerClient:
             return
         if ensure_dev_tools:
             self._ensure_dev_tools(timeout, languages, versions)
+            self._ensure_apt_packages(apt_packages, timeout)
             self._ensure_search_fallback(timeout)
         wheel = wheel if wheel is not None else resolve_worker_wheel()
         if wheel is not None:
@@ -698,6 +718,129 @@ class WorkerClient:
                     "domain is the usual cause — check the sandbox network policy",
                     output=_output_tail(result),
                 )
+
+    def _ensure_apt_packages(self, packages: Sequence[str], timeout: float) -> None:
+        """The operator's `[sandbox] apt_packages` (#681), probe-first.
+
+        One ``dpkg -s`` pass names what the template lacks; the rest is one
+        ``apt-get update && install``, so a template baked with the list
+        (``sbxloop bake`` passes it) costs a probe and no network. Unlike
+        the toolchain ensure this is NOT best-effort: the operator named
+        these packages because the project does not build without them, so
+        a failed install is a provisioning failure that names the package
+        and apt's last lines — not a run that spends its revision budget
+        rediscovering the missing library.
+        """
+        if not packages:
+            return
+        probe = self.sandbox.exec(
+            [
+                "sh",
+                "-c",
+                'for p in "$@"; do dpkg -s "${p%%=*}" >/dev/null 2>&1 || echo "$p"; done',
+                "sbxloop-apt-probe",
+                *packages,
+            ],
+            timeout=timeout,
+        )
+        if not probe.ok:
+            raise WorkerError(
+                f"could not probe apt packages {list(packages)} (rc={probe.returncode}): "
+                f"{_output_tail(probe)}"
+            )
+        missing = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+        if not missing:
+            log.debug("worker.apt_packages_present", sandbox=self.sandbox.name, packages=packages)
+            return
+        log.info("worker.apt_packages_installing", sandbox=self.sandbox.name, packages=missing)
+        result = self.sandbox.exec(
+            [
+                "sh",
+                "-c",
+                f"sudo -n apt-get update -q && sudo -n apt-get install -y -q {shlex.join(missing)}",
+            ],
+            timeout=timeout,
+        )
+        if not result.ok:
+            raise WorkerError(
+                f"apt packages {missing} did not install (rc={result.returncode}); "
+                "rc=100 usually means apt could not reach its mirrors or knows no such "
+                f"package — check the name and the sandbox network policy: {_output_tail(result)}"
+            )
+        self.apt_installed = missing
+
+    def run_setup(
+        self,
+        commands: Sequence[str],
+        *,
+        run_id: str,
+        cwd: str,
+        timeout: float = 600.0,
+    ) -> None:
+        """The operator's `[sandbox] setup_commands` (#681), in order.
+
+        Each runs in the workspace under a login shell with the same
+        environment a job's worker process gets — the delivered exports
+        (per-job stdin, or the in-VM env file), so a registry credential or
+        a `[sandbox] env` value is in scope — and under the sandbox's
+        egress policy as already applied. Its exit code, duration and
+        output tail become one ``sandbox.setup`` event; the first non-zero
+        exit stops the sequence and fails provisioning naming the command,
+        because the project would not build for the agent either.
+        """
+        for command in commands:
+            started = time.monotonic()
+            payload = self._env_payload()
+            script = f"cd {shlex.quote(cwd)} && {command}"
+            if payload is None:
+                # The env file is what the worker process loads at startup;
+                # a template without one (no secrets, proxy delivery) runs
+                # the command in the profile's environment alone.
+                inner = shlex.join(["sh", "-lc", f"[ -f {ENV_FILE} ] && . {ENV_FILE}; {script}"])
+                cmd = ["sh", "-c", f"exec {inner}"]
+            else:
+                inner = shlex.join(
+                    ["sh", "-lc", f'eval "${JOB_ENV_VAR}"; unset {JOB_ENV_VAR}; {script}']
+                )
+                cmd = ["sh", "-c", f'{JOB_ENV_VAR}="$(cat)" exec {inner}']
+            result = self.sandbox.exec(cmd, timeout=timeout, stdin=payload)
+            tail = _output_tail(result)
+            if payload is not None:
+                tail = _scrub(tail, self._secret_values(payload))
+            duration = round(time.monotonic() - started, 1)
+            self.bus.emit(
+                HostEventTypes.SANDBOX_SETUP,
+                run_id,
+                sandbox=self.sandbox.name,
+                command=command,
+                rc=result.returncode,
+                duration_s=duration,
+                tail=tail,
+            )
+            log.info(
+                "worker.setup_command",
+                sandbox=self.sandbox.name,
+                command=command,
+                rc=result.returncode,
+                duration_s=duration,
+            )
+            if not result.ok:
+                raise WorkerError(
+                    f"setup command failed (rc={result.returncode}) after {duration}s: "
+                    f"{command}\n{tail}"
+                )
+
+    @staticmethod
+    def _secret_values(payload: str) -> list[str]:
+        """The delivered values worth scrubbing from a command's output: any
+        export long enough to be a credential rather than a mode flag."""
+        values: list[str] = []
+        for line in payload.splitlines():
+            _key, _sep, quoted = line.removeprefix("export ").partition("=")
+            value = "".join(shlex.split(quoted)) if quoted else ""
+            if len(value) >= 8:
+                values.append(value)
+        return values
 
     # The worker reroutes the Copilot CLI's glob/grep tools to a PATH ripgrep
     # on non-4-KiB-page guests (USE_BUILTIN_RIPGREP=false, issue #122); this

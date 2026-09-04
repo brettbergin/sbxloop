@@ -488,6 +488,44 @@ in `[sandbox] env` (its own `GOPRIVATE`) wins over the registry's. A
 `[[github.repos]]` entry may carry its own `registries` list, which replaces
 the top-level one.
 
+### OS packages and setup commands
+
+Toolchains carry the packages their own runtime needs; the library a
+project links against (`libpq-dev`, `libjpeg-dev`), a compiler its build
+shells out to (`protobuf-compiler`), a JDK beside a Python project, or a
+one-off like `playwright install --with-deps` is the project's business —
+and without a place to say so, the agent discovers it on its first failed
+install and spends revision budget on `sudo apt-get`. `[sandbox] apt_packages` and `setup_commands` (#681) are that place:
+
+```toml
+[sandbox]
+apt_packages = ["libpq-dev", "protobuf-compiler"]
+setup_commands = [
+  "npx playwright install --with-deps chromium",
+  "pre-commit install-hooks",
+]
+```
+
+`apt_packages` are ensured right after the toolchains, on the prebaked path
+too: one `dpkg -s` pass names what the template lacks and the rest is one
+`apt-get install`, so `sbxloop bake` with the list configured makes a run's
+share a probe and no network. Unlike the toolchain ensure this is not
+best-effort — the operator named the package because the project does not
+build without it, so a failed install fails provisioning naming the package
+and apt's last lines. `setup_commands` run in order, in the cloned workspace,
+after the toolchains, the registries' client files and the sandbox
+environment are in place and before the first agent phase; each runs under a
+login shell with the same environment a job gets (per-job stdin delivery or
+the in-VM env file, so a `secret_env` credential is in scope) and under the
+run's egress policy as already applied — a command that needs a host the
+allowlist lacks fails here, not in a phase. Every command's exit code,
+duration and output tail is a `sandbox.setup` event (delivered secret values
+scrubbed); the first non-zero exit ends the run at provisioning with the
+command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell`. A `[[github.repos]]` entry may carry its own `apt_packages` or
+`setup_commands`, which replaces the top-level list; a per-repo package list
+is paid at that repository's provision, since the bake reads the global list
+only.
+
 ## The daemon: an always-on outer loop
 
 `sbxloop daemon` is deliberately small. It polls the one configured
@@ -1652,6 +1690,7 @@ The notable knobs:
 | `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the credential-free remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                      |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
+| `[sandbox] apt_packages` / `setup_commands`               | `[]` / `[]`        | OS packages ensured beside the toolchains (fail closed), and commands run in the workspace before the first phase, each a `sandbox.setup` event. Per-repo overridable; see "OS packages and setup commands".                                                                                                                                                       |
 | `[[registries]]`                                          | none               | Private package registries: each entry opens `host` for the agent sandbox and writes the ecosystem's client config (`~/.npmrc`, `PIP_INDEX_URL`, `GOPRIVATE`, `~/.cargo/config.toml`, `settings.xml`, `NuGet.Config`, `BUNDLE_*`); `auth_env` is delivered like `secret_env`. Per-repo overridable; see "Private package registries".                              |
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |

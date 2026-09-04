@@ -187,6 +187,17 @@ so it takes exactly the tiers above, and wherever the ecosystem's client
 expands environment variables the file references it by name. Only the netrc
 kinds hold a value at rest, and only in the agent's own VM.
 
+Operator setup (`[sandbox] apt_packages` / `setup_commands`, #681) is the last
+step before the first phase. The packages ride `WorkerClient.install` beside the
+toolchain ensure — a `dpkg -s` probe, then one apt call for what is missing — on
+both the ladder and the prebaked path, and fail closed where the toolchains
+warn: the operator named them. The commands run from the engine after both
+worker installs, in the agent's workdir, launched exactly as a job is (the
+login shell evals the stdin-delivered exports or sources the env file), each
+reported as a `sandbox.setup` event with delivered secret values scrubbed from
+the tail; the first failure raises out of provisioning like an install failure,
+so `keep_on_failure` applies. The bake installs the global package list only.
+
 ### GitHub App installation auth (#568)
 
 `GITHUB_APP_ID` + `GITHUB_APP_INSTALLATION_ID` +

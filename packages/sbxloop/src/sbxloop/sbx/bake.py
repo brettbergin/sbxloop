@@ -130,7 +130,14 @@ def bake_template(
 
             report(f"installing the worker (full install ladder) and {', '.join(languages)}")
             client = WorkerClient(sandbox)
-            client.install(extras=config.agent.backend, ensure_dev_tools=True, languages=languages)
+            client.install(
+                extras=config.agent.backend,
+                ensure_dev_tools=True,
+                languages=languages,
+                # The global list only: a `[[github.repos]]` override is
+                # paid at that repository's provision (#681).
+                apt_packages=config.sandbox.apt_packages,
+            )
 
             if cache_runtime and config.agent.backend == "copilot":
                 report("pre-caching the Copilot runtime")
