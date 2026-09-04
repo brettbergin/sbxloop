@@ -3,8 +3,8 @@ must not mistake for a Python repo, walked through every generalization
 surface that has landed.
 
 Today's columns: language detection (#624), the toolchain series each
-declares (#627), the installer allowlist (#616), the project gate
-(#625/#626) and the config-override lint (#628).
+declares (#627/#686), the installer allowlist (#616), the project gate
+(#625/#626, below the root #687) and the config-override lint (#628).
 Later work adds its column here rather than a test of its own, so "does a
 Go repo work?" stays one table, and a regression names the decision that
 changed.
@@ -209,6 +209,63 @@ EXPECTATIONS: dict[str, Expectation] = {
         lint=(("bundle exec rake default", False),),
     ),
     # both, in registry order — union, never "best guess"
+    # composer.json's `scripts.check` is the gate; composer itself comes
+    # from getcomposer.org, PHP from apt
+    "php": Expectation(
+        ("php",),
+        "detected",
+        versions={},
+        allowed=("getcomposer.org",),
+        not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
+        gate="composer run check",
+        lint=(("composer run check", False),),
+    ),
+    # apt-only: the toolchain opens no installer host, and CMake declares
+    # no gate of its own (a build is not a check)
+    "cpp": Expectation(
+        ("cpp",),
+        "detected",
+        versions={},
+        allowed=(),
+        not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
+        gate=None,
+        lint=(("cmake --build build", False),),
+    ),
+    # a wrapper is preferred over the toolchain's mvn; the pom's
+    # compiler release is the floor the series is read from (#686)
+    "java-maven": Expectation(
+        ("java",),
+        "detected",
+        versions={"java": ("21", "pom.xml")},
+        allowed=("api.foojay.io", "github.com"),
+        not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
+        gate="./mvnw -q verify",
+        lint=(("./mvnw -q verify", False),),
+    ),
+    # No manifest at the root at all: the packages two levels down carry
+    # both the language and the gate, run under the client the root's
+    # lockfile pins (#687)
+    "monorepo": Expectation(
+        ("javascript",),
+        "detected",
+        versions={"javascript": ("24", "default")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="cd packages/api && pnpm run check",
+        lint=(("cd packages/api && pnpm run check", False),),
+    ),
+    # A package.json with a latin-1 byte in its author field: detection,
+    # the engines reader and the gate detector decode it leniently
+    # instead of failing the provision (#687)
+    "bad-encoding": Expectation(
+        ("javascript",),
+        "detected",
+        versions={"javascript": ("22", "package.json")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="npm run check",
+        lint=(("npm run check", False),),
+    ),
     "polyglot": Expectation(
         ("python", "javascript"),
         "detected",

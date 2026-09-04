@@ -1298,3 +1298,39 @@ def test_unsatisfiable_pin_surfaces_from_resolve_languages(tmp_path: Path) -> No
     (tmp_path / "Gemfile").write_text('ruby "~> 2.7"\n')
     with pytest.raises(ProvisionError, match="Gemfile pins ruby"):
         toolchains.resolve_languages(["ruby"], tmp_path)
+
+
+# --- #687: manifests are read with errors="replace" -----------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "body", "toolchain", "series"),
+    [
+        (
+            "pyproject.toml",
+            b'[project]\nname = "x"  # caf\xe9\nrequires-python = ">=3.11,<3.12"\n',
+            "python",
+            "3.11",
+        ),
+        (".python-version", b"3.11\n# caf\xe9\n", "python", "3.11"),
+        (".nvmrc", b"20\n\xff\n", "javascript", "20"),
+        (
+            "package.json",
+            b'{"engines": {"node": ">=18 <21"}, "name": "caf\xe9"}',
+            "javascript",
+            "20",
+        ),
+        (".ruby-version", b"3.2.2\n# \xe9\n", "ruby", "3.2.2"),
+        (".java-version", b"17\n# \xe9\n", "java", "17"),
+        ("global.json", b'{"sdk": {"version": "8.0.400"}, "note": "caf\xe9"}', "dotnet", "8"),
+    ],
+)
+def test_a_manifest_that_is_not_utf8_provisions_without_error(
+    tmp_path: Path, name: str, body: bytes, toolchain: str, series: str
+) -> None:
+    # A Latin-1 comment used to raise UnicodeDecodeError out of ensure_pair
+    # and kill the run at provisioning; the bytes that matter are ASCII.
+    (tmp_path / name).write_bytes(body)
+    toolchains.resolve_languages((), tmp_path)
+    versions = toolchains.toolchain_versions([toolchain], tmp_path)
+    assert (versions[toolchain].series, versions[toolchain].source) == (series, name)

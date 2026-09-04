@@ -373,12 +373,21 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   `"ci-only"` no verify job is submitted at all (`skipped`). Both apply to a
   fix task's verify commands too.
 - **GATE** — the project's own gate (`[sandbox] gate_command`, or the one
-  `verifylint.project_gate` detects: a `check`/`ci`/`verify` target in a
-  makefile, justfile or Taskfile; a package.json script run under the
-  client its `packageManager` field or lockfile names; tox; nox; a
-  Rakefile `ci`/`check`/`default` task; a composer `check`/`ci` script;
-  `./gradlew check`; `mvn -q verify`; a cargo `ci` alias; and, when a Go,
-  Rust or .NET repo declares nothing, the tool itself — `go vet && go test`, `cargo test`, `dotnet test`) over the whole tree, mechanical.
+  `verifylint.project_gate` detects: a `check`/`ci`/`verify` *rule* in a
+  makefile or justfile (a `check := …` variable is not one) or a *task*
+  in a parsed Taskfile (not an include or a var); a package.json script
+  run under the client its `packageManager` field or lockfile names; tox;
+  nox; a Rakefile `ci`/`check`/`default` task; a composer `check`/`ci`
+  script; `./gradlew check`; `mvn -q verify`; a cargo `ci` alias; and,
+  when a Go (`go.mod` or `go.work`), Rust or .NET repo declares nothing,
+  the tool itself — `go vet && go test`, `cargo test`, `dotnet test`)
+  over the whole tree, mechanical. The walk mirrors language detection
+  (#687): the root first, then the same `toolchains.DETECT_DEPTH` levels
+  of subdirectories in sorted order, skipping `toolchains.SKIP_DIRS`
+  plus test/fixture/example/docs directories; the first gate found below
+  the root is emitted as `cd <relative dir> && <gate>` (one `shell_batch`
+  line, so the `cd` scopes it), and a package below a monorepo root
+  inherits the client the root's `packageManager` or lockfile pins.
   Every detector is tied to a toolchain and only runs when that toolchain
   was resolved for the sandbox (#624) — `make`, `just` and `task` are
   entries of their own, selected by their manifests (#685) — so the gate is

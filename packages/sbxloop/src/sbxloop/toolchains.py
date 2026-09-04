@@ -60,7 +60,9 @@ from sbxloop.log import get_logger
 __all__ = [
     "BASELINE_TOOLS",
     "DEFAULT_LANGUAGES",
+    "DETECT_DEPTH",
     "GIT",
+    "SKIP_DIRS",
     "TOOLCHAINS",
     "LanguageResolution",
     "Toolchain",
@@ -278,7 +280,7 @@ def _python_series_from(workspace: Path) -> ToolchainVersion | None:
     ``>=3.11.4`` still selects 3.11, whose latest patch uv installs."""
     pin = workspace / ".python-version"
     try:
-        first = pin.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+        first = pin.read_text(encoding="utf-8", errors="replace").strip().splitlines()[0].strip()
     except (OSError, IndexError):
         first = ""
     if first:
@@ -294,7 +296,9 @@ def _python_series_from(workspace: Path) -> ToolchainVersion | None:
                 toolchain="python",
             )
     try:
-        data = tomllib.loads((workspace / "pyproject.toml").read_text(encoding="utf-8"))
+        data = tomllib.loads(
+            (workspace / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+        )
     except (OSError, tomllib.TOMLDecodeError):
         return None
     project = data.get("project")
@@ -491,7 +495,7 @@ def _ruby_series_from(workspace: Path) -> ToolchainVersion | None:
     that selects the newest series in the table satisfying it."""
     pin = workspace / ".ruby-version"
     try:
-        first = pin.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+        first = pin.read_text(encoding="utf-8", errors="replace").strip().splitlines()[0].strip()
     except (OSError, IndexError):
         first = ""
     if first:
@@ -507,7 +511,11 @@ def _ruby_series_from(workspace: Path) -> ToolchainVersion | None:
             return None
         return _ruby_series_for(parsed, first, pin.name)
     try:
-        lines = (workspace / ".tool-versions").read_text(encoding="utf-8").splitlines()
+        lines = (
+            (workspace / ".tool-versions")
+            .read_text(encoding="utf-8", errors="replace")
+            .splitlines()
+        )
     except OSError:
         lines = []
     for line in lines:
@@ -524,7 +532,7 @@ def _ruby_series_from(workspace: Path) -> ToolchainVersion | None:
                 return None
             return _ruby_series_for(parsed, words[1], ".tool-versions")
     try:
-        gemfile = (workspace / "Gemfile").read_text(encoding="utf-8")
+        gemfile = (workspace / "Gemfile").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     match = _GEMFILE_RUBY.search(gemfile)
@@ -780,14 +788,19 @@ def _java_major_from(workspace: Path) -> ToolchainVersion | None:
     # (source, the version text, the declaration as written)
     exact_sources: list[tuple[str, str, str]] = []
     try:
-        first = (workspace / ".java-version").read_text(encoding="utf-8").strip().splitlines()[0]
+        first = (
+            (workspace / ".java-version")
+            .read_text(encoding="utf-8", errors="replace")
+            .strip()
+            .splitlines()[0]
+        )
     except (OSError, IndexError):
         first = ""
     if first.strip():
         exact_sources.append((".java-version", first.strip(), first.strip()))
     for name, key in ((".sdkmanrc", "java="), (".tool-versions", "java ")):
         try:
-            lines = (workspace / name).read_text(encoding="utf-8").splitlines()
+            lines = (workspace / name).read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         for line in lines:
@@ -797,7 +810,7 @@ def _java_major_from(workspace: Path) -> ToolchainVersion | None:
                 break
     for name in _GRADLE_FILES:
         try:
-            text = (workspace / name).read_text(encoding="utf-8")
+            text = (workspace / name).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         match = _GRADLE_TOOLCHAIN.search(text) or _GRADLE_COMPATIBILITY.search(text)
@@ -819,7 +832,7 @@ def _java_major_from(workspace: Path) -> ToolchainVersion | None:
             written, major.__eq__, JAVA_JDK_MAJOR, JAVA_MAJOR_CANDIDATES, source, toolchain="java"
         )
     try:
-        pom = (workspace / "pom.xml").read_text(encoding="utf-8")
+        pom = (workspace / "pom.xml").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     match = _POM_RELEASE.search(pom)
@@ -1100,7 +1113,12 @@ def _node_major_from(workspace: Path) -> ToolchainVersion | None:
     first (an exact pin), then ``package.json`` ``engines.node``."""
     for name in (".nvmrc", ".node-version"):
         try:
-            first = (workspace / name).read_text(encoding="utf-8").strip().splitlines()[0]
+            first = (
+                (workspace / name)
+                .read_text(encoding="utf-8", errors="replace")
+                .strip()
+                .splitlines()[0]
+            )
         except (OSError, IndexError):
             continue
         first = first.strip()
@@ -1127,7 +1145,9 @@ def _node_major_from(workspace: Path) -> ToolchainVersion | None:
             first, major.__eq__, NODE_MAJOR, NODE_MAJOR_CANDIDATES, name, toolchain="javascript"
         )
     try:
-        data = json.loads((workspace / "package.json").read_text(encoding="utf-8"))
+        data = json.loads(
+            (workspace / "package.json").read_text(encoding="utf-8", errors="replace")
+        )
     except (OSError, ValueError):
         return None
     engines = data.get("engines") if isinstance(data, dict) else None
@@ -1261,7 +1281,9 @@ _PACKAGE_MANAGER_PIN = re.compile(r"^bun@(\d+\.\d+\.\d+)")
 
 def _bun_series_from(workspace: Path) -> ToolchainVersion | None:
     try:
-        data = json.loads((workspace / "package.json").read_text(encoding="utf-8"))
+        data = json.loads(
+            (workspace / "package.json").read_text(encoding="utf-8", errors="replace")
+        )
     except (OSError, ValueError):
         return None
     declared = data.get("packageManager") if isinstance(data, dict) else None
@@ -1494,7 +1516,7 @@ def _dotnet_series_from(workspace: Path) -> ToolchainVersion | None:
     ``rollForward`` policy decide which installed SDK is acceptable, and
     an SDK outside the policy makes ``dotnet`` refuse to run at all."""
     try:
-        text = (workspace / "global.json").read_text(encoding="utf-8")
+        text = (workspace / "global.json").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     try:
@@ -1735,7 +1757,7 @@ DEFAULT_LANGUAGES: tuple[str, ...] = ("python",)
 # Subdirectory names detect_languages never descends into: dependency and
 # tool trees carry other ecosystems' manifests (a Python repo's node_modules
 # is full of package.json), and dot-directories are tooling, not project.
-_SKIP_DIRS = frozenset({"node_modules", "vendor", "third_party", "site-packages"})
+SKIP_DIRS = frozenset({"node_modules", "vendor", "third_party", "site-packages"})
 
 _BY_KEY: dict[str, Toolchain] = {}
 for _toolchain in TOOLCHAINS:
@@ -1822,11 +1844,11 @@ def _manifest_matches(name: str, manifests: Iterable[str]) -> bool:
 # (a pnpm workspace's tsconfig.json lives there, not at the root), while
 # descending further starts reading fixtures and dependency trees — the
 # false positives outweigh the finds.
-_DETECT_DEPTH = 2
+DETECT_DEPTH = 2
 
 
 def _candidate_files(workspace: Path) -> list[str]:
-    """Names of the files at the workspace root and up to ``_DETECT_DEPTH``
+    """Names of the files at the workspace root and up to ``DETECT_DEPTH``
     levels down, skipping dot-directories and dependency trees.
 
     A workspace that does not exist yields nothing rather than raising: the
@@ -1844,10 +1866,10 @@ def _candidate_files(workspace: Path) -> list[str]:
             if entry.is_file():
                 names.append(entry.name)
             elif (
-                depth < _DETECT_DEPTH
+                depth < DETECT_DEPTH
                 and entry.is_dir()
                 and not entry.name.startswith(".")
-                and entry.name not in _SKIP_DIRS
+                and entry.name not in SKIP_DIRS
             ):
                 pending.append((entry, depth + 1))
     return names
@@ -1856,7 +1878,7 @@ def _candidate_files(workspace: Path) -> list[str]:
 def detect_languages(workspace: Path) -> dict[str, tuple[str, ...]]:
     """Which registry languages ``workspace`` declares, and on what evidence.
 
-    Pure filesystem read, no process spawn, bounded at ``_DETECT_DEPTH``
+    Pure filesystem read, no process spawn, bounded at ``DETECT_DEPTH``
     levels below the root. Returns ``{language: signals}`` in registry
     order — the signals being the manifest names that matched, so the run
     event can say *why* Go was provisioned. Union, not "best guess": a repo

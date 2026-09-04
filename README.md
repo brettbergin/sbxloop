@@ -182,7 +182,11 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   itself) over the whole tree, mechanical. A detector only fires for a
   toolchain the sandbox was provisioned with — the task runners included:
   a Makefile, justfile or Taskfile selects `make`, `just` or `task` the
-  way `go.mod` selects Go. A later task can break what an earlier one proved,
+  way `go.mod` selects Go. The root is read first, then the same two
+  levels of subdirectories language detection reads (test, fixture,
+  example and docs directories excluded); a gate found below the root
+  runs as `cd <dir> && <gate>`, a package.json script under the client
+  the monorepo's root pins. A later task can break what an earlier one proved,
   so this is the last look at the tree exactly as it will be delivered. A run
   with no `[github] repo` ends **`completed`** here, its work in the
   workspace.
@@ -1495,7 +1499,9 @@ and spending revision budget on it. Which ones is resolved once per run:
    subdirectories are read (so a monorepo's `packages/<name>/` count;
    `node_modules`, `vendor`, and dot-directories do not), and every match is
    selected — a repo carrying both `pyproject.toml` and `package.json` gets
-   both.
+   both. A manifest that is not valid UTF-8 (a latin-1 author name)
+   is decoded leniently — it still selects its language and its version
+   pin is still read — rather than failing the provision.
 3. Otherwise `python`, so a workspace with no recognizable manifest behaves
    as it always has.
 
