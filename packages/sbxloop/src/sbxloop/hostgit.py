@@ -34,15 +34,28 @@ What is deliberately NOT done:
 * ``--filter=blob:none`` by default. A partial clone keeps history but
   fetches blobs *lazily*, from inside the sandbox VM, the moment the agent
   touches a file whose blob is missing (``git checkout``, ``git diff``,
-  ``git log -p`` …). The VM holds no git credential, so on a private
-  remote that is a mid-task git failure with no useful message; even on a
-  public one every such blob is a network round trip in the agent's
-  critical path. It is therefore opt-in — ``[sandbox] clone_filter =
-  "blob:none"`` — and applies only to :func:`clone_from_remote`, the
-  credential-free public-remote path where lazy fetches can succeed at
-  all (git ignores filters on local path clones anyway). A git too old to
-  know ``--filter`` falls back to an unfiltered clone with a log line
+  ``git log -p`` …). The VM holds no git credential — the run's token
+  authenticates the *host* clone only (#683) — so on a private remote
+  that is a mid-task git failure with no useful message; even on a public
+  one every such blob is a network round trip in the agent's critical
+  path. It is therefore opt-in — ``[sandbox] clone_filter = "blob:none"``
+  — and applies only to :func:`clone_from_remote`, the remote path where
+  lazy fetches can succeed at all (git ignores filters on local path
+  clones anyway), and only sensibly on a public repository. A git too old
+  to know ``--filter`` falls back to an unfiltered clone with a log line
   rather than failing the run.
+
+Cloning a private remote (#683)
+-------------------------------
+:func:`clone_from_remote` takes the run's GitHub token — the same PAT or
+App installation token the github sandbox delivers with — and hands it to
+git through a one-shot ``credential.helper`` set in the *environment*
+(``GIT_CONFIG_COUNT``/``GIT_CONFIG_KEY_n``, git ≥ 2.31). The token never
+appears on the command line, never lands in ``.git/config`` or the remote
+URL, and is gone once the clone returns; any helper the host user has
+configured is switched off for that one process so the clone can only ever
+authenticate as the run. ``x-access-token`` is the username GitHub accepts
+for both credential kinds.
 """
 
 from __future__ import annotations
@@ -309,15 +322,18 @@ def clone_from_remote(
     *,
     existing: bool = False,
     clone_filter: str | None = None,
+    token: str | None = None,
 ) -> str:
     """Clone a *remote* URL into ``target`` on a fresh ``branch``; return sha.
 
     The no-local-checkout path of per-repo workspace resolution: a repo
     entry configured without a workspace has no host tree to clone, so the
-    run's tree comes from the remote itself. Only credential-free (public)
-    remotes can work here — the host deliberately holds no git credential
-    (#46) — so the clone runs with terminal and credential-helper prompting
-    disabled and fails loudly rather than hanging on an auth prompt.
+    run's tree comes from the remote itself. The host holds no git
+    credential of its own (#46): the clone runs with terminal and
+    credential-helper prompting disabled and fails loudly rather than
+    hanging on an auth prompt. ``token`` — the run's GitHub credential —
+    authenticates this one clone through an environment-scoped helper (see
+    the module docstring, #683); without it only a public remote can work.
 
     With ``existing`` the clone is cut *on* ``branch`` (``--branch``): under
     ``--single-branch`` that is the only way ``origin/<branch>`` exists in
@@ -333,11 +349,7 @@ def clone_from_remote(
     ``ProvisionError`` on any failure; a half-created target is removed so a
     retry starts clean. Never falls back to another tree.
     """
-    env = {
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "",
-        "GCM_INTERACTIVE": "never",
-    }
+    env = _clone_env(token)
     options = list(CLONE_OPTIONS)
     if existing:
         options.append(f"--branch={branch}")
@@ -358,6 +370,44 @@ def clone_from_remote(
         raise ProvisionError(
             f"cloning {public_remote_url(repo_url)} into {target} failed: {_describe(exc)}"
         ) from exc
+
+
+# The environment variable the one-shot credential helper reads the run's
+# token from. It exists only in the clone's process environment.
+CLONE_TOKEN_ENV = "SBXLOOP_GIT_TOKEN"  # nosec B105 - env var name, not a secret
+_CLONE_CREDENTIAL_HELPER = (
+    '!f() { echo username=x-access-token; echo "password=$' + CLONE_TOKEN_ENV + '"; }; f'
+)
+
+
+def _clone_env(token: str | None) -> dict[str, str]:
+    """The environment a remote clone runs under.
+
+    Prompting is off in every form so a missing or rejected credential
+    fails the clone instead of hanging. With ``token`` git additionally
+    gets two config entries through ``GIT_CONFIG_*`` — an empty
+    ``credential.helper`` that clears whatever helpers the host user has
+    (a keychain must not answer for the run), then the one-shot helper
+    that answers with the token from :data:`CLONE_TOKEN_ENV`. Neither the
+    helper nor the token touches argv, ``.git/config`` or the URL.
+    """
+    env = {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "GCM_INTERACTIVE": "never",
+    }
+    if token:
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "credential.helper",
+                "GIT_CONFIG_VALUE_0": "",
+                "GIT_CONFIG_KEY_1": "credential.helper",
+                "GIT_CONFIG_VALUE_1": _CLONE_CREDENTIAL_HELPER,
+                CLONE_TOKEN_ENV: token,
+            }
+        )
+    return env
 
 
 def _clone_remote(
@@ -868,8 +918,15 @@ def merge_from_base(repo_path: Path, base_branch: str, *, remote: str = "origin"
 
 def _describe(exc: Exception) -> str:
     stderr = getattr(exc, "stderr", None)
-    if isinstance(stderr, str) and stderr.strip():
-        return stderr.strip().splitlines()[-1]
+    if isinstance(stderr, str):
+        # GitPython hands stderr over as "\n  stderr: '<text>'"; the last
+        # non-empty line inside the quotes is the reason git gave.
+        text = stderr.strip()
+        if text.startswith("stderr: '") and text.endswith("'"):
+            text = text[len("stderr: '") : -1]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
     return str(exc)
 
 

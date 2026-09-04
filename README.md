@@ -410,8 +410,9 @@ host checkout, `[sandbox] clone_filter = "blob:none"` opts the remote clone
 into git's partial-clone filter: history and trees come down, file contents
 are fetched lazily on first checkout. The hazard is that lazy fetch happens
 wherever git next needs a blob, including inside the VM, which holds no git
-credential — fine for the public repositories that mode is limited to, and
-the reason the filter is opt-in and applies only there. A git without
+credential (the run's token authenticates the host clone only) — fine for a
+public repository, a mid-task failure on a private one, and the reason the
+filter is opt-in and applies only to the remote clone. A git without
 partial-clone support logs `workspace.clone_filter_unsupported` and clones
 in full rather than failing.
 
@@ -1138,10 +1139,18 @@ belongs to it) has no host tree, so its runs clone the repository from its
 own remote into the run directory (from the server `[github] api_url`
 names, single-branch, optionally blob-filtered — see
 [Working against an existing checkout](#working-against-an-existing-checkout)).
-The host deliberately holds no git credential, so **this mode only works
-for a public repository**; for a private one the clone fails the run with
-that reason, rather than falling back to anything. Give private
-repositories a checkout of their own.
+The clone authenticates with the run's own GitHub credential — the
+daemon-wide `GH_TOKEN`, the entry's `token_env`, or a GitHub App
+installation token minted on the host — so **private repositories clone
+like public ones**. The token reaches git through a one-shot credential
+helper that exists only in that clone's environment: it is never on the
+command line, never in the clone's `.git/config` or remote URL, and any
+credential helper the host user has configured is switched off for that
+process, so the host still holds no git credential of its own. With no
+GitHub credential configured at all only a public repository can be
+cloned; a failure names which case applied, rather than falling back to
+anything. `sandbox.workspace_clone` records whether the clone was
+authenticated.
 
 **Migration.** A single-repo deployment's `[sandbox] workspace` keeps
 working exactly as before. When you add a second repository, **move
@@ -1717,7 +1726,7 @@ The notable knobs:
 | `[sandbox] workspace`                                     | unset              | Where runs execute; unset gives each run a fresh dir under `state_dir`.                                                                                                                                                                                                                                                                                            |
 | `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                                                                                                                                                                                                            |
 | `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                                                                                                                                                                                                                   |
-| `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the credential-free remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                      |
+| `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                                      |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
 | `[sandbox] apt_packages` / `setup_commands`               | `[]` / `[]`        | OS packages ensured beside the toolchains (fail closed), and commands run in the workspace before the first phase, each a `sandbox.setup` event. Per-repo overridable; see "OS packages and setup commands".                                                                                                                                                       |

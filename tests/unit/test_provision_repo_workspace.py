@@ -16,6 +16,7 @@ from git import Repo
 
 from sbxloop.config import Config
 from sbxloop.errors import ProvisionError
+from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from tests.conftest import FakeSbx
 from tests.unit.test_provision import TOKENS
@@ -105,11 +106,78 @@ def test_legacy_workspace_not_used_for_another_repo(
 def test_no_workspace_no_credential_fails_explicitly(
     fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A host with no GitHub credential at all can still clone a public
+    remote, and a private one fails naming that as the reason."""
     legacy = _checkout(tmp_path / "sbxloop", "o/one")
     config = _config(
         tmp_path,
         [{"repo": "o/one", "workspace": str(legacy)}, {"repo": "o/private"}],
     )
+    provisioner = Provisioner(SbxCLI(binary=str(fake_sbx.binary)), config, env={})
+
+    from sbxloop import hostgit
+
+    seen: dict[str, object] = {}
+
+    def boom(url: str, target: Path, branch: str, **kwargs: object) -> str:
+        seen.update(kwargs)
+        raise ProvisionError(f"cloning {url} failed: could not read Username")
+
+    monkeypatch.setattr(hostgit, "clone_from_remote", boom)
+    with pytest.raises(ProvisionError) as excinfo:
+        provisioner._resolve_workspace("r1", "o/private")
+    message = str(excinfo.value)
+    assert seen["token"] is None
+    assert "no workspace is configured for o/private" in message
+    assert "No GitHub credential is configured on the host" in message
+    assert "GH_TOKEN" in message
+
+
+def test_remote_clone_carries_the_runs_token(
+    fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#683: the clone authenticates with the same credential the github
+    sandbox delivers with — daemon-wide GH_TOKEN, or the entry's own
+    token_env — and the clone event says so."""
+    legacy = _checkout(tmp_path / "sbxloop", "o/one")
+    upstream = _checkout(tmp_path / "upstream", "o/private")
+    config = _config(
+        tmp_path,
+        [
+            {"repo": "o/one", "workspace": str(legacy)},
+            {"repo": "o/private"},
+            {"repo": "o/other", "token_env": "OTHER_TOKEN"},
+        ],
+    )
+    env = {**TOKENS, "OTHER_TOKEN": "github_pat_other"}
+    provisioner = Provisioner(SbxCLI(binary=str(fake_sbx.binary)), config, env=env)
+
+    from sbxloop import hostgit
+
+    seen: list[str | None] = []
+
+    def fake_clone(url: str, target: Path, branch: str, **kwargs: object) -> str:
+        seen.append(kwargs.get("token"))  # type: ignore[arg-type]
+        return hostgit.clone_for_run(upstream, target, branch)
+
+    monkeypatch.setattr(hostgit, "clone_from_remote", fake_clone)
+    events: list[object] = []
+    provisioner.bus.subscribe(events.append)
+    provisioner._resolve_workspace("r1", "o/private")
+    provisioner._resolve_workspace("r2", "o/other")
+    assert seen == ["github_pat_user", "github_pat_other"]
+    clones = [e for e in events if e.type == "sandbox.workspace_clone"]  # type: ignore[attr-defined]
+    assert [e.data["authenticated"] for e in clones] == [True, True]  # type: ignore[attr-defined]
+    assert "with the run's GitHub credential" in clones[0].data["message"]  # type: ignore[attr-defined]
+    # The token itself is in no event.
+    assert all("github_pat" not in str(e.data) for e in clones)  # type: ignore[attr-defined]
+
+
+def test_remote_clone_failure_with_a_token_names_the_permission(
+    fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy = _checkout(tmp_path / "sbxloop", "o/one")
+    config = _config(tmp_path, [{"repo": "o/one", "workspace": str(legacy)}, {"repo": "o/private"}])
     provisioner = _provisioner(fake_sbx, config)
 
     from sbxloop import hostgit
@@ -121,8 +189,35 @@ def test_no_workspace_no_credential_fails_explicitly(
     with pytest.raises(ProvisionError) as excinfo:
         provisioner._resolve_workspace("r1", "o/private")
     message = str(excinfo.value)
-    assert "no workspace is configured for o/private" in message
-    assert "credential" in message
+    assert "authenticated with the run's GitHub credential" in message
+    assert "contents:read" in message
+    assert "github_pat_user" not in message
+
+
+def test_remote_clone_with_a_misconfigured_credential_fails_before_cloning(
+    fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-repo token_env that is unset is a misconfiguration, not "no
+    credential": the run fails naming it rather than cloning unauthenticated
+    and reporting a confusing remote error."""
+    legacy = _checkout(tmp_path / "sbxloop", "o/one")
+    config = _config(
+        tmp_path,
+        [
+            {"repo": "o/one", "workspace": str(legacy)},
+            {"repo": "o/private", "token_env": "MISSING_TOKEN"},
+        ],
+    )
+    provisioner = _provisioner(fake_sbx, config)
+
+    from sbxloop import hostgit
+
+    def never(url: str, target: Path, branch: str, **kwargs: object) -> str:
+        raise AssertionError("clone must not be attempted")
+
+    monkeypatch.setattr(hostgit, "clone_from_remote", never)
+    with pytest.raises(ProvisionError, match="MISSING_TOKEN"):
+        provisioner._resolve_workspace("r1", "o/private")
 
 
 def test_no_workspace_public_repo_clones_from_remote(
@@ -147,6 +242,7 @@ def test_no_workspace_public_repo_clones_from_remote(
         *,
         existing: bool = False,
         clone_filter: str | None = None,
+        token: str | None = None,
     ) -> str:
         seen["url"] = url
         seen["clone_filter"] = clone_filter
@@ -189,6 +285,7 @@ def test_remote_clone_follows_api_url_and_clone_filter(
         *,
         existing: bool = False,
         clone_filter: str | None = None,
+        token: str | None = None,
     ) -> str:
         seen["url"] = url
         seen["clone_filter"] = clone_filter
