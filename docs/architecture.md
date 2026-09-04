@@ -800,8 +800,20 @@ a fix round (the same tick may dispatch it; the resume budget is not
 charged); merged, or the required number of human approvals → the hold is
 claimed `approving` and the same gh-ops-only `land()` the merge gate uses
 finishes the landing, so a review left during the park is honoured. A
-landing that comes back anything but `Landed`/`Closed` reopens the hold
-with the detail (`review.merge_failed`). Past `review_wait_s` without a
+landing that comes back `AwaitingReview` re-parks the hold for what it now
+waits on — `held_by_draft` and `approvals_required` rewritten
+(`review.reparked`); anything else but `Landed`/`Closed` reopens the hold
+with the detail (`review.merge_failed`).
+
+A draft the loop did not make is a person's hold (#677). `land()` clears
+the draft once when `own_draft=True` (the engine passes
+`deliver_draft and not _undrafted(run_id)`, the record being the run's own
+`land.undraft` event); a draft found otherwise returns
+`AwaitingReview(draft=True)` after `land.held_by_draft`, and the daemon
+parks it on the same hold row with `held_by_draft = 1` — no reviewers
+requested, the poll watching `draft` rather than approvals (`review.ready`
+when a person marks it ready), and `_land_parked` passing
+`own_draft=False` so the finishing landing never un-drafts either. Past `review_wait_s` without a
 verdict the hold pauses — item `paused_review`, one `run.review_paused`
 mention, no more polling — until `resume <item>` reopens it; a restart
 reopens holds caught mid-approval. A human's changes-requested review that

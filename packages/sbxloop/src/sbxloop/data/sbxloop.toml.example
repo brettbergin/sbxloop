@@ -231,12 +231,15 @@ secret_strategy = "proxy"
 # changes-requested review resumes it for a fix round; the PR closed
 # abandons it. After review_wait_s without a verdict the item goes
 # `paused_review` (one more mention, no more polling) until
-# `!sbx resume <item>` picks it up again. Survives restarts.
+# `!sbx resume <item>` picks it up again. Survives restarts. A person
+# converting the PR to draft is the same park: it waits for the PR to be
+# marked ready for review (approvals alone do not end it), then lands.
 # merge_gate = "off"         # off | chat
 # review_poll_interval_s = 600  # how often a parked PR is checked (2 API requests per check)
 # review_wait_s = 14400      # how long to keep checking before pausing the wait
 # review_notify = []         # chat user ids mentioned when a PR parks for review; overridable per repo
-# deliver_draft = true
+# deliver_draft = true      # the PR opens as a draft, un-drafted once review and CI pass; a
+#                           # repository plan without drafts gets a ready PR on one retry
 # max_review_rounds = 3      # times the review may request changes
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
 # retry_rounds = 2           # daemon: an exhausted run resumes its own PR once with this many more; 0 = hand to a human

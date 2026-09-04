@@ -892,6 +892,27 @@ class TestEmbeds:
             "review(s) from a code owner (0/2 so far); waiting for a reviewer on GitHub"
         ]
         assert waiting[0].flush
+        drafted = format_for_discord(ev("land.held_by_draft", pr=9, head="abc"))
+        assert texts(drafted) == [
+            "✋ PR #9 was converted to draft by a person — holding until it is marked ready "
+            "for review"
+        ]
+        assert drafted[0].flush
+        held = format_for_discord(
+            ev(
+                "run.awaiting_review",
+                pr=9,
+                url="https://x/pull/9",
+                approvals_required=0,
+                code_owners=False,
+                draft=True,
+            )
+        )
+        assert texts(held) == [
+            "✋ **held in draft** PR [#9](https://x/pull/9) — a person converted it to draft; "
+            "waiting for it to be marked ready for review"
+        ]
+        assert held[0].flush
 
 
 def tev(ts: float, type: str, **data: Any) -> Event:
@@ -1394,6 +1415,8 @@ class TestStatusLineStages:
         assert s.render().startswith("🚀 landing · merging")
         s.observe(ev("land.undraft", pr=9))
         assert s.render().startswith("🚀 landing · out of draft")
+        s.observe(ev("land.held_by_draft", pr=9, head="abc"))
+        assert s.render().startswith("🚀 landing · held in draft by a person")
         s.observe(ev("land.update", pr=9, attempt=1, accepted=True))
         assert "updating from base (attempt 1)" in s.render()
         s.observe(ev("run.state", state="merged"))

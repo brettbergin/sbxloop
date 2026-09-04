@@ -11,6 +11,7 @@ test_engine_landing.py.
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch
+from sbxloop.daemon.store import DaemonStore
 from sbxloop.gh.ops import GithubOpsError
 from tests.fakes.fake_github import BLOCKED_405, FakeGithub, human_review
 from tests.unit.test_daemon_loop import PR_URL, Harness, RecordingFrontend, gh_item
@@ -297,7 +299,7 @@ class TestPoll:
         assert fresh.state == "open" and fresh.detail == "the base now wants 2 approving reviews"
         item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "awaiting_review"
-        assert notices(h, "review.merge_failed")
+        assert notices(h, "review.reparked") and not notices(h, "review.merge_failed")
 
     def test_a_poll_that_fails_keeps_waiting(self, tmp_path: Path) -> None:
         h, fake, run_id = self.parked(tmp_path)
@@ -319,6 +321,97 @@ class TestPoll:
         h.clock.t += 600
         assert h.loop.tick().idle_kind == "paused"
         assert landed(h, run_id).state == "merged"
+
+    def test_a_draft_hold_waits_for_ready_not_for_approvals(self, tmp_path: Path) -> None:
+        """#677: a person converted the PR to draft. The hold row says so,
+        nobody is asked to review, approvals do not end it — the PR marked
+        ready does, and the landing finishes with gh ops alone."""
+        c = config(tmp_path)
+        c = c.model_copy(update={"daemon": c.daemon.model_copy(update={"max_resumes_per_item": 0})})
+        h, fake = review_harness(tmp_path, c)
+        fake.pr["draft"] = True
+        h.source.items = [gh_item("1")]
+        h.outcomes = ["held_by_draft"]
+        assert h.loop.tick().outcome == "awaiting_review"
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.run_id is not None
+        run_id = item.run_id
+        hold = h.dstore.review_hold_for(run_id)
+        assert hold is not None and hold.held_by_draft and hold.state == "open"
+        assert not [p for _m, p, _b in fake.raw_calls if p.endswith("/requested_reviewers")]
+        (parked,) = notices(h, "run.awaiting_review")
+        assert "converted PR #9 to draft" in parked.text and "marked ready" in parked.text
+        # Approvals do not end a draft hold.
+        fake.reviews_payload = [
+            human_review("alice", "APPROVED", "", id=1),
+            human_review("bob", "APPROVED", "", id=2),
+        ]
+        h.clock.t += 600
+        h.loop.tick()
+        hold = h.dstore.review_hold_for(run_id)
+        assert hold is not None and hold.state == "open" and hold.polls == 1
+        assert not notices(h, "review.ready") and fake.merges == []
+        # Marked ready: the landing runs, and never un-drafts on its own.
+        fake.pr["draft"] = False
+        h.clock.t += 600
+        h.loop.tick()
+        assert notices(h, "review.ready")
+        landed(h, run_id)
+        assert fake.merges and fake.ready_calls == []
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "done"
+        fresh = h.dstore.review_hold_for(run_id)
+        assert fresh is not None and fresh.state == "merged"
+        (done,) = notices(h, "run.done")
+        assert "marked ready" in done.text
+
+    def test_a_review_wait_finding_a_persons_draft_becomes_a_draft_hold(
+        self, tmp_path: Path
+    ) -> None:
+        """Approved, but someone converted the PR to draft meanwhile: the
+        landing parks for the draft, and the row waits for that now."""
+        h, fake, run_id = self.parked(tmp_path)
+        fake.reviews_payload = [
+            human_review("alice", "APPROVED", "", id=1),
+            human_review("bob", "APPROVED", "", id=2),
+        ]
+        fake.pr["draft"] = True
+        h.clock.t += 600
+        h.loop.tick()
+        fresh = landed(h, run_id)
+        assert fresh.state == "open" and fresh.held_by_draft
+        assert "marked ready for review" in (fresh.detail or "")
+        assert fake.ready_calls == [] and fake.merges == []
+        assert notices(h, "review.reparked")
+        # Marked ready: the approvals stand, and it lands.
+        fake.pr["draft"] = False
+        h.clock.t += 600
+        h.loop.tick()
+        landed(h, run_id)
+        assert fake.merges
+        fresh = h.dstore.review_hold_for(run_id)
+        assert fresh is not None and fresh.state == "merged"
+
+    def test_a_draft_hold_lifted_onto_a_review_rule_becomes_a_review_wait(
+        self, tmp_path: Path
+    ) -> None:
+        h, fake = review_harness(tmp_path)
+        fake.pr["draft"] = True
+        h.source.items = [gh_item("1")]
+        h.outcomes = ["held_by_draft"]
+        assert h.loop.tick().outcome == "awaiting_review"
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.run_id is not None
+        run_id = item.run_id
+        fake.pr["draft"] = False
+        fake.merge_outcomes = [BLOCKED_405]
+        fake.protection = {"required_pull_request_reviews": {"required_approving_review_count": 2}}
+        h.clock.t += 600
+        h.loop.tick()
+        fresh = landed(h, run_id)
+        assert fresh.state == "open" and not fresh.held_by_draft
+        assert fresh.approvals_required == 2
+        assert fresh.detail == "the base now wants 2 approving reviews"
 
 
 class TestTimeoutAndResume:
@@ -400,6 +493,38 @@ class TestTimeoutAndResume:
         h.loop.tick()
         item = h.loop.abandon_item("gh:issue:1")
         assert item.state == "failed"
+
+
+class TestSchema:
+    def test_a_hold_table_from_before_draft_holds_migrates_in_place(self, tmp_path: Path) -> None:
+        """#677: a deployed daemon's review-hold rows predate ``held_by_draft``;
+        opening the store adds the column and reads those rows as review
+        waits."""
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE daemon_review_holds (run_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, "
+            "repo TEXT NOT NULL, pr_number INTEGER NOT NULL, pr_url TEXT NOT NULL DEFAULT '', "
+            "branch TEXT, login TEXT NOT NULL DEFAULT '', is_bot INTEGER, "
+            "approvals_required INTEGER NOT NULL DEFAULT 1, notify_ids TEXT NOT NULL DEFAULT '[]', "
+            "state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL, since_at REAL NOT NULL, "
+            "next_poll_at REAL NOT NULL, polls INTEGER NOT NULL DEFAULT 0, resolved_at REAL, "
+            "resolved_by TEXT, detail TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO daemon_review_holds (run_id, item_id, repo, pr_number, "
+            "approvals_required, created_at, since_at, next_poll_at) "
+            "VALUES ('r1', 'gh:issue:1', 'o/r', 9, 2, 1, 1, 2)"
+        )
+        conn.commit()
+        conn.close()
+        store = DaemonStore(db)
+        hold = store.review_hold_for("r1")
+        assert hold is not None and not hold.held_by_draft and hold.approvals_required == 2
+        store.reopen_review_hold("r1", 3.0, "drafted", held_by_draft=True)
+        fresh = store.review_hold_for("r1")
+        assert fresh is not None and fresh.held_by_draft and fresh.approvals_required == 2
+        store.close()
 
 
 class TestRecovery:

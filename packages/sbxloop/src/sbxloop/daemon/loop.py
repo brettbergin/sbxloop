@@ -1584,11 +1584,14 @@ class DaemonLoop:
             self._frontend_finished(item, report)
             return "blocked"
         repo = item.repo or self.config.github.repo or ""
-        # What the base wants, from the run's own record of the park.
-        required, code_owners = 1, False
+        # What the base wants, from the run's own record of the park — or,
+        # a person's draft hold (#677), what they want: the PR marked
+        # ready, no approval count.
+        required, code_owners, draft = 1, False, False
         for _seq, event in self.store.events(run_id, type_prefix="run.awaiting_review"):
             required = max(1, int(event.data.get("approvals_required") or 0))
             code_owners = bool(event.data.get("code_owners"))
+            draft = bool(event.data.get("draft"))
         notify = self._review_notify(item, run_id)
         # The loop's identity on this PR, resolved once: the poll excludes
         # its own reviews without an identity read per poll.
@@ -1606,7 +1609,7 @@ class DaemonLoop:
                 )
                 login, is_bot = identity.login, identity.is_bot
                 reviewers = self.config.github.reviewers_for(repo)
-                if first_park and reviewers:
+                if first_park and reviewers and not draft:
                     ops.pr_request_reviewers(repo, pr_number, reviewers)
                     log.info("review.requested", run=run_id, pr=pr_number, reviewers=reviewers)
             except Exception as exc:
@@ -1628,27 +1631,42 @@ class DaemonLoop:
             notify_ids=notify,
             now=now,
             next_poll_at=now + self.config.landing.review_poll_interval_s,
+            held_by_draft=draft,
         )
         self.dstore.mark_awaiting_review(item.item_id, now)
         fresh = self.dstore.get(item.item_id) or item
         self._deliver_report(fresh)
         self._frontend_finished(item, report)
-        what = f"{required} approving review{'s' if required != 1 else ''}" + (
-            " from a code owner" if code_owners else ""
-        )
         wait_h = self.config.landing.review_wait_s / 3600
+        cadence = (
+            f"checking every {self.config.landing.review_poll_interval_s / 60:.0f} min "
+            f"for {wait_h:.0f} h"
+        )
+        if draft:
+            text = (
+                f"✋ {item.item_id} ready to merge, but a person converted PR #{pr_number} "
+                f"to draft — holding until it is marked ready for review; I'll finish the "
+                f"landing then, or make the changes a reviewer asks for ({cadence})"
+            )
+        else:
+            what = f"{required} approving review{'s' if required != 1 else ''}" + (
+                " from a code owner" if code_owners else ""
+            )
+            text = (
+                f"👀 {item.item_id} ready to merge — the base requires {what}; awaiting a "
+                f"reviewer on GitHub · PR #{pr_number} — I'll merge once it is approved, or "
+                f"make the changes a reviewer asks for ({cadence})"
+            )
         self._notice(
             "run.awaiting_review",
-            f"👀 {item.item_id} ready to merge — the base requires {what}; awaiting a "
-            f"reviewer on GitHub · PR #{pr_number} — I'll merge once it is approved, or "
-            f"make the changes a reviewer asks for (checking every "
-            f"{self.config.landing.review_poll_interval_s / 60:.0f} min for {wait_h:.0f} h)",
+            text,
             item=item.item_id,
             run=run_id,
             url=pr_url or None,
             pr=pr_number,
             approvals_required=required,
             code_owners=code_owners,
+            draft=draft,
             mention_ids=notify,
         )
         return "awaiting_review"
@@ -1719,6 +1737,7 @@ class DaemonLoop:
             return
         merged = bool(pr.get("merged"))
         closed = str(pr.get("state") or "").lower() == "closed" and not merged
+        draft = bool(pr.get("draft"))
         changes = [v.login for v in verdicts if v.state == "CHANGES_REQUESTED" and not v.is_bot]
         approvals = [v.login for v in verdicts if v.state == "APPROVED" and not v.is_bot]
         log.debug(
@@ -1729,6 +1748,7 @@ class DaemonLoop:
             changes_requested=changes,
             merged=merged,
             closed=closed,
+            draft=draft,
         )
         if closed:
             if not self.dstore.claim_review_hold(run_id, "approving"):
@@ -1775,7 +1795,25 @@ class DaemonLoop:
                 by=who,
             )
             return
-        if merged or len(approvals) >= hold.approvals_required:
+        if hold.held_by_draft and not merged:
+            # A person's draft hold (#677): the PR marked ready ends it —
+            # the landing re-runs every bar, and a review the base wants
+            # parks it again, as a review wait this time.
+            if draft:
+                return
+            if not self.dstore.claim_review_hold(run_id, "approving"):
+                return
+            by = ", ".join(approvals) or "GitHub"
+            self._notice(
+                "review.ready",
+                f"🚀 {item_id}: PR #{hold.pr_number} was marked ready for review — "
+                "completing the landing",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+            )
+        elif merged or len(approvals) >= hold.approvals_required:
             if not self.dstore.claim_review_hold(run_id, "approving"):
                 return
             by = ", ".join(approvals) or "GitHub"
@@ -1788,12 +1826,14 @@ class DaemonLoop:
                 pr=hold.pr_number,
                 by=by,
             )
-            threading.Thread(
-                target=self._complete_review_landing,
-                args=(hold, by),
-                daemon=True,
-                name=f"sbxloop-review-{run_id}",
-            ).start()
+        else:
+            return
+        threading.Thread(
+            target=self._complete_review_landing,
+            args=(hold, by),
+            daemon=True,
+            name=f"sbxloop-review-{run_id}",
+        ).start()
 
     def resume_review(self, target: str, by: str | None = None) -> str:
         """Operator ``resume <item|run>`` on a review wait (#675): check the
@@ -1836,6 +1876,7 @@ class DaemonLoop:
         as for a merge gate. A landing GitHub still refuses (a review that
         went stale, a check that turned red) puts the hold back up."""
         run_id, item_id = hold.run_id, hold.item_id
+        ended = "it was marked ready" if hold.held_by_draft else "its approval"
         try:
             outcome = self._land_parked(hold.repo, hold.pr_number, hold.branch, run_id)
         except RunCancelledError as exc:
@@ -1847,8 +1888,8 @@ class DaemonLoop:
             self.dstore.reopen_review_hold(run_id, self.clock(), f"landing failed: {exc}")
             self._notice(
                 "review.merge_failed",
-                f"⚠ landing {item_id} after its approval did not merge: {exc} — still "
-                "waiting; I'll try again at the next approval check",
+                f"⚠ landing {item_id} after {ended} did not merge: {exc} — still "
+                "waiting; I'll try again at the next check",
                 level="warning",
                 item=item_id,
                 run=run_id,
@@ -1856,8 +1897,13 @@ class DaemonLoop:
             return
         now = self.clock()
         if isinstance(outcome, Landed):
+            how = (
+                "merged once marked ready"
+                if hold.held_by_draft
+                else f"merged after approval by {by}"
+            )
             try:
-                self.store.reconcile_run(run_id, "merged", f"merged after approval by {by}")
+                self.store.reconcile_run(run_id, "merged", how)
             except SbxloopError:
                 log.warning("review.record_update_failed", run=run_id, exc_info=True)
             self.dstore.resolve_review_hold(run_id, "merged", by, now)
@@ -1868,7 +1914,7 @@ class DaemonLoop:
                 self._deliver_report(fresh)
             self._notice(
                 "run.done",
-                f"🎉 {item_id} merged after approval by {by} · PR #{hold.pr_number}",
+                f"🎉 {item_id} {how} · PR #{hold.pr_number}",
                 item=item_id,
                 run=run_id,
                 url=hold.pr_url or None,
@@ -1893,19 +1939,34 @@ class DaemonLoop:
                 item=item_id,
                 run=run_id,
             )
-        else:
-            why = (
-                f"the base now wants {outcome.wanted}"
-                if isinstance(outcome, AwaitingReview)
-                else outcome.why
-                if isinstance(outcome, Blocked | NeedsFix)
-                else str(outcome)
+        elif isinstance(outcome, AwaitingReview):
+            # Parked again, maybe for the other reason (#677): a draft
+            # hold lifted and the base wants a review, or a reviewer's
+            # approval met a PR someone converted back to draft. The row
+            # waits for what the landing now says.
+            why = f"the base now wants {outcome.wanted}"
+            self.dstore.reopen_review_hold(
+                run_id,
+                now,
+                why,
+                held_by_draft=outcome.draft,
+                approvals_required=max(1, outcome.approvals_required),
             )
+            self._notice(
+                "review.reparked",
+                f"👀 landing {item_id} did not merge yet: {why} — still waiting",
+                item=item_id,
+                run=run_id,
+                url=hold.pr_url or None,
+                pr=hold.pr_number,
+            )
+        else:
+            why = outcome.why if isinstance(outcome, Blocked | NeedsFix) else str(outcome)
             self.dstore.reopen_review_hold(run_id, now, why)
             self._notice(
                 "review.merge_failed",
-                f"⚠ landing {item_id} after its approval did not merge: {why} — still "
-                "waiting; I'll try again at the next approval check",
+                f"⚠ landing {item_id} after {ended} did not merge: {why} — still "
+                "waiting; I'll try again at the next check",
                 level="warning",
                 item=item_id,
                 run=run_id,
@@ -2051,10 +2112,12 @@ class DaemonLoop:
         self, repo: str, number: int, branch: str | None, run_id: str
     ) -> LandingOutcome:
         """The gh-ops-only landing a parked run finishes with — a merge gate
-        approved, a review wait approved (#675). ``land()`` re-runs every
-        bar (undraft, objections, CI, update-branch, reconciliation) against
-        the live PR, so a review or comment left during the park is
-        honoured, never merged over."""
+        approved, a review wait approved (#675), a draft hold lifted (#677).
+        ``land()`` re-runs every bar (objections, CI, update-branch,
+        reconciliation) against the live PR, so a review or comment left
+        during the park is honoured, never merged over — and a draft is a
+        person's (``own_draft=False``): the loop's own was cleared by the
+        run's landing, so one now is a hold, not something to un-draft."""
         assert self.github is not None
         ops = self.github.ops()
         identity = resolve_identity(
@@ -2084,6 +2147,7 @@ class DaemonLoop:
             emit=lambda type, **data: log.info(type, run=run_id, **data),
             answered=self.store.answered_objections(run_id),
             review_posted=True,
+            own_draft=False,
             ack=lambda threads: acknowledge_human_threads(
                 ops,
                 repo,

@@ -266,6 +266,65 @@ class TestDeliverWorkspace:
         assert ops.pr_kwargs["base"] == "develop"
         assert ops.pr_kwargs["draft"] is True
 
+    def test_a_repository_without_drafts_gets_a_ready_pr_on_one_retry(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#677: private repositories on GitHub Free and GHE instances
+        without drafts 422 a draft PR; `deliver_draft` was a preference."""
+
+        class NoDraftsOps(StubOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.creates: list[dict[str, Any]] = []
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                self.creates.append(kwargs)
+                if kwargs.get("draft"):
+                    raise github_error("pr_draft_unsupported_422")
+                return super().pr_create(repo, **kwargs)
+
+        ops = NoDraftsOps()
+        with caplog.at_level(logging.INFO, logger="sbxloop.deliver"):
+            pr = deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r1",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                draft=True,
+            )
+        assert pr.number == 7
+        assert [c["draft"] for c in ops.creates] == [True, False]
+        assert not [c for c in ops.raw_calls if "/pulls?" in c[1]], "not a collision: no lookup"
+        assert any("deliver.draft_unsupported" in r.getMessage() for r in caplog.records)
+
+    def test_a_draft_refusal_that_says_something_else_is_not_retried(self, tmp_path: Path) -> None:
+        class RefusingOps(StubOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.creates = 0
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                self.creates += 1
+                raise github_error("pr_no_commits_422")
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    return []  # the collision lookup finds no open PR
+                return super().raw(method, path, body)
+
+        ops = RefusingOps()
+        with pytest.raises(GithubOpsError):
+            deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r1",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                draft=True,
+            )
+        assert ops.creates == 1, "a bare 422 is a possible collision, never a draft retry"
+
     def test_empty_workspace_refused(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty"
         empty.mkdir()
@@ -1130,16 +1189,68 @@ class TestNaming:
         )
         assert pr.number == 12
 
+    def test_a_ref_422_naming_signatures_names_signing_not_the_prefix(self, tmp_path: Path) -> None:
+        """#677: every non-collision 422 used to be "the branch name"."""
+
+        class RefusedRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise github_error("ref_signature_required_422")
+                return super().raw(method, path, body)
+
+        with pytest.raises(DeliveryError) as info:
+            deliver_workspace(
+                RefusedRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        text = str(info.value)
+        assert "verified signatures" in text and "signed commits" in text
+        assert "GitHub App" in text and "branch_prefix" not in text
+
+    def test_a_ref_422_naming_a_lock_says_so(self, tmp_path: Path) -> None:
+        class RefusedRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise github_error("ref_locked_422")
+                return super().raw(method, path, body)
+
+        with pytest.raises(DeliveryError, match="locked") as info:
+            deliver_workspace(
+                RefusedRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        assert "branch_prefix" not in str(info.value)
+
+    def test_an_unrecognised_ref_422_quotes_github_and_names_no_knob(self, tmp_path: Path) -> None:
+        class RefusedRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise github_error("ref_refused_unclassified_422")
+                return super().raw(method, path, body)
+
+        with pytest.raises(DeliveryError) as info:
+            deliver_workspace(
+                RefusedRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        text = str(info.value)
+        assert "Something about the size limit" in text
+        assert "branch_prefix" not in text and "signed" not in text and "locked" not in text
+
     def test_a_ruleset_refusing_the_branch_names_the_knob(self, tmp_path: Path) -> None:
         class RefusedRefOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
-                    raise GithubOpsError(
-                        "github op raw.api failed: GithubOpError: gh api POST "
-                        f"{path} failed (rc=1): Cannot create ref due to creations being "
-                        "restricted. (HTTP 422)",
-                        http_status=422,
-                    )
+                    raise github_error("ref_creation_restricted_422")
                 return super().raw(method, path, body)
 
         with pytest.raises(DeliveryError, match=r"\[github\] branch_prefix") as info:

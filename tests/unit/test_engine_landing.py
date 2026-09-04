@@ -356,6 +356,7 @@ class Landing:
         policy_for: PolicyFor = no_policy,
         bot_round_spent: bool = False,
         settle_from: float | None = None,
+        own_draft: bool = True,
     ) -> Any:
         return land(
             self.fake,
@@ -375,6 +376,7 @@ class Landing:
             policy_for=policy_for,
             bot_round_spent=bot_round_spent,
             settle_from=settle_from,
+            own_draft=own_draft,
         )
 
     def against_base(self, *, advisory_spent: Container[str] = frozenset()) -> PolicyFor:
@@ -436,6 +438,35 @@ class TestLand:
         fake = FakeGithub(draft=True)
         fake.fail_once["pr_ready_for_review"] = GithubOpsError("graphql said no")
         assert isinstance(Landing(fake).run(), Blocked)
+
+    def test_a_draft_the_loop_did_not_make_is_a_persons_hold(self) -> None:
+        """#677: a parked landing re-entering (`own_draft=False`) finds the
+        PR a draft — a person converted it back. Not the loop's to clear:
+        it parks until they mark it ready."""
+        fake = FakeGithub(draft=True)
+        lp = Landing(fake)
+        outcome = lp.run(own_draft=False)
+        assert outcome == AwaitingReview(0, 0, False, "commit0", draft=True)
+        assert "marked ready for review" in outcome.wanted
+        assert fake.ready_calls == [] and fake.merges == []
+        assert ("land.held_by_draft", {"pr": 7, "head": "commit0"}) in lp.rec.events
+
+    def test_a_draft_after_the_loops_own_undraft_is_a_persons_hold(self) -> None:
+        """The loop's own draft is cleared once; someone converting the PR
+        back between polls is a hold, not a second un-draft."""
+        fake = FakeGithub(draft=True)
+        fake.pr["mergeable_state"] = "draft"
+        lp = Landing(fake)
+
+        def redraft(n: int) -> None:
+            fake.pr["mergeable_state"] = "clean"
+            fake.pr["draft"] = True
+
+        lp.rec.on_tick.append(redraft)
+        outcome = lp.run()
+        assert isinstance(outcome, AwaitingReview) and outcome.draft
+        assert fake.ready_calls == ["PR_node7"], "un-drafted once, never over a person"
+        assert fake.merges == []
 
     def test_a_pr_a_human_already_merged_lands_without_a_merge_call(self) -> None:
         fake = FakeGithub()

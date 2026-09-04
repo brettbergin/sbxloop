@@ -2527,6 +2527,48 @@ class TestPipeline:
         run = engine.store.get_run(result.run_id)
         assert run.ci_rounds == 1
 
+    def test_a_person_converting_the_pr_to_draft_parks_the_run(self, harness: Harness) -> None:
+        """#677: the loop clears its own draft once; a draft after that is
+        a person's hold. The run parks `awaiting_review` (draft flavour)
+        rather than un-drafting over them, and files nothing twice."""
+
+        class Redrafting(FakeGithub):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                pr = super().pr_get(repo, number)
+                if self.ready_calls and not self.pr.get("redrafted"):
+                    # Someone converts it back right after the loop's un-draft.
+                    self.pr["draft"] = True
+                    self.pr["redrafted"] = True
+                    pr["draft"] = True
+                return pr
+
+        fake = Redrafting()
+        fake.pr["draft"] = True
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("hold it")
+        assert result.state == "awaiting_review", result.reason
+        assert "converted the PR to draft" in (result.reason or "")
+        assert fake.ready_calls == ["PR_node7"], "un-drafted once, never over a person"
+        assert fake.merges == []
+        (held,) = self._events(harness, HostEventTypes.LAND_HELD_BY_DRAFT)
+        assert held.data["pr"] == 7
+        (parked,) = self._events(harness, HostEventTypes.RUN_AWAITING_REVIEW)
+        assert parked.data["draft"] is True and parked.data["approvals_required"] == 0
+
+    def test_the_loops_own_undraft_is_on_the_runs_record(self, harness: Harness) -> None:
+        """The record of the loop's un-draft (`land.undraft`) outlives the
+        landing call, so a later landing of this run (a resume, a parked
+        one re-entering) knows a draft is a person's."""
+        fake = FakeGithub()
+        fake.pr["draft"] = True
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("land it")
+        assert result.state == "merged" and fake.ready_calls == ["PR_node7"]
+        assert engine._undrafted(result.run_id) is True
+        assert engine._undrafted("nope") is False
+
     def test_a_queue_removal_past_the_ci_budget_fails_naming_the_check(
         self, harness: Harness
     ) -> None:

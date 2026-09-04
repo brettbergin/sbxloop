@@ -658,6 +658,13 @@ the run; a changes-requested review resumes it for a fix round; the PR
 closed abandons it. After `review_wait_s` without a verdict the item goes
 `paused_review` (one more mention, no more polling) until
 `!sbx resume <item>` picks it up again. The park survives restarts.
+A person converting the PR to draft is the same park with a different
+end: `✋ held in draft` in the thread, no reviewers requested, and the poll
+waits for the PR to be marked ready for review — approvals alone do not
+end it — then completes the landing without ever un-drafting on its own
+(`review.ready`). A landing that comes back waiting on something else
+(the base grew a review rule; someone re-drafted it) re-parks the hold for
+that (`review.reparked`) rather than failing it.
 Mentions are otherwise always disabled, so model output can never ping the
 channel, and Discord's automatic link previews (unfurls) are suppressed on
 every send *and* every edit, so no message sprouts a grey preview card — the
@@ -1065,7 +1072,13 @@ filtered by `[artifacts] exclude`. Every fix round re-delivers onto the same
 branch — force-moved, the open PR reused — so one run is one PR, and
 `sbxloop resume <run>` at `delivering` is the retry path when a delivery
 failed. The PR stays a draft until the review approves and CI is green, so a
-watching human reads "draft" as "sbxloop is still working on this".
+watching human reads "draft" as "sbxloop is still working on this". A
+repository plan without draft pull requests (GitHub answers the draft with
+a 422 saying so) gets a ready PR on one retry, logged
+`deliver.draft_unsupported`; the run is otherwise unchanged. The loop clears
+only the draft it made: a PR *a person* converts to draft — before the
+landing, or after the loop's own un-draft — is a hold, not a block (see
+`awaiting_review` in the daemon section).
 
 **Naming.** The branch, the PR title and the commit message are rendered
 from `[github]` templates — `branch_prefix` (default `sbxloop/`, the run id
@@ -1077,8 +1090,13 @@ gets names it accepts. `{title}` is the plan's own `pr_title`, written in
 the repository's commit style (the decomposer is shown the recent `git log`), falling back to the run's outcome. A fix round can retitle the PR
 by writing `.sbxloop/pr-title` in the workspace — the file is read, never
 delivered — so a red title-lint check is curable like any other; a
-re-delivery whose title changed renames the PR. A branch name the
-repository's rulesets refuse fails the delivery naming `branch_prefix`.
+re-delivery whose title changed renames the PR. A branch creation GitHub
+refuses (422) fails the delivery quoting GitHub and naming the knob its
+wording points at: a branch-name or creation rule → `branch_prefix`; a
+signature rule → signed commits, satisfied by a GitHub App credential; a
+locked or archived repository → nothing to configure; wording the loop
+does not recognise names no knob, so a guess never sends anyone to the
+wrong setting.
 
 **The review is the run's own.** A fresh read-only session reads the diff
 and returns a verdict; the run acts on that verdict whatever GitHub does

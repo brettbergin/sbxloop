@@ -93,6 +93,70 @@ def _is_ref_refusal(exc: GithubOpsError) -> bool:
     return is_422 and "already exists" not in text.lower()
 
 
+# GitHub's answer to a draft PR on a plan or instance without drafts —
+# private repositories on GitHub Free, GHE instances predating the
+# feature (#677). Matched case-insensitively; the wording is GitHub's.
+_DRAFT_UNSUPPORTED = "draft pull requests are not supported"
+
+
+def _is_draft_unsupported(exc: GithubOpsError) -> bool:
+    """Whether a PR create was refused because the repository has no draft
+    pull requests at all — a 422 saying so, which no lookup and no retry
+    of the same request would change."""
+    text = str(exc)
+    is_422 = exc.http_status == 422 or "HTTP 422" in text
+    return is_422 and _DRAFT_UNSUPPORTED in text.lower()
+
+
+# A refs POST 422 that is not "already exists", by what GitHub's message
+# says (#677): (needle in the lowercased message, the advice). The first
+# match wins; a message none of these fit is quoted as it came — every
+# 422 used to be "the branch name", which sent an operator whose base
+# wants signed commits off to change `branch_prefix`.
+_REF_REFUSALS: tuple[tuple[str, str], ...] = (
+    (
+        "signature",
+        "the base requires signed commits; GitHub signs commits the loop creates through "
+        "its API only when it authenticates as a GitHub App (GITHUB_APP_ID + private key)",
+    ),
+    (
+        "signed",
+        "the base requires signed commits; GitHub signs commits the loop creates through "
+        "its API only when it authenticates as a GitHub App (GITHUB_APP_ID + private key)",
+    ),
+    (
+        "locked",
+        "the repository is locked (a migration in progress, or archived) — nothing the "
+        "loop does changes that",
+    ),
+    (
+        "archived",
+        "the repository is archived — nothing the loop does changes that",
+    ),
+    (
+        "branch name",
+        "the repository's rules do not admit that branch name — set `[github] "
+        "branch_prefix` (or the [[github.repos]] entry's) to a prefix its rulesets allow",
+    ),
+    (
+        "creations being restricted",
+        "the repository's rules do not admit that branch name — set `[github] "
+        "branch_prefix` (or the [[github.repos]] entry's) to a prefix its rulesets allow",
+    ),
+)
+
+
+def _explain_ref_refusal(exc: GithubOpsError) -> str:
+    """The advice for a refs POST GitHub refused, from its own words; a
+    message none of :data:`_REF_REFUSALS` fits gets no advice beyond the
+    quote — a wrong knob named is worse than none."""
+    text = str(exc).lower()
+    for needle, advice in _REF_REFUSALS:
+        if needle in text:
+            return advice
+    return "GitHub's refusal is quoted above; the repository's rules or state say why"
+
+
 def _is_pr_collision(exc: GithubOpsError) -> bool:
     """Whether a PR create *may* have failed because that head already has
     an open PR. GitHub's answer is HTTP 422 "A pull request already exists
@@ -356,6 +420,29 @@ def deliver_workspace(
             draft=draft,
         )
     except GithubOpsError as exc:
+        if draft and _is_draft_unsupported(exc):
+            # No drafts on this plan or instance (#677): one retry as a
+            # ready PR. The landing's un-draft step then has nothing to
+            # do; `deliver_draft` was a preference, not a requirement.
+            log.info(
+                "deliver.draft_unsupported",
+                run=run_id,
+                repo=repo,
+                hint="the repository has no draft pull requests; opening the PR ready for review",
+            )
+            draft = False
+            pr = ops.pr_create(
+                repo,
+                base=base,
+                head=branch,
+                title=title,
+                body=_body(run_id, outcome, plan, closes=closes),
+                draft=False,
+            )
+            log.info(
+                "deliver.pr_opened", run=run_id, repo=repo, pr=pr.number, url=pr.url, draft=False
+            )
+            return pr
         if not _is_pr_collision(exc):
             raise
         existing = _find_open_pr(ops, repo, branch)
@@ -410,13 +497,12 @@ def _point_branch(
     except GithubOpsError as exc:
         if _is_ref_refusal(exc):
             # A 422 that is not "already exists" is the repository refusing
-            # the name itself — a ruleset or protection admitting only
-            # certain branch patterns (#621). No retry changes that; say
-            # which knob does.
+            # the ref: a ruleset admitting only certain branch patterns
+            # (#621), a base that wants signed commits, a locked repository
+            # (#677). No retry changes any of these; the advice comes from
+            # GitHub's own words, never a knob its message does not name.
             raise DeliveryError(
-                f"{repo} refused to create branch {branch!r}: {exc}. The repository's "
-                "rules do not admit that branch name — set `[github] branch_prefix` "
-                "(or the [[github.repos]] entry's) to a prefix its rulesets allow"
+                f"{repo} refused to create branch {branch!r}: {exc}. {_explain_ref_refusal(exc)}"
             ) from exc
         if not _is_ref_collision(exc):
             raise

@@ -191,6 +191,9 @@ class HostEventTypes:
     # `regressions`, `preexisting`, `advisory`, `ignored`, `baseline_sha`.
     LANDING_CHECKS = "landing.checks"
     LAND_UNDRAFT = "land.undraft"
+    # A draft the loop did not make (#677): a person converted the PR back,
+    # and the landing parks until they mark it ready (`pr`, `head`).
+    LAND_HELD_BY_DRAFT = "land.held_by_draft"
     LAND_UPDATE = "land.update"
     # The base merges through a merge queue (#676): the PR entered it
     # (`pr`, `head`, `position`, `resumed` when it was already queued) …

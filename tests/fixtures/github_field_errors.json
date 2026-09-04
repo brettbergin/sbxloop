@@ -74,6 +74,42 @@
       "status": 422,
       "provenance": "field",
       "observed": "run rfxja288b, PR #512, 2026-08-29: a review finding anchored to a line outside the diff (#514); the same text 422s POST /pulls/{n}/reviews with inline comments and, in single-identity mode, the one POST /pulls/{n}/comments for that finding (#513)."
+    },
+    "pr_draft_unsupported_422": {
+      "message": "github op pr.create failed: GithubOpError: POST https://api.github.com/repos/o/r/pulls -> HTTP 422: {\"message\":\"Draft pull requests are not supported in this repository.\",\"errors\":[]}",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: delivering a draft PR to a repository whose plan has no draft pull requests (#677; deliver._is_draft_unsupported matches the phrase)"
+    },
+    "pr_no_commits_422": {
+      "message": "github op pr.create failed: GithubOpError: POST https://api.github.com/repos/o/r/pulls -> HTTP 422: {\"message\":\"Validation Failed\",\"errors\":[{\"message\":\"No commits between main and sbxloop/r42\"}]}",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: a pr.create 422 that is neither a collision nor a draft refusal (#677; stays an error, no retry)"
+    },
+    "ref_signature_required_422": {
+      "message": "github op raw.api failed: GithubOpError: gh api POST /repos/o/r/git/refs failed (rc=1): gh: Commits must have verified signatures. (HTTP 422)",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: creating the delivery branch on a base with a signature rule (#677; deliver._explain_ref_refusal names signed commits, not branch_prefix)"
+    },
+    "ref_locked_422": {
+      "message": "github op raw.api failed: GithubOpError: gh api POST /repos/o/r/git/refs failed (rc=1): gh: Repository was locked for migration. (HTTP 422)",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: creating the delivery branch on a locked repository (#677; deliver._explain_ref_refusal names the lock)"
+    },
+    "ref_creation_restricted_422": {
+      "message": "github op raw.api failed: GithubOpError: gh api POST /repos/o/r/git/refs failed (rc=1): gh: Cannot create ref due to creations being restricted. (HTTP 422)",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "not yet captured: a ruleset refusing the branch name (#677; deliver._explain_ref_refusal names branch_prefix)"
+    },
+    "ref_refused_unclassified_422": {
+      "message": "github op raw.api failed: GithubOpError: gh api POST /repos/o/r/git/refs failed (rc=1): gh: Something about the size limit. (HTTP 422)",
+      "status": 422,
+      "provenance": "synthetic",
+      "observed": "deliberately unrecognised wording standing in for any ref refusal the classifier has no entry for (#677; deliver._explain_ref_refusal quotes GitHub and names no knob)"
     }
   }
 }
