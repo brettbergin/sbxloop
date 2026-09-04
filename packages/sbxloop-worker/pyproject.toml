@@ -3,13 +3,14 @@ name = "sbxloop-worker"
 dynamic = ["version"]  # derived from git tags by hatch-vcs (see [tool.hatch.version])
 description = "In-sandbox worker runtime for sbxloop (protocol models, agent backends, job runner)"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 license = "MIT"
 authors = [{ name = "Brett Bergin" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Typing :: Typed",

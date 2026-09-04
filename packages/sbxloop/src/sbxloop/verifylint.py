@@ -36,6 +36,7 @@ shape and ``uv run`` is not demanded.
 from __future__ import annotations
 
 import configparser
+import functools
 import json
 import re
 import shlex
@@ -1173,12 +1174,50 @@ def _matches_exclusion(path: str, pattern: str, workspace: Path) -> bool:
     clean = _drop_dot_slash(_normalise_path_arg(path))
     if clean == "." or (workspace / clean).is_dir():
         return False
-    target = PurePosixPath(clean)
     glob = _drop_dot_slash(pattern.rstrip("/"))
+    if PurePosixPath(clean) == PurePosixPath(glob):
+        return True
     try:
-        return target.full_match(glob) or target == PurePosixPath(glob)
-    except ValueError:
+        return _glob_regex(glob).match(clean) is not None
+    except re.error:
         return False
+
+
+@functools.lru_cache(maxsize=256)
+def _glob_regex(glob: str) -> re.Pattern[str]:
+    """A whole-path glob as ``PurePosixPath.full_match`` (3.13+) reads one.
+
+    ``*`` and ``?`` stay inside a path segment; a segment that is exactly
+    ``**`` spans any number of segments, including none; ``[...]`` classes
+    pass through (``[!x]`` negates). Nothing else is special, and dotfiles
+    are ordinary names. Written out because the floor is 3.12.
+    """
+    segments = glob.split("/")
+    out: list[str] = []
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        if segment == "**":
+            out.append(".*" if last else "(?:.*/)?")
+            continue
+        i = 0
+        while i < len(segment):
+            char = segment[i]
+            if char == "*":
+                out.append("[^/]*")
+            elif char == "?":
+                out.append("[^/]")
+            elif char == "[" and (close := segment.find("]", i + 1)) != -1:
+                body = segment[i + 1 : close]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out.append("[" + body.replace("\\", "\\\\") + "]")
+                i = close
+            else:
+                out.append(re.escape(char))
+            i += 1
+        if not last:
+            out.append("/")
+    return re.compile("".join(out) + r"\Z")
 
 
 def _explicit_path_arguments(command: str, tool: ConfigScopedTool) -> list[str]:

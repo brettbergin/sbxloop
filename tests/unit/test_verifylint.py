@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from sbxloop.verifylint import (
     CONFIG_SCOPED_TOOLS,
     GATE_DETECTORS,
+    _glob_regex,
     command_heads,
     config_override_example,
     config_override_problems,
@@ -1079,3 +1080,44 @@ class TestConfigOverrideAcrossEcosystems:
         assert "OVERRIDES" in problem and "only narrows the run" in problem
         assert config_override_problems("uv run mypy packages/sbxloop/src/sbxloop", tmp_path) == []
         assert config_override_problems("uv run mypy", tmp_path) == []
+
+
+# (glob, path, matches) — the `**`-aware whole-path semantics rubocop's
+# Exclude globs need. `PurePosixPath.full_match` is the reference where the
+# interpreter has it (3.13+); the floor is 3.12, so verifylint carries its own.
+GLOB_CASES = (
+    ("db/schema.rb", "db/schema.rb", True),
+    ("db/schema.rb", "app/db/schema.rb", False),
+    ("lib/**/*_pb.rb", "lib/proto/order_pb.rb", True),
+    ("lib/**/*_pb.rb", "lib/order_pb.rb", True),
+    ("lib/**/*_pb.rb", "lib/a/b/c/x_pb.rb", True),
+    ("lib/**/*_pb.rb", "app/lib/x_pb.rb", False),
+    (".bundle/**/*", ".bundle/config.rb", True),
+    (".bundle/**/*", ".bundle/a/b", True),
+    (".bundle/**/*", ".bundle", False),
+    ("**/*.rb", "x.rb", True),
+    ("**/*.rb", "a/b/x.rb", True),
+    ("**/*.rb", "a/b/x.py", False),
+    ("*.rb", "a/x.rb", False),
+    ("*.rb", "x.rb", True),
+    ("vendor/**", "vendor/a/b.rb", True),
+    ("vendor/**", "vendor", False),
+    ("spec/?.rb", "spec/a.rb", True),
+    ("spec/?.rb", "spec/ab.rb", False),
+    ("spec/[!a]*.rb", "spec/b1.rb", True),
+    ("spec/[!a]*.rb", "spec/a1.rb", False),
+    ("a.b", "aXb", False),
+    ("**", "anything/at/all", True),
+    ("db/*", "db/.hidden", True),
+)
+
+
+class TestExclusionGlob:
+    @pytest.mark.parametrize(("glob", "path", "expected"), GLOB_CASES)
+    def test_whole_path_semantics(self, glob: str, path: str, expected: bool) -> None:
+        assert (_glob_regex(glob).match(path) is not None) is expected
+
+    @pytest.mark.skipif(not hasattr(PurePosixPath, "full_match"), reason="reference needs 3.13+")
+    @pytest.mark.parametrize(("glob", "path", "expected"), GLOB_CASES)
+    def test_agrees_with_full_match(self, glob: str, path: str, expected: bool) -> None:
+        assert PurePosixPath(path).full_match(glob) is expected  # type: ignore[attr-defined, unused-ignore]
