@@ -1229,6 +1229,11 @@ class LoopEngine:
                         "parked by [landing] merge_gate — ready to merge, awaiting human approval"
                     )
                 if isinstance(outcome, AwaitingReview):
+                    if outcome.draft:
+                        return "awaiting_review", (
+                            "ready to merge — a person converted the PR to draft; awaiting "
+                            "it being marked ready for review"
+                        )
                     return "awaiting_review", (
                         f"ready to merge — the base requires {outcome.wanted} "
                         f"({outcome.approvals_have}/{outcome.approvals_required} so far), "
@@ -2209,6 +2214,12 @@ class LoopEngine:
                 rounds[-1] = ReviewRound(last.round, last.verdict, str(report))
         return rounds
 
+    def _undrafted(self, run_id: str) -> bool:
+        """Whether this run's landing has already taken its PR out of draft
+        (#677): the ``land.undraft`` event is on the run's record. After
+        it, a draft is a person's hold, not the loop's to clear."""
+        return any(True for _seq, _event in self.store.events(run_id, type_prefix="land.undraft"))
+
     def _review_posted(self, run_id: str) -> bool:
         """Whether the most recent review round got its record onto GitHub.
 
@@ -2587,6 +2598,9 @@ class LoopEngine:
                 number=number,
             ),
             bot_round_spent=self.store.bot_round_spent(run_id),
+            # The loop's own draft is the one it delivered and has not yet
+            # cleared (#677); after its un-draft, any draft is a person's.
+            own_draft=self.config.landing.deliver_draft and not self._undrafted(run_id),
         )
         if isinstance(outcome, Landed):
             log.info(
@@ -2628,6 +2642,7 @@ class LoopEngine:
                 head=outcome.head,
                 approvals_required=outcome.approvals_required,
                 approvals_have=outcome.approvals_have,
+                draft=outcome.draft,
             )
             self.bus.emit(
                 HostEventTypes.RUN_AWAITING_REVIEW,
@@ -2638,6 +2653,7 @@ class LoopEngine:
                 approvals_required=outcome.approvals_required,
                 approvals_have=outcome.approvals_have,
                 code_owners=outcome.code_owners,
+                draft=outcome.draft,
                 review_rounds=run.review_rounds,
                 ci_rounds=run.ci_rounds,
             )

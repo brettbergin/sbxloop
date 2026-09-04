@@ -210,6 +210,9 @@ CREATE INDEX IF NOT EXISTS idx_merge_gates_item  ON daemon_merge_gates(item_id);
 -- `merged` / `dismissed` are the ends. login/is_bot are the loop's own
 -- identity on this PR, resolved once so a poll costs no identity read;
 -- since_at is when the current wait began (a resume restarts it).
+-- held_by_draft (#677) is the other wait a person ends: they converted
+-- the PR to draft, and the poll watches for it to be marked ready
+-- instead of counting approvals.
 CREATE TABLE IF NOT EXISTS daemon_review_holds (
     run_id             TEXT PRIMARY KEY,
     item_id            TEXT NOT NULL,
@@ -220,6 +223,7 @@ CREATE TABLE IF NOT EXISTS daemon_review_holds (
     login              TEXT NOT NULL DEFAULT '',
     is_bot             INTEGER,
     approvals_required INTEGER NOT NULL DEFAULT 1,
+    held_by_draft      INTEGER NOT NULL DEFAULT 0,
     notify_ids         TEXT NOT NULL DEFAULT '[]',
     state              TEXT NOT NULL DEFAULT 'open',
     created_at         REAL NOT NULL,
@@ -307,6 +311,7 @@ class ReviewHold(NamedTuple):
     login: str
     is_bot: bool | None
     approvals_required: int
+    held_by_draft: bool
     notify_ids: tuple[str, ...]
     state: str  # open | approving | fixing | paused | merged | dismissed
     created_at: float
@@ -334,6 +339,7 @@ def _row_to_hold(row: sqlite3.Row) -> ReviewHold:
         login=str(row["login"] or ""),
         is_bot=None if is_bot is None else bool(is_bot),
         approvals_required=int(row["approvals_required"] or 0),
+        held_by_draft=bool(row["held_by_draft"]),
         notify_ids=notify,
         state=row["state"],
         created_at=row["created_at"],
@@ -649,6 +655,11 @@ class DaemonStore:
             "daemon_work_items",
             "prior_pr_number",
             "ALTER TABLE daemon_work_items ADD COLUMN prior_pr_number INTEGER",
+        ),
+        (
+            "daemon_review_holds",
+            "held_by_draft",
+            "ALTER TABLE daemon_review_holds ADD COLUMN held_by_draft INTEGER NOT NULL DEFAULT 0",
         ),
     )
 
@@ -2066,21 +2077,24 @@ class DaemonStore:
         notify_ids: Sequence[str],
         now: float,
         next_poll_at: float,
+        held_by_draft: bool = False,
     ) -> None:
         """Persist a review wait, its first poll due at ``next_poll_at`` (the
         run just looked: nothing to see yet). A run that parks again after
         a fix round re-opens its own row (the wait starts over; the notify
-        list is the fresh one); a decision already taken on a finished row
-        stands."""
+        list is the fresh one, and so is what it waits for — a review, or
+        the PR marked ready, #677); a decision already taken on a finished
+        row stands."""
         with self._lock:
             self._conn.execute(
                 "INSERT INTO daemon_review_holds (run_id, item_id, repo, pr_number, pr_url, "
-                "branch, login, is_bot, approvals_required, notify_ids, state, created_at, "
-                "since_at, next_poll_at, polls) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 0) "
+                "branch, login, is_bot, approvals_required, held_by_draft, notify_ids, state, "
+                "created_at, since_at, next_poll_at, polls) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 0) "
                 "ON CONFLICT(run_id) DO UPDATE SET state = 'open', since_at = excluded.since_at, "
                 "next_poll_at = excluded.next_poll_at, notify_ids = excluded.notify_ids, "
-                "approvals_required = excluded.approvals_required, login = excluded.login, "
+                "approvals_required = excluded.approvals_required, "
+                "held_by_draft = excluded.held_by_draft, login = excluded.login, "
                 "is_bot = excluded.is_bot, detail = NULL, resolved_at = NULL, resolved_by = NULL "
                 "WHERE daemon_review_holds.state IN ('open', 'fixing', 'paused', 'approving')",
                 (
@@ -2093,6 +2107,7 @@ class DaemonStore:
                     login,
                     None if is_bot is None else int(is_bot),
                     approvals_required,
+                    int(held_by_draft),
                     json.dumps(list(notify_ids)),
                     now,
                     now,
@@ -2164,17 +2179,37 @@ class DaemonStore:
             return cursor.rowcount == 1
 
     def reopen_review_hold(
-        self, run_id: str, now: float, detail: str | None = None, *, restart: bool = False
+        self,
+        run_id: str,
+        now: float,
+        detail: str | None = None,
+        *,
+        restart: bool = False,
+        held_by_draft: bool | None = None,
+        approvals_required: int | None = None,
     ) -> bool:
         """Put the wait back up from any unfinished state: a failed landing,
         an interrupted one, or a pause an operator ends. ``restart`` begins
-        the wait over (``since_at``); the next poll is due at once."""
+        the wait over (``since_at``); the next poll is due at once. A
+        landing that parked again for a different reason (#677: a draft
+        hold lifted, then the base wanted a review — or the reverse)
+        passes what the wait is for now."""
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE daemon_review_holds SET state = 'open', detail = ?, next_poll_at = ?, "
-                "since_at = CASE WHEN ? THEN ? ELSE since_at END "
+                "since_at = CASE WHEN ? THEN ? ELSE since_at END, "
+                "held_by_draft = COALESCE(?, held_by_draft), "
+                "approvals_required = COALESCE(?, approvals_required) "
                 "WHERE run_id = ? AND state IN ('open', 'approving', 'fixing', 'paused')",
-                (detail, now, int(restart), now, run_id),
+                (
+                    detail,
+                    now,
+                    int(restart),
+                    now,
+                    None if held_by_draft is None else int(held_by_draft),
+                    approvals_required,
+                    run_id,
+                ),
             )
             self._conn.commit()
         log.info("store.review_hold_reopened", run=run_id, detail=detail, restart=restart)

@@ -56,6 +56,7 @@ INFO_TYPES: frozenset[str] = frozenset(
         HostEventTypes.FIX_ROUND,
         HostEventTypes.CI_STATUS,
         HostEventTypes.LAND_UNDRAFT,
+        HostEventTypes.LAND_HELD_BY_DRAFT,
         HostEventTypes.LAND_UPDATE,
         HostEventTypes.LAND_ENQUEUED,
         HostEventTypes.LAND_DEQUEUED,

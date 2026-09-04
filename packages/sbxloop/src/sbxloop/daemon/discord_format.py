@@ -1087,6 +1087,9 @@ class StatusLine:
         elif t == HostEventTypes.LAND_UNDRAFT:
             self.landing = "out of draft"
             self._dirty = True
+        elif t == HostEventTypes.LAND_HELD_BY_DRAFT:
+            self.landing = "held in draft by a person"
+            self._dirty = True
         elif t == HostEventTypes.LAND_UPDATE:
             self.landing = f"updating from base (attempt {d.get('attempt')})"
             self._dirty = True
@@ -1389,6 +1392,14 @@ def format_for_discord(
         return []
     if t == HostEventTypes.LAND_UNDRAFT:
         return [line(f"🚀 PR #{data.get('pr')} taken out of draft")]
+    if t == HostEventTypes.LAND_HELD_BY_DRAFT:
+        return [
+            line(
+                f"✋ PR #{data.get('pr')} was converted to draft by a person — holding until "
+                "it is marked ready for review",
+                flush=True,
+            )
+        ]
     if t == HostEventTypes.LAND_UPDATE:
         return [
             line(f"🚀 PR #{data.get('pr')} updated from its base (attempt {data.get('attempt')})")
@@ -1417,6 +1428,14 @@ def format_for_discord(
         ]
     if t == HostEventTypes.RUN_AWAITING_REVIEW:
         label = f"#{data.get('pr')}"
+        if data.get("draft"):
+            return [
+                line(
+                    f"✋ **held in draft** PR {link(label, data.get('url'))} — a person "
+                    "converted it to draft; waiting for it to be marked ready for review",
+                    flush=True,
+                )
+            ]
         need = data.get("approvals_required") or 1
         have = data.get("approvals_have") or 0
         owners = " from a code owner" if data.get("code_owners") else ""

@@ -220,6 +220,8 @@ NoticeKind = Literal[
     "gate.merge_failed",
     "gate.dismissed",
     "review.approved",
+    "review.ready",
+    "review.reparked",
     "review.changes_requested",
     "review.merge_failed",
     "review.dismissed",

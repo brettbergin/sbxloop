@@ -104,17 +104,26 @@ class AwaitingReview(NamedTuple):
     approving review the loop cannot give its own pull request (#675). Not
     a block: a person on GitHub ends it. ``approvals_have`` counts the
     standing human approvals (the loop's own excluded) — informational,
-    GitHub's ``mergeable_state`` is the authority."""
+    GitHub's ``mergeable_state`` is the authority.
+
+    ``draft`` is the other wait a person ends (#677): the PR is a draft the
+    loop did not make — someone converted it back — and marking it ready
+    for review is theirs to do. No approval count applies; the landing
+    resumes when the PR is ready."""
 
     approvals_required: int
     approvals_have: int
     code_owners: bool
     head: str
+    draft: bool = False
 
     @property
     def wanted(self) -> str:
         """The bar, in words: "an approving review", "2 approving reviews",
-        with the code-owner review named when it is one."""
+        with the code-owner review named when it is one; for a draft hold,
+        the PR marked ready for review."""
+        if self.draft:
+            return "the pull request marked ready for review (a person converted it to draft)"
         if self.approvals_required <= 1 and not self.code_owners:
             return "an approving review"
         count = (
@@ -636,6 +645,7 @@ def land(
     bot_round_spent: bool = False,
     is_bot: bool | None = None,
     settle_from: float | None = None,
+    own_draft: bool = True,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
@@ -652,6 +662,14 @@ def land(
     loop at all: where the merge would happen, every other bar cleared,
     the PR is enqueued and the queue is polled — see
     :func:`_through_queue`.
+
+    ``own_draft`` is whether a draft seen on entry is the loop's own — it
+    delivered the PR as one (``deliver_draft``) and has not yet cleared
+    it. That draft is cleared, once. A draft seen after the loop cleared
+    it, or on entry when ``own_draft`` is False (a parked landing
+    re-entering, a resume after the loop's un-draft), is a person's
+    hold (#677): the landing does not un-draft over them, it parks
+    ``AwaitingReview(draft=True)`` until they mark the PR ready.
 
     ``review_posted`` is whether the round that approved this PR actually
     got its review onto GitHub. False blocks the merge: a run whose review
@@ -705,10 +723,20 @@ def land(
         if str(pr.get("state") or "") == "closed":
             return Closed("the pull request was closed without being merged")
         if pr.get("draft"):
+            if not own_draft:
+                # A draft the loop did not make (#677): a person converted
+                # the PR back, and that is a hold — un-drafting over them
+                # would be the loop overruling a human. They end it.
+                held = _head_sha(pr)
+                emit("land.held_by_draft", pr=number, head=held)
+                return AwaitingReview(0, 0, False, held, draft=True)
             ready = _undraft(ops, node_id or _str(pr.get("node_id")))
             if not ready:
                 return Blocked("its draft status could not be cleared")
             emit("land.undraft", pr=number)
+            # The loop's own draft is cleared once; a draft after this is
+            # a person's (#677).
+            own_draft = False
             # GitHub reports a draft's mergeable_state as `draft`; the real
             # merge state only becomes readable on the next read.
             tick("undraft")
