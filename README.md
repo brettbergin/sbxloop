@@ -1507,15 +1507,40 @@ manifests that matched), so "why did this run install Go?" has an answer.
 honours `.python-version` (an exact pin) and then `[project] requires-python`
 in `pyproject.toml` (a PEP 440 specifier); Node honours `.nvmrc` /
 `.node-version` (a major, a full version, or an `lts/<codename>` alias) and
-then `engines.node` in `package.json` (a node-semver range). The rule is the
-same for both: the default series when it satisfies the declaration, else the
-highest series this host can install that does, else the default with a
-`toolchains.version_unsatisfiable` warning. Every choice is a
-`sandbox.toolchain` event naming the `series`, its `source` (the file read,
-or `default`) and the `constraint` it was read from — so a probe failure is
-read against the interpreter the project asked for. Go needs none of this:
-its own `toolchain` directive in `go.mod` makes `go` fetch what the module
-declares.
+then `engines.node` in `package.json` (a node-semver range). .NET honours
+`global.json` — the `sdk.version` band together with its `rollForward`
+policy, exactly as the SDK applies it, so a `8.0.400` pin under the default
+`patch` policy provisions the pinned 8.0.4xx SDK and refuses a 9.x one.
+Java honours `.java-version`, `.sdkmanrc`, `.tool-versions` and a Gradle
+`toolchain { languageVersion }` / `sourceCompatibility` as an exact major,
+and `maven.compiler.release` / `java.version` in `pom.xml` as a floor (a JDK
+21 compiles `--release 17` sources; only a level above the default forces a
+newer JDK). Ruby honours `.ruby-version`, `.tool-versions` and the Gemfile's
+`ruby` requirement (an exact release, or a RubyGems range from which the
+highest installable series is taken).
+
+The rule is the same everywhere: the default series when it satisfies the
+declaration, else the highest series this host can install that does. A
+declaration no series satisfies **stops the run at resolution**, before any
+microVM, with a `toolchains.version_unsatisfiable` error naming the file,
+the constraint and the installable series — never the default with a
+warning, because a project that pins its runtime refuses the wrong one at
+the gate (`dotnet` and `bundler` both hard-fail), and a run that spends its
+turns finding that out is worse than one that never starts. Widen the
+declaration or pin an installable series. A declaration this host cannot
+read at all (`jruby-…`, a `graalvm` alias, a non-JSON `global.json`) is
+treated as undeclared, with a `toolchains.version_unreadable` warning.
+Every choice is a `sandbox.toolchain` event naming the `series`, its
+`source` (the file read, or `default`) and the `constraint` it was read
+from — so a probe failure is read against the interpreter the project asked
+for. Go needs none of this: its own `toolchain` directive in `go.mod` makes
+`go` fetch what the module declares.
+
+A pinned Ruby is compiled from source with `ruby-build` (there is no
+official binary), which takes several minutes and is the one install with
+its own budget (30 minutes) rather than the provisioning default. A project
+that pins Ruby is the strongest case for `sbxloop bake`: bake it once and
+every run probes the compiled interpreter instead of rebuilding it.
 
 ```toml
 [sandbox]
@@ -1526,15 +1551,15 @@ languages = ["python"]   # optional; unset = detect from the workspace
 | ------------ | -------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `python`     | `py`, `python3`            | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile`, `uv.lock`, `poetry.lock` | `python3-venv`, `python3-pip` (apt), `uv` + Python 3.13 by default (3.8–3.14 by declaration)                                 |
 | `cpp`        | `c`, `c++`, `cxx`, `c-cpp` | `CMakeLists.txt`, `meson.build`, `configure.ac`                                                    | `build-essential`, `cmake`, `ninja-build`, `pkg-config` (apt)                                                                |
-| `ruby`       | `rb`                       | `Gemfile`, `Rakefile`, `*.gemspec`                                                                 | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt)                                                                  |
-| `java`       | `jdk`, `jvm`               | `pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`                                           | `openjdk-21-jdk`, `maven` (apt), plus `JAVA_HOME`                                                                            |
+| `ruby`       | `rb`                       | `Gemfile`, `Rakefile`, `*.gemspec`                                                                 | `ruby-full`, `ruby-dev`, `bundler`, `build-essential` (apt) by default; 3.1–4.0 by declaration, compiled with `ruby-build`   |
+| `java`       | `jdk`, `jvm`               | `pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`                                           | `openjdk-21-jdk`, `maven` (apt) by default; JDK 8/11/17/25 by declaration (Temurin tarballs), plus `JAVA_HOME`               |
 | `php`        | —                          | `composer.json`                                                                                    | `php-cli` + mbstring/xml/curl/zip (apt), Composer (pinned)                                                                   |
 | `javascript` | `js`, `node`, `nodejs`     | `package.json`                                                                                     | Node 24 + npm/npx by default (18/20/22 by declaration; pinned tarballs from `nodejs.org`), plus `pnpm`/`yarn` corepack shims |
 | `typescript` | `ts`                       | `tsconfig.json`                                                                                    | `tsc` from npm, on top of `javascript`                                                                                       |
 | `bun`        | —                          | `bun.lock`, `bun.lockb`                                                                            | bun (pinned, from npm; the `packageManager` pin by declaration), on top of `javascript`                                      |
 | `go`         | `golang`                   | `go.mod`                                                                                           | Go toolchain (pinned tarball from `go.dev`)                                                                                  |
 | `rust`       | `rs`, `cargo`              | `Cargo.toml`                                                                                       | cargo, rustc, rustfmt, clippy (pinned rustup)                                                                                |
-| `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`                                                                   |
+| `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK 10 by default (8/9 by `global.json`; pinned builds from Microsoft), plus `DOTNET_ROOT`                              |
 | `make`       | `gnumake`                  | `Makefile`, `makefile`, `GNUmakefile`                                                              | `make` (apt)                                                                                                                 |
 | `just`       | —                          | `justfile`, `.justfile`, `Justfile`                                                                | just (pinned release binary from GitHub)                                                                                     |
 | `task`       | `go-task`, `taskfile`      | `Taskfile.yml`, `Taskfile.yaml`                                                                    | Task (pinned release binary from GitHub)                                                                                     |
@@ -1577,27 +1602,31 @@ template (`sbxloop bake`) than downloaded per run.
 
 ### Installer hosts are allowed for the selected toolchains
 
-The apt-only entries (`cpp`, `ruby`, `java`, `make`) need only the apt
-mirrors, which are in the sandbox's always-reachable baseline. The rest download from a
-vendor or registry, and **provisioning runs before any task**, so a task's
+The apt-only entries (`cpp`, `make`) need only the apt mirrors, which are in
+the sandbox's always-reachable baseline; `ruby` and `java` are apt-only at
+their default series and download only for a declared one, but the allowlist
+is computed before the workspace is read, so their hosts are always allowed.
+The rest download from a vendor or registry, and **provisioning runs before any task**, so a task's
 `egress` declaration is too late to help it. Each toolchain therefore carries
 its installer hosts, and the agent sandbox is created with the hosts of the
 *selected* toolchains allowed — under a default-deny sbx preset too. A
 language that was not selected opens nothing, and `[policy] deny` still wins
 over an installer host (the toolchain then fails to provision, loudly).
 
-| Language     | Allowed at provisioning time                         |
-| ------------ | ---------------------------------------------------- |
-| `python`     | `github.com`, `release-assets.githubusercontent.com` |
-| `php`        | `getcomposer.org`                                    |
-| `javascript` | `nodejs.org`, `registry.npmjs.org`                   |
-| `typescript` | `nodejs.org`, `registry.npmjs.org`                   |
-| `bun`        | `nodejs.org`, `registry.npmjs.org`                   |
-| `go`         | `go.dev`, `dl.google.com`                            |
-| `rust`       | `static.rust-lang.org`                               |
-| `dotnet`     | `builds.dotnet.microsoft.com`                        |
-| `just`       | `github.com`, `release-assets.githubusercontent.com` |
-| `task`       | `github.com`, `release-assets.githubusercontent.com` |
+| Language     | Allowed at provisioning time                                                                       |
+| ------------ | -------------------------------------------------------------------------------------------------- |
+| `python`     | `github.com`, `release-assets.githubusercontent.com`                                               |
+| `ruby`       | `github.com`, `codeload.github.com`, `release-assets.githubusercontent.com`, `cache.ruby-lang.org` |
+| `java`       | `api.foojay.io`, `github.com`, `release-assets.githubusercontent.com`                              |
+| `php`        | `getcomposer.org`                                                                                  |
+| `javascript` | `nodejs.org`, `registry.npmjs.org`                                                                 |
+| `typescript` | `nodejs.org`, `registry.npmjs.org`                                                                 |
+| `bun`        | `nodejs.org`, `registry.npmjs.org`                                                                 |
+| `go`         | `go.dev`, `dl.google.com`                                                                          |
+| `rust`       | `static.rust-lang.org`                                                                             |
+| `dotnet`     | `builds.dotnet.microsoft.com`                                                                      |
+| `just`       | `github.com`, `release-assets.githubusercontent.com`                                               |
+| `task`       | `github.com`, `release-assets.githubusercontent.com`                                               |
 
 `sbxloop bake` allows the same hosts for the configured `languages` (there is
 no workspace to detect from at bake time) and installs those toolchains into

@@ -1,0 +1,4 @@
+{
+  // the SDK band this project builds with
+  "sdk": { "version": "8.0.400", "rollForward": "latestPatch" }
+}
